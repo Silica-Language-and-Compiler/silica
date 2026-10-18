@@ -1,0 +1,155 @@
+// Board heap: a supervisor whose init fails gives back everything the runtime built for it (its
+// actor control block, its stack chunks, its child table), so failed inits do not leave the heap
+// growing. main starts a root supervisor whose init divides by zero (badarith) twice as a warm-up,
+// waits for the FailureReporter to drain; then 5 more failed inits, drain,
+// read; then 20 more, drain, read. The heap after 25 failed inits must equal the heap after 5
+// (Fable's lki repro, 2026-10-12: equal after the fix; before it each failed init kept its
+// actor control block). spawn_registered_supervisor returns when the root's init fails, and the
+// two "sync" messages main casts to the reporter let the failure reports queued before them be
+// handled. The reporter is cast-only (spec §15.4.13.4), so it counts each "sync" it reaches in a
+// call-only tally actor registered as :noproc (an atom the runtime always numbers), and main polls
+// the tally until both of its "sync"s are counted. Each
+// failed root writes the runtime's root-actor note on the board (27 in all); the notes are
+// compared as a set (.scout.multiset), as the suite's other failure trials are. main ends the
+// program with cast_exit(0) after printing (nothing else would end its wait_for_exit).
+// Atoms: the supervisor's registered name and its child's id reuse :unknown_op and :explicit,
+// already numbered by earlier units of this suite, so no other trial's atoms are renumbered.
+// Expected:
+//   [silica] root actor exited (no supervisor)   (27 times)
+//   true
+//   0
+use Supervisor;
+
+impl InitFailureAcbSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    } <- { strategy: :one_for_one, allowed_restart_count: 3 / initial_state, restarts_time_frame: 3600 };
+        children: List[
+            {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+            mem(normal)
+        ] <- [
+            { id: :explicit, agent_type: :worker, initial_state: 0, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg + 1, state)
+}
+
+fn spawn_bad(n: int64) -> int64 {
+    sequence proc[concurrency]
+        _s: supervisor_ref <- spawn_registered_supervisor(InitFailureAcbSup, 0, :unknown_op, stack_policy(0, :keep_last_message));
+        r: int64 <- case n == 1 of { true -> 0; false -> spawn_bad(n - 1) }
+    produces
+        pure r
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io, mem(normal)]
+        rep: actor_ref <- start_reporter();
+        _t: actor_ref <- spawn_registered(0, sync_tally, :noproc, stack_policy(0, :keep_last_message));
+        _w: int64 <- spawn_bad(2);
+        _s0: int64 <- drain(rep, 2);
+        _p: int64 <- spawn_bad(5);
+        _s2: int64 <- drain(rep, 4);
+        h5: int64 <- heap_used();
+        _q: int64 <- spawn_bad(20);
+        _s4: int64 <- drain(rep, 6);
+        h25: int64 <- heap_used();
+        _: atom <- print_boolean(h25 == h5);
+        _: atom <- println("");
+        _: boolean <- cast_exit(0);
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The reporter ignores failure reports; a "sync" from main is counted in the tally.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: int64 <- case report == "sync" of {
+            true -> call_registered(:noproc, 1 impl ActorMessage {});
+            false -> 0
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Call-only tally: adds its message to the count and replies with the new count.
+fn sync_tally(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+// Casts two "sync"s to the reporter and returns once the tally has counted `total` of them, so
+// every failure report queued ahead of them has been handled.
+fn drain(rep: actor_ref, total: int64) -> int64 {
+    sequence proc[concurrency]
+        _: boolean <- cast(rep, "sync" impl ActorMessage {});
+        _: boolean <- cast(rep, "sync" impl ActorMessage {});
+        r: int64 <- await_tally(total)
+    produces
+        pure r
+    end
+}
+
+fn await_tally(total: int64) -> int64 {
+    sequence proc[concurrency]
+        got: int64 <- call_registered(:noproc, 0 impl ActorMessage {});
+        r: int64 <- case got >= total of {
+            true -> got;
+            false -> await_tally(total)
+        }
+    produces
+        pure r
+    end
+}
+
+fn start_reporter() -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

@@ -1,5 +1,7 @@
 # Compressed Sparse Row Graph Snapshot Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/graph_csr_core.silica` with `graph_csr_directed`, `graph_csr_undirected`, `graph_csr_weighted`, `graph_csr_weighted_undirected`; trials in `trials/ordered_data_structures/graph_csr_core/` (9 programs) and `graph_collections/`. The freeze overflow-failure path has no trial.
+
 **Module family:** `graph_csr_directed`, `graph_csr_undirected`, weighted variants
 **Source:** frozen live WBT graph
 **Mutability:** immutable topology snapshot
@@ -52,6 +54,8 @@ Unweighted snapshots omit `edge_data`. Weighted/attributed snapshots use a paral
 `V`, `V_PLUS_ONE`, and `A` are runtime-sized internal extent identifiers bound to checked `int64` values during freeze. They are not public graph type parameters and do not create a distinct public graph type for each graph size. The extent equations are normative even when the compiler changes the private inline-record spelling.
 
 ## 4. Freeze definition
+
+A CSR snapshot has no constructor record of its own. `graph_csr_directed@freeze_from_wbt/1` (and the undirected, weighted and weighted-undirected twins) takes a live WBT graph and carries that graph's `functions` record (`{ compare_node, compare_edge, edge_target }` directed, `{ compare_node, compare_edge_data }` undirected, plus `edge_weight` and `compare_weight` weighted). Internally the snapshot stores them as `compare_key` and `compare_value`.
 
 Freeze is a deterministic sequence:
 

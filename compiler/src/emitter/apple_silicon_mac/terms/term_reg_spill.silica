@@ -25,6 +25,8 @@ use string_parse;
 use reg_conventions;
 use term_sir_helpers;
 use term_aggregate_helpers;
+use term_user_call_abi;
+use prims_tuple;
 
 export spill_reg_chain_from_outer/1;
 export next_frame_spill_slot/1;
@@ -37,8 +39,11 @@ export body_kind_census/1;
 export emit_region_destroy_reg/1;
 export agg_subtree_bytes/2;
 export agg_offset_for/4;
+export agg_offset_table/1;
 export type_name_is_list_like/1;
 export outer_for_aggregate_let_rhs/2;
+export let_sret_home_bytes/2;
+export sret_on_spine/2;
 export hide_actor_sret/1;
 export outer_append_id_ret_tuple_sret/3;
 export compute_let_rhs_spill_reg/3;
@@ -354,8 +359,131 @@ fn type_name_is_memory_handle_like(type_name: string) -> boolean {
 // state (`next <- case state of { ... -> (:mapped, w) }`) also wrote into the reply buffer, so the
 // installed state was the buffer's own address and the next dispatch overwrote it
 // (design_documents/actor_memory_budget_plan.md item B).
+// A let emitted inside this RHS sees only its own right_expr as its body, never the continuation
+// after the enclosing let, so spill_reg_chain_for_body would hand it a callee-saved register that
+// is dead in the RHS and live afterwards: `n <- call_supervisor(rt, { op: :count_children })`
+// lowers to `let %_supervisor_live_count = supervisor_count_children(rt) in record_make(...)`,
+// and when the ten callee-saved registers were all bound the count was parked in rt's X19, so the
+// terminate_child that followed received the count as its supervisor_ref (board trial
+// supervisors_board_defects_addition/supervisor_ref_after_calls; the hosted emitters did the same).
+// The RHS therefore keeps the bound callee-saved registers, as a case arm does (`_keep_cs`): a
+// nested let that finds the chain full takes a frame slot instead of reusing a bound register.
 fn outer_for_aggregate_let_rhs(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> string {
-    hide_actor_sret(outer_reg)
+    with_home(term, outer_reg_keep_callee_saved(hide_actor_sret(outer_reg)))
+}
+
+// A let that destructures the result of an sret tuple call, `(a, b) <- f(x)` (lowered to
+// `let %_td_0 = f(x) in let %a = proj(%_td_0, 0) in ...`), gives the call a home in this frame:
+// the projections read the result from there and nothing else ever sees its address, so it needs
+// no region block. The home is part of the frame region area (agg_subtree_bytes reserves it, with
+// the RHS's own regions after it and the body's after those), addressed [X29, #-N] for
+// N = the let's region offset + its size. call@sret_x8_setup reads `_x8h<call node>=N`.
+// True when node `idx` is on the return spine of an sret tuple function: emitter_core publishes
+// `_rsp=,<idx>,<idx>,...,` (the body root, through let bodies and case arms) on the body's outer.
+// A let or case listed there leaves its aggregate where it is (the epilogue copies it out while the
+// frame is alive) instead of promoting it to the heap.
+fn sret_on_spine(outer_reg: string, idx: int64) -> boolean {
+    list: string <- var@find_sp_binding(outer_reg, "_rsp");
+    length_bytes(list) > 0 and aoff_find(list, concat(",", concat(atom_table@int64_to_decimal_string(idx), ",")), 0) >= 0
+}
+
+fn let_sret_home_bytes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, let_idx: int64) -> int64 {
+    case let_idx < 0 of {
+        true -> 0;
+        false -> {
+            ln: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, let_idx));
+            case ln.kind == 2 and ln.inner >= 0 of {
+                false -> 0;
+                true -> {
+                    rn: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, ln.inner));
+                    case (rn.kind == 4 or rn.kind == 5) and prims_tuple@is_sret_aggregate_type(rn.type_name) of {
+                        false -> 0;
+                        true -> case let_result_stays_in_scope(term, ln) of {
+                            true -> prims_tuple@sret_aggregate_bytes(rn.type_name);
+                            false -> 0
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The bound result never outlives this frame: a destructuring temporary (`%_td_`, read only through
+// its projections), a discarded binding, or a name the body uses only as the base of a projection
+// to a scalar, as the right side of a destructuring let, or not at all.
+fn let_result_stays_in_scope(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, ln: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }) -> boolean {
+    case length_bytes(ln.name) >= 5 and substring(ln.name, 0, 5) == "%_td_" of {
+        true -> true;
+        false -> case ln.name == "_" or ln.name == "%_" of {
+            true -> true;
+            false -> sret_name_escapes(term_sir_helpers@sir_term_at(term, ln.right_expr), ln.name) == false
+        }
+    }
+}
+
+// True when `name` may leave the scope through `term`: any use other than the base of a
+// projection with a non-aggregate result or the right side of a destructuring let, or a rebinding.
+fn sret_name_escapes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, name: string) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            inner_t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, n.inner);
+            inner_is_name: boolean <- inner_t.root >= 0 and term_sir_helpers@sir_term_root_node(inner_t).kind == 1 and binding_name_matches_ref(term_sir_helpers@sir_term_root_node(inner_t).name, name);
+            case n.kind == 1 of {
+                true -> binding_name_matches_ref(n.name, name);
+                false -> case n.kind == 2 and binding_name_matches_ref(n.name, name) of {
+                    true -> true;
+                    false -> {
+                        reads_only: boolean <- inner_is_name and ((n.kind == 6 and (n.name == "record_proj" or n.name == "tuple_proj") and reg_conventions@is_aggregate_struct_or_tuple_return_type(n.type_name) == false)
+                            or (n.kind == 2 and length_bytes(n.name) >= 5 and substring(n.name, 0, 5) == "%_td_"));
+                        left: boolean <- case reads_only of {
+                            true -> false;
+                            false -> sret_name_escapes(inner_t, name)
+                        };
+                        case left of {
+                            true -> true;
+                            false -> sret_name_escapes(term_sir_helpers@sir_term_at(term, n.right_expr), name)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn with_home(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> string {
+    h: int64 <- let_sret_home_bytes(term, term.root);
+    case h > 0 of {
+        false -> outer_reg;
+        true -> {
+            off: int64 <- let_region_offset(term, outer_reg);
+            case off < 0 of {
+                true -> outer_reg;
+                false -> concat(outer_reg, concat("|_x8h", concat(atom_table@int64_to_decimal_string(term_sir_helpers@sir_term_root_node(term).inner), concat("=", atom_table@int64_to_decimal_string(off + h)))))
+            }
+        }
+    }
+}
+
+// The frame region offset of a let node (where its home starts), or -1 when the let cannot be
+// found from the body root (a rebuilt sub-term): the call then falls back to X8 = 0.
+fn let_region_offset(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> int64 {
+    broot: string <- var@find_sp_binding(outer_reg, "_broot");
+    br: int64 <- case length_bytes(broot) > 0 of { true -> string_parse@string_to_int64(broot); false -> 0 - 1 };
+    tab: string <- var@find_sp_binding(outer_reg, "_aoff");
+    cached: int64 <- case length_bytes(tab) > 0 of {
+        true -> aoff_lookup(tab, term.root, aoff_arena_len(term.nodes));
+        false -> 0 - 1
+    };
+    case cached >= 0 of {
+        true -> cached;
+        false -> case br < 0 of {
+            true -> 0 - 1;
+            false -> agg_offset_for(term, br, term.root, 0)
+        }
+    }
 }
 
 // The buffer register stays reserved while hidden: a let inside the hidden subtree must not spill
@@ -752,6 +880,52 @@ fn agg_persist_bytes(term: { nodes: List[{ kind: int64, type_name: string, value
     }
 }
 
+// list_cons evaluates its tail first (the whole rest of the list, each element already copied into
+// its heap cell) and then the head, whose make emit_list_cons copies into the region before the
+// prepend. So the head's slab and the tail's slabs are never live together and may share one base:
+// a 400-record list literal needed a 77 KB frame (over the ESP32-S3 `entry` limit of 32,760 bytes)
+// where one record's room suffices. Only a head without a nested make shares: no make at all, or a
+// record_make whose field values hold none (a nested make's pointer stays in the boxed copy, so its
+// slab must outlive the cons). The record's own field chain is record_make nodes of its own type.
+fn list_cons_head_shares(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, head_bytes: int64) -> boolean {
+    case n.kind == 6 and n.name == "list_cons" and n.inner >= 0 of {
+        false -> false;
+        true -> case head_bytes == 0 of {
+            true -> true;
+            false -> {
+                h: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, n.inner));
+                h.kind == 6 and h.name == "record_make" and record_chain_fields_flat(term, n.inner, h.type_name)
+            }
+        }
+    }
+}
+
+fn record_chain_fields_flat(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64, rec_type: string) -> boolean {
+    case idx < 0 of {
+        true -> true;
+        false -> {
+            c: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, idx));
+            case c.kind == 6 and c.name == "record_make" and c.type_name == rec_type of {
+                true -> subtree_has_no_make(term, c.inner) and record_chain_fields_flat(term, c.right_expr, rec_type);
+                false -> subtree_has_no_make(term, idx)
+            }
+        }
+    }
+}
+
+fn subtree_has_no_make(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> boolean {
+    case idx < 0 of {
+        true -> true;
+        false -> {
+            c: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, idx));
+            case c.kind == 6 and (c.name == "tuple_make" or c.name == "record_make") of {
+                true -> false;
+                false -> subtree_has_no_make(term, c.inner) and subtree_has_no_make(term, c.right_expr)
+            }
+        }
+    }
+}
+
 // nested makes sit above their parent's shell.
 fn agg_subtree_bytes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> int64 {
     case idx < 0 of {
@@ -766,14 +940,14 @@ fn agg_subtree_bytes(term: { nodes: List[{ kind: int64, type_name: string, value
             // live with the parent, and is not always heap-promoted first. Sharing
             // there corrupted 16 trials (rec_call_field, tuple3_nested_destr, ...).
             in_chain: boolean <- n.kind == 6 and (n.name == "tuple_make" or n.name == "record_make");
-            share: boolean <- n.kind == 7 or (in_chain and agg_child_is_make(term, n.inner));
+            share: boolean <- n.kind == 7 or (in_chain and agg_child_is_make(term, n.inner)) or list_cons_head_shares(term, n, a);
             case share of {
                 true -> own + (case a > b of { true -> a; false -> b });
                 false -> case n.kind == 2 of {
                     true -> {
                         pb: int64 <- agg_persist_bytes_let(term, idx);
                         tot: int64 <- pb + b;
-                        own + (case a > tot of { true -> a; false -> tot })
+                        own + let_sret_home_bytes(term, idx) + (case a > tot of { true -> a; false -> tot })
                     };
                     false -> own + a + b
                 }
@@ -793,14 +967,14 @@ fn agg_offset_for(term: { nodes: List[{ kind: int64, type_name: string, value: s
             true -> base;
             false -> {
                 n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, idx));
-                own: int64 <- term_aggregate_helpers@agg_shell_bytes(term_sir_helpers@sir_term_at(term, idx));
+                own: int64 <- term_aggregate_helpers@agg_shell_bytes(term_sir_helpers@sir_term_at(term, idx)) + let_sret_home_bytes(term, idx);
                 cb: int64 <- base + own;
                 l: int64 <- agg_offset_for(term, n.inner, target, cb);
                 case l >= 0 of {
                     true -> l;
                     false -> {
                         in_chain_r: boolean <- n.kind == 6 and (n.name == "tuple_make" or n.name == "record_make");
-                        share_r: boolean <- n.kind == 7 or (in_chain_r and agg_child_is_make(term, n.inner));
+                        share_r: boolean <- n.kind == 7 or (in_chain_r and agg_child_is_make(term, n.inner)) or (n.kind == 6 and n.name == "list_cons" and list_cons_head_shares(term, n, agg_subtree_bytes(term, n.inner)));
                         rb: int64 <- case share_r of {
                             true -> cb;
                             false -> case n.kind == 2 of {
@@ -812,6 +986,109 @@ fn agg_offset_for(term: { nodes: List[{ kind: int64, type_name: string, value: s
                     }
                 }
             }
+        }
+    }
+}
+
+
+// One walk of the function body that yields what agg_subtree_bytes(root) and agg_offset_for(root,
+// target, 0) give for every make, together: (region bytes, "a<idx>b<offset>" for each make in
+// visit order). frame_region_for walks from the body root once per make, and every node it reads
+// costs a walk of the SIR arena, so a function built from a 400-record list literal took 50 s and
+// 3.7 GB to emit on the Mac and timed out on the Pi. emitter_core puts the table in the body's
+// outer_reg as `_aoff` when the function has many makes; the formulas mirror agg_subtree_bytes and
+// agg_offset_for exactly (share / let / plain).
+fn agg_offsets_walk(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64, base: int64, acc: string, count: int64) -> (int64, string, int64) {
+    case idx < 0 of {
+        true -> (0, acc, count);
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, idx));
+            home_b: int64 <- let_sret_home_bytes(term, idx);
+            own: int64 <- term_aggregate_helpers@agg_shell_bytes(term_sir_helpers@sir_term_at(term, idx)) + home_b;
+            cb: int64 <- base + own;
+            in_chain: boolean <- n.kind == 6 and (n.name == "tuple_make" or n.name == "record_make");
+            acc1: string <- case in_chain or home_b > 0 of {
+                true -> concat(acc, concat(concat("a", atom_table@int64_to_decimal_string(idx)), concat("b", atom_table@int64_to_decimal_string(base))));
+                false -> acc
+            };
+            count1: int64 <- case in_chain or home_b > 0 of { true -> count + 1; false -> count };
+            (a: int64, acc2: string, count2: int64) <- agg_offsets_walk(term, n.inner, cb, acc1, count1);
+            share: boolean <- n.kind == 7 or (in_chain and agg_child_is_make(term, n.inner)) or list_cons_head_shares(term, n, a);
+            pb: int64 <- case share == false and n.kind == 2 of {
+                true -> agg_persist_bytes_let(term, idx);
+                false -> 0
+            };
+            rb: int64 <- case share of {
+                true -> cb;
+                false -> case n.kind == 2 of {
+                    true -> cb + pb;
+                    false -> cb + a
+                }
+            };
+            (b: int64, acc3: string, count3: int64) <- agg_offsets_walk(term, n.right_expr, rb, acc2, count2);
+            sub: int64 <- case share of {
+                true -> own + (case a > b of { true -> a; false -> b });
+                false -> case n.kind == 2 of {
+                    true -> {
+                        tot: int64 <- pb + b;
+                        own + (case a > tot of { true -> a; false -> tot })
+                    };
+                    false -> own + a + b
+                }
+            };
+            (sub, acc3, count3)
+        }
+    }
+}
+
+// (agg_subtree_bytes(body, body.root), the `_aoff` table, the number of makes).
+fn agg_offset_table(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> (int64, string, int64) {
+    (sub: int64, tab: string, count: int64) <- agg_offsets_walk(term, term.root, 0, "", 0);
+    // Led by the arena size: a lookup from a term of another arena (a rebuilt sub-term) misses.
+    (sub, concat(concat("n", atom_table@int64_to_decimal_string(aoff_arena_len(term.nodes))), concat(tab, "a")), count)
+}
+
+fn aoff_arena_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn aoff_find(h: string, needle: string, i: int64) -> int64 {
+    case i + length_bytes(needle) > length_bytes(h) of {
+        true -> 0 - 1;
+        false -> case substring(h, i, i + length_bytes(needle)) == needle of {
+            true -> i;
+            false -> aoff_find(h, needle, i + 1)
+        }
+    }
+}
+
+fn aoff_digits_end(h: string, i: int64) -> int64 {
+    case i >= length_bytes(h) of {
+        true -> i;
+        false -> case substring(h, i, i + 1) == "a" of {
+            true -> i;
+            false -> aoff_digits_end(h, i + 1)
+        }
+    }
+}
+
+// The offset the `_aoff` table records for make `target` of a term with `arena_len` nodes, or -1.
+fn aoff_lookup(tab: string, target: int64, arena_len: int64) -> int64 {
+    key: string <- concat(concat("a", atom_table@int64_to_decimal_string(target)), "b");
+    lead: string <- concat("n", atom_table@int64_to_decimal_string(arena_len));
+    at: int64 <- case length_bytes(tab) > length_bytes(lead) and substring(tab, 0, length_bytes(lead)) == lead and substring(tab, length_bytes(lead), length_bytes(lead) + 1) == "a" of {
+        true -> aoff_find(tab, key, 0);
+        false -> 0 - 1
+    };
+    case at < 0 of {
+        true -> 0 - 1;
+        false -> {
+            s: int64 <- at + length_bytes(key);
+            string_parse@string_to_int64(substring(tab, s, aoff_digits_end(tab, s)))
         }
     }
 }
@@ -829,7 +1106,15 @@ fn frame_region_for(term: { nodes: List[{ kind: int64, type_name: string, value:
     // element 0 when they shared the same offset space.
     broot: string <- var@find_sp_binding(outer_reg, "_broot");
     br: int64 <- case length_bytes(broot) > 0 of { true -> string_parse@string_to_int64(broot); false -> 0 - 1 };
-    raw: int64 <- agg_offset_for(term, br, term.root, 0);
+    tab: string <- var@find_sp_binding(outer_reg, "_aoff");
+    cached: int64 <- case length_bytes(tab) > 0 of {
+        true -> aoff_lookup(tab, term.root, aoff_arena_len(term.nodes));
+        false -> 0 - 1
+    };
+    raw: int64 <- case cached >= 0 of {
+        true -> cached;
+        false -> agg_offset_for(term, br, term.root, 0)
+    };
     prefix: int64 <- case raw >= 0 of { true -> raw; false -> 0 };
     own: int64 <- term_aggregate_helpers@agg_shell_bytes(term);
     need: int64 <- case own < 16 of { true -> 16; false -> (own + 15) / 16 * 16 };
@@ -875,17 +1160,21 @@ fn compute_let_rhs_spill_reg(term: { nodes: List[{ kind: int64, type_name: strin
     // callee-saved chain run dry inside case arms and pushed live values into X29 slots the
     // prologue never reserved ([X29, #-16] over the saved X19/X20 pair in
     // type_checker_expressions_binary_ops@check_comparison_operands).
+    // The RHS type is the VALUE type of the right-hand side (term_sir_helpers@let_rhs_value_type):
+    // for a nested let chain that is the tail's type, not the first statement's. Reading the root
+    // let's type_name ("unit" for a discarded `println(..)`) skipped the spill, so the binding was
+    // left in X0 for the next call to overwrite.
     case term_sir_helpers@sir_term_root_node(term).name == "_" or term_sir_helpers@sir_term_root_node(term).name == "%_" of {
         true -> "";
         false ->
-        case is_float_scalar_type(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).type_name) of {
+        case is_float_scalar_type(term_sir_helpers@let_rhs_value_type(term)) of {
             true -> case is_caller_saved_fp(rhs_reg) of {
-                true -> fp_spill_reg_chain_from_outer(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).type_name, outer_reg);
+                true -> fp_spill_reg_chain_from_outer(term_sir_helpers@let_rhs_value_type(term), outer_reg);
                 false -> ""
             };
             false -> case is_caller_saved_gpr(rhs_reg) of {
                 false -> "";
-                true -> case let_rhs_type_spills_across_io(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).type_name) of {
+                true -> case let_rhs_type_spills_across_io(term_sir_helpers@let_rhs_value_type(term)) of {
                     true -> {
                         unused: string <- spill_reg_chain_from_outer(outer_reg);
                         case length_bytes(unused) > 0 of {

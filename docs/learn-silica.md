@@ -35,7 +35,7 @@ You will recognize most of the pieces. The combination is the point. Silica puts
 
 The design rules, in the order you will feel them:
 
-- **Effects are explicit.** If a block prints, allocates, or sends a message, a `sequence` says so. Callers inherit that obligation.
+- **Effects are explicit.** If a block prints, allocates, or sends a message, its `sequence` says so. Effects are local: a sequence declares what its own steps do, and calling a function adds nothing to the caller, because the callee's own sequence declares and discharges its effects.
 - **Heap is an effect.** Allocating or growing region-backed storage is `mem(<space>)` on a sequence, not an invisible runtime service.
 - **Memory is regional and stack-shaped per actor.** There is no garbage collector and no shared heap for long-lived application data. A `ref` or `buf` is never separated from the region that contains the memory it refers to.
 - **Concurrency is message passing.** Isolation comes first. Sharing is a deliberate, typed move of a region, not a default. A well-designed application is a set of actors, not a tree of function calls.
@@ -83,7 +83,7 @@ Catch-alls are typed: `_: int64 -> 0`. A bare `_` is illegal. Python `match` all
 
 `and` / `or` / `not` are boolean. Comparisons are `==` `!=` `<` `>` `<=` `>=`. Integer `/` truncates toward zero. That is closer to Python `//` than to `/`, except Python `//` floors and Silica truncates toward zero.
 
-Functions are top-level only, and they take at most eight parameters. A nested `fn name` declaration is an error. Lambdas (`fn(x: int64) -> int64 { x + 1 }`) are fine in expression position. There are no Python-style nested `def`s, no `*args`, and no default arguments. If you need more than eight inputs, group them in a tuple or a record.
+Functions are top-level only, and they take at most eight parameters. A nested `fn name` declaration is an error. Function literals (`fn(x: int64) -> int64 { x + 1 }`) are fine in expression position. The `-> type` is required (a literal without it is error E1071; the type is never inferred). A literal may capture a name only if, where the literal is written, that name is bound to an integer literal (decimal or hex) by an integer-typed binding (`int8` to `int64`, `uint8` to `uint64`). Every other capture is error E1072, which names the captured name: a function parameter, a computed value (`m: int64 <- n * 2`), a float, boolean, string or atom literal, a record, a name rebound later to a non-literal, a name shadowed by a tuple decomposition or a case pattern, or a formal of an enclosing literal. To use any other value, pass it to the literal as an argument. There are no closure environments. With `n: int64 <- 3` in scope, `f: fn(int64) -> int64 <- fn(x: int64) -> int64 { x + n }` adds 3, and `f` can be passed as an argument or sent as a message (the trials `functions_addition/fn_param_unary_lambda_as_variable_capture` and `actors_addition/actor_message_capturing_fn_literal` show both). A literal that captures a local binding cannot be returned from the function that owns the binding (E1067): a returned capturing literal stays an error. There are no Python-style nested `def`s, no `*args`, and no default arguments. If you need more than eight inputs, group them in a tuple or a record.
 
 The entry point is `main`. There is no `if __name__ == "__main__"`.
 
@@ -173,23 +173,23 @@ This is legal:
 ```silica
 fn boom() -> int64 {
     sequence proc[device_io]
-        println("x");
+        println("x")
     produces
         pure 0
     end
 }
 ```
 
-The signature of `boom` is only `() -> int64`. The sequence admits `device_io`. `produces pure 0` is the value that comes out; `pure` means `0` itself does not start a new effect. Nested sequences — including sequences inside lambdas — each declare what they need. Effects propagate up: a caller of `boom` must already sit in a sequence that admits `device_io`.
+The signature of `boom` is only `() -> int64`. The sequence admits `device_io`. `produces pure 0` is the value that comes out; `pure` means `0` itself does not start a new effect. Nested sequences — including sequences inside lambdas — each declare what they need. Effects are local: a sequence declares only the effects of its own operations. A caller of `boom` needs no `device_io` of its own, because `boom`'s sequence already declares and discharges it; a caller that declares an effect only because a callee uses it gets E3010 (unused effect declaration). The one exception is `register_rwr`: a function whose body holds a `register_rwr` sequence reaches a device, so every caller must declare it too.
 
-That is the honesty rule. A helper that prints cannot hide inside an innocent-looking `fn`. You see the effect at every layer that can reach it.
+That is the honesty rule. A helper that prints cannot print without a sequence that says so, and you see that sequence where the printing is written. Reading a function body tells you what that body does itself; a `sequence` header never lists work that only a callee performs.
 
 Built-in effects:
 
 | Effect            | Means                                                 |
 | ----------------- | ----------------------------------------------------- |
 | `device_io`       | stdout, console, files                                |
-| `network_io`      | sockets, HTTP, and other network I/O                  |
+| `network_io`      | network I/O, reached through Fifi wrappers (§20.4)    |
 | `concurrency`     | `spawn`, `call`, `cast`, and related actor work       |
 | `mem(Space)`      | allocate, read, or write in that memory space         |
 | `atomic`          | atomic operations                                     |
@@ -197,7 +197,7 @@ Built-in effects:
 | `register_rwr`    | MMIO; only inside `spawn_device` behaviors            |
 | `external_danger` | outbound FFI; only inside `spawn_dangerous` behaviors |
 
-Print helpers require `device_io`. In Python, `print` is an ordinary call. Here the sequence must admit the effect, and every caller up the chain must too. The trials use `print_string`, `print_bool`, and `println` — open those files for the spelling that compiles today.
+Print helpers require `device_io`. In Python, `print` is an ordinary call. Here the sequence that prints must admit the effect. The print builtins are `print_string`, `print_int64`, `print_boolean`, `print_char`, `println` and `println_stderr`; each returns the atom `:ok`, so a print that is not the last step is written `_: atom <- print_int64(n);` (a bare `println("x");` statement is also accepted). `wait_for_exit()` needs `device_io` as well, because it reads standard input.
 
 On OS-hosted targets, `mem(Space)` is still in the type system. Distinct hardware attributes per space are guaranteed on OS-free targets, not on macOS or Linux process virtual memory. The OS still chooses the page attributes; Silica still makes you name the space you meant.
 
@@ -432,7 +432,7 @@ Vertex IDs are any type the node comparator accepts. They are never slot indexes
 
 The module headers list these deviations. You will meet them today:
 
-- **Bracket types.** A bracket-typed binding such as `OrderedMap[string, int64, mem(normal)]` is accepted for a `module@empty/1` result, and for parameters and returns. The record an update returns (`{ map, inserted, replaced }`, `{ set, inserted }`, `{ tree, added, child_slot }`) is rejected when its field is written with the bracket type (E2003). It must be bound with the representation's inline record. `BinaryTree[...]` is not recognised at all (E1040), so tree-binary values use the inline record.
+- **Bracket types.** A bracket-typed binding such as `OrderedMap[string, int64, mem(normal)]` is accepted for a `module@empty/1` result, and for parameters and returns. The record an update returns (`{ map, inserted, replaced }`, `{ set, inserted }`, `{ tree, added, child_slot }`) is rejected when its field is written with the bracket type (E2003). It must be bound with the representation's inline record. `BinaryTree[ItemType, mem(normal)]` is accepted like the others (a `tree_binary@with_root({ compare_item: f }, item)` result, parameters and returns).
 - **Placeholders.** Lookups take a placeholder argument to return with `:not_found` (`get`, `peek`, `root_item`, `weight_of`).
 - **Trait dispatch.** A bracket-typed receiver, and a method whose result mentions a placeholder, are dispatched to the last listed implementation. The graph trait headers name the affected methods. Call the representation module's function of the same name instead.
 - **Memory space.** Only `mem(normal)` is supported.
@@ -596,7 +596,14 @@ fn total(bag: OrderedMap[string, int64, mem(normal)]) -> int64 {
 }
 ```
 
-A caller sees only `OrderedMap[string, int64, mem(normal)]`. This `main` exercises the module directly: it is a test of a data structure, not an application (§12 shows the application shape). It uses one small printing helper:
+A caller sees only `OrderedMap[string, int64, mem(normal)]`. This `main` exercises the module directly: it is a test of a data structure, not an application (§12 shows the application shape). It begins with the two `use` lines that make `word_bag@...` and `OrderedMap@...` calls legal in this file (a qualified call without its `use` is E1010):
+
+```silica
+use word_bag;
+use OrderedMap;
+```
+
+It uses one small printing helper:
 
 ```silica
 fn show(label: string, n: int64) -> atom {
@@ -654,7 +661,7 @@ sequence proc[mem(normal)]
     L1: lifetime <- fresh_lifetime();
     r: region(L1, normal) <- alloc_region(normal);
     cell: ref(L1, normal, int64) <- alloc_ref(r, 42);
-    _: atom <- write_ref(cell, 43);
+    _: atom <- write_ref(cell, 43)
 produces
     pure (r, cell)
 end
@@ -662,13 +669,13 @@ end
 
 `fresh_lifetime()` gives you a unique `L1`. `alloc_region` creates the arena. `alloc_ref` puts a cell in that arena. `write_ref` updates the cell. The effect is `mem(normal)` because that is the space you named. `(r, cell)` keeps the arena alive in the caller; `cell` remains valid because `r` is still owned.
 
-This is rejected and produces a compiler error — `cell` would dangle after `r` is freed at `end`:
+This is rejected with E2100 (reference outlives region) — `cell` would dangle after `r` is freed at `end`:
 
 ```silica
 sequence proc[mem(normal)]
     L1: lifetime <- fresh_lifetime();
     r: region(L1, normal) <- alloc_region(normal);
-    cell: ref(L1, normal, int64) <- alloc_ref(r, 42);
+    cell: ref(L1, normal, int64) <- alloc_ref(r, 42)
 produces
     pure cell
 end
@@ -715,13 +722,14 @@ fn log(msg: string, state: int64) -> (:no_reply, int64) {
 }
 ```
 
-One behavior is one convention. The compiler tracks call-only versus cast-only on each `actor_ref`. `call` on a cast-only ref is a type error. You do not write a union of `(:reply, …)` and `(:no_reply, …)` and hope.
+One behavior is one convention. The compiler tracks call-only versus cast-only on each `actor_ref`, through variables, parameters, results, tuple and record fields, list elements, state and message fields. A cast (`cast`, `cast_registered`) that reaches a call-only actor is error E2237; a call (`call`, `call_registered`) that reaches a cast-only actor is E2238. Where the compiler cannot follow the reference (one returned by `whereis`, a `child` field of a `call_supervisor` reply, a reference in an exit report) the runtime checks the recorded convention before it enqueues anything, and on a mismatch nothing is sent and the sender fails with `:language_error` (in `main`: `language_error` on stderr and exit status 1). You do not write a union of `(:reply, …)` and `(:no_reply, …)` and hope.
 
 Spawning the counter and calling it once:
 
 ```silica
 fn main() -> int64 {
     sequence proc[concurrency]
+        _: atom <- register_failure_reporter(spawn(0, reporter, stack_policy(0, :keep_last_message)));
         a: actor_ref <- spawn(0, counter, stack_policy(0, :keep_last_message));
         n: int64 <- call(a, 3 impl ActorMessage {})
     produces
@@ -729,6 +737,8 @@ fn main() -> int64 {
     end
 }
 ```
+
+The first line registers a FailureReporter, the cast-only actor that receives every failure report; `reporter` is the behaviour shown in "Keep `main` small" below. `main` must register one before it starts any actor or supervisor (spec §15.4.13.4), or the compiler rejects the first start with E2236. The reporter's own `spawn`, written as `register_failure_reporter`'s argument (or bound to a name the same function then registers), is the one start allowed before registration.
 
 `spawn(0, counter, stack_policy(0, :keep_last_message))` starts an actor whose state is `0`. Every spawn form takes a stack policy (spec §15.1.2.2): the reservation in bytes (`0` takes the default, the machine's memory plus swap) and a release algorithm (`:keep_last_message` keeps what the last message used). `call` sends `3` and waits for the reply. Messages need `ActorMessage`, usually written `expr impl ActorMessage {}` at the send site.
 
@@ -739,13 +749,15 @@ The runtime model is Erlang `gen_server`, not a user-level receive loop:
 3. You return `(:reply, Reply, State)` or `(:no_reply, State)`.
 4. The runtime stores the new state and waits for the next message.
 
-`call` blocks for `Reply`. `cast` does not. A dead target raises `actor_not_found`. If the target dies with outstanding `call`s, those callers get the actor-death result. A restarted actor does not inherit the failed actor’s mailbox.
+`call` blocks for `Reply`. `cast` does not. A call (or cast) to an actor that has ended raises `actor_not_found` in the sender: a supervised sender fails and is restarted, and `main` ends the program. If the target dies with outstanding `call`s, those callers get the same result. A restarted actor does not inherit the failed actor’s mailbox.
+
+Every actor has a 64-bit **identity**, fixed for its life and never reused: the high 32 bits are the position of the spawner that numbered it (`main` is position 0, root supervisors take 1, 2, … in start order) and the low 32 bits are the number that spawner gave it, counting up from 0. `actor_id(ref)` returns it as a `uint64`. It is conventionally printed as `<position.child>`, and the failure banner prints it as one decimal number (`4294967296` is `<1.0>`). `==`, `!=`, `<`, `<=`, `>` and `>=` compare references by identity, as the pair (position, child number). A restarted child gets the spawner’s next number, so it is a new actor: its reference never equals the old one, and compares greater. A reference to an ended actor never equals a live one. A name is only a lookup; it follows a restarted child to its new identity (trial `supervisors_addition/identity_restart`).
 
 Supervisors are a different handle (`supervisor_ref`). You maintain them with `call_supervisor`, not ordinary `call` / `cast`. See the [supervisors tutorial](https://github.com/yenrab/silica/blob/main/compiler/tutorials_and_howtos/supervisors_and_failure_reporter_tutorial.md).
 
 ### Keep `main` small
 
-Well designed Silica applications have a very small `main` function consisting of a sequence that includes the launch of a supervisor and any initialization calls needed. The last line in `main`'s sequence is almost always `wait_for_exit()`.
+Well designed Silica applications have a very small `main` function consisting of a sequence that registers a FailureReporter, launches a supervisor and makes any initialization calls needed. The last line in `main`'s sequence is almost always `wait_for_exit()`.
 
 That is an architectural rule, not a style preference, and the reason is in the runtime model. `main` is not an actor (spec §15.1.2.2, "The main Function"). It runs on the platform's ordinary program stack, with no growth and no release, and nothing supervises it.
 
@@ -833,11 +845,40 @@ fn init(initial_state: int64) -> (
 }
 ```
 
-`main` launches the supervisor, sends one initialization message, and waits:
+Before it starts anything, `main` registers a FailureReporter (spec §15.4.13.4). Every failure report goes to it, the root supervisor's own included; once a reporter is registered the runtime hands it each report instead of writing the report to stderr itself. `main` keeps a small stack and only waits, so the reporter is where a failed root supervisor ends the program. The compiler checks the order: a start that can run before `register_failure_reporter`, in `main` or in any function `main` calls, is error E2236. The reporter is an ordinary cast-only actor: its behaviour returns `(:no_reply, state)`, and the runtime casts it each formatted report (a call-only reporter would be sent nothing, and the report would fall back to stderr). This reporter writes each report to stderr and ends the program with status 70, the fault status, when the report is the root supervisor's (it has no supervisor, and its frame `#0` is the runtime's `<unknown behavior>`):
+
+```silica
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+```
+
+`region_dump_limit` is part of the `FailureReporter` contract: registration calls it once, and `0` turns region dumps off.
+
+`main` registers the reporter, launches the supervisor, sends one initialization message, and waits:
 
 ```silica
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref);
         _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message));
         _: boolean <- cast_registered(:log, "service started" impl ActorMessage {});
         _: int64 <- wait_for_exit()
@@ -847,7 +888,20 @@ fn main() -> int64 {
 }
 ```
 
-Compiled with the standard-library `Supervisor.silica`, it prints `1: service started` and keeps running until standard input delivers `exit`. `init` is the supervisor's child table; everything after `main`'s first line is initialization and waiting.
+Compiled with the standard-library `Supervisor.silica`, it prints `1: service started` and keeps running until standard input delivers `exit`. `init` is the supervisor's child table; everything after the supervisor's start is initialization and waiting.
+
+### Ending the program, and ending a supervisor
+
+`wait_for_exit()` returns when it is told to, and `main` then returns and the program ends (running dispatches are abandoned, mailboxes are discarded). It is told to in two ways:
+
+- A line that reads exactly `exit` on standard input is recorded as `cast_exit(0)`, so it makes `wait_for_exit()` return 0 (and a later `cast_exit` returns `false`). Any other line is ignored. If standard input reaches its end, the wait goes on: the end of input does not end it. (Sent immediately, an `exit` line can end the program before the actors have printed anything; the first example in `docs/examples/first_program/` prints nothing if `exit` is piped to it at once.)
+- An actor calls `cast_exit(value: int64) -> boolean`, and `wait_for_exit()` returns `value`. The first request wins: `cast_exit` returns `true` when it recorded the request and `false` when an earlier one had already been recorded. It does not wait, so nothing after it in the same dispatch is guaranteed to run; an actor that needs another actor's work finished first uses `call` for that work and issues `cast_exit` after the reply. A batch program (a compiler, a converter) ends itself this way; a server runs until it is stopped from outside.
+
+The FailureReporter above is the usual caller: the report of the root supervisor means nothing is supervising the program any more, so by convention the reporter calls `cast_exit(70)`, the fault status (§15.4.5.5, §15.4.13.4).
+
+A supervisor that ends takes its children with it. It stops them one at a time, last row of its child table first, waiting for each (a child supervisor stops its own children first), then it goes. A child whose `shutdown` is `0` is killed at once, with reason tag 1; a child with `shutdown` above `0` is allowed to finish the message it is handling and ends with `(:explicit, :shutdown)`, reason tag 4. The time limit that a positive `shutdown` names is not enforced yet: nothing preempts a running message. Each stopped child produces a failure report like any other death, and its registered names are freed. A `:temporary` child’s row is removed when it ends; `:permanent` and `:transient` rows stay (trial `supervisors_addition/child_shut_down_with_supervisor`).
+
+A supervisor answers questions about its table through `call_supervisor(sup, { op: :get_child, id: :log } impl SupervisorMessage {})`: the reply is the child that has that id (its `child` reference and a `child_info` record), not the first live child. The trial `supervisors_addition/supervisor_get_child_by_id` shows the reply type.
 
 The other `main` functions in this book are deliberately not in this shape. The one in §2, the tree-node `main` in §6, the `math@add(2, 3)` in §8 and the `spawn` / `call` above each isolate one construct, and a bare `main` is the shortest place to show it. An application's `main` looks like the one here.
 
@@ -857,9 +911,9 @@ The preferred request/response shape between actors is asynchronous: the request
 
 What `call` costs, per the spec:
 
-- **The caller is suspended for the whole round trip.** `call` blocks until the target returns `(:reply, …)`, and it has no timeout: the caller stays blocked until the target replies or ends (§16.1.1). `call_with_timeout` bounds the wait; on `:timeout` the request is not withdrawn, and the late reply is discarded (§16.1.1.2).
+- **The caller is suspended for the whole round trip.** `call` blocks until the target returns `(:reply, …)`, and it has no timeout: the caller stays blocked until the target replies or ends (§16.1.1). `call_with_timeout` (§16.1.1.2) is the specified way to bound the wait, but it is not implemented yet: no caller can stop waiting for a reply today.
 - **Its mailbox is not served meanwhile.** A behaviour runs one message per turn, and the suspended call is inside that turn, so every message queued for the caller waits as well. A caller's latency and throughput are therefore bound by its slowest callee.
-- **Waiting can deadlock.** `call(self(), …)` is a compile error because the reply could never come (§16.2.6.5). The compiler cannot see a cycle through other actors, and with no timeout, actors that `call` each other in a cycle wait until one of them ends.
+- **Waiting can deadlock.** `call(self(), …)` can never be answered, and the specification makes it a compile error (§16.2.6.5); the compiler rejects it with E2240. The compiler cannot see a cycle through other actors either, and with no timeout, actors that `call` each other in a cycle wait until one of them ends.
 - **The callee can die.** If the target is dead, or ends before replying, `call` raises `actor_not_found` in the caller (§16.1.1).
 
 What `cast` gives instead: it returns immediately after enqueueing (§16.1.2), and mailboxes are unbounded, so a cast never blocks on capacity (§18.4.1). The answer arrives as an ordinary message that the requester's behaviour handles in its own turn, between whatever else it is doing. Two consequences follow:
@@ -867,7 +921,7 @@ What `cast` gives instead: it returns immediately after enqueueing (§16.1.2), a
 - **The requester's one message type carries both its requests' triggers and the answers**, so the behaviour dispatches on the message. Replies must be matched to requests. Include a request id, or the requester's registered name, in the request, and have the responder echo it in the answer.
 - **Nothing slows a fast sender.** Unbounded mailboxes mean there is no built-in backpressure. The spec lists `call` as one way to slow a producer, beside explicit acknowledgements and bounded application queues (§16.2.8).
 
-`call` is still right when the next step genuinely cannot proceed without the answer, and for simple request/response at the edges of a system: a `main` or a test that needs one value, or a producer that must be throttled. BEAM programmers will recognise `gen_server:cast` and `gen_server:call`. One difference: `gen_server:call` has a default timeout of 5000 ms, while Silica's `call` waits indefinitely unless you use `call_with_timeout`.
+`call` is still right when the next step genuinely cannot proceed without the answer, and for simple request/response at the edges of a system: a `main` or a test that needs one value, or a producer that must be throttled. BEAM programmers will recognise `gen_server:cast` and `gen_server:call`. One difference: `gen_server:call` has a default timeout of 5000 ms, while Silica's `call` waits indefinitely (`call_with_timeout` is specified but not implemented yet).
 
 An example with two supervised actors. The client asks a translator for words. Each reply echoes the word it answers, which is how the client matches replies to requests. Both actors live in `main.silica`, and their supervisor's `init` lists them with the behaviour type `fn(msg: string, state: int64) -> (:no_reply, int64)`, in the same shape as the logger's.
 
@@ -925,11 +979,13 @@ fn spanish(word: string) -> string {
 }
 ```
 
-`main` starts the supervisor, sends two initialization messages, and waits:
+`main` registers the reporter (the one above), starts the supervisor, sends two initialization messages, and waits:
 
 ```silica
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref);
         _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message));
         _: boolean <- cast_registered(:client, "hello" impl ActorMessage {});
         _: boolean <- cast_registered(:client, "thanks" impl ActorMessage {});
@@ -949,7 +1005,7 @@ reply hello = hola
 reply thanks = gracias
 ```
 
-Both requests are in flight before either answer is handled; the client never blocks. The replies here are string literals because today's compiler has a defect: a record message cast from one actor to another can arrive corrupted. The general form carries a record such as `{ kind: atom, reply_to: atom, id: int64, value: int64 }` and replies with `cast_registered(msg.reply_to, …)`.
+Both requests are in flight before either answer is handled; the client never blocks. The replies here are string literals to keep the example short. The general form carries a record such as `{ kind: atom, reply_to: atom, id: int64, value: int64 }` and replies with `cast_registered(msg.reply_to, …)`; a record message cast between actors arrives intact (trial `supervisors_addition/record_message_cast_between_actors`).
 
 `spawn` has variants for pinning, registration, device workers, and FFI workers. Migration strategy (`lazy`, `eager_copy`, `static_core`) is about how much stack one message uses and how often the actor moves, not about “how long the actor lives.” [Spawning tutorial](https://github.com/yenrab/silica/blob/main/compiler/tutorials_and_howtos/actor_spawning_tutorial.md).
 
@@ -983,13 +1039,16 @@ Silica would rather stop you than “optimize away” a mistake or wait for a te
 - **Duplicate work** — the same computation written twice when once would do.
 - **Redundant arithmetic** — additions of zero, multiplications by one, and similar noise.
 - **Loop-invariant mistakes** — the recursive equivalent of “this does not change in the loop.”
-- **Missing effects** — a print, allocate, or send without the matching `proc[…]`.
+- **Missing effects** — a print, allocate, or send without the matching `proc[…]`; and the reverse, an effect a sequence declares that none of its own steps needs (E3010).
+- **A start before the FailureReporter** — in `main`, or in any function `main` calls, an actor or supervisor that can start before `register_failure_reporter` runs (E2236). The reporter’s own `spawn` is the one start allowed first.
 - **Non-exhaustive** `case` — a value that no arm covers.
 - **Untyped** `_` — a catch-all that does not name the leftover type.
 - `if` **used as a statement** — use `case`.
 - **Nested** `fn` **declarations** — helpers go at the top level, or use a lambda.
 - **More than eight parameters** — group them.
-- `call` **/** `cast` **convention mismatch** — a call-only ref used as cast-only, or the reverse.
+- `call` **/** `cast` **convention mismatch** — a cast that reaches a call-only actor (E2237), or a call that reaches a cast-only one (E2238).
+- **Function literals without `-> type`** (E1071), and nothing is inferred in their place.
+- **Function literals that capture anything but an integer-literal binding** (E1072): pass the value as an argument instead.
 - **Region, lifetime, or isolation violations** — a `ref` returned without its region, a ref that outlives its region, a handle used after a move.
 - `dangerous_` **taint that was not declared** — a foreign dependency that did not walk up the module graph.
 
@@ -997,7 +1056,24 @@ Diagnostics carry a code (`E2000`, …), a location, and a spec section. Read th
 
 Programs the compiler is supposed to refuse: `[error_enforcement_addition](https://github.com/yenrab/silica/tree/main/trials/error_enforcement_addition)`, `[warning_enforcement_addition](https://github.com/yenrab/silica/tree/main/trials/warning_enforcement_addition)`.
 
-## 15. Next
+## 15. Running on the ESP32-S3 board
+
+The same programs run on an ESP32-S3 board with no operating system, compiled by the cross compiler `binaries/silica-compiler-ESP32-S3_raw`. The board pack lives in `compiler/src/emitter/ESP32-S3_raw/board/`; its README describes the console protocol, the stack budget and every tool. The sample apps are under `board/apps/`: `silica_00_return42` through `silica_22_device_buzzer` (arithmetic, strings, lists, regions, floats, the stdlib `wbt_map`, and device drivers written in Silica for the UART, GPIO, the ST7789 display, the 24-LED row, the buzzer and the buttons), plus the `asm_*` bring-up programs in assembly. Most `silica_16` and later apps drive LEDs, the display or the buzzer, so run them while watching the board.
+
+One command builds an app in a temporary directory, loads it into the board’s RAM (nothing is written to flash unless you pass `--flash`) and compares the console output with the app’s `expected.scout`:
+
+```sh
+B=compiler/src/emitter/ESP32-S3_raw/board
+$B/tools/run_app.sh silica_04_print
+$B/tools/run_app.sh --build-only silica_14_wbt_map        # image only, the board is not touched
+$B/tools/run_app.sh --send 'exit\n' --send-delay 65 --timeout 120 silica_20_device_buttons_led
+```
+
+It needs the Xtensa toolchain and the ESP-IDF Python environment (esptool, pyserial) from [Required software]({{ '/required-software/' | relative_url }}); `BOARD_PYTHON`, `XTENSA_BIN`, `ESPTOOL` and `BOARD_PORT` point it elsewhere, and `SILICA_COMPILER` names the cross compiler. `run_app.sh --help` lists every option and exit status. Programs follow the same small-`main` shape as on the hosts: the board has one console, so the FailureReporter’s report appears in the program output, `exit` typed (or `--send`) on the console ends a waiting `main`, and a fault ends the program with status 70 and a runtime abort with 71.
+
+Actors run on both LX7 cores, one cooperative scheduler per core, and an actor’s stack is a chain of heap chunks that grows on demand. The design target is 1,000 actors and supervisors on the board, against millions on a hosted machine ([actor memory budget plan](https://github.com/yenrab/silica/blob/main/compiler/design_documents/actor_memory_budget_plan.md)); [the port status](https://github.com/yenrab/silica/blob/main/compiler/design_documents/ports/esp32s3_port_status.md) lists what is verified on the board and where it differs from the hosts.
+
+## 16. Next
 
 Read the trials when you want a small program in hand. Read the specification when you want the rule. The tutorials are the middle ground for actors, regions, and FFI.
 

@@ -1,5 +1,9 @@
 # Plan: resolving HIGH_PRIORITY compiler defects and diagnostic gaps (2026-09-08 + 09-09 addendum)
 
+## Implementation status (2026-10-16)
+
+Executed. Phase 0 (validation trials) is done: the `train_defect_*` trials are installed in the real suites. Phases 1 (A1, A4, A7, A8), 2 (A5), 4 (A3, A9, A10), 5 (A6) and 6 (B1-B14) are done and each item is pinned by an installed trial whose behaviour or error golden matches the last run. Phase 3 is done only as 3a: the diagnostic E1067 (a function literal that captures local bindings cannot be returned from the function that owns them) is in place; 3b (closure environments, a two-word fn value) is NOT implemented and still needs the design decision. The message-text cleanups at the end of Phase 6 were not re-checked and are still open. Per-item table: [HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md](./HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md); what was found while executing: [compiler_defects_execution_status_2026-09-10.md](./compiler_defects_execution_status_2026-09-10.md). The plan below is kept as written; its tree names are historical (`src_selfhost` is now `compiler/src`, the Rust-free tree; there is no separate seed source tree).
+
 Scope: the 8 silent miscompilations (A1-A8), the 14 diagnostic gaps (B1-B14), the four misleading
 diagnostics, plus two related defects recorded in memory since the document was written
 (record message + List state in behaviours; a `call` whose message is a call expression).

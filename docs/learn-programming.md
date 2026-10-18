@@ -34,7 +34,7 @@ That is the one idea this book starts from: a program is a group of small worker
 
 Read in order. Each chapter uses only ideas already introduced.
 
-You do not have to run every example on a computer to learn from this book. Reading the code and predicting what it means is real practice. When you are ready to run programs, the [project page](https://github.com/yenrab/silica#building-the-compiler) explains how to build the Silica compiler.
+You do not have to run every example on a computer to learn from this book. Reading the code and predicting what it means is real practice. When you are ready to run programs, the [Build and test]({{ '/build-and-test/' | relative_url }}) page explains how to use the Silica compiler that comes with the repository, or build your own.
 
 A few habits will help:
 
@@ -112,11 +112,34 @@ fn init(initial_state: int64) -> (
 
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref);
         _: supervisor_ref <- spawn_registered_supervisor(AdderSupervisor, 0, :adder_supervisor, stack_policy(0, :keep_last_message));  // the elephant mother arrives, ready to have her calf
         _: boolean <- cast_registered(:adder, (2, 3) impl ActorMessage {});  // something in the world nudges the calf: "here are two numbers"
         _: int64 <- wait_for_exit()
     produces
         pure 0
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
     end
 }
 ```
@@ -156,6 +179,8 @@ Now read the five commented lines again, in the order things happen.
 
 The last line of `main`, `wait_for_exit()`, keeps the program alive so the calf has time to work and print. Without it, `main` would finish before the message was ever read.
 
+The first two lines of `main` are scaffolding too. Before anything else is started, they start one more actor, the `reporter`, which hears about every failure in the program and writes it out; the functions after `main` are its behaviour. Silica insists on that order: a program that starts an actor before its reporter does not compile. If the supervisor herself ever fails, there is no one left to watch over the program, so the reporter ends it with the exit status `70` (Chapter 18).
+
 That is the whole shape of every program in this book: a supervisor gives birth to actors, messages arrive from the world, the actors do their work, and the supervisor watches.
 
 These two files, with a short README, live in the Silica repository at `docs/examples/first_program/`. If you want to run them, ask your LLM to help you compile the two files together with the standard-library file `Supervisor.silica` — the `use Supervisor;` line at the top of `main.silica` asks for it.
@@ -182,7 +207,7 @@ The computer cannot run the text of a Silica file directly. A program called a *
 
 Silica's motto is: *secure by default at compile time — fail soft, never fail silent.* In beginner terms: the compiler tries to catch problems before they become surprises, and when a running actor does fail, its supervisor is there — the failure is noticed and handled, never hidden.
 
-**How the rest of this book shows programs.** The supervisor's `init` function in Chapter 3 is long, and it is almost the same in every program. From now on, examples show the actor's behaviour and the lines of `main` that change. The supervisor is the one from Chapter 3 with three things swapped: the child's `id`, the child's `behavior`, and the behaviour's type, which is written in two places inside `init` (both say `behavior: fn(msg: ..., state: ...) -> ...`). When a program needs something else changed, the chapter says so.
+**How the rest of this book shows programs.** The supervisor's `init` function in Chapter 3 is long, and it is almost the same in every program. From now on, examples show the actor's behaviour and the lines of `main` that change. The supervisor is the one from Chapter 3 with three things swapped: the child's `id`, the child's `behavior`, and the behaviour's type, which is written in two places inside `init` (both say `behavior: fn(msg: ..., state: ...) -> ...`). The reporter and its two lines at the top of `main` stay exactly as in Chapter 3. When a program needs something else changed, the chapter says so.
 
 The behaviour itself goes in `main.silica` too, next to `init`, and `init` names it without a file name in front: `behavior: greeter` rather than `behavior: adder@add_and_print`. Chapter 19 shows how to give a calf a file of its own, the way `adder.silica` is.
 
@@ -283,7 +308,7 @@ With the message `(2, 3)` this calf prints `10`. `total` is still `5`. `doubled`
 
 Why so strict? Because a name that never changes is a name you can trust. If `total` is `5` on one line, it is still `5` ten lines later. That makes programs easier to read and easier for the compiler to check. It also matches the way actors work: each message is handled from a clean start, with its own names.
 
-The name `_` is special. It means "I have to bind this, but I do not need it." The first program wrote `_: atom <- print_int64(total)` because printing gives back a small value nobody wants.
+The name `_` is special. It means "I have to bind this, but I do not need it." The first program wrote `_: atom <- print_int64(total)` because printing gives back a small value, the atom `:ok`, that nobody wants.
 
 Names are chosen by whoever writes the program; when your LLM writes it, ask for good ones. Good names read like English: `total`, `left`, `guest_count`. Silica uses **snake_case**: words in lowercase, separated by underscores.
 
@@ -539,14 +564,14 @@ So far, most of an actor's work has been computing a value. Real actors also pri
 Silica makes effects visible. You declare them on the sequence that performs them.
 
 - `device_io` — this sequence may print or use files. The calf prints, so its sequence says `device_io`.
-- `concurrency` — this sequence may start actors or send messages. `main` in the first program starts a supervisor and sends a message, so it says `proc[concurrency, device_io]`.
+- `concurrency` — this sequence may start actors or send messages. `main` in the first program starts actors and sends a message, so it says `concurrency`. It also says `device_io`, because its last step, `wait_for_exit()`, listens to the keyboard for the word `exit`.
 - `mem(normal)` — this sequence may ask for ordinary memory to hold something new, such as a growing list (Chapter 15). The supervisor's `init` builds its list of children, so it says `mem(normal)`.
 
-Why the ceremony? Because a function that only adds numbers and a function that writes a file are different kinds of thing. Silica will not let you hide a print inside an innocent-looking helper. If something prints, a sequence above it must admit `device_io`. If something sends a message, a sequence above it must admit `concurrency`.
+Why the ceremony? Because a function that only adds numbers and a function that writes a file are different kinds of thing. Silica will not let you print from inside a sequence that does not say so. The sequence that does the printing must admit `device_io`, and the sequence that sends a message must admit `concurrency`. Each sequence declares what its own steps do and nothing more: if a helper function prints, the helper has its own sequence with `device_io`, and whoever calls the helper does not repeat it. A sequence that lists an effect none of its own steps needs is refused too.
 
 That is not bureaucracy for its own sake. It is honesty. When you read a program six months later, the word `device_io` tells you: this part talks to the world. The word `concurrency` tells you: this part talks to other actors.
 
-`println` writes a line of text. `print_int64` writes a number without a line break, which is why the calf follows it with `println("")` to end the line. Silica also has `print_string`, which writes text without adding a new line. All of them need `device_io`.
+`println` writes a line of text. `print_int64` writes a number without a line break, which is why the calf follows it with `println("")` to end the line. Silica also has `print_string`, which writes text without adding a new line, `print_boolean`, which writes `true` or `false`, and `print_char`, which writes one character. All of them need `device_io`, and each gives back the atom `:ok`, which is why the examples bind it to `_` when the print is not the last step.
 
 ### Try this
 
@@ -584,7 +609,7 @@ Because it answers, `main` sends to it with `call_registered`, which waits for t
 
 With `initial_state: 0` in `init`, this prints `1` and then `5`. The first message adds `1` to `0`; the calf answers `1` and remembers `1`. The second adds `4`; the calf answers `5` and remembers `5`.
 
-This is the two kinds of friend from Chapter 1. `cast` is the note you leave and walk away from. `call` is the question you wait on. A behaviour picks one: `:no_reply` for calves that are cast to, `:reply` for calves that are called. The supervisor's `init` must promise the matching type: `fn(msg: int64, state: int64) -> (:reply, int64, int64)` for the counter.
+This is the two kinds of friend from Chapter 1. `cast` is the note you leave and walk away from. `call` is the question you wait on. A behaviour picks one: `:no_reply` for calves that are cast to, `:reply` for calves that are called. The supervisor's `init` must promise the matching type: `fn(msg: int64, state: int64) -> (:reply, int64, int64)` for the counter. The compiler holds everyone to the choice: a program that casts to a calf that answers, or calls a calf that never answers, does not compile.
 
 Notice what state gives you. Names inside a behaviour are fresh for every message (Chapter 6). State is the one thing that lasts. It is also private. No other actor can look at the counter's `state`; they can only send a message and read the answer. That privacy is why actors are easy to reason about: the only way in is the mailbox.
 
@@ -594,11 +619,11 @@ Of the two, leaving a note is the one to reach for first.
 
 Think about how you text. Few people send a text and then stare at the phone, doing nothing, until the answer arrives. You send it and get on with your day, and when the answer comes back it arrives as a new text, which you read when you get to it. Silica programs work best the same way. The asking calf casts its request and carries on with other work. When the other calf has the answer, it casts the answer back, as a new message of its own. Programmers call this **cast and cast back**. Chapter 14 shows two calves doing it.
 
-Now think of the friend who asks you something and then stands in your doorway until you answer. While they stand there, they cannot do anything else. Everything else they meant to do today waits too. A `call` is that friend. The actor that calls is stopped until the answer comes back, and Silica puts no time limit on a `call`: if the answer takes all day, the caller waits all day. If the calf it asked dies before answering, the caller gets no answer at all, only the news that the calf is gone.
+Now think of the friend who asks you something and then stands in your doorway until you answer. While they stand there, they cannot do anything else. Everything else they meant to do today waits too. A `call` is that friend. The actor that calls is stopped until the answer comes back, and Silica puts no time limit on a `call`: if the answer takes all day, the caller waits all day. If the calf it asked has ended, or dies before answering, the caller gets no answer at all, only the news that the calf is gone (Silica calls it `actor_not_found`).
 
 A `cast` is the note on the door. It returns at once. The message waits in the calf's mailbox, and both of you get on with your day. A mailbox has no size limit, so leaving a note never has to wait for room.
 
-Waiting can also go wrong in a way notes cannot. A calf that called itself would stand in its own doorway waiting for itself, forever, so Silica refuses to compile a calf that calls itself.
+Waiting can also go wrong in a way notes cannot. A calf that called itself would stand in its own doorway waiting for itself, forever. The language rules forbid it, and the compiler should one day refuse such a program; today it does not yet, so never write one.
 
 So use cast and cast back unless the sender truly cannot go on without the answer. That is when `call` is the right tool: the fallback, not the first choice. Here `main` uses `call` because the whole point is to print the counter's answers, and `main` cannot print an answer it has not been given.
 
@@ -993,6 +1018,8 @@ fn summer(msg: List[int64, mem(normal)], state: int64) -> (:no_reply, int64) {
 
 ```silica
     sequence proc[concurrency, device_io, mem(normal)]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref);
         _: supervisor_ref <- spawn_registered_supervisor(SumSupervisor, 0, :sum_supervisor, stack_policy(0, :keep_last_message));
         numbers: List[int64, mem(normal)] <- [1, 2, 3];
         _: boolean <- cast_registered(:summer, numbers impl ActorMessage {});
@@ -1223,37 +1250,44 @@ Some questions have no good numeric answer. What is ten divided by zero? What is
 
 A sloppy language might crash the whole program, or invent `0`, or keep running with a corrupt value. Silica does two better things. Inside a behaviour, you can **return the situation as data**. And when a calf does fail, its **mother is watching**.
 
-Start with the mother. A dividing calf:
+Start with the mother. A dividing calf that prints one hundred divided by the number it is sent:
 
 ```silica
-fn divider(msg: int64, state: int64) -> (:reply, int64, int64) {
-    (:reply, 100 / msg, state)
+fn divider(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        _: atom <- print_int64(100 / msg);
+        println("")
+    produces
+        pure (:no_reply, state)
+    end
 }
 ```
 
-`main` calls it with `0`, then with `5`. It uses `call` rather than `cast` for the reason in Chapter 11: it prints the answer, so it cannot go on without it.
+`main` sends it `5`, and then `0`:
 
 ```silica
-        _: int64 <- call_registered(:divider, 0 impl ActorMessage {});
-        answer: int64 <- call_registered(:divider, 5 impl ActorMessage {});
-        _: atom <- print_int64(answer);
-        println("")
+        _: boolean <- cast_registered(:divider, 5 impl ActorMessage {});
+        _: boolean <- cast_registered(:divider, 0 impl ActorMessage {});
+        _: int64 <- wait_for_exit()
 ```
 
-Dividing by zero is not something a calf can do. The first call makes the calf fail. When you run the program you see the runtime report it:
+The first message prints `20`. Dividing by zero is not something a calf can do, so the second message makes the calf fail. When you run the program you see the runtime report it:
 
 ```
 === Silica Actor Failure ===
-actor_id:        0x10362f470
-...
+actor_id:        4294967296
+agent_type_atom: 24
+reason_tag:      1
+supervisor_acb:  0x104a4ef20
 call_stack:
   #0  main_divider
   #1  _actor_thread_main
 === End Silica Actor Failure ===
-20
 ```
 
-The numbers that start with `0x` are places inside the computer's memory. They change every time you run the program, and they are there for the people who build Silica; you can skip them. Read the last line. After the failure report, the program prints `20`. The calf died, the supervisor noticed, and because the child's `restart` field in `init` says `:permanent`, she started a new calf with the same name and the same `initial_state`. The second call reached the new calf, and `100 / 5` is `20`. The rest of the program did not fall over. That is the elephant mother doing exactly what Chapter 1 promised: the child made a mistake, and she helped it get going again.
+The report is written by the reporter you met in Chapter 3. The `actor_id` is the failed calf's identity: a number that belongs to that one actor for as long as it lives, and to no other actor, ever. The other numbers are for the people who build Silica; you can skip them, and they change every time you run the program. Read the last thing that happened: the program is still running. The calf died, the supervisor noticed, and because the child's `restart` field in `init` says `:permanent`, she started a new calf with the same name and the same `initial_state`. A message sent to `:divider` now reaches the new calf, not the dead one. The rest of the program did not fall over. That is the elephant mother doing exactly what Chapter 1 promised: the child made a mistake, and she helped it get going again. (Type `exit` to end the program.)
+
+The `0` was cast and not called, on purpose. The dying calf never sent an answer, and a `call` to a calf that ends before it answers does not wait forever: it stops the *caller* with the news that the calf is gone. If `main` had used `call_registered(:divider, 0 ...)`, `main` would have been the one to fail, and `main` has no mother (see below). Another calf that makes such a call is a different matter: it has a mother, who starts it again.
 
 The numbers in `init`'s `flags` set her patience: `allowed_restart_count: 3, restarts_time_frame: 5` means "if a child fails more than three times in five seconds, something is really wrong; stop restarting and report upward."
 
@@ -1336,7 +1370,7 @@ The rest of those lines is addresses for the people who build Silica. The same m
 ### Try this
 
 1. What does `safe_divide(10, 0)` return? What does `safe_divide(10, 2)` return?
-2. If `restart` in `init` said `:temporary` instead of `:permanent`, would the second call in the `divider` program still reach a calf?
+2. If `restart` in `init` said `:temporary` instead of `:permanent`, would a message sent to the `divider` after the failure still reach a calf?
 
 Answers: (1) `(:error, 0)` and `(:ok, 5)`. (2) No. `:temporary` means "never restart"; there would be no calf to reach.
 
@@ -1471,6 +1505,10 @@ The `strategy` in `init`'s `flags` says how the mother reacts when one calf amon
 - `:one_for_all` — restart all of them, because they depend on each other.
 - `:rest_for_one` — restart the one that failed and every calf listed after it.
 
+Every actor has an **identity**, a number made from its mother's position and its own birth number, so no two actors are ever the same one; you saw one in the failure report in Chapter 18. A calf that is started again after a failure is a new actor with a new identity, even though it has the old calf's name.
+
+A mother does not leave her children behind. When she ends, whether her own mother stopped her or she failed too many times, she first sends her children home one at a time, the one listed last first, and waits for each to finish before she goes.
+
 That is the whole of concurrency in this book. Isolation first. Separate workers, private memory, notes instead of shared drawers, and a mother watching every one of them. That is how Silica keeps programs with many workers understandable.
 
 The longer story — supervisors inside supervisors, `call` versus `cast` in detail, pinning work to a core — is in [Silica for Programmers]({{ '/learn-silica/' | relative_url }}) and in the [actor spawning tutorial](https://github.com/yenrab/silica/blob/main/compiler/tutorials_and_howtos/actor_spawning_tutorial.md).
@@ -1548,7 +1586,7 @@ When you want the rules in full, read the [language specification](https://githu
 
 When you want hands-on topics — actors, regions, foreign functions, project makefiles, and keeping what goes into and out of functions small — start from the [tutorials](https://github.com/yenrab/silica/tree/main/compiler/tutorials_and_howtos).
 
-When you want to run programs, [build the compiler]({{ '/build-and-test/' | relative_url }}).
+When you want to run programs, [build the compiler]({{ '/build-and-test/' | relative_url }}), or use the compiler that comes with the repository: that page also shows how. Programs written in Silica run on a small ESP32-S3 board as well as on a laptop; the same page and the [required software]({{ '/required-software/' | relative_url }}) page say what the board needs.
 
 Programming is a craft. The first programs will feel stiff. That is expected. Write small behaviours. Let the compiler talk. Let the supervisor watch. Change one thing at a time. The machine is literal. You can learn to be literal too.
 

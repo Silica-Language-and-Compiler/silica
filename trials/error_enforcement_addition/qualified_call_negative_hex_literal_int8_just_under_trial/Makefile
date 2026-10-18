@@ -41,7 +41,7 @@ silica.config:
 	@printf '%s\n' \
 		main_negative_hex_literal_int8_just_under.silica \
 		LiteralLib.silica \
-		> "$(THIS_DIR)silica.config"
+		> "$(THIS_DIR)silica.config" && cd "$(THIS_DIR)" && $(TRIAL_SUPPORT_CONFIG)
 
 help:
 	@echo "qualified_call_negative_hex_literal_int8_just_under_trial (multi-file error enforcement)"

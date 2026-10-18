@@ -30,12 +30,6 @@ Explains **why Silica avoids classic named recursive type definitions**, what pr
 
 ---
 
-## [do_end_tutorial.md](./do_end_tutorial.md)
-
-Tutorial for **`do ... end` blocks**: how they relate to function bodies `{ }`, when to use a block in **expression position**, readability, effects, and examples. (The language also documents newer **`sequence`** block spelling—see [silica_sequence_blocks_tutorial_updated.md](../design_documents/silica_sequence_blocks_tutorial_updated.md) in design documents.)
-
----
-
 ## [memory_region_types.md](./memory_region_types.md)
 
 **Memory spaces** for regions (`normal`, write-through, non-cacheable, `atomic`, `device`): cache behavior, visibility, and how they connect to **`alloc_region`**, **`List[T, S]`**, and **`sequence proc[mem(S)]`** with pointers to list design and trials.

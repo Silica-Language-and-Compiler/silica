@@ -110,7 +110,8 @@ $(SILICA_COMPILER):
 	@$(ENSURE_SILICA_COMPILER)
 
 # Multi-unit batches use process-per-unit hygiene: the seed exits 75 (EX_TEMPFAIL)
-# between units so the OS reclaims host heap. Recipes must re-invoke until exit 0
+# between units so the OS reclaims host heap (76 = crashed in a unit; the next process reports it
+# and skips it; treated like 75). Recipes must re-invoke until exit 0
 # (or a hard failure). Usage inside a recipe (same cwd as silica.config):
 #   $(RUN_SILICA_COMPILER)
 # Optional override of the binary path:
@@ -126,11 +127,12 @@ $(SILICA_COMPILER):
 # for the slow machine, not a fix for the underlying slowness; lower it again once that's fixed.
 SILICA_COMPILE_TIMEOUT ?= 900
 define RUN_SILICA_COMPILER_WITH
+	rm -f silica.compile.inprogress silica.compile.crashed; \
 	while true; do \
 		perl -e 'alarm shift @ARGV; exec @ARGV' $(SILICA_COMPILE_TIMEOUT) $(1); \
 		ec=$$?; \
 		if [ $$ec -eq 0 ]; then break; fi; \
-		if [ $$ec -eq 75 ]; then \
+		if [ $$ec -eq 75 ] || [ $$ec -eq 76 ]; then \
 			echo "  (reclaiming memory; continuing next unit)"; \
 			continue; \
 		fi; \
@@ -145,11 +147,12 @@ endef
 # redirect into `.cur_fail` often run in the make shell (not a subshell), and `exit`
 # would abort the recipe before the diff step. Callers use `|| true` around the loop.
 define RUN_SILICA_COMPILER_QUIET_WITH
+	rm -f silica.compile.inprogress silica.compile.crashed; \
 	while true; do \
 		perl -e 'alarm shift @ARGV; exec @ARGV' $(SILICA_COMPILE_TIMEOUT) $(1); \
 		ec=$$?; \
 		if [ $$ec -eq 0 ]; then break; fi; \
-		if [ $$ec -eq 75 ]; then continue; fi; \
+		if [ $$ec -eq 75 ] || [ $$ec -eq 76 ]; then continue; fi; \
 		break; \
 	done
 endef
@@ -161,6 +164,47 @@ endef
 define RUN_SILICA_COMPILER_QUIET
 	$(call RUN_SILICA_COMPILER_QUIET_WITH,"$(SILICA_COMPILER)")
 endef
+
+# ---- supervisor-actor shaped trials (actor_memory_budget_plan.md item M) ----
+# A trial's main starts a supervisor, casts its work (a function literal) to the supervisor's one
+# worker and waits in wait_for_exit. The supervisor and worker live in the shared trial-support
+# modules trials/lib_trial_support/trial_{support,call,wait}_<type>.silica (written by
+# programmer_tools/trial_shape_m/gen_support.py), which use the Supervisor trait. Each suite compiles
+# the modules its trials `use`, plus Supervisor (unless its config already lists the stdlib trait),
+# through private symlinks in <suite>/.trial_stdlib/,
+# so their .sams/.iface land in the suite and the suite's own `*.sams` loops never see them.
+#   silica.config rule (in the directory holding silica.config, after writing it):
+#       ... > silica.config && $(TRIAL_SUPPORT_CONFIG)
+#   before linking:            $(TRIAL_SUPPORT_ASSEMBLE);
+#   per trial, in the link line: $(call TRIAL_SUPPORT_OBJ,<trial .silica>)
+TRIAL_STDLIB_SUPERVISOR := $(abspath $(_SILICA_COMPILER_MK_DIR)../compiler/stdlib/Supervisor.silica)
+TRIAL_SUPPORT_DIR := $(abspath $(_SILICA_COMPILER_MK_DIR)lib_trial_support)
+# The links these helpers make inside the tree are relative to the directory holding the link,
+# so a tree synced to another host (nix, pix) keeps working
+# links; an absolute link carried /Volumes/2T/... there. $(TRIAL_REL_FN) defines the shell function
+# _trial_rel <target> <existing link directory>, which prints the target relative to the link
+# directory. Both sides are resolved physically (pwd -P): the kernel resolves a relative link from
+# the directory the link really lives in.
+TRIAL_REL_FN = _trial_rel() { _t="$$(CDPATH= cd "$${1%/*}" && pwd -P)/$${1\#\#*/}"; _f="$$(CDPATH= cd "$$2" && pwd -P)"; _u=""; while :; do case "$$_t/" in "$$_f"/*) break;; esac; _f="$${_f%/*}"; _u="../$$_u"; done; printf '%s%s\n' "$$_u" "$${_t\#"$$_f"/}"; }
+TRIAL_SUPPORT_CONFIG = { $(TRIAL_REL_FN); rm -rf .trial_stdlib && mods=$$(grep -rhoE --include='*.silica' '^use trial_(support|call|wait)_[a-z0-9_]+;' . 2>/dev/null | sed 's/^use //;s/;$$//' | LC_ALL=C sort -u) && if [ -n "$$mods" ]; then mkdir .trial_stdlib && { grep -q 'Supervisor\.silica$$' silica.config || { ln -sfn "$$(_trial_rel "$(TRIAL_STDLIB_SUPERVISOR)" .trial_stdlib)" .trial_stdlib/Supervisor.silica && echo .trial_stdlib/Supervisor.silica >> silica.config; }; } && for mod in $$mods; do ln -sfn "$$(_trial_rel "$(TRIAL_SUPPORT_DIR)/$$mod.silica" .trial_stdlib)" ".trial_stdlib/$$mod.silica" && echo ".trial_stdlib/$$mod.silica" >> silica.config || exit 1; done; fi; }
+# A harness that compiles and links everything in a lib/ directory (ordered_data_structures/leaf.mk)
+# gets the modules as lib/ links instead (gitignored): run before the lib/ listing is taken.
+TRIAL_SUPPORT_LIB = { $(TRIAL_REL_FN); mods=$$(grep -hoE '^use trial_(support|call|wait)_[a-z0-9_]+;' *.silica 2>/dev/null | sed 's/^use //;s/;$$//' | LC_ALL=C sort -u); rm -f lib/trial_support_*.silica lib/trial_wait_*.silica lib/trial_call_*.silica; [ ! -L lib/Supervisor.silica ] || rm -f lib/Supervisor.silica; if [ -n "$$mods" ]; then mkdir -p lib && { [ -e lib/Supervisor.silica ] || ln -sfn "$$(_trial_rel "$(TRIAL_STDLIB_SUPERVISOR)" lib)" lib/Supervisor.silica; } && for mod in $$mods; do ln -sfn "$$(_trial_rel "$(TRIAL_SUPPORT_DIR)/$$mod.silica" lib)" "lib/$$mod.silica" || exit 1; done; fi; }
+TRIAL_SUPPORT_ASSEMBLE = { for tss in .trial_stdlib/trial_*.sams; do [ -f "$$tss" ] || continue; $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler "$$tss" -o "$${tss%.sams}.o" || echo "❌❌ assembling $$tss failed"; done; }
+TRIAL_SUPPORT_OBJ = $$(sed -n 's|^use \(trial_[a-z0-9_]*\);.*|.trial_stdlib/\1.o|p' "$(1)" 2>/dev/null)
+# compiler/stdlib/Supervisor.sams is a golden (Supervisor.ascomp) that only supervisors_addition
+# writes and compares. Every other suite that lists the stdlib Supervisor in its silica.config gets a
+# private copy instead: the line is rewritten in place (same position, so the unit order and the
+# application's atom table do not change) to .trial_stdlib/Supervisor.silica, a symlink, so the
+# compiler writes that suite's Supervisor.sams/.iface under <suite>/.trial_stdlib/ rather than into
+# compiler/stdlib/, where suites with different atom tables overwrote one another's output.
+#   silica.config rule, after writing it (and after TRIAL_SUPPORT_CONFIG, which empties .trial_stdlib):
+#       ... > silica.config && $(TRIAL_SUPPORT_CONFIG) && $(TRIAL_PRIVATE_SUPERVISOR)
+TRIAL_PRIVATE_SUPERVISOR = { $(TRIAL_REL_FN); if grep -qE '^(\.\./)+compiler/stdlib/Supervisor\.silica$$' silica.config; then mkdir -p .trial_stdlib && ln -sfn "$$(_trial_rel "$(TRIAL_STDLIB_SUPERVISOR)" .trial_stdlib)" .trial_stdlib/Supervisor.silica && sed -E 's|^(\.\./)+compiler/stdlib/Supervisor\.silica$$|.trial_stdlib/Supervisor.silica|' silica.config > silica.config.tmp && mv silica.config.tmp silica.config; fi; }
+# Single-file compiles (error trials) in a scratch directory <dir> holding <file>: add Supervisor and
+# the support module the file uses (none for a trial left in its old shape, which keeps its golden).
+#   $(call TRIAL_SUPPORT_IN_TMP,<dir>,<file>)
+TRIAL_SUPPORT_IN_TMP = { for mod in $$(LC_ALL=C sed -n 's/^use \(trial_[a-z0-9_]*\);.*/\1/p' "$(2)"); do ln -sfn "$(TRIAL_SUPPORT_DIR)/$$mod.silica" "$(1)/$$mod.silica" && echo "$$mod.silica" >> "$(1)/silica.config" && ln -sfn "$(TRIAL_STDLIB_SUPERVISOR)" "$(1)/Supervisor.silica" && echo Supervisor.silica >> "$(1)/silica.config"; done; }
 
 # ============================================================================
 # integrate wrapper -- parallel fan-out, per-directory log and report
@@ -324,7 +368,7 @@ else
 		fi; \
 	fi; \
 	date +%s > "$(INTEGRATE_DIR).integrate_start"; \
-	rm -f "$(INTEGRATE_DIR).integrate_log" "$(INTEGRATE_DIR).integrate_status" "$(INTEGRATE_DIR).integrate_report"; \
+	rm -f "$(INTEGRATE_DIR).integrate_log" "$(INTEGRATE_DIR).integrate_status" "$(INTEGRATE_DIR).integrate_report" "$(INTEGRATE_DIR).integrate_skipped"; \
 	if [ -n "$$SILICA_INTEGRATE_ROOT" ]; then \
 		export SILICA_INTEGRATE_ACTIVE=1; \
 		{ $(MAKE) --no-print-directory $(INTEGRATE_JOBFLAGS) -C "$(INTEGRATE_DIR)" -f "$(INTEGRATE_MAKEFILE)" integrate-run; \
@@ -390,8 +434,19 @@ integrate-report:
 # The board target mirrors the tree under trials/.target/<target>/ and its logs carry that target's
 # label. A host run must not walk into it: doing so put board failures in the host report, where they
 # looked like this machine's and drowned the real ones.
+# A log under a directory this run skipped (.integrate_skipped, from INTEGRATE_PENDING) is from an
+# earlier run, not this one: INTEGRATE_CHILD deletes such logs when it skips, and this filter drops
+# any that survive (a log written after the skip, or a tree the skip did not clean), so the report
+# lists only failures this run produced.
 define INTEGRATE_FAILURE_DETAILS
 logs=$$(find $(or $(INTEGRATE_LOG_ROOTS),"$(INTEGRATE_DIR)") -name '.target' -prune -o -name .integrate_log -print 2>/dev/null | awk '{ n = gsub("/", "/"); print n "\t" $$0 }' | sort -rn | cut -f2-); \
+logs=$$(for l in $$logs; do d=$${l%/*}; keep=1; \
+	while [ -n "$$d" ]; do \
+		if [ -f "$$d/.integrate_skipped" ]; then keep=0; break; fi; \
+		[ "$$d" = "$(_INTEGRATE_DIR_NOSLASH)" ] && break; \
+		[ "$${d#"$(_INTEGRATE_DIR_NOSLASH)"/}" != "$$d" ] || break; d=$${d%/*}; \
+	done; \
+	[ "$$keep" = 1 ] && printf '%s\n' "$$l"; done); \
 [ -n "$$logs" ] && awk -v cap="$(INTEGRATE_DETAIL_LINES)" ' \
 	function flush() { if (blk != "") print blk; blk = "" } \
 	FNR == 1 { flush(); skip = 1 } \
@@ -440,6 +495,7 @@ rm -f "$$dir/.integrate_counts" "$$dir/.integrate_report" "$$dir/.integrate_stat
 if [ -f "$$dir/INTEGRATE_PENDING" ] && [ -z "$(INTEGRATE_NAMED_SUITES)" ]; then \
 	echo "SKIP: $$dir (INTEGRATE_PENDING -- see $$dir/README.md)"; \
 	: > "$$dir/.integrate_skipped"; \
+	find "$$dir" -name .target -prune -o \( -name .integrate_log -o -name .integrate_report -o -name .integrate_status \) -type f -exec rm -f {} + 2>/dev/null || true; \
 else \
 	$(MAKE) --no-print-directory -C "$$dir" integrate $(2) > /dev/null 2>&1; \
 	if [ ! -f "$$dir/.integrate_report" ]; then \

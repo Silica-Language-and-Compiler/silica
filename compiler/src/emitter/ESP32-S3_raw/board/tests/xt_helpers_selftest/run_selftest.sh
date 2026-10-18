@@ -46,8 +46,9 @@ python3 "$HERE/qualify.py" "$B/xt_selftest.silica" "$B/xt_vr.silica" "$B/xt_isa.
 printf 'string_parse.silica\nxt_vr.silica\nxt_isa.silica\nxt_mem.silica\nxt_selftest.silica\n' > "$B/silica.config"
 
 cd "$B"
+# 75: a unit is done, reclaim memory; 76: the compiler crashed in a unit, the next run skips it.
 ec=75
-while [ $ec -eq 75 ]; do perl -e 'alarm 300; exec @ARGV' "$SEED" > compile.log 2>&1 && ec=0 || ec=$?; done
+while [ $ec -eq 75 ] || [ $ec -eq 76 ]; do perl -e 'alarm 300; exec @ARGV' "$SEED" > compile.log 2>&1 && ec=0 || ec=$?; done
 if [ $ec -ne 0 ]; then echo "compile failed ($ec)"; grep -B2 -A12 -i 'error' compile.log | head -60; exit 1; fi
 objs=""
 for s in *.sams; do clang -mmacosx-version-min=26.0 -c -x assembler "$s" -o "${s%.sams}.o"; objs="$objs ${s%.sams}.o"; done

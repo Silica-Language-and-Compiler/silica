@@ -16,7 +16,8 @@ normalize_pointer_lines() {
       gsub(/\r/, "", $0)
     }
     # A null pointer prints as (nil) under glibc and as 0x0 on Darwin: same value either way.
-    /^[[:space:]]*actor_id:[[:space:]]*(0x[0-9a-fA-F]+|\(nil\))$/ {
+    # actor_id is the 64-bit identity in decimal on current runtimes (an address on older ones).
+    /^[[:space:]]*actor_id:[[:space:]]*(0x[0-9a-fA-F]+|\(nil\)|[0-9]+)$/ {
       print "actor_id:        <PTR>"
       next
     }

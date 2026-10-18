@@ -8,9 +8,8 @@ This document defines the principles, properties, and architecture for the Silic
 
 | Document | Purpose |
 |----------|---------|
-| [parser_design.jsonld](parser_design.jsonld) | Machine-readable design data (JSON-LD) |
 | [silica-compiler-code-organization.md](silica-compiler-code-organization.md) | Overall compiler structure |
-| [silica-specification.md](../silica-specification.md) | Silica language syntax and semantics |
+| [silica-specification.md](silica-specification.md) | Silica language syntax and semantics |
 | [sir_generator_formalization_spec.md](../sir_generator_formalization_spec.md) | Downstream SIR generator contract |
 
 ---
@@ -59,7 +58,7 @@ This document defines the principles, properties, and architecture for the Silic
 **The parser is implemented in Silica.**
 
 - Uses Silica's structs, linked lists, recursion, and case expressions.
-- No arrays or mutable buffers in the initial implementation; uses `ListToken`, `ListInt`, and similar linked structures.
+- No arrays or mutable buffers; uses `List[T, mem(normal)]` of records (tokens, slots, constraints) and `List[int64, mem(normal)]` for role sets. Silica has no named struct or list-of-X types, so the `ListToken`, `ListInt`, `TokenSlot` and `Constraint` names in this document are shorthand for inline record and `List[...]` types.
 - All types are concrete; no generics.
 
 ---
@@ -132,7 +131,7 @@ struct ListConstraint {
 
 ### 3.3 Role Codes
 
-Roles are integer codes. Each capability defines its own role namespace. Examples:
+Implementation status (2026-10-16): `propagate_until_fixed` first converts the constraint list into two role-indexed tables (`build_next_table`, `build_prev_table`, indexed by trigger role) and propagates through those, so a role lookup is a table index rather than a scan of the constraint list. Roles are integer codes. Each capability defines its own role namespace. Examples:
 
 | Role Code | Role Name | Capability |
 |-----------|-----------|------------|
@@ -201,18 +200,28 @@ Propagation is recursive and immutable: each pass builds a new `ListTokenSlot`. 
 
 ```
 parser/
-├── constraint_core.silica         # Shared: TokenSlot, Constraint, ListTokenSlot, propagation engine
+├── constraint_core.silica         # Shared: slots, constraints, role tables, propagation engine
 ├── constraint_runner.silica       # Shared: parse_program, all_constraints registry, orchestration
-├── constraint_extract.silica      # Shared: slots_to_program (structure extraction)
+├── constraint_extract.silica      # Shared: structure extraction entry (slots to program)
+├── constraint_extract_*.silica    # Extraction passes: decls, params, slots, expr, expr_bindings,
+│                                  #   expr_lits, lambda_lift, hof_wrap, validate
+├── parser_core, parser_ast, parser_tuples, parser_runner, instantiated_fn_name, parse_in_actor
 │
-├── capabilities/
-│   ├── capability_fn_decl.silica     # fn name ( ) -> type { body }
-│   ├── capability_expr_literal.silica # 42, identifiers (minimal: fn main(){ 42 })
-│   ├── capability_case.silica        # case x of { ... }
-│   ├── capability_struct.silica      # struct X { ... }
-│   ├── capability_if.silica          # if ... then ... else ...
-│   └── ...                           # One file per capability
+├── capabilities/                  # One file per capability (19 today)
+│   ├── capability_fn_decl.silica      # fn name ( params ) -> type proc[...] { body }
+│   ├── capability_expr_literal.silica # literals and identifiers
+│   ├── capability_case.silica         # case ... of { ... }
+│   ├── capability_list.silica, capability_sequence.silica, capability_trait.silica,
+│   │   capability_actors.silica, capability_foreign.silica, capability_memory_region.silica,
+│   │   capability_module.silica, capability_effect_decl.silica, capability_bind.silica,
+│   │   capability_tuple_decompose.silica, capability_supervisor_phases.silica, ...
 ```
+
+Implementation status (2026-10-16): the layout above is the shipped one. There is no `capability_struct`
+or `capability_if` file: Silica has no named struct declarations (records are inline types) and
+conditionals are `case` expressions. Structure extraction is not a per-capability
+`extract_contribution` function; it lives in the shared `constraint_extract_*` passes, which read the
+final role sequence.
 
 ### 5.2 Capability File Contract
 
@@ -220,7 +229,7 @@ Each capability file MUST:
 
 1. **Export `constraints() -> ListConstraint`**: All constraints for this capability.
 2. **Export `initial_roles(token_kind: int64) -> ListInt`**: Roles this capability allows for the given token kind. Returns empty list if this capability does not apply.
-3. **Export `extract_contribution(slots: ListTokenSlot, start_index: int64) -> (ASTFragment, int64)`**: Optional. If the capability contributes to structure extraction, parse its span and return (fragment, next_index). Used by `constraint_extract.silica`.
+3. **Export `extract_contribution(slots: ListTokenSlot, start_index: int64) -> (ASTFragment, int64)`**: Optional in the design. Not used in the implementation (2026-10-16): capabilities export `constraints/0`, `initial_roles/1` and their `role_*` codes; extraction is done by the shared `constraint_extract_*` passes.
 
 Each capability file MUST NOT:
 
@@ -330,3 +339,4 @@ When multiple roles remain, use precedence, associativity, or context to resolve
 | Version | Date | Changes |
 |---------|------|---------|
 | 1.0 | 2025-02-15 | Initial design: constraint propagation, one file per capability |
+| 1.1 | 2026-10-16 | Layout, capability contract and data-structure notes aligned with the implementation |

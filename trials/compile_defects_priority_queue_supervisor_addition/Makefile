@@ -32,7 +32,7 @@ LDFLAGS_clang := -Wl,-e,main -Wl,-macos_version_min,$(MACOS_MIN_VERSION)
 
 silica.config:
 	@cd "$(THIS_DIR)" && { \
-		find "$$PWD" -type f -name '*.silica' | sed "s|^$$PWD/||"; \
+		find "$$PWD" -type f -name '*.silica' | sed "s|^$$PWD/||" | LC_ALL=C sort; \
 		echo "../../compiler/stdlib/Supervisor.silica"; \
 		echo "../../compiler/stdlib/data_structures/brodal_okasaki_node.silica"; \
 		echo "../../compiler/stdlib/data_structures/brodal_okasaki_compare.silica"; \
@@ -46,7 +46,7 @@ silica.config:
 		echo "../../compiler/stdlib/data_structures/brodal_okasaki.silica"; \
 		echo "../../compiler/stdlib/data_structures/brodal_okasaki_priority.silica"; \
 		echo "../../compiler/stdlib/data_structures/PriorityQueue.silica"; \
-	} > silica.config
+	} > silica.config && $(TRIAL_SUPPORT_CONFIG) && $(TRIAL_PRIVATE_SUPERVISOR)
 
 all: executables
 
@@ -65,7 +65,7 @@ objects: assembly
 		echo "Assembling: $$sams -> $$base.o"; \
 		$(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler $$sams -o $$base.o; \
 	done; \
-	for line in $$(grep '^\.\./\.\./compiler/stdlib/' silica.config 2>/dev/null); do \
+	for line in $$(grep -E '^(\.\./\.\./compiler/stdlib/|\.trial_stdlib/Supervisor\.silica$$)' silica.config 2>/dev/null); do \
 		src=$${line%.silica}; base=$$(basename "$$src"); \
 		[ -f "$$src.sams" ] || continue; \
 		echo "Assembling: $$base.sams (stdlib) -> $$base.o"; \
@@ -79,10 +79,11 @@ executables: objects
 		[ "$$hb" = "__silica_runtime" ] && continue; \
 		grep -qE '^\.global main$$' "$$h" || helper_objs="$$helper_objs $$hb.o"; \
 	done; \
-	for line in $$(grep '^\.\./\.\./compiler/stdlib/' silica.config 2>/dev/null); do \
+	for line in $$(grep -E '^(\.\./\.\./compiler/stdlib/|\.trial_stdlib/Supervisor\.silica$$)' silica.config 2>/dev/null); do \
 		hb=$$(basename "$${line%.silica}"); \
 		[ -f "$$hb.o" ] && helper_objs="$$helper_objs $$hb.o"; \
 	done; \
+	$(TRIAL_SUPPORT_ASSEMBLE); \
 	for o in *.o; do \
 		[ -f "$$o" ] || continue; \
 		base=$${o%.o}; \
@@ -90,6 +91,7 @@ executables: objects
 	grep -qE '^\.global main$$' "$$base.sams" || continue; \
 	runtime_obj=""; \
 	[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+	runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 			$(RUST_LLD) -flavor darwin -o $$base $$o $$helper_objs $$runtime_obj $(LDFLAGS_rust-lld) && echo "  ✅ $(MSG_PREFIX)$$base (rust-lld)"; \
 		else \
@@ -149,7 +151,7 @@ integrate-run:
 		ko=$$((ko + 1)); failed=1; break; \
 	fi; \
 	done; \
-	for line in $$(grep '^\.\./\.\./compiler/stdlib/' silica.config 2>/dev/null); do \
+	for line in $$(grep -E '^(\.\./\.\./compiler/stdlib/|\.trial_stdlib/Supervisor\.silica$$)' silica.config 2>/dev/null); do \
 		src=$${line%.silica}; base=$$(basename "$$src"); \
 		[ -f "$$src.sams" ] || continue; \
 		echo "Assembling $$base.sams (stdlib)..."; \
@@ -161,10 +163,11 @@ integrate-run:
 		[ "$$hb" = "__silica_runtime" ] && continue; \
 		grep -qE '^\.global main$$' "$$h" || helper_objs="$$helper_objs $$hb.o"; \
 	done; \
-	for line in $$(grep '^\.\./\.\./compiler/stdlib/' silica.config 2>/dev/null); do \
+	for line in $$(grep -E '^(\.\./\.\./compiler/stdlib/|\.trial_stdlib/Supervisor\.silica$$)' silica.config 2>/dev/null); do \
 		hb=$$(basename "$${line%.silica}"); \
 		[ -f "$$hb.o" ] && helper_objs="$$helper_objs $$hb.o"; \
 	done; \
+	$(TRIAL_SUPPORT_ASSEMBLE); \
 	for o in *.o; do \
 		[ -f "$$o" ] || continue; \
 		base=$${o%.o}; \
@@ -172,9 +175,11 @@ integrate-run:
 	grep -qE '^\.global main$$' "$$base.sams" || continue; \
 	runtime_obj=""; \
 	[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+	runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 		echo "Linking $$base..."; \
 		runtime_obj=""; \
 		[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 			if ! $(RUST_LLD) -flavor darwin -o $$base $$o $$helper_objs $$runtime_obj $(LDFLAGS_rust-lld); then \
 			echo "❌❌ $(MSG_PREFIX)$$base link failed"; \

@@ -1,5 +1,7 @@
 # Brokered IPC Isolation Architecture for Safe Use of Unsafe Libraries
 
+> **Implementation status (2026-10-16).** Design only. Silica has no broker, no helper-process runtime and no `NetOpen`-style intrinsics; none of the compiler, the runtimes or the trials implement this architecture. The in-process mechanism is Fifi ([silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md)): networking is not part of the language and a program reaches the host's network through Fifi wrappers in dangerous actors (specification §20.4). This document is the stronger-isolation alternative that [dangerous_ffi_security_model.md](dangerous_ffi_security_model.md) §16 names for untrusted or adversarial libraries. The `NetOpen` example below is an illustration of a broker protocol, not a Silica API.
+
 ## Purpose
 
 This document describes a system architecture intended to maximize safety when a memory-safe application must use functionality provided by an unsafe library, such as a C networking library. The primary goal is to isolate unsafe behavior from the safe application while still allowing the safe application to access the required functionality.

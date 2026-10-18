@@ -1,8 +1,12 @@
 # Recursive Tuple Specification
 
-**Status:** Design approved via Recursive Tuple Design Discussion tool (Trade-off Analysis complete)
+**Status:** Implemented (see Implementation status (2026-10-16) below); design approved via the Recursive Tuple Design Discussion tool (Trade-off Analysis complete)
 
 **Related:** [tuple_recursion_discussion.jsonld](../compiler-building-tools/tuple_recursion_discussion.jsonld)
+
+## Implementation status (2026-10-16)
+
+Implemented end to end: `rec` is a lexer keyword (`lexer_keywords.silica`); `ref?(R, Space, T)` and `rec` are type syntax; the type checker implements structural equality with the `rec`-scoped occurs check and `ref?` slots (`type_checker/type_checker_recursive_tuples.silica`, exports `recursive_types_equal`, `is_ref_optional_type`, `atom_fits_ref_optional_slot`, `ref_fits_ref_optional_slot`); `alloc_rec` is lowered in `sir_generator/terms/memory_region_calls.silica` and emitted by `terms/prims/prims_memory.silica` in the Apple Silicon and ESP32-S3 backends. The language specification carries the normative text (`silica-specification.md`, recursive tuples section). Trials: `trials/memory_region_addition` and the `ordered_data_structures` suites (the standard collections `wbt_core`, `binary_tree_core`, `skew_ral_core` are built on recursive tuples). The companion `../compiler-building-tools/tuple_recursion_discussion.jsonld` exists. Not verified: the Layer 1 formal-verification rules in section 4 are a proof-side statement with no compiler counterpart. Section 8 (region uniqueness across the application lifetime) is still an open item; no mechanism was found in the compiler or specification.
 
 ---
 

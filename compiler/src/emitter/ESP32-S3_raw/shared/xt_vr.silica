@@ -64,6 +64,7 @@ export vr_x_home_name/1;
 export vr_d_home_name/1;
 export vr_vsp_off/0;
 export tp_load/1;
+export vsp_adjust/1;
 export xt_prelude_macros/0;
 
 // One instruction line.
@@ -245,6 +246,74 @@ fn vsp_load(scratch: string) -> string {
     concat(tp_load(scratch), tp_ld(scratch, scratch, vr_vsp_off()))
 }
 
+// Offsets in the register block of this context's auxiliary-stack limit (VRG_ALIMIT, rt_actors.S:
+// the current auxiliary chunk's guard band top), the chunk's top (VRG_ATOP: a release reaching it
+// pops the chunk; ~0 in the first chunk and in main) and the size word a growing reservation leaves
+// for the runtime (VRG_ARG). Published at every context switch and chunk change, and at start-up
+// for main.
+fn vr_alimit_off() -> int64 {
+    120
+}
+
+fn vr_atop_off() -> int64 {
+    124
+}
+
+fn vr_arg_off() -> int64 {
+    136
+}
+
+// The three checks after a store of a new SP (actor_memory_budget_plan.md item F; the runtime's
+// "Growable stacks"). `sp` holds the value just stored and `t` the register block's base (both
+// intact from the store); only these two are scratch -- a2/a3 may hold the data words of the
+// access that follows and a4-a7 are X9/X10 -- so t is overwritten and sp is reloaded where the
+// runtime moved it. A reservation of k bytes below the limit grows: the size goes to VRG_ARG and
+// silica_rt_aux_grow moves SP to the next chunk, so what follows sees sp as the new SP either
+// way. A release at or above the chunk's top pops it (silica_rt_aux_release); a restore of a saved
+// SP (the self-tail-call stub's MOV SP, X18) may land in any older chunk, so it is checked on both
+// sides. The runtime keeps the caller's a2-a7 (its own window starts at the caller's a8) and its
+// X0-X2 in a10-a15 (it never writes its own a2-a7); a8 and a9 come back clobbered. In main the
+// grow entry raises the fatal overflow (a slab larger than the 64-byte band could otherwise
+// straddle it without a store into it, plan §8.2) and the pop never fires.
+fn vsp_reserve_check(sp: string, t: string, k: int64) -> string {
+    grow: string <- concat(xt_ins("movi", concat(t, concat(", ", xt_itos(k)))), concat(tp_load(sp), concat(tp_st(t, sp, vr_arg_off()), concat(xt_ins("call8", "silica_rt_aux_grow"), concat(tp_load(t), tp_ld(sp, t, vr_vsp_off()))))));
+    concat(tp_ld(t, t, vr_alimit_off()), concat(xt_ins("bgeu", concat(sp, concat(", ", concat(t, ", 1f")))), concat(grow, "1:\n")))
+}
+
+fn vsp_release_check(sp: string, t: string) -> string {
+    concat(tp_ld(t, t, vr_atop_off()), concat(xt_ins("bltu", concat(sp, concat(", ", concat(t, ", 1f")))), concat(xt_ins("call8", "silica_rt_aux_release"), "1:\n")))
+}
+
+fn vsp_restore_check(sp: string, t: string) -> string {
+    below: string <- concat(tp_ld(t, t, vr_alimit_off()), xt_ins("bltu", concat(sp, concat(", ", concat(t, ", 2f")))));
+    above: string <- concat(tp_load(t), concat(tp_ld(t, t, vr_atop_off()), xt_ins("bltu", concat(sp, concat(", ", concat(t, ", 1f"))))));
+    concat(below, concat(above, concat("2:\n", concat(xt_ins("call8", "silica_rt_aux_release"), "1:\n"))))
+}
+
+// dst = src + k in one of the forms addi reaches, or through a8 (which must then be free).
+fn vsp_add_imm(dst: string, src: string, k: int64) -> string {
+    case k >= 0 - 128 and k <= 127 of {
+        true -> xt_ins("addi", concat(dst, concat(", ", concat(src, concat(", ", xt_itos(k))))));
+        false -> concat(xt_ins("movi", concat("a8, ", xt_itos(k))), xt_ins("add", concat(dst, concat(", ", concat(dst, ", a8")))))
+    }
+}
+
+// SP += off on this core's auxiliary stack (the emitter's SUB/ADD SP, #n and the pre-/post-index
+// forms of xt_mem): the word at THREADPTR+112 is moved and then checked, a reservation (off < 0)
+// against the limit and a release (off > 0) against the chunk's top (above). a8 and a9 are scratch;
+// a9 holds the new SP afterwards. Nothing is emitted for off == 0.
+fn vsp_adjust(off: int64) -> string {
+    vsp: string <- xt_itos(vr_vsp_off());
+    case off == 0 of {
+        true -> "";
+        // a8 is vsp_add_imm's temp for large offsets, so the block's base is reloaded to store.
+        false -> concat(concat(tp_load("a8"), xt_ins("l32i", concat("a9, a8, ", vsp))), concat(vsp_add_imm("a9", "a9", off), concat(tp_load("a8"), concat(xt_ins("s32i", concat("a9, a8, ", vsp)), case off < 0 of {
+            true -> vsp_reserve_check("a9", "a8", 0 - off);
+            false -> vsp_release_check("a9", "a8")
+        }))))
+    }
+}
+
 // Word `plus` (0 = low, 4 = high) of a memory-homed VR into `scratch`.
 fn mem_word_load(v: string, scratch: string, plus: int64) -> string {
     case vr_is_global(v) of {
@@ -325,9 +394,11 @@ fn vr_put(dst: string, lo: string, hi: string) -> string {
     case c == "ZR" or c == "" or vr_is_fp(dst) of {
         true -> "";
         false -> case c == "SP" of {
+            // a generic SP write is the self-tail-call stub's restore of a saved SP (emitter_core
+            // tco_restart_stub); SUB/ADD SP, #n go through vsp_adjust (xt_isa)
             true -> {
                 t: string <- temp_not(lo, lo);
-                concat(tp_load(t), tp_st(lo, t, vr_vsp_off()))
+                concat(tp_load(t), concat(tp_st(lo, t, vr_vsp_off()), vsp_restore_check(lo, t)))
             };
             false -> case vr_is_phys(dst) of {
                 true -> case wide of {

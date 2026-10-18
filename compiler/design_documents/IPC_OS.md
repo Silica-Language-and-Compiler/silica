@@ -1,5 +1,7 @@
 # Local Inter-Process Messaging Architecture
 
+> **Implementation status (2026-10-16).** Design only. No Unix-domain-datagram transport, process supervisor or inter-process mailbox exists in the compiler or in the macOS and Linux runtimes (no `AF_UNIX` or `sendto` use in the runtime sources). Silica's actors on a hosted target live inside one OS process with in-process mailboxes, supervised by the runtime's supervisor machinery (specification §15), and reach other processes only through Fifi (specification §20.4 and [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md)). `send(destination, message)` and `receive()` below are the design's runtime steps, not Silica builtins with these semantics. The IPC sketches are the starting point if cross-process messaging is ever added; [brokered_ipc_isolation_architecture.md](brokered_ipc_isolation_architecture.md) is the isolation-oriented alternative.
+
 ## Purpose
 
 This document describes a message-passing architecture for applications running on modern operating systems such as:
@@ -156,7 +158,7 @@ Messages consist of a fixed-size header followed by an opaque payload.
 +---------+---------+----------+----------------+
 ```
 
-Suggested header record (selfhost dialect: inline record type, bound to a variable)
+Suggested header record (an inline record type, bound to a variable)
 
 ```silica
 header: {

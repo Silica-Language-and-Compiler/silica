@@ -11,6 +11,13 @@
 #   - that unit's own source
 #   - every lib/*.silica in the leaf (the whole dependency surface; trials never
 #     `use` each other, only lib modules, so this covers what the unit can see)
+#   - the atom/shape table basis the leaf starts from: the content of
+#     $SDS_STDLIB_CACHE/silica.{atoms,shapes} when the root integrate installs the
+#     prebuilt stdlib objects, or "standalone" when the leaf compiles its own lib/.
+#     A unit's .sams holds atom indices from the table it was compiled under, so a
+#     unit cached by a standalone run (lib/trial_support_int64 numbering :no_reply
+#     from 23) must never be restored next to stdlib objects whose table gave 23 to
+#     :less. Different basis, different key.
 #
 # On a hit we restore the unit's .sams AND .iface. Restoring the .iface is what
 # makes the hit take effect: SEED_SDS_COMPILE_ORDER (leaf.mk) and pending_units()
@@ -43,11 +50,23 @@ hash_file() {
 	shasum -a 256 "$1" | cut -d' ' -f1
 }
 
-# Hash of the compiler binary plus every lib source in this leaf. Computed once
-# per invocation and reused for all units, since it is the same for all of them.
+# The table basis (see the key comment above). Mirrors the condition under which
+# leaf.mk's INSTALL_SDS_STDLIB_OBJS installs the stdlib cache's objects and tables.
+table_basis() {
+	if [ -n "${SDS_STDLIB_CACHE:-}" ] && [ -d "$SDS_STDLIB_CACHE/lib" ]; then
+		printf 'stdlib-cache atoms %s shapes %s\n' \
+			"$(hash_file "$SDS_STDLIB_CACHE/silica.atoms")" "$(hash_file "$SDS_STDLIB_CACHE/silica.shapes")"
+	else
+		printf 'standalone\n'
+	fi
+}
+
+# Hash of the compiler binary, the table basis, and every lib source in this leaf.
+# Computed once per invocation and reused for all units, since it is the same for all.
 compute_base_hash() {
 	{
 		hash_file "$SILICA_COMPILER"
+		table_basis
 		if [ -d lib ]; then
 			for f in lib/*.silica; do
 				[ -e "$f" ] || continue
@@ -92,6 +111,9 @@ restore)
 		if [ -f "$dir/$key.sams" ] && [ -f "$dir/$key.iface" ]; then
 			cp -f "$dir/$key.sams" "$base.sams"
 			cp -f "$dir/$key.iface" "$base.iface"
+			# A trial's runtime module is sized by its own atom table (item J), so it is cached
+			# with the unit; the leaf runtime stands in only for units that never had one.
+			if [ -f "$dir/$key.runtime.sams" ]; then cp -f "$dir/$key.runtime.sams" "$base.runtime.sams"; fi
 			hits=$((hits + 1))
 		else
 			misses=$((misses + 1))
@@ -103,6 +125,17 @@ restore)
 	if [ -f "$CACHE_DIR/runtime/$BASE_HASH.sams" ] && [ ! -f "__silica_runtime.sams" ]; then
 		cp -f "$CACHE_DIR/runtime/$BASE_HASH.sams" "__silica_runtime.sams"
 	fi
+	# The leaf's atom and shape tables go with the units compiled under them: a restored
+	# .sams keeps indices from the table stored under this key, and every later sandbox
+	# extends it. When anything was restored that table replaces the leaf's (the basis is
+	# in the key, so it extends the stdlib cache's table the installed objects use); a
+	# lib unit compiled now then extends it instead of reusing an index a restored unit
+	# already holds.
+	for f in atoms shapes; do
+		if [ -f "$CACHE_DIR/runtime/$BASE_HASH.$f" ] && { [ "$hits" -gt 0 ] || [ ! -f "silica.$f" ]; }; then
+			cp -f "$CACHE_DIR/runtime/$BASE_HASH.$f" "silica.$f"
+		fi
+	done
 	echo "${MSG_PREFIX}compile cache: ${hits} reused, ${misses} to compile"
 	;;
 
@@ -116,9 +149,10 @@ store)
 		[ -f "$dir/$key.sams" ] && continue
 		mkdir -p "$dir"
 		# Drop stale keys for this unit so the cache stays bounded.
-		rm -f "$dir"/*.sams "$dir"/*.iface 2>/dev/null || true
+		rm -f "$dir"/*.sams "$dir"/*.iface "$dir"/*.runtime.sams 2>/dev/null || true
 		cp -f "$base.sams" "$dir/$key.sams"
 		cp -f "$base.iface" "$dir/$key.iface"
+		if [ -f "$base.runtime.sams" ]; then cp -f "$base.runtime.sams" "$dir/$key.runtime.sams"; fi
 		stored=$((stored + 1))
 	done
 	if [ -f "__silica_runtime.sams" ] && [ ! -f "$CACHE_DIR/runtime/$BASE_HASH.sams" ]; then
@@ -126,6 +160,11 @@ store)
 		rm -f "$CACHE_DIR/runtime"/*.sams 2>/dev/null || true
 		cp -f "__silica_runtime.sams" "$CACHE_DIR/runtime/$BASE_HASH.sams"
 	fi
+	# The tables are rewritten every store: they only grow, and the latest covers every unit
+	# stored under this key.
+	for f in atoms shapes; do
+		if [ -f "silica.$f" ]; then mkdir -p "$CACHE_DIR/runtime"; cp -f "silica.$f" "$CACHE_DIR/runtime/$BASE_HASH.$f"; fi
+	done
 	[ "$stored" -gt 0 ] && echo "${MSG_PREFIX}compile cache: ${stored} unit(s) recorded"
 	exit 0
 	;;

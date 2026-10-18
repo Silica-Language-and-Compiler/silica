@@ -16,7 +16,7 @@ The [language specification](https://github.com/yenrab/silica/blob/main/compiler
 
 All side effects are tracked in type signatures.
 
-Mutation, I/O, concurrency, and other observable behavior are not inferred from names or comments. They are declared, checked, and visible at the call site’s surrounding sequence.
+Mutation, I/O, concurrency, and other observable behavior are not inferred from names or comments. They are declared on the sequence that performs them, checked, and visible where the work is written. Effects are local: calling a function does not add that function’s effects to the caller, because the callee’s own sequence declares and discharges them.
 
 **Benefit:** Reviews and tools see the same contract. Observable behavior is checked, not guessed from names.
 
@@ -56,7 +56,7 @@ A `ref` or `buf` carries the region’s lifetime in its type (`ref(L, Space, T)`
 
 Allocating or growing region-backed storage is an effect, and it is treated like any other effect.
 
-Constructing a region, a reference, a buffer, or a growing list is not an invisible runtime service. It happens under an explicit `mem(<space>)` on a `sequence` — for example `sequence proc[mem(normal)]` — the same way I/O happens under `device_io`. Callers inherit that obligation. Pure functions do not allocate.
+Constructing a region, a reference, a buffer, or a growing list is not an invisible runtime service. It happens under an explicit `mem(<space>)` on a `sequence` — for example `sequence proc[mem(normal)]` — the same way I/O happens under `device_io`. The sequence that allocates carries the obligation; a caller of a function that allocates does not repeat it. Pure functions do not allocate.
 
 **Benefit:** Allocation is visible in the type, so “this just computes a value” cannot quietly grow memory. Reviews and tools see the same `mem(…)` contract they see for I/O.
 
@@ -180,7 +180,7 @@ Side effects are declared on sequence blocks:
 sequence proc[device_io, mem(normal)]
 ```
 
-Function declarations do not carry effect declarations. Effects appear only on sequences, and requirements propagate through those sequences. Heap is one of those effects ([principle 6](#heap-is-an-effect)).
+Function declarations do not carry effect declarations. Effects appear only on sequences, and each sequence declares exactly what its own steps do; one that declares more is refused. Heap is one of those effects ([principle 6](#heap-is-an-effect)).
 
 **Benefit:** Observable behavior is visible to people and to tools, so analysis does not depend on naming conventions.
 

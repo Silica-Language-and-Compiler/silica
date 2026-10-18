@@ -1,6 +1,6 @@
 # Peek and poke on `ESP32-S3_raw` — Implementation Plan
 
-**Scope:** the "plus peek and poke" half of **ESP32-S3 board release 1** ([ROADMAP.md](../../../ROADMAP.md) §"The three
+**Scope:** the "plus peek and poke" half of **ESP32-S3 board release 1** ([ROADMAP.md](../../../ROADMAP.md) §"The four
 paths", row ESP32-S3; §"First milestone"). It is the board-release gate for that path, not one of the numbered
 enhancement chunks, and chunk 16 (raw chip features, the `device` space) lists it as a prerequisite
 ([ROADMAP.md](../../../ROADMAP.md) chunk 16). Apple Silicon and Linux AArch64 (and Linux x86-64, which takes the Linux
@@ -15,6 +15,34 @@ where this plan and it differ.
 node shapes, the description table, the board-pack window table, the exact Xtensa lowering, and the hosted
 rejection mechanics). **Port status:** [esp32s3_port_status.md](esp32s3_port_status.md) §4.2 is the row this plan
 closes.
+
+## Implementation status (2026-10-16)
+
+Work items 1 to 19 are in the tree; the plan's text below keeps its 2026-09-29 starting position ("What exists
+today" is that position, not the present one). Where each piece lives now:
+
+| Items | Where |
+| --- | --- |
+| 1 `register_rwr` effect | `effect_checker/effect_checker_core.silica` (`is_builtin_effect`; a `sequence proc[register_rwr] ... produces pure ... end` does not discharge it, so callers must declare it) |
+| 2 lexer and parser surface | keywords `spawn_device`, `spawn_device_registered`, `device_actor_ref`, `device_window`; register markers absorbed at the postfix choke point |
+| 3 built-in trait files | `compiler/stdlib/DeviceDescription.silica`, `Register8.silica` to `Register64.silica` (an app lists them in its `extra_sources.txt`) |
+| 4, 5, 8 descriptions, prim checks, write-one-to-clear warning | `type_checker/device/type_checker_device_descriptions.silica`, `type_checker/expressions/type_checker_expressions_device.silica`; codes E2201 to E2215, E2219 (device access in `main`), warning W2201 ([error_codes.md](../../error_codes.md)) |
+| 6, 7 device workers, module rules | `module_checker/module_checker_device.silica`; E2216, E2217, E2223 to E2225, E2230 to E2233 |
+| 9 SIR lowering | `sir_generator/terms/sir_device_calls.silica` (casts lower as `actor_cast_device` / `actor_cast_device_registered`, spawns as `spawn_device` / `spawn_device_registered`) |
+| 10, 11 capability query and rejection pass | `emitter_core@unsupported_prim_reason` in each of the four emitters; `sir_generator/sir_target_verify.silica` reports E2220 and stops the driver before `emit_module` |
+| 12, 13 hosted emitters | the three hosted `terms/prims/prims.silica` catch-alls write an `.error` line naming the prim (they are reached only if the pre-emit pass is bypassed); the device-worker intrinsics are carried by the hosted runtimes with a third registry |
+| 14 window table | `emitter/ESP32-S3_raw/board_pack.silica` (12 windows, `window_containing`, `window_allows_width`), twin `board/runtime/rt_device.S`; the draft in this directory, [board_pack.silica](board_pack.silica), is the design copy |
+| 15, 16 `map_device`, `peek`, `poke` | `emitter/ESP32-S3_raw/terms/prims/prims_device.silica`: a constant base is checked against the table at compile time, a computed base by `silica_rt_map_device_check` (abort `illegal device map`, status 71); `peek` is `memw` + `l32i`, `poke` is `memw` + `s32i` + `memw`; **only 32-bit accesses are accepted**, `Register8`/`16`/`64` are refused with an `.error` line naming the width |
+| 17 workers and third registry | `terms/prims/prims_actors.silica`, `board/runtime/rt_actors.S` (registries are sized per image from the atom table, `silica_registry_slots`) |
+| 18 call-site barriers | unchanged (`effects/emitter_effects.silica`) |
+| 19 trials | `trials/error_enforcement_addition/device_*` (54 entries), `trials/warning_enforcement_addition/device_w1c_read_modify_write`, board-only `trials/device_actor_addition` (9 programs with `ESP32-S3_raw.scout` goldens; `INTEGRATE_PENDING`, run by naming it: `make integrate TRIAL_TARGET=ESP32-S3_raw TRIAL_SUITES=device_actor_addition`), `trials/cast_device_registered_unheld_name_board_addition`; apps `board/apps/silica_16_device_uart` to `silica_22_device_buzzer` |
+| 20 documentation | done in [esp32s3_port_status.md](esp32s3_port_status.md) §4.2 and `board/README.md`; [porting_for_os_free_targets.md](../porting_for_os_free_targets.md) carries a status paragraph |
+
+Decisions the text below left open: the host-side skip of the board-only suite is `INTEGRATE_PENDING`
+(a named suite still runs); the diagnostic channel stayed narrow (items 10 and 11 only); widths other than 32 are
+refused on this board. Recorded as open on 2026-09-30 and not re-checked on 2026-10-16: descriptions that sit in
+modules seen only through an `.iface`; `spawn_device` inside a `register_rwr` sequence; the move-only rule for
+`device_window`; the restart-time hardware `init` rule of device spec §8 (nothing enforces it).
 
 ## What the specification requires
 
@@ -75,7 +103,7 @@ unless marked otherwise.
 
 ## What exists today
 
-Measured against the tree on 2026-09-29.
+Measured against the tree on 2026-09-29 (the starting position; see the implementation status above for the present one).
 
 - **Nothing of the prims, the markers, the descriptions, or the device-worker intrinsics** exists in any shared
   stage. `spawn_device`, `cast_device`, `map_device`, `peek`, `poke`, `DeviceDescription`, `Register8`…`Register64`
@@ -147,7 +175,7 @@ Measured against the tree on 2026-09-29.
   (`type_checker_traits.silica:322-326,339-360`, the `Collectable` / `ActorMessage` special cases). The one
   standard-library trait file, `compiler/stdlib/Supervisor.silica:22-27`, shows the trait-file form
   (`export trait …; export f/n; required { … }`) and is added to a build through `silica.config`
-  ([trials/targets/README.md](../../../../trials/targets/README.md) "What a board run does", step 2).
+  ([trials/targets/README.md](../../../trials/targets/README.md) "What a board run does", step 2).
 
 ## Work
 

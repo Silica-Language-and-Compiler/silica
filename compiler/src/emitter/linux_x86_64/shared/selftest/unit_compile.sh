@@ -65,11 +65,13 @@ done < "$order"
 n=$(wc -l < "$scratch/silica.config" | tr -d ' ')
 cd "$scratch"
 # The compiler exits 75 after each unit of a large batch to reclaim memory; re-invoke until it
-# finishes (src/Makefile does the same).
+# finishes (src/Makefile does the same). 76 means it crashed inside a unit; the next run reports
+# that unit as failed, skips it and compiles the rest.
 : > compile.log
 while true; do
     nice -n 19 "$comp" >> compile.log 2>&1 && ec=0 || ec=$?
     [ "$ec" -eq 75 ] && continue
+    [ "$ec" -eq 76 ] && continue
     break
 done
 if [ "$ec" -eq 0 ]; then

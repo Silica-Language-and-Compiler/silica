@@ -270,41 +270,16 @@ do_remote() {
     conn="${spec%%:*}"; rpath="${spec#*:}"
     ssh -o BatchMode=yes "$conn" true 2>/dev/null || { echo "  cannot reach $conn over key-based ssh"; note "$t" UNREACHABLE - - "$conn"; return 1; }
     if [ "$DO_SYNC" = 1 ]; then
-        # A full refresh, so clear what is there before transferring: it removes files deleted or
-        # renamed here, and it avoids rsync's delete modes, which disable incremental recursion and
-        # then fail to allocate a 96,000-entry file list on the receiver.
-        # Only the directories this script sends are cleared. binaries/ is NOT one of them: it holds
-        # that machine's own compilers, which are excluded from the sync and must survive.
-        case "$rpath" in ""|"/"|"~"|"~/"|"$HOME") echo "  refusing to clear a suspicious path: '$rpath'"; note "$t" "BAD PATH" - - "$conn"; return 1 ;; esac
-        echo "  clearing the synced directories on $conn (binaries/ is kept)"
-        ssh -o BatchMode=yes "$conn" "cd $rpath 2>/dev/null && rm -rf compiler trials project_makefiles programmer_tools docs" \
-            >>"$LOG_DIR/$t-sync.log" 2>&1 || { echo "  could not clear them; continuing anyway"; }
-        echo "  sync sources to $conn (this is slow the first time)"
-        # No --delete-excluded: it disables incremental recursion, so rsync builds the whole
-        # 96,000-entry file list in memory first and the receiver fails to allocate it
-        # ("error allocating core memory buffers", code 22) on both a 4 GB Pi and a full disk.
-        # *.tmp: the Makefile writes silica.config.compiler.tmp / .silica.config.units.tmp then
-        # renames them in the same breath. If a build is running here while this syncs, rsync's
-        # file-list scan can see one exist and then find it gone when it tries to read it
-        # ("open (2): No such file or directory", exit 23) -- excluding them removes the race
-        # instead of just tolerating the exit code.
-        # SYNC_BUILD_EXCLUDES (sync_excludes.sh): built artifacts stay on the machine that built them.
-        exfile="$(mktemp "${TMPDIR:-/tmp}/silica-sync-exe.XXXXXX")"
-        sync_exe_excludes "$REPO/trials" "/trials" > "$exfile"
-        rsync -a "${SYNC_BUILD_EXCLUDES[@]}" --exclude-from="$exfile" \
-            --exclude '.git' \
-            --exclude '*.tmp' \
-            --exclude '.target' --exclude '*.elf' --exclude '*.map' --exclude '*.image.log' \
-            --exclude 'binaries/' \
-            --exclude '.claude' --exclude '.claude-memory' --exclude '.codex_artifacts' \
-            --exclude '.cursor' --exclude '.vscode' --exclude '.scratch' \
-            --exclude 'board_backups' --exclude '*.pptx' --exclude '*.ndjson' \
-            "$REPO/" "$conn:$rpath/" >"$LOG_DIR/$t-sync.log" 2>&1
+        # sync_to_hosts.sh (Lee's rule 2026-10-12) replaces the old clear-then-copy: it pulls this
+        # platform's goldens back, deletes exactly the files this tree no longer has (computed here,
+        # sent as a list; no rsync delete mode, so no 96,000-entry list on the receiver), and keeps
+        # build outputs, binaries/ and this platform's goldens. Then it pushes.
+        echo "  sync sources to $conn (sync_to_hosts.sh)"
+        bash "$(dirname "${BASH_SOURCE[0]}")/sync_to_hosts.sh" --apply --remote "${t}=${conn}:${rpath}" \
+            --list-dir "$LOG_DIR/sync" >"$LOG_DIR/$t-sync.log" 2>&1
         rsync_rc=$?
-        rm -f "$exfile"
-        # 24 means some source files vanished while it ran, which is normal in a working tree.
-        if [ $rsync_rc -ne 0 ] && [ $rsync_rc -ne 24 ]; then
-            echo "  SYNC FAILED (rsync exit $rsync_rc), see $LOG_DIR/$t-sync.log"
+        if [ $rsync_rc -ne 0 ]; then
+            echo "  SYNC FAILED (sync_to_hosts.sh exit $rsync_rc), see $LOG_DIR/$t-sync.log"
             tail -2 "$LOG_DIR/$t-sync.log" | sed 's/^/    /'
             note "$t" "SYNC FAILED" - - "$conn"; return 1
         fi

@@ -2,7 +2,7 @@
 
 **Purpose:** Identify every change needed so `silica-compiler` can build and maintain itself without `silica-bootstrap-compiler`, replacing bootstrap-era internal data structures and workarounds with the standard generated families specified in [data_structures_as_traits.md](data_structures_as_traits.md) and [data_structure_to_algorithms.md](data_structure_to_algorithms.md).
 
-**Scope:** Parallel compiler tree `compiler/src/` (self-host edits), additive build targets, and compiler-facing trials. Production `compiler/src/` and `silica-bootstrap-compiler` stay untouched until Phase 6 cutover. Stdlib implementation of WBT / Brodal–Okasaki / BinaryTree modules is tracked in [standard_data_structures_implementation_plan.md](standard_data_structures_implementation_plan.md). **Withdrawn 2026-09-29:** the compiler's further adoption of the standard structures (WBT maps for the symbol, effect, module and FFI environments, and a `BinaryTree` syntax tree) is no longer planned. The compiler keeps its lists and its index-arena `Expr`/`SIRTerm`; only the emitter pools moved to `wbt_map` (Phase 3). The former Phase 4 and Phase 7 are removed from this plan.
+**Scope (as written 2026-09-08; see the status section below for the current state):** Parallel compiler tree `compiler/src/` (self-host edits), additive build targets, and compiler-facing trials. Production `compiler/src/` and `silica-bootstrap-compiler` stay untouched until Phase 6 cutover. Stdlib implementation of WBT / Brodal–Okasaki / BinaryTree modules is tracked in [standard_data_structures_implementation_plan.md](standard_data_structures_implementation_plan.md). **Withdrawn 2026-09-29:** the compiler's further adoption of the standard structures (WBT maps for the symbol, effect, module and FFI environments, and a `BinaryTree` syntax tree) is no longer planned. The compiler keeps its lists and its index-arena `Expr`/`SIRTerm`; only the emitter pools moved to `wbt_map` (Phase 3). The former Phase 4 and Phase 7 are removed from this plan.
 
 **Authority:**
 
@@ -11,34 +11,45 @@
 - [standard_data_structures_implementation_plan.md](standard_data_structures_implementation_plan.md) — stdlib build progress and acceptance trials
 - [list_implementation_design.md](../list_implementation_design.md) — when `List[T, S]` remains correct (AST chains, token streams)
 
-**Current state (audit, refreshed 2026-09-08):**
+## Status (2026-10-16): self-hosting reached, bootstrap retired
 
-| Layer | Frozen `src/` (built by the Rust bootstrap; produces the **seed**) | `src/` (built by `binaries/seed-compiler`; produces the **selfhost**) |
-| ----- | ------------------------- | -------------------------------- |
-| Compiler executable | `src/Makefile` builds `main.silica` → `main.ll` via `silica-boot` and links `libsilica_compiler.a`; its product is published as `binaries/silica-NNNNNN-seed-macos-applesilicon` (`binaries/seed-compiler`) | `make -C src build` compiles the 331-unit `silica.config.compiler` batch, links Rust-free (`silica_rt_shim.s`, `deviceio_link_thunks.s`, `main_entry_alias.s`), and publishes `binaries/silica-NNNNNN-macos-applesilicon` (`binaries/silica-compiler`). **Every `trials/*/` suite runs on this selfhost binary** (`trials/silica_compiler.mk`). |
-| Subdir Makefiles | `lexer/`, `parser/`, `type_checker/` (partial), `sir_generator/`, `emitter/`, `effect_checker/` | none needed: one config-driven batch (`topo_silica_config.sh` → `silica.config.compiler`) |
-| Internal ADTs | `data_structures/bst.silica` (naive unbalanced BST); 125 named `struct` declarations, 48 of them `List*` cons-cell structs | zero named structs; `List[<inline record>, mem(normal)]` everywhere; emitter pools on `compiler_maps` + `wbt_map`/`OrderedMap` (`string_literal_pool` still linear-scan, Step 3.3) |
-| Parser expression AST | Recursive `Expr` struct with direct `inner` / `right_expr` and cyclic `kind=-1` dummy | Index arena `{ nodes: List[<inline node>, mem(normal)], root: int64 }` with `root = -1` for absence (`parser/parser_ast.silica`, `sir_generator/sir_ast.silica`) |
-| Type aliases | `type TokenKind = int64` remains in `src/lexer/lexer_token_kind.silica` (removed only at Phase 6.3 cutover) | zero (`rg '^\s*type\s+\w+\s*='` → 0) |
-| Compiler-internal stdlib | none | `wbt_map`, `OrderedMap` staged into `src/lib/` by `LIB_STDLIB_MODULES`; `wbt_set`/`OrderedSet` not consumed |
+The goal of this plan is met. The text below the status tables is the working plan as it stood on 2026-09-08 and is kept as the record of how the migration was sequenced; the phase tables here supersede it wherever they disagree. Tree names in the body are historical: "frozen `src/`" was the Rust-bootstrapped seed tree and "parallel tree `src/`" was the selfhost tree; both no longer exist as such. There is now one compiler tree, `compiler/src/` (formerly `src_selfhost`), and the Rust bootstrap crate is deleted from the repository (removed in commit `8dcf493d4`, 2026-09-17).
 
-## Status snapshot (2026-09-08)
+| Milestone | Date | Where |
+| --------- | ---- | ----- |
+| First fixed point (gen3 equals gen2 modulo UUID/signature), 33,000+ trials pass | 2026-09-12 | commit `9285f5330` |
+| Apple Silicon fixed point 1 | 2026-09-13 | commit `8aff9cdc5` |
+| Linux AArch64 fixed point 1 (Raspberry Pi) | 2026-09-17 | commit `8dcf493d4`; Rust bootstrap crate removed |
+| Linux x86-64 first fixed point | 2026-09-19/20 | commit `e8274292e` (with Apple Silicon and Linux AArch64) |
+| Fixed points on all three hosted platforms again, ESP32-S3 cross compiler rebuilt | 2026-10-07 | commit `eff040583`; the 2026-10-07 `-linux-aarch64` and `-linux-x86_64` binaries in `binaries/` |
+| Apple Silicon fixed point (349 units compared, 0 differ, gen2 = gen3 = 6,850,384 bytes) | 2026-10-16 | `/Volumes/2T/silica_builds/20261016-052517/fixpoint-apple_silicon_mac.log`; `binaries/silica-compiler` -> `silica-999949-macos-applesilicon`, `seed-compiler` -> `silica-999983-seed-macos-applesilicon` |
+| Linux AArch64 fixed point (349 units, 0 differ, 11,095,520 bytes) | 2026-10-16 | `remote-linux_aarch64.log` in the same build directory |
+| ESP32-S3 cross compiler built by the Mac compiler | 2026-10-16 | `binaries/silica-compiler-ESP32-S3_raw` -> `silica-999981-ESP32_S3_raw-macos-applesilicon` |
 
-Where self-hosting actually stands, superseding any phase row below that disagrees:
+The Linux x86-64 build of 2026-10-16 (`remote-linux_x86_64.log`, built on `nix`, 20 m 26 s) reached its fixed point: 355 units compared, 0 differ, gen2 = gen3 = 12,670,752 bytes. That binary is not yet published into `binaries/`; the newest published x86-64 compiler there is the 2026-10-07 one.
 
-- **Done:** Phase 0 (parallel tree), Phase 5.1 (no aliases), Phase 3 except Step 3.3, the whole §12 dialect rewrite (waves A–C: no named structs, arenas for `Expr`/`SIRTerm`), Phase 1 build targets (`build`, aliases `build-selfhost` / `assembly-selfhost`), the Rust-free link, and the seed → selfhost publication policy in `binaries/install_compiler.bash` (generation numbers count *down*; seeds and selfhosts numbered independently; `check-seed` enforces that `src` is built by a seed, never by a selfhost).
-- **In production:** the selfhost binary built by the seed is what `make integrate` runs (commit `ccdb0610`, 2026-09-02: "selfhost compiler passes all CI trials"). The bootstrap is used for exactly one thing: producing a seed from frozen `src/`.
-- **Open, in this order (the agreed seven-step ladder, 2026-09-07):**
-  1. single-pass liveness landed (Lee compiles seed → selfhost);
-  2. compiler memory: ≤16-byte aggregate returns in X0/X1, `module_iface_append_iface_stub_programs`; gate = `data_structures/string_escapes.silica` compiles under 8 GB with the selfhost;
-  3. fail-loud probe harness (`ulimit -v`, `/usr/bin/time -l`, hard timeout, same-site fault breaker);
-  4. per-unit sweep: the selfhost compiles `src` unit by unit under the harness. **Status:** the `list_nth` builtin (pure, allocation-free list index) is now implemented in both `src/` and `src/` and `sir_term_node_at` / `expr_node_at` use it; the parser peak for `emitter/apple_silicon_mac/emitter_core.silica` dropped from 8.0 GB to 3.2 GB in the probe. `emitter_core.silica` is the last unit listed in `src/silica.compile.order`; a post-port confirming build is Lee's to run.
-  5. generation 2: `make -C src build SILICA_COMPILER=binaries/silica-compiler`; full trial tree green under gen 2. **Pause and report here.**
-  6. differential: gen-1 vs gen-2 `.sams` on the same trials must be identical;
-  7. fixpoint: gen 2 builds gen 3; byte-identical modulo metadata = full self-hosting. Then Phase 6.3 cutover and 6.4 bootstrap retirement.
-- **Not started:** Step 3.3 (`string_literal_pool`), Step 6.1's `trials/self_host_addition/`, any gen-2 / fixpoint target or script.
-- **Unproven / must be settled by a run, not a grep:** whether the selfhost has ever compiled 100 % of `src` (the on-disk `.sams` are seed products); whether `src/fix_seed_emission.py` (a post-processor for seven classes of seed miscompilation) is still applied by hand — if it is, no fixpoint claim is valid until it is retired; which two `trials/ordered_data_structures` leaves are red in its `.integrate_counts` (`139 2`). Commit `25cc8c89` (2026-07-31) claimed a fully self-hosted binary; every later commit describes a compiler that could not self-compile, so treat that claim as premature.
-- **Known open compiler defects** that the training-trial generator had to route around are listed in [../HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md](../HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md); A5 there (provided trait methods lose overload resolution across the exit-75 restart) is on the self-host path because `src` itself is compiled through that restart.
+How the build works now (details in `compiler/src/README.md`, `compiler/src/Makefile` and `programmer_tools/README.md`): `binaries/seed-compiler`, a published Silica-built binary, compiles `compiler/src`; `make gen1`, `make gen2` and `make fixpoint` produce `binaries/silica-gen1`, `silica-gen2` and compare gen3 with gen2; a build that reaches its fixed point becomes the next seed. Generation numbers count down and seeds and selfhosts are numbered independently (`binaries/install_compiler.bash`). Each emit target builds in its own directory `compiler/build/<TARGET>/` so one target's build never leaves artifacts that disturb another. The platform scripts are `programmer_tools/build_all_platforms.sh`, `rebuild_refresh_verify.sh`, `sync_to_hosts.sh` and `run_trials_all_platforms.sh`. The link is Rust-free: the runtime comes from the self-emitted `__silica_runtime.sams` plus the small hand-written shims in `compiler/src/runtime_asm/<target>/` (`silica_rt_shim.s`, `deviceio_link_thunks.s`) and `main_entry_alias.s`.
+
+| Phase / step | Status |
+| ------------ | ------ |
+| Phase 0 (audit, parallel tree) | Done |
+| Phase 1 (build targets, Rust-free link, config-driven batch) | Done; superseded by `make build`, `gen1`, `gen2`, `fixpoint` and the per-target build directory |
+| Phase 2 (bootstrap workarounds W01-W16) | Done as a gate: the selfhost reproduces itself. Individual workaround comments may remain in source as history; this plan no longer tracks them |
+| Phase 3 (BST to WBT in the emitter pools) | Done for the five pools; `data_structures/bst.silica` is gone from `src`. Step 3.3 (`string_literal_pool`) is NOT migrated: it still deduplicates by linear list scan (`find_index_in_list`) |
+| Phase 4, Phase 7 (compiler adoption of standard structures) | Withdrawn 2026-09-29, removed |
+| Phase 5.1 (no `type` aliases) | Done: zero `type` aliases and zero named `struct` declarations in `compiler/src` (verified with `git grep`) |
+| Phase 5.2 (no legacy stdlib `use`) | Done; compiler-internal stdlib is `wbt_map` and `OrderedMap` only |
+| Step 6.1 (gen 2, differential, fixpoint) | Done: `make gen2`, `make fixpoint` (the fixpoint check also reports units emitted differently by gen2 than by gen1); logs under `/Volumes/2T/silica_builds/`. `trials/self_host_addition/` was not created; `make trials-gen1`, `trials-gen2`, `trials-both` run the whole tree against a generation instead |
+| Step 6.3 (cutover) and 6.4 (bootstrap retirement) | Done: single tree `compiler/src`, no `silica-boot`, no Rust crate |
+
+Open items that remain from this plan:
+
+- Step 3.3, `string_literal_pool` linear scan.
+- Orphans (removed 2026-10-16): `compiler/src/btree_set_nodeid.silica` (was excluded from the build by `topo_silica_config.sh`) and `compiler/src/fix_seed_emission.py` (not referenced by the Makefile) were removed from git on 2026-10-16.
+- The reachability of provided trait methods across the exit-75 restart (defect A5) is fixed; see [../HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md](../HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md).
+- The compiler still builds one unit per file with process-per-unit reclaim; the one-unit model is described in [../APPLICATION_IS_ONE_COMPILATION_UNIT.md](../APPLICATION_IS_ONE_COMPILATION_UNIT.md).
+
+Everything below the status section is the original 2026-09-08 plan.
 
 This document intentionally contains no Silica source code. It is written as fine-grained work items that an LLM can follow when migrating compiler internals.
 
@@ -98,7 +109,7 @@ These are compiler/runtime fixes or stdlib gaps that block compiling the full `s
    - `src/Makefile`, `src/lexer/Makefile`, `src/effect_checker/Makefile`, `src/sir_generator/Makefile`, `src/emitter/Makefile` (+ parent rules for `parser/`, `type_checker/`, `module_checker/`, `ffi/`, `trait_checker/` via `src/Makefile`)
 3. Identify bootstrap runtime dependency: `libsilica_compiler.a` linked into `silica-compiler` executable (`src/Makefile` lines 13–14, 143–148).
 4. Note stray duplicates not in the build graph for later cleanup (do **not** delete from frozen `src/` in this step unless already proven unused by the default path):
-   - `src/btree_set_nodeid.silica` (orphan bootstrap copy; superseded by target `stdlib/data_structures/wbt_set.silica`)
+   - `src/btree_set_nodeid.silica` (orphan bootstrap copy, removed 2026-10-16; superseded by target `stdlib/data_structures/wbt_set.silica`)
    - `stdlib/data_structures/` duplicate or `.bak` files if present
 5. Create `compiler/src/` as a copy of frozen `src/`; add a short README: self-host migration edits only this tree; bootstrap and `src/` stay default until Phase 6 cutover.
 
@@ -391,7 +402,7 @@ Work items map to W-ids from Step 0.2. Prefer fixing and simplifying **inside `s
 1. Add a `gen2` target to `src/Makefile`: `make build SILICA_COMPILER=binaries/silica-compiler` (selfhost compiles `src`), publishing as a selfhost generation; run the full trial tree under it. **Pause and report after this step.**
 2. Differential: compile the same trial sources with gen 1 and gen 2 and diff every `.sams` (label counters `o[0-9]+` are the only expected noise; see `trials/` notes).
 3. Fixpoint: gen 2 builds gen 3; compare binaries byte-for-byte modulo embedded metadata. Self-compiling once is *not* fixpoint.
-4. Retire `src/fix_seed_emission.py` before claiming fixpoint if it is still applied to any `.sams`.
+4. (Done: `src/fix_seed_emission.py` was removed 2026-10-16.) Retire it before claiming fixpoint if it is still applied to any `.sams`.
 5. Optionally add `trials/self_host_addition/` wrapping steps 1–3 so `make integrate` runs them.
 
 **Exit criteria:**
@@ -433,7 +444,7 @@ Work items map to W-ids from Step 0.2. Prefer fixing and simplifying **inside `s
 
 ## Historical: the first vertical slice (all landed between 2026-07-16 and 2026-09-02)
 
-1. Step 0.1 inventory (read-only against frozen `src/` / bootstrap); optionally note orphan `src/btree_set_nodeid.silica` for later cleanup — **do not delete from frozen `src/` in this PR unless already unused by the default build**
+1. Step 0.1 inventory (read-only against frozen `src/` / bootstrap); optionally note orphan `src/btree_set_nodeid.silica` for later cleanup (removed 2026-10-16) — **do not delete from frozen `src/` in this PR unless already unused by the default build**
 2. Copy `src/` → `src/` (or scripted sync) with README stating: edit only `src/` for self-host work
 3. Step 5.1 in `src/` only: remove `type TokenKind = int64` (and any other aliases)
 4. Step 3.1 `src/compiler_maps.silica` + self-host trial (explicit `OrderedMap[…]`; no aliases)
@@ -459,25 +470,4 @@ That sequences **freeze production → parallel alias ban → parallel WBT emitt
 
 ## Completion Tracking
 
-| Area | Status | Notes |
-| ---- | ------ | ----- |
-| Phase 0 audit | Done | Workaround sites catalogued in Step 0.2; ~23 `bootstrap` workaround comments survive in `src/` as history (W02 `effect_checker_core.silica:239`, W04 `atom_rodata.silica:21,28`, W15 `term_user_call_abi.silica:144`) — reclassify or delete |
-| `src/` parallel tree | Diverged dialect tree | No longer a copy of `src/`: 333 units, different builtins (`length_bytes`/`length_chars`), `{}` blocks, list destructuring, different file layout; file-by-file refresh from `src/` is no longer possible |
-| Frozen `src/` + bootstrap | `src/` edited for seed builtins only | Bootstrap crate untouched; `src/` changed when the seed must learn something `src/` needs (Global Rule 8, relaxed) |
-| Build system dual-mode | Complete | `make -C src build` = config-driven batch, parallel `.sams`→`.o`, Rust-free link, auto-publish via `binaries/install_compiler.bash selfhost`; host pinned to `binaries/seed-compiler` (`check-seed`) |
-| DeviceIO file intrinsics | Done | `src_staging_deviceio/` overlay no longer exists; DeviceIO resolved by `silica_rt_shim.s` + `deviceio_link_thunks.s` at link |
-| Named-struct dialect rewrite | Complete (waves A–C) | 0 named structs, 0 aliases; `Expr`/`SIRTerm` are index arenas |
-| Runtime link | Rust-free | `silica_rt_shim.s` supplies the four `_silica_*` symbols; binary shrank from 7.98 MB to 4.73 MB |
-| `data_structures/bst.silica` | Gone from `src/` | Still in frozen `src/`; five emitter pools use `compiler_maps` + WBT; `string_literal_pool` not migrated (Step 3.3) |
-| `ListSymbolEntry` | Named struct gone; list remains | Wave A turned it into `List[<inline record>]`; the environments stay lists (WBT-map upgrade withdrawn 2026-09-29) |
-| `type TokenKind = int64` | Cleared in `src/` | Still present in frozen `src/` (`lexer/lexer_token_kind.silica:172`); Global Rule 9 |
-| `wbt_map` / `wbt_set` stdlib | Accepted (§§8A–§10) | Only `wbt_map` + `OrderedMap` are compiler-internal |
-| `compiler_maps` + emitter WBT | Done in parallel tree | Smoke: `trials/ordered_data_structures/self_host_maps/compiler_string_index_map` |
-| `list_nth` builtin (memory wall) | Implemented in `src/` and `src/` | Allocation-free list index; parser peak on `emitter_core.silica` 8.0 GB → 3.2 GB; confirming selfhost build pending (Lee) |
-| Selfhost compiles all of `src` | Unproven | `emitter_core.silica` is the sole entry in `src/silica.compile.order`; on-disk `.sams` are seed products |
-| Generation 2 / differential / fixpoint | Not started | Ladder steps 5–7 in the status snapshot; no target, script or log exists |
-| Compiler trait obligations | Not complete | See traits doc §Compiler obligations; and defect A5 (provided methods across the exit-75 restart) |
-| `tree_binary` / `BinaryTree` stdlib | Planned | Standard-plan §§7.10, 8D, 9D |
-| Parser `Expr` / `SIRTerm` seed-legal form | Done (arena) | Stays an index arena |
-| Stray `btree_set_nodeid.silica` | Orphan in **both** trees | `src/topo_silica_config.sh:56` excludes it from the build (it is the only remaining `use btree_set_csr`); delete from `src/` now, from `src/` at cutover |
-| Bootstrap retirement | In progress | Bootstrap confined to producing the seed; retirement gated on gen 2 → differential → fixpoint → cutover (6.3–6.4) |
+Superseded by the Status (2026-10-16) tables at the top of this document. Remaining open: Step 3.3 (`string_literal_pool` linear scan). The two orphan files named there were removed 2026-10-16.

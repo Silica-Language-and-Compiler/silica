@@ -28,7 +28,11 @@ use control;
 use module_linkage;
 use reg_conventions;
 use var;
+use atom_table;
+use string_parse;
+use prims_tuple;
 use x86_isa;
+use x86_mem;
 
 export emit_call_body/3;
 export emit_call_body_effects/5;
@@ -36,6 +40,7 @@ export emit_call_body_with_callee/3;
 export emit_tail_call_body/4;
 export sir_call_targets_bound_callee/2;
 export emit_indirect_callee_address_to_x17/2;
+export sret_node_listed/3;
 
 
 // Local SIRTerm arena helpers (sir_ast node accessors are not exported).
@@ -116,6 +121,102 @@ fn emit_indirect_callee_address_to_x17(outer_reg: string, sir_callee: string) ->
     }
 }
 
+// --- sret tuple calls (reg_conventions@is_sret_tuple_type) ------------------------------------------
+//
+// The callee copies its result to [X8] and returns X8 in X0; X8 = 0 asks it for a fresh region block,
+// which is what every tuple call got before. What the caller names:
+//   - `_x8h<node>=N`: the let that destructures this call's result reserved a home at [X29, #-N]
+//     (term_reg_spill@with_home); the result is read through the projections and dies with the frame;
+//   - a call on the function's return spine (`_rsp` lists the node) of an sret function passes the
+//     caller's own buffer through (`_rsret=N`: X8 was saved at [X29, #-N] on entry);
+//   - anything else (bound to a name, an argument, an element, ...) may outlive the frame: X8 = 0.
+// A call whose type is not an sret tuple but goes through a function value may still reach an sret
+// function (a generic fn(T) -> T instantiated at a tuple), so it passes 0 as well.
+
+// True when `key` (",<idx>,") occurs in `list` at or after i.
+fn sret_node_listed(list: string, key: string, i: int64) -> boolean {
+    case i + length_bytes(key) > length_bytes(list) of {
+        true -> false;
+        false -> case substring(list, i, i + length_bytes(key)) == key of {
+            true -> true;
+            false -> sret_node_listed(list, key, i + 1)
+        }
+    }
+}
+
+// X8 <- X29 - N (N a positive decimal string). X17 may hold an indirect callee: not used here.
+fn sret_x8_fp_sub(n: string) -> string {
+    case string_parse@string_to_int64(n) <= 4095 of {
+        true -> x86_isa@x86_sub("X8", "X29", concat("#", n));
+        false -> concat(x86_isa@x86_mov("X8", concat("#", n)), x86_isa@x86_sub("X8", "X29", "X8"))
+    }
+}
+
+fn sret_x8_load_saved(n: string) -> string {
+    concat(sret_x8_fp_sub(n), x86_mem@x86_ldr("X8", "[X8, #0]"))
+}
+
+// A reply-form callee ((:reply, R, S) / (:no_reply, S)) takes its reply buffer in X<n> after its n
+// arguments, not an sret pointer in X8, and with 8 parameters that is X8 itself: an indirect call
+// must not zero it. See trials/compile_defects_reply_float_param_direct_call_addition.
+fn reply_form_result_type(t: string) -> boolean {
+    (length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,") or (length_bytes(t) >= 11 and substring(t, 0, 11) == "(:no_reply,")
+}
+
+// X8 is the result buffer only where a call sets it on purpose: the sret paths above (a home, this
+// function's own incoming buffer, or 0), a reply-form callee whose reply buffer is X<argc> (X8 itself
+// with 8 parameters), and a tuple call whose slab term_emit_kind_call reserved with MOV X8, SP. Every
+// other user call clears it: a callee that returns a record through X8 (emitter_core@
+// fn_returns_sret_tuple) copies its result wherever a nonzero X8 points, and the caller's view of the
+// type can miss that callee's convention. `m: OrderedMap[string, int64, mem(normal)] <-
+// wbt_map@empty(..)` carried the trait type, no X8 was set, and the 64-byte map was copied over the
+// 32-byte witness record X8 still pointed at; on linux_aarch64 that record ended an actor arena block
+// mapped just below a glibc heap, and the copy overwrote the heap header (malloc arena assertion in
+// gen2 compiling the tree). Clearing costs one instruction and a stale X8 can never reach a callee.
+fn keeps_x8_for_callee(t: string) -> boolean {
+    reply_form_result_type(t) or reg_conventions@is_tuple_type(t)
+}
+
+fn sret_x8_setup(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, indirect: boolean) -> string {
+    case prims_tuple@is_sret_aggregate_type(sir_term_root_node(term).type_name) of {
+        true -> {
+            home: string <- var@find_sp_binding(outer_reg, concat("_x8h", atom_table@int64_to_decimal_string(term.root)));
+            case length_bytes(home) > 0 of {
+                true -> sret_x8_fp_sub(home);
+                false -> {
+                    saved: string <- var@find_sp_binding(outer_reg, "_rsret");
+                    on_spine: boolean <- length_bytes(saved) > 0 and sret_node_listed(var@find_sp_binding(outer_reg, "_rsp"), concat(",", concat(atom_table@int64_to_decimal_string(term.root), ",")), 0);
+                    case on_spine of {
+                        true -> sret_x8_load_saved(saved);
+                        false -> x86_isa@x86_mov("X8", "XZR")
+                    }
+                }
+            }
+        };
+        false -> case keeps_x8_for_callee(sir_term_root_node(term).type_name) of {
+            true -> "";
+            false -> x86_isa@x86_mov("X8", "XZR")
+        }
+    }
+}
+
+// A tail call hands the callee this function's own X8.
+fn sret_x8_tail_setup(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, indirect: boolean) -> string {
+    case prims_tuple@is_sret_aggregate_type(sir_term_root_node(term).type_name) of {
+        true -> {
+            saved: string <- var@find_sp_binding(outer_reg, "_rsret");
+            case length_bytes(saved) > 0 of {
+                true -> sret_x8_load_saved(saved);
+                false -> x86_isa@x86_mov("X8", "XZR")
+            }
+        };
+        false -> case keeps_x8_for_callee(sir_term_root_node(term).type_name) of {
+            true -> "";
+            false -> x86_isa@x86_mov("X8", "XZR")
+        }
+    }
+}
+
 fn emit_call_body_effects(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, effect_value: string, outer_reg: string, indirect_via_x9: boolean) -> string {
     call_effects: string <- effect_value;
     pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
@@ -162,9 +263,10 @@ fn emit_call_body_effects(term: { nodes: List[{ kind: int64, type_name: string, 
         true -> concat(eff_comment, "\n");
         false -> ""
     };
+    x8_line: string <- sret_x8_setup(term, outer_reg, indirect_via_x9);
     with_pre: string <- case length_bytes(pre_barrier) > 0 of {
-        true -> concat(with_comment, concat(pre_barrier, concat("\n", adrp_line)));
-        false -> concat(with_comment, adrp_line)
+        true -> concat(with_comment, concat(pre_barrier, concat("\n", concat(x8_line, adrp_line))));
+        false -> concat(with_comment, concat(x8_line, adrp_line))
     };
     with_post: string <- case length_bytes(post_barrier) > 0 of {
         true -> concat(with_pre, concat("\n", post_barrier));
@@ -201,7 +303,7 @@ fn emit_tail_call_body(term: { nodes: List[{ kind: int64, type_name: string, val
         true -> concat(with_comment, concat(pre_barrier, "\n"));
         false -> with_comment
     };
-    concat(with_pre, br_line)
+    concat(with_pre, concat(sret_x8_tail_setup(term, outer_reg, indirect_via_x9), br_line))
 }
 
 // Emit call with explicit callee symbol (e.g. silica_print_float64 for print_float64).

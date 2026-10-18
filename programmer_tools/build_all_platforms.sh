@@ -367,22 +367,8 @@ local_fixpoint() {
 
 # ---------------------------------------------------------------- remote helpers
 
-# SYNC_BUILD_EXCLUDES (sync_excludes.sh) keeps every built artifact (.o .a .so .dylib, .sams, .iface,
-# trial outputs and executables, compiler/build/, fixtures/build/) on the machine that built it.
-RSYNC_EX=( "${SYNC_BUILD_EXCLUDES[@]}"
-           --exclude '.git' --exclude '*.tmp'
-           # *.tmp: write-then-rename Makefile artifacts (silica.config.compiler.tmp,
-           # .silica.config.units.tmp); if a build is running here mid-sync, rsync can catch one
-           # existing and then find it gone by the time it reads it (exit 23, "open (2): No such
-           # file or directory") -- excluded so the race can't happen, not just tolerated.
-           # Local-only working state. .claude/worktrees in particular holds a full checkout per
-           # agent and reached 5.3 GB on a machine with 5.4 GB free, which filled its disk.
-           --exclude '.claude' --exclude '.claude-memory' --exclude '.codex_artifacts'
-           --exclude '.cursor' --exclude '.vscode' --exclude '.scratch'
-           --exclude 'board_backups' --exclude '*.pptx' --exclude '*.ndjson'
-           # trials/.target is the board mirror: build output only, large, and rewritten by any
-           # board run, so rsync trips over files that vanish while it reads them.
-           --exclude '.target' --exclude '*.elf' --exclude '*.map' --exclude '*.image.log' )
+# Syncing a remote machine is programmer_tools/sync_to_hosts.sh (pull goldens back, delete what this
+# tree no longer has, push without built artifacts); see its header.
 
 remote_sh() { ssh -o BatchMode=yes "$1" "$2"; }
 
@@ -392,16 +378,14 @@ remote_build_and_fixpoint() {  # $1 = target, $2 = user@host, $3 = remote repo p
     echo "== $t on $conn"
     remote_sh "$conn" "true" >/dev/null 2>&1 || { echo "  cannot reach $conn over ssh"; return 1; }
 
-    echo "  sync sources"
-    local exfile; exfile="$(mktemp "${TMPDIR:-/tmp}/silica-sync-exe.XXXXXX")"
-    sync_exe_excludes "$REPO/trials" "/trials" > "$exfile"
-    rsync -a "${RSYNC_EX[@]}" --exclude-from="$exfile" --exclude 'binaries/' \
-        "$REPO/" "$conn:$rpath/" >>"$log" 2>&1 || { rm -f "$exfile"; echo "  sync failed (see $log)"; return 1; }
-    rm -f "$exfile"
+    # sync_to_hosts.sh: pull this platform's goldens back, delete what this tree no longer has
+    # (Lee's rule 2026-10-12; build outputs, binaries/ and this platform's goldens stay), then push.
+    echo "  sync sources (sync_to_hosts.sh)"
+    bash "$(dirname "${BASH_SOURCE[0]}")/sync_to_hosts.sh" --apply --remote "${t}=${conn}:${rpath}" \
+        --list-dir "$LOG_DIR/sync" >>"$log" 2>&1 || { echo "  sync failed (see $log)"; return 1; }
 
-    # rsync adds and updates but never removes, so a directory renamed here survives on the remote
-    # as a stale duplicate of the whole compiler tree. Nothing builds from it, but it costs disk on
-    # a machine that may not have much. Report it and let the owner decide.
+    # The sync now deletes directories this tree no longer has, so this should not appear; it stays
+    # as a check (the deleting sync refuses when more than 40% of the host would go).
     if remote_sh "$conn" "test -f $rpath/compiler/src/Makefile && test -d $rpath/compiler/silica-compiler" >/dev/null 2>&1; then
         local stale; stale="$(remote_sh "$conn" "du -sh $rpath/compiler/silica-compiler 2>/dev/null | cut -f1")"
         echo "  note: $conn still holds the pre-rename tree at $rpath/compiler/silica-compiler (${stale:-unknown size})."

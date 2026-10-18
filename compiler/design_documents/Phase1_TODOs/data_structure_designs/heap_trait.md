@@ -1,5 +1,7 @@
 # `Heap` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/Heap.silica` over `brodal_okasaki_min` / `brodal_okasaki_max`; trials: the `heap_*` programs in `trials/ordered_data_structures/heap_collections/`. Deviations (module header): `peek` takes a placeholder item; a `Heap[...]` binding is accepted only for an `@empty` call, other results use the inline record type.
+
 **Public trait:** `Heap`  
 **Generated modules:** `brodal_okasaki_min`, `brodal_okasaki_max`  
 **Shared core:** [`brodal_okasaki_queue.md`](brodal_okasaki_queue.md)

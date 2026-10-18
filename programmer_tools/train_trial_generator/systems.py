@@ -97,7 +97,7 @@ def t_act_cast_then_call(rng, area):
     init = rng.randint(0, 9)
     k = rng.randint(1, 9)
     beh = fn_decl("sink", [("msg", "int64"), ("state", "int64")], "(:no_reply, int64)", [], "(:no_reply, state + msg)")
-    stmts = [f"w: actor_ref <- spawn({init}, sink)", f"enqueued: boolean <- cast(w, {k} impl ActorMessage {{}})", "print_bool(enqueued)", 'println("")']
+    stmts = [f"w: actor_ref <- spawn({init}, sink)", f"enqueued: boolean <- cast(w, {k} impl ActorMessage {{}})", "print_boolean(enqueued)", 'println("")']
     body = seq_block(["concurrency", "device_io"], stmts, ":ok", 0)
     hdr = "// Spec §16.1.2: cast enqueues asynchronously and returns boolean; behavior returns (:no_reply, new_state)"
     src = program(beh, f"fn main() -> atom {{\n{body}\n}}", header=hdr)

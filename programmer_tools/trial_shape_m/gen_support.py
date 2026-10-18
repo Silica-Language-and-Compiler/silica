@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Write the shared trial-support modules (item M) into trials/lib_trial_support/.
+
+    gen_support.py [OUT_DIR]
+
+One module per (form, type). Each holds its own Supervisor impl (one supervisor, one :transient
+worker, restart limit 0), the worker, and two exported functions main calls: start/0 and run/1.
+Atoms (:trial_supervisor, :trial_worker) are named only in the module, because atoms are numbered
+per compilation unit.
+
+  trial_support_<T>  cast form. run(work) casts the work; the worker calls it and ends the wait with
+                     cast_exit: the value itself for int64, 0 for every other type (main then ends
+                     with its own literal result).
+  trial_wait_<T>     wait form, for a main that already ended in wait_for_exit: the worker runs the
+                     work and returns; the harness's `exit` line ends the wait.
+
+Every module's start() spawns the FailureReporter and registers it (start_reporter) before it starts anything else
+(spec §15.4.13.4, E2236: register_failure_reporter must run before any start). While a reporter is
+registered the runtime hands it every unwind report instead of writing the report to stderr itself
+(silica_rt_actor_deliver_unwind_report on every target), so the reporter writes the report to
+stderr exactly as the runtime would have, and every .scout that holds a failure banner still
+matches. The root supervisor's own report (no supervisor, frame #0 `<unknown behavior>`) also ends
+the program with cast_exit(70), the fault status. The reporter's declarations follow the module's
+older ones and name no new atom or record shape, so the atoms keep their first-appearance order and
+a suite's application tables are not renumbered. e2236_convert.py writes the same reporter into
+trials whose main starts its own actors.
+"""
+
+import os
+import sys
+
+TYPES = ('int64', 'int32', 'int16', 'int8', 'uint64', 'uint32', 'uint16', 'uint8',
+         'float64', 'float32', 'float16', 'atom', 'boolean', 'string')
+
+CHILD = ('{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: %s, '
+         'restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }')
+FLAGS = ('{ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, '
+         'restarts_time_frame: int64 }')
+
+HEAD = {
+    'support': 'a trial whose work returns %(t)s. main starts the supervisor, casts the work to its one\n'
+               '// worker and waits in wait_for_exit; the worker runs the work and\n// %(ends)s.',
+    'wait': 'a trial whose work starts actors that print and then waits for the `exit` line. main\n'
+            '// starts the supervisor, casts the work to its one worker and waits; the worker runs the\n'
+            '// work and returns.',
+}
+
+
+def module(form, t):
+    name = 'trial_%s_%s' % (form, t)
+    sup = 'Trial%s%sSupervisor' % (form.capitalize(), ''.join(p.capitalize() for p in t.split('_')))
+    if True:  # every form's worker is a :no_reply behaviour
+        beh_t = 'fn(msg: fn() -> %s, state: int64) -> (:no_reply, int64)' % t
+        if form == 'wait':
+            worker = ('fn worker(msg: fn() -> %s, state: int64) -> (:no_reply, int64) {\n'
+                      '    _: %s <- msg();\n'
+                      '    (:no_reply, state)\n'
+                      '}\n') % (t, t)
+            ends = ''
+        elif t == 'int64':
+            worker = ('fn worker(msg: fn() -> int64, state: int64) -> (:no_reply, int64) {\n'
+                      '    sequence proc[concurrency]\n'
+                      '        value: int64 <- msg();\n'
+                      '        _: boolean <- cast_exit(value)\n'
+                      '    produces\n'
+                      '        pure (:no_reply, state)\n'
+                      '    end\n'
+                      '}\n')
+            ends = 'hands its value back through cast_exit, so wait_for_exit returns it'
+        else:
+            worker = ('fn worker(msg: fn() -> %s, state: int64) -> (:no_reply, int64) {\n'
+                      '    sequence proc[concurrency]\n'
+                      '        _: %s <- msg();\n'
+                      '        _: boolean <- cast_exit(0)\n'
+                      '    produces\n'
+                      '        pure (:no_reply, state)\n'
+                      '    end\n'
+                      '}\n') % (t, t)
+            ends = 'ends the wait with cast_exit(0); main then ends with its own literal result'
+        run = ('// Casts the trial\'s work to the worker.\n'
+               'fn run(work: fn() -> %s) -> boolean {\n'
+               '    sequence proc[concurrency]\n'
+               '        sent: boolean <- cast_registered(:trial_worker, work impl ActorMessage {})\n'
+               '    produces\n'
+               '        pure sent\n'
+               '    end\n'
+               '}\n') % t
+    child = CHILD % beh_t
+    text = ('// Trial support (actor_memory_budget_plan.md item M), generated by\n'
+            '// programmer_tools/trial_shape_m/gen_support.py: the supervisor-actor shape for\n'
+            '// ' + HEAD[form] % {'t': t, 'ends': ends} + '\n\n'
+            'use Supervisor;\n\n'
+            'impl %s for Supervisor;\n\n'
+            'export start/0;\n'
+            'export run/1;\n\n' % sup)
+    text += worker + '\n'
+    text += ('fn init(initial_state: int64) -> (\n'
+             '    %s,\n'
+             '    List[%s, mem(normal)]\n'
+             ') {\n'
+             '    sequence proc[mem(normal)]\n'
+             '        flags: %s <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 1 };\n'
+             '        children: List[%s, mem(normal)] <- [\n'
+             '            { id: :trial_worker, agent_type: :worker, initial_state: initial_state, behavior: worker, restart: :transient, shutdown: 0, flavor: :plain }\n'
+             '        ]\n'
+             '    produces\n'
+             '        pure (flags, children)\n'
+             '    end\n'
+             '}\n\n') % (FLAGS, child, FLAGS, child)
+    text += ('// Starts and registers the FailureReporter, then starts the supervisor and its worker.\n'
+             'fn start() -> supervisor_ref {\n'
+             '    sequence proc[concurrency]\n'
+             '        _: atom <- start_reporter();\n'
+             '        sup: supervisor_ref <- spawn_registered_supervisor(%s, 0, :trial_supervisor, stack_policy(0, :keep_last_message))\n'
+             '    produces\n'
+             '        pure sup\n'
+             '    end\n'
+             '}\n\n') % sup
+    text += run + '\n'
+    # after every declaration of the old module, so the atoms keep their first-appearance order
+    text += REPORTER + START_REPORTER
+    return name, text
+
+
+# The FailureReporter every module registers (spec §15.4.13.4). region_dump_limit must be defined in
+# the unit that calls register_failure_reporter (the emitters call the caller unit's own).
+REPORTER = (
+    '// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).\n'
+    '// region_dump_limit is called once at registration; 0 disables region dumps.\n'
+    'fn region_dump_limit() -> int64 {\n'
+    '    0\n'
+    '}\n\n'
+    '// True for the root supervisor\'s own report: no supervisor (a null pointer prints as 0x0 on\n'
+    '// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,\n'
+    '// the runtime-owned supervisor behaviour. A worker\'s report always names its behaviour.\n'
+    'fn report_is_from_root_supervisor(report: string) -> boolean {\n'
+    '    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\\n") or contains(report, "supervisor_acb:  (nil)\\n") or contains(report, "supervisor_acb:  0x00000000\\n");\n'
+    '    no_supervisor and contains(report, "#0  <unknown behavior>")\n'
+    '}\n\n'
+    '// A registered reporter receives every report the runtime would otherwise write to stderr, so it\n'
+    '// writes the report there itself. The root supervisor\'s report ends the program with status 70.\n'
+    'fn reporter(report: string, state: int64) -> (:no_reply, int64) {\n'
+    '    sequence proc[concurrency, device_io]\n'
+    '        _: atom <- println_stderr(report);\n'
+    '        _: boolean <- case report_is_from_root_supervisor(report) of {\n'
+    '            true -> cast_exit(70);\n'
+    '            false -> true\n'
+    '        }\n'
+    '    produces\n'
+    '        pure (:no_reply, state)\n'
+    '    end\n'
+    '}\n\n')
+
+
+START_REPORTER = (
+    '// Spawns the FailureReporter and registers it.\n'
+    'fn start_reporter() -> atom {\n'
+    '    sequence proc[concurrency]\n'
+    '        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));\n'
+    '        registered: atom <- register_failure_reporter(reporter_ref)\n'
+    '    produces\n'
+    '        pure registered\n'
+    '    end\n'
+    '}\n')
+
+
+def main():
+    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), '..', '..', 'trials', 'lib_trial_support')
+    os.makedirs(out, exist_ok=True)
+    n = 0
+    for form in ('support', 'wait'):
+        for t in TYPES:
+            name, text = module(form, t)
+            open(os.path.join(out, name + '.silica'), 'w').write(text)
+            n += 1
+    print('wrote %d modules to %s' % (n, os.path.normpath(out)))
+
+
+if __name__ == '__main__':
+    main()

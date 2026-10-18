@@ -1,6 +1,15 @@
 # Silica Device Actor Specification
 
-**Status:** Normative for the language rules below. **Not implemented** in the current compiler or runtime. Until the checker enforces these rules, `register_rwr` is only an effect name plus optional barriers. The poke prims are `map_device`, `peek`, and `poke` (§4.7); every device they reach needs a description: the target's board pack describes the on-board devices, and the programmer describes any other device (§4.9). Bring-up inventory: [porting_for_os_free_targets.md](porting_for_os_free_targets.md).
+**Status:** Normative for the language rules below. **Implemented** for the ESP32-S3_raw target (see "Implementation status (2026-10-16)" below). The poke prims are `map_device`, `peek`, and `poke` (§4.7); every device they reach needs a description: the target's board pack describes the on-board devices, and the programmer describes any other device (§4.9). Bring-up inventory: [porting_for_os_free_targets.md](porting_for_os_free_targets.md).
+
+**Implementation status (2026-10-16).** Detailed record: [ports/esp32s3_peek_poke_implementation_plan.md](ports/esp32s3_peek_poke_implementation_plan.md) (status table at its top).
+
+- *Shared compiler (all ports):* the `register_rwr` effect; `spawn_device`, `spawn_device_registered`, `cast_device`, `cast_device_registered`, `device_actor_ref`, `device_window`; the built-in `DeviceDescription` and `Register8` to `Register64` traits (`compiler/stdlib/`); description validation and the `peek`/`poke` checks (`type_checker/device/type_checker_device_descriptions.silica`, `type_checker/expressions/type_checker_expressions_device.silica`); module rules (`module_checker/module_checker_device.silica`); SIR lowering (`sir_generator/terms/sir_device_calls.silica`). Codes: E2201 to E2217, E2219, E2220, E2223 to E2225, E2230 to E2233 and the warning W2201 (write-one-to-clear read-modify-write), assigned in [error_codes.md](../error_codes.md). A `peek` of a `:write_only` register reports E2215, the same code as a `poke` to a `:read_only` one.
+- *Hosted targets (§10):* the pre-emit pass is `sir_generator/sir_target_verify.silica`, which reports E2220 naming the module, function and prim; the device-worker intrinsics are carried by the hosted runtimes with a third registry.
+- *ESP32-S3_raw (OS-free):* `emitter/ESP32-S3_raw/terms/prims/prims_device.silica` and the run-time twin `board/runtime/rt_device.S`. A constant base is checked against the board window table at compile time, a computed base at run time (abort `illegal device map`, status 71). Only 32-bit accesses are accepted on this board: `Register8`, `Register16` and `Register64` are refused in the emitter with an `.error` line naming the width. Trials: `trials/error_enforcement_addition/device_*`, `trials/warning_enforcement_addition/device_w1c_read_modify_write`, board-only `trials/device_actor_addition`.
+- *Board-pack descriptions:* on the ESP32-S3 the on-board devices are described by generated `device_esp32s3_<peripheral>_registers` modules (`emitter/ESP32-S3_raw/board/pack/`), written in the same `impl fn registers(device: (:tag))` form as a programmer description, with access modes; a tag the pack describes may be described only by the pack's own module for it, any other `impl fn registers` for it is E2239 (§4.9 rule 5; the tag-to-module table is `emitter/<TARGET>/pack_descriptions.silica`, empty on hosted targets; the pack windows without a generated description, rtc_cntl, timg0, timg1, systimer and usb_serial_jtag, are not listed yet). `emitter/ESP32-S3_raw/board_pack.silica` holds the windows (12), `window_containing`, `window_allows_width` and runtime-use rows, not access modes.
+- *Not enforced (no code or trial found):* the move-only use rule for `device_window` (§5.1; recorded as open in the peek/poke plan; the exclusive-overlap rule for live maps is not verified); `spawn_device` inside a `register_rwr` sequence; the restart-time hardware `init` rule of §8; the IRQ-enqueue contract of §9 (the ESP32-S3 runtime never enables interrupts: INTENABLE is 0 in `rt_vectors.S`); DMA buffer move laws (§5.3) for device-transfer message types.
+- *Not implemented:* programmer-described devices on a hosted target (device prims are rejected there by design); a generator from vendor SVD files (§3.3).
 
 This specification is the device-register counterpart to [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md). Ordinary actors never poke MMIO. Dedicated **device worker actors** own mapped windows and execute `register_rwr` sequences. Application actors request work by `cast`.
 
@@ -196,10 +205,10 @@ required {
 ```
 
 ```silica
-// device_esp32s3_uart.silica — supplied by the programmer (layout illustrative)
+// device_my_uart.silica — supplied by the programmer (layout illustrative)
 use devicedescription;
 
-impl fn registers(device: (:esp32s3_uart)) -> List[{ name: atom, offset: uint64, width: uint64, access: atom }] {
+impl fn registers(device: (:my_uart)) -> List[{ name: atom, offset: uint64, width: uint64, access: atom }] {
     [
         { name: :fifo,    offset: 0x00, width: 32, access: :read_write },
         { name: :int_raw, offset: 0x04, width: 32, access: :write_one_to_clear },
@@ -218,7 +227,7 @@ The description covers the register layout only. The base address is not part of
 2. **What it is implemented for.** The first parameter's type is a device tag, `(:tag)`. A program has at most one description per tag; a second is a compile-time error.
 3. **Data only.** The body is a single list literal of record literals whose fields are literals. No calls, bindings, conditionals, or arithmetic. The compiler reads the description as data at compile time without running it; programs may also call `devicedescription@registers` at run time like any trait method.
 4. **Required.** A `map_device` whose tag is neither a board-pack device tag nor described in a module visible from the calling module (in that module, or in a module it `use`s) is a compile-time error. There is no device access without a description.
-5. **Not for board-pack devices.** An `impl fn registers` whose tag is a board-pack device tag is a compile-time error, whatever the body says. The board pack's description is the only one.
+5. **Not for board-pack devices.** An `impl fn registers` whose tag is a board-pack device tag is a compile-time error, whatever the body says. The board pack's description is the only one. (E2239 BoardPackDeviceDescribed.)
 
 **Validity.** The shared compiler checks each description:
 
@@ -268,7 +277,7 @@ The same validity rules as §4.9 apply, checked by the shared compiler when it r
 
 A pack that fails these rules is a defect in the target, reported when the compiler is built or run for that target, not a program error.
 
-**Status of the ESP32-S3 pack.** `emitter/ESP32-S3_raw/board_pack.silica` is not yet fully conforming. It records each register's runtime use (`register_runtime_use`: `:reads`, `:writes`, `:reads_writes`) and a stride for per-pin arrays, but not the four access modes. It must be extended to list an access mode per register before the checks above can run against it.
+**Status of the ESP32-S3 pack (2026-10-16).** `emitter/ESP32-S3_raw/board_pack.silica` holds the window table, the run-time use of each register the runtime drives (`register_runtime_use`: `:reads`, `:writes`, `:reads_writes`) and a stride for per-pin arrays, but not access modes. The access-mode descriptions of the on-board peripherals are the generated `device_esp32s3_<peripheral>_registers` modules in `emitter/ESP32-S3_raw/board/pack/` (gpio, io_mux, ledc, rmt, spi2, system, uart), which the type checker reads like any programmer description. The validity checks above run on those modules as on a programmer description (E2201 to E2210); the pack-level checks (window overlap, register inside window) were not found in the compiler.
 
 ---
 
@@ -352,7 +361,7 @@ Hosted `device_io` print does not use this specification.
 
 ---
 
-## 11. Compile-time enforcement (when implemented)
+## 11. Compile-time enforcement
 
 The type checker uses the same style of markers as `__silica_tc_in_behavior` / `__silica_tc_in_main`:
 
@@ -393,9 +402,7 @@ These checks are in the shared compiler and behave the same on every port. The c
 | `peek` / `poke` width the port's board pack does not allow | Error naming the width |
 | Constant `map_device` outside the board pack's windows | Error |
 
-Suggested codes: **E2201** onward (device-actor family), adjacent to FFI taint **E2103**; the write-one-to-clear warning takes a warning code in the same family. Exact strings are assigned when the checker lands. Error-enforcement trials belong under `trials/error_enforcement_addition/` once seed/selfhost implement the rules; the hosted rejection needs one such trial on each hosted path.
-
-Until then, implementations **SHOULD** still follow this document in new OS-free work.
+Codes: **E2201** onward (device-actor family), adjacent to FFI taint **E2103**; the write-one-to-clear warning is **W2201**. The assigned codes and their strings are in [error_codes.md](../error_codes.md); error-enforcement trials are under `trials/error_enforcement_addition/device_*` (including `device_hosted_rejection_trial`).
 
 ---
 

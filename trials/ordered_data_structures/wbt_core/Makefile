@@ -124,11 +124,12 @@ check-wbt-alloc-rec-gate:
 
 lib-sources: stdlib-data-structures
 	@mkdir -p "$(LEAF_DIR)lib"
-	@ln -sf "$(abspath $(LEAF_DIR)$(LIB_SRC)/wbt_set.silica)" "$(LEAF_DIR)lib/wbt_set.silica"
-	@ln -sf "$(abspath $(LEAF_DIR)$(LIB_SRC)/wbt_map.silica)" "$(LEAF_DIR)lib/wbt_map.silica"
+	@# Relative (from lib/), so the links stay valid in a tree synced to another host.
+	@ln -sfn "../$(LIB_SRC)/wbt_set.silica" "$(LEAF_DIR)lib/wbt_set.silica"
+	@ln -sfn "../$(LIB_SRC)/wbt_map.silica" "$(LEAF_DIR)lib/wbt_map.silica"
 
 silica.config: lib-sources
-	@cd "$(LEAF_DIR)" && { \
+	@cd "$(LEAF_DIR)" && $(TRIAL_SUPPORT_LIB) && { \
 		printf '%s\n' $(ALL_COMPILE_SILICA); \
 		if [ -d lib ]; then find lib -name '*.silica' | sort; fi; \
 	} > silica.config

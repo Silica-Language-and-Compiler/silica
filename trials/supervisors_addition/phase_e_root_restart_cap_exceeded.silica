@@ -1,5 +1,11 @@
 // Phase E cap test (single supervisor):
 // verify that a worker's parent supervisor exits when it exceeds restart-frequency cap.
+// main calls the pulser once (it kills :cap_leaf_worker, restart 1 of 1) and drains the supervisor;
+// then an unsupervised killer kills it again: that passes the cap, so the supervisor stops the pulser
+// (its report, reason_tag 1, #0 kill_worker_beh) and ends (the root report, reason_tag 0). The
+// reporter's cast_exit on the root report ends main's wait_for_exit, and main prints "done".
+// Expected output (unordered compare): two noop_worker reports, the pulser's report, the root
+// supervisor's report, the root note, done, 0.
 
 use Supervisor;
 
@@ -64,6 +70,7 @@ fn noop_worker(msg: int64, state: int64) -> (:reply, int64, int64) {
 
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
         sup: supervisor_ref <- spawn_registered_supervisor(PhaseECapSingleSup, 400, :phase_e_cap_single_sup, stack_policy(0, :keep_last_message));
         _ready: {
             tag: :child_started | :ok | :children | :count | :child_info | :error,
@@ -74,6 +81,15 @@ fn main() -> int64 {
             child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },
             error: atom
         } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
+        first_leaf: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)],
+            count: int64,
+            child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },
+            error: atom
+        } <- call_supervisor(sup, { op: :get_child, id: :cap_leaf_worker } impl SupervisorMessage {});
         call_registered(:cap_pulser, 0 impl ActorMessage {});
         _drain1: {
             tag: :child_started | :ok | :children | :count | :child_info | :error,
@@ -84,29 +100,80 @@ fn main() -> int64 {
             child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },
             error: atom
         } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
-        call_registered(:cap_pulser, 1 impl ActorMessage {});
-        _drain2: {
-            tag: :child_started | :ok | :children | :count | :child_info | :error,
-            child: actor_ref,
-            status: atom,
-            children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)],
-            count: int64,
-            child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },
-            error: atom
-        } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
-        call_registered(:cap_pulser, 2 impl ActorMessage {});
-        _drain3: {
-            tag: :child_started | :ok | :children | :count | :child_info | :error,
-            child: actor_ref,
-            status: atom,
-            children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)],
-            count: int64,
-            child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },
-            error: atom
-        } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
-        println("done");
-        _: int64 <- wait_for_exit()
+        // The second kill passes the cap (allowed_restart_count 1): the supervisor shuts the pulser down
+        // and ends. It is made by an unsupervised actor running the pulser's behaviour, which the
+        // shutdown does not stop, so main's call to it always gets its reply; main reaches no child
+        // after this point. The reporter's cast_exit on the root supervisor's own report ends main's
+        // wait, so "done" comes after every report.
+        // The second kill must reach the restarted leaf, never the first one while it is still ending
+        // (that run printed one noop_worker report, about 1 run in 40 on pix and nix): wait until the
+        // supervisor lists a different actor under :cap_leaf_worker.
+        _: int64 <- await_leaf_restart(sup, first_leaf.child);
+        killer: actor_ref <- spawn(0, kill_worker_beh, stack_policy(0, :keep_last_message));
+        _: int64 <- call(killer, 1 impl ActorMessage {});
+        _: int64 <- wait_for_exit();
+        println("done")
     produces
         pure 0
+    end
+}
+
+// Asks the supervisor for :cap_leaf_worker until another actor than old holds it (the restart is done).
+fn await_leaf_restart(sup: supervisor_ref, old: actor_ref) -> int64 {
+    sequence
+        got: {
+        tag: :child_started | :ok | :children | :count | :child_info | :error,
+        child: actor_ref,
+        status: atom,
+        children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)],
+        count: int64,
+        child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },
+        error: atom
+    } <- call_supervisor(sup, { op: :get_child, id: :cap_leaf_worker } impl SupervisorMessage {});
+        restarted: boolean <- got.tag == :child_info and not (got.child == old);
+        r: int64 <- case restarted of {
+            true -> 0;
+            false -> await_leaf_restart(sup, old)
+        }
+    produces
+        pure r
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
     end
 }

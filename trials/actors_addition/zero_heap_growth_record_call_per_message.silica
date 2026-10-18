@@ -1,0 +1,87 @@
+// A record returned by a call inside an actor leaves nothing on the actor's heap once its fields
+// are read. Each message calls pair_record once and adds its two fields. Before the fix every call
+// copied its record to the actor's region, which nothing frees until the actor ends (32 bytes a
+// call on the Mac). The trial's work spawns the counter and casts it its first message; the
+// counter casts itself the next message through a helper, reads heap_used() on every message
+// through the same helper after the work and before the cast, keeps the reading from message 100
+// and at message 1100 prints how far the heap grew over the thousand messages between and ends the
+// program. The state is one int64 holding both numbers, messages handled + 4096 * heap_used() at
+// message 100. It uses trial_wait_int64 (whose worker does not end the program) and the suite's
+// existing {a, b} record shape, so it adds no shape that would renumber other trials.
+// Expected output:
+//   0
+//   0
+use trial_wait_int64;
+
+fn pair_record(n: int64) -> { a: int64, b: int64 } {
+    { a: n, b: n + 1 }
+}
+
+fn work(n: int64) -> int64 {
+    r: { a: int64, b: int64 } <- pair_record(n);
+    r.a + r.b
+}
+
+fn send_next(me: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast(me, 1 impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn finish(growth: int64) -> boolean {
+    sequence proc[concurrency, device_io]
+        _: atom <- print_int64(growth);
+        _: atom <- println("");
+        ended: boolean <- cast_exit(0)
+    produces
+        pure ended
+    end
+}
+
+fn read_heap_used() -> int64 {
+    sequence proc[mem(normal)]
+        used: int64 <- heap_used()
+    produces
+        pure used
+    end
+}
+
+// state: messages handled + 4096 * heap_used() at message 100
+fn count(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        base_then: int64 <- state / 4096;
+        n: int64 <- state - 4096 * base_then + msg;
+        _: int64 <- work(n);
+        used: int64 <- read_heap_used();
+        base: int64 <- case n == 100 of {
+            true -> used;
+            false -> base_then
+        };
+        me: actor_ref <- self();
+        _: boolean <- case n == 1100 of {
+            true -> finish(used - base);
+            false -> send_next(me)
+        }
+    produces
+        pure (:no_reply, n + 4096 * base)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                a: actor_ref <- spawn(0, count, stack_policy(0, :keep_last_message));
+                _: boolean <- cast(a, 1 impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

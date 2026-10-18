@@ -1,6 +1,6 @@
 # Growable and Shrinkable Actor Stacks — Implementation Plan
 
-**Scope:** chunk 1 after the first fixed point on every emitter path (see [ROADMAP.md](../../../../ROADMAP.md)).
+**Scope:** chunk 1 after the first fixed point on every emitter path (see [ROADMAP.md](../../../ROADMAP.md)).
 **Authority:** [silica-specification.md](../silica-specification.md) §15.1.2.2 *Actor Stack Architecture*, as
 revised on 2026-09-17, together with §15.4.11.2 (failure reasons) and §22.4 (`get_actor_memory_usage`).
 **Mechanics:** [actor_growable_stack_design.md](../actor_growable_stack_design.md) §2.1, §2.2, §4.2, §4.4 and §7,
@@ -74,8 +74,8 @@ it exceeds what the machine can commit, and a program only sees a smaller one wh
 Work items 1 to 6 are implemented; 7 (NUMA) is not applicable on the Mac or the Pi. The runtime is
 `emitter/<target>/terms/prims/prims_actors_stack_asm.silica` on both hosted paths, with the spawn,
 thread-loop, arena and fault-handler changes in `prims_actors_runtime_asm.silica` and
-`ffi_fault_runtime_asm.silica`. The Linux port was written from the Apple module and assembles, but has
-not run on a Pi yet. Decisions the specification leaves open, taken here:
+`ffi_fault_runtime_asm.silica`. The Linux AArch64 port was written from the Apple module (it ran on a Pi 5 the next day, below), and
+`emitter/linux_x86_64` carries its own copy of the module, so all three hosted paths have it. Decisions the specification leaves open, taken here:
 
 - The runtime is still one OS thread per actor (carriers are chunk 12). The thread keeps a 128 KB
   pthread stack for the mailbox loop and switches SP onto the reservation for every behavior call and
@@ -131,11 +131,15 @@ now frees first, on both hosts).
 | --- | --- |
 | Reservation, commit, release | `emitter/<target>/terms/prims/prims_actors_runtime_asm.silica`, `_silica_rt_actor_init_region` and the fault handler in `terms/ffi_fault_runtime_asm.silica` |
 | Fault precedence | `terms/ffi_fault_runtime_asm.silica`, `_silica_rt_sync_fault_handler`: reservation test first, then `_silica_rt_ffi_guarded_fault_handler_try` |
-| Actor control block | the ACB gains reserve, committed, retained, high-water, next-chunk and algorithm fields |
+| Actor control block | the ACB fields #272..#391 (stack base, reservation, committed, high-water, next chunk, algorithm, retained, usage ring, ring index, last message time, alternate stack, policy as given, saved runtime SP, lowered flag, pending exit atom), listed at the head of `prims_actors_stack_asm.silica`; the control block is 448 bytes on the hosted paths since 2026-10-12 |
 | `stack_policy` | type checker, SIR generator and the three emitters, following the same chain as `core_id` |
-| `main` | `emitter/linux_aarch64/emitter_core.silica` (`program_main_stack_trampoline`, to be removed), `src/Makefile` (`LDFLAGS_STACK`), `src/main.silica` |
+| `main` | `src/main.silica` (spawns the pipeline actor). The Linux `main` trampoline in `emitter/linux_aarch64/emitter_core.silica` and the Darwin `-Wl,-stack_size` flag are gone; `LDFLAGS_STACK` in `src/Makefile` now holds only the Linux link flags `-no-pie -rdynamic` |
 
 ## Still to decide
+
+The ESP32-S3 has no demand paging and no overcommit, so it does not use this design: the board's stack
+sizes, the chunk pool its actors draw from and the 1,000-actor target are in
+[actor_memory_budget_plan.md](../actor_memory_budget_plan.md) Part II. What remains open here:
 
 - Operating-system prerequisites: whether `vm.max_map_count` is documented or checked by the runtime at
   start, and what targets without demand paging (ESP32-S3) do instead. Awaiting discussion.
@@ -146,8 +150,17 @@ now frees first, on both hosts).
   after the message; a foreign call from deep inside a grown stack that grows further; a million idle
   actors holding no stack memory; a lowered reservation being exhausted and reported; the compiler
   running as an actor with a bounded RSS.
-- The chunk closes when those trials pass under the selfhost built by the selfhost on both hosts, and
+- The chunk closes when those trials pass under a compiler built by itself on both hosts, and
   `make fixpoint` passes again on both.
+
+**Status of the gate (2026-10-16).** The compiler-as-an-actor, deep-recursion, shrink, lowered-reservation and
+foreign-call trials exist and passed on Apple Silicon at the 2026-09-18 fixed point; Linux AArch64 reached its
+fixed point the same day (above) and Linux x86-64 on 2026-09-19 (it carries its own copy of the stack module). The
+Apple Silicon fixed point was reached again on 2026-10-16 (`make fixpoint`: 348 units compared, none emitted
+differently by gen2 than by gen1, gen3 byte-identical to gen2; build log
+`silica_builds/20261016-052517/fixpoint-apple_silicon_mac.log`). Open: the "million idle actors" trial (the hosted
+runtime is still one OS thread per actor; the trial holds a thousand, and the count waits on ROADMAP chunk 2's
+carriers) and the `vm.max_map_count` decision above.
 
 Related: [region_memory_safety_todo.md](region_memory_safety_todo.md) (arena ownership and release),
 [porting_for_os_free_targets.md](../porting_for_os_free_targets.md) (board stacks and the port table).

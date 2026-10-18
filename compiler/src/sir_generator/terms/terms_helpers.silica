@@ -400,12 +400,51 @@ fn sir_find_arrow_pos(s: string, i: int64) -> int64 {
     }
 }
 
+// A function-valued binding carries its surface type `fn(T1, T2) -> R`; a declared function's
+// scheme is `(T1, T2) -> R`. Both name their parameters between the first parenthesis and the arrow,
+// so a literal argument to a function value takes the formal type too: hv(9.75, 50) with
+// hv: fn(float64, int64) -> ... lowered 9.75 as the float32 default and passed S0 for a D0 parameter.
+// See trials/compile_defects_reply_float_param_direct_call_addition.
+fn sir_func_type_without_fn_keyword(func_type: string) -> string {
+    case length_bytes(func_type) >= 3 and substring(func_type, 0, 2) == "fn" and (substring(func_type, 2, 3) == "(" or substring(func_type, 2, 3) == " ") of {
+        true -> tuple_trim_ws(substring(func_type, 2, length_bytes(func_type)));
+        false -> func_type
+    }
+}
+
 fn sir_params_inner_from_func_type(func_type: string) -> string {
-    arrow_pos: int64 <- sir_find_arrow_pos(func_type, 0);
+    stripped: string <- sir_func_type_without_fn_keyword(func_type);
+    case stripped == func_type of {
+        true -> sir_params_inner_from_scheme(func_type);
+        false -> sir_params_inner_from_fn_value_type(stripped)
+    }
+}
+
+fn sir_params_inner_from_fn_value_type(t: string) -> string {
+    arrow_pos: int64 <- sir_find_top_arrow_from(t, 0, 0);
     case arrow_pos < 0 of {
         true -> "";
         false -> {
-            params_part: string <- substring(func_type, 0, arrow_pos);
+            params_part: string <- tuple_trim_ws(substring(t, 0, arrow_pos));
+            n: int64 <- length_bytes(params_part);
+            case n >= 2 and substring(params_part, 0, 1) == "(" and substring(params_part, n - 1, n) == ")" of {
+                true -> substring(params_part, 1, n - 1);
+                false -> ""
+            }
+        }
+    }
+}
+
+// The scheme's own arrow is the first one outside every bracket: a function-typed parameter has an
+// arrow of its own, and `(fn(float64, float64) -> float64, float64, float64) -> float64` cut at its
+// first ` -> ` gave no formal to the float64 parameters after it, so their literal arguments lowered
+// as the float32 default and went in S0/S1 for D0/D1 (apply2(addf, 3.0, 4.5) returned 0.0).
+fn sir_params_inner_from_scheme(func_type: string) -> string {
+    arrow_pos: int64 <- sir_find_top_arrow_from(func_type, 0, 0);
+    case arrow_pos < 0 of {
+        true -> "";
+        false -> {
+            params_part: string <- tuple_trim_ws(substring(func_type, 0, arrow_pos));
             case length_bytes(params_part) < 2 of {
                 true -> "";
                 false -> substring(params_part, 1, length_bytes(params_part) - 1)
@@ -783,12 +822,51 @@ fn sir_case_extend_context_for_pattern(context: { env: List[{ name: string, type
                 p_inner: string <- substring(pi.bind_type, 1, length_bytes(pi.bind_type) - 1);
                 sir_case_extend_tuple_elems(context, p_inner, 0, type_checker_tuple_decompose_helpers@case_count_tuple_elems(p_inner))
             };
+            // Record pattern `{ x: a, y: b }`: each field binding gets the field's type from the
+            // scrutinee record (type checker: case_extend_record_fields_rem). Without it `a` and `b`
+            // had no type, so `a + b > 6.5` lowered as float32 over float64 fields.
+            false -> case pi.pattern_kind == 8 of {
+            true -> sir_case_extend_record_fields(context, type_checker_record_types@record_case_inner_body(pi.bind_type), type_checker_tuple_decompose_helpers@case_record_variant_for_pattern(pi.bind_type, scrutinee_type));
             false -> case length_bytes(pi.bind_name) > 0 and pi.bind_name != "_" of {
             true -> { env: sir_env_add_symbol(context.env, pi.bind_name, case length_bytes(pi.bind_type) > 0 of { true -> pi.bind_type; false -> scrutinee_type }) };
             false -> case length_bytes(pi.list_tail_name) > 0 and pi.list_tail_name != "_" of {
                 true -> { env: sir_env_add_symbol(context.env, pi.list_tail_name, case length_bytes(pi.list_tail_type) > 0 of { true -> pi.list_tail_type; false -> scrutinee_type }) };
                 false -> context
             }
+            }
+            }
+        }
+    }
+}
+
+fn sir_case_extend_record_fields(context: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, rem: string, record_type: string) -> { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] } {
+    r: string <- type_checker_record_types@strip_spaces_rt(rem);
+    case length_bytes(r) == 0 of {
+        true -> context;
+        false -> {
+            (seg: string, rest: string) <- type_checker_record_types@record_case_field_step(r);
+            (fname: string, sub: string) <- type_checker_record_types@record_field_segment_name_sub(seg);
+            fty: string <- case length_bytes(fname) == 0 of {
+                true -> "";
+                false -> type_checker_record_types@find_field_type_in_record(record_type, fname)
+            };
+            case length_bytes(fty) == 0 of {
+                true -> sir_case_extend_record_fields(context, rest, record_type);
+                false -> {
+                    spi: { is_valid: boolean, pattern_kind: int64, bool_lit: boolean, str_lit: string, int_lit_str: string, bind_name: string, bind_type: string, list_tail_name: string, list_tail_type: string } <- type_checker_tuple_decompose_helpers@case_parse_record_field_subpat(sub, fty);
+                    ctx2: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] } <- case spi.is_valid of {
+                        false -> context;
+                        true -> case spi.pattern_kind of {
+                            2 -> case length_bytes(spi.bind_name) > 0 and spi.bind_name != "_" of {
+                                true -> { env: sir_env_add_symbol(context.env, spi.bind_name, spi.bind_type) };
+                                false -> context
+                            };
+                            8 -> sir_case_extend_record_fields(context, type_checker_record_types@record_case_inner_body(spi.bind_type), type_checker_tuple_decompose_helpers@case_record_variant_for_pattern(spi.bind_type, fty));
+                            _: int64 -> context
+                        }
+                    };
+                    sir_case_extend_record_fields(ctx2, rest, record_type)
+                }
             }
         }
     }
@@ -821,7 +899,21 @@ fn sir_identifier_is_function(context: { env: List[{ name: string, type_name: st
 
 fn user_call_first_arg_expected_type(context: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, callee_name: string, inferred: string) -> string {
     case length_bytes(inferred) > 0 and type_checker_record_types@record_type_starts(inferred) of {
-        true -> inferred;
+        // A record argument keeps its own type, except against an all-scalar record formal: there the
+        // formal's field types win, so `whole({ x: 3.5, y: 3.25 })` against `{ x: float64, y: float64 }`
+        // builds float64 fields instead of the float32 the unsuffixed literals infer (the type checker
+        // has already matched the two record types).
+        true -> {
+            func_type_r: string <- lookup_function_type_for_call_sir(context.env, callee_name);
+            first_ty_r: string <- case length_bytes(func_type_r) == 0 of {
+                true -> "";
+                false -> first_formal_param_type_from_scheme(func_type_r)
+            };
+            case formal_is_all_scalar_record_type(first_ty_r) and type_checker_record_types@count_record_fields(first_ty_r) == type_checker_record_types@count_record_fields(inferred) of {
+                true -> first_ty_r;
+                false -> inferred
+            }
+        };
         false -> {
             func_type: string <- lookup_function_type_for_call_sir(context.env, callee_name);
             case length_bytes(func_type) == 0 of {
@@ -919,7 +1011,11 @@ fn expected_or_inferred_call_arg_type(context: { env: List[{ name: string, type_
     // callee read as a float64 word (float64_addition/float_literal_in_tuple_argument). Placeholder
     // and nested formals keep the inferred type as before.
     tuple_literal_takes_formal: boolean <- type_checker_expressions_helpers@expr_kind(expr) == 9 and formal_is_all_scalar_tuple_type(formal_type);
-    case literal_takes_formal or tuple_literal_takes_formal of {
+    // A record literal argument (kind 21) likewise takes an all-scalar record formal: `{ x: 3.5 }`
+    // against `{ x: float64 }` must build a float64 field, not the float32 default.
+    // The formal must also have the literal's field count (the type checker matched the two).
+    record_literal_takes_formal: boolean <- type_checker_expressions_helpers@expr_kind(expr) == 21 and formal_is_all_scalar_record_type(formal_type) and (length_bytes(inferred) == 0 or type_checker_record_types@count_record_fields(formal_type) == type_checker_record_types@count_record_fields(inferred));
+    case literal_takes_formal or tuple_literal_takes_formal or record_literal_takes_formal of {
         true -> formal_type;
         false -> case length_bytes(inferred) > 0 of {
             true -> inferred;
@@ -947,6 +1043,39 @@ fn formal_tuple_elems_all_scalar(t: string) -> boolean {
             }
         };
         false -> formal_is_scalar_elem_type(t)
+    }
+}
+
+// `{ x: float64, y: float64 }`, `{ n: int32, ok: boolean }` ...: a record type whose every field is a
+// scalar. A nested record, tuple, list, function or placeholder field answers false.
+fn formal_record_fields_all_scalar(rem: string) -> boolean {
+    r: string <- type_checker_record_types@strip_spaces_rt(rem);
+    case length_bytes(r) == 0 of {
+        true -> true;
+        false -> {
+            (seg: string, rest: string) <- type_checker_record_types@record_case_field_step(r);
+            (fname: string, fty: string) <- type_checker_record_types@record_field_segment_name_sub(seg);
+            case length_bytes(fname) > 0 and formal_is_scalar_elem_type(type_checker_record_types@strip_spaces_rt(fty)) of {
+                true -> formal_record_fields_all_scalar(rest);
+                false -> false
+            }
+        }
+    }
+}
+
+// Only a whole record type with at least one field qualifies. A formal cut short by the scheme
+// splitter (`{ f: fn(int64` from `fn(int64, { f: fn(int64) -> int64 }) -> int64`, whose params end at
+// the first `)`) has no closing brace and an empty body, which answered true here: a record literal
+// with a function field then took that fragment as its type, its shape had no fields, and every
+// field store was emitted as `.err` (generic_modules_addition/nested_record_item_through_generic).
+fn formal_is_all_scalar_record_type(t: string) -> boolean {
+    s: string <- type_checker_record_types@strip_spaces_rt(t);
+    case length_bytes(s) >= 2 and type_checker_record_types@record_type_starts(s) and substring(s, length_bytes(s) - 1, length_bytes(s)) == "}" of {
+        true -> {
+            body: string <- type_checker_record_types@record_case_inner_body(s);
+            length_bytes(type_checker_record_types@strip_spaces_rt(body)) > 0 and formal_record_fields_all_scalar(body)
+        };
+        false -> false
     }
 }
 
@@ -1008,6 +1137,8 @@ fn build_single_arg_call(context: { env: List[{ name: string, type_name: string,
         true -> atoms@build_atom_bits_from_sir(type_checker_expressions_helpers@expr_name(expr), arg);
         false -> case type_checker_expressions_helpers@expr_name(expr) == "actor_ref_bits" of {
             true -> atoms@build_actor_ref_bits_from_sir(type_checker_expressions_helpers@expr_name(expr), arg);
+            false -> case type_checker_expressions_helpers@expr_name(expr) == "actor_id" of {
+            true -> atoms@build_actor_id_from_sir(arg);
             false -> case type_checker_expressions_helpers@expr_name(expr) == "actor_ref_of_word" of {
                 true -> atoms@build_actor_ref_of_word_from_sir(type_checker_expressions_helpers@expr_name(expr), arg);
                 false -> case type_checker_expressions_helpers@expr_name(expr) == "print_atom" of {
@@ -1064,6 +1195,7 @@ fn build_single_arg_call(context: { env: List[{ name: string, type_name: string,
                 }
             }
         }
+        }
     }
 }
 
@@ -1075,13 +1207,14 @@ fn region_call_second_arg(expr: { nodes: List[{ kind: int64, value: string, name
 }
 
 fn is_single_arg_builtin(call_name: string) -> boolean {
-    call_name == "atom_bits" or call_name == "actor_ref_bits" or call_name == "actor_ref_of_word" or call_name == "print_atom" or call_name == "print_int32" or call_name == "print_uint32" or call_name == "print_int16" or call_name == "print_uint16" or call_name == "print_int8" or call_name == "print_uint8" or call_name == "print_float16" or call_name == "print_float32" or call_name == "print_string" or call_name == "print" or call_name == "println" or call_name == "print_string_stderr" or call_name == "println_stderr" or call_name == "length_bytes" or call_name == "length_chars" or call_name == "len" or call_name == "print_int64" or call_name == "print_uint64" or call_name == "print_bool" or call_name == "print_float64" or call_name == "read_lines" or call_name == "file_exists" or call_name == "delete_file"
+    call_name == "atom_bits" or call_name == "actor_ref_bits" or call_name == "actor_id" or call_name == "actor_ref_of_word" or call_name == "print_atom" or call_name == "print_int32" or call_name == "print_uint32" or call_name == "print_int16" or call_name == "print_uint16" or call_name == "print_int8" or call_name == "print_uint8" or call_name == "print_float16" or call_name == "print_float32" or call_name == "print_string" or call_name == "print" or call_name == "println" or call_name == "print_string_stderr" or call_name == "println_stderr" or call_name == "length_bytes" or call_name == "length_chars" or call_name == "len" or call_name == "print_int64" or call_name == "print_uint64" or call_name == "print_boolean" or call_name == "print_char" or call_name == "print_float64" or call_name == "read_lines" or call_name == "file_exists" or call_name == "delete_file"
 }
 
 fn arg_expected_type(call_name: string, expected_type: string) -> string {
     case call_name of {
         "atom_bits" -> "atom";
         "actor_ref_bits" -> "actor_ref";
+        "actor_id" -> "actor_ref";
         "actor_ref_of_word" -> "int64";
         "concatenate" -> "string";
         "concat" -> "string";
@@ -1108,6 +1241,7 @@ fn arg_expected_type(call_name: string, expected_type: string) -> string {
         "print_float64" -> "float64";
         "print_float16" -> "float16";
         "print_float32" -> "float32";
+        "print_char" -> "char";
         _: string -> expected_type
     }
 }

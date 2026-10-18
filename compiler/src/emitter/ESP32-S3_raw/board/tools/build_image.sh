@@ -24,7 +24,19 @@
 # -q prints nothing on success (the section sizes and the image path are otherwise printed).
 #
 # Sources are .S/.s hand-written assembly or .sams emitted by an ESP32-S3_raw silica-compiler.
-# Produces <name>.elf, <name>.map and <name>.bin (flash at offset 0x0 with flash_image.sh).
+# Produces <name>.elf, <name>.map, <name>.bin (flash at offset 0x0 with flash_image.sh) and
+# <name>.stack, the sizes chosen for main's two stacks. Actor stacks are chunks grown at run time
+# (actor_memory_budget_plan.md item F) and need nothing from the build.
+#
+# main's stacks are sized per image (actor_memory_budget_plan.md §4.1, item D): the image is linked
+# once with small main stacks (4 KB + 1 KB, only to measure), main_stack_bound.py walks the linked code from _start for
+# the deepest chain of windowed frames and the deepest auxiliary-stack reservation, and the image is
+# linked again with --defsym _silica_main_stack_req / _silica_main_aux_req set to those bounds plus
+# margin (a quarter, at least 128 bytes, then the 64-byte guard band, rounded up to 64) and
+# _silica_rt_depth_reserve set to the deepest runtime chain emitted code can call (the limit every
+# emitted prologue checks against). A main the walk cannot bound keeps the script's defaults
+# (128 KB + 64 KB) and the .stack file says why. The second link moves only the heap/stack boundary,
+# so the bound taken from the first image holds for the second.
 #
 # Toolchain: Espressif's xtensa-esp-elf GCC (assembler, linker, libgcc) and esptool from the
 # ESP-IDF Python environment. No ESP-IDF component, header or library is linked.
@@ -107,12 +119,63 @@ for src in "$@"; do
     objs="$objs $obj"
 done
 
-"$CC" -nostdlib -nostartfiles -Wl,--gc-sections -Wl,-T,"$RT/silica_esp32s3.ld" \
-    -Wl,-Map,"$out.map" -o "$out.elf" $objs -lgcc
+link() {   # the --defsym options must precede -T: the script tests DEFINED() on them
+    "$CC" -nostdlib -nostartfiles -Wl,--gc-sections "$@" -Wl,-T,"$RT/silica_esp32s3.ld" \
+        -Wl,-Map,"$out.map" -o "$out.elf" $objs -lgcc
+}
+
+# Pass 1: small main stacks, only to measure. Pass 2: main's stacks and the runtime reserve from
+# the bound, or the script's defaults (the code's addresses must not move between the passes: the
+# bound was taken from pass 1; the stack sizes move only the heap/stack boundary). Measuring with
+# the 128 KB + 64 KB defaults made a large but legal image fail the linker's heap-room assertion
+# before its stack bound was ever taken.
+link -Wl,--defsym,_silica_main_stack_req=4096 -Wl,--defsym,_silica_main_aux_req=1024
+PY=${BOARD_PYTHON:-python3}
+bound=$("$PY" "$HERE/main_stack_bound.py" --objdump "$XTENSA_BIN/xtensa-esp32s3-elf-objdump" "$out.elf") || {
+    echo "main_stack_bound.py failed for $out.elf" >&2; exit 1; }
+main1=$("$XTENSA_BIN/xtensa-esp32s3-elf-nm" "$out.elf" | awk '$3 == "_silica_iram_end" {print $1}')
+status=$(printf '%s\n' "$bound" | sed -n 's/^status //p')
+machine=$(printf '%s\n' "$bound" | sed -n 's/^machine //p')
+aux=$(printf '%s\n' "$bound" | sed -n 's/^aux //p')
+rt_depth=$(printf '%s\n' "$bound" | sed -n 's/^rt_depth //p')
+[ "$rt_depth" -lt 64 ] && rt_depth=64        # the overflow handlers' own two frames
+size_with_margin() {                         # bound -> bound + max(bound/4, 128) + guard 64, up to 64
+    m=$(( $1 / 4 )); [ "$m" -lt 128 ] && m=128
+    echo $(( ( $1 + m + 64 + 63 ) / 64 * 64 ))
+}
+case "$status $aux" in
+    "bounded "[0-9]*)
+        stack=$(size_with_margin "$machine")
+        auxsz=$(size_with_margin "$aux")
+        [ "$auxsz" -lt 256 ] && auxsz=256
+        link -Wl,--defsym,_silica_main_stack_req=$stack -Wl,--defsym,_silica_main_aux_req=$auxsz \
+             -Wl,--defsym,_silica_rt_depth_req=$rt_depth
+        printf 'main_stack %d\nmain_aux %d\nbound_machine %d\nbound_aux %d\nrt_depth %d\nstatus bounded\n' \
+            "$stack" "$auxsz" "$machine" "$aux" "$rt_depth" > "$out.stack"
+        ;;
+    *)
+        # unbounded (recursion from main, a call through a function value, or an untracked SP
+        # store): the script's defaults stay; the reserve is still exact for this image
+        link -Wl,--defsym,_silica_rt_depth_req=$rt_depth
+        stack=$(( 0x20000 )); auxsz=$(( 0x10000 ))
+        reason=$status; case "$aux" in unbounded*) [ "$status" = bounded ] && reason="aux $aux" ;; esac
+        printf 'main_stack %d\nmain_aux %d\nbound_machine %s\nbound_aux %s\nrt_depth %d\nstatus %s\n' \
+            "$stack" "$auxsz" "$machine" "$aux" "$rt_depth" "$reason" > "$out.stack"
+        ;;
+esac
+main2=$("$XTENSA_BIN/xtensa-esp32s3-elf-nm" "$out.elf" | awk '$3 == "_silica_iram_end" {print $1}')
+if [ "$main1" != "$main2" ]; then
+    echo "build_image: the code moved between the two links ($main1 -> $main2); the bound was taken from the first" >&2
+    exit 1
+fi
 
 "$ESPTOOL" --chip esp32s3 elf2image --flash-mode dio --flash-freq 80m --flash-size 2MB \
     -o "$out.bin" "$out.elf" >/dev/null
 
 [ "$quiet" = 1 ] && exit 0
 "$XTENSA_BIN/xtensa-esp32s3-elf-size" -A "$out.elf" | awk '/^\.(iram0|dram0)/ {printf "  %-16s %7d bytes @ %s\n", $1, $2, sprintf("0x%x", $3)}'
+hs=$("$XTENSA_BIN/xtensa-esp32s3-elf-nm" "$out.elf" | awk '$3 == "_silica_heap_start" {print $1}')
+he=$("$XTENSA_BIN/xtensa-esp32s3-elf-nm" "$out.elf" | awk '$3 == "_silica_heap_end" {print $1}')
+heap=$(( 0x$he - 0x$hs ))
+echo "  main stacks: machine $stack aux $auxsz ($(sed -n 's/^status //p' "$out.stack"); bound $machine/$aux, runtime reserve $rt_depth)${heap:+; heap $heap bytes}"
 echo "  image: $out.bin"

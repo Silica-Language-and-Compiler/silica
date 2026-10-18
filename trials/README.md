@@ -151,3 +151,14 @@ Parents fan out with `$(call INTEGRATE_CHILD,<subdir>)` and sum with
 `$(call INTEGRATE_SUM_CHILDREN,<subdirs>)`; see `Makefile`,
 `ordered_data_structures/Makefile`, `error_enforcement_addition/Makefile`, and
 `ffi_addition/Makefile` for the pattern.
+
+### Standard input and `<trial>.no_stdin_exit`
+
+`actor_registration_addition` and the three `cast_*registered_unheld_name*` suites pipe
+an `exit` line into every trial that does not `use trial_support_*`; that line is
+recorded as `cast_exit(0)` (spec §15.1.2.5) and ends `main`'s `wait_for_exit()` at once.
+A trial whose `main` must instead wait for one of its own actors (usually the failure
+reporter) to call `cast_exit` gets an empty marker file `<trial>.no_stdin_exit`; the
+recipe then gives it an empty standard input, whose end does not end the wait. This is
+unrelated to `<trial>.wait_for_exit`, which names the output marker a trial prints
+before the harness sends `exit`.

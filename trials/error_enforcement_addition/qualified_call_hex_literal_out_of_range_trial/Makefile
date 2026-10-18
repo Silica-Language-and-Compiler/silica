@@ -41,7 +41,7 @@ silica.config:
 	@printf '%s\n' \
 		main_hex_literal_out_of_range.silica \
 		LiteralLib.silica \
-		> "$(THIS_DIR)silica.config"
+		> "$(THIS_DIR)silica.config" && cd "$(THIS_DIR)" && $(TRIAL_SUPPORT_CONFIG)
 
 help:
 	@echo "qualified_call_hex_literal_out_of_range_trial (multi-file error enforcement)"

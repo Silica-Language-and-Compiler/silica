@@ -2,6 +2,7 @@
 
 **Date:** 2026-06-29; BinaryTree amendment 2026-07-02
 **Status:** Normative detailed design; no implementation sequencing
+**Implementation status (2026-10-16):** every design in this directory is implemented in `compiler/stdlib/data_structures/` and covered by `trials/ordered_data_structures/`; each file carries its own status note with the deviations the compiler forced. Exceptions: the BinaryTree constructor-record compile-fail trials (`trial_compile_fail_binary_tree_*`, `StubBinaryTree`), constructor-record compile-fail trials for the graph, Heap, PriorityQueue and Tree families, and WBT `join`/`split`/`concat` (deferred) are not implemented.
 **Parent authorities:** [`../data_structures_as_traits.md`](../data_structures_as_traits.md) and [`../data_structure_to_algorithms.md`](../data_structure_to_algorithms.md)
 
 ## Purpose
@@ -71,7 +72,7 @@ All Silica snippets are normative as interface shape but may use `TypeName` plac
 - All updates are persistent. A successful update returns a new root value; the old root and every node not on a changed path remain usable.
 - Recursive nodes are region-allocated and referenced through optional recursive references. `:none` is the empty recursive position.
 - Every constructor uses the canonical application-lifetime arena for its generated representation specialization and memory space.
-- A constructor function record may be the exact empty record `{}` only when its detailed design requires no comparator, extractor, or other behavior function; the declared collection type and explicit value arguments must still determine every specialization parameter.
+- A constructor function record must contain the function field that witnesses `ItemType`; `BinaryTree` uses `{ compare_item }`, a witness-only field its core never calls, because an empty record `{}` gives no witness (E2017). The declared collection type and explicit value arguments must still determine every specialization parameter.
 - The collection value carries the canonical arena capability needed by its nodes.
 - Comparators define identity as well as order: `:equal` means the two values occupy one ordered-key position.
 - Comparator results other than `:less`, `:equal`, or `:greater` are invalid behavior and produce a deterministic collection error; they are never treated as an ordering branch.

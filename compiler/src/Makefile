@@ -87,6 +87,9 @@ JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 
 # Stdlib modules pulled in by compiler_maps (staged under lib/ like trial leaves).
 LIB_STDLIB_MODULES := wbt_map OrderedMap
+# Stdlib trait modules from the stdlib root (main.silica implements Supervisor for its root supervisor).
+STDLIB_ROOT := $(abspath $(THIS_DIR)../stdlib)
+LIB_STDLIB_ROOT_MODULES := Supervisor
 
 .DEFAULT_GOAL := build
 
@@ -148,9 +151,14 @@ check-seed:
 	fi
 
 # Stage stdlib WBT/OrderedMap sources into lib/ for config membership (module name = basename).
-LIB_STAGED := $(addprefix $(THIS_DIR)lib/,$(addsuffix .silica,$(LIB_STDLIB_MODULES)))
+LIB_STAGED := $(addprefix $(THIS_DIR)lib/,$(addsuffix .silica,$(LIB_STDLIB_MODULES) $(LIB_STDLIB_ROOT_MODULES)))
 
 $(THIS_DIR)lib/%.silica: $(STDLIB_DS)/%.silica
+	@mkdir -p "$(THIS_DIR)lib"
+	@if [ ! -f "$<" ]; then echo "FAIL: missing $<"; exit 1; fi
+	@cp "$<" "$@"
+
+$(THIS_DIR)lib/Supervisor.silica: $(STDLIB_ROOT)/Supervisor.silica
 	@mkdir -p "$(THIS_DIR)lib"
 	@if [ ! -f "$<" ]; then echo "FAIL: missing $<"; exit 1; fi
 	@cp "$<" "$@"
@@ -220,6 +228,10 @@ silica.config.regen:
 # Stage 1: seed reads silica.config → .sams (and optional __silica_runtime.sams / silica.link).
 # Multi-unit batches use process-per-unit hygiene: seed exits 75 between units so the OS
 # reclaims host heap (required for large modules such as lib/wbt_map.silica).
+# Exit 76 means the compiler crashed inside a unit (main.silica, main_crash.silica): the loop runs
+# the next process as for 75, and that process reports the unit as failed, skips it and compiles
+# the rest; the batch then ends with status 1. silica.compile.inprogress / silica.compile.crashed
+# carry that between the processes of one batch and are removed only when a new batch starts.
 # Seed failures cover compilation and emitter errors.
 #
 # Incremental: keep .sams / .iface whose mtime is not older than their .silica source AND not
@@ -295,7 +307,7 @@ assembly: check-seed silica.config stage record-compile-start
 	    fi; \
 	  done < silica.config; \
 	  echo "Invalidated $$removed unit artifact set(s)"; \
-	  rm -f __silica_runtime.sams silica.link silica.needs_runtime; \
+	  rm -f __silica_runtime.sams silica.link silica.needs_runtime silica.compile.inprogress silica.compile.crashed; \
 	  : > silica.compile.order; \
 	  while IFS= read -r unit || [ -n "$$unit" ]; do \
 	    [ -z "$$unit" ] && continue; \
@@ -321,6 +333,10 @@ assembly: check-seed silica.config stage record-compile-start
 	    if [ $$ec -eq 0 ]; then break; fi; \
 	    if [ $$ec -eq 75 ]; then \
 	      echo "  (reclaiming memory; continuing next unit)"; \
+	      continue; \
+	    fi; \
+	    if [ $$ec -eq 76 ]; then \
+	      echo "  (the compiler crashed in a unit; continuing with the rest of the batch)"; \
 	      continue; \
 	    fi; \
 	    echo "FAIL: seed compilation failed (exit $$ec)"; \
@@ -575,7 +591,7 @@ clean-all:
 	@cd "$(THIS_DIR)" && \
 	  find . \( -name '*.sams' -o -name '*.o' -o -name '*.ll' -o -name '*.bc' \) ! -path './_wd_probe/*' -delete; \
 	  rm -f silica-compiler silica.config silica.config.compiler silica.target silica.link \
-	    silica.compile.order \
+	    silica.compile.order silica.compile.inprogress silica.compile.crashed \
 	    .silica.config.units .silica.config.units.tmp silica.config.compiler.tmp \
 	    __silica_runtime.sams __silica_runtime.o .compile_start .gen1_emission_stamp; \
 	  rm -f silica-compiler-* 2>/dev/null || true; \

@@ -215,21 +215,21 @@ def t_int_compare(rng, ty, area):
         b = int_expr(rng, ty, 1, [])
         op = rng.choice(ops)
         val = eval(f"{a.val} {op} {b.val}")
-        stmts.append(f"_: atom <- print_bool({a.wrap(3)} {op} {b.wrap(3)})")
+        stmts.append(f"_: atom <- print_boolean({a.wrap(3)} {op} {b.wrap(3)})")
         stmts.append('println("")')
         outs.append("true" if val else "false")
     stmts[-2] = stmts[-2].replace("_: atom", "result: atom")
     stmts.pop()
     body = seq_block(["device_io"], stmts, "result", rng.randint(0, 2))
     out = "\n".join(outs)
-    hdr = f"// {ty} comparisons printed with print_bool"
+    hdr = f"// {ty} comparisons printed with print_boolean"
     src = program(f"fn main() -> atom {{\n{body}\n}}", header=hdr)
     c = Case(area, "compare", src, out, 0)
-    c.info["fnames"] = ["print_bool"]
+    c.info["fnames"] = ["print_boolean"]
     c.info["has_seq"] = True
     # chained comparison is non-associative
     c.add_fail("E2003", "comparison against a string binding",
-               rep(src, "sequence proc[device_io]", "sequence proc[device_io]\n        label: string <- \"x\";", 1).replace("print_bool(", "print_bool(label == ", 1))
+               rep(src, "sequence proc[device_io]", "sequence proc[device_io]\n        label: string <- \"x\";", 1).replace("print_boolean(", "print_boolean(label == ", 1))
     return c
 
 
@@ -487,7 +487,7 @@ def t_float_compare(rng, ty, area):
         b = float_expr(rng, ty, 1)
         op = rng.choice(["<", "<=", ">", ">=", "==", "!="])
         val = eval(f"a.val {op} b.val")
-        stmts.append(f"_: atom <- print_bool({a.wrap(3)} {op} {b.wrap(3)})")
+        stmts.append(f"_: atom <- print_boolean({a.wrap(3)} {op} {b.wrap(3)})")
         stmts.append('println("")')
         outs.append("true" if val else "false")
     stmts[-2] = stmts[-2].replace("_: atom", "done: atom")
@@ -496,7 +496,7 @@ def t_float_compare(rng, ty, area):
     hdr = f"// {ty} comparisons"
     src = program(f"fn main() -> atom {{\n{body}\n}}", header=hdr)
     c = Case(area, "compare", src, "\n".join(outs), 0)
-    c.info["fnames"] = ["print_bool"]
+    c.info["fnames"] = ["print_boolean"]
     c.info["has_seq"] = True
     return c
 
@@ -596,7 +596,7 @@ def t_int_negate(rng, ty, area):
     elif kind == "triple":
         expr, val = f"{nf}({nf}({nf}({v})))", -v
     else:
-        expr, val = f"print_bool({nf}({nf}({v})) == {v})", None
+        expr, val = f"print_boolean({nf}({nf}({v})) == {v})", None
     stmts = []
     if kind == "variable":
         stmts.append(f"x: {ty} <- {v}")
@@ -736,17 +736,17 @@ def t_bool_logic(rng, area):
     lit = lambda x: "true" if x else "false"
     kind = rng.choice(["vars", "literals"])
     if kind == "vars":
-        stmts = [f"b: boolean <- {lit(a)}", f"a: boolean <- {lit(b)}", f"result: boolean <- b {op} a", "outcome: atom <- print_bool(result)"]
+        stmts = [f"b: boolean <- {lit(a)}", f"a: boolean <- {lit(b)}", f"result: boolean <- b {op} a", "outcome: atom <- print_boolean(result)"]
         names = ["a", "b", "result"]
     else:
-        stmts = [f"result: boolean <- {lit(a)} {op} {lit(b)}", "outcome: atom <- print_bool(result)"]
+        stmts = [f"result: boolean <- {lit(a)} {op} {lit(b)}", "outcome: atom <- print_boolean(result)"]
         names = ["result"]
     body = seq_block(["device_io"], stmts, "outcome", rng.randint(0, 2))
     hdr = f"// {lit(a)} {op} {lit(b)} printed"
     src = program(f"fn main() -> atom {{\n{body}\n}}", header=hdr)
     c = Case(area, "logic", src, lit(val), 0)
     c.info["names"] = names
-    c.info["fnames"] = ["print_bool"]
+    c.info["fnames"] = ["print_boolean"]
     c.info["has_seq"] = True
     c.add_fail("E2001", "integer literal bound to a boolean", rep(src, f"result: boolean <- ", "result: boolean <- 1 + 0 * 1 and ", 1) if kind == "literals" else rep(src, f"b: boolean <- {lit(a)}", "b: boolean <- 1", 1))
     return c
@@ -781,12 +781,12 @@ def t_bool_compare(rng, area):
     a, b = rng.randint(0, 30), rng.randint(0, 30)
     op = rng.choice(["<", "<=", ">", ">=", "==", "!="])
     val = eval(f"{a} {op} {b}")
-    stmts = [f"result: atom <- print_bool({a} {op} {b})"]
+    stmts = [f"result: atom <- print_boolean({a} {op} {b})"]
     body = seq_block(["device_io"], stmts, "result", rng.randint(0, 2))
-    hdr = f"// print_bool({a} {op} {b})"
+    hdr = f"// print_boolean({a} {op} {b})"
     src = program(f"fn main() -> atom {{\n{body}\n}}", header=hdr)
     c = Case(area, "boolcmp", src, "true" if val else "false", 0)
-    c.info["fnames"] = ["print_bool"]
+    c.info["fnames"] = ["print_boolean"]
     c.info["has_seq"] = True
     return c
 
@@ -857,13 +857,13 @@ def t_atom_eq(rng, area):
     rhs = a if same else b
     op = rng.choice(["==", "!="])
     val = (a == rhs) if op == "==" else (a != rhs)
-    stmts = [f"left: atom <- :{a}", f"result: atom <- print_bool(left {op} :{rhs})"]
+    stmts = [f"left: atom <- :{a}", f"result: atom <- print_boolean(left {op} :{rhs})"]
     body = seq_block(["device_io"], stmts, "result", rng.randint(0, 2))
     hdr = f"// atom identity: :{a} {op} :{rhs} is {str(val).lower()}"
     src = program(f"fn main() -> atom {{\n{body}\n}}", header=hdr)
     c = Case(area, "atomeq", src, "true" if val else "false", 0)
     c.info["names"] = ["left"]
-    c.info["fnames"] = ["print_bool"]
+    c.info["fnames"] = ["print_boolean"]
     c.info["has_seq"] = True
     c.add_fail("E2003", "atom compared against an integer binding", rep(src, f"left: atom <- :{a}", "left: int64 <- 3", 1))
     return c

@@ -25,7 +25,7 @@ Whole-program facts are therefore facts of the application, decided once, over a
 
 ## What happens today is a work-around
 
-Today the compiler cannot hold a whole application in memory, so a build is split into many compilation units:
+Today (2026-10-16) the compiler cannot hold a whole application in memory, so a build is split into many compilation units:
 
 - `silica.config` lists one unit per `.silica` file;
 - each unit is compiled in its own process, and the compiler exits with status 75 between units to give the memory
@@ -38,8 +38,15 @@ it. The specification's description of a batch as "the ordered list of compilati
 one `.silica` file" (near line 11696) describes the current implementation, not the language's model.
 
 Where the split build cannot behave like one unit, that is a defect of the work-around, not intended behaviour.
-The known case is atom numbering: atoms are numbered per unit today, so the same atom can compare unequal across
-files. See trials/modules_addition/sd3_cross_unit_atoms.silica and sd3_cross_unit_atoms_registered_name.silica.
+The known case was atom numbering: atoms were numbered per unit, so the same atom could compare unequal across
+files. **Implementation status (2026-10-16):** fixed for atoms. The build keeps one atom table in `silica.atoms`
+(one lexeme per line, in index order, the fixed runtime prefix first) that every unit reads and extends, and record
+shapes are likewise numbered once per build in `silica.shapes`; the runtime module is written once, after the last
+unit, from the complete table (`main_emit.silica`, `main_lists.silica`). The cross-unit atom trials
+`trials/modules_addition/sd3_cross_unit_atoms.silica` and `sd3_cross_unit_atoms_registered_name.silica` pass
+(`.sout` equals `.scout`). The shared tables are the temporary reconciliation of rule 3 below; the work-around
+itself (one unit per file, exit 75 between units, `.iface` files) is still how the compiler builds, and the compiler
+is still not able to compile an application as one unit.
 
 ## Rules for designers
 

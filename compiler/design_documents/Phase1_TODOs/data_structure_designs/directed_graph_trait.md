@@ -1,5 +1,7 @@
 # `DirectedGraph` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/DirectedGraph.silica` over `graph_wbt_directed`, `graph_csr_directed` and `graph_dense_directed`; trials in `trials/ordered_data_structures/graph_live_core/` and `graph_collections/` (`gc_directed_trait`, `gc_csr_directed_trait`, `gc_dense_directed_trait`). Deviations are numbered in the module headers (placeholder spelling, accumulator-second folds, no arity overloading, required rather than provided methods). No constructor-record compile-fail trial exists for this family.
+
 **Public trait:** `DirectedGraph`
 **Generated modules:** `graph_wbt_directed`, `graph_csr_directed`, `graph_dense_directed`
 **Default live representation:** [`live_wbt_graph.md`](live_wbt_graph.md)

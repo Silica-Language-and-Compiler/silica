@@ -19,7 +19,7 @@ silica.config:
 	@cd "$(THIS_DIR)" && { \
 		echo "device_plain_lib.silica"; \
 		echo "main_uses_device.silica"; \
-	} > silica.config
+	} > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 check: silica.config
 	@cd "$(THIS_DIR)" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(COMPILER)); } > $(MAIN).cur_fail 2>&1 || true

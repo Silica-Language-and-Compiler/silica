@@ -2,6 +2,12 @@
 
 **Status:** Future development. Not implemented. Not normative for the current compiler. The current Apple Silicon path emits assembly text and lets the platform assembler produce object files. This document records the intended future direction for replacing that assembly step with Silica-owned chip instruction encoders and relocatable object writers.
 
+## Implementation status (2026-10-16)
+
+Still not implemented; the design is unchanged. What exists today: four assembly-text backends in `compiler/src/emitter/` (`apple_silicon_mac`, `linux_aarch64`, `linux_x86_64`, `ESP32-S3_raw`), each producing `.sams` text that the host or cross toolchain assembles and the platform linker links (`make` stages `.sams -> .o -> link`). The ESP32-S3 backend is native Xtensa LX7 bare metal with no IDF; its instruction selection (`emitter/ESP32-S3_raw/shared/xt_isa.silica`, over virtual registers in `xt_vr.silica`) still produces assembly text. The first implementation target named in section 3 (Apple Silicon Mach-O) is therefore no longer the only existing backend, and the x86-64 and Xtensa rows of the section 4 table describe targets that now have text backends; "Hardware behavior to expose" entries mentioning IDF-style cache synchronization and PSRAM do not match the shipped ESP32-S3 port (internal SRAM only).
+
+---
+
 ## Related Documents
 
 

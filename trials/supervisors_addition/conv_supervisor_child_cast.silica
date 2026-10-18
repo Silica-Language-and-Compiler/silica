@@ -1,0 +1,141 @@
+// Spec §16.2.6.4 (run-time check where the convention is unknown): a `child` field in a
+// call_supervisor reply is one of the references the compiler cannot follow. main asks the supervisor
+// for its child by id ({ op: :get_child }), takes the call-only worker from the reply, calls it (the
+// right way: 1 + 10 = 11 is printed), then casts to it. The cast is the mismatch: nothing is enqueued,
+// and because main is not an actor the failure is the language-level failure of §15.4.5.5:
+// `language_error` on standard error and exit status 1.
+//
+// Expected output:
+//   11
+//   language_error
+// exit status 1
+//
+// The supervisor name and child id reuse atoms the suite already defines (:double_tuple_supervisor,
+// :adder), so adding this trial does not renumber the suite's atom table.
+
+use Supervisor;
+
+impl ConvSupervisorChildCastSup for Supervisor;
+
+fn worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg + state, state)
+}
+
+fn init(initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+            strategy: :one_for_one | :one_for_all | :rest_for_one,
+            allowed_restart_count: int64,
+            restarts_time_frame: int64
+        } <- { strategy: :one_for_one, allowed_restart_count: 3, restarts_time_frame: 3600 };
+        children: List[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: int64,
+                behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous
+            },
+            mem(normal)
+        ] <- [
+            { id: :adder, agent_type: :worker, initial_state: 10, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        sup: supervisor_ref <- spawn_registered_supervisor(ConvSupervisorChildCastSup, 0, :double_tuple_supervisor, stack_policy(0, :keep_last_message));
+        got: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, { op: :get_child, id: :adder } impl SupervisorMessage {});
+        c: actor_ref <- got.child;
+        v: int64 <- call(c, 1 impl ActorMessage {});
+        print_int64(v);
+        println("");
+        _: boolean <- cast(c, 2 impl ActorMessage {});
+        println("not reached")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

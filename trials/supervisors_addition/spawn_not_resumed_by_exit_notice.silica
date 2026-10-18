@@ -1,0 +1,180 @@
+// The root supervisor starts N1 (traits/SpawnNotResumedN1Sup) and then N2
+// (traits/SpawnNotResumedN2Sup). N2's init kills N1's only worker (allowed_restart_count 0), so N1
+// ends and its exit notice reaches the root while the root is suspended in spawn waiting for N2's
+// start. That notice must not resume the root's spawn: spawn returns only once N2's init has run.
+// N2's init calls a call-only gate actor (which prints "n2 init waiting"), giving N1's exit notice
+// time to arrive while the root waits, then casts "n2 init finished" to the FailureReporter
+// (registered as :dup_caller). main casts "spawn returned" to the same reporter once spawn has
+// returned; both are casts into the reporter's one mailbox, so their order there is the order they
+// were sent. The reporter remembers whether "n2 init finished" has arrived and prints
+// "spawn returned after n2 init" or "spawn returned before n2 init" (the defect), and "done" once
+// both failure reports and both casts have arrived.
+// The two failure reports (the worker's badarith and N1's end) are printed asynchronously by the
+// reporter, and "n2 init waiting" can land before or after them, so the lines are compared as a
+// multiset (.scout.multiset); the order that matters is carried by the "after"/"before" line.
+// Fable's repro (w3), 2026-10-12. Atoms: every atom here is already numbered by an earlier unit of
+// supervisors_addition (the suite shares one atom table), so adding this trial renumbers no other
+// trial's atoms.
+use Supervisor;
+use SpawnNotResumedN1Sup;
+use SpawnNotResumedN2Sup;
+
+impl SpawnNotResumedRootSup for Supervisor;
+
+fn init(initial_state: int64) -> ({
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    }, List[{
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(initial_state: int64) -> ({
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    }, List[{
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:no_reply, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        }, mem(normal)]),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        }, mem(normal)]) {
+    sequence proc[mem(normal)]
+        flags: {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 5 };
+        children: List[{
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(initial_state: int64) -> ({
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    }, List[{
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:no_reply, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        }, mem(normal)]),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        }, mem(normal)] <- [
+            { id: :s1_rec_sup, agent_type: :supervisor, initial_state: 0, behavior: SpawnNotResumedN1Sup@SpawnNotResumedN1Sup_child_start, restart: :temporary, shutdown: 0, flavor: :plain },
+            { id: :s1_tuple_sup, agent_type: :supervisor, initial_state: 0, behavior: SpawnNotResumedN2Sup@SpawnNotResumedN2Sup_child_start, restart: :temporary, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- start_reporter();
+        _g: actor_ref <- spawn_registered(0, gate, :asker, stack_policy(0, :keep_last_message));
+        sup: supervisor_ref <- spawn_registered_supervisor(SpawnNotResumedRootSup, 0, :dup_add_top_sup, stack_policy(0, :keep_last_message));
+        _: boolean <- cast(rep, "spawn returned" impl ActorMessage {});
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}
+
+// N2's init calls the gate (a call-only actor) and waits for its answer.
+fn gate(msg: string, state: int64) -> (:reply, int64, int64) {
+    sequence proc[device_io]
+        _: atom <- println(msg)
+    produces
+        pure (:reply, 0, state)
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// flags: 1 once "n2 init finished" has arrived, plus 2 once "spawn returned" has.
+fn spawn_line(flags: int64) -> string {
+    case flags == 1 of {
+        true -> "spawn returned after n2 init";
+        false -> "spawn returned before n2 init"
+    }
+}
+
+fn plain_line(report: string, flags: int64) -> string {
+    case contains(report, "spawn returned") of {
+        true -> spawn_line(flags);
+        false -> report
+    }
+}
+
+fn report_line(report: string, flags: int64) -> string {
+    case contains(report, "=== Silica Actor Failure ===") of {
+        true -> "failure report";
+        false -> plain_line(report, flags)
+    }
+}
+
+fn finished_bit(report: string) -> int64 {
+    case contains(report, "n2 init finished") of {
+        true -> 1;
+        false -> 0
+    }
+}
+
+fn spawn_bit(report: string) -> int64 {
+    case contains(report, "spawn returned") of {
+        true -> 2;
+        false -> 0
+    }
+}
+
+fn report_count(report: string) -> int64 {
+    case contains(report, "=== Silica Actor Failure ===") of {
+        true -> 1;
+        false -> 0
+    }
+}
+
+// "done" (the harness's end marker) only once everything has arrived: both flags (3) and both
+// failure reports (2), so no report can be cut off by the exit that follows the marker.
+fn done_suffix(flags: int64, reports: int64) -> string {
+    case flags * 10 + reports == 32 of {
+        true -> "\ndone";
+        false -> ""
+    }
+}
+
+// The FailureReporter, cast-only. state: (flags, failure reports seen)
+fn reporter(report: string, state: (int64, int64)) -> (:no_reply, (int64, int64)) {
+    sequence proc[device_io]
+        (flags, reports): (int64, int64) <- state;
+        nflags: int64 <- flags + finished_bit(report) + spawn_bit(report);
+        nreports: int64 <- reports + report_count(report);
+        _: atom <- println(concat(report_line(report, flags), done_suffix(nflags, nreports)))
+    produces
+        pure (:no_reply, (nflags, nreports))
+    end
+}
+
+fn start_reporter() -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn_registered((0, 0), reporter, :dup_caller, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

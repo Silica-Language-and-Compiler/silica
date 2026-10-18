@@ -1,0 +1,72 @@
+// A FailureReporter (spec §15.4.13.4) that ends the program only on the root supervisor's own
+// unwind report. The root supervisor allows no restart, and its one child is :transient: the
+// child's death is reported (the reporter goes on), and the restart it calls for breaches the
+// limit at once (§15.4.13.2), so the root supervisor fails and its report ends the program with
+// status 1. The runtime also writes its root-actor note to stderr when the root supervisor ends.
+// This is the compiler's own shape (compiler/src/main.silica).
+//
+// The root supervisor's report is told from a worker's by the runtime's fixed report lines:
+// `supervisor_acb:` is a null pointer and frame #0 is `<unknown behavior>` (the runtime-owned
+// supervisor behaviour has no user function).
+use Supervisor;
+
+impl ReporterRootOnlySupervisor for Supervisor;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// a null pointer prints as 0x0 on Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// Ends the program only on the root supervisor's report. A worker's report is taken and dropped:
+// it is not printed, because the root supervisor's report can reach the reporter before the
+// worker's does (the worker's death and the supervisor's escalation run on different threads),
+// and the program ends on the root's.
+fn handle_report(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> {
+                _: atom <- println("root supervisor failure reported; exiting");
+                cast_exit(1)
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, state + 1)
+    end
+}
+
+fn divide_beh(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, 42 / msg)
+}
+
+// No restarts; the window is not 0, because a count and a window that are both 0 mean "no limit".
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 2000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :divider, agent_type: :worker, initial_state: 0, behavior: divide_beh, restart: :transient, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        reporter: actor_ref <- spawn(0, handle_report, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter);
+        _: supervisor_ref <- spawn_registered_supervisor(ReporterRootOnlySupervisor, 0, :trial_supervisor, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_registered(:divider, 0 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

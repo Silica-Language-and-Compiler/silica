@@ -1,5 +1,7 @@
 # `OrderedMap` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/OrderedMap.silica` over `wbt_map.silica`; trials in `trials/ordered_data_structures/ordered_collections/` (`ordered_map_*`) and `wbt_core/`. `get` is `get/3` (placeholder value for the `:not_found` payload).
+
 **Public trait:** `OrderedMap`  
 **Generated representation module:** `wbt_map`  
 **Shared core:** [`weight_balanced_tree.md`](weight_balanced_tree.md)

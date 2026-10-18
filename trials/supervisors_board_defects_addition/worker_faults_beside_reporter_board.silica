@@ -1,0 +1,67 @@
+// Actor faults reported on the ESP32-S3 when the FailureReporter shares a core with a failing actor.
+// The reporter is pinned to core 0; worker a runs on core 0 (the reporter's core) and worker b on
+// core 1. Each is cast one message and reads the head of an empty list, a load from address 0
+// (LoadProhibited), which ends only that actor (spec §15.4.5): two failure reports, reason_tag 3,
+// no supervisor. The reporter writes each report and ends main's wait_for_exit() with cast_exit(0) on
+// the second, so main prints "main continues" and returns its status 0.
+// Expected, by hand (compared as a multiset: the two reports arrive in either order):
+//   report: reason_tag 3, frame #0 worker_faults_beside_reporter_board_worker   (twice)
+//   main continues
+//   0
+// Before the fix the program hung when the failing actor and the reporter were on the same core.
+// Atoms: :keep_last_message only, already numbered in this suite.
+fn first_of(xs: List[int64, mem(normal)]) -> int64 {
+    xs.head
+}
+
+fn worker(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[mem(normal)]
+        none: List[int64, mem(normal)] <- [];
+        v: int64 <- first_of(none) + msg
+    produces
+        pure (:no_reply, v)
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// Writes each report; the second one ends main's wait (its state counts the reports so far).
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case state of {
+            1 -> cast_exit(0);
+            _: int64 -> true
+        }
+    produces
+        pure (:no_reply, state + 1)
+    end
+}
+
+// The reporter is spawned on core 0, the core worker a runs on.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), 0);
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        a: actor_ref <- spawn(0, worker, stack_policy(0, :keep_last_message), 0);
+        b: actor_ref <- spawn(0, worker, stack_policy(0, :keep_last_message), 1);
+        _: boolean <- cast(a, 1 impl ActorMessage {});
+        _: boolean <- cast(b, 2 impl ActorMessage {});
+        code: int64 <- wait_for_exit();
+        println("main continues")
+    produces
+        pure code
+    end
+}

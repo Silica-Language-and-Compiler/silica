@@ -1,6 +1,19 @@
 // §15.1.2.2: when the spawning actor's reservation cannot be made, that actor fails with
-// (:explicit, :stack_reserve_failed) (reason_tag 4); the caller's call completes with the
-// actor-death result, and the rest of the program is unaffected.
+// (:explicit, :stack_reserve_failed) (reason_tag 4), and the rest of the program is unaffected.
+// Spec §16.1.1: a call to an actor that ends before replying raises actor_not_found in the caller.
+// A relay actor calls the spawner, so the relay is the caller blocked in the call when the
+// spawner fails: the call raises actor_not_found in the relay, which fails the same way
+// (reason_tag 4). The work only casts to the relay, so it never calls an actor that ends mid-call,
+// and a fresh actor spawned afterwards still answers.
+//
+// Expected output (compared as a multiset: the reports are asynchronous):
+//   failure report, #0 the spawner, reason_tag 4   its reservation cannot be made
+//   failure report, #0 the relay, reason_tag 4     its call to the spawner raises actor_not_found
+//   15                                             call(ok, 5) on state 10
+//   done                                           the marker; the harness then sends `exit`
+//   0                                              wait_for_exit returns, main produces 0
+
+use trial_wait_int64;
 
 fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
     (:reply, msg + state, state)
@@ -15,16 +28,34 @@ fn spawner(msg: int64, state: int64) -> (:reply, int64, int64) {
     end
 }
 
+// The relay calls the spawner with its message; the spawner fails before replying, so the call
+// raises actor_not_found here (§16.1.1) and the relay fails with reason_tag 4.
+fn relay(msg: int64, state: actor_ref) -> (:no_reply, actor_ref) {
+    sequence proc[concurrency]
+        _: int64 <- call(state, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
-        s: actor_ref <- spawn(0, spawner, stack_policy(0, :keep_last_message));
-        dead: int64 <- call(s, 5 impl ActorMessage {});
-        print_int64(dead);
-        println("");
-        ok: actor_ref <- spawn(10, beh, stack_policy(0, :keep_last_message));
-        r: int64 <- call(ok, 5 impl ActorMessage {});
-        print_int64(r);
-        println("")
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency, device_io]
+                s: actor_ref <- spawn(0, spawner, stack_policy(0, :keep_last_message));
+                q: actor_ref <- spawn(s, relay, stack_policy(0, :keep_last_message));
+                _: boolean <- cast(q, 5 impl ActorMessage {});
+                ok: actor_ref <- spawn(10, beh, stack_policy(0, :keep_last_message));
+                r: int64 <- call(ok, 5 impl ActorMessage {});
+                print_int64(r);
+                println("");
+                println("done")
+            produces
+                pure 0
+            end
+        });
+        _: int64 <- wait_for_exit()
     produces
         pure 0
     end

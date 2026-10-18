@@ -50,7 +50,7 @@ WBT live graphs are governed separately by [`live_wbt_graph.md`](../data_structu
 
 **Design authority:** `common_contract.md` §1; CSR §2; dense §2–§3.
 
-**Coverage:** `snapshot_graphs/csr_node_id_not_slot`, `snapshot_graphs/dense_node_id_not_slot` (planned).
+**Coverage:** `graph_csr_core/gcsr_directed_freeze`, `gcsr_generic_payloads`; `graph_dense_core/gd_universe`, `gd_generic_payloads` (landed 2026-09-18; the planned `snapshot_graphs/` stems were not used).
 
 ---
 
@@ -81,7 +81,7 @@ WBT live graphs are governed separately by [`live_wbt_graph.md`](../data_structu
 
 **Design authority:** CSR §3; dense §3–§4; `common_contract.md` §9.
 
-**Coverage:** `snapshot_graphs/csr_runtime_extents`, `snapshot_graphs/dense_v_squared_overflow` (planned).
+**Coverage:** `graph_csr_core/gcsr_directed_freeze`; `graph_dense_core/gd_universe` (landed 2026-09-18). A V-squared overflow trial was not landed.
 
 ---
 
@@ -101,7 +101,7 @@ WBT live graphs are governed separately by [`live_wbt_graph.md`](../data_structu
 
 **Design authority:** CSR §3–§5; algorithm map locked decision #7.
 
-**Coverage:** `snapshot_graphs/csr_weighted_parallel_buffers` (planned).
+**Coverage:** `graph_csr_core/gcsr_weighted` (landed 2026-09-18).
 
 ---
 
@@ -121,7 +121,7 @@ cells: SkewRAL[boolean]   length V*V
 
 **Design authority:** dense §1, §4, §6; algorithm map locked decision #9 (RAL cells, not bitset).
 
-**Coverage:** `snapshot_graphs/dense_unweighted_boolean_cells` (planned).
+**Coverage:** `graph_dense_core/gd_directed_updates` (landed 2026-09-18). Implementation status (2026-10-16): the cells are optional references (`ref?`), not booleans; see `graph_dense_core.silica` header, deviation 1.
 
 ---
 
@@ -142,7 +142,7 @@ cells: SkewRAL[:none | (:some, EdgeDataType)]   length V*V
 
 **Design authority:** dense §4, §6.
 
-**Coverage:** `snapshot_graphs/dense_weighted_tagged_cells` (planned).
+**Coverage:** `graph_dense_core/gd_weighted` (landed 2026-09-18). Implementation status (2026-10-16): the cells are optional references (`ref?`) because the parser rejected `:none | (:some, EdgeDataType)` when the module was written (E1040, per the module header); the contract text is kept as the design and whether the form now parses was not re-verified.
 
 ---
 
@@ -167,7 +167,7 @@ cells: SkewRAL[:none | (:some, EdgeDataType)]   length V*V
 
 **Design authority:** implementation plan §4; CSR §8; dense §1; `live_wbt_graph.md` §1.
 
-**Coverage:** `cross_representation/graph_distinct_concrete_types`, `cross_representation/wbt_csr_dense_trait_agree` (planned).
+**Coverage:** `graph_csr_core/gcsr_equivalence_large`, `gcsr_snapshot_isolation`; `graph_dense_core/gd_equivalence`; `graph_collections/gc_csr_*_trait`, `gc_dense_*_trait` (landed 2026-09-18; the `cross_representation/` stems were not used).
 
 ---
 

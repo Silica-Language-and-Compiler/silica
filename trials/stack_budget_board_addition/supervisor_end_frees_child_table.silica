@@ -1,0 +1,247 @@
+// Board child-table rows (actor_memory_budget_plan.md item A): the rows of a supervisor's child
+// table go back to the heap when the supervisor ends, so a loop that starts and ends supervisors
+// does not grow the heap by their rows. A root supervisor holds one child, a ten-worker supervisor
+// (traits/CycleSup.silica); each cycle ends the ten workers, then the supervisor, and starts a
+// fresh one. Every step completes before the next starts, so the heap reads are deterministic on
+// two cores: a worker is ended by one cast carrying 0 (it divides by its message; spec §16.1.1
+// makes a call to an actor that ends mid-call raise actor_not_found in the caller, so the workers
+// are cast-only); main then waits until the FailureReporter has counted the ten workers' reports
+// (below); a worker's exit notice reaches its supervisor before its report is sent, so the
+// supervisor's :count_children call then follows the ten exit notices through its ingress; the
+// root's :terminate_child ends the supervisor (the runtime waits for its exit, rows and all) and
+// :restart_child starts the next.
+// heap_used() is read after one warm-up cycle and after ten more. The ten 96-byte rows and their
+// 8-byte heap headers are 1,040 bytes a cycle, 10,400 over the ten; before the fix every cycle
+// kept them. The four call_supervisor replies a cycle (heap records the caller's scope now frees
+// when it is done with them) and the restarted supervisor's init child-spec list (freed by the
+// runtime once its rows are filled) cost 1,944 bytes a cycle on top of that before they were
+// freed (19,440 over the ten against 29,760 with the rows kept, 2026-10-09). With all three freed
+// the ten cycles grow the heap by 4,920 bytes (492 a cycle: the nine intermediate handles a
+// ten-element list literal builds and drops, and the child-info record a :get_child reply copies
+// from, measured 2026-10-09). The trial asserts the growth over ten cycles stays under 10,000
+// bytes, about double the measured figure and well under the 19,440 the leaks cost.
+// Every supervised end prints the runtime's failure banner, eleven a cycle; the multiset golden
+// ignores their order and addresses.
+// The registered FailureReporter prints those banners asynchronously (E2236 conversion, 2026-10-11),
+// and each queued report holds heap until the reporter has handled it, so heap_used() read with
+// reports still queued (about 110 of them at h1) measures the queue, not leaks. main therefore casts
+// the reporter a "sync" just before h0 and just before h1: the reporter handles its mailbox in
+// order, so it reaches the "sync" only after every report queued ahead of it. The reporter is
+// cast-only (spec §15.4.13.4), so it counts each "sync" in a call-only tally actor registered as
+// :noproc (an atom the runtime always numbers), and main polls the tally until its "sync" is
+// counted; the heap is read with the queue drained. The reporter prints nothing for "sync", so the
+// output is unchanged.
+// With the sync the ten cycles grew the heap by 7,264 bytes (2026-10-12), under the 10,000 bound.
+// The figures above were measured while the workers were still ended by calls. Since the
+// restructure for spec §16.1.1 (2026-10-13) the reporter also adds 1,000 to the tally for each
+// CycleSup_worker report (a "sync" adds 1), and main waits for the cycle's ten worker reports by
+// polling the tally: a scalar call that allocates nothing. (Polling :count_children instead held a
+// reply record per poll until the poll returned and exhausted the board heap.)
+// Measured on the board 2026-10-13 after the restructure: the ten cycles grow the heap by 10,184 to
+// 10,192 bytes, over the 10,000 bound, so the trial prints false. Ending the workers with
+// :terminate_child instead (no fault) measured 4,672, and the call-ended version 7,264: a worker
+// that faults while handling a cast leaves about 30 bytes more behind than one that faults while
+// handling a call. Fixed 2026-10-15 (cascading supervisor shutdown, Lee): measured on the board, the
+// ten cycles now grow the heap by 4,720 bytes, under the bound; the golden keeps true.
+// Expected:
+//   10
+//   true
+//   1
+
+use Supervisor;
+use CycleSup;
+
+impl CycleRootSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 100, restarts_time_frame: 1000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :cyc_nested, agent_type: :supervisor, initial_state: 0, behavior: CycleSup@CycleSup_child_start, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+// End the worker: message 0 is its division fault. The worker is cast-only, so nothing waits on
+// it here; await_worker_reports does the waiting.
+fn stop_worker(name: atom) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast_registered(name, 0 impl ActorMessage {})
+    produces pure sent end
+}
+
+
+// Cycle k (1 for the warm-up) ends the ten workers, waits until the reporter has counted 10 * k
+// worker reports in all, and ends and restarts the ten-worker supervisor.
+fn cycle(root: supervisor_ref, k: int64) -> int64 {
+    sequence
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :get_child, id: :cyc_nested } impl SupervisorMessage {});
+        _s1: boolean <- stop_worker(:cyc_w1);
+        _s2: boolean <- stop_worker(:cyc_w2);
+        _s3: boolean <- stop_worker(:cyc_w3);
+        _s4: boolean <- stop_worker(:cyc_w4);
+        _s5: boolean <- stop_worker(:cyc_w5);
+        _s6: boolean <- stop_worker(:cyc_w6);
+        _s7: boolean <- stop_worker(:cyc_w7);
+        _s8: boolean <- stop_worker(:cyc_w8);
+        _s9: boolean <- stop_worker(:cyc_w9);
+        _s10: boolean <- stop_worker(:cyc_w10);
+        _a: int64 <- await_worker_reports(10 * k);
+        n: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(got.child, { op: :count_children } impl SupervisorMessage {});
+        _t: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :terminate_child, id: :cyc_nested } impl SupervisorMessage {});
+        _r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :restart_child, id: :cyc_nested } impl SupervisorMessage {})
+    produces pure n.count end
+}
+
+fn repeat(root: supervisor_ref, n: int64, k: int64) -> int64 {
+    sequence
+        _: int64 <- cycle(root, k);
+        r: int64 <- case n == 1 of { true -> 0; false -> repeat(root, n - 1, k + 1) }
+    produces pure r end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io, mem(normal)]
+        rep: actor_ref <- start_reporter();
+        _t: actor_ref <- spawn_registered(0, sync_tally, :noproc, stack_policy(0, :keep_last_message));
+        root: supervisor_ref <- spawn_registered_supervisor(CycleRootSup, 0, :cyc_root, stack_policy(0, :keep_last_message));
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :get_child, id: :cyc_nested } impl SupervisorMessage {});
+        n: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(got.child, { op: :count_children } impl SupervisorMessage {});
+        print_int64(n.count);
+        println("");
+        _w: int64 <- cycle(root, 1);
+        _q0: int64 <- drain(rep, 1);
+        h0: int64 <- heap_used();
+        _p: int64 <- repeat(root, 10, 2);
+        _q1: int64 <- drain(rep, 2);
+        h1: int64 <- heap_used();
+        print_boolean(h1 - h0 < 10000);
+        println("");
+        rc: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :count_children } impl SupervisorMessage {});
+        print_int64(rc.count);
+        println("")
+    produces pure 0 end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+// main's "sync" is not a report (no failure banner): the reporter counts it in the tally (1) without
+// printing. A ten-worker supervisor's worker report adds 1,000 to the tally.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        is_report: boolean <- contains(report, "=== Silica Actor Failure ===");
+        _: atom <- case is_report of {
+            true -> println_stderr(report);
+            false -> :ok
+        };
+        _: boolean <- case is_report and report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        };
+        _: int64 <- case report == "sync" of {
+            true -> call_registered(:noproc, 1 impl ActorMessage {});
+            false -> 0
+        };
+        _: int64 <- case is_report and contains(report, "CycleSup_worker") of {
+            true -> call_registered(:noproc, 1000 impl ActorMessage {});
+            false -> 0
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Call-only tally: adds its message to the count and replies with the new count.
+fn sync_tally(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+// Casts a "sync" to the reporter and returns once the tally has counted `total` of them (the tally
+// modulo 1,000), so every failure report queued ahead of it has been handled.
+fn drain(rep: actor_ref, total: int64) -> int64 {
+    sequence proc[concurrency]
+        _: boolean <- cast(rep, "sync" impl ActorMessage {});
+        r: int64 <- await_tally(total)
+    produces
+        pure r
+    end
+}
+
+fn await_tally(total: int64) -> int64 {
+    sequence proc[concurrency]
+        got: int64 <- call_registered(:noproc, 0 impl ActorMessage {});
+        r: int64 <- case got - (got / 1000) * 1000 >= total of {
+            true -> got;
+            false -> await_tally(total)
+        }
+    produces
+        pure r
+    end
+}
+
+// Returns once the reporter has counted `total` worker reports (the tally divided by 1,000). main's
+// stack on the board is fixed, so the polls nest in three levels (at most 100 + 100 frames, plus
+// one for every 10,000 polls) rather than one frame per poll.
+fn await_worker_reports(total: int64) -> int64 {
+    sequence
+        reached: boolean <- poll_reports_100x100(total, 100);
+        r: int64 <- case reached of {
+            true -> 0;
+            false -> await_worker_reports(total)
+        }
+    produces
+        pure r
+    end
+}
+
+fn poll_reports_100x100(total: int64, n: int64) -> boolean {
+    sequence
+        reached: boolean <- poll_reports_100(total, 100);
+        r: boolean <- case reached or n <= 1 of {
+            true -> reached;
+            false -> poll_reports_100x100(total, n - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn poll_reports_100(total: int64, n: int64) -> boolean {
+    sequence proc[concurrency]
+        got: int64 <- call_registered(:noproc, 0 impl ActorMessage {});
+        reached: boolean <- got / 1000 >= total;
+        r: boolean <- case reached or n <= 1 of {
+            true -> reached;
+            false -> poll_reports_100(total, n - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+// Spawns the FailureReporter and registers it; main keeps the reference for its "sync" casts.
+fn start_reporter() -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

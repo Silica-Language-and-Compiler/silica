@@ -1,5 +1,7 @@
 # `SearchTree` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/SearchTree.silica`, a trait over the `wbt_set` value that implements `OrderedSet`; trials in `trials/ordered_data_structures/search_tree_collections/` (14 programs). A `SearchTree`-typed parameter accepts an updated tree (`st_parameter_accepts_updated_tree`).
+
 **Public trait:** `SearchTree`  
 **Concrete standard implementation:** the same `wbt_set` value that implements `OrderedSet`  
 **Separate storage:** none

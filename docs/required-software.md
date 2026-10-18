@@ -100,7 +100,7 @@ them:
 | -------- | ------- | ------- |
 | `XTENSA_BIN` | `~/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin` | `board/tools/build_image.sh` |
 | `ESPTOOL` | `~/.espressif/python_env/idf6.2_py3.14_env/bin/esptool` | `board/tools/build_image.sh` |
-| `BOARD_PYTHON` | `~/.espressif/python_env/idf6.2_py3.14_env/bin/python` | the board trial target (`trials/targets/`) |
+| `BOARD_PYTHON` | `~/.espressif/python_env/idf6.2_py3.14_env/bin/python` | `board/tools/run_app.sh` (and through it `run_on_board.py` and `main_stack_bound.py`) and the board trial target (`trials/targets/`) |
 
 (`board/` is `compiler/src/emitter/ESP32-S3_raw/board/`.)
 
@@ -126,8 +126,8 @@ It is installed as `binaries/silica-NNNNNN-ESP32_S3_raw-<platform>`, with its ow
   (BYU-I eBadge v4.0, ESP32-S3-MINI-1-N4R2, CP2102N bridge).
 - A USB **data** cable (charge-only cables enumerate nothing). macOS's built-in driver serves the
   CP2102N; the board appears as `/dev/cu.usbserial-*`. If the board has a power switch, it must be on.
-- The trial runner uses the one USB serial port it finds. With several, set `BOARD_PORT=/dev/cu....`
-  (an interactive run asks). `BOARD_MAC=<mac>` makes a run refuse any board but that one.
+- The trial runner and `board/tools/run_app.sh` use the one USB serial port they find. With several, set `BOARD_PORT=/dev/cu....`
+  (an interactive trial run asks). `BOARD_MAC=<mac>` makes a run refuse any board but that one.
 
 ## Checking an installation
 
@@ -150,4 +150,4 @@ plain message when no board is connected.
 
 - [Build and test the compiler]({{ '/build-and-test/' | relative_url }}): building the compiler and running the trials.
 - [trials/README.md](https://github.com/yenrab/silica/blob/main/trials/README.md) and [trials/targets/README.md](https://github.com/yenrab/silica/blob/main/trials/targets/README.md): the trial tree, and running it on a board.
-- [board/README.md](https://github.com/yenrab/silica/blob/main/compiler/src/emitter/ESP32-S3_raw/board/README.md): the ESP32-S3 board support files.
+- [board/README.md](https://github.com/yenrab/silica/blob/main/compiler/src/emitter/ESP32-S3_raw/board/README.md): the ESP32-S3 board support files, and how to run the Silica sample apps on the board with `tools/run_app.sh`.

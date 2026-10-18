@@ -1,5 +1,7 @@
 # `PriorityQueue` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/PriorityQueue.silica` over `brodal_okasaki_priority.silica`; trials: the `pq_*` programs in `trials/ordered_data_structures/heap_collections/`. Deviations (module headers): the priority type is spelled `KeyType` and the value type `ValueType`; the comparator pair is carried twice; entries carry their comparators; `peek`, `peek_priority` and `peek_value` take placeholder arguments; the core is not `brodal_okasaki_min` but a separate unit over entries.
+
 **Public trait:** `PriorityQueue`  
 **Generated core:** `brodal_okasaki_min` over priority/value entries  
 **Shared core:** [`brodal_okasaki_queue.md`](brodal_okasaki_queue.md)

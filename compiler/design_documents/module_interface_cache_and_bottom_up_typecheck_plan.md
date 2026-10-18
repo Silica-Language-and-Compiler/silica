@@ -1,11 +1,10 @@
 # Module Interface Cache and Bottom-Up Type Checking
 
-**Status:** Design / implementation plan  
-**Date:** 2026-07-25  
+**Status:** Implemented (phases 0-4); see Implementation status (2026-10-16) below  
+**Date:** 2026-07-25 (status 2026-10-16)  
 **Applies to:**
 
-- `compiler/src/` (seed)
-- `compiler/src/` (Wave C / self-host)
+- `compiler/src/` (the only compiler tree; the dual seed/self-host trees this plan was written for no longer exist)
 
 **Related:**
 
@@ -14,6 +13,35 @@
 - [Phase2_TODO/use_tree_first_pass.md](./Phase2_TODO/use_tree_first_pass.md) (first process: uses-only prefix parse)
 - Spec §3.4.2 (inline-only types; no user type aliases)
 - Seed type-checker work: surface→type_id cache and id-first equality (reduces cost of fat export type strings once loaded)
+
+---
+
+## Implementation status (2026-10-16)
+
+Phases 1-4 are implemented in `compiler/src/module_checker/module_iface.silica` (extract, publish, read,
+stub injection, invalidation) and `module_iface_type_dag.silica` (the interned type-DAG persisted in
+the iface). Where each design point lives:
+
+| Plan item | Implementation |
+| --- | --- |
+| Draft extract, publish after type-check success | `publish_module_iface/4`, called from `main_compile_pipeline.silica` after a successful type check |
+| Failed check deletes a stale iface | `unpublish_module_iface_at_path/1` on each failure path in `main_compile_pipeline.silica` |
+| Location | beside the unit: `<unit>.iface` next to `<unit>.sams` (under the per-target build directory `compiler/build/<TARGET>/` for compiler builds; beside the source for trials) |
+| Format | text, line-oriented; magic `SILICA_IFACE_V1`, `format=2`, `stamp=selfhost-iface-7`, `source=`, `source_hash=`, `deps=`, `deps_hash=`, `export_trait=`, `export_count=`, `impl_count=`, then a `===DAG===` section (names and type nodes) replacing the v1 type-surface strings |
+| Read path | `load_ifaces_for_module_names/2` then `import_ifaces_into_context/2` (`add_exports_by_surface`); dependents type-check against iface stubs (`append_iface_stub_programs/2`), not dependency ASTs |
+| Invalidation (phase 3) | header validated on load: magic, format version, compiler stamp, source hash and dependency hash; `iface_usable_for_source/2` gates use |
+| Parse skip | `main_iface_skip.filter_use_paths_missing_iface/3`, used by `main_parse.silica`: a `use` target with a usable iface is not re-parsed |
+| Trial coverage | `modules_addition` and `generic_modules_addition` (every trial unit leaves a `.iface`); trait specialization across stubs is pinned by `traits_addition/train_defect_a5_*` |
+
+Differences from the plan as written:
+
+- v1 stored type surfaces as strings; format 2 stores the DAG (the plan's phase 4) and the compiler stamp is a literal in `iface_compiler_stamp/0`, bumped by hand when the format or a consumer changes.
+- Trait specialization and call mangling still need provided-method data not carried by plain exports; the pipeline runs `specialize_iface_stub_world` over stub programs before mangling (the A5 fix), so a dependent sees the same overload set whether the dependency was parsed in-process or loaded from its iface.
+- There is no `.cache/ifaces` directory; the plan's "or alongside unit outputs" alternative was taken.
+- The export-conflict check named `E4001` in section 11 is now `E4013 DuplicateExport` (E4001 is the internal unlowered-builtin code); self-import is `E4008`.
+- Not verified here: the correctness checklist in section 11 was not re-audited item by item, and phase 5 trials named in section 10 (stale iface rejected, dependent type-checked with the dependency AST omitted) were not found as separate named trials.
+
+Per [APPLICATION_IS_ONE_COMPILATION_UNIT.md](./APPLICATION_IS_ONE_COMPILATION_UNIT.md), the iface cache is part of the per-file build that works around compiler memory; no language or runtime feature may depend on it.
 
 ---
 

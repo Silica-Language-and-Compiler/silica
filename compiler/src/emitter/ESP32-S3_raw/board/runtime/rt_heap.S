@@ -420,7 +420,12 @@ silica_rt_heap_is_block:
 // A heap block is scanned over its whole payload; anything else over nbytes (0: not at all), so
 // a word that is a scalar or an address outside the heap is never followed. Slots hold a 32-bit
 // address in the low word with the high word zero, as the emitted code lays composites out.
+// Recursion bounded by `depth` (silica_rt_state_release passes 4): at most five frames of this
+// function plus silica_rt_heap_is_block below the deepest. tools/main_stack_bound.py reads the
+// declared bound instead of walking the recursion.
+    .set    silica_rt_heap_reaches__stack_bound, 5 * 32 + 32
     .align  4
+    .global silica_rt_heap_reaches             // rt_supervisors.S silica_rt_init_owners_reach
 silica_rt_heap_reaches:
     entry   a1, 32
     movi    a6, 65536
@@ -460,7 +465,7 @@ silica_rt_heap_reaches:
 // from new -- its slots, and the slots of the blocks they name, four levels down; the emitter
 // moves one level, so a state that packs its predecessor keeps it alive -- or is the spec init
 // a supervised child's row keeps for restarts (rt_supervisors.S ROW_INIT).
-#define ACB_ROW  104
+#define ACB_ROW  76
 #define ROW_INIT 24
     .align  4
     .global silica_rt_state_release

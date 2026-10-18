@@ -1,5 +1,7 @@
 # Common Contract for Standard Data Structures
 
+**Implementation status (2026-10-16):** Implemented; the checker enforces the constructor-record, bracket-type, comparator-atom and lookup-status rules (`trials/ordered_data_structures/compiler_substrate/` and `trials/error_enforcement_addition/standard_data_structures/`). Known deviations: only `mem(normal)` is used by the landed modules; the specification's constructor record for BinaryTree is `{ compare_item }` (decision 2026-10-16), not `{}`; trait methods that return an `ItemType` take a placeholder argument. See `../standard_data_structures_baseline/requirements_to_trials_ledger.md` for coverage per section.
+
 **Applies to:** every design in this directory
 **Nature:** semantic and Silica-encoding rules, not an implementation plan
 
@@ -64,7 +66,7 @@ CSR and dense inline records have compiler-version-private structural layouts. T
 
 ## 3. Constructor resolution
 
-Every public constructor receives one inline function record, which may be the exact empty record `{}` when the detailed design requires no behavior function. Resolution uses:
+Every public constructor receives one inline function record, which carries at least the function that witnesses `ItemType` (`BinaryTree` uses `{ compare_item }`, a witness its core never calls; an empty record `{}` gives no witness, E2017). Resolution uses:
 
 1. the expected collection type at the binding or return position; and
 2. all function-field parameter and return types, when fields are present; and

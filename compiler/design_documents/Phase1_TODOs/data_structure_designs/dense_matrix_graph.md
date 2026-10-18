@@ -1,5 +1,7 @@
 # Dense Matrix Graph Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/graph_dense_core.silica` with `graph_dense_directed`, `graph_dense_undirected`, `graph_dense_weighted`, `graph_dense_weighted_undirected`; trials in `trials/ordered_data_structures/graph_dense_core/` (9 programs) and `graph_collections/`. Deviation: cells are optional references (`ref?`) over the skew RAL for every family, not boolean or `:none | (:some, EdgeDataType)` cells (module header, deviation 1).
+
 **Module family:** `graph_dense_directed`, `graph_dense_undirected`, weighted variants
 **Storage:** skew binary random-access lists
 **Vertex universe:** fixed at construction
@@ -139,6 +141,8 @@ Validation checks vertex-index bijection, RAL invariants, exact runtime extent, 
 | validate | `Theta(V^2)` | diagnostics |
 
 ## 13. Representation choice rule
+
+Construction: `graph_dense_directed@empty_for_nodes(functions, nodes)` takes the same `functions` record as the matching live graph (`{ compare_node, compare_edge, edge_target }` directed; `{ compare_node, compare_edge_data }` undirected; `{ compare_node, compare_edge_data, edge_weight, compare_weight }` weighted) and the universe of node IDs as a `List`; the dense families have no freeze step.
 
 This design is appropriate only when allocating and scanning `V^2` cells is acceptable. Sparse or dynamically growing graphs use the live WBT representation and may freeze to CSR for traversal.
 

@@ -1,5 +1,7 @@
 # `BinaryTree` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/BinaryTree.silica` over `tree_binary.silica`; trials in `trials/ordered_data_structures/binary_tree_core/` (13 programs). The constructor record is `{ compare_item }` (decision 2026-10-16: the specification follows the implementation; a bare `ItemType` is witnessed only by a `compare_*` field, and the core never calls the function). Deviations from the placeholder-free draft: `root_item`, `get`, `left_item` and `right_item` take a placeholder item, so they are arity 2 and 3 rather than 1 and 2; paths are built with `tree_binary@path_root/path_left/path_right` (atoms are numbered per unit); `mem(normal)` only. The `BinaryTree[ItemType, mem(normal)]` bracket type is accepted. Not landed: the constructor-record compile-fail trials (`trial_compile_fail_binary_tree_*`, `StubBinaryTree`) and the randomized-oracle and complexity trials (`standard_data_structures_implementation_plan.md` §7.10, §17, §20).
+
 **Public trait:** `BinaryTree`  
 **Generated module:** `tree_binary`  
 **Representation:** persistent fixed-arity binary tree with optional left/right recursive references  
@@ -33,23 +35,27 @@ The public type is:
 BinaryTree[ItemType, mem(SpaceType)]
 ```
 
-The exact constructor function record is empty:
+The constructor function record is:
 
 ```text
-{}
+{ compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater }
 ```
 
-It is still an inline constructor record. The expected result type and explicit item arguments provide the `ItemType` and `SpaceType` witnesses. The record captures no comparator, extractor, orientation, or ordering identity.
+(Decision 2026-10-16: the specification matches the implementation. An earlier draft of this design made the record the exact empty record `{}`.)
+
+It is still an inline constructor record. The expected result type and explicit item arguments provide the `SpaceType` witness and the item values. The `compare_item` field is the `ItemType` witness: the compiler resolves a bare `ItemType` at a qualified call only from a `compare_item` (or `compare_priority`) function field of the first argument, and an empty record `{}` gives no witness (E2017). The function is stored in the tree record, so every tree value, every node-producing result and every update carries it forward, and the checker can resolve `ItemType` for every later call from the tree. The tree core never calls it: `compare_item` is not an ordering identity, no ordering bundle is materialized, no operation reorders or compares items, and a BinaryTree remains unordered (left and right are fixed roles). The record captures no extractor or orientation.
 
 Examples:
 
 ```silica
-empty_tree: BinaryTree[string, mem(normal)] <- tree_binary@empty({});
+empty_tree: BinaryTree[string, mem(normal)] <- tree_binary@empty({ compare_item: compare_strings });
 
-rooted: BinaryTree[string, mem(normal)] <- tree_binary@with_root({}, "root");
+rooted: BinaryTree[string, mem(normal)] <- tree_binary@with_root({ compare_item: compare_strings }, "root");
 ```
 
-Supporting an exact empty constructor record is part of the BinaryTree Layer 1 registration delta. Missing type context for `empty({})` is a compile-time error; the compiler must not choose a default item type or space.
+where `compare_strings` is any `fn(string, string) -> :less | :equal | :greater`.
+
+Missing type context for `empty({ compare_item: ... })` is a compile-time error; the compiler must not choose a default item type or space.
 
 ## 3. No custom surface types
 
@@ -201,15 +207,15 @@ export validate/1;
 Expository signatures:
 
 ```text
-fn empty(functions: {}) -> BinaryTree[ItemType, mem(SpaceType)] {}
+fn empty(functions: { compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater }) -> BinaryTree[ItemType, mem(SpaceType)] {}
 
 fn with_root(
-    functions: {},
+    functions: { compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater },
     root_item: ItemType
 ) -> BinaryTree[ItemType, mem(SpaceType)] {}
 
 fn node(
-    functions: {},
+    functions: { compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater },
     item: ItemType,
     left: BinaryTree[ItemType, mem(SpaceType)],
     right: BinaryTree[ItemType, mem(SpaceType)]
@@ -285,14 +291,14 @@ Zipper signatures repeat the complete inline zipper record described by [`persis
 
 ## 8. Empty, root, and direct-child behavior
 
-`empty({})`:
+`empty({ compare_item })`:
 
 - resolves the canonical arena for the expected specialization;
 - stores `root=:none`;
 - reports count zero; and
 - allocates no binary-tree node.
 
-`with_root({}, item)` creates one leaf with count one.
+`with_root({ compare_item }, item)` creates one leaf with count one.
 
 `root_item` on empty returns `status=:not_found`.
 
@@ -307,7 +313,7 @@ No query allocates a binary-tree node.
 
 ## 9. Node construction and subtree compatibility
 
-`node({}, item, left, right)` creates a one-node root whose children are the supplied whole trees.
+`node({ compare_item }, item, left, right)` creates a one-node root whose children are the supplied whole trees.
 
 It checks both child values before allocating:
 
@@ -476,15 +482,15 @@ Let `h` be target depth and `n` logical node occurrences.
 ## 18. Example
 
 ```silica
-empty_s: BinaryTree[string, mem(normal)] <- tree_binary@empty({});
+empty_s: BinaryTree[string, mem(normal)] <- tree_binary@empty({ compare_item: compare_strings });
 
-left: BinaryTree[string, mem(normal)] <- tree_binary@with_root({}, "left");
-right: BinaryTree[string, mem(normal)] <- tree_binary@with_root({}, "right");
+left: BinaryTree[string, mem(normal)] <- tree_binary@with_root({ compare_item: compare_strings }, "left");
+right: BinaryTree[string, mem(normal)] <- tree_binary@with_root({ compare_item: compare_strings }, "right");
 
 made: {
     tree: BinaryTree[string, mem(normal)],
     compatible: boolean
-} <- tree_binary@node({}, "root", left, right);
+} <- tree_binary@node({ compare_item: compare_strings }, "root", left, right);
 
 left_item: {
     status: :not_found | :found,

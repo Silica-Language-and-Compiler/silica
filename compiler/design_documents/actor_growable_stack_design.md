@@ -2,13 +2,40 @@
 
 **Version**: 1.0
 **Date**: April 2, 2026
-**Status**: Design Specification (Pre-Implementation)
+**Status**: Design specification. The hosted stack mechanism (§2, §4.1, §4.2, §4.4, §7) was implemented 2026-09-17/18; lazy page migration (§4.3, §5.3) is not (see Implementation status below)
 
 ---
 
 ## Executive Summary
 
 > **Decisions of 2026-09-17.** The sizing and policy in this document were settled against the language contract in [silica-specification.md](silica-specification.md) §15.1.2.2, which is the authority; where this document and that section differ, the specification wins. The settled points, each of which §15.1.2.2 states: one contiguous reservation per actor, defaulting to the machine's memory plus swap and lowerable per spawn, in place of the earlier 1 GB figure and in place of the segmented stacks the roadmap once proposed; nothing committed at spawn; growth in chunks that double from one platform page to 1 MB and then stay at 1 MB; release at the message boundary under one of five named algorithms chosen at spawn, where the stack policy is a required argument of every spawn form; no per-actor maximum and no runtime cap, so memory exhaustion is the host's affair; the platform's page size rather than a fixed one; `main` is not an actor; NUMA placement and lazy migration only where the platform has NUMA; and a four-field memory report. The implementation plan is [Phase1_TODOs/actor_stack_growth_plan.md](Phase1_TODOs/actor_stack_growth_plan.md). Sections below that still show 4 KB pages, an 8 MB initial mapping, a 1 GB region or a guard page are describing the pre-decision layout and are superseded on those points.
+
+> **Implementation status (2026-10-16).** Checked against `emitter/<target>/terms/prims/prims_actors_stack_asm.silica`
+> on `apple_silicon_mac`, `linux_aarch64` and `linux_x86_64`, and against ROADMAP chunk 1.
+> **Implemented (hosted, 2026-09-17/18):** the reservation (default the machine's memory plus swap, lowered by
+> `stack_policy`), nothing committed at spawn, growth in the fault handler in chunks that double from one platform
+> page to 1 MB, the reservation test ahead of the guarded-foreign-call recovery, the five release algorithms, the
+> four-field `get_actor_memory_usage`, `(:explicit, :stack_exhausted)` and `(:explicit, :stack_reserve_failed)`, and
+> `main` on the platform's ordinary stack (the compiler's own `main` is a small `main` that waits in
+> `wait_for_exit`). The control-block fields of §2.2 live at ACB offsets 272 to 391, listed in the module's header;
+> the control block is 448 bytes. Where the implementation differs from the text below: the runtime is still one OS
+> thread per actor (carriers are ROADMAP chunk 2, hosted part), so the actor thread keeps a 128 KB pthread stack
+> for its mailbox loop, switches SP onto the reservation around each behaviour call, and has a 64 KB
+> `sigaltstack` (a growth fault happens with SP inside inaccessible memory); a release is an anonymous `MAP_FIXED`
+> remap to `PROT_NONE` (on Darwin `madvise(MADV_FREE*)` only re-accounts), not `MADV_FREE`; the lowest page of a
+> reservation is never committed, so that reaching it is the end of the reservation; the per-message usage that
+> `:keep_last_message` and `:track_recent_peak` need is measured by scanning for the lowest nonzero page of a run
+> that is zeroed after every message; `:release_when_idle` is a one-second timed wait in the actor's own mailbox
+> loop, since there is no carrier thread to sweep (§4.2.1 says carriers); the implicit heap is a chain of 64 MB
+> anonymous blocks with a bounds-checked bump pointer; child-spec children inherit the spawner's policy;
+> `stack_policy(reserve, release)` is one word, `(reserve rounded to 16) | algorithm index`, and the release atom
+> must be a literal. Trials: `trials/actor_stacks_addition`, `error_enforcement_addition/stack_policy_*`,
+> `ffi_addition/app_foreign_call_from_deep_stack`. **Not implemented:** NUMA-node-local commitment and the lazy page
+> migration handler of §4.3 and the migration strategies of §5.3 (they apply only to platforms that report NUMA
+> nodes; the Mac and the Pi have none), the proactive growth hints of §13.2, and a million idle actors (bounded by the
+> host's thread limit until chunk 2 brings carriers). **Not this design:** the ESP32-S3 has no demand paging; its
+> stacks are chains of heap chunks, designed and built in [actor_memory_budget_plan.md](actor_memory_budget_plan.md)
+> (§5 item F, §11).
 
 This document describes the complete actor memory architecture for Silica, replacing the per-actor heap model with **growable stacks and lazy page migration**. Key design principles:
 
@@ -1854,6 +1881,8 @@ memory_used: int64 <- get_actor_memory_usage(actor);
 
 ### Phase 1: Core Growable Stack (Weeks 1-3)
 
+*Implemented 2026-09-17/18 on the hosted paths in the decided form (see Implementation status at the top); the sizes in the block below are the pre-decision ones.*
+
 ```
 1. Virtual memory allocation
    - Per-actor 1 GB virtual r
@@ -1875,6 +1904,8 @@ memory_used: int64 <- get_actor_memory_usage(actor);
 ```
 
 ### Phase 2: Lazy Migration (Weeks 4-6)
+
+*Not implemented: it applies only where the platform reports NUMA nodes. `migrate_actor` itself exists (ROADMAP chunk 2) and moves an actor's execution, not its pages.*
 
 ```
 1. Extend page fault handler
@@ -2059,5 +2090,5 @@ spec §15.1.2.2. An explicit limit is opt-in.
 
 ---
 
-**Document Status**: Ready for implementation
-**Next Step**: Prototype Phase 1 (virtual allocation + page fault handler)
+**Document Status**: Phase 1 (§11) implemented on the hosted paths; Phases 2 and 3 not started (NUMA-only); see Implementation status at the top
+**Next Step**: carriers (ROADMAP chunk 2) to lift the thread-per-actor bound; the NUMA phases when a NUMA target is taken up

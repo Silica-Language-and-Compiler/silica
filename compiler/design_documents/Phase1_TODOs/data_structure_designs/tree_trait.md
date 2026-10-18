@@ -1,5 +1,7 @@
 # `Tree` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/Tree.silica` over `tree_rose.silica`; trials in `trials/ordered_data_structures/tree_collections/` (16 programs). Deviations (module header, eight numbered): `add_child` is exported as `add_leaf/3` because `add_child` is a supervisor built-in name; `get`, `child_at` and `find_first` take a placeholder item; `mem(normal)` only. The `Tree[ItemType, mem(normal)]` bracket type is accepted.
+
 **Public trait:** `Tree`  
 **Generated module:** `tree_rose`  
 **Representation:** persistent rose tree with skew-binary child-slot sequences

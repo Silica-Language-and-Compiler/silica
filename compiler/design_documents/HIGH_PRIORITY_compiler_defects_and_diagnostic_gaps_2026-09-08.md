@@ -1,15 +1,46 @@
 # HIGH PRIORITY — Compiler defects and diagnostic gaps found while generating training trials (2026-09-08)
 
-**Status:** open defects. None of these is fixed. Each was found with the seed compiler
-`binaries/silica-compiler` (→ `silica-999994-macos-applesilicon`) while generating the
+**Status (original, 2026-09-08):** open defects; see Implementation status below for the current state. Each was found with the seed compiler
+`binaries/silica-compiler` (a Silica-built generation, `silica-999994-macos-applesilicon` at the time) while generating the
 5,294 `train_*` trial pairs, and each was *avoided* in the generated corpus rather than
-fixed. That means **no installed trial pins any of them**; the reproductions below are
-the only record. Every reproduction is a single `.silica` file: put it in a scratch
-directory with a one-line `silica.config` naming it and run `binaries/silica-compiler`
-there (milliseconds), so nothing here needs a compiler rebuild to confirm.
+fixed. Every reproduction is a single `.silica` file: put it in a scratch
+directory with a one-line `silica.config` naming it and run the compiler there (milliseconds), so nothing here needs a compiler rebuild to confirm.
 
 Generator: `programmer_tools/train_trial_generator/` (its README lists the areas it skips
 because of the items below).
+
+---
+
+## Implementation status (2026-10-16)
+
+Every item below has an installed `train_defect_*` trial (56 `.silica` files across `actors_addition`,
+`floatNN_addition`, `intNN_addition`, `uintNN_addition`, `tuples_addition`, `traits_addition`,
+`deep_frame_spill_addition` and `error_enforcement_addition`). The behaviour trials carry hand-derived
+`.scout` goldens and their last recorded `.sout` equals the `.scout`; the error trials carry `.golden_fail`
+goldens that equal the last `.cur_fail`. Plan and execution record:
+[compiler_defects_resolution_plan.md](./compiler_defects_resolution_plan.md),
+[compiler_defects_execution_status_2026-09-10.md](./compiler_defects_execution_status_2026-09-10.md).
+
+| Item | Status | Where it lives |
+| --- | --- | --- |
+| A1 second float parameter lost | fixed | `train_defect_a1_*` (6 trials, float16/32/64) |
+| A2 returned closure loses capture | rejected with E1067 (interim); closure environments NOT implemented | `train_defect_a2_*` (3 `.golden_fail`) |
+| A3 record-typed actor state through call/reply | fixed | `actors_addition/train_defect_a3_record_state_reply_0001` |
+| A4 tuple/record parameter after a scalar | fixed | `train_defect_a4_*` (3 trials) |
+| A5 provided trait methods across the exit-75 restart | fixed | `traits_addition/train_defect_a5_*` |
+| A6 large single units killed | fixed (20-40 live bindings compile) | `deep_frame_spill_addition/train_defect_a6_*` |
+| A7 parenthesised right operand | fixed | `train_defect_a7_*` (per integer width) |
+| A8 float compare, compound both sides | fixed | `train_defect_a8_*` (float32, float64) |
+| A9 record message with List state | fixed | `actors_addition/train_defect_a9_*` |
+| A10 call whose message is a call expression | fixed | `actors_addition/train_defect_a10_*` |
+| B1-B14 diagnostic gaps | all diagnosed | `error_enforcement_addition/train_defect_b*` (B1 E2005, B2 E2001, B3/B4 E3002, B5 E3010, B6 E1040, B7 E1066, B8/B9 E2001, B10 E2019, B11 E2005/E2001, B12 E2011, B13 E2001, B14 E2005) |
+
+Open: A2 closure environments (a function value is a code pointer only; the E1067 diagnostic stops the
+silent wrong answer for a returned capturing literal; the design decision, a two-word closure of code
+pointer and environment, is not taken). The four misleading-diagnostic wordings in the section after
+the Part B table were not re-checked against the current compiler and stay listed as open.
+
+The body of this document is the original 2026-09-08 report, kept as the record of the reproductions.
 
 ---
 

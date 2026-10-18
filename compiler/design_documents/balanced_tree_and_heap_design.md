@@ -24,6 +24,8 @@ BrodalOkasakiPriorityQueue[PriorityType, ItemType, mem(normal)]
 
 Registry bracket forms may identify generator keys (§2.6). **Emitted module filenames** use representation (+ min/max for heaps) only — for example `wbt_set.silica`, `wbt_map.silica`, `brodal_okasaki_min.silica` — not filenames that embed payload type or memory space.
 
+**Implementation status (2026-10-16):** implemented in `compiler/stdlib/data_structures/` as `wbt_set` and `wbt_map` (§3) and `brodal_okasaki.silica` with its split units and the `brodal_okasaki_min`, `brodal_okasaki_max` and `brodal_okasaki_priority` forwarders (§4), under the traits `OrderedSet`, `OrderedMap`, `SearchTree`, `Heap` and `PriorityQueue`. Trials: `trials/ordered_data_structures/` (`wbt_core`, `ordered_collections`, `brodal_okasaki_core`, `heap_collections`, `search_tree_collections`). Nodes are inline recursive tuples in a canonical arena, not the node-list alternative of §3.2; comparators return `:less | :equal | :greater`, not `atom`. Deviations the compiler forced (placeholder arguments to `peek`/`get`, `KeyType`/`ValueType` spelling for `PriorityQueue`, `mem(normal)` only) are numbered in the module headers.
+
 ---
 
 ## 2. Shared constraints

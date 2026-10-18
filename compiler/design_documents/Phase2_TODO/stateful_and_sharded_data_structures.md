@@ -2,6 +2,8 @@
 
 Date: 2026-06-03
 
+**Implementation status (2026-10-16):** not started. No actor-wrapped or sharded collection exists in `compiler/stdlib/data_structures` or elsewhere (searched for an ordered-set actor wrapper and `hash_key`). The Phase 1 collections it builds on are landed (`OrderedSet`/`OrderedMap` over `wbt_set`/`wbt_map`, `Heap`, `PriorityQueue`, `Tree`, `BinaryTree`, `SearchTree`, the graph traits, and the skew-binary random-access list). The `fn(...) -> atom` comparator spelling in the sketches below is shorthand: the real comparator type is `fn(T, T) -> :less | :equal | :greater` (`wbt_set.silica`). Cross-shard transactions and restart handling depend on `link`/`monitor`, which are still runtime stubs (see [actor_monitor_demonitor_todo.md](actor_monitor_demonitor_todo.md)). The Phase 1 reference `data_structures_implementation_command.md` is not in the tree; see [../Phase1_TODOs/standard_data_structures_implementation_plan.md](../Phase1_TODOs/standard_data_structures_implementation_plan.md).
+
 This Phase 2 note describes two extensions to the Phase 1 trait-oriented
 standard data-structure design:
 
@@ -17,8 +19,7 @@ value data structures.
 
 Phase 1 standard data structures are ordinary typed values with **generic payloads**
 (resolved from declared collection types and constructor function records — see
-[data_structures_implementation_command.md](../Phase1_TODOs/data_structures_implementation_command.md)
-Phase 1 Steps 1.10–1.11):
+[standard_data_structures_implementation_plan.md](../Phase1_TODOs/standard_data_structures_implementation_plan.md)):
 
 ```text
 names: OrderedSet[string, mem(normal)] <- wbt_set@empty({

@@ -2,6 +2,20 @@
 
 This document captures an implementation path for treating general recursion in a runtime that must respect **stack limits**, **controlled allocation**, **debuggability**, and **preemptibility** (save/resume with fair scheduling). It reflects a design where the primary story is an **explicit recursion frame stack** and a small **interpreter loop**, not universal CPS with heap closures.
 
+## Implementation status (2026-10-16)
+
+The explicit frame stack, interpreter loop and fuel-based preemption described here are a design that is NOT implemented, and the specification now rules out preemption inside a dispatch: an actor is switched out only at a scheduler yield point (a dispatch boundary or a wait on `call`); a long computation shares its core by casting to itself (`silica-specification.md` section 16.2.6.5, 23.1.1). What the compiler does today:
+
+- Recursion runs on the native stack. Each actor's stack grows on demand and is bounded by its reservation (see `actor_growable_stack_design.md`, `Phase1_TODOs/actor_stack_growth_plan.md`); deep recursion ends the actor with `(:explicit, :stack_exhausted)` where the reservation is capped, not with a frame-stack depth error.
+- Tail calls: a recursive call in tail position is emitted as a jump (`B` / the target's equivalent) rather than call and return; `recursion_support@module_uses_tail_calls` decides whether the module needs the tail-call header, and `emitter_core` records non-tail calls in `main` (`main_kind5_body_uses_non_tail_call`).
+- The type checker classifies call sites (`type_checker_recursion.silica`, `recursion_analyze_body`: self vs other, tail vs non-tail) for the emitters; no new type errors come from it.
+- The `emit_fuel_backedge_stub_comment`, `emit_trampoline_fallback_stub`, `emit_stack_trace_hook_comment` and `.lcomm _silica_fuel` pieces in `emitter/apple_silicon_mac/recursion/recursion_support.silica` are comments and placeholders; no emitted code decrements `_silica_fuel` or branches to `_silica_yield`, and no runtime defines them.
+- SIR-level recursion handling (fold recognition, explicit-stack lowering) is specified in `sir_recursion_strategy.md`; trials are under `trials/recursive_function_addition`.
+
+Phases 1, 3, 4 (frames, fuel, source-mapped traces) and 6 (trampoline) are therefore open design; phase 5 (native tail calls) is the part that exists. `recursion_implementation.jsonld`, referenced by the code comments, is no longer in this directory.
+
+---
+
 ## Goals
 
 | Goal | Approach |
@@ -66,4 +80,4 @@ Source-level tail recursion is a **special case** of a machine where every trans
 
 ## References
 
-- Related runtime containment and process semantics: `beam_like_crash_containment_design_notes.md` in this directory.
+- Related runtime containment and process semantics: `runtime_failure_reporting.md` in this directory (the earlier `beam_like_crash_containment_design_notes.md` was removed).

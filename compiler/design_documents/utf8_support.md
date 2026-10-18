@@ -1,5 +1,19 @@
 # UTF-8 Support for Char Literals in substring_until_char
 
+## Implementation status (2026-10-16)
+
+Implemented as designed, in every phase named below:
+
+- Lexer: `advance_utf8_char` and `utf8_lead_byte_length` were removed. The lexer now checks UTF-8 validity itself (comments, strings, characters, atoms), and invalid bytes are error E0007 InvalidUtf8 (lone continuation bytes, C0/C1/F5-FF, truncated, overlong, surrogates, above U+10FFFF); a leading byte order mark is skipped. The text below describing those two helpers is the original design.
+- Substring helper: its backward walk restarts from byte 0 on invalid input.
+- SIR generator: `byte_to_int64` (256-case table), `char_lexeme_to_utf8_encoded` and the char-literal branch of `expr_to_sir_with_type` in `src/sir_generator/terms/literals.silica`; a char literal is the int64 `(len << 56) | packed`.
+- Emitters: `L_substring_until_char_helper` with full code-point matching in `string_substring_mmap_nomte.silica` for all four backends (`apple_silicon_mac`, `linux_aarch64`, `linux_x86_64`, `ESP32-S3_raw`); the substring helper also has an ASCII fast path and a UTF-8 slow path with a cursor cache.
+- Trials: `substring_utf8_cursor` and the `string_test_substring_until_char_*` set.
+
+The "no calls out to Rust runtime functions" constraint is moot: the compiler is Rust-free. File paths below are given relative to `compiler/src/`; the emitter path is per target (`emitter/<target>/terms/`).
+
+---
+
 ## Problem
 
 The `char_lexeme_to_int64_string` function in `sir_generator/terms/literals.silica` converts char literal lexemes (e.g. `"' '"`, `"','"`) to decimal strings for the `substring_until_char` helper. Currently it uses a hardcoded lookup table covering only a few ASCII characters (` `, `,`, `x`, `z`, `\n`, `\t`). Unlisted characters fall through to `"0"`, producing incorrect behavior. Multi-byte UTF-8 characters (e.g. `'é'`) are not handled correctly.

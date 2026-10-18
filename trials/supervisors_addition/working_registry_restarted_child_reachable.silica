@@ -1,0 +1,137 @@
+// Spec §20.3.1 "Names across restarts": a supervisor child is registered under its id; when it is
+// restarted, the runtime registers the replacement under the same name before the replacement
+// handles its first message, and the name is removed at the old child's teardown, before the
+// supervisor handles the exit, so the re-registration is not a duplicate (item J of
+// actor_memory_budget_plan.md). The child is reached by name, killed abnormally, the supervisor is
+// made to serve the exit (a maintenance call drains its ingress), and the child is reached by name again.
+// The kill comes from a sibling child (:pulser), since kill_abnormal is only allowed in a behaviour.
+//
+// Expected output:
+//   42                            call_registered(:echo_worker, 21) before the kill
+//   <failure report of the first :echo_worker: reason_tag 1, agent_type_atom :worker>
+//   10                            call_registered(:echo_worker, 5) reaches the replacement
+
+use Supervisor;
+
+impl RegisteredRestartSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    } <- { strategy: :one_for_one, allowed_restart_count: 3, restarts_time_frame: 3600 };
+        children: List[
+            {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+            mem(normal)
+        ] <- [
+            { id: :echo_worker, agent_type: :worker, initial_state: 0, behavior: echo_worker, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :pulser, agent_type: :worker, initial_state: 0, behavior: pulser_beh, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn echo_worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg * 2, state)
+}
+
+// kill_abnormal is only allowed inside a behaviour: this sibling ends :echo_worker by name when asked.
+fn pulser_beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        _: atom <- kill_abnormal(:echo_worker)
+    produces
+        pure (:reply, msg, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        sup: supervisor_ref <- spawn_registered_supervisor(RegisteredRestartSup, 0, :registered_restart_sup, stack_policy(0, :keep_last_message));
+        before: int64 <- call_registered(:echo_worker, 21 impl ActorMessage {});
+        print_int64(before);
+        println("");
+        _: int64 <- call_registered(:pulser, 0 impl ActorMessage {});
+        _drain: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)],
+            count: int64,
+            child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },
+            error: atom
+        } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
+        after: int64 <- call_registered(:echo_worker, 5 impl ActorMessage {});
+        print_int64(after);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

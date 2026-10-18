@@ -4,8 +4,9 @@
 **Date:** 2026-08-13  
 **Applies to:**
 
-- `compiler/src/main.silica` (seed)
-- `compiler/src/main.silica` (selfhost)
+- `compiler/src/main_parse.silica` (`parse_all_files_recursive`) and `compiler/src/main_driver_first.silica` (`prepare_compile_order`, the first-pass driver). There is one compiler source tree now (`compiler/src`); the seed/selfhost split this note was written against no longer exists.
+
+**Implementation status (2026-10-16):** not implemented. `parse_all_files_recursive` still prints `Parsing <file>...`, `  Lexing...`, `  Parsing...` and runs `lexer_runner` and the full parser on every config path, and no parser entry that stops at the first function exists. The batch compile order file is still written by `main_driver_first.silica` and the run exits 75 as described below; `main_crash.silica` adds a second batch exit (76) not covered here. `topo_silica_config.sh` now lives in `compiler/src/`.
 
 **Related:**
 
@@ -31,7 +32,7 @@ Progress is `Parsing` / `Lexing...` / `Parsing...` per file, so the pass looks l
 
 `extract_use_modules_from_program` only reads declaration tag 2 (`use`) and the imported names in `parameters`. Spec §19.3.1 and E4005 already require every `use` to appear before any `fn`. The graph does not need function bodies.
 
-The selfhost Makefile’s `topo_silica_config.sh` already approximates the same graph with a line scan of `use ...;`. That remains a membership/order hint. The compiler’s first pass is the authoritative in-process graph and must see comments, strings, and multi-line `use` correctly.
+The compiler Makefile’s `topo_silica_config.sh` already approximates the same graph with a line scan of `use ...;`. That remains a membership/order hint. The compiler’s first pass is the authoritative in-process graph and must see comments, strings, and multi-line `use` correctly.
 
 ---
 
@@ -48,7 +49,7 @@ The selfhost Makefile’s `topo_silica_config.sh` already approximates the same 
    - Per-file progress names the use-tree work, for example `  uses: path.silica`, not a compile `Parsing...` / `Lexing...` / `Parsing...` sequence.
 3. Kahn-sort; report a cycle as today.
 4. Multi-unit: write `silica.compile.order` and exit 75 (`Compile order ready; exiting to reclaim memory before unit compiles...`).
-5. Single-unit (or seed’s in-process path of 32 or fewer units): the existing compile path still full-parses that unit before module checking. The use-tree prefix is not a substitute for the compile parse.
+5. Single-unit: the existing compile path still full-parses that unit before module checking. The use-tree prefix is not a substitute for the compile parse.
 
 ### Resume process (`silica.compile.order` present)
 
@@ -79,7 +80,6 @@ Stop at the first **function declaration**, not the first non-`use` line. `modul
 
 - Add a parser entry such as `parse_use_prefix` / `parse_until_first_function` that reuses existing `use` / `module` / `export` extractors and returns when `is_fn_decl_start` (or equivalent) is true.
 - Replace `parse_all_files_recursive`’s `parse_program` call with that entry. The returned “program” for the sort may be a decls-only prefix; `extract_use_modules_from_program` already ignores non-tag-2 decls.
-- Seed dialect (`do` / `end`, named structs) in `src/`; selfhost dialect (`{` / `}`, inline records) in `src/`. Do not copy one tree into the other.
 - Keep fail-fast: a lex or prefix-parse error still aborts the batch before writing `silica.compile.order`.
 
 ---
@@ -90,5 +90,4 @@ Stop at the first **function declaration**, not the first non-`use` line. `modul
 - Use-tree progress is distinct from compile progress.
 - Multi-line `use` and `use` in comments/strings match today’s full-parse graph.
 - A `use` after the first `fn` is omitted from the first-pass graph and still fails E4005 on the compile parse.
-- Seed and selfhost both implement the prefix parse.
-- `trials/codegen_regressions` integrate still compiles; independent files remain leaves.
+- A multi-unit trial suite (`make integrate` in `trials/`) still compiles; independent files remain leaves.

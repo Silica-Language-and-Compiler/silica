@@ -41,7 +41,7 @@ silica.config:
 	@printf '%s\n' \
 		qualified_call_too_many_args.silica \
 		bees_hello.silica \
-		> "$(THIS_DIR)silica.config"
+		> "$(THIS_DIR)silica.config" && cd "$(THIS_DIR)" && $(TRIAL_SUPPORT_CONFIG)
 
 help:
 	@echo "qualified_call_too_many_args_trial (multi-file error enforcement)"

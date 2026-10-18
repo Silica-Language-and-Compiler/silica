@@ -24,7 +24,7 @@
 //   badarith_chunk, case_clause_chunk.
 // Every symbol, control-block offset, data layout, message-node shape and atom-index parameter is the
 // same as in emitter/linux_aarch64/terms/prims/prims_actors_runtime_asm.silica (header there documents
-// the 512 B ACB, the 152 B message nodes and the two-list mailboxes). Only the instruction text changed.
+// the 408 B ACB (item I), the 152 B message nodes and the two-list mailboxes). Only the instruction text changed.
 //
 // Register model (shared with prims_actors_runtime_asm / _b): internal convention X0..X7 = rdi rsi rdx rcx
 // r8 r9 r14 r15, result in rdi (never rax); C library results arrive in rax and are moved. AArch64
@@ -50,6 +50,8 @@ export actor_rt_pid_registry_chunk/1;
 export actor_rt_asm_phase_i_chunk/1;
 export actor_rt_asm_badarith_chunk/0;
 export actor_rt_asm_case_clause_chunk/0;
+export actor_rt_asm_name_taken_chunk/1;
+export actor_rt_identity_chunk/1;
 
 // Phase C (§15.4.10–§15.4.11): structured exit notification construction + ingress delivery, plus three
 // behavior-only trial accessors used by `phase_c_child_exit_notification.silica` to assert payload fields.
@@ -70,12 +72,26 @@ fn actor_rt_asm_phase_c_chunk(table: { is_empty: boolean, index_map: { root: ref
 	.p2align	2
 # Phase C -- §15.4.10 unified delivery
 silica_rt_actor_deliver_exit:
-# X0 (rdi) = child self; X0 out: 0 delivered, 1 drop (no sup / dead / OOM)
+# X0 (rdi) = child self; X0 out: 0 delivered or dropped (dead supervisor), 1 no supervisor / OOM (root note)
 # slots: [rbp-8] = x19 child, [rbp-16] = x20 supervisor, [rbp-24] = x21 payload, [rbp-32] = x22 node
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
+# A death is in flight from here until its failure report is listed or written
+# (silica_rt_actor_deliver_unwind_report): the supervisor can end on this exit and the
+# process with it before this thread reports, so the exit drain waits for the count.
+	lock inc	QWORD PTR [rip + silica_rt_report_inflight]
+# An ending supervisor shuts its children down first (spec §15.4.8.4, §15.4.12.2), so their
+# names are free before its own exit reaches its supervisor, which may restart it at once.
+	cmp	QWORD PTR [rdi + 216], 0
+	je	Lde_no_children
+	call	silica_rt_sup_shutdown_children
+	mov	rdi, QWORD PTR [rbp - 8]
+Lde_no_children:
+# §20.3.1: the registered name goes before the exit reaches the supervisor, on every exit path.
+	call	silica_rt_registry_forget_actor
+	mov	rdi, QWORD PTR [rbp - 8]
 	mov	rsi, QWORD PTR [rdi + 192]
 	mov	QWORD PTR [rbp - 16], rsi
 	test	rsi, rsi
@@ -88,39 +104,78 @@ silica_rt_actor_deliver_exit:
 	mov	QWORD PTR [rbp - 24], rax
 	mov	r10, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rax], r10
-	mov	r11, QWORD PTR [r10 + 336]
+	mov	r11, QWORD PTR [r10 + 232]
 	mov	QWORD PTR [rax + 8], r11
-	mov	r11, QWORD PTR [r10 + 496]
+	mov	r11, QWORD PTR [r10 + 384]
 	mov	QWORD PTR [rax + 16], r11
 	mov	r11, QWORD PTR [r10 + 200]
 	mov	QWORD PTR [rax + 24], r11
+# The notice holds this actor's control block until a supervisor has handled it
+# (silica_rt_exit_payload_free): maybe_restart matches rows by this reference.
+	lock add	QWORD PTR [r10 + 392], 1
+# A row child its spawner has not yet committed to the row (#400 == 0) parks the notice there; the
+# spawner enqueues it once the row holds this actor (silica_rt_supervisor_spawn_child_row_by_flavor).
+	mov	rcx, rax
+	xor	eax, eax
+	lock cmpxchg	QWORD PTR [r10 + 400], rcx
+	jnz	Lde_enqueue
+	xor	edi, edi
+	leave
+	ret
+Lde_enqueue:
 	mov	rdi, QWORD PTR [rbp - 16]
+	mov	rsi, QWORD PTR [rbp - 24]
+	call	silica_rt_sup_enqueue_exit
+# A supervised actor whose supervisor has ended is not a root actor: its notice is dropped
+# (§15.4.10.4) without the root note (a supervisor's shutdown ends every child this way).
+	xor	edi, edi
+	leave
+	ret
+Lde_nosup:
+	mov	edi, 1
+	leave
+	ret
+                                        # -- End function
+	.globl	silica_rt_sup_enqueue_exit
+	.p2align	2
+silica_rt_sup_enqueue_exit:
+# X0 (rdi) = supervisor ACB, X1 (rsi) = exit notification payload -> X0 = 0 queued in its ingress,
+# 1 dropped (the supervisor has ended; the payload is freed).
+# slots: [rbp-16] = x20 supervisor, [rbp-24] = x21 payload, [rbp-32] = x22 node
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 48
+	mov	QWORD PTR [rbp - 16], rdi
+	mov	QWORD PTR [rbp - 24], rsi
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	r10, QWORD PTR [rbp - 16]
 	mov	r11d, DWORD PTR [r10 + 152]
 	test	r11d, r11d
-	jz	Lde_dead
-	mov	r11d, DWORD PTR [r10 + 248]
+	jz	Lsee_dead
+	mov	rdi, r10
+	call	silica_rt_sb_require
+	mov	r11d, DWORD PTR [rdi + 16]
 	cmp	r11d, 1024
-	jae	Lde_abort
+	jae	Lsee_abort
 	mov	edi, 1
 	mov	esi, 152
 	call	calloc
 	test	rax, rax
-	jz	Lde_dead
+	jz	Lsee_dead
 	mov	QWORD PTR [rbp - 32], rax
 	mov	r10, QWORD PTR [rbp - 24]
 	mov	QWORD PTR [rax + 8], r10
 	mov	DWORD PTR [rax + 16], 0
 	mov	rdi, QWORD PTR [rbp - 16]
-	add	rdi, 232
+	mov	rdi, QWORD PTR [rdi + 216]
 	mov	rsi, rax
 	call	silica_rt_q_enqueue_locked
 	mov	r10, QWORD PTR [rbp - 16]
-	mov	r11d, DWORD PTR [r10 + 248]
+	mov	rcx, QWORD PTR [r10 + 216]
+	mov	r11d, DWORD PTR [rcx + 16]
 	add	r11d, 1
-	mov	DWORD PTR [r10 + 248], r11d
+	mov	DWORD PTR [rcx + 16], r11d
 	lea	rdi, [r10 + 80]
 	call	silica_rt_cv_signal
 	mov	rdi, QWORD PTR [rbp - 16]
@@ -129,20 +184,16 @@ silica_rt_actor_deliver_exit:
 	xor	edi, edi
 	leave
 	ret
-Lde_dead:
-	mov	rdi, QWORD PTR [rbp - 24]
-	call	free
+Lsee_dead:
 	mov	rdi, QWORD PTR [rbp - 16]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_exit_payload_free
 	mov	edi, 1
 	leave
 	ret
-Lde_nosup:
-	mov	edi, 1
-	leave
-	ret
-Lde_abort:
+Lsee_abort:
 	call	silica_rt_abort_exit_queue_full
                                         # -- End function
 	.globl	silica_rt_actor_supervision_wait_and_drain_one
@@ -162,15 +213,18 @@ silica_rt_actor_supervision_wait_and_drain_one:
 	call	silica_rt_lock_lock
 Lswd_try:
 	mov	rdi, QWORD PTR [rbp - 8]
-	add	rdi, 232
+	mov	rdi, QWORD PTR [rdi + 216]
+	test	rdi, rdi
+	jz	Lswd_wait
 	call	silica_rt_q_dequeue_locked
 	test	rdi, rdi
 	jz	Lswd_wait
 	mov	QWORD PTR [rbp - 16], rdi
 	mov	r10, QWORD PTR [rbp - 8]
-	mov	r11d, DWORD PTR [r10 + 248]
+	mov	rcx, QWORD PTR [r10 + 216]
+	mov	r11d, DWORD PTR [rcx + 16]
 	sub	r11d, 1
-	mov	DWORD PTR [r10 + 248], r11d
+	mov	DWORD PTR [rcx + 16], r11d
 	mov	r11, QWORD PTR [rdi + 8]
 	mov	QWORD PTR [rbp - 24], r11
 	lea	rdi, [r10 + 16]
@@ -186,6 +240,9 @@ Lswd_try:
 	mov	rsi, QWORD PTR [rbp - 8]
 	mov	rdx, QWORD PTR [r11 + 8]
 	call	silica_rt_supervisor_maybe_restart
+	mov	r11, QWORD PTR [rbp - 24]
+	mov	rdi, QWORD PTR [r11]
+	call	silica_rt_acb_release
 Lswd_free_wrap:
 	mov	rdi, QWORD PTR [rbp - 16]
 	call	free
@@ -371,13 +428,256 @@ fn actor_rt_asm_phase_f_chunk() -> string {
 .comm	silica_rt_root_failure_reporter,8,8
 .globl	silica_rt_region_dump_limit
 .comm	silica_rt_region_dump_limit,8,8
+# The report a FailureReporter is handling: +0 the string block (0: none), +8 escaped (the
+# behaviour sent it on, so another actor holds it), +16/+24 the reporter's arena block and bump
+# pointer when handling began. One root reporter handles reports, so one record serves.
+.globl	silica_rt_report_owner
+.comm	silica_rt_report_owner,32,8
+	.text
+	.globl	silica_rt_report_begin
+	.p2align	4
+silica_rt_report_begin:
+# rdi = owned payload, rsi = receiving ACB, before its behaviour runs: the report is recorded as the
+# one being handled, then taken off the pending list (in that order, so the exit drain never sees
+# it in neither place).
+	lea	rax, [rip + silica_rt_report_owner]
+	mov	QWORD PTR [rax], rdi
+	mov	QWORD PTR [rax + 8], 0
+	mov	r10, QWORD PTR [rsi + 160]
+	mov	QWORD PTR [rax + 16], r10
+	mov	r10, QWORD PTR [rsi + 176]
+	mov	QWORD PTR [rax + 24], r10
+	jmp	silica_rt_report_list_take
+	.globl	silica_rt_report_escape_check
+	.p2align	4
+silica_rt_report_escape_check:
+# rsi = a message being sent, cast or called with. When it is the report being handled, the report
+# has moved on to another actor and its dispatch must not free it. Leaf; rax and r10 only,
+# rdi/rsi/rdx kept.
+	lea	rax, [rip + silica_rt_report_owner]
+	mov	r10, QWORD PTR [rax]
+	test	r10, r10
+	jz	Lrec_ret
+	cmp	r10, rsi
+	jne	Lrec_ret
+	mov	QWORD PTR [rax + 8], 1
+Lrec_ret:
+	ret
+	.globl	silica_rt_report_release
+	.p2align	4
+silica_rt_report_release:
+# rdi = owned payload, rsi = ACB whose behaviour just returned (its new state is in [rsi]). Frees the
+# payload unless the behaviour kept it: it sent it on (escaped), it is the new state, or a word of
+# what the behaviour allocated in its arena names it or its text (the arena span since
+# silica_rt_report_begin; the block a composite state lives in). Anything uncertain keeps it: a
+# missed free leaks one report, a wrong one corrupts. Leaf apart from the tail call to free.
+	lea	rax, [rip + silica_rt_report_owner]
+	cmp	QWORD PTR [rax], rdi
+	jne	Lrr_keep
+	mov	QWORD PTR [rax], 0
+	cmp	QWORD PTR [rax + 8], 0
+	jne	Lrr_keep
+	lea	r9, [rdi + 24]
+	mov	r10, QWORD PTR [rsi]
+	cmp	r10, rdi
+	je	Lrr_keep
+	cmp	r10, r9
+	je	Lrr_keep
+	mov	r10, QWORD PTR [rax + 16]
+	mov	r11, QWORD PTR [rsi + 160]
+	mov	rcx, QWORD PTR [rax + 24]
+	mov	rdx, QWORD PTR [rsi + 176]
+	cmp	r10, r11
+	je	Lrr_scan
+	test	r10, r10
+	jnz	Lrr_keep
+	test	r11, r11
+	jz	Lrr_free
+	lea	rcx, [r11 + 16]
+Lrr_scan:
+	cmp	rcx, rdx
+	jae	Lrr_free
+	mov	r10, QWORD PTR [rcx]
+	add	rcx, 8
+	cmp	r10, rdi
+	je	Lrr_keep
+	cmp	r10, r9
+	je	Lrr_keep
+	jmp	Lrr_scan
+Lrr_free:
+	jmp	free
+Lrr_keep:
+	ret
+# Pending reports: handed to the reporter (cast) and not yet taken by its dispatch. A list node is
+# 16 B: +0 next, +8 the report string. silica_rt_report_list: +0 head (oldest first), +8 lock.
+	.globl	silica_rt_report_list_add
+	.p2align	4
+silica_rt_report_list_add:
+# rdi = report string -> rdi = 1 listed, 0 no memory.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	edi, 16
+	call	malloc
+	test	rax, rax
+	jz	Lrla_fail
+	mov	QWORD PTR [rbp - 16], rax
+	mov	QWORD PTR [rax], 0
+	mov	rcx, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 8], rcx
+	lea	rdi, [rip + silica_rt_report_list + 8]
+	call	silica_rt_lock_lock
+	lea	r10, [rip + silica_rt_report_list]
+Lrla_walk:
+	mov	r11, QWORD PTR [r10]
+	test	r11, r11
+	jz	Lrla_link
+	mov	r10, r11
+	jmp	Lrla_walk
+Lrla_link:
+	mov	rax, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [r10], rax
+	lea	rdi, [rip + silica_rt_report_list + 8]
+	call	silica_rt_lock_unlock
+	mov	edi, 1
+	leave
+	ret
+Lrla_fail:
+	xor	edi, edi
+	leave
+	ret
+	.globl	silica_rt_report_list_take
+	.p2align	4
+silica_rt_report_list_take:
+# rdi = report string -> rdi = 1 when it was listed (it is not any more), 0 when it was not (the
+# exit drain printed it).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], 0
+	lea	rdi, [rip + silica_rt_report_list + 8]
+	call	silica_rt_lock_lock
+	lea	r10, [rip + silica_rt_report_list]
+	mov	rcx, QWORD PTR [rbp - 8]
+Lrlt_walk:
+	mov	r11, QWORD PTR [r10]
+	test	r11, r11
+	jz	Lrlt_unlock
+	cmp	QWORD PTR [r11 + 8], rcx
+	je	Lrlt_found
+	mov	r10, r11
+	jmp	Lrlt_walk
+Lrlt_found:
+	mov	rax, QWORD PTR [r11]
+	mov	QWORD PTR [r10], rax
+	mov	QWORD PTR [rbp - 16], r11
+Lrlt_unlock:
+	lea	rdi, [rip + silica_rt_report_list + 8]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	test	rdi, rdi
+	jz	Lrlt_ret
+	call	free
+	mov	edi, 1
+Lrlt_ret:
+	leave
+	ret
+	.globl	silica_rt_report_unhandled
+	.p2align	4
+silica_rt_report_unhandled:
+# rdi = a report still queued when the reporter ended: written to stderr (unless the exit drain
+# already did) and freed.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_report_list_take
+	test	rdi, rdi
+	jz	Lrun_free
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rax + 8]
+	mov	rdx, QWORD PTR [rax + 16]
+	mov	edi, 2
+	mov	eax, 1
+	syscall
+Lrun_free:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	free
+	leave
+	ret
+	.globl	silica_rt_report_drain_at_exit
+	.p2align	4
+silica_rt_report_drain_at_exit:
+# atexit handler (C ABI: rbx and r12 are restored). Waits (2 s at most, in 1 ms steps) while a
+# report is pending or being handled and the reporter is alive, then writes every report still
+# pending to stderr, oldest first. A report the reporter is handling when the wait ends is the
+# reporter's to print.
+	push	rbp
+	mov	rbp, rsp
+	push	rbx
+	push	r12
+	mov	ebx, 2000
+Lrd_wait:
+# A death whose report is not listed yet (silica_rt_report_inflight) is waited for first,
+# reporter or not: its supervisor may have ended the process on that exit.
+	cmp	QWORD PTR [rip + silica_rt_report_inflight], 0
+	jne	Lrd_sleep
+	mov	rax, QWORD PTR [rip + silica_rt_report_list]
+	or	rax, QWORD PTR [rip + silica_rt_report_owner]
+	jz	Lrd_print
+	cmp	QWORD PTR [rip + silica_rt_root_failure_reporter], 0
+	je	Lrd_print
+Lrd_sleep:
+	test	ebx, ebx
+	jz	Lrd_print
+	dec	ebx
+	mov	edi, 1000
+	call	usleep
+	jmp	Lrd_wait
+Lrd_print:
+	lea	rdi, [rip + silica_rt_report_list + 8]
+	call	silica_rt_lock_lock
+	mov	rbx, QWORD PTR [rip + silica_rt_report_list]
+	mov	QWORD PTR [rip + silica_rt_report_list], 0
+Lrd_loop:
+	test	rbx, rbx
+	jz	Lrd_unlock
+	mov	r12, QWORD PTR [rbx + 8]
+	mov	rsi, QWORD PTR [r12 + 8]
+	mov	rdx, QWORD PTR [r12 + 16]
+	mov	edi, 2
+	mov	eax, 1
+	syscall
+	mov	rdi, rbx
+	mov	rbx, QWORD PTR [rbx]
+	call	free
+	jmp	Lrd_loop
+Lrd_unlock:
+	lea	rdi, [rip + silica_rt_report_list + 8]
+	call	silica_rt_lock_unlock
+# Held to the end of the process: a root note being written finishes first, later ones wait.
+	lea	rdi, [rip + silica_rt_root_note_lock]
+	call	silica_rt_lock_lock
+	pop	r12
+	pop	rbx
+	pop	rbp
+	ret
+	.bss
+	.p2align	3
+.globl	silica_rt_report_list
+.comm	silica_rt_report_list,16,8
+# Deaths between silica_rt_actor_deliver_exit and their listed or written failure report.
+.globl	silica_rt_report_inflight
+.comm	silica_rt_report_inflight,8,8
 	.section .rodata
 	.p2align	2
 Ldup_oom_msg:
 	.asciz	\"[silica] unwind report: malloc failed\\n\"
 	.p2align	2
 L_phase_f_unwind_fmt:
-	.asciz	\"\\n=== Silica Actor Failure ===\\nactor_id:        %p\\nagent_type_atom: %lld\\nreason_tag:      %lld\\nsupervisor_acb:  %p\\n\"
+	.asciz	\"\\n=== Silica Actor Failure ===\\nactor_id:        %llu\\nagent_type_atom: %lld\\nreason_tag:      %lld\\nsupervisor_acb:  %p\\n\"
 	.p2align	2
 L_phase_f_cs_hdr:
 	.asciz	\"call_stack:\\n\"
@@ -414,7 +714,13 @@ silica_rt_failure_reporter_register:
 	mov	r10, QWORD PTR [rax]
 	test	r10, r10
 	jnz	Lfr_reg_done
-	mov	QWORD PTR [rax], rdi
+# rdi = the reporter's reference. The marker word says one is registered; delivery resolves the
+# identity (§15.1.4), so an ended reporter is never touched.
+	mov	QWORD PTR [rip + silica_rt_root_failure_reporter_id], rdi
+	mov	QWORD PTR [rax], 1
+# Reports already handed to the reporter are printed before the process ends (§15.4.13.4: one
+# handle_report per actor death): exit runs silica_rt_report_drain_at_exit, registered at
+# runtime start (silica_rt_exit_request_init).
 Lfr_reg_done:
 	xor	edi, edi
 	ret
@@ -455,6 +761,7 @@ silica_rt_actor_deliver_unwind_report:
 	mov	rbp, rsp
 	sub	rsp, 128
 	mov	QWORD PTR [rbp - 24], rdi
+	mov	QWORD PTR [rbp - 32], 0
 	mov	QWORD PTR [rbp - 72], 2048
 	mov	edi, 2048
 	call	malloc
@@ -464,7 +771,7 @@ silica_rt_actor_deliver_unwind_report:
 	mov	r10, QWORD PTR [rbp - 24]
 	mov	r11, QWORD PTR [r10 + 200]
 	mov	QWORD PTR [rbp - 40], r11
-	mov	r11, QWORD PTR [r10 + 336]
+	mov	r11, QWORD PTR [r10 + 232]
 	mov	QWORD PTR [rbp - 48], r11
 	mov	r11, QWORD PTR [r10 + 192]
 	mov	QWORD PTR [rbp - 56], r11
@@ -472,7 +779,7 @@ silica_rt_actor_deliver_unwind_report:
 	mov	rdi, rax
 	mov	rsi, QWORD PTR [rbp - 72]
 	lea	rdx, [rip + L_phase_f_unwind_fmt]
-	mov	rcx, r10
+	mov	rcx, QWORD PTR [r10 + 408]
 	mov	r8, QWORD PTR [rbp - 40]
 	mov	r9, QWORD PTR [rbp - 48]
 	sub	rsp, 16
@@ -610,25 +917,65 @@ Lcs_nul_term:
 Ldup_no_dump:
 	lea	rax, [rip + silica_rt_root_failure_reporter]
 	mov	r10, QWORD PTR [rax]
-	mov	QWORD PTR [rbp - 32], r10
 	test	r10, r10
 	jz	Ldup_stderr_path
+	mov	r10, QWORD PTR [rip + silica_rt_root_failure_reporter_id]
 	mov	r11, QWORD PTR [rbp - 24]
-	cmp	r11, r10
+	cmp	QWORD PTR [r11 + 408], r10
 	jne	Ldup_fr_try
 	mov	QWORD PTR [rax], 0
 	jmp	Ldup_stderr_path
 Ldup_fr_try:
-	mov	r11d, DWORD PTR [r10 + 152]
+# The reporter is resolved and held for the delivery (released at Ldup_ep_ret).
+	mov	rdi, r10
+	call	silica_rt_ref_hold
+	mov	QWORD PTR [rbp - 32], rdi
+	test	rdi, rdi
+	jz	Ldup_stderr_path
+	mov	r11d, DWORD PTR [rdi + 152]
 	test	r11d, r11d
 	jz	Ldup_stderr_path
-	mov	rdi, r10
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_actor_cast
-# F6: cast enqueue failure (OOM for 152 B node, null target, etc.) -- same stderr fallback as F5 unregistered root.
-	test	edi, edi
+# The reporter's handle_report takes `report: string`: one block holds the string header
+# {tag -1, bytes, length} (the layout L_ps_helper and the string prims read) and the text after it,
+# as the board's silica_rt_string_from_bytes builds one. The message owns the block: the reporter's
+# dispatch frees it once handle_report has returned (silica_rt_report_release), and the text
+# buffer goes back here. [rbp-80] holds the block.
+	movsxd	rdi, DWORD PTR [rbp - 64]
+	add	rdi, 25
+	call	malloc
+	test	rax, rax
 	jz	Ldup_stderr_path
-	jmp	Ldup_leave_nofree
+	mov	QWORD PTR [rbp - 80], rax
+	mov	QWORD PTR [rax], -1
+	lea	rdi, [rax + 24]
+	mov	QWORD PTR [rax + 8], rdi
+	movsxd	rdx, DWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 16], rdx
+	mov	rsi, QWORD PTR [rbp - 8]
+	call	memcpy
+	mov	rax, QWORD PTR [rbp - 80]
+	movsxd	rdx, DWORD PTR [rbp - 64]
+	mov	BYTE PTR [rax + rdx + 24], 0
+# Listed until handle_report takes it, so process exit can still print it (silica_rt_report_list_add).
+	mov	rdi, QWORD PTR [rbp - 80]
+	call	silica_rt_report_list_add
+	test	rdi, rdi
+	jz	Ldup_cast_failed
+	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rsi, QWORD PTR [rbp - 80]
+	mov	edx, 1
+	call	silica_rt_actor_cast_flagged
+# F6: cast enqueue failure (OOM for 152 B node, null target, etc.) -- same stderr fallback as F5 unregistered root.
+# 2: the reporter's behaviour is call-only (§16.2.6.4): nothing was enqueued, so the report falls back
+# to stderr as for any failed enqueue (§15.4.13.4).
+	cmp	edi, 1
+	je	Ldup_std_free_only
+	mov	rdi, QWORD PTR [rbp - 80]
+	call	silica_rt_report_list_take
+Ldup_cast_failed:
+	mov	rdi, QWORD PTR [rbp - 80]
+	call	free
+	jmp	Ldup_stderr_path
 Ldup_stderr_path:
 	mov	eax, DWORD PTR [rbp - 64]
 	cmp	eax, 1
@@ -642,10 +989,6 @@ Ldup_std_free_only:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	free
 	jmp	Ldup_ep_ret
-Ldup_leave_nofree:
-	xor	edi, edi
-	leave
-	ret
 Ldup_malloc_fail:
 # F5: always surface *something* on stderr when unwind text cannot be allocated (independent of ingress).
 	mov	edi, 2
@@ -655,6 +998,11 @@ Ldup_malloc_fail:
 	syscall
 	jmp	Ldup_ep_ret
 Ldup_ep_ret:
+	mov	rdi, QWORD PTR [rbp - 32]
+	call	silica_rt_acb_release
+# The report is listed or written: this death is no longer in flight (counted by
+# silica_rt_actor_deliver_exit, or by silica_rt_root_report_and_note for a root).
+	lock dec	QWORD PTR [rip + silica_rt_report_inflight]
 	xor	edi, edi
 	leave
 	ret
@@ -670,17 +1018,49 @@ fn actor_rt_pid_registry_chunk(table: { is_empty: boolean, index_map: { root: re
     found_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":found"));
     not_found_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":not_found"));
     unknown_op_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":unknown_op"));
+    name_taken_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":name_taken"));
+    already_registered_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":already_registered"));
+    actor_not_found_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found"));
+    slots: string <- atom_table@int64_to_decimal_string(atom_table@atom_count(table));
+    reply_tag: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":reply"));
+    no_reply_tag: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":no_reply"));
     p0: string <- "
-# PID registry primitive actor.
-# State layout: 3840 B calloc block, occ[240] at +0, actor_ref words[240] at +1920.
+# The registry slot count of this image: one slot per atom of the build (atoms/atom_table.silica
+# build_runtime_atom_table; actor_memory_budget_plan.md item J). Atoms are interned when the program
+# is built (spec §4.1.7), so the tables never overflow. The keyed forms treat an int64 below this
+# count as an atom and at or above it as an actor_ref: control blocks are calloc'd, and the non-PIE
+# image's heap starts above its own text (0x400000), far above any atom count.
+	.section .rodata
+	.p2align	3
+	.globl	silica_registry_slots
+silica_registry_slots:
+	.quad	";
+    // The behaviour result tags the dispatch loop reads (actor_rt_asm_chunk_2): this build's atoms.
+    p0b: string <- concat(concat(concat(concat(concat(p0, slots), "
+	.globl	silica_rt_reply_tag
+silica_rt_reply_tag:
+	.quad	"), reply_tag), "
+	.globl	silica_rt_no_reply_tag
+silica_rt_no_reply_tag:
+	.quad	"), no_reply_tag);
+    p0c: string <- concat(p0b, "
+	.text
+# PID registry primitive actor (spec §20.3.1).
+# State layout: one calloc block of silica_registry_slots * 16 B: occ[slots] (int64, 1 = held) at +0,
+# actor_ref words[slots] at +slots*8. The same block is read directly by the keyed forms and by
+# silica_rt_register_actor_named (the store writes the ref before the occ word; a removal clears the
+# occ word first).
 # Message record layout follows record emission: shape word@0, op@8, name@16, pid@24.
 # Behavior return layout follows actor runtime convention: tag@0, reply@8, next_state@16.
+# :insert replies :ok (stored, or the actor already holds this very name), :name_taken (a live actor
+# or supervisor holds the name), :already_registered (the actor holds another name in this table) or
+# :actor_not_found (the actor has ended); the reply is a (status atom, actor_ref) pair.
 	.globl	silica_rt_pid_registry_beh
 	.p2align	2
 silica_rt_pid_registry_beh:
 # X0 = message record, X1 = state. slots: [rbp-8] = x19 msg, [rbp-16] = x20 state, [rbp-24] = x21 op,
 # [rbp-32] = x22 name, [rbp-40] = x23 pid, [rbp-48] = x24 result block. After the callocs: rdi = reply block,
-# rsi = state, r10 = op, r11 = name, rcx = pid (no further calls).
+# rsi = state, r10 = op, r11 = name, rcx = pid, r9 = slot count (reloaded after the one further call).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -711,8 +1091,9 @@ silica_rt_pid_registry_beh:
 	mov	r10, QWORD PTR [rbp - 24]
 	mov	r11, QWORD PTR [rbp - 32]
 	mov	rcx, QWORD PTR [rbp - 40]
-	cmp	r10, ";
-    p1: string <- concat(p0, insert_idx);
+	mov	r9, QWORD PTR [rip + silica_registry_slots]
+	cmp	r10, ");
+    p1: string <- concat(p0c, insert_idx);
     p2: string <- concat(p1, "
 	je	L_pidreg_insert
 	cmp	r10, ");
@@ -731,13 +1112,54 @@ silica_rt_pid_registry_beh:
 	jmp	L_pidreg_done
 L_pidreg_insert:
 	cmp	r11, 0
-	jl	L_pidreg_insert_ok
-	cmp	r11, 240
-	jge	L_pidreg_insert_ok
-	mov	rax, 1
-	mov	QWORD PTR [rsi + r11*8], rax
-	lea	r8, [rsi + 1920]
+	jl	L_pidreg_name_taken
+	cmp	r11, r9
+	jge	L_pidreg_name_taken
+# The pid is an identity (§15.1.4): liveness is the identity table's, and so is the holder's.
+	mov	rdi, rcx
+	call	silica_rt_ref_alive
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	rdi, QWORD PTR [rbp - 48]
+	mov	rdi, QWORD PTR [rdi + 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	r11, QWORD PTR [rbp - 32]
+	mov	rcx, QWORD PTR [rbp - 40]
+	mov	r9, QWORD PTR [rip + silica_registry_slots]
+	cmp	QWORD PTR [rbp - 56], 0
+	je	L_pidreg_actor_not_found
+	mov	rax, QWORD PTR [rsi + r11*8]
+	cmp	rax, 1
+	jne	L_pidreg_insert_free
+	lea	r8, [rsi + r9*8]
+	mov	rax, QWORD PTR [r8 + r11*8]
+	cmp	rax, rcx
+	je	L_pidreg_insert_ok
+	mov	rdi, rax
+	call	silica_rt_ref_alive
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	rdi, QWORD PTR [rbp - 48]
+	mov	rdi, QWORD PTR [rdi + 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	r11, QWORD PTR [rbp - 32]
+	mov	rcx, QWORD PTR [rbp - 40]
+	mov	r9, QWORD PTR [rip + silica_registry_slots]
+	cmp	QWORD PTR [rbp - 56], 0
+	jne	L_pidreg_name_taken
+L_pidreg_insert_free:
+	mov	rdi, rsi
+	mov	rsi, rcx
+	call	silica_rt_registry_table_holds
+	mov	rdi, QWORD PTR [rbp - 48]
+	mov	rdi, QWORD PTR [rdi + 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	r11, QWORD PTR [rbp - 32]
+	mov	rcx, QWORD PTR [rbp - 40]
+	mov	r9, QWORD PTR [rip + silica_registry_slots]
+	test	rax, rax
+	jnz	L_pidreg_already_registered
+	lea	r8, [rsi + r9*8]
 	mov	QWORD PTR [r8 + r11*8], rcx
+	mov	QWORD PTR [rsi + r11*8], 1
 L_pidreg_insert_ok:
 	mov	rax, ");
     p9: string <- concat(p8, ok_idx);
@@ -745,19 +1167,40 @@ L_pidreg_insert_ok:
 	mov	QWORD PTR [rdi], rax
 	mov	QWORD PTR [rdi + 8], rcx
 	jmp	L_pidreg_done
+L_pidreg_name_taken:
+	mov	rax, ");
+    p10b: string <- concat(p10, name_taken_idx);
+    p10c: string <- concat(p10b, "
+	mov	QWORD PTR [rdi], rax
+	mov	QWORD PTR [rdi + 8], rcx
+	jmp	L_pidreg_done
+L_pidreg_already_registered:
+	mov	rax, ");
+    p10d: string <- concat(p10c, already_registered_idx);
+    p10e: string <- concat(p10d, "
+	mov	QWORD PTR [rdi], rax
+	mov	QWORD PTR [rdi + 8], rcx
+	jmp	L_pidreg_done
+L_pidreg_actor_not_found:
+	mov	rax, ");
+    p10f: string <- concat(p10e, actor_not_found_idx);
+    p10g: string <- concat(p10f, "
+	mov	QWORD PTR [rdi], rax
+	mov	QWORD PTR [rdi + 8], 0
+	jmp	L_pidreg_done
 L_pidreg_lookup:
 	cmp	r11, 0
 	jl	L_pidreg_not_found
-	cmp	r11, 240
+	cmp	r11, r9
 	jge	L_pidreg_not_found
 	mov	rax, QWORD PTR [rsi + r11*8]
 	cmp	rax, 1
 	jne	L_pidreg_not_found
 	mov	rax, ");
-    p11: string <- concat(p10, found_idx);
+    p11: string <- concat(p10g, found_idx);
     p12: string <- concat(p11, "
 	mov	QWORD PTR [rdi], rax
-	lea	r8, [rsi + 1920]
+	lea	r8, [rsi + r9*8]
 	mov	r9, QWORD PTR [r8 + r11*8]
 	mov	QWORD PTR [rdi + 8], r9
 	jmp	L_pidreg_done
@@ -771,10 +1214,10 @@ L_pidreg_not_found:
 L_pidreg_delete:
 	cmp	r11, 0
 	jl	L_pidreg_delete_ok
-	cmp	r11, 240
+	cmp	r11, r9
 	jge	L_pidreg_delete_ok
 	mov	QWORD PTR [rsi + r11*8], 0
-	lea	r8, [rsi + 1920]
+	lea	r8, [rsi + r9*8]
 	mov	QWORD PTR [r8 + r11*8], 0
 L_pidreg_delete_ok:
 	mov	rax, ");
@@ -790,6 +1233,184 @@ L_pidreg_ret_null:
 	xor	edi, edi
 	leave
 	ret
+# silica_rt_registry_table_holds(rdi = registry state block, rsi = actor_ref) -> rax = 1 when the
+# table holds a name for the actor, else 0 (an actor holds at most one name per registry, §20.3.1).
+	.globl	silica_rt_registry_table_holds
+	.p2align	2
+silica_rt_registry_table_holds:
+	mov	r9, QWORD PTR [rip + silica_registry_slots]
+	lea	r10, [rdi + r9*8]
+	xor	r11d, r11d
+Lrth_loop:
+	cmp	r11, r9
+	jge	Lrth_no
+	cmp	QWORD PTR [rdi + r11*8], 1
+	jne	Lrth_next
+	cmp	QWORD PTR [r10 + r11*8], rsi
+	je	Lrth_yes
+Lrth_next:
+	inc	r11
+	jmp	Lrth_loop
+Lrth_yes:
+	mov	eax, 1
+	ret
+Lrth_no:
+	xor	eax, eax
+	ret
+# silica_rt_registry_table_forget(rdi = registry state block, rsi = actor_ref): clears every slot the
+# actor holds in that table, occ word first so a reader never sees a held slot with a stale ref.
+	.globl	silica_rt_registry_table_forget
+	.p2align	2
+silica_rt_registry_table_forget:
+	mov	r9, QWORD PTR [rip + silica_registry_slots]
+	lea	r10, [rdi + r9*8]
+	xor	r11d, r11d
+Lrtf_loop:
+	cmp	r11, r9
+	jge	Lrtf_done
+	cmp	QWORD PTR [rdi + r11*8], 1
+	jne	Lrtf_next
+	cmp	QWORD PTR [r10 + r11*8], rsi
+	jne	Lrtf_next
+	mov	QWORD PTR [rdi + r11*8], 0
+	mov	QWORD PTR [r10 + r11*8], 0
+Lrtf_next:
+	inc	r11
+	jmp	Lrtf_loop
+Lrtf_done:
+	ret
+# silica_rt_registry_forget_actor(rdi = actor_ref): removes the actor's names from the three
+# registries. Runs on every exit path before the exit reaches the supervisor (§20.3.1, removal when
+# an actor ends), so a restarted child finds its own name free and a recycled control block address
+# never answers to an old name. Keeps rdi.
+	.globl	silica_rt_registry_forget_actor
+	.p2align	2
+silica_rt_registry_forget_actor:
+	push	rbp
+	mov	rbp, rsp
+	push	rbx
+	sub	rsp, 8
+	mov	rbx, rdi
+	mov	rax, QWORD PTR [rip + silica_pid_registry_ref]
+	test	rax, rax
+	jz	Lrfa_dangerous
+	mov	rdi, QWORD PTR [rax]
+	test	rdi, rdi
+	jz	Lrfa_dangerous
+	mov	rsi, QWORD PTR [rbx + 408]
+	call	silica_rt_registry_table_forget
+Lrfa_dangerous:
+	mov	rax, QWORD PTR [rip + silica_dangerous_pid_registry_ref]
+	test	rax, rax
+	jz	Lrfa_device
+	mov	rdi, QWORD PTR [rax]
+	test	rdi, rdi
+	jz	Lrfa_device
+	mov	rsi, QWORD PTR [rbx + 408]
+	call	silica_rt_registry_table_forget
+Lrfa_device:
+	mov	rax, QWORD PTR [rip + silica_device_pid_registry_ref]
+	test	rax, rax
+	jz	Lrfa_done
+	mov	rdi, QWORD PTR [rax]
+	test	rdi, rdi
+	jz	Lrfa_done
+	mov	rsi, QWORD PTR [rbx + 408]
+	call	silica_rt_registry_table_forget
+Lrfa_done:
+	mov	rdi, rbx
+	add	rsp, 8
+	pop	rbx
+	pop	rbp
+	ret
+# silica_rt_registry_held_in(rdi = registry actor_ref or 0, rsi = atom) -> rax = 1 when a live actor
+# or supervisor holds the name in that registry, else 0.
+	.globl	silica_rt_registry_held_in
+	.p2align	2
+silica_rt_registry_held_in:
+	test	rdi, rdi
+	jz	Lrhi_no
+	mov	r9, QWORD PTR [rdi]
+	test	r9, r9
+	jz	Lrhi_no
+	cmp	rsi, 0
+	jl	Lrhi_no
+	mov	r10, QWORD PTR [rip + silica_registry_slots]
+	cmp	rsi, r10
+	jge	Lrhi_no
+	cmp	QWORD PTR [r9 + rsi*8], 1
+	jne	Lrhi_no
+	lea	r11, [r9 + r10*8]
+	mov	rdi, QWORD PTR [r11 + rsi*8]
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_ref_alive
+	mov	rax, rdi
+	pop	rbp
+	ret
+Lrhi_no:
+	xor	eax, eax
+	ret
+# silica_rt_registry_name_held(rdi = atom) -> rax = 1 when the ordinary registry holds the name for a
+# live actor or supervisor. The supervisor child paths probe a child id with it before spawning.
+	.globl	silica_rt_registry_name_held
+	.p2align	2
+silica_rt_registry_name_held:
+	mov	rsi, rdi
+	mov	rdi, QWORD PTR [rip + silica_pid_registry_ref]
+	jmp	silica_rt_registry_held_in
+# silica_rt_registry_require_free{,_dangerous,_device}(X0 = atom): the pre-spawn check of
+# spawn_registered, spawn_dangerous_registered, spawn_device_registered and
+# spawn_registered_supervisor (§20.3.1): when a live actor holds the name no actor is spawned and the
+# caller fails with :language_error (silica_rt_registry_name_taken, which does not return).
+	.globl	silica_rt_registry_require_free
+	.p2align	2
+silica_rt_registry_require_free:
+	push	rbp
+	mov	rbp, rsp
+	mov	rsi, rdi
+	mov	rdi, QWORD PTR [rip + silica_pid_registry_ref]
+	call	silica_rt_registry_held_in
+	test	rax, rax
+	jnz	Lrrf_taken
+	xor	edi, edi
+	pop	rbp
+	ret
+Lrrf_taken:
+	pop	rbp
+	jmp	silica_rt_registry_name_taken
+	.globl	silica_rt_registry_require_free_dangerous
+	.p2align	2
+silica_rt_registry_require_free_dangerous:
+	push	rbp
+	mov	rbp, rsp
+	mov	rsi, rdi
+	mov	rdi, QWORD PTR [rip + silica_dangerous_pid_registry_ref]
+	call	silica_rt_registry_held_in
+	test	rax, rax
+	jnz	Lrrfd_taken
+	xor	edi, edi
+	pop	rbp
+	ret
+Lrrfd_taken:
+	pop	rbp
+	jmp	silica_rt_registry_name_taken
+	.globl	silica_rt_registry_require_free_device
+	.p2align	2
+silica_rt_registry_require_free_device:
+	push	rbp
+	mov	rbp, rsp
+	mov	rsi, rdi
+	mov	rdi, QWORD PTR [rip + silica_device_pid_registry_ref]
+	call	silica_rt_registry_held_in
+	test	rax, rax
+	jnz	Lrrfv_taken
+	xor	edi, edi
+	pop	rbp
+	ret
+Lrrfv_taken:
+	pop	rbp
+	jmp	silica_rt_registry_name_taken
 ")
 }
 
@@ -798,6 +1419,15 @@ fn actor_rt_asm_phase_i_chunk(table: { is_empty: boolean, index_map: { root: ref
 	.p2align	3
 .globl	silica_rt_wait_root_acb
 .comm	silica_rt_wait_root_acb,8,8
+# §15.1.2.5: the exit request. _flag is 0 until the first cast_exit wins its compare-and-swap (1 after);
+# _request holds the winner's int64 value (any value, so the flag is separate), stored before the one byte
+# goes down the private pipe (read end @0, write end @4) that wakes main's wait_for_exit.
+.globl	silica_rt_exit_flag
+.comm	silica_rt_exit_flag,8,8
+.globl	silica_rt_exit_request
+.comm	silica_rt_exit_request,8,8
+.globl	silica_rt_exit_pipe
+.comm	silica_rt_exit_pipe,8,8
 # Global slot for the PID registry actor_ref (written by silica_rt_register_actor / read by silica_rt_get_registry_actor).
 .globl	silica_pid_registry_ref
 .comm	silica_pid_registry_ref,8,8
@@ -818,7 +1448,8 @@ silica_rt_pid_registry_init_spawn:
 	push	rbp
 	mov	rbp, rsp
 	mov	edi, 1
-	mov	esi, 3840
+	mov	rsi, QWORD PTR [rip + silica_registry_slots]
+	shl	rsi, 4
 	call	calloc
 # spawn(X0 = init state, X1 = beh, X2 = core_id 0, X3 = 0, X4 = stack policy 0 = inherit) -> X0
 	mov	rdi, rax
@@ -826,7 +1457,12 @@ silica_rt_pid_registry_init_spawn:
 	xor	edx, edx
 	xor	ecx, ecx
 	xor	r8d, r8d
+	lea	rax, [rip + silica_rt_runtime_spawner]
+	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], rax
 	call	silica_rt_actor_spawn
+	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], 0
+# The registries never end, so their ACBs are kept (not held) for the runtime's own use.
+	call	silica_rt_ref_peek
 	leave
 	ret
 # silica_pid_registry_init: called once at program start from emitter-injected main prologue.
@@ -836,6 +1472,7 @@ silica_rt_pid_registry_init_spawn:
 silica_pid_registry_init:
 	push	rbp
 	mov	rbp, rsp
+	call	silica_rt_exit_request_init
 	call	silica_rt_pid_registry_init_spawn
 	lea	rax, [rip + silica_pid_registry_ref]
 	mov	QWORD PTR [rax], rdi
@@ -849,14 +1486,20 @@ silica_rt_dangerous_pid_registry_init_spawn:
 	push	rbp
 	mov	rbp, rsp
 	mov	edi, 1
-	mov	esi, 3840
+	mov	rsi, QWORD PTR [rip + silica_registry_slots]
+	shl	rsi, 4
 	call	calloc
 	mov	rdi, rax
 	lea	rsi, [rip + silica_rt_pid_registry_beh]
 	xor	edx, edx
 	xor	ecx, ecx
 	xor	r8d, r8d
+	lea	rax, [rip + silica_rt_runtime_spawner]
+	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], rax
 	call	silica_rt_actor_spawn
+	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], 0
+# The registries never end, so their ACBs are kept (not held) for the runtime's own use.
+	call	silica_rt_ref_peek
 	leave
 	ret
 # silica_dangerous_pid_registry_init: called once at program start from emitter-injected main prologue.
@@ -879,14 +1522,20 @@ silica_rt_device_pid_registry_init_spawn:
 	push	rbp
 	mov	rbp, rsp
 	mov	edi, 1
-	mov	esi, 3840
+	mov	rsi, QWORD PTR [rip + silica_registry_slots]
+	shl	rsi, 4
 	call	calloc
 	mov	rdi, rax
 	lea	rsi, [rip + silica_rt_pid_registry_beh]
 	xor	edx, edx
 	xor	ecx, ecx
 	xor	r8d, r8d
+	lea	rax, [rip + silica_rt_runtime_spawner]
+	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], rax
 	call	silica_rt_actor_spawn
+	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], 0
+# The registries never end, so their ACBs are kept (not held) for the runtime's own use.
+	call	silica_rt_ref_peek
 	leave
 	ret
 # silica_device_pid_registry_init: called once at program start from emitter-injected main prologue.
@@ -904,29 +1553,44 @@ silica_device_pid_registry_init:
 	ret
 	.globl	silica_rt_wait_for_exit
 	.p2align	2
-# Phase I - stdin line e-x-i-t terminates process; EOF returns 0.
+# §15.1.2.5 - returns 0 for a stdin line e-x-i-t, or the value of the first recorded cast_exit; main then
+# continues. At the end of stdin only the exit pipe is watched; the wait does not end on idleness.
 silica_rt_wait_for_exit:
 # Local layout ([rsp + k]): fd_set 128 B @0, timeval 16 B @128, line buf 256 B @144, scratch @400 -- 416 B,
-# then the 80 B slot area: [rbp-16] = x20 line length, [rbp-24] = x21 cursor, [rbp-32] = x22 after-root flag.
+# then the 80 B slot area: [rbp-16] = line length, [rbp-24] = cursor, [rbp-32] = 1 while standard input is
+# still read (0 after its end), [rbp-40] = the exit pipe's read end.
 # select(2) with a 250 ms timeout, as on the AArch64 runtime (poll(2) on a tty stdin was unreliable on macOS).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 496
 	mov	QWORD PTR [rbp - 16], 0
+	mov	QWORD PTR [rbp - 32], 1
+	lea	rax, [rip + silica_rt_exit_pipe]
+	mov	eax, DWORD PTR [rax]
+	mov	QWORD PTR [rbp - 40], rax
 Lwi_loop:
-	mov	QWORD PTR [rbp - 32], 0
-Lwi_after_root:
 	mov	rdi, rsp
 	xor	esi, esi
 	mov	edx, 128
 	call	memset
+	cmp	QWORD PTR [rbp - 32], 0
+	je	Lwi_set_pipe
 	mov	eax, DWORD PTR [rsp]
 	or	eax, 1
 	mov	DWORD PTR [rsp], eax
+Lwi_set_pipe:
+	mov	rcx, QWORD PTR [rbp - 40]
+	mov	r10, rcx
+	shr	r10, 3
+	and	ecx, 7
+	mov	r11d, 1
+	shl	r11d, cl
+	or	BYTE PTR [rsp + r10], r11b
 	mov	QWORD PTR [rsp + 128], 0
 	mov	r10, 250000
 	mov	QWORD PTR [rsp + 136], r10
-	mov	edi, 1
+	mov	rdi, QWORD PTR [rbp - 40]
+	add	edi, 1
 	mov	rsi, rsp
 	xor	edx, edx
 	xor	ecx, ecx
@@ -936,6 +1600,20 @@ Lwi_after_root:
 	je	Lwi_select_sleep
 	cmp	eax, 0
 	je	Lwi_loop
+# The exit pipe is readable once a cast_exit request is recorded: return its value.
+	mov	rcx, QWORD PTR [rbp - 40]
+	mov	r10, rcx
+	shr	r10, 3
+	and	ecx, 7
+	movzx	r11d, BYTE PTR [rsp + r10]
+	shr	r11d, cl
+	test	r11d, 1
+	jnz	Lwi_cast_exit
+	cmp	QWORD PTR [rbp - 32], 0
+	je	Lwi_loop
+	mov	eax, DWORD PTR [rsp]
+	test	eax, 1
+	jz	Lwi_loop
 	mov	r10, QWORD PTR [rbp - 16]
 	cmp	r10, 255
 	jae	Lwi_overflow_discard
@@ -948,9 +1626,7 @@ Lwi_after_root:
 	call	read
 	cmp	rax, 0
 	jne	Lwi_line_read_nz
-	mov	r10, QWORD PTR [rbp - 32]
-	test	r10, r10
-	jz	Lwi_ret_ok
+	mov	QWORD PTR [rbp - 32], 0
 	jmp	Lwi_loop
 Lwi_line_read_nz:
 	cmp	rax, 1
@@ -969,7 +1645,6 @@ Lwi_trim_cr:
 	jle	Lwi_cmp_exit
 	lea	r11, [r10 - 1]
 	lea	rax, [rsp + 144]
-	mov	QWORD PTR [rbp - 32], rax
 	movzx	r10d, BYTE PTR [rax + r11]
 	cmp	r10d, 13
 	jne	Lwi_cmp_exit
@@ -1004,9 +1679,7 @@ Lwi_overflow_discard:
 	call	read
 	cmp	rax, 0
 	jne	Lwi_overflow_read_nz
-	mov	r10, QWORD PTR [rbp - 32]
-	test	r10, r10
-	jz	Lwi_ret_ok
+	mov	QWORD PTR [rbp - 32], 0
 	jmp	Lwi_loop
 Lwi_overflow_read_nz:
 	cmp	rax, 1
@@ -1024,11 +1697,70 @@ Lwi_select_sleep:
 	mov	edx, 100
 	call	poll
 	jmp	Lwi_loop
+Lwi_cast_exit:
+	lea	rax, [rip + silica_rt_exit_request]
+	mov	rdi, QWORD PTR [rax]
+	leave
+	ret
 Lwi_process_exit:
+# The exit line is the request cast_exit(0) would make (§15.1.2.5, the first request wins): it is recorded
+# the same way, so a later cast_exit returns 0. Lost to an earlier cast_exit: that request's pipe byte is
+# coming, so the loop waits for it and returns its value.
 	xor	edi, edi
-	call	exit
-	jmp	Lwi_process_exit
-Lwi_ret_ok:
+	call	silica_rt_cast_exit
+	test	rdi, rdi
+	jz	Lwi_line_reset
+	xor	edi, edi
+	leave
+	ret
+# §15.1.2.5 runtime start: no exit request yet (flag 0) and a private close-on-exec pipe from cast_exit to
+# wait_for_exit. Called from silica_pid_registry_init before any actor exists.
+	.globl	silica_rt_exit_request_init
+	.p2align	2
+silica_rt_exit_request_init:
+	push	rbp
+	mov	rbp, rsp
+	lea	rax, [rip + silica_rt_exit_flag]
+	mov	QWORD PTR [rax], 0
+	lea	rax, [rip + silica_rt_exit_request]
+	mov	QWORD PTR [rax], 0
+	lea	rdi, [rip + silica_rt_exit_pipe]
+	mov	esi, 524288
+	call	pipe2
+# Every death is reported once (§15.4.13.4), with or without a FailureReporter: exit waits for
+# reports still in flight and prints the pending ones (silica_rt_report_drain_at_exit).
+	lea	rdi, [rip + silica_rt_report_drain_at_exit]
+	call	atexit
+	xor	edi, edi
+	leave
+	ret
+# §15.1.2.5 cast_exit(value: int64) -> boolean. X0 (rdi) = value. Compare-and-swap silica_rt_exit_flag from 0
+# to 1: the winner stores its value in silica_rt_exit_request (x86 stores are ordered before the later write
+# syscall), writes one byte to the exit pipe so main's wait_for_exit wakes and returns that value, and returns 1.
+# A later request returns 0 and changes nothing. Any actor thread may call this; nothing here allocates.
+	.globl	silica_rt_cast_exit
+	.p2align	2
+silica_rt_cast_exit:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	xor	eax, eax
+	mov	r10d, 1
+	lea	rcx, [rip + silica_rt_exit_flag]
+	lock cmpxchg	QWORD PTR [rcx], r10
+	jne	Lce_lost
+	lea	rcx, [rip + silica_rt_exit_request]
+	mov	QWORD PTR [rcx], rdi
+	lea	rcx, [rip + silica_rt_exit_pipe]
+	mov	edi, DWORD PTR [rcx + 4]
+	lea	rsi, [rbp - 8]
+	mov	edx, 1
+	call	write
+	mov	edi, 1
+	leave
+	ret
+Lce_lost:
 	xor	edi, edi
 	leave
 	ret
@@ -1055,7 +1787,7 @@ silica_rt_badarith:
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	r10, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [r10 + 336], 1
+	mov	QWORD PTR [r10 + 232], 1
 	mov	DWORD PTR [r10 + 152], 0
 	lea	rdi, [r10 + 80]
 	call	silica_rt_cv_signal
@@ -1063,7 +1795,11 @@ silica_rt_badarith:
 	add	rdi, 16
 	call	silica_rt_lock_unlock
 	mov	r10, QWORD PTR [rbp - 8]
-	mov	rax, QWORD PTR [r10 + 272]
+	mov	rax, QWORD PTR [r10 + 216]
+	test	rax, rax
+	jz	Lsbg_2
+	mov	rax, QWORD PTR [rax + 40]
+Lsbg_2:
 	test	rax, rax
 	jnz	Lbadarith_report_already_done
 	mov	rdi, r10
@@ -1075,6 +1811,21 @@ silica_rt_badarith:
 Lbadarith_report_already_done:
 	mov	QWORD PTR [rbp - 16], 0
 Lbadarith_after_report:
+# The started word (#224) is set after the report so a spawner spinning on it (actor_spawn /
+# spawn_linked, while this actor's start trampoline ran) proceeds: 2 = the init trampoline divided by zero. The ACB is
+# not freed under the spawner: it goes with its last holder (silica_rt_acb_release); a row child's
+# exit notice is parked at #400 until its spawner has committed it to the row.
+	mov	r10, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [r10 + 224], 0
+	jne	Lbadarith_started_set
+	mov	QWORD PTR [r10 + 224], 2
+	jmp	Lbadarith_no_supervisor
+Lbadarith_started_set:
+# A notice parked at #400 (this row child ended before its spawner committed it) is not in the
+# supervisor's ingress yet: nothing to drain or wait for.
+	mov	r10, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [r10 + 400], 1
+	jne	Lbadarith_no_supervisor
 	mov	r10, QWORD PTR [rbp - 8]
 	mov	r11, QWORD PTR [r10 + 192]
 	mov	QWORD PTR [rbp - 24], r11
@@ -1087,39 +1838,46 @@ Lbadarith_after_report:
 	mov	QWORD PTR [rbp - 32], r11
 	test	r11, r11
 	jz	Lbadarith_no_supervisor
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_sup_wait_enter
+	test	rdi, rdi
+	jz	Lbadarith_no_supervisor
+# Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
+# (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
+# restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
+# row (its policy restarts nothing); before, the child and that caller spun forever
+# (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
+# supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
+# keeps the rows until it stops: a row freed under the wait was read as a garbage child
+# (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
+Lbadarith_wait_new_child:
 	mov	r10, QWORD PTR [rbp - 24]
 	mov	eax, DWORD PTR [r10 + 152]
 	test	eax, eax
-	jz	Lbadarith_no_supervisor
-Lbadarith_wait_new_child:
+	jz	Lbadarith_wait_done
 	mov	r11, QWORD PTR [rbp - 32]
 	mov	rdi, QWORD PTR [r11]
-	mov	r10, QWORD PTR [rbp - 8]
-	cmp	rdi, r10
-	je	Lbadarith_wait_new_child
 	test	rdi, rdi
-	jz	Lbadarith_wait_new_child
-	mov	rax, QWORD PTR [rdi + 288]
+	jz	Lbadarith_wait_done
+	cmp	rdi, QWORD PTR [rbp - 8]
+	je	Lbadarith_wait_new_child
+	mov	rax, QWORD PTR [rdi + 224]
 	test	rax, rax
 	jz	Lbadarith_wait_new_child
+Lbadarith_wait_done:
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_sup_wait_leave
 Lbadarith_no_supervisor:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_signal_pending_call_deaths
-	mov	r10, QWORD PTR [rbp - 8]
-	mov	r11, QWORD PTR [r10 + 208]
-	mov	QWORD PTR [rbp - 32], r11
-	mov	rdi, r10
+	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_child_table_free
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_ffi_arena_teardown
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_dealloc_region
 	mov	rdi, QWORD PTR [rbp - 8]
-	call	free
-	mov	r11, QWORD PTR [rbp - 32]
-	test	r11, r11
-	jz	Lbadarith_thread_exit
-	mov	QWORD PTR [r11 + 56], 1
+	call	silica_rt_actor_final_release
 Lbadarith_thread_exit:
 	xor	edi, edi
 	call	pthread_exit
@@ -1156,7 +1914,7 @@ silica_rt_case_clause:
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	r10, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [r10 + 336], 2
+	mov	QWORD PTR [r10 + 232], 2
 	mov	DWORD PTR [r10 + 152], 0
 	lea	rdi, [r10 + 80]
 	call	silica_rt_cv_signal
@@ -1164,7 +1922,11 @@ silica_rt_case_clause:
 	add	rdi, 16
 	call	silica_rt_lock_unlock
 	mov	r10, QWORD PTR [rbp - 8]
-	mov	rax, QWORD PTR [r10 + 272]
+	mov	rax, QWORD PTR [r10 + 216]
+	test	rax, rax
+	jz	Lsbg_3
+	mov	rax, QWORD PTR [rax + 40]
+Lsbg_3:
 	test	rax, rax
 	jnz	Lcaseclause_report_already_done
 	mov	rdi, r10
@@ -1176,6 +1938,21 @@ silica_rt_case_clause:
 Lcaseclause_report_already_done:
 	mov	QWORD PTR [rbp - 16], 0
 Lcaseclause_after_report:
+# The started word (#224) is set after the report so a spawner spinning on it (actor_spawn /
+# spawn_linked, while this actor's start trampoline ran) proceeds: 2 = the init trampoline matched no case arm. The ACB is
+# not freed under the spawner: it goes with its last holder (silica_rt_acb_release); a row child's
+# exit notice is parked at #400 until its spawner has committed it to the row.
+	mov	r10, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [r10 + 224], 0
+	jne	Lcaseclause_started_set
+	mov	QWORD PTR [r10 + 224], 2
+	jmp	Lcaseclause_no_supervisor
+Lcaseclause_started_set:
+# A notice parked at #400 (this row child ended before its spawner committed it) is not in the
+# supervisor's ingress yet: nothing to drain or wait for.
+	mov	r10, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [r10 + 400], 1
+	jne	Lcaseclause_no_supervisor
 	mov	r10, QWORD PTR [rbp - 8]
 	mov	r11, QWORD PTR [r10 + 192]
 	mov	QWORD PTR [rbp - 24], r11
@@ -1188,39 +1965,46 @@ Lcaseclause_after_report:
 	mov	QWORD PTR [rbp - 32], r11
 	test	r11, r11
 	jz	Lcaseclause_no_supervisor
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_sup_wait_enter
+	test	rdi, rdi
+	jz	Lcaseclause_no_supervisor
+# Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
+# (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
+# restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
+# row (its policy restarts nothing); before, the child and that caller spun forever
+# (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
+# supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
+# keeps the rows until it stops: a row freed under the wait was read as a garbage child
+# (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
+Lcaseclause_wait_new_child:
 	mov	r10, QWORD PTR [rbp - 24]
 	mov	eax, DWORD PTR [r10 + 152]
 	test	eax, eax
-	jz	Lcaseclause_no_supervisor
-Lcaseclause_wait_new_child:
+	jz	Lcaseclause_wait_done
 	mov	r11, QWORD PTR [rbp - 32]
 	mov	rdi, QWORD PTR [r11]
-	mov	r10, QWORD PTR [rbp - 8]
-	cmp	rdi, r10
-	je	Lcaseclause_wait_new_child
 	test	rdi, rdi
-	jz	Lcaseclause_wait_new_child
-	mov	rax, QWORD PTR [rdi + 288]
+	jz	Lcaseclause_wait_done
+	cmp	rdi, QWORD PTR [rbp - 8]
+	je	Lcaseclause_wait_new_child
+	mov	rax, QWORD PTR [rdi + 224]
 	test	rax, rax
 	jz	Lcaseclause_wait_new_child
+Lcaseclause_wait_done:
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_sup_wait_leave
 Lcaseclause_no_supervisor:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_signal_pending_call_deaths
-	mov	r10, QWORD PTR [rbp - 8]
-	mov	r11, QWORD PTR [r10 + 208]
-	mov	QWORD PTR [rbp - 32], r11
-	mov	rdi, r10
+	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_child_table_free
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_ffi_arena_teardown
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_dealloc_region
 	mov	rdi, QWORD PTR [rbp - 8]
-	call	free
-	mov	r11, QWORD PTR [rbp - 32]
-	test	r11, r11
-	jz	Lcaseclause_thread_exit
-	mov	QWORD PTR [r11 + 56], 1
+	call	silica_rt_actor_final_release
 Lcaseclause_thread_exit:
 	xor	edi, edi
 	call	pthread_exit
@@ -1239,4 +2023,765 @@ L_silica_case_clause_msg:
 	.asciz	\"case_clause\\n\"
 	.text
 "
+}
+fn actor_rt_asm_name_taken_chunk(nf_idx: int64) -> string {
+    concat(concat("	.data
+	.p2align	3
+	.globl	silica_rt_actor_not_found_atom
+silica_rt_actor_not_found_atom:
+	.quad	", atom_table@int64_to_decimal_string(nf_idx)), "
+	.section .rodata
+L_silica_actor_not_found_msg:
+	.asciz	\"actor_not_found\\n\"
+	.text
+# silica_rt_actor_not_found: cast_registered / call_registered / cast_dangerous_registered /
+# cast_device_registered named a name no live actor holds in its registry
+# (spec §20.3.1: they raise actor_not_found, as cast() and call() do for an ended actor). The current
+# actor fails with failure_reason (:explicit, :actor_not_found), tag 4, ended where it stands exactly as
+# silica_rt_registry_name_taken ends it (shared exit body, the tag in [rbp-40]); in main (no current
+# actor) it is the language-level failure of §15.4.5.5: the atom's name on standard error, exit status 1.
+# The atom is appended to every runtime atom table (atom_table@build_runtime_atom_table). Never returns.
+	.globl	silica_rt_actor_not_found
+	.p2align	2
+silica_rt_actor_not_found:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	call	silica_rt_tls_current_actor_get
+	mov	QWORD PTR [rbp - 8], rdi
+	test	rdi, rdi
+	jz	Lnotfound_process
+	mov	rax, QWORD PTR [rip + silica_rt_actor_not_found_atom]
+	mov	QWORD PTR [rdi + 384], rax
+	mov	QWORD PTR [rbp - 40], 4
+	jmp	Lnametaken_fail_actor
+Lnotfound_process:
+	mov	edi, 2
+	lea	rsi, [rip + L_silica_actor_not_found_msg]
+	mov	edx, 16
+	mov	eax, 1
+	syscall
+	mov	edi, 1
+	call	exit
+	jmp	Lnotfound_process
+
+# Control-block lifetime. #392 counts the holders of an actor's ACB; the last one frees it, so it
+# is freed exactly once, whichever order they finish in:
+#   - the actor's own thread, to the end of its exit path (silica_rt_actor_final_release);
+#   - its spawner, until the spawn has returned it (silica_rt_spawner_let_go) or, for a row child,
+#     until the row holds it (silica_rt_supervisor_spawn_child_row_by_flavor);
+#   - each child whose #192 names it as supervisor, until that child's exit path is done with it;
+#   - its exit notice, until a supervisor has handled it (silica_rt_exit_payload_free): maybe_restart
+#     matches rows by this reference, so no new actor may take the address before then.
+# #400 is a row child's exit notice slot: 0 = not yet committed to its row, 1 = committed (and for
+# every other actor), else a notice the child parked because it ended before the commit.
+	.globl	silica_rt_acb_hold
+	.p2align	4
+silica_rt_acb_hold:
+# rdi = ACB or 0: one more holder. Leaf; rdi kept.
+	test	rdi, rdi
+	jz	Lacbh_ret
+	lock add	QWORD PTR [rdi + 392], 1
+Lacbh_ret:
+	ret
+	.globl	silica_rt_acb_release
+	.p2align	4
+silica_rt_acb_release:
+# rdi = ACB or 0: one holder lets go; the last frees the block.
+	test	rdi, rdi
+	jz	Lacbrel_ret
+	mov	rax, -1
+	lock xadd	QWORD PTR [rdi + 392], rax
+	cmp	rax, 1
+	jne	Lacbrel_ret
+	jmp	free
+Lacbrel_ret:
+	ret
+	.globl	silica_rt_actor_final_release
+	.p2align	4
+silica_rt_actor_final_release:
+# rdi = an ended actor's ACB; the last act of its thread before it exits. Its identity stops resolving
+# (§15.1.4: a reference to it is dead from here on), its own hold goes, then its row's exit_done and
+# block reference (sb_child_done), then its hold on its supervisor.
+# slots: [rbp-8] = supervisor, [rbp-16] = row, [rbp-24] = ACB
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 24], rdi
+	call	silica_rt_idt_remove
+	mov	rdi, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [rdi + 192]
+	mov	QWORD PTR [rbp - 8], rax
+	mov	rcx, QWORD PTR [rdi + 208]
+	test	rax, rax
+	cmovz	rcx, rax
+	mov	QWORD PTR [rbp - 16], rcx
+	call	silica_rt_acb_release
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_sb_child_done
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_acb_release
+	leave
+	ret
+	.globl	silica_rt_spawner_let_go
+	.p2align	4
+silica_rt_spawner_let_go:
+# rdi = the actor a spawn made (0: none) -> rdi = the reference the spawn returns: its identity
+# (§15.1.4), which is dead already when the actor ended inside its start trampoline. The spawner's
+# hold goes. No actor (no memory) gives the identity no actor has, all ones.
+# slots: [rbp-8] = the identity returned
+	test	rdi, rdi
+	jz	Lslg_none
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	rax, QWORD PTR [rdi + 408]
+	mov	QWORD PTR [rbp - 8], rax
+	call	silica_rt_acb_release
+	mov	rdi, QWORD PTR [rbp - 8]
+	leave
+	ret
+Lslg_none:
+	mov	rdi, -1
+	ret
+	.globl	silica_rt_exit_payload_free
+	.p2align	4
+silica_rt_exit_payload_free:
+# rdi = an exit notice payload or 0: frees it and drops its hold on the ended actor.
+	test	rdi, rdi
+	jz	Lepf_ret
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	rax, QWORD PTR [rdi]
+	mov	QWORD PTR [rbp - 8], rax
+	call	free
+	mov	rdi, QWORD PTR [rbp - 8]
+	leave
+	jmp	silica_rt_acb_release
+Lepf_ret:
+	ret
+# The dead actor (never alive, never freed: its holder count can never reach 0).
+	.data
+	.p2align	4
+	.globl	silica_rt_dead_acb
+silica_rt_dead_acb:
+	.space	392
+	.quad	0x4000000000000000
+	.quad	1
+	.quad	-1
+	.quad	0, 0
+	.quad	0, 0
+	.text
+
+# silica_rt_registry_name_taken: a registered name was already held by a live actor or supervisor
+# (spec §20.3.1: spawn_registered, spawn_registered_supervisor, a supervised child id). Ends the current
+# actor with failure_reason :language_error exactly as silica_rt_case_clause does; in main (no current
+# actor) it is the language-level failure of §15.4.5.5: the failure atom name on standard error, exit 1.
+# The trampoline-ran word (#288) is set after the report so a spawner waiting on it proceeds.
+# silica_rt_beh_convention(rax = behaviour entry or 0) -> rax = 1 call-only, 2 cast-only, 0 not checked
+# (spec §16.2.6.4). The emitter writes 0x5C1AC0F1 / 0x5C1AC0F2 in the 4 bytes before the entry of every
+# function declared to return (:reply, ...) / (:no_reply, ...); runtime-internal behaviours and
+# supervisors (no behaviour) have no such word. Leaf; changes rax and the flags only.
+	.globl	silica_rt_beh_convention
+	.p2align	2
+silica_rt_beh_convention:
+	test	rax, rax
+	jz	Lbcx_none
+	push	rcx
+	mov	ecx, DWORD PTR [rax - 4]
+	mov	eax, ecx
+	shr	ecx, 4
+	cmp	ecx, 0x5C1AC0F
+	jne	Lbcx_pop_none
+	and	eax, 15
+	cmp	eax, 3
+	jae	Lbcx_pop_none
+	pop	rcx
+	ret
+Lbcx_pop_none:
+	pop	rcx
+Lbcx_none:
+	xor	eax, eax
+	ret
+# silica_rt_convention_mismatch: a call()/cast() whose target was spawned with the other calling
+# convention (spec §16.2.6.4), or kill_abnormal naming the calling actor (§15.1.2.3). Nothing was
+# enqueued; the calling actor fails with :language_error (main: the message and exit 1, §15.4.5.5).
+	.globl	silica_rt_convention_mismatch
+	.globl	silica_rt_language_error_current
+	.globl	silica_rt_registry_name_taken
+	.p2align	2
+silica_rt_convention_mismatch:
+silica_rt_language_error_current:
+silica_rt_registry_name_taken:
+# slots: [rbp-8] = x19 self, [rbp-16] = x20 deliver_exit result, [rbp-24] = x21 supervisor, [rbp-32] = x22 ACB[#208],
+# [rbp-40] = the exit reason tag (2 here, 4 from silica_rt_actor_not_found, which shares this body)
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	call	silica_rt_tls_current_actor_get
+	mov	QWORD PTR [rbp - 8], rdi
+	test	rdi, rdi
+	jz	Lnametaken_process
+	mov	QWORD PTR [rbp - 40], 2
+Lnametaken_fail_actor:
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	r10, QWORD PTR [rbp - 8]
+	mov	rax, QWORD PTR [rbp - 40]
+	mov	QWORD PTR [r10 + 232], rax
+	mov	DWORD PTR [r10 + 152], 0
+	lea	rdi, [r10 + 80]
+	call	silica_rt_cv_signal
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	r10, QWORD PTR [rbp - 8]
+	mov	rax, QWORD PTR [r10 + 216]
+	test	rax, rax
+	jz	Lsbg_4
+	mov	rax, QWORD PTR [rax + 40]
+Lsbg_4:
+	test	rax, rax
+	jnz	Lnametaken_report_already_done
+	mov	rdi, r10
+	call	silica_rt_actor_deliver_exit
+	mov	QWORD PTR [rbp - 16], rdi
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_deliver_unwind_report
+	jmp	Lnametaken_after_report
+Lnametaken_report_already_done:
+	mov	QWORD PTR [rbp - 16], 0
+Lnametaken_after_report:
+# The started word (#224) is set after the report on both branches so a spawner waiting on it
+# proceeds. Still 0 here means the start trampoline failed while its spawner spins on the word:
+# 2 tells it so, and the actor skips its supervisor's drain (the spawner has not yet put it in a
+# row; its exit notice is parked at #400 for the spawner) and its ACB stays until its last holder lets
+# go (silica_rt_acb_release; before, the actor freed it at once and a spawner descheduled until then
+# spun on freed memory: working_registry_child_id_taken_across_supervisors hung in actor_spawn).
+	mov	r10, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [r10 + 224], 0
+	jne	Lnametaken_started_set
+	mov	QWORD PTR [r10 + 224], 2
+	jmp	Lnametaken_no_supervisor
+Lnametaken_started_set:
+# A notice parked at #400 (this row child ended before its spawner committed it) is not in the
+# supervisor's ingress yet: nothing to drain or wait for.
+	mov	r10, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [r10 + 400], 1
+	jne	Lnametaken_no_supervisor
+	mov	r11, QWORD PTR [r10 + 192]
+	mov	QWORD PTR [rbp - 24], r11
+	test	r11, r11
+	jz	Lnametaken_no_supervisor
+	mov	rdi, r11
+	call	silica_rt_supervisor_drain_ingress
+	mov	r10, QWORD PTR [rbp - 8]
+	mov	r11, QWORD PTR [r10 + 208]
+	mov	QWORD PTR [rbp - 32], r11
+	test	r11, r11
+	jz	Lnametaken_no_supervisor
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_sup_wait_enter
+	test	rdi, rdi
+	jz	Lnametaken_no_supervisor
+# Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
+# (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
+# restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
+# row (its policy restarts nothing); before, the child and that caller spun forever
+# (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
+# supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
+# keeps the rows until it stops: a row freed under the wait was read as a garbage child
+# (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
+Lnametaken_wait_new_child:
+	mov	r10, QWORD PTR [rbp - 24]
+	mov	eax, DWORD PTR [r10 + 152]
+	test	eax, eax
+	jz	Lnametaken_wait_done
+	mov	r11, QWORD PTR [rbp - 32]
+	mov	rdi, QWORD PTR [r11]
+	test	rdi, rdi
+	jz	Lnametaken_wait_done
+	cmp	rdi, QWORD PTR [rbp - 8]
+	je	Lnametaken_wait_new_child
+	mov	rax, QWORD PTR [rdi + 224]
+	test	rax, rax
+	jz	Lnametaken_wait_new_child
+Lnametaken_wait_done:
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_sup_wait_leave
+Lnametaken_no_supervisor:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_signal_pending_call_deaths
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_child_table_free
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_ffi_arena_teardown
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_dealloc_region
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_final_release
+Lnametaken_thread_exit:
+	xor	edi, edi
+	call	pthread_exit
+	jmp	Lnametaken_thread_exit
+Lnametaken_process:
+	mov	edi, 2
+	lea	rsi, [rip + L_silica_name_taken_msg]
+	mov	edx, 15
+	mov	eax, 1
+	syscall
+	mov	edi, 1
+	call	exit
+	jmp	Lnametaken_process
+	.section .rodata
+L_silica_name_taken_msg:
+	.asciz	\"language_error\\n\"
+	.text
+")
+}
+
+// Actor identity (spec §15.1.4): the identity table, spawner records and the reference boundary.
+fn actor_rt_identity_chunk(ie_idx: int64) -> string {
+    concat(concat("# ---- Actor identity (spec §15.1.4) ----
+# A reference is its actor's 64-bit identity, position << 32 | child number; never a pointer. The
+# identity table maps identity -> ACB for every actor that has not finished ending: open addressing,
+# linear probing, power-of-two capacity, grown x2 above half load, backward-shift deletion. A slot
+# holds the ACB (0 empty); its key is the ACB's +408. An actor is inserted by its spawn before its
+# thread exists and removed by its final release before its own hold goes, so a slot never names
+# freed memory. silica_rt_ref_hold resolves under the table lock and takes a holder (+392): the
+# runtime never dereferences a reference a program hands it.
+# ACB +408 identity, +416 spawner record (pos+1, 0 = none yet), +424 next child number. A row
+# child's spawner record is its row's +96/+104 instead, so it survives the child's restarts (§15.4.12.1).
+	.data
+	.p2align	3
+	.globl	silica_rt_idt
+silica_rt_idt:
+	.quad	0, 0, 0, 0
+	.globl	silica_rt_next_position
+silica_rt_next_position:
+	.quad	1
+	.globl	silica_rt_main_spawner
+silica_rt_main_spawner:
+	.quad	1, 0
+	.globl	silica_rt_runtime_spawner
+silica_rt_runtime_spawner:
+	.quad	0x100000000, 0
+	.globl	silica_rt_spawn_rec_override
+silica_rt_spawn_rec_override:
+	.quad	0
+	.globl	silica_rt_root_failure_reporter_id
+silica_rt_root_failure_reporter_id:
+	.quad	0
+	.globl	silica_rt_identity_exhausted_atom
+silica_rt_identity_exhausted_atom:
+	.quad	", atom_table@int64_to_decimal_string(ie_idx)), "
+	.section .rodata
+L_silica_identity_exhausted_msg:
+	.asciz	\"identity_exhausted\\n\"
+	.text
+# silica_rt_idt_find_locked(rdi = identity) -> rdi = the slot that holds it or the empty slot where it
+# would go (0: no table yet), rsi = its ACB or 0. Table lock held. Leaf; rax, rcx, r8-r10.
+	.globl	silica_rt_idt_find_locked
+	.p2align	4
+silica_rt_idt_find_locked:
+	mov	r8, QWORD PTR [rip + silica_rt_idt + 8]
+	mov	r9, QWORD PTR [rip + silica_rt_idt + 16]
+	test	r8, r8
+	jz	Lidtf_none
+	mov	r10, rdi
+	mov	rax, rdi
+	movabs	rcx, 0x9E3779B97F4A7C15
+	imul	rax, rcx
+	shr	rax, 32
+	and	rax, r9
+Lidtf_loop:
+	lea	rdi, [r8 + rax*8]
+	mov	rsi, QWORD PTR [rdi]
+	test	rsi, rsi
+	jz	Lidtf_ret
+	cmp	QWORD PTR [rsi + 408], r10
+	je	Lidtf_ret
+	add	rax, 1
+	and	rax, r9
+	jmp	Lidtf_loop
+Lidtf_none:
+	xor	edi, edi
+	xor	esi, esi
+Lidtf_ret:
+	ret
+# silica_rt_idt_grow_locked -> rdi = 0, or 1 when no memory. Table lock held.
+# Frame: [rbp-8] old slots, [rbp-16] old mask, [rbp-24] new capacity, [rbp-32] index, [rbp-40] ACB.
+	.p2align	4
+silica_rt_idt_grow_locked:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 48
+	mov	rax, QWORD PTR [rip + silica_rt_idt + 8]
+	mov	QWORD PTR [rbp - 8], rax
+	mov	rcx, QWORD PTR [rip + silica_rt_idt + 16]
+	mov	QWORD PTR [rbp - 16], rcx
+	mov	QWORD PTR [rbp - 24], 64
+	test	rax, rax
+	jz	Lidtg_alloc
+	lea	rdx, [rcx + 1]
+	shl	rdx, 1
+	mov	QWORD PTR [rbp - 24], rdx
+Lidtg_alloc:
+	mov	rdi, QWORD PTR [rbp - 24]
+	mov	esi, 8
+	call	calloc
+	test	rax, rax
+	jz	Lidtg_oom
+	mov	QWORD PTR [rip + silica_rt_idt + 8], rax
+	mov	rcx, QWORD PTR [rbp - 24]
+	sub	rcx, 1
+	mov	QWORD PTR [rip + silica_rt_idt + 16], rcx
+	cmp	QWORD PTR [rbp - 8], 0
+	je	Lidtg_ok
+	mov	QWORD PTR [rbp - 32], 0
+Lidtg_move:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 32]
+	mov	rdx, QWORD PTR [rax + rcx*8]
+	test	rdx, rdx
+	jz	Lidtg_next
+	mov	QWORD PTR [rbp - 40], rdx
+	mov	rdi, QWORD PTR [rdx + 408]
+	call	silica_rt_idt_find_locked
+	mov	rdx, QWORD PTR [rbp - 40]
+	mov	QWORD PTR [rdi], rdx
+Lidtg_next:
+	mov	rcx, QWORD PTR [rbp - 32]
+	add	rcx, 1
+	mov	QWORD PTR [rbp - 32], rcx
+	cmp	rcx, QWORD PTR [rbp - 16]
+	jbe	Lidtg_move
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	free
+Lidtg_ok:
+	xor	edi, edi
+	leave
+	ret
+Lidtg_oom:
+	mov	edi, 1
+	leave
+	ret
+# silica_rt_idt_insert(rdi = ACB, its identity at +408) -> rdi = 0, or 1 when no memory.
+	.globl	silica_rt_idt_insert
+	.p2align	4
+silica_rt_idt_insert:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	lea	rdi, [rip + silica_rt_idt]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rip + silica_rt_idt + 8]
+	test	rax, rax
+	jz	Lidti_grow
+	mov	rcx, QWORD PTR [rip + silica_rt_idt + 24]
+	add	rcx, 1
+	shl	rcx, 1
+	mov	rdx, QWORD PTR [rip + silica_rt_idt + 16]
+	add	rdx, 1
+	cmp	rcx, rdx
+	jbe	Lidti_put
+Lidti_grow:
+	call	silica_rt_idt_grow_locked
+	mov	QWORD PTR [rbp - 16], rdi
+	test	rdi, rdi
+	jnz	Lidti_unlock
+Lidti_put:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rdi, QWORD PTR [rax + 408]
+	call	silica_rt_idt_find_locked
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rdi], rax
+	add	QWORD PTR [rip + silica_rt_idt + 24], 1
+	mov	QWORD PTR [rbp - 16], 0
+Lidti_unlock:
+	lea	rdi, [rip + silica_rt_idt]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	leave
+	ret
+# silica_rt_idt_remove(rdi = ACB): its identity no longer resolves. Entries after it in the probe run
+# shift back into the hole when that does not move them before their home slot.
+	.globl	silica_rt_idt_remove
+	.p2align	4
+silica_rt_idt_remove:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	lea	rdi, [rip + silica_rt_idt]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rdi, QWORD PTR [rax + 408]
+	call	silica_rt_idt_find_locked
+	cmp	rsi, QWORD PTR [rbp - 8]
+	jne	Lidtr_unlock
+	mov	r8, QWORD PTR [rip + silica_rt_idt + 8]
+	mov	r9, QWORD PTR [rip + silica_rt_idt + 16]
+	mov	r10, rdi
+	sub	r10, r8
+	shr	r10, 3
+	mov	r11, r10
+	movabs	rcx, 0x9E3779B97F4A7C15
+Lidtr_scan:
+	add	r11, 1
+	and	r11, r9
+	mov	rsi, QWORD PTR [r8 + r11*8]
+	test	rsi, rsi
+	jz	Lidtr_clear
+	mov	rax, QWORD PTR [rsi + 408]
+	imul	rax, rcx
+	shr	rax, 32
+	and	rax, r9
+	mov	rdx, r11
+	sub	rdx, rax
+	and	rdx, r9
+	mov	rax, r11
+	sub	rax, r10
+	and	rax, r9
+	cmp	rdx, rax
+	jb	Lidtr_scan
+	mov	QWORD PTR [r8 + r10*8], rsi
+	mov	r10, r11
+	jmp	Lidtr_scan
+Lidtr_clear:
+	mov	QWORD PTR [r8 + r10*8], 0
+	sub	QWORD PTR [rip + silica_rt_idt + 24], 1
+Lidtr_unlock:
+	lea	rdi, [rip + silica_rt_idt]
+	call	silica_rt_lock_unlock
+	leave
+	ret
+# silica_rt_ref_hold(rdi = identity) -> rdi = its ACB with one more holder (+392; give it back with
+# silica_rt_acb_release), or 0 when no actor that has not finished ending has the identity.
+	.globl	silica_rt_ref_hold
+	.p2align	4
+silica_rt_ref_hold:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	lea	rdi, [rip + silica_rt_idt]
+	call	silica_rt_lock_lock
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_idt_find_locked
+	mov	QWORD PTR [rbp - 16], rsi
+	test	rsi, rsi
+	jz	Lrh_unlock
+	lock add	QWORD PTR [rsi + 392], 1
+Lrh_unlock:
+	lea	rdi, [rip + silica_rt_idt]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	leave
+	ret
+# silica_rt_ref_alive(rdi = identity) -> rdi = 1 when the actor is in the table and alive (+152).
+# silica_rt_ref_peek(rdi = identity) -> rdi = its ACB without a hold (only for actors that never end:
+# the registries), or 0.
+	.globl	silica_rt_ref_alive
+	.p2align	4
+silica_rt_ref_alive:
+	mov	eax, 1
+	jmp	Lra_common
+	.globl	silica_rt_ref_peek
+	.p2align	4
+silica_rt_ref_peek:
+	xor	eax, eax
+Lra_common:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 24], rax
+	lea	rdi, [rip + silica_rt_idt]
+	call	silica_rt_lock_lock
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_idt_find_locked
+	mov	QWORD PTR [rbp - 16], rsi
+	cmp	QWORD PTR [rbp - 24], 0
+	je	Lra_unlock
+	test	rsi, rsi
+	jz	Lra_unlock
+	xor	eax, eax
+	cmp	DWORD PTR [rsi + 152], 0
+	setne	al
+	mov	QWORD PTR [rbp - 16], rax
+Lra_unlock:
+	lea	rdi, [rip + silica_rt_idt]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	leave
+	ret
+# silica_rt_ref_call(rdi = identity, rsi/rdx/rcx = arguments, r10 = body): the body runs with rdi =
+# the held ACB, or 0 when the reference names no actor, and its rdi is returned; the hold goes after.
+	.globl	silica_rt_ref_call
+	.p2align	4
+silica_rt_ref_call:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 48
+	mov	QWORD PTR [rbp - 8], rsi
+	mov	QWORD PTR [rbp - 16], rdx
+	mov	QWORD PTR [rbp - 24], rcx
+	mov	QWORD PTR [rbp - 32], r10
+	call	silica_rt_ref_hold
+	mov	QWORD PTR [rbp - 40], rdi
+	mov	rsi, QWORD PTR [rbp - 8]
+	mov	rdx, QWORD PTR [rbp - 16]
+	mov	rcx, QWORD PTR [rbp - 24]
+	call	QWORD PTR [rbp - 32]
+	mov	QWORD PTR [rbp - 48], rdi
+	mov	rdi, QWORD PTR [rbp - 40]
+	call	silica_rt_acb_release
+	mov	rdi, QWORD PTR [rbp - 48]
+	leave
+	ret
+# silica_rt_sup_ref_call: silica_rt_ref_call for call_supervisor; a supervisor that has ended (or
+# never existed) raises actor_not_found (§16.1.1.1, as call() does).
+	.globl	silica_rt_sup_ref_call
+	.p2align	4
+silica_rt_sup_ref_call:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 48
+	mov	QWORD PTR [rbp - 8], rsi
+	mov	QWORD PTR [rbp - 16], rdx
+	mov	QWORD PTR [rbp - 24], rcx
+	mov	QWORD PTR [rbp - 32], r10
+	call	silica_rt_ref_hold
+	mov	QWORD PTR [rbp - 40], rdi
+	test	rdi, rdi
+	jz	Lsrc_not_found
+	cmp	DWORD PTR [rdi + 152], 0
+	je	Lsrc_dead
+	mov	rsi, QWORD PTR [rbp - 8]
+	mov	rdx, QWORD PTR [rbp - 16]
+	mov	rcx, QWORD PTR [rbp - 24]
+	call	QWORD PTR [rbp - 32]
+	mov	QWORD PTR [rbp - 48], rdi
+	mov	rdi, QWORD PTR [rbp - 40]
+	call	silica_rt_acb_release
+	mov	rdi, QWORD PTR [rbp - 48]
+	leave
+	ret
+Lsrc_dead:
+	call	silica_rt_acb_release
+Lsrc_not_found:
+	leave
+	jmp	silica_rt_actor_not_found
+# silica_rt_spawner_rec(rdi = the spawning actor's ACB, or 0 for main) -> rdi = its spawner record.
+	.globl	silica_rt_spawner_rec
+	.p2align	4
+silica_rt_spawner_rec:
+	test	rdi, rdi
+	jz	Lsrec_main
+	mov	rax, QWORD PTR [rdi + 192]
+	test	rax, rax
+	jz	Lsrec_own
+	mov	rax, QWORD PTR [rdi + 208]
+	cmp	rax, 4096
+	jb	Lsrec_own
+	lea	rdi, [rax + 96]
+	ret
+Lsrec_own:
+	add	rdi, 416
+	ret
+Lsrec_main:
+	mov	rdi, QWORD PTR [rip + silica_rt_spawn_rec_override]
+	test	rdi, rdi
+	jnz	Lsrec_ret
+	lea	rdi, [rip + silica_rt_main_spawner]
+Lsrec_ret:
+	ret
+# silica_rt_spawner_position(rdi = spawner record) -> rdi = position + 1, given now from the global
+# counter if the record has none, or 0 when positions are exhausted. Leaf.
+	.globl	silica_rt_spawner_position
+	.p2align	4
+silica_rt_spawner_position:
+	mov	rax, QWORD PTR [rdi]
+	test	rax, rax
+	jnz	Lspos_have
+	mov	ecx, 1
+	lock xadd	QWORD PTR [rip + silica_rt_next_position], rcx
+	mov	edx, 0xFFFFFFFF
+	cmp	rcx, rdx
+	jae	Lspos_exhausted
+	lea	rdx, [rcx + 1]
+	xor	eax, eax
+	lock cmpxchg	QWORD PTR [rdi], rdx
+	jnz	Lspos_have
+	mov	rdi, rdx
+	ret
+Lspos_have:
+	mov	rdi, rax
+	ret
+Lspos_exhausted:
+	xor	edi, edi
+	ret
+# silica_rt_ident_assign(rdi = a new ACB, rsi = its spawner's record) -> rdi = 0 (identity at +408,
+# in the table), 1 the spawner's numbers are exhausted, 2 no memory.
+	.globl	silica_rt_ident_assign
+	.p2align	4
+silica_rt_ident_assign:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	mov	rdi, rsi
+	call	silica_rt_spawner_position
+	test	rdi, rdi
+	jz	Lia_exhausted
+	sub	rdi, 1
+	mov	QWORD PTR [rbp - 24], rdi
+	mov	rax, QWORD PTR [rbp - 16]
+	mov	ecx, 1
+	lock xadd	QWORD PTR [rax + 8], rcx
+	mov	rdx, rcx
+	shr	rdx, 32
+	jnz	Lia_exhausted
+	mov	rax, QWORD PTR [rbp - 24]
+	shl	rax, 32
+	or	rcx, rax
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rdi + 408], rcx
+	call	silica_rt_idt_insert
+	test	rdi, rdi
+	jz	Lia_ret
+	mov	edi, 2
+	jmp	Lia_ret
+Lia_exhausted:
+	mov	edi, 1
+Lia_ret:
+	leave
+	ret
+# silica_rt_identity_exhausted: the spawner ran out of child numbers or positions (§15.1.4). The
+# current actor fails with (:explicit, :identity_exhausted); main (no actor) prints the atom's name
+# and exits with status 1. Never returns.
+	.globl	silica_rt_identity_exhausted
+	.p2align	4
+silica_rt_identity_exhausted:
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Lie_main
+	mov	rsi, QWORD PTR [rip + silica_rt_identity_exhausted_atom]
+	call	silica_rt_actor_fail_current
+Lie_main:
+	mov	edi, 2
+	lea	rsi, [rip + L_silica_identity_exhausted_msg]
+	mov	edx, 19
+	mov	eax, 1
+	syscall
+	mov	edi, 1
+	call	exit
+	jmp	Lie_main
+")
 }

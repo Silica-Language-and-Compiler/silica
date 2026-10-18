@@ -38,7 +38,7 @@ clean:
 silica.config:
 	@cd "$(THIS_DIR)" && printf '%s\n%s\n' \
 		"supervisor_agent_type_invalid_atom_trial.silica" \
-		"../../../compiler/stdlib/Supervisor.silica" > silica.config
+		"../../../compiler/stdlib/Supervisor.silica" > silica.config && $(TRIAL_PRIVATE_SUPERVISOR)
 
 help:
 	@echo "supervisor_agent_type_invalid_atom_trial (multi-file error enforcement)"

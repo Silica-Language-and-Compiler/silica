@@ -49,8 +49,10 @@ An **OS-hosted** platform can run a compiler, so it builds its own and reaches i
 | [`programmer_tools/build_all_platforms.sh`](https://github.com/yenrab/silica/blob/main/programmer_tools/build_all_platforms.sh) | Builds Silica for every platform you name, from whatever machine you start on. |
 | [`programmer_tools/run_trials_all_platforms.sh`](https://github.com/yenrab/silica/blob/main/programmer_tools/run_trials_all_platforms.sh) | Runs the full trial tree on each platform with that platform's own compiler. It never builds a compiler. |
 | [`programmer_tools/build_and_trial_all_platforms.sh`](https://github.com/yenrab/silica/blob/main/programmer_tools/build_and_trial_all_platforms.sh) | Both, in one command: build every indicated platform, then run the full trial tree on each one. |
+| [`programmer_tools/rebuild_refresh_verify.sh`](https://github.com/yenrab/silica/blob/main/programmer_tools/rebuild_refresh_verify.sh) | Per platform: rebuild, run the whole tree, re-record the assembly goldens of trials whose output already matched, run the tree again. Steps 5 and 6 of [A change, end to end](#a-change-end-to-end). |
+| [`programmer_tools/sync_to_hosts.sh`](https://github.com/yenrab/silica/blob/main/programmer_tools/sync_to_hosts.sh) | Pushes this checkout to the remote build machines, deleting what the checkout no longer has and pulling each platform's goldens back first. A dry run unless you pass `--apply`. The other scripts call it for you (`--sync`). |
 
-Each script prints its own manual with `-h` or `--help`, and lists what a run would do — without doing it — with `--list`.
+Each script prints its own manual with `-h` or `--help`. The build and trial scripts also list what a run would do, without doing it, with `--list`; `sync_to_hosts.sh` is a dry run until you pass `--apply`.
 
 ### Which machines, remembered once
 
@@ -269,7 +271,20 @@ A raw target has no OS and cannot host a compiler, so its cross compiler is alwa
 bash programmer_tools/build_all_platforms.sh --targets ESP32-S3_raw
 ```
 
-This machine still builds its own native compiler first; the raw cross compiler is built after it. The result is published as `binaries/silica-compiler-ESP32-S3_raw` on this machine, and its numbered binary is `binaries/silica-<NNNNNN>-ESP32_S3_raw-<platform>` (the emit target's hyphens become underscores in the file name). Board images are built and flashed separately; see [Required software]({{ '/required-software/' | relative_url }}).
+This machine still builds its own native compiler first; the raw cross compiler is built after it. The result is published as `binaries/silica-compiler-ESP32-S3_raw` on this machine, and its numbered binary is `binaries/silica-<NNNNNN>-ESP32_S3_raw-<platform>` (the emit target's hyphens become underscores in the file name). To run a Silica program on the board, see [Run a Silica program on the board](#run-a-silica-program-on-the-board); what the board needs installed is in [Required software]({{ '/required-software/' | relative_url }}).
+
+## Run a Silica program on the board
+
+The sample programs for the ESP32-S3 board are under `compiler/src/emitter/ESP32-S3_raw/board/apps/` (`silica_00_return42` to `silica_22_device_buzzer`, plus the `asm_*` bring-up programs). One script builds an app in a temporary directory, loads it into the board's RAM and compares the output with the app's `expected.scout`:
+
+```bash
+B=compiler/src/emitter/ESP32-S3_raw/board
+$B/tools/run_app.sh silica_04_print
+$B/tools/run_app.sh --build-only silica_14_wbt_map     # compile and build the image; the board is not touched
+$B/tools/run_app.sh --help                             # options, environment and exit statuses
+```
+
+It uses `binaries/silica-compiler-ESP32-S3_raw` unless `SILICA_COMPILER` names another cross compiler; a cross compiler older than the board runtime in the tree compiles but does not link, so build one from the current tree first (above). The Xtensa toolchain and the ESP-IDF Python environment come from [Required software]({{ '/required-software/' | relative_url }}); `BOARD_PYTHON`, `XTENSA_BIN`, `ESPTOOL`, `BOARD_PORT` and `BOARD_MAC` point the tools elsewhere. The script takes the board lock the board trial runs use, so it will not start while one is in progress. Most apps from `silica_16` on drive LEDs, the display or the buzzer; run those while watching the board. The README in that `board/` directory has the full list, what each app prints and how it ends.
 
 ## What a build does on each machine
 

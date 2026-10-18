@@ -22,21 +22,45 @@
 #   fixtures/build/            ffi_addition's per-platform fixture objects and archives
 #   app_*/dangerous_exposure_source   the per-app link into the platform's fixture view, recreated
 #                              (ln -sfn) by every app integrate; a synced one would dangle
-#   trial outputs              .sams .iface .sout .cur_fail .integrate* silica.config/.link/.atoms/
+#   trial outputs              .sams .iface .sout .cur_* .checked (leaf.mk's per-unit make stamps: a Mac
+#                              stamp on a host made make skip that host's own check) .integrate*
+#                              silica.config/.link/.atoms/
 #                              .shapes/.needs_runtime/.compile.order, and each trial's linked
 #                              executable (sync_exe_excludes)
 #   /compiler/src/silica-*     the old in-tree compiler binaries, if an older checkout left any
+#   transient run state        files a compile or trial run creates and deletes while it runs, so a
+#                              push that starts during a run must never read them (2026-10-16: a push
+#                              to pix and nix during a Mac whole-tree run failed with openrsync
+#                              "silica.compile.inprogress: open (2) ... No such file or directory"):
+#                              silica.compile.inprogress / .crashed (the compiler's per-unit markers),
+#                              .integrate* (logs, reports, counts, marks, the .integrate_running/ pid
+#                              directory and the .integrate.lock directory), *.tmp (make's write-then-mv
+#                              files, .silica.config.units.tmp, silica.config.compiler.tmp),
+#                              .silica.config.units*, .cache/ (the iface cache), *.mklog *.gnorm *.ll *.bc
+#                              *.atom_rotext.expect .gen1_emission_stamp silica-compiler-gen3, .DS_Store.
+#                              Logs (*.log), .trial_cache/, .trial_stdlib/ and .target/ are excluded by
+#                              sync_to_hosts.sh's own list.
+#   NOT excluded, on purpose:  *.norm (trials hold tracked *.golden_link_fail.clang.norm goldens; the
+#                              transient *.cur_*.norm are caught by *.cur_*), *.lock (trials/.board.lock
+#                              is a tracked flock file), silica.config.compiler (tracked in compiler/src;
+#                              elsewhere it is written via .tmp + mv, so it never vanishes),
+#                              INTEGRATE_PENDING (a hand-written suite marker).
 #
 # silica.link.scout is a golden and is kept: only the exact name silica.link is excluded.
 # Patterns are for rsync (-a, no --delete-excluded, so nothing already on the remote is removed).
 
 SYNC_BUILD_EXCLUDES=(
     --exclude '*.o' --exclude '*.a' --exclude '*.so' --exclude '*.dylib'
-    --exclude '*.sams' --exclude '*.iface' --exclude '*.sout' --exclude '*.cur_fail'
+    --exclude '*.sams' --exclude '*.iface' --exclude '*.sout' --exclude '*.cur_*' --exclude '*.checked'
     --exclude '.integrate*' --exclude '.stdlib_cache' --exclude '__pycache__'
-    --exclude 'silica.config' --exclude 'silica.target' --exclude '.silica.config.units'
+    --exclude 'silica.config' --exclude 'silica.target'
     --exclude 'silica.link' --exclude 'silica.atoms' --exclude 'silica.shapes'
     --exclude 'silica.needs_runtime' --exclude 'silica.compile.order'
+    --exclude 'silica.compile.inprogress' --exclude 'silica.compile.crashed'
+    --exclude '.silica.config.units*' --exclude '*.tmp' --exclude '.cache/'
+    --exclude '*.mklog' --exclude '*.gnorm' --exclude '*.ll' --exclude '*.bc'
+    --exclude '*.atom_rotext.expect' --exclude '.gen1_emission_stamp' --exclude 'silica-compiler-gen3'
+    --exclude '.DS_Store'
     --exclude 'compiler/build/' --exclude '/build/' --exclude 'fixtures/build/'
     --exclude 'app_*/dangerous_exposure_source'
     --exclude '/compiler/src/silica-*'

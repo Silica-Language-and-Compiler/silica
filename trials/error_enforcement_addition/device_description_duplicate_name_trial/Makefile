@@ -20,7 +20,7 @@ silica.config:
 		echo "../../../compiler/stdlib/DeviceDescription.silica"; \
 		echo "../../../compiler/stdlib/Register32.silica"; \
 		echo "device_description_duplicate_name.silica"; \
-	} > silica.config
+	} > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 check: silica.config
 	@cd "$(THIS_DIR)" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(COMPILER)); } > $(MAIN).cur_fail 2>&1 || true

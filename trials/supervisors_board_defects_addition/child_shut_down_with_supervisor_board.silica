@@ -1,0 +1,166 @@
+// Board variant of supervisors_addition/child_shut_down_with_supervisor: a child still running
+// when its supervisor ends is shut down with it (Lee, 2026-10-15; a supervisor ends its children,
+// last row first, before it is gone). The host trial cannot run as it is on the ESP32-S3: the
+// board never preempts and an actor runs on the core that spawned it, so a slow child spinning on
+// core 0 would hold the core until it ended (and spin depth 24 takes over 300 s through stack-chunk
+// crossings). Here main asks the supervisor for :area's reference (:get_child), moves :area to
+// core 1 with migrate_actor (spec §15.1.2 Actor Pinning Policy), and then casts it a short spin
+// (2^16 calls). While :area spins on core 1, core 0 runs main's cast to :adder with 0: the breaker
+// dies, the restart limit (0) is exceeded and the root supervisor shuts :area down (shutdown 0:
+// reason_tag 1) and ends.
+// This trial was child_outlives_supervisor_board (2026-10-12), which had :area outlive the
+// supervisor and end by badarith while its exit path still read the supervisor's rows.
+// get_child looks the child up by its id; :area is listed first, as it always was.
+// Both workers are cast-only and main only casts (as in the host trial): a cast to a call-only
+// actor is rejected at compile time (spec §16.1.2, 2026-10-12).
+// The FailureReporter acts on the root supervisor's report: it prints how many reports came before
+// it (the breaker's and the slow child's) and the done marker, and ends the program with
+// cast_exit(0).
+// Expected output:
+//   [silica] root actor exited (no supervisor)
+//   2 reports before the root supervisor's
+//   done
+//   0
+
+use Supervisor;
+
+impl ChildShutDownBoardSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:no_reply, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+            strategy: :one_for_one | :one_for_all | :rest_for_one,
+            allowed_restart_count: int64,
+            restarts_time_frame: int64
+        } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 3600 };
+        children: List[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: int64,
+                behavior: fn(msg: int64, state: int64) -> (:no_reply, int64),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous
+            },
+            mem(normal)
+        ] <- [
+            { id: :area, agent_type: :worker, initial_state: 0, behavior: slow_divider, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :adder, agent_type: :worker, initial_state: 0, behavior: breaker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn breaker(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, 42 / msg + state)
+}
+
+fn spin(depth: int64) -> int64 {
+    case depth == 0 of {
+        true -> 1;
+        false -> spin(depth - 1) + spin(depth - 1)
+    }
+}
+
+fn slow_divider(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, spin(msg) / state)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        sup: supervisor_ref <- spawn_registered_supervisor(ChildShutDownBoardSup, 0, :double_tuple_supervisor, stack_policy(0, :keep_last_message));
+        area: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, { op: :get_child, id: :area } impl SupervisorMessage {});
+        _: atom <- migrate_actor(area.child, 1);
+        _: boolean <- cast_registered(:area, 16 impl ActorMessage {});
+        _: boolean <- cast_registered(:adder, 0 impl ActorMessage {});
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn report_done(seen: int64) -> boolean {
+    sequence proc[concurrency, device_io]
+        _: atom <- print_int64(seen);
+        _: atom <- println(" reports before the root supervisor's");
+        _: atom <- println("done");
+        ended: boolean <- cast_exit(0)
+    produces
+        pure ended
+    end
+}
+
+// state: reports seen before the root supervisor's
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    _: boolean <- case report_is_from_root_supervisor(report) of {
+        true -> report_done(state);
+        false -> true
+    };
+    (:no_reply, state + 1)
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

@@ -22,6 +22,11 @@ Nothing is installed unless it has been proven against the real compiler:
 4. `install.py` — copies the verified files into `trials/`; refuses to overwrite
    any file whose name does not start with `train_`.
 
+Since 2026-10-10 (actor_memory_budget_plan.md item M) every pair is in the supervisor-actor shape:
+`pipeline.py` runs `shape_stage.py` on the pairs it keeps (`M_SHAPE=0` turns it off), and
+`python3 shape_stage.py --installed OUT [area,...]` followed by `python3 install.py OUT` reshapes the
+pairs already installed. See programmer_tools/trial_shape_m/README.md.
+
 ## Usage
 
 ```sh

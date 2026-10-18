@@ -1,7 +1,7 @@
 # Standard Data Structures As Traits
 
 **Date:** 2026-06-29; BinaryTree amendment 2026-07-02
-**Status:** **Not implemented** — trait API and representation wiring specification only.
+**Status:** Trait API and representation wiring specification. **Implementation status (2026-10-16):** all ten traits and their representation modules are implemented in `compiler/stdlib/data_structures/` (see `standard_data_structures_implementation_plan.md` status records); the source snippets below remain the design, and the deviations the compiler forced are numbered in each module's header (placeholder-item arguments to `peek`/`root_item`/`get`, `KeyType`/`ValueType` spelling for `PriorityQueue`, `add_leaf/3` for the rose-tree `add_child`, `mem(normal)` only, inline records for values not bound from an `@empty` call).
 **Algorithm authority (locked):** [data_structure_to_algorithms.md](data_structure_to_algorithms.md)
 **Detailed API and representation authority:** [data_structure_designs/README.md](data_structure_designs/README.md)
 
@@ -49,7 +49,7 @@ PriorityQueue                         →  brodal_okasaki_min (pairs)    →  Br
 3. All mutators return **new values** (functional persistence); captured comparators are preserved on every update path.
 4. Node IDs, keys, values, priorities, directed edge payloads, direction-independent edge data, and weights are **typed collection parameters**.
 5. Counts, capacities, and internal indices may remain `int64`.
-6. Generated constructors take **inline function records** (no named struct aliases for those records); the exact record may be `{}` when a design requires no behavior function.
+6. Generated constructors take **inline function records** (no named struct aliases for those records); every landed family's record has at least one function field; `BinaryTree`'s is `{ compare_item }` (decision 2026-10-16), a witness for `ItemType` that the tree core never calls.
 7. Collection variables declare explicit collection types including memory effects (`mem(normal)`, `mem(writethrough)`).
 8. **One exported function per operation** per generated module (`export insert/2`, not per-width duplicates).
 9. Algorithms in user code and stdlib should depend on **traits**, not generated module names.
@@ -94,7 +94,7 @@ Memory space comes from the declared collection type, not from the function reco
 
 Ordering compatibility is based on exact function-value identity. A top-level function symbol has one canonical identity; a closure identity includes its exact captured-environment instance, so separately created closures are incompatible even if behaviorally equivalent. Function-type equality is insufficient, and programmers cannot override identity with a declared token.
 
-An unordered family whose exact constructor record is `{}`, such as `BinaryTree`, carries no ordering bundle. Its specialization is determined from the declared collection type and explicit item arguments.
+An unordered family such as `BinaryTree` has the constructor record `{ compare_item }` only as an `ItemType` witness (a bare `ItemType` resolves only from a `compare_*` field of the first argument; `{}` gives none, E2017). The function is stored in the tree record and never called, so the family carries no ordering bundle. Its specialization is determined from the declared collection type, the witness and explicit item arguments.
 
 **Example (ordered set):**
 
@@ -615,10 +615,10 @@ provided {
 **Constructor function record:**
 
 ```text
-{}
+{ compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater }
 ```
 
-The record is exactly empty because item ordering, equality, and extraction do not control this representation. Expected collection type and explicit item arguments witness `ItemType` and `SpaceType`.
+Item ordering, equality, and extraction do not control this representation, so the tree core never calls `compare_item` and builds no ordering bundle. The field exists because the compiler resolves a bare `ItemType` at a qualified call only from a `compare_item` or `compare_priority` function field of the first argument; an empty record `{}` gives no witness (E2017). The function is stored in the tree record and carried through every constructor and update. The expected collection type and explicit item arguments witness `SpaceType`.
 
 **Trait surface:**
 
@@ -637,6 +637,8 @@ export fold_postorder/3;
 ```
 
 Paths are inline `List[:left | :right, SpaceType]` values. `:none` represents an empty root or child; no cyclic dummy node is part of the representation.
+
+**Implementation status (2026-10-16):** the landed trait is `BinaryTree.silica` over `tree_binary.silica`. Its required methods are `node_count/1`, `root_item/2`, `get/3`, `left_item/3`, `right_item/3` and the three folds (`/3`), with provided `is_empty/1`; the extra argument is a placeholder item for the `:not_found` payload. Paths are built with `tree_binary@path_root`, `path_left`, `path_right` because atoms are numbered per compilation unit. The constructor record is `{ compare_item }` (decision 2026-10-16: the specification follows the implementation).
 
 **Generated module `tree_binary`:** `empty`, `with_root`, `node`, `replace_item`, `replace_left`, `replace_right`, `clear_left`, `clear_right`, root/child queries, preorder/inorder/postorder folds, shape-preserving maps, inline zipper operations, and `validate`.
 
@@ -707,7 +709,7 @@ Stdlib adapters (`ordered_set_wbt_adapter`, …) are the same pattern wired as `
 ## What programmers supply
 
 - Explicit collection type declarations at bindings and function returns.
-- Inline constructor function records with comparators/extractors where required, or the exact empty record `{}` for BinaryTree.
+- Inline constructor function records with comparators/extractors where required, or `{ compare_item }` as a witness-only record for BinaryTree.
 - For custom structures: either direct trait `impl fn` or a view/adaptor value.
 
 **Examples:**
@@ -726,7 +728,7 @@ frontier: Heap[int64, mem(normal)] <- brodal_okasaki_min@empty({
     compare_item: compare_node_id
 });
 
-syntax: BinaryTree[string, mem(normal)] <- tree_binary@with_root({}, "root");
+syntax: BinaryTree[string, mem(normal)] <- tree_binary@with_root({ compare_item: compare_strings }, "root");
 
 g: DirectedGraph[NodeId, Edge, mem(normal)] <- graph_wbt_directed@empty({
     compare_node: compare_node_id,
@@ -761,7 +763,7 @@ Example responsibilities:
 
 ---
 
-## Compiler obligations (not implemented)
+## Compiler obligations
 
 Required compiler support before stdlib acceptance:
 
@@ -775,8 +777,10 @@ Required compiler support before stdlib acceptance:
 | 5   | Checking / codegen for `provided` trait block bodies                                    |                                                        |
 | 6   | Link-name mangling from resolved concrete trait impl types                              |                                                        |
 | 7   | Closed comparator return-type enforcement                                               | statically require `:less | :equal | :greater`         |
-| 8   | Exact empty constructor-record resolution for unordered families                        | BinaryTree `{}`; declared/argument witnesses required   |
+| 8   | Exact empty constructor-record resolution for unordered families                        | BinaryTree `{ compare_item }`; declared/argument witnesses required   |
 
+
+**Implementation status (2026-10-16):** obligations 1–7 are met by the checker and the landed stdlib (`compiler_substrate/` trait-dispatch, constructor, registry and comparator trials; `error_enforcement_addition/standard_data_structures/`). Obligation 8 is met in the form `{ compare_item }` (decision 2026-10-16): `tree_binary@empty` takes `{ compare_item }`, because a bare `ItemType` resolves only from a `compare_*` field of the constructor record, and `{}` gives no witness (E2017). The `BinaryTree[ItemType, mem(normal)]` bracket type is accepted.
 
 `Collectable` placeholder resolution remains **list-specific**; standard structures use constructor function records, not public `Collectable` construction.
 
@@ -824,7 +828,7 @@ The CSR/dense decision is closed:
 - `provided` algorithms that default to `fold` may be asymptotically fine but allocation-heavy if `neighbors` materializes large lists every call.
 - Error messages must distinguish trait dispatch, constructor resolution, function-record mismatch, and payload mismatch.
 - Brodal–Okasaki and WBT codegen complexity is higher than array-backed bootstrap modules.
-- BinaryTree `empty({})` requires sufficient declared result context; accepting it without a complete item/space witness would reintroduce ambiguous defaulting.
+- BinaryTree `empty({ compare_item: ... })` requires sufficient declared result context; accepting it without a complete item/space witness would reintroduce ambiguous defaulting.
 
 ---
 
@@ -841,4 +845,3 @@ The CSR/dense decision is closed:
 | [data_structure_designs/persistent_binary_tree.md](data_structure_designs/persistent_binary_tree.md) | BinaryTree core, zipper, sharing, validation |
 | [data_structure_designs/binary_tree_trait.md](data_structure_designs/binary_tree_trait.md) | Public BinaryTree trait/module contract |
 | [bootstrap_retirement_and_self_host_plan.md](bootstrap_retirement_and_self_host_plan.md) | The compiler's emitter pools on `wbt_map`; further compiler adoption withdrawn 2026-09-29 |
-| [data_structures_implementation_command.md](data_structures_implementation_command.md) | Acceptance trials and phase order                 |

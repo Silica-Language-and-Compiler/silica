@@ -2,13 +2,20 @@
 
 **Audience / scope:** Treat this file as the **Apple Silicon + macOS** implementation record for sysctl-backed **`_silica_rt_*` topology and `core_capabilities`** in the emitter (`prims_actors_runtime_asm.silica`). **Phases A–C** (ABI freeze, lexer, parser) describe **shared** compiler work and are not CPU-specific; **Phase G “complete” status, §Runtime contract, and all sysctl / NUMA / cache specifics apply only to Apple Silicon.** Portable or non-Apple targets are **not** covered here—use a separate plan or backend when adding them.
 
-**Date**: April 9, 2026  
+**Date**: April 9, 2026 (implementation status added 2026-10-16)  
 **Status**: Phases A–C complete; **Phase G (emitter) complete on Apple Silicon + macOS** for `_silica_rt_get_cpu_topology` and `_silica_rt_get_core_capabilities` (see §Runtime contract). Phases D–F and H remain (typing/SIR/effects parity and verification). Non–Apple-Silicon targets are **not** implemented in this path (ignored for now; no Makefile churn).  
 **References**:
 
 - [silica-specification.md](../silica-specification.md) — §4.6 core affinity types, §22 actor builtins, CPU affinity appendix (`cpu_topology`, `core_info`, `get_cpu_topology`, `get_efficiency_cores`, `get_performance_cores`, `get_core_capabilities`)
-- [actor_implementation_plan.md](actor_implementation_plan.md) — actor / affinity status and remaining migration caveats
 - [silica-compiler-code-organization.md](../silica-compiler-code-organization.md) — where lexer/parser/checkers/SIR/emitter modules live
+
+> **Implementation status (2026-10-16).** The Apple Silicon + macOS path described below is unchanged. Since this plan was written the same
+> surface exists on the other targets, each in its own runtime:
+>
+> - **linux_aarch64 and linux_x86_64:** `silica_rt_get_cpu_topology` and `silica_rt_get_core_capabilities` use the same heap layout as the Apple path and read their numbers through a `silica_rt_sysctlbyname` shim in `linux_rt_shims_asm.silica` (answers from `sysconf`/`getauxval(AT_HWCAP)` on aarch64 and `sysconf`/`cpuid` leaves 1 and 7 on x86-64; unknown keys return -1). The Apple-specific wording below (sysctl, `hw.optional.*`) describes the keys the code asks for, not a macOS requirement.
+> - **ESP32-S3_raw:** `rt_actors.S` builds `core_info` records and the `cpu_topology` record for the two LX7 cores: both `:performance`, no efficiency cores, empty NUMA list, empty cache hierarchy, `frequency_mhz` 0; an id at or above the core count (or negative) gives the `id: -1` sentinel. `get_performance_cores()` lists every running core and `get_efficiency_cores()` is empty.
+> - **Phase H:** unchanged in substance. `trials/cpu_discovery_and_spawn_pinning` is still `INTEGRATE_PENDING` on every target. The two spawn trials (`cpu_spawn_third_arg_affinity`, `cpu_spawn_third_nonliteral_affinity`) have .ascomp goldens per host; `cpu_topology_runtime_queries` and `cpu_topology_phase_h_verify` were reported in `ports/esp32s3_port_status.md` (2026-09-28) as not compiling on any target (E2015, the pre-`mem(normal)` list syntax). The blocker stated in Phase H (emitter stubbing `main` for `sequence proc[concurrency]` bodies) is not re-verified. `phase_h_static.sh` still checks only the Apple runtime source.
+> - **Spawn core argument:** the third argument is a `uint64` or `core_id(n)`; the pinning rule is the Actor Pinning Policy of the specification §15.1.2 (see [actor_spawn_core_affinity_os_semantics.md](../actor_spawn_core_affinity_os_semantics.md)).
 
 ---
 

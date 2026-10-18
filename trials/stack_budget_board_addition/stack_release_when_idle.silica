@@ -1,0 +1,131 @@
+// Board stacks (actor_memory_budget_plan.md item F, spec §15.1.2.2): :release_when_idle keeps
+// everything while messages keep arriving and releases all of it once no message has arrived for
+// one second (the 16 MHz system timer; each core's scheduler frees its idle actors' chunks). A
+// poller actor looks at the deep actor's usage once per message, after a pure spin that keeps the
+// polls sparse (each get_actor_memory_usage is a 40-byte record the board never frees), through a
+// bounded number of rounds, so a runtime that never released would still end and print false.
+// The driver's rounds are a self tail call, so its stack does not grow with them.
+// Expected:
+//   true
+//   true
+//   true
+//   0
+
+fn depth(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            r: int64 <- depth(n - 1);
+            r + 1
+        }
+    }
+}
+
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+fn spin(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> spin(n - 1)
+    }
+}
+
+// One poll per message, after a spin of msg steps.
+fn poller(msg: int64, w: actor_ref) -> (:reply, int64, actor_ref) {
+    sequence proc[concurrency]
+        _: int64 <- spin(msg);
+        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        r: int64 <- case u.committed == 0 of {
+            true -> 1;
+            false -> 0
+        }
+    produces
+        pure (:reply, r, w)
+    end
+}
+
+fn rounds(p: actor_ref, n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            sequence proc[concurrency]
+                r: int64 <- call(p, 200000 impl ActorMessage {});
+                res: int64 <- case r == 1 of {
+                    true -> 1;
+                    false -> rounds(p, n - 1)
+                }
+            produces
+                pure res
+            end
+        }
+    }
+}
+
+// Up to msg polls; the loop lives in this actor, not in main (main is not an actor and its stack is
+// sized per image, §15.1.2.2).
+fn driver(msg: int64, p: actor_ref) -> (:reply, int64, actor_ref) {
+    r: int64 <- rounds(p, msg);
+    (:reply, r, p)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        w: actor_ref <- spawn(0, beh, stack_policy(0, :release_when_idle));
+        _: int64 <- call(w, 400 impl ActorMessage {});
+        busy: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        print_boolean(busy.committed > 8192 and busy.retained == busy.committed);
+        println("");
+        p: actor_ref <- spawn(w, poller, stack_policy(0, :keep_last_message));
+        d: actor_ref <- spawn(p, driver, stack_policy(0, :keep_last_message));
+        released: int64 <- call(d, 1500 impl ActorMessage {});
+        print_boolean(released == 1);
+        println("");
+        idle: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        print_boolean(idle.committed == 0 and idle.high_water == busy.high_water);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :release_when_idle));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

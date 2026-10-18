@@ -7,6 +7,14 @@ images but not yet run on the board. The follow-up decisions of the same day (ha
 startup code, a last-resort path for a fault inside the handler, `_exit` on every process-fatal path, and
 the two paths that used to exit 1) were implemented in defect batch 2 (§6).
 
+**Implementation status (2026-10-16).** The runtime text has since been run on every target: the Linux
+AArch64 and x86-64 runtimes through their fixed points and trial suites, the board runtime through the board
+trial suites and apps (the stack-guard app, the device-actor fault details of §3.2). The board has an actor
+runtime and two cores since 2026-09 (an actor's fault ends the actor; only `main`, the scheduler and the
+runtime's own code take the process-fatal path), so the earlier statements below that the board has no actor
+runtime describe the 2026-09-19 state and are corrected in place. The non-fatal path, the report an actor's
+death delivers to the `FailureReporter`, is described in §7.
+
 The contract is normative in the specification, **§15.4.5.5 Process-Fatal Reports and Exit Status**
 ([silica-specification.md](silica-specification.md)). This document is non-normative: it describes how each
 target meets that contract, so that a program that ends abnormally reports it the same way whether it
@@ -42,7 +50,7 @@ What the rules mean in practice:
 | `0x<pc>` width | 16 digits | 16 | 16 | 8 |
 | ` in <symbol>+0x<offset>` | yes: `dladdr` names the nearest preceding exported symbol | only when the address is exactly a symbol's start: the ELF symbols the emitters write have no `.size`, and glibc's `dladdr` matches a size-0 symbol only at its address | as `linux_aarch64` | never: no symbol table on the board |
 | `  addr=0x..` (fault) | `si_addr` | `si_addr` | `si_addr` | `EXCVADDR`, only for the exception causes that set it (2, 3, 9, 12-18, 20, 24-26, 28, 29); a stack-guard hit (a data breakpoint, cause 1006) has none |
-| `  actor=  sbase=  ssize=` (fault) | yes (zero outside an actor) | yes | yes | never: no actor runtime yet |
+| `  actor=  sbase=  ssize=` (fault) | yes (zero outside an actor) | yes | yes | never: the board's fatal report carries no actor fields (an actor's own fault is an actor failure, §7) |
 | After the report | exit | exit | exit | exit marker; for a fault, the board-only details after it: ` fault: exccause=<n> epc=0x.. excvaddr=0x..` and ` (stack guard: ...)` for cause 1006, which `run_on_board.py` sends to stderr |
 
 Examples. A stack overflow in `main` (trial `actor_stacks_addition/stack_overflow_in_main`):
@@ -78,7 +86,7 @@ attributed to the function after it.
 **Signals.** `silica_rt_install_sync_fault_handlers` (`emitter/<target>/terms/ffi_fault_runtime_asm.silica`)
 installs `silica_rt_sync_fault_handler` with `sigaction` for SIGSEGV, SIGBUS, SIGILL and SIGFPE
 (`SA_SIGINFO | SA_ONSTACK | SA_NODEFER`) and gives the installing thread a 64 KB `sigaltstack`. Each actor
-thread gets its own 64 KB alternate stack (ACB +464). **The startup code installs the handlers before
+thread gets its own 64 KB alternate stack (ACB +352). **The startup code installs the handlers before
 `main` runs**: the same module puts the install routine in the program's constructor list
 (`__DATA,__mod_init_func` on Darwin, `.init_array` on Linux), which dyld or the C runtime runs before
 `main`, so a fault in `main`'s prologue, or in anything else that runs before `main`'s body (a foreign
@@ -202,6 +210,8 @@ unchanged, byte for byte. Hosts never have device actors (device actor specifica
 report has no such lines. A restarted device child that a supervisor spawns from a child row is not flagged
 (rows carry no device flavor yet).
 
+**Both cores (2026-10-16).** A fatal fault or runtime abort on either core stops the other. Each core has its own fault stack (2 KB) and its own fault counter (`silica_rt_fatal_depth`); the first core to claim the fatal-owner word stalls the other core through the RTC stall bits (RunStall) and then reports. The other core is stopped, so there is one report. The second fault stack costs 2 KB of heap.
+
 **Runtime abort.** The entries `silica_rt_abort_with(reason)` and `silica_rt_abort_<site>()` (`rt_console.S`)
 are windowed functions reached with CALL8. Each names its reason in `a2` and jumps to
 `silica_rt_abort_body`, which turns the return address in `a0` into the address of the CALL8 (bits 31:30
@@ -235,7 +245,7 @@ emitter's `prims_memory.silica`):
 | --- | --- | --- |
 | `L_region_overflow` (the region allocator returned nothing) | `silica_rt_abort_region_overflow` | `region allocation failed` |
 | `L_buf_invalid` (`alloc_buf` count negative, or its byte size overflows) | `silica_rt_abort_buf_invalid` | `invalid buffer size` |
-| `L_buf_bounds` (buffer store index at or past the length) | `silica_rt_abort_buf_bounds` | `buffer index out of bounds` |
+| `L_buf_bounds` (buffer store or load index at or past the length) | `silica_rt_abort_buf_bounds` | `buffer index out of bounds` |
 | `L_lat_oob` in `L_list_at_helper` (host) | `silica_rt_abort_list_index` | `list index out of range` |
 
 Hosted runtime (`emitter/<target>/terms/`):
@@ -265,14 +275,16 @@ The ESP32-S3 emitter tree still carries the AArch64 runtime chunks it was copied
 marker only) and are edited in step with the Mac tree.
 
 Reachable from Silica source today, and covered by a trial: the list index, the invalid buffer size, the
-zero canonical-arena key, the fatal fault of a stack overflow in `main`, and `main`'s failed stack
+buffer index past the length (`memory_region_addition/buf_write_out_of_bounds_aborts`, `buf_read_out_of_bounds_aborts`),
+the zero canonical-arena key, the fatal fault of a stack overflow in `main`, and `main`'s failed stack
 reservation (`actor_stacks_addition/stack_reserve_failed_in_main`). Covered by a trial through a C probe
 linked after the runtime (`ffi_addition/app_process_fatal_paths`): a fault before `main`, a fault inside
 the fault handler, a guarded foreign fault with no current actor. Not reachable in practice: the
 allocator failures (region, arena, guarded FFI state), a full supervision ingress (1024 pending entries),
-and the stack-commit refusal. **The buffer bounds check is never emitted** (an open defect): the store only
-checks when its SIR node carries a `|bounds:` marker, which no trial produces, and loads have no check;
-`memory_region_addition/buf_write_out_of_bounds_aborts` pins the required behaviour and fails until then.
+and the stack-commit refusal. **The buffer bounds check is emitted** (since 2026-09-19): `alloc_buf` stores the
+element count in the word below element 0 (`prims_memory@emit_alloc_buf`) and every store and load compares the
+index against it (`emit_buf_bounds_check`) and branches to `L_buf_bounds`. Before that the store only checked
+when its SIR node carried a `|bounds:` marker, which no program produced.
 
 ## 5. Comparing reports
 
@@ -317,16 +329,75 @@ Where it is applied:
 - Two reports at once (two threads failing together) can interleave their lines; only the first abort
   reports, but a fault on another thread does not take the abort's claim word.
 - On Linux the symbol is missing from most reports until the emitters write `.size` for their functions.
-- The board has one core and no actor runtime, so there is no actor failure on the board yet: a fault is
-  always fatal there.
+- On the board a CPU exception in an actor ends only that actor (`silica_rt_actor_fault_hook`; a stack-guard hit in an actor ends it with
+  `(:explicit, :stack_exhausted)`); a fault in `main`, in the scheduler or in the
+  runtime's own code is fatal. The fatal report still has no actor fields.
 - **Implemented in defect batch 2 (2026-09-19):** a spawn whose stack reservation fails while `main` is the
   spawner is a runtime abort (`stack reservation failed`, 71; spec §15.1.2.2; trial
   `actor_stacks_addition/stack_reserve_failed_in_main`), and a guarded FFI fault with no current actor is a
   fatal fault (70; trial `ffi_addition/app_process_fatal_paths/foreign_fault_without_actor`). They used to
   print `stack_reserve_failed` or `foreign_fault` and exit 1.
 - Process-fatal paths write only the report line; unwind reports belong to actor failures (spec §15.4.5.5).
+- **Supervisor shutdown (2026-10-15, spec §15.4.12.2).** When a supervisor ends, it first shuts down its live children, one at
+  a time, last child-table row first. Each shut-down child produces a failure report like any other death: a child with
+  `shutdown: 0` ends with reason tag 1 (as `kill_abnormal`), a child with `shutdown > 0` ends with
+  `(:explicit, :shutdown)` (reason tag 4). A child whose supervisor is already dead does not print the root-actor note.
+  The `shutdown` time limit is not enforced on any target, because nothing preempts a running message.
+- `remove_actor(self())` and `kill_abnormal(self())` fail the caller with `:language_error` at run time (spec §15.1.2.3);
+  the compile-time rejection is not implemented.
+- A `call` or `cast` whose target's calling convention does not match (a cast to a call-only actor, a call to a
+  cast-only one) is rejected at compile time wherever the compiler can follow the reference (E2237, E2238; spec
+  §16.2.6.4). Where it cannot, the runtime records the convention in the control block at spawn (hosted ACB
+  +432) and the sender fails with `:language_error`, the same exit reason as any other language-level failure
+  in an actor.
 
-## 7. Where the code is
+## 7. Actor failure reports (the non-fatal path)
+
+Non-normative; the contract is spec §15.4.6.4 (the report), §15.4.11 (the notification to the supervisor) and
+§15.4.13.4 (the `FailureReporter` trait). This is the path an actor's death takes, as opposed to the
+process-fatal reports of §1 to §5. Checked against the hosted and board runtimes 2026-10-16.
+
+- **One report per death, delivered asynchronously.** When an actor ends abnormally or is shut down, the
+  runtime formats the report on the dying actor's teardown path and hands it to the registered root
+  `FailureReporter` by a cast, so `handle_report` runs on the reporter's own thread (hosted) or dispatch
+  (board), never on the dying actor's stack. The structured notification to the supervisor's ingress is a
+  separate channel. Where no reporter is registered the report is written to standard error (the board: the
+  console) at once.
+- **The banner.** Hosted (`L_phase_f_unwind_fmt`) and board (`rt_actors.S`) print the same shape:
+  `=== Silica Actor Failure ===`, `actor_id:` (the actor's 64-bit identity of spec §15.1.4, position in the
+  high word and child number in the low word, printed as one unsigned integer; before 2026-10-12 it was the
+  control-block pointer), `agent_type_atom:`, `reason_tag:`, `supervisor_acb:` (a pointer; null prints `0x0`
+  on Darwin, `(nil)` on glibc, `0x00000000` on the board), `call_stack:` with `#0` the behaviour's symbol
+  (`<unknown behavior>` when the slot is empty) and `#1  _actor_thread_main`, and
+  `=== End Silica Actor Failure ===`. A region dump section follows only when the reporter's
+  `region_dump_limit()` is above zero. The fields differ from the specification's example (`agent_type:`,
+  `behavior:`, `supervisor:` lines); the table of §15.4.6.4 describes the intended report. The comparison
+  tools fold `actor_id`, `supervisor_acb`, `epc` and `agent_type_atom` (§5).
+- **Handler before any start (E2236).** `main` must register the reporter before it starts any actor or
+  supervisor, so a death during start-up, the root supervisor's own included, always has a destination. The
+  reporter must be cast-only: `register_failure_reporter` of a reply-form (call-only) behaviour is rejected
+  (E2237).
+- **The root supervisor's report ends the program.** A reporter recognises it (null `supervisor_acb`, frame
+  `#0  <unknown behavior>`) and calls `cast_exit`; the compiler's reporter uses status 76 or 1
+  (`main.silica`), the trial-support reporters 70. The runtime separately writes
+  `[silica] root actor exited (no supervisor)` synchronously for a root actor's death; the note is not part
+  of the report, which is why ordered `.scout` comparison cannot see their relative order (§5).
+- **Drained at exit (hosted).** Reports already handed to the reporter are not lost when the process ends:
+  an `atexit` handler (`_silica_rt_report_drain_at_exit`) waits up to two seconds, in one-millisecond steps,
+  while a report is pending or being handled and the reporter is alive, then writes every report still pending
+  to standard error, oldest first. A report the reporter is handling when the wait ends is the reporter's to
+  print. A process-fatal path ends with `_exit` (§3.1), which runs no `atexit` handlers, so it does not drain.
+- **Report blocks are freed.** The runtime owns the report string until the reporter's behaviour returns, and
+  frees it then unless the behaviour passed it on in a message (`_silica_rt_report_escape_check`); the
+  structured payload sent to a supervisor is freed by `silica_rt_actor_failure_release`. A report still queued when the reporter ends goes to
+  standard error and is freed (`_silica_rt_report_unhandled`).
+- **Supervisor shutdown and restarts.** A supervisor ending shuts down its live children first; each produces
+  a report like any other death (§6, spec §15.4.12.2).
+- **Restart-intensity breach (2026-10-16, spec §15.4.13.2).** A supervisor that exceeds its restart intensity ends,
+  after shutting down its children, with `(:explicit, :restart_intensity_breach)` (reason tag 4) on every target. It used to end with
+  reason tag 0, so a `:transient` parent never restarted it. The atom is a dedicated runtime atom, distinct from the `:shutdown` of orderly shutdown.
+
+## 8. Where the code is
 
 | Target | Fault report | Runtime abort |
 | --- | --- | --- |

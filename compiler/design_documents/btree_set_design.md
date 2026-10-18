@@ -19,6 +19,8 @@ WeightBalancedTreeMap[KeyType, ValueType, mem(normal)]
 
 **Emitted modules:** `wbt_set.silica`, `wbt_map.silica`.
 
+**Implementation status (2026-10-16):** implemented as `compiler/stdlib/data_structures/wbt_set.silica` and `wbt_map.silica` with the `OrderedSet` and `OrderedMap` traits (trials `trials/ordered_data_structures/wbt_core/` and `ordered_collections/`). Differences from the shapes below: the node is an inline recursive tuple `(ItemType, int64, ref?, ref?)` (set) or `(KeyType, ValueType, int64, ref?, ref?)` (map) in a canonical arena, not a node list; the map `get` is `get/3` (a placeholder value for the `:not_found` payload); the public bracket types are `OrderedSet[ItemType, mem(normal)]` and `OrderedMap[KeyType, ValueType, mem(normal)]`, and the registry keys `WeightBalancedTreeSet`/`WeightBalancedTreeMap` below are descriptive only; `mem(normal)` is the only space in the landed modules. `join`/`split`/`concat` are not exported.
+
 ---
 
 ## 2. Shared ordered-collection model

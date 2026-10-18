@@ -1,5 +1,7 @@
 # Embedded Actor Runtime (Bare Metal)
 
+> **Implementation status (2026-10-16).** Partly realised by the ESP32-S3_raw runtime (`compiler/src/emitter/ESP32-S3_raw/board/runtime/rt_actors.S`, [ports/esp32s3_xtensa_port.md](ports/esp32s3_xtensa_port.md) §8). It matches the design in: no operating system; actors with private state and one mailbox each; a runtime scheduler dispatching one message at a time (cooperative, per core; both LX7 cores run actors); supervision with restart; registration of logical names (atom-keyed registries, [atom_actor_registry_direct_index_design.md](atom_actor_registry_direct_index_design.md)). It differs in: mailboxes are queues of allocated message nodes (48 B each, [actor_memory_budget_plan.md](actor_memory_budget_plan.md)), not fixed-slot circular rings with a compile-time payload ceiling, and the runtime allocates (memory budgets are set by [actor_memory_budget_plan.md](actor_memory_budget_plan.md)); interrupts are never enabled by the runtime (INTENABLE is 0), so the "Interrupt Handling" section has no implementation; there is no mailbox-full policy, no cross-application shared-SRAM transport and no datagram header. "Multi-core support" under Future Extensions exists (two cores). Priority mailboxes, timers and delayed messages: actor priorities and scheduler policies exist (`set_actor_priority`, `set_scheduler_policy`), see [ports/esp32s3_port_status.md](ports/esp32s3_port_status.md). The datagram sections below remain design.
+
 ## Purpose
 
 This document describes an Erlang-inspired actor runtime for embedded systems running without an operating system.
@@ -138,7 +140,7 @@ Concurrency:
 +---------+---------+----------+----------+
 ```
 
-Suggested wire record (selfhost dialect: inline record type, bound to a variable)
+Suggested wire record (an inline record type, bound to a variable)
 
 ```silica
 // L_ipc: static lifetime for mailbox storage (bare-metal runtime region)

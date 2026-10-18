@@ -185,11 +185,12 @@ assembly: check-seed silica.config record-compile-start
 	    exit 0; \
 	  fi; \
 	  echo "Compiling with $(SILICA_COMPILER) ($$need unit(s) to compile)"; \
+	  rm -f silica.compile.inprogress silica.compile.crashed; \
 	  while true; do \
 	    "$(SILICA_COMPILER)"; \
 	    ec=$$?; \
 	    if [ $$ec -eq 0 ]; then break; fi; \
-	    if [ $$ec -eq 75 ]; then \
+	    if [ $$ec -eq 75 ] || [ $$ec -eq 76 ]; then \
 	      echo "  (reclaiming memory; continuing next unit)"; \
 	      continue; \
 	    fi; \

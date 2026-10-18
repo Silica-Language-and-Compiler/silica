@@ -49,11 +49,12 @@ ensure-silica-compiler:
 # (or a hard failure). Usage inside a recipe (same cwd as silica.config):
 #   $(RUN_SILICA_COMPILER)
 define RUN_SILICA_COMPILER_WITH
+	rm -f silica.compile.inprogress silica.compile.crashed; \
 	while true; do \
 		$(1); \
 		ec=$$?; \
 		if [ $$ec -eq 0 ]; then break; fi; \
-		if [ $$ec -eq 75 ]; then \
+		if [ $$ec -eq 75 ] || [ $$ec -eq 76 ]; then \
 			echo "  (reclaiming memory; continuing next unit)"; \
 			continue; \
 		fi; \

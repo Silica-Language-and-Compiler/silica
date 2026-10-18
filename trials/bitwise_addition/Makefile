@@ -26,7 +26,7 @@ MSG_PREFIX := $(TRIAL_DIR)/
 .PHONY: all clean assembly objects executables integrate help silica.config
 
 silica.config:
-	@cd "$(THIS_DIR)" && find "$$PWD" -path "$$PWD/negative" -prune -o -type f -name '*.silica' -print | sed "s|^$$PWD/||" > silica.config
+	@cd "$(THIS_DIR)" && find "$$PWD" -path "$$PWD/negative" -prune -o -type f -name '*.silica' -print | sed "s|^$$PWD/||" | LC_ALL=C sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 all: executables
 
@@ -45,12 +45,14 @@ objects: assembly
 	done
 
 executables: objects
-	@for o in *.o; do \
+	@$(TRIAL_SUPPORT_ASSEMBLE); \
+	for o in *.o; do \
 		[ -f "$$o" ] || continue; \
 		base=$${o%.o}; \
 		[ "$$base" = "__silica_runtime" ] && continue; \
 		runtime_obj=""; \
 		[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 			$(RUST_LLD) -flavor darwin -o $$base $$o $$runtime_obj $(LDFLAGS_rust-lld) && echo "  ✅ $(MSG_PREFIX)$$base (rust-lld)"; \
 		else \
@@ -105,12 +107,14 @@ integrate-run:
 		ko=$$((ko + 1)); failed=1; break; \
 	fi; \
 	done; \
+	$(TRIAL_SUPPORT_ASSEMBLE); \
 	for o in *.o; do \
 		[ -f "$$o" ] || continue; \
 		base=$${o%.o}; \
 		[ "$$base" = "__silica_runtime" ] && continue; \
 		runtime_obj=""; \
 		[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 		echo "Linking $$base..."; \
 		if test -x "$(RUST_LLD)"; then \
 			if ! $(RUST_LLD) -flavor darwin -o $$base $$o $$runtime_obj $(LDFLAGS_rust-lld); then \

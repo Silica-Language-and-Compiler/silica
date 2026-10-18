@@ -33,13 +33,14 @@ export count_tuple_allocations/1;
 export count_flat_elements/1;
 export count_type_elements/1;
 export flat_alloc_size/1;
+export is_sret_aggregate_type/1;
+export sret_aggregate_bytes/1;
 export flat_alloc_size_str/1;
 export emit_flat_store/3;
 export emit_flat_mov_dest/1;
 export index_to_offset/1;
 export ldr_prefix_for_type/1;
 export tuple_field_start_byte_offset/2;
-export tuple_type_uses_boxed_float32/1;
 export tuple_type_nth_element/2;
 export tuple_pattern_named_count/1;
 export tuple_pattern_strip_spaces/3;
@@ -182,31 +183,12 @@ fn nested_tuple_span_bytes(tuple_ty: string) -> int64 {
     nested_tuple_span_accum(tuple_ty, 0, cnt)
 }
 
-// Byte span of one tuple slot's type segment (matches emit_flat_tuple_stores stepping / memcpy sizes).
+// Byte span of one tuple slot: every element is one word. A scalar (float32 and float16 included)
+// is stored in its slot; a record, list or nested tuple is a pointer to it. A float32 used to be
+// boxed (a pointer to a value parked in the next word): that pointer aimed into the frame region
+// the tuple was built in, the region was sized one word per element, and the box overran it.
 fn tuple_segment_stride_bytes(seg_raw: string, parent_tuple_elem_count: int64) -> int64 {
-    seg: string <- strip_ty(seg_raw);
-    case length_bytes(seg) == 0 of {
-        true -> 8;
-        false -> case reg_conventions@is_float32_type(seg) and parent_tuple_elem_count > 1 of {
-            true -> 16;
-            false -> case substring(seg, 0, 1) == "{" of {
-                // Record values are heap pointers in the ABI. Tuple slots that hold a record
-                // store that pointer (8 bytes). Using value-flat record size here made
-                // tuple_proj of a (record, int64) pair load the second element at #64 while
-                // construction stored pointers at #0/#8.
-                true -> 8;
-                false -> case length_bytes(seg) >= 5 and substring(seg, 0, 5) == "List[" of {
-                    true -> 8;
-                    false -> case substring(seg, 0, 1) == "(" of {
-                        // Matches emit_flat_tuple_stores non-record aggregates: nested tuple_make/record_make
-                        // are emitted as one pointer-sized slot (STR at idx*8+adjust), not a contiguous memcpy of nested_tuple_span_bytes.
-                        true -> 8;
-                        false -> 8
-                    }
-                }
-            }
-        }
-    }
+    8
 }
 
 fn field_stride_for_tuple_elem(type_name: string, i: int64, total_elems: int64) -> int64 {
@@ -224,36 +206,10 @@ fn accum_field_start_bytes(type_name: string, i: int64, target_idx: int64, total
     }
 }
 
-// Byte offset of field `field_idx` (0-based), matching emit_flat_tuple_stores (boxed float32 uses 16 bytes).
+// Byte offset of field `field_idx` (0-based), matching emit_flat_tuple_stores (one word per element).
 fn tuple_field_start_byte_offset(type_name: string, field_idx: int64) -> int64 {
     total_elems: int64 <- count_type_elements(type_name);
     accum_field_start_bytes(type_name, 0, field_idx, total_elems)
-}
-
-fn scan_tuple_has_f32(type_name: string, i: int64, cnt: int64) -> boolean {
-    case i >= cnt of {
-        true -> false;
-        false -> {
-            seg: string <- strip_ty(tuple_type_nth_element(type_name, i));
-            case reg_conventions@is_float32_type(seg) of {
-                true -> true;
-                false -> scan_tuple_has_f32(type_name, i + 1, cnt)
-            }
-        }
-    }
-}
-
-fn tuple_type_uses_boxed_float32(type_name: string) -> boolean {
-    case length_bytes(type_name) < 2 or substring(type_name, 0, 1) != "(" of {
-        true -> false;
-        false -> {
-            cnt: int64 <- count_type_elements(type_name);
-            case cnt > 1 of {
-                true -> scan_tuple_has_f32(type_name, 0, cnt);
-                false -> false
-            }
-        }
-    }
 }
 
 fn count_flat_elements(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
@@ -355,14 +311,18 @@ fn index_to_offset_int(idx: int64) -> string {
     concat("#", atom_table@int64_to_decimal_string(idx * 8))
 }
 
+// A float16 element loads into H: an X load left the value in X<n> while the binding read H<n>.
 fn ldr_prefix_for_type(type_name: string) -> string {
     case reg_conventions@is_float64_type(type_name) of {
         true -> "D";
         false -> case reg_conventions@is_float32_type(type_name) of {
             true -> "S";
-            false -> case reg_conventions@is_narrow_type(type_name) of {
-                true -> "W";
-                false -> "X"
+            false -> case reg_conventions@is_float16_type(type_name) of {
+                true -> "H";
+                false -> case reg_conventions@is_narrow_type(type_name) of {
+                    true -> "W";
+                    false -> "X"
+                }
             }
         }
     }
@@ -560,5 +520,24 @@ fn tuple_pattern_number_from(s: string, i: int64, seen_dot: boolean, seen_digit:
                 }
             }
         }
+    }
+}
+
+// Results returned through the caller's buffer in X8 (call@sret_x8_setup, emitter_core@
+// fn_returns_sret_tuple): plain tuples (reg_conventions@is_sret_tuple_type) and records with the boxed
+// layout -- one word per field after the shape word. The runtime-laid-out records (child specs,
+// supervisor replies) keep their own return path.
+fn is_sret_aggregate_type(t: string) -> boolean {
+    case reg_conventions@is_sret_tuple_type(t) of {
+        true -> true;
+        false -> reg_conventions@is_inline_struct_type(t) and prims_record@record_type_keeps_inline_layout(t) == false
+    }
+}
+
+// Bytes of the shell the callee copies to [X8] (and the caller's home holds), a multiple of 16.
+fn sret_aggregate_bytes(t: string) -> int64 {
+    case reg_conventions@is_sret_tuple_type(t) of {
+        true -> flat_alloc_size(count_type_elements(t));
+        false -> (prims_record@record_type_value_flat_byte_size(t) + 15) / 16 * 16
     }
 }

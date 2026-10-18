@@ -1,6 +1,6 @@
 # Building an application with the project Makefiles
 
-This how-to shows how to build a **general Silica application** with `silica-compiler` using the drop-in Makefiles under [`project_makefiles/`](../../../project_makefiles/) at the repository root. Those files are a sanitized form of the self-hosted compiler’s config-driven build: topological `silica.config`, process-per-unit reclaim, assemble `.sams`, then link.
+This how-to shows how to build a **general Silica application** with `silica-compiler` using the drop-in Makefiles under [`project_makefiles/`](../../project_makefiles/) at the repository root. Those files are a sanitized form of the self-hosted compiler’s config-driven build: topological `silica.config`, process-per-unit reclaim, assemble `.sams`, then link.
 
 You do **not** need the compiler sources, the emitters, or any of the platform build scripts for an ordinary app. You need `silica-compiler` on your machine, **GNU Make**, and **Clang**.
 
@@ -10,7 +10,7 @@ For why leaf-to-root batches and exit `75` matter for RAM, see [compiling_with_l
 
 ## What you copy
 
-From [`project_makefiles/`](../../../project_makefiles/), put these files in your **application source root** (the directory that will contain `main.silica` and `silica.config`):
+From [`project_makefiles/`](../../project_makefiles/), put these files in your **application source root** (the directory that will contain `main.silica` and `silica.config`):
 
 | File | Role |
 | --- | --- |
@@ -235,4 +235,4 @@ main.silica
 - [open_recursion_callbacks.md](./open_recursion_callbacks.md) — split recursive algorithms without circular `use`  
 - [ffi_wrappers_and_makefiles.md](./ffi_wrappers_and_makefiles.md) — FFI wrappers, sidecars, and link archives  
 - [designing_apps_with_foreign_functions.md](./designing_apps_with_foreign_functions.md) — app structure around `dangerous_*` workers  
-- Drop-in files: [`project_makefiles/`](../../../project_makefiles/) at the repository root  
+- Drop-in files: [`project_makefiles/`](../../project_makefiles/) at the repository root  

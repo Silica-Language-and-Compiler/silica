@@ -13,7 +13,7 @@ grep '\.error' *.sams
 
 | Program | Refusal |
 | --- | --- |
-| `device_map_outside_window` | `map_device((:esp32s3_uart), 0x3FC88000)` — SRAM, not a `board_pack.silica` window |
+| `device_map_outside_window` | `map_device((:test_uart), 0x3FC88000)` — SRAM, not a `board_pack.silica` window |
 | `device_peek_register64` | `peek(...) impl Register64 {}` — a 64-bit access is not one load on this bus |
 
 When the emitter's refusals move onto the pre-emit diagnostic channel (plan "Still to decide"),

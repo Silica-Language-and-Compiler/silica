@@ -74,14 +74,15 @@ scout_diff() {
     fi
 }
 
-# The compiler's reclaim loop (exit 75 = continue with the next unit), with the per-unit alarm.
+# The compiler's reclaim loop (exit 75/76 = continue with the next unit), with the per-unit alarm.
 run_compiler() {
     local ec
+    rm -f silica.compile.inprogress silica.compile.crashed
     while true; do
         perl -e 'alarm shift @ARGV; exec @ARGV' "$COMPILE_TIMEOUT" "$BOARD_SILICA_COMPILER"
         ec=$?
         [ $ec -eq 0 ] && return 0
-        [ $ec -eq 75 ] && continue
+        { [ $ec -eq 75 ] || [ $ec -eq 76 ]; } && continue
         [ $ec -eq 142 ] && echo "❌❌ compiler TIMED OUT after ${COMPILE_TIMEOUT}s (compile hang)"
         return $ec
     done
@@ -95,6 +96,12 @@ if [ "${1:-}" = "--fail-one" ]; then
     tmp=$(mktemp -d)
     ln -s "$src/$stem.silica" "$tmp/$stem.silica"
     echo "$stem.silica" > "$tmp/silica.config"
+    # Item M: the trial-support module the trial uses, then Supervisor (TRIAL_SUPPORT_IN_TMP's order)
+    for m in $(sed -nE 's/^use (trial_[a-z0-9_]+);.*/\1/p' "$src/$stem.silica"); do
+        ln -sfn "$TRIALS_ROOT/lib_trial_support/$m.silica" "$tmp/$m.silica"
+        ln -sfn "$TRIALS_ROOT/../compiler/stdlib/Supervisor.silica" "$tmp/Supervisor.silica"
+        printf '%s\n' "$m.silica" Supervisor.silica >> "$tmp/silica.config"
+    done
     ( cd "$tmp" && run_compiler ) > "$work/build/$stem.cur_fail" 2>&1
     rm -rf "$tmp"
     cp "$work/build/$stem.cur_fail" "$src/$stem.$target.cur_fail"
@@ -212,6 +219,22 @@ while IFS= read -r m; do
     staged=$((staged + 1))
 done < <(sed -n 's#.*echo *"\(\.\./\.\./compiler/[^"]*\.silica\)".*#\1#p' "$src/Makefile" 2>/dev/null | LC_ALL=C sort -u)
 
+# Item M: the trial-support modules the suite's programs use (trials/lib_trial_support), and the
+# Supervisor trait they implement, staged as support modules the way TRIAL_SUPPORT_CONFIG adds them
+# to the host's silica.config. link_closure then links each program with the one it `use`s.
+while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    [ -e "src/$m.silica" ] && continue
+    ln -s "$TRIALS_ROOT/lib_trial_support/$m.silica" "src/$m.silica"
+    modules+=("$m")
+    staged=$((staged + 1))
+    if [ ! -e src/Supervisor.silica ] && ! find src -name Supervisor.silica | grep -q .; then
+        ln -s "$TRIALS_ROOT/../compiler/stdlib/Supervisor.silica" src/Supervisor.silica
+        modules+=("Supervisor")
+        staged=$((staged + 1))
+    fi
+done < <(cd "$src" && cat ./*.silica 2>/dev/null | sed -nE 's/^use (trial_(support|wait|call)_[a-z0-9_]+);.*/\1/p' | LC_ALL=C sort -u)
+
 # --- program trials: one compile, then image + board run + golden per program -------------------
 if [ "${#programs[@]}" -gt 0 ]; then
     ( cd src && find . -name '*.silica' -not -path './.*' | sed 's|^\./||' | LC_ALL=C sort > silica.config )
@@ -283,11 +306,23 @@ if [ "${#programs[@]}" -gt 0 ]; then
             # run_on_board.py started; two suites then opened the port together and the second one
             # found it busy (the run reported the board as lost after ~60 trials). Raising $^F keeps
             # the lock descriptor open, and so the lock held, for the life of the exec'd process.
+            # A trial with a <stem>.wait_for_exit marker ends only on the `exit` line (spec §15.1.2.5;
+            # on the board standard input is the console). The host harness writes it after the
+            # marker text appears; run_on_board.py can write it a fixed delay after the start marker,
+            # so the delay must cover the trial's run up to its marker: BOARD_EXIT_DELAY seconds
+            # (default 5).
+            # A suite whose host Makefile runs every trial through run_integration_exit_after_marker.py
+            # with the marker "done" (supervisors_addition, record_shapes_actors_addition) gets the
+            # `exit` line for every trial, as on the host.
+            send=()
+            if [ -f "$src/$stem.wait_for_exit" ] || grep -q 'run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "done"' "$src/Makefile" 2>/dev/null; then
+                send=(--send 'exit\n' --send-delay "${BOARD_EXIT_DELAY:-5}")
+            fi
             integrate_killed=0
             perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' \
                 perl -MFcntl=:flock -e '$^F = 255; open(my $f, ">>", shift @ARGV) or die "board lock: $!\n"; flock($f, LOCK_EX) or die "board lock: $!\n"; exec @ARGV or exit 127' \
                 "$MARK_ROOT/.board.lock" "$BOARD_PYTHON" "$BOARD_TOOLS/run_on_board.py" --port "$BOARD_PORT" \
-                --timeout "$TRIAL_TIMEOUT" --out "build/$stem.sout" "$img.bin" 2> "build/$stem.run.err" &
+                --timeout "$TRIAL_TIMEOUT" ${send[@]+"${send[@]}"} --out "build/$stem.sout" "$img.bin" 2> "build/$stem.run.err" &
             pid=$!
             reg="$MARK_ROOT/.integrate_running/$pid"
             { printf '%s %s\n' "$pid" "$suite/$stem" > "$reg"; } 2>/dev/null

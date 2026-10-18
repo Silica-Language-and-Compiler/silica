@@ -64,6 +64,11 @@ if [ -n "$(SDS_STDLIB_CACHE)" ] && [ -d "$(SDS_STDLIB_CACHE)/lib" ]; then \
 			done; \
 		fi; \
 	done; \
+	for f in silica.atoms silica.shapes; do \
+		src="$(SDS_STDLIB_CACHE)/$$f"; \
+		[ -f "$$src" ] || continue; \
+		if [ -f "$$f" ] && head -c "$$(wc -c < "$$src" | tr -d ' ')" "$$f" | cmp -s - "$$src"; then :; else cp -f "$$src" "$$f"; fi; \
+	done; \
 fi
 endef
 
@@ -91,7 +96,7 @@ endef
 # compiler never re-derives it. Store runs after a successful compile.
 # Set TRIAL_CACHE=0 to force a full recompile.
 TRIAL_CACHE_SH := $(LEAF_DIR)../trial_cache.sh
-TRIAL_CACHE_ENV = MSG_PREFIX="$(MSG_PREFIX)" SILICA_COMPILER="$(SILICA_COMPILER)"
+TRIAL_CACHE_ENV = MSG_PREFIX="$(MSG_PREFIX)" SILICA_COMPILER="$(SILICA_COMPILER)" SDS_STDLIB_CACHE="$(SDS_STDLIB_CACHE)"
 TRIAL_CACHE_RESTORE = $(TRIAL_CACHE_ENV) "$(SHELL)" "$(TRIAL_CACHE_SH)" restore
 TRIAL_CACHE_STORE   = $(TRIAL_CACHE_ENV) "$(SHELL)" "$(TRIAL_CACHE_SH)" store
 
@@ -101,7 +106,7 @@ TRIAL_CACHE_STORE   = $(TRIAL_CACHE_ENV) "$(SHELL)" "$(TRIAL_CACHE_SH)" store
 
 silica.config:
 	@echo "$(MSG_PREFIX)regenerating silica.config..."
-	@cd "$(THIS_DIR)" && { \
+	@cd "$(THIS_DIR)" && $(TRIAL_SUPPORT_LIB) && { \
 		printf '%s\n' $(POSITIVE_SILICA); \
 		if [ -d lib ]; then find lib \( -type f -o -type l \) -name '*.silica' | sort; fi; \
 	} > silica.config
@@ -199,9 +204,18 @@ LEAF_SANDBOX := .sandbox
 LEAF_POST_LIB_HOOK ?= :
 
 # $(call LEAF_SANDBOX_PREPARE,<sandbox dir>,<units to compile>) -- cwd is the leaf.
+# Every sandbox of this leaf starts from the leaf's silica.atoms and silica.shapes: the compiler
+# numbers a unit's atoms by extending that table (atom_table@build_atom_table_extending) and
+# sizes the registries of the runtime module it (re)writes from it (item J). A sandbox that
+# started empty numbered the trial unit against the fixed prefix alone and wrote a runtime
+# with fewer slots than the lib objects' atom indices (type_interner_roundtrip: the lib's
+# :type_surface_cache was atom 28, the sandbox runtime had 27 slots, so the name never
+# registered and parse_type reported failure). The tables only ever grow, so an object
+# compiled under an earlier state of the table keeps valid indices.
 define LEAF_SANDBOX_PREPARE
 sb="$(1)"; rm -rf "$$sb"; mkdir -p "$$sb/.pad"; \
 if [ -d lib ]; then ln -s ../../lib "$$sb/lib"; fi; \
+for f in silica.atoms silica.shapes; do if [ -f "$$f" ]; then cp -f "$$f" "$$sb/$$f"; fi; done; \
 : > "$$sb/silica.config"; n=0; \
 while IFS= read -r f || [ -n "$$f" ]; do \
 	[ -n "$$f" ] || continue; \
@@ -236,9 +250,9 @@ if [ -n "$$pending" ]; then \
 		printf '%d %d\n' 0 1 > .integrate_counts; \
 		exit 1; \
 	fi; \
-	if [ -f "$(LEAF_SANDBOX)/_lib/__silica_runtime.sams" ] && [ ! -f __silica_runtime.sams ]; then \
-		cp -f "$(LEAF_SANDBOX)/_lib/__silica_runtime.sams" __silica_runtime.sams; \
-	fi; \
+	for f in silica.atoms silica.shapes __silica_runtime.sams; do \
+		if [ -f "$(LEAF_SANDBOX)/_lib/$$f" ]; then cp -f "$(LEAF_SANDBOX)/_lib/$$f" "$$f"; fi; \
+	done; \
 	rm -rf "$(LEAF_SANDBOX)/_lib"; \
 	echo "$(MSG_PREFIX)lib units compiled; trials reuse their .o files"; \
 else \
@@ -270,7 +284,8 @@ define LEAF_UNIT_RUN
 b="$(1)"; sb="$(LEAF_SANDBOX)/$$b"; res=.integrate_results; rm -rf "$$sb"; \
 if [ -f "$$b.sams" ] && [ -f "$$b.iface" ]; then \
 	mkdir -p "$$sb"; \
-	if [ -f __silica_runtime.sams ]; then cp -f __silica_runtime.sams "$$sb/__silica_runtime.sams"; fi; \
+	if [ -f "$$b.runtime.sams" ]; then cp -f "$$b.runtime.sams" "$$sb/__silica_runtime.sams"; \
+	elif [ -f __silica_runtime.sams ]; then cp -f __silica_runtime.sams "$$sb/__silica_runtime.sams"; fi; \
 else \
 	$(call LEAF_SANDBOX_PREPARE,$$sb,$$b.silica); \
 	if ( cd "$$sb" && $(RUN_SILICA_COMPILER) ) > "$$sb/compile.log" 2>&1; then :; else \
@@ -294,6 +309,7 @@ else \
 	fi; \
 	mv -f "$$sb/$$b.sams" "$$b.sams"; \
 	if [ -f "$$sb/$$b.iface" ]; then mv -f "$$sb/$$b.iface" "$$b.iface"; fi; \
+	if [ -f "$$sb/__silica_runtime.sams" ]; then cp -f "$$sb/__silica_runtime.sams" "$$b.runtime.sams"; fi; \
 	if [ -f "$$sb/__silica_runtime.sams" ] && [ ! -f __silica_runtime.sams ]; then \
 		cp -f "$$sb/__silica_runtime.sams" "__silica_runtime.sams.$$b" && mv -f "__silica_runtime.sams.$$b" __silica_runtime.sams; \
 	fi; \
@@ -509,7 +525,7 @@ clean:
 		[ -f "$$s" ] || continue; \
 		rm -f "$${s%.sams}"; \
 	done
-	@cd "$(THIS_DIR)" && rm -f *.sams lib/*.sams *.o lib/*.o *.iface lib/*.iface __silica_runtime.o __silica_runtime.sams.* *.checked .integrate_results smoke_harness_ready *.sout silica.config .integrate_counts silica.compile.order silica.needs_runtime silica.atoms silica.link
+	@cd "$(THIS_DIR)" && rm -f *.sams lib/*.sams *.o lib/*.o *.iface lib/*.iface __silica_runtime.o __silica_runtime.sams.* *.checked .integrate_results smoke_harness_ready *.sout silica.config .integrate_counts silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link
 	@cd "$(THIS_DIR)" && rm -rf $(LEAF_SANDBOX)
 	@echo "✅ $(MSG_PREFIX)Clean complete"
 

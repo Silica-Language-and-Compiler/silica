@@ -37,7 +37,7 @@ LDFLAGS_clang := -Wl,-e,main -Wl,-macos_version_min,$(MACOS_MIN_VERSION)
 .PHONY: all clean assembly objects executables integrate help silica.config
 
 silica.config:
-	@cd "$(THIS_DIR)" && find "$$PWD" -type f -name '*.silica' ! -name 'trial_negative_*.silica' | sed "s|^$$PWD/||" > silica.config
+	@cd "$(THIS_DIR)" && find "$$PWD" -type f -name '*.silica' ! -name 'trial_negative_*.silica' | sed "s|^$$PWD/||" | LC_ALL=C sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 all: executables
 
@@ -66,6 +66,7 @@ executables: objects
 		[ "$$base" = "__silica_runtime" ] && continue; \
 		runtime_obj=""; \
 		[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 	if test -x "$(RUST_LLD)"; then \
 			$(RUST_LLD) -flavor darwin -o $$base $$o $$runtime_obj $(LDFLAGS_rust-lld) && echo "  ✅ $(MSG_PREFIX)$$base (rust-lld)"; \
 		else \
@@ -122,12 +123,14 @@ integrate-run:
 		ko=$$((ko + 1)); failed=1; break; \
 	fi; \
 	done; \
+	$(TRIAL_SUPPORT_ASSEMBLE); \
 	for o in *.o; do \
 		[ -f "$$o" ] || continue; \
 		base=$${o%.o}; \
 		[ "$$base" = "__silica_runtime" ] && continue; \
 		runtime_obj=""; \
 		[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 	echo "Linking $$base..."; \
 		if test -x "$(RUST_LLD)"; then \
 			if ! $(RUST_LLD) -flavor darwin -o $$base $$o $$runtime_obj $(LDFLAGS_rust-lld); then \

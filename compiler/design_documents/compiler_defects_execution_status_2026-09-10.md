@@ -1,5 +1,7 @@
 # Execution status: HIGH_PRIORITY compiler defects (2026-09-10, scratch copies)
 
+**Implementation status (2026-10-16):** the scratch work below was accepted into the repository. All Part A items except A2 3b and all Part B items are fixed and pinned by installed `train_defect_*` trials; A3, A9 and A10, listed as open below, are fixed and pass (`actors_addition/train_defect_a3_*`, `_a9_*`, `_a10_*`: `.sout` equals `.scout`). Still open: A2 3b (closure environments; E1067 rejects the returned capturing literal) and the four misleading-diagnostic wordings. The scratch paths, the seed/selfhost patch pair and the "still open" list in this file are the 2026-09-10 record; the seed source tree it mentions no longer exists (the compiler is `compiler/src`, built by the Silica-built seed in `binaries/seed-compiler`).
+
 All work is in scratch copies; the repository is untouched.
 
 | Tree | Path |

@@ -20,6 +20,22 @@ This document specifies how **immutable, Erlang-style lists** (`List[T, S]`) are
 
 ---
 
+## Implementation status (2026-10-16)
+
+The design is implemented for the v1 kernel except `map`, `filter` and `reduce`. Facts that differ from, or refine, the text below:
+
+- **Surface syntax in code.** The space is written with the effect wrapper: `List[int64, mem(normal)]`, `empty[int64, mem(normal)]()`, `length[int64, mem(normal)](xs)`. The shorter `List[int64, normal]` in the examples below is prose shorthand (the tutorials say the same). List values are consumed with the fields `.is_nil`, `.head`, `.tail` in `case`, and `list_at[T, S](xs, i)` (also `list_nth`) reads the i-th element without a `.tail` walk. Compiler-known primitives: `list_nil`, `list_cons` (`prepend`), `list_length`, `list_head`, `list_remove_head`, `list_at`.
+- **Representation (all four backends; Apple Silicon reference in `emitter/apple_silicon_mac/terms/prims/prims_list.silica`, runtime in `rt_list.S` per target).** A list value is a 24-byte handle (`length`, `chunk_ptr`, `cursor`); the empty list is 0. A chunk is `[element slots, filled back to front][next chunk][claim]`, so the allocation is `CDATA + 16` bytes, with `CDATA = max(16, elem_slot_bytes)`. Chunks and handles are allocated with `_silica_rt_region_alloc`. The handle is immutable; chunk slots are written once.
+- **Copy-on-write prepend.** The claim word records the lowest data offset already handed out; a prepend onto a list whose cursor is not the chunk's frontier copies the live part of the chunk into a fresh chunk, so two prepends onto one list no longer overwrite each other (persistence; AArch64, x86-64 and ESP32-S3 runtimes). This replaces the "mutable chunks" wording of the emitter header.
+- **Boxed elements.** Since the uniform boxed record layout, every record field is one word, and list cells of record/tuple/string/list/fn elements hold pointers to a copy made in the region before the prepend; the only inline exceptions are runtime-built records (child-spec lists, `which_children` cells; `element_type_is_runtime_inline_record`).
+- **Cursors and the bundle.** There is no separate cursor set: each `List[T, S]` value is its own handle (head cursor), `.tail` allocates a new 24-byte handle, and a name that ends with its scope releases nothing separately. The unbounded cursor set of section 9.1 and the scope-exit cursor drop of 9.7 are realized by handle values and region lifetime, not by bundle metadata.
+- **Early desugaring.** List operations lower in SIR to prims (`list_*`) that the emitters expand directly; there is no retained `List` IR node beyond that prim set.
+- **Space checking.** The `mem(S)` agreement of 9.8 is enforced by the effect checker (`E3011 ListMemorySpaceMismatch`); allocation of every space comes from the same arena today (see `memory-effects-aarch64-implementation-plan.md` implementation status).
+- **Not implemented.** `map`, `filter`, `reduce` (see `Phase1_TODOs/list_map_filter_reduce_and_hardening_todo.md`) and SIMD-width chunks (`list_chunk_vector_alignment_todo.md`). The standard collections use fold-style modules in `stdlib/data_structures` instead.
+- **Trials.** `trials/list_addition/` now holds 537 `.silica` files (the inventory in section 8 lists the original design trials; later additions include `list_at_*`, the record and tuple element trials and the generated `train_list_*` sets). Tree and trial paths below written as `silica-compiler/...` are `compiler/...` and `trials/...` in the current layout.
+
+---
+
 ## 2. Goals (semantic)
 
 | Goal | Description |
@@ -88,7 +104,7 @@ The **living Apple Silicon emitter** (`emitter/apple_silicon_mac/terms/prims/pri
 | Concern | In this document | In the emitter today |
 |--------|---------------------|----------------------|
 | **Chunk data bytes** \(**`CDATA`**\) | Vector width × packing rules (**§4.1**, **§4.2**) | **`CDATA = max(16, elem_slot_bytes)`**, where **`elem_slot_bytes`** is derived from **`T`** only (**`chunk_elem_slot_bytes`** / **`chunk_data_bytes`**). **`16`** matches **Neon’s 128-bit lane bundle** commonly used as a “minimum vector slab,” but **is not derived from ISA / `-mcpu` / feature-matrix selection** (**fixed constant today**). |
-| **Full chunk allocation** | **Chunk buffer** + linkage | **`CDATA`** bytes for **filled-back-to-front** slots (**§9.5**) plus **`8`** bytes for **`next`**; see file header comments in **`prims_list.silica`**. |
+| **Full chunk allocation** | **Chunk buffer** + linkage | **`CDATA`** bytes for **filled-back-to-front** slots (**§9.5**) plus **`8`** bytes for **`next`** and **`8`** bytes for the copy-on-write **claim** word; see file header comments in **`prims_list.silica`**. |
 | **Codegen** | **§9.5** fixed layout should **admit** eventual **vector loads/stores** | **Scalar** **`LDR`/`STR`** (and width variants); **no** Neon **`LD*`** list fast paths yet. |
 
 So: **documentation** states **SIMD-motivated sizing and packing** as the **target** behavior; **`silica-compiler`** currently uses a **fixed 128-bit-style minimum slab** (**16 bytes**) plus **scalar** helpers. Closing the gap (**256-bit slabs**, ISA-selected **`CDATA`**, **SIMD emits**, allocator **alignment**) is tracked in **[list_chunk_vector_alignment_todo.md](list_chunk_vector_alignment_todo.md)**.
@@ -252,3 +268,4 @@ The following **§9** sections record **agreed** decisions for **list** **implem
 | 1.13 | §3.5 `List[T, S]` and explicit memory space; §9.8 effect checker alignment; §7/§9.7 updated; `memory_region_addition` trial headers cross-reference; optional `with mem(S)` on functions. |
 | 1.14 | §3/§8: uniform list types—parameters, variables, literals, patterns must match; cross-ref silica-specification §4.2.4; trials use consistent `List[T, S]`. |
 | 1.15 | §4.5 emitter alignment vs §2/§4.1 vector-chunk wording; §8 trial wording for multi-chunk `uint32`; cross-ref **list_chunk_vector_alignment_todo.md**. |
+| 1.16 | Implementation status (2026-10-16): `mem(S)` syntax in code, handle and chunk layout with claim word, copy-on-write prepend, boxed elements, map/filter/reduce not implemented. |

@@ -20,7 +20,7 @@
 // concatenates these in the same order as the AArch64 original; every chunk starts at a section
 // boundary (chunk 9 .rodata, 10 .bss, 11 .text, 12 .rodata, 13 .text), so no routine straddles into
 // or out of this module. All data layouts, control-block offsets and constants are those documented
-// in prims_actors_runtime_asm.silica (ACB 512 B, 152 B message nodes, mailbox pairs at #128/#136 and
+// in prims_actors_runtime_asm.silica (ACB 408 B, item I, 152 B message nodes, mailbox pairs at #128/#136 and
 // #232/#240 with the u32 depth at #248, arena fields #160..#184, region list cells [next][size]).
 //
 // Register model (shared by the linux_x86_64 runtime modules): X0..X7 -> rdi rsi rdx rcx r8 r9 r14 r15,
@@ -694,11 +694,81 @@ fn actor_rt_asm_chunk_12() -> string {
 L_silica_root_actor_exit:
 	.asciz	\"[silica] root actor exited (no supervisor)\\n\"
 	.text
+# The root-exit note. Written under silica_rt_root_note_lock; the exit drain
+# (silica_rt_report_drain_at_exit) takes that lock last and keeps it, so the process never ends
+# while a note is half written (a torn \"[s\" glued to the next output through a PTY).
+	.globl	silica_rt_root_note_write
+	.p2align	2
+silica_rt_root_note_write:
+	push	rbp
+	mov	rbp, rsp
+	lea	rdi, [rip + silica_rt_root_note_lock]
+	call	silica_rt_lock_lock
+	mov	edi, 2
+	lea	rsi, [rip + L_silica_root_actor_exit]
+	mov	edx, 43
+	call	write
+	lea	rdi, [rip + silica_rt_root_note_lock]
+	call	silica_rt_lock_unlock
+	pop	rbp
+	ret
+# X0 (rdi) out: 1 when a FailureReporter is registered and the note has been written now, 0 when
+# the caller writes it after the report as before. With a reporter the report is printed on the
+# reporter's thread, which may call cast_exit on it, so the note must be out before the report is
+# queued; without one the report is written synchronously and the note follows it.
+	.globl	silica_rt_root_note_early
+	.p2align	2
+silica_rt_root_note_early:
+	push	rbp
+	mov	rbp, rsp
+	xor	edi, edi
+	cmp	QWORD PTR [rip + silica_rt_root_failure_reporter], 0
+	je	Lrne_ret
+	call	silica_rt_root_note_write
+	mov	edi, 1
+Lrne_ret:
+	pop	rbp
+	ret
+# X0 (rdi) = a root actor's (or root supervisor's) control block: its failure report and the root
+# note, in the order silica_rt_root_note_early gives.
+	.globl	silica_rt_root_report_and_note
+	.p2align	2
+silica_rt_root_report_and_note:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	lock inc	QWORD PTR [rip + silica_rt_report_inflight]
+	call	silica_rt_root_note_early
+	mov	QWORD PTR [rbp - 16], rdi
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_deliver_unwind_report
+	cmp	QWORD PTR [rbp - 16], 0
+	jne	Lrrn_ret
+	call	silica_rt_root_note_write
+Lrrn_ret:
+	leave
+	ret
+	.bss
+	.p2align	2
+.globl	silica_rt_root_note_lock
+.comm	silica_rt_root_note_lock,4,4
+	.text
 	.globl	silica_rt_migrate_actor
 	.p2align	2
 # -- Begin function silica_rt_migrate_actor
 silica_rt_migrate_actor:
-# rdi=actor_ref rsi=target_core; sets thread affinity to target core
+# rdi = reference: resolved and held for the body below (silica_rt_ref_call).
+	lea	r10, [rip + silica_rt_migrate_actor_acb]
+	jmp	silica_rt_ref_call
+	.p2align	2
+silica_rt_migrate_actor_acb:
+# rdi=actor_ref rsi=target_core -> rdi = 0 (:ok) or 2 (:actor_not_found, a null reference); the emitter
+# maps the code to the program's atom (prims_actors emit_prim_op_with_atoms). Hosted pinning is the
+# thread's affinity hint; the OS may still share or move the thread (spec §22.10), so the hint's own
+# result is not reported.
+	test	rdi, rdi
+	jz	Lmig_not_found
 # frame: [rbp-8] target core (X19), [rbp-16] thread (X20); [rsp] the 4-byte policy tag
 	push	rbp
 	mov	rbp, rsp
@@ -714,30 +784,11 @@ silica_rt_migrate_actor:
 	mov	rdx, rsp
 	mov	ecx, 1
 	call	silica_rt_thread_policy_set
+	xor	edi, edi
 	leave
 	ret
-# -- End function
-	.globl	silica_rt_move_actor
-	.p2align	2
-# -- Begin function silica_rt_move_actor
-silica_rt_move_actor:
-# rdi=actor_ref rsi=from_core rdx=to_core; migrate actor to target core
-# frame: [rbp-8] target core (X19), [rbp-16] thread (X20); [rsp] the 4-byte policy tag
-	push	rbp
-	mov	rbp, rsp
-	sub	rsp, 96
-	mov	QWORD PTR [rbp - 8], rdx
-	mov	rdi, QWORD PTR [rdi + 144]
-	call	silica_rt_pthread_mach_thread_np
-	mov	QWORD PTR [rbp - 16], rdi
-	mov	eax, DWORD PTR [rbp - 8]
-	mov	DWORD PTR [rsp], eax
-	mov	rdi, QWORD PTR [rbp - 16]
-	mov	esi, 4
-	mov	rdx, rsp
-	mov	ecx, 1
-	call	silica_rt_thread_policy_set
-	leave
+Lmig_not_found:
+	mov	edi, 2
 	ret
 # -- End function
 "
@@ -972,6 +1023,11 @@ Lrrt_done:
 	.p2align	2
 # Phase B: synthetic exit / trial hook; bounded queue
 silica_rt_actor_supervision_ingress_enqueue:
+# rdi = reference: resolved and held for the body below (silica_rt_ref_call).
+	lea	r10, [rip + silica_rt_actor_supervision_ingress_enqueue_acb]
+	jmp	silica_rt_ref_call
+	.p2align	2
+silica_rt_actor_supervision_ingress_enqueue_acb:
 # rdi=target actor_ref, rsi=int64 payload -> rdi=:ok (0). Cast-shaped 152 B node; +8 = inline int64; +24 = 1 (trial; not heap payload).
 # frame: [rbp-8] actor (X19), [rbp-16] node (X20), [rbp-24] payload (X21)
 	push	rbp
@@ -983,8 +1039,9 @@ silica_rt_actor_supervision_ingress_enqueue:
 	jz	Lsie_fail_nolock
 	add	rdi, 16
 	call	silica_rt_lock_lock
-	mov	rax, QWORD PTR [rbp - 8]
-	mov	r10d, DWORD PTR [rax + 248]
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_sb_require
+	mov	r10d, DWORD PTR [rdi + 16]
 	cmp	r10d, 1024
 	jae	Lsie_abort
 	mov	edi, 1
@@ -998,13 +1055,14 @@ silica_rt_actor_supervision_ingress_enqueue:
 	mov	DWORD PTR [rax + 16], 0
 	mov	DWORD PTR [rax + 24], 1
 	mov	rdi, QWORD PTR [rbp - 8]
-	add	rdi, 232
+	mov	rdi, QWORD PTR [rdi + 216]
 	mov	rsi, rax
 	call	silica_rt_q_enqueue_locked
 	mov	rax, QWORD PTR [rbp - 8]
-	mov	r10d, DWORD PTR [rax + 248]
+	mov	rcx, QWORD PTR [rax + 216]
+	mov	r10d, DWORD PTR [rcx + 16]
 	add	r10d, 1
-	mov	DWORD PTR [rax + 248], r10d
+	mov	DWORD PTR [rcx + 16], r10d
 	lea	rdi, [rax + 80]
 	call	silica_rt_cv_signal
 	mov	rdi, QWORD PTR [rbp - 8]
@@ -1024,6 +1082,32 @@ Lsie_fail_nolock:
 Lsie_abort:
 	call	silica_rt_abort_ingress_full
 # -- End function
+	.globl	silica_rt_sb_require
+	.p2align	2
+silica_rt_sb_require:
+# rdi = ACB -> rdi = its supervision block (SB, 112 B: +0/+8 ingress front/rear, +16 depth u32,
+# +24 child-table head, +32 len, +40 sync_failure_reported, +48 start trampoline, +56 strategy,
+# +64 allowed restarts, +72 time frame, +80 restart count, +88 window start, +96 children counted in a replacement wait, +104 tearing down: sup_wait_enter, +112 references: sb_unref), made now when the
+# actor had none: by spawn for an actor with a trampoline, by the ingress enqueue for any other
+# actor that receives an exit notice (an add_child parent; the caller holds the target's lock),
+# by the child-table paths for the running actor. Freed by its last reference (sb_unref).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rdi, QWORD PTR [rdi + 216]
+	test	rdi, rdi
+	jnz	Lsbr_have
+	mov	edi, 1
+	mov	esi, 120
+	call	calloc
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rdi + 216], rax
+	mov	rdi, rax
+	mov	QWORD PTR [rdi + 112], 1
+Lsbr_have:
+	leave
+	ret
 	.globl	silica_rt_actor_recv
 	.p2align	2
 # Phase B/C/G: ingress then standard; spec 15.4.8.6 DOWN only on standard
@@ -1040,16 +1124,32 @@ silica_rt_actor_recv:
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	rdi, QWORD PTR [rbp - 8]
-	add	rdi, 232
+	mov	rdi, QWORD PTR [rdi + 216]
+	mov	QWORD PTR [rbp - 16], 0
+	test	rdi, rdi
+	jz	Lrecv_try_std
 	call	silica_rt_q_dequeue_locked
 	mov	QWORD PTR [rbp - 16], rdi
 	test	rdi, rdi
 	jz	Lrecv_try_std
 	mov	rax, QWORD PTR [rbp - 8]
-	mov	r10d, DWORD PTR [rax + 248]
+	mov	rax, QWORD PTR [rax + 216]
+	mov	r10d, DWORD PTR [rax + 16]
 	sub	r10d, 1
-	mov	DWORD PTR [rax + 248], r10d
-	jmp	Lrecv_unlock_node
+	mov	DWORD PTR [rax + 16], r10d
+# An exit notice handed to the program keeps no hold on the ended actor.
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rax, QWORD PTR [rbp - 16]
+	cmp	DWORD PTR [rax + 24], 0
+	jne	Lrecv_ret_node
+	mov	rax, QWORD PTR [rax + 8]
+	test	rax, rax
+	jz	Lrecv_ret_node
+	mov	rdi, QWORD PTR [rax]
+	call	silica_rt_acb_release
+	jmp	Lrecv_ret_node
 Lrecv_try_std:
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 128
@@ -1059,6 +1159,7 @@ Lrecv_unlock_node:
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
+Lrecv_ret_node:
 	mov	rdi, QWORD PTR [rbp - 16]
 	leave
 	ret
@@ -1071,7 +1172,29 @@ Lrecv_done_null:
 	.p2align	2
 # Explicit supervisor child registration
 silica_rt_actor_add_child:
-# rdi=parent supervisor actor_ref, rsi=child actor_ref -> rdi=atom :ok.
+# rdi = parent reference, rsi = child reference: both held for the body.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 24], rsi
+	call	silica_rt_ref_hold
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_ref_hold
+	mov	QWORD PTR [rbp - 16], rdi
+	mov	rsi, rdi
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_add_child_acb
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_acb_release
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_acb_release
+	xor	edi, edi
+	leave
+	ret
+	.p2align	2
+silica_rt_actor_add_child_acb:
+# rdi=parent supervisor ACB, rsi=child ACB (either may be 0) -> rdi=atom :ok.
 # Records the explicit parent/child relationship used by supervisor ingress teardown.
 # frame: [rbp-8] parent (X19), [rbp-16] child (X20)
 	test	rdi, rdi
@@ -1083,14 +1206,20 @@ silica_rt_actor_add_child:
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rbp - 16], rsi
-	mov	QWORD PTR [rsi + 192], rdi
+	cmp	QWORD PTR [rsi + 192], rdi
+	je	Ladd_child_held
+# The child holds its supervisor until its exit path is done with it (silica_rt_actor_final_release).
+	lock add	QWORD PTR [rdi + 392], 1
+	mov	rax, rdi
+	xchg	QWORD PTR [rsi + 192], rax
+	mov	rdi, rax
+	call	silica_rt_acb_release
+Ladd_child_held:
+	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	rcx, QWORD PTR [rbp - 16]
-	mov	rdx, QWORD PTR [rax + 216]
-	mov	QWORD PTR [rcx + 224], rdx
-	mov	QWORD PTR [rax + 216], rcx
 	lea	rdi, [rax + 16]
 	call	silica_rt_lock_unlock
 	leave
@@ -1102,7 +1231,7 @@ Ladd_child_done:
 	.p2align	2
 # Phase G: spec 15.4.8.4-8.5
 silica_rt_actor_link:
-# rdi=target actor_ref -> rdi=atom :ok (index 0). Idempotent link; dead target must enqueue exit (ingress if supervisor) -- stub.
+# rdi=target actor_ref -> rdi=0; the emitter answers :ok (prims_actors emit_prim_op_with_atoms). Idempotent link; dead target must enqueue exit (ingress if supervisor) -- stub.
 	xor	edi, edi
 	ret
 # -- End function
@@ -1117,7 +1246,7 @@ silica_rt_actor_monitor:
 	.p2align	2
 # Phase G: spec 15.4.8.6-8.7
 silica_rt_actor_demonitor:
-# rdi=monitor_ref -> rdi=atom :ok
+# rdi=monitor_ref -> rdi=0; the emitter answers :ok
 	xor	edi, edi
 	ret
 # -- End function

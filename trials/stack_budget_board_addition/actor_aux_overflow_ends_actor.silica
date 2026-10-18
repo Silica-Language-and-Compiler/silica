@@ -1,0 +1,108 @@
+// Board stacks (actor_memory_budget_plan.md item F, §8.2): every reservation emitted code makes on
+// the auxiliary stack (the emitter's SP: values staged while a nested call's arguments are
+// evaluated, argument slabs) is compared with the current chunk's limit; below it the auxiliary
+// stack grows by a chunk, so a slab larger than the 64-byte guard band cannot pass the band unseen
+// and a deep nesting never fails for want of auxiliary stack. Under a lowered reservation the
+// growth stops at the reservation: a nested expression stages 176 bytes per level of nesting in
+// one frame; one level fits the first auxiliary chunk of an explicit 2 KB reservation (whose first
+// chunks fill it), eight levels cannot grow past it, and the actor ends with (:explicit, :stack_exhausted) -- from the auxiliary side,
+// since its machine stack is nowhere near its own share; a fresh actor still answers.
+// Spec §16.1.1: a call to an actor that ends before replying raises actor_not_found in the caller.
+// main therefore sends the deep message through a relay actor: the relay calls w, w ends, and the
+// call raises actor_not_found in the relay, which fails the same way (reason_tag 4). main only
+// casts to the relay, prints `done` and waits in wait_for_exit for the `exit` line.
+// Expected (compared as a multiset: the reports are asynchronous):
+//   17
+//   <the failure report of the actor, #0 beh, reason_tag 4>
+//   <the failure report of the relay, #0 relay, reason_tag 4>
+//   17
+//   done
+//   0
+
+fn same(x: int64) -> int64 { x + 0 }
+
+fn add6(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64) -> int64 { a + b + c + d + e + f }
+
+fn shallow(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64) -> int64 {
+    add6(same(a), same(b), same(c), same(d), same(e), same(f))
+}
+
+fn deep(a: int64, b: int64, c: int64, d: int64, e: int64, f: int64) -> int64 {
+    add6(same(a), same(b), same(c), same(d), same(e), add6(same(a), same(b), same(c), same(d), same(e), add6(same(a), same(b), same(c), same(d), same(e), add6(same(a), same(b), same(c), same(d), same(e), add6(same(a), same(b), same(c), same(d), same(e), add6(same(a), same(b), same(c), same(d), same(e), add6(same(a), same(b), same(c), same(d), same(e), add6(same(a), same(b), same(c), same(d), same(e), same(f)))))))))
+}
+
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- case msg == 1 of {
+        true -> shallow(2, 3, 4, 5, 1, 2);
+        false -> deep(2, 3, 4, 5, 1, 2)
+    };
+    (:reply, r, state)
+}
+
+// The relay calls w with its message; w ends before replying, so the call raises actor_not_found
+// here (spec §16.1.1) and the relay fails with reason_tag 4.
+fn relay(msg: int64, state: actor_ref) -> (:no_reply, actor_ref) {
+    sequence proc[concurrency]
+        _: int64 <- call(state, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        w: actor_ref <- spawn(0, beh, stack_policy(2048, :keep_last_message));
+        small: int64 <- call(w, 1 impl ActorMessage {});
+        print_int64(small);
+        println("");
+        q: actor_ref <- spawn(w, relay, stack_policy(0, :keep_last_message));
+        _: boolean <- cast(q, 2 impl ActorMessage {});
+        other: actor_ref <- spawn(0, beh, stack_policy(2048, :keep_last_message));
+        still: int64 <- call(other, 1 impl ActorMessage {});
+        print_int64(still);
+        println("");
+        println("done");
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

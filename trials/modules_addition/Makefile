@@ -24,7 +24,7 @@ LDFLAGS_clang := -Wl,-e,main -Wl,-macos_version_min,$(MACOS_MIN_VERSION)
 .PHONY: all integrate clean help silica.config
 
 silica.config:
-	@cd "$(THIS_DIR)" && find "$$PWD" -type f -name '*.silica' | sed "s|^$$PWD/||" > silica.config
+	@cd "$(THIS_DIR)" && find "$$PWD" -type f -name '*.silica' | sed "s|^$$PWD/||" | LC_ALL=C sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 .DEFAULT_GOAL := all
 
@@ -45,7 +45,7 @@ integrate-run:
 	@$(MAKE) -f "$(THIS_DIR)Makefile" all
 	@cd "$(THIS_DIR)" && \
 	rm -f .integrate_counts; ok=0; ko=0; failed=0; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^lib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^lib/'); do \
 		base=$${line%.silica}; \
 		sams="$$base.sams"; \
 		if [ ! -f "$$sams" ]; then \
@@ -69,7 +69,7 @@ integrate-run:
 			ok=$$((ok + 1)); \
 		fi; \
 	done; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^lib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^lib/'); do \
 		base=$${line%.silica}; \
 		sams="$$base.sams"; \
 		[ -f "$$sams" ] || continue; \
@@ -99,7 +99,7 @@ integrate-run:
 		ko=$$((ko + 1)); failed=1; break; \
 	fi; \
 	done; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^lib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^lib/'); do \
 		base=$${line%.silica}; \
 		[ -f "$$base.o" ] || continue; \
 		echo "Linking $$base..."; \
@@ -107,8 +107,10 @@ integrate-run:
 		for lib_obj in lib/*.o; do \
 			[ -f "$$lib_obj" ] && lib_objs="$$lib_objs $$lib_obj"; \
 		done; \
+		[ -n "$$tsa_done" ] || { $(TRIAL_SUPPORT_ASSEMBLE); tsa_done=1; }; \
 		runtime_obj=""; \
 		[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 						if ! $(RUST_LLD) -flavor darwin -o "$$base" "$$base.o" $$lib_objs $$runtime_obj $(LDFLAGS_rust-lld); then \
 				echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
@@ -123,7 +125,7 @@ integrate-run:
 		fi; \
 		fi; \
 	done; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^lib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^lib/'); do \
 		base=$${line%.silica}; \
 		if [ ! -x "$$base" ]; then \
 			echo "❌❌ $(MSG_PREFIX)$$base missing executable (assemble/link failed earlier)"; \
@@ -161,7 +163,7 @@ integrate-run:
 clean:
 	@cd "$(THIS_DIR)" && \
 	rm -f *.sout lib/*.sams lib/*.o *.iface *.sams __silica_runtime.o && \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^lib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^lib/'); do \
 		base=$${line%.silica}; \
 		rm -f "$$base" "$$base.o"; \
 	done && \

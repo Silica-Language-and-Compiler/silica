@@ -22,7 +22,7 @@ silica.config:
 		echo "../../../compiler/src/emitter/ESP32-S3_raw/board/pack/device_esp32s3_uart_registers.silica"; \
 		echo "device_uart_lib.silica"; \
 		echo "device_cast_registered.silica"; \
-	} > silica.config
+	} > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 check: silica.config
 	@cd "$(THIS_DIR)" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(COMPILER)); } > $(MAIN).cur_fail 2>&1 || true

@@ -2,6 +2,14 @@
 
 This document describes what remains to be done to make Silica's region-based memory model memory-safe as specified. The specification (../silica-specification.md §12) defines comprehensive safety guarantees; the current implementation provides only partial support.
 
+**Implementation status (2026-10-16).** The plan below is the 2025-2026 gap list. The chunk-4 design
+([region_memory_safety_design.md](../region_memory_safety_design.md), ROADMAP chunk 4) supersedes it for everything
+not yet built: static lifetime analysis beyond Phase A (§2.1), region isolation (§2.3), ownership-based release and
+the use-after-free hazards (§2.4), and atomic references (§2.5) are all still open, and none of the design's
+error codes (E2300 to E2320) or `drop` nodes exists in the compiler. One item is done: buffer bounds checking
+(§2.2), emitted on all four targets since 2026-09-19. File paths below are relative to `compiler/src`, and the
+emitter files exist once per target, as `emitter/<target>/terms/prims/prims_memory.silica`.
+
 ## Related Documents
 
 | Document | Purpose |
@@ -31,7 +39,7 @@ In many other languages, **arena** names an allocator *pattern*, not a full type
 | Memory space validation | Same | ✓ Validates `normal`, `normal_writeback`, `normal_writethrough`, `normal_noncacheable`, `atomic`, `device` |
 | Effect tracking for region ops | `effect_checker/effect_checker_memory_regions.silica` | ✓ Requires `mem(Space)` for `alloc_region`, `alloc_ref`, `read_ref`, `write_ref`, etc. |
 | SIR prim generation | `sir_generator/terms/memory_region_calls.silica` | ✓ Maps current region built-ins to SIR prim terms; `alloc_atomic` is not implemented as a SIR prim |
-| Code emission | `emitter/terms/prims/prims_memory.silica` | ✓ Emits AArch64 for alloc/read/write (heap bump; see §1.2); atomic-space refs still lower through ordinary memory prims |
+| Code emission | `emitter/<target>/terms/prims/prims_memory.silica` (four targets) | ✓ Emits alloc/read/write (heap bump; see §1.2) and the buffer bounds check (§2.2); atomic-space refs still lower through ordinary memory prims |
 
 ### 1.2 Current Allocation Strategy
 
@@ -50,11 +58,11 @@ Terminology: [memory region vs arena](#terminology-memory-region-vs-arena) (abov
 
 **Specification**: §12.1.4 Static Region Lifetime Analysis
 
-**Status**: ⚠️ Phase A implemented; Phases B and C pending
+**Status**: ⚠️ Phase A implemented; Phases B and C pending (checked 2026-10-16: `check_sequence_return_lifetime` in `type_checker_memory_regions.silica` is still the only lifetime rule; design in [region_memory_safety_design.md](../region_memory_safety_design.md) §4, §5)
 
 **Phase A (implemented)**: Single-scope lifetime analysis in `type_checker_memory_regions.silica`:
 - When a sequence returns, any `ref(L,...)`, `buf(L,...)` (including `ref(L, atomic, ...)` for atomic space), or legacy `atomic_ref(L,...)` in the return type must have `region(L,...)` in the return type (scope exit rule).
-- Error E2100: "reference outlives region" when returning references without the region.
+- Error E2100: "reference outlives region" when returning references without the region. (E2100 is also emitted by `ffi/ffi_taint_checker.silica` for external-danger taint, the only meaning `error_codes.md` registers; the design's §10 moves the region meaning.)
 
 **Phases B and C (not yet implemented)**: Must be implemented after functions are fully supported:
 - **Phase B**: Nested scopes — extend L and ScopDep across nested blocks and sequences.
@@ -90,29 +98,11 @@ Terminology: [memory region vs arena](#terminology-memory-region-vs-arena) (abov
 
 **Specification**: §12.3.3 Bounds Checking, §14.4.1 Bounds Checking
 
-**Status**: ❌ Not implemented
+**Status**: ✓ Implemented 2026-09-19 on all four targets (the entry below is kept as the record of what was required)
 
-**Current behavior**: `buf_load` and `buf_store` emit raw `LDR`/`STR` with no index validation:
+**As built**: `alloc_buf` stores the element count in the word below element 0 and rejects a negative count or a byte-size overflow (`L_buf_invalid`, runtime abort `invalid buffer size`). Every `buf_store` and `buf_load` compares the index against that count (`emit_buf_bounds_check` in `prims_memory.silica`: `LDR X17, [X1, #-8]; CMP X2, X17; B.HS L_buf_bounds`) and branches to `L_buf_bounds`, which ends the process with the runtime abort `buffer index out of bounds`, status 71 ([runtime_failure_reporting.md](../runtime_failure_reporting.md) §4). Trials: `memory_region_addition/buf_write_out_of_bounds_aborts` and `buf_read_out_of_bounds_aborts`.
 
-```silica
-// Current: prims_memory.silica
-fn emit_buf_load(dest: string) -> string {
-    concat("    LDR ", dest, ", [X1, X2, LSL #3]")  // No bounds check!
-}
-```
-
-**Required**: Before every `buf_load` and `buf_store`:
-
-1. Emit a bounds check: compare index against buffer size (N from `buf(R, Space, T, N)`)
-2. On out-of-bounds: raise runtime error (e.g., `BoundsError`) or trap
-
-**Implementation options**:
-
-- **Option A**: Emit `CMP X2, N` + conditional branch to error handler before each load/store
-- **Option B**: Use a runtime helper that validates and traps
-- **Option C**: When MTE is available, rely on hardware (see spec §21.3); otherwise software bounds check
-
-**Note**: The buffer size N must be available at code generation time (it is in the type `buf(R, Space, T, N)`). The SIR/emitter must propagate this to the prim emission.
+**Not done**: the check uses the run-time count, not the `N` of `buf(R, Space, T, N)`, so the size passed to `alloc_buf` is never compared with `N` (design §1.1). The spec says an out-of-bounds access is a trap; the process-wide abort, even inside an actor, against "crash to the supervisor" is open decision Q9 in the design (§1.5, S5).
 
 ---
 
@@ -193,7 +183,7 @@ The spec describes "implicit deallocation when r goes out of scope" — the impl
 
 Recommended order of work:
 
-1. **Buffer bounds checking** (§2.2) — Relatively localized; prevents buffer overflows immediately.
+1. **Buffer bounds checking** (§2.2) — done 2026-09-19.
 2. **Region isolation enforcement** (§2.3) — Extends existing type checker; prevents obvious misuse.
 3. **Static region lifetime analysis** (§2.1) — Core safety; blocks use-after-free. Depends on build-plan Phase 6.
 4. **Allocation strategy** (§2.4) — May follow from lifetime analysis; consider heap-based regions if stack proves insufficient.
@@ -207,7 +197,7 @@ When implementation is complete, the following should hold:
 
 - [ ] No program can return a reference whose region does not outlive the call (lifetime analysis)
 - [ ] No program can use a reference after its region has been deallocated (lifetime analysis)
-- [ ] No `buf_load` or `buf_store` executes without a prior bounds check (bounds checking)
+- [x] No `buf_load` or `buf_store` executes without a prior bounds check (bounds checking; 2026-09-19, against the buffer's run-time count)
 - [ ] No `ref(R1, ...)` is used with `region(R2, ...)` when R1 ≠ R2 (region isolation)
 - [ ] Cross-module region usage is validated (cross-module lifetime tracking)
 - [ ] `alloc_atomic` is implemented end to end or removed from the specification until it is implemented
@@ -223,3 +213,4 @@ When implementation is complete, the following should hold:
 | 1.0 | 2025-03-10 | Initial document; gaps identified from implementation analysis |
 | 1.1 | 2026-03-27 | Terminology: memory region vs arena; §1.2/§2.4 aligned with heap bump emitter |
 | 1.2 | 2026-05-26 | Moved into `Phase1_TODOs`; aligned atomic status with source-code audit |
+| 1.3 | 2026-10-16 | Status block: superseded by the chunk-4 design; bounds checking (§2.2) marked implemented; paths made per-target |

@@ -35,7 +35,7 @@ silica.config:
 		for f in *.silica; do \
 			[ -f "$$f" ] && printf '%s\n' "$$f"; \
 		done; \
-	} | LC_ALL=C sort > silica.config
+	} | LC_ALL=C sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 all: executables
 
@@ -60,13 +60,16 @@ executables: objects
 	@cd "$(THIS_DIR)" && \
 	while read -r ln; do \
 		[ -n "$$ln" ] || continue; \
+		case "$$ln" in .trial_stdlib/*) continue ;; esac; \
 		bn=$$(basename "$$ln"); \
 		stem=$${bn%.silica}; \
 		main_o="$$stem.o"; \
 		[ -f "$$main_o" ] || continue; \
 		[ "$$stem" = "__silica_runtime" ] && continue; \
+		[ -n "$$tsa_done" ] || { $(TRIAL_SUPPORT_ASSEMBLE); tsa_done=1; }; \
 		rt_one=""; \
 		[ -f "__silica_runtime.o" ] && rt_one="__silica_runtime.o"; \
+		rt_one="$$rt_one $(call TRIAL_SUPPORT_OBJ,$$stem.silica)"; \
 		echo "Linking $$stem..."; \
 		if test -x "$(RUST_LLD)"; then \
 			$(RUST_LLD) -flavor darwin -o $$stem $$main_o $$rt_one $(LDFLAGS_rust-lld) && echo "  ✅ $(MSG_PREFIX)$$stem (rust-lld)"; \
@@ -76,6 +79,8 @@ executables: objects
 	done < silica.config
 
 # integrate: compile, diff .sams vs .ascomp, run, diff .sout vs .scout
+# A trial marked <stem>.scout.multiset is compared with compare_scout_multiset.sh (../compare_scout_unordered.sh) instead of diff -Bw:
+# its failure reports and root-exit notes are printed asynchronously, so their order is not defined.
 integrate-run:
 	@$(MAKE) -f "$(THIS_DIR)Makefile" clean
 	@$(MAKE) -f "$(THIS_DIR)Makefile" silica.config
@@ -126,13 +131,16 @@ integrate-run:
 	done; \
 	while read -r ln; do \
 		[ -n "$$ln" ] || continue; \
+		case "$$ln" in .trial_stdlib/*) continue ;; esac; \
 		bn=$$(basename "$$ln"); \
 		stem=$${bn%.silica}; \
 		main_o="$$stem.o"; \
 		[ -f "$$main_o" ] || continue; \
 		[ "$$stem" = "__silica_runtime" ] && continue; \
+		[ -n "$$tsa_done" ] || { $(TRIAL_SUPPORT_ASSEMBLE); tsa_done=1; }; \
 		rt_one=""; \
 		[ -f "__silica_runtime.o" ] && rt_one="__silica_runtime.o"; \
+		rt_one="$$rt_one $(call TRIAL_SUPPORT_OBJ,$$stem.silica)"; \
 		echo "Linking $$stem..."; \
 		if test -x "$(RUST_LLD)"; then \
 						if ! $(RUST_LLD) -flavor darwin -o $$stem $$main_o $$rt_one $(LDFLAGS_rust-lld); then \
@@ -150,6 +158,7 @@ integrate-run:
 	done < silica.config; \
 	while read -r ln; do \
 		[ -n "$$ln" ] || continue; \
+		case "$$ln" in .trial_stdlib/*) continue ;; esac; \
 		bn=$$(basename "$$ln"); \
 		stem=$${bn%.silica}; \
 		[ "$$stem" = "__silica_runtime" ] && continue; \
@@ -159,11 +168,12 @@ integrate-run:
 			ko=$$((ko + 1)); failed=1; continue; \
 		fi; \
 		if [ -f "$$stem.scout" ]; then \
-			{ printf 'exit\n' | ./$$stem 2>&1; echo $$?; } > "$$stem.sout"; \
-			if ! diff -Bw -q "$$stem.sout" "$$stem.scout" > /dev/null 2>&1; then \
+			{ { grep -q '^use trial_support_' "$$stem.silica" || [ -f "$$stem.no_stdin_exit" ] || printf 'exit\n'; } | ./$$stem 2>&1; echo $$?; } > "$$stem.sout"; \
+			if [ -f "$$stem.scout.multiset" ]; then set -- bash "$(THIS_DIR)compare_scout_multiset.sh"; else set -- diff -Bw; fi; \
+			if ! "$$@" "$$stem.sout" "$$stem.scout" > /dev/null 2>&1; then \
 				echo "❌❌ $(MSG_PREFIX)$$stem .sout differs from .scout"; \
 				$(INTEGRATE_DOT_FAIL); \
-				diff -Bw "$$stem.sout" "$$stem.scout" || true; \
+				"$$@" "$$stem.sout" "$$stem.scout" || true; \
 				ko=$$((ko + 1)); failed=1; \
 			else \
 				echo "✅✅ $(MSG_PREFIX)$$stem output matches .scout"; \

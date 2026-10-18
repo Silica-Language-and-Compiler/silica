@@ -1,0 +1,96 @@
+// A FailureReporter (spec §15.4.13.4) that keeps every report it is given and sends each one on to
+// a logger actor that keeps it too. The runtime frees a report string once handle_report returns,
+// unless the reporter kept it in its state or sent it on; a report freed while it is still kept is
+// read back damaged when the next report arrives.
+//
+// The failing actor is a root worker: the reporter spawns it and casts it 0, and it dies dividing
+// 42 by 0. Its unwind report goes to the reporter, which
+//   - checks that the report it kept from last time is intact (it still holds the report's last
+//     line and the failing behaviour's name), and keeps the new one in its state;
+//   - sends the new report, with its own count of damaged reports, to the logger registered as
+//     :kick, which makes the same check on the report it kept and keeps the new one;
+//   - starts the next worker, up to 300.
+// No worker has a supervisor, so no restart limit is involved. At the 300th report the logger
+// prints the number of damaged reports the two actors saw and ends the program with status 0.
+// The logger's name, :kick, is an atom this suite already numbers ahead of this trial; a new atom
+// would renumber the atom tables of the trials compiled after it.
+// Expected output:
+//   0
+//   0
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn divide_beh(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, 42 / msg)
+}
+
+fn next_worker() -> boolean {
+    sequence proc[concurrency]
+        w: actor_ref <- spawn(0, divide_beh, stack_policy(0, :keep_last_message));
+        sent: boolean <- cast(w, 0 impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// A report is intact when it still holds its last line and the failing behaviour's name.
+fn intact(report: string) -> boolean {
+    contains(report, "=== End Silica Actor Failure ===") and contains(report, "failure_reports_kept_and_forwarded_divide_beh")
+}
+
+// msg: (a report, the reporter's count of damaged reports)
+// state: (reports seen, the last report, damaged reports seen)
+fn logger(msg: (string, int64), state: (int64, string, int64)) -> (:no_reply, (int64, string, int64)) {
+    sequence proc[concurrency, device_io]
+        (report, reporter_damaged): (string, int64) <- msg;
+        (n, last, damaged): (int64, string, int64) <- state;
+        ok: boolean <- n == 0 or intact(last);
+        now_damaged: int64 <- case ok of {
+            true -> damaged;
+            false -> damaged + 1
+        };
+        _: boolean <- case n + 1 == 300 of {
+            true -> {
+                _: atom <- print_int64(reporter_damaged + now_damaged);
+                _: atom <- println("");
+                cast_exit(0)
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, (n + 1, report, now_damaged))
+    end
+}
+
+// state: (reports seen, the last report, damaged reports seen)
+fn handle_report(report: string, state: (int64, string, int64)) -> (:no_reply, (int64, string, int64)) {
+    sequence proc[concurrency]
+        (n, last, damaged): (int64, string, int64) <- state;
+        ok: boolean <- n == 0 or intact(last);
+        now_damaged: int64 <- case ok of {
+            true -> damaged;
+            false -> damaged + 1
+        };
+        _: boolean <- cast_registered(:kick, (report, now_damaged) impl ActorMessage {});
+        _: boolean <- case n + 1 < 300 of {
+            true -> next_worker();
+            false -> true
+        }
+    produces
+        pure (:no_reply, (n + 1, report, now_damaged))
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        reporter: actor_ref <- spawn((0, "", 0), handle_report, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter);
+        _: actor_ref <- spawn_registered((0, "", 0), logger, :kick, stack_policy(0, :keep_last_message));
+        _: boolean <- next_worker();
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

@@ -19,21 +19,98 @@
 // (see thin_dispatchers_for_compile_ram.md).
 //
 // `main` is not an actor and runs on the platform's ordinary stack (spec §15.1.2.2), so it does
-// no compiling itself: it spawns one actor that holds the whole pipeline on a runtime-managed
-// stack, which grows as far as the lexer, parser and type checker recurse, and calls it. The
-// reply is the driver's exit code (75 between units in a process-per-unit batch).
+// no compiling itself (learn-silica.md, "Keep `main` small"). It registers the FailureReporter,
+// starts the root supervisor, whose one child is the pipeline actor that holds the whole compile on
+// a runtime-managed stack, casts the work to that child, and waits in `wait_for_exit` (§15.1.2.5).
+// The pipeline actor ends the program with `cast_exit(code)` once its work and output are complete:
+// 0 success, 1 errors, 75 between units of a process-per-unit batch (the Makefile's reclaim loop).
+//
+// Compiler-only rule (actor_memory_budget_plan.md item L): the pipeline actor is reached by
+// `cast`, never by `call`, and serves no calls, so no caller ever waits on a reply the process
+// ends before sending.
+//
+// A pipeline that dies without reaching `cast_exit` (a fault, `badarith`, `case_clause`) is a
+// compiler crash. The root supervisor allows no restarts, so the pipeline's death breaches its
+// restart limit at once and the supervisor itself fails (§15.4.13.2). Every unwind report reaches
+// the FailureReporter (§15.4.13.4), which writes it to stderr; the root supervisor's own report
+// ends the process. When the crash happened inside a unit's compile (main_crash.silica's
+// in-progress marker names it) the status is 76, "crashed in a unit, continue": the batch loop
+// that reruns the compiler on 75 reruns it on 76 too, and the next process reports the unit as
+// failed, skips it and compiles the rest; the batch ends with status 1. A crash outside any unit
+// ends the batch with status 1.
 
+use Supervisor;
 use main_driver;
+use main_crash;
 
-fn compile_beh(msg: int64, state: int64) -> (:reply, int64, int64) {
-    code: int64 <- main_driver@run();
-    (:reply, code, state)
+impl CompilerSupervisor for Supervisor;
+
+// The pipeline child. Cast-only; its reply form is `(:no_reply, state)`.
+fn compile_beh(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        code: int64 <- main_driver@run();
+        _: boolean <- cast_exit(code)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// FailureReporter (§15.4.13.4). `region_dump_limit` is called once at registration; 0 disables
+// region dumps. `handle_report` receives the formatted unwind report of any actor that dies.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own unwind report, the one the runtime writes when the restart
+// limit is breached (§15.4.13.2): the actor has no supervisor and its behaviour is the runtime-owned
+// supervisor behaviour, which has no user function. Spec §15.4.6.4 writes these as
+// `agent_type:` and `supervisor:   none`; the hosted runtimes (prims_actors_runtime_asm*.silica,
+// L_phase_f_unwind_fmt) and the board runtime (rt_actors.S) write instead
+//   `supervisor_acb:  <pointer>`      a null pointer is `0x0` on Darwin, `(nil)` on glibc, `0x00000000` on the board
+//   `  #0  <unknown behavior>`        the frame line of an actor whose behaviour slot is empty
+// and their `agent_type_atom:` line is 0 for every root actor, so it cannot name the supervisor;
+// the two lines above are what identifies it. A worker's report always names its supervisor.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn handle_report(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(main_crash@root_failure_status());
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// No restarts: the first death of the pipeline breaches the limit. The window must not be 0: the
+// runtimes read a count and a window that are both 0 as "no limit".
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 2000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :pipeline, agent_type: :worker, initial_state: 0, behavior: compile_beh, restart: :transient, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
 }
 
 fn main() -> int64 {
-    sequence proc[concurrency]
-        pipeline: actor_ref <- spawn(0, compile_beh, stack_policy(0, :keep_high_water));
-        code: int64 <- call(pipeline, 0 impl ActorMessage {})
+    sequence proc[concurrency, device_io]
+        reporter: actor_ref <- spawn(0, handle_report, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter);
+        _: supervisor_ref <- spawn_registered_supervisor(CompilerSupervisor, 0, :compiler_supervisor, stack_policy(0, :keep_last_message));
+        // A supervised child is registered under its child-spec id (§20.3.1).
+        _: boolean <- cast_registered(:pipeline, 0 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
     produces
         pure code
     end

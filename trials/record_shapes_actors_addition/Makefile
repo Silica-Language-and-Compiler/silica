@@ -30,9 +30,9 @@ LDFLAGS_clang := -Wl,-e,main -Wl,-macos_version_min,$(MACOS_MIN_VERSION)
 
 silica.config:
 	@cd "$(THIS_DIR)" && { \
-		find "$$PWD" -type f -name '*.silica' ! -name 'trial_negative_*.silica' | sed "s|^$$PWD/||"; \
+		find "$$PWD" -type f -name '*.silica' ! -name 'trial_negative_*.silica' | sed "s|^$$PWD/||" | LC_ALL=C sort; \
 		echo "../../compiler/stdlib/Supervisor.silica"; \
-	} > silica.config
+	} > silica.config && $(TRIAL_SUPPORT_CONFIG) && $(TRIAL_PRIVATE_SUPERVISOR)
 
 .DEFAULT_GOAL := all
 
@@ -50,7 +50,7 @@ compile: clean silica.config
 all: compile
 	@failed=0; \
 	cd "$(THIS_DIR)" && \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
 		base=$${line%.silica}; \
 		sams="$$base.sams"; \
 		if [ ! -f "$$sams" ]; then \
@@ -85,7 +85,7 @@ all: compile
 		ko=$$((ko + 1)); failed=1; \
 	fi; \
 	fi; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
 		base=$${line%.silica}; \
 		[ -f "$$base.o" ] || continue; \
 		echo "Linking $$base..."; \
@@ -93,8 +93,10 @@ all: compile
 		for trait_obj in traits/*.o; do \
 			[ -f "$$trait_obj" ] && trait_objs="$$trait_objs $$trait_obj"; \
 		done; \
+		[ -n "$$tsa_done" ] || { $(TRIAL_SUPPORT_ASSEMBLE); tsa_done=1; }; \
 		runtime_obj=""; \
 		[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 			if ! $(RUST_LLD) -flavor darwin -o "$$base" "$$base.o" $$trait_objs $$runtime_obj $(LDFLAGS_rust-lld); then \
 			echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
@@ -122,14 +124,16 @@ all: compile
 # Compare: default diff -Bw <base>.sout <base>.scout. If <base>.scout.normalized exists, use
 # compare_scout_normalized.sh (ordered compare with dynamic runtime fields normalized). If <base>.scout.multiset
 # exists, use compare_scout_multiset.sh (or compare_scout_multiset_oneof.sh when <base>.scout.alt exists —
-# multiset matches any listed golden).
+# multiset matches any listed golden). A .scout.multiset marker wins over .scout.normalized (as in
+# targets/board_suite.sh); compare_scout_multiset.sh is ../compare_scout_unordered.sh (failure reports are
+# printed asynchronously by the FailureReporter, so their order among other lines is not defined).
 integrate-run:
 	@$(MAKE) -f "$(THIS_DIR)Makefile" clean
 	@$(MAKE) -f "$(THIS_DIR)Makefile" silica.config
 	@$(MAKE) -f "$(THIS_DIR)Makefile" compile
 	@cd "$(THIS_DIR)" || exit 1; \
 	rm -f .integrate_counts; ok=0; ko=0; failed=0; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
 		base=$${line%.silica}; \
 		sams="$$base.sams"; \
 		if [ ! -f "$$sams" ]; then \
@@ -164,7 +168,7 @@ integrate-run:
 		ko=$$((ko + 1)); failed=1; \
 	fi; \
 	fi; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
 		base=$${line%.silica}; \
 		sams="$$base.sams"; \
 		[ "$$base" = "__silica_runtime" ] && continue; \
@@ -183,7 +187,7 @@ integrate-run:
 			ok=$$((ok + 1)); \
 		fi; \
 	done; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
 		base=$${line%.silica}; \
 		[ -f "$$base.o" ] || continue; \
 		echo "Linking $$base..."; \
@@ -191,8 +195,10 @@ integrate-run:
 		for trait_obj in traits/*.o; do \
 			[ -f "$$trait_obj" ] && trait_objs="$$trait_objs $$trait_obj"; \
 		done; \
+		[ -n "$$tsa_done" ] || { $(TRIAL_SUPPORT_ASSEMBLE); tsa_done=1; }; \
 		runtime_obj=""; \
 		[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 			if ! $(RUST_LLD) -flavor darwin -o "$$base" "$$base.o" $$trait_objs $$runtime_obj $(LDFLAGS_rust-lld); then \
 			echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
@@ -207,7 +213,7 @@ integrate-run:
 		fi; \
 		fi; \
 	done; \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
 		base=$${line%.silica}; \
 		if [ ! -x "$$base" ]; then \
 			echo "❌❌ $(MSG_PREFIX)$$base missing executable (assemble/link failed earlier)"; \
@@ -228,7 +234,7 @@ integrate-run:
 					ko=$$((ko + 1)); failed=1; \
 					continue; \
 				fi; \
-				if [ -f "$$base.scout.normalized" ]; then \
+				if [ -f "$$base.scout.normalized" ] && [ ! -f "$$base.scout.multiset" ]; then \
 					if [ -f "$(THIS_DIR)compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$$base.scout"; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout normalized-compare differs from .scout"; \
 						$(INTEGRATE_DOT_FAIL); \
@@ -303,7 +309,7 @@ stress-j2:
 clean:
 	@cd "$(THIS_DIR)" && \
 	rm -f *.sout traits/*.sams traits/*.o *.iface *.sams __silica_runtime.o && \
-	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
+	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
 		base=$${line%.silica}; \
 		rm -f "$$base" "$$base.o"; \
 	done && \

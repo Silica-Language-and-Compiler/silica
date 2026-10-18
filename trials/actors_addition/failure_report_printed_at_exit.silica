@@ -1,0 +1,69 @@
+// A failure report handed to the FailureReporter is handled to its end even when the program ends
+// while the reporter is handling it (spec §15.4.13.4, §15.1.2.5). main registers the reporter, starts
+// a root supervisor whose one :temporary child divides 42 by its message, casts the child 0 and waits
+// in wait_for_exit. The child dies dividing by 0 and its unwind report goes to the reporter; as a
+// :temporary child it is not restarted, so nothing else happens. The reporter, on that report, first
+// asks for the program to end with cast_exit(3) and only then prints its line, so main's
+// wait_for_exit returns 3 and main returns while the report is being handled. The runtime lets the
+// reporter finish what it is handling and what is queued for it before the program ends; it used to
+// end at once, and the line was lost.
+// main only casts to the child: it never calls an actor that dies mid-call, which would raise
+// actor_not_found in main (§16.1.1) and end the program from main's failure instead. The child is
+// supervised so that no "[silica] root actor exited (no supervisor)" note is due: the board writes
+// that note for an unsupervised actor after its report is queued, which would race the exit.
+// The reporter prints one fixed line (the report itself carries pointers) when the report names
+// the failing behaviour. The child id and the supervisor name are atoms this suite already numbers
+// ahead of this trial.
+// Expected output:
+//   report received
+//   3
+use Supervisor;
+
+impl ReportAtExitSupervisor for Supervisor;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn divide_beh(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, 42 / msg + state)
+}
+
+// No restarts; the window is not 0, because a count and a window that are both 0 mean "no limit".
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 2000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :trial_worker, agent_type: :worker, initial_state: 0, behavior: divide_beh, restart: :temporary, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn handle_report(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: boolean <- cast_exit(3);
+        _: atom <- case contains(report, "failure_report_printed_at_exit_divide_beh") of {
+            true -> println("report received");
+            false -> println("report damaged")
+        }
+    produces
+        pure (:no_reply, state + 1)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        reporter: actor_ref <- spawn(0, handle_report, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter);
+        _: supervisor_ref <- spawn_registered_supervisor(ReportAtExitSupervisor, 0, :trial_supervisor, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_registered(:trial_worker, 0 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

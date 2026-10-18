@@ -1,5 +1,9 @@
 # Skew Binary Random-Access List Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/skew_ral.silica` with split units (`skew_ral_weights`, `_node`, `_tree_read`, `_tree_write`, `_forest`, `_index`, `_traverse`, `_build`, `_validate`, `_dispatch_access`, `_dispatch_bulk`); trials in `trials/ordered_data_structures/skew_ral_core/` (11 programs).
+
+**Constructor record:** `skew_ral@empty_ral({ compare_item: fn(ItemType, ItemType) -> (:less | :equal | :greater) }, reversed: boolean)` (named `empty_ral` because an unqualified `empty` resolves to the list builtin, E2020). `compare_item` is the `ItemType` witness and is carried in the list value; the list core never calls it and it is not an ordering identity. The Tree family passes its own comparator.
+
 **Consumers:** dense matrix graph, rose-tree child sequence  
 **Algorithm:** Okasaki skew binary random-access list [Oka95, Oka98 §6.4.1]
 

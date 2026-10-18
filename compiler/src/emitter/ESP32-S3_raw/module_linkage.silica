@@ -411,9 +411,99 @@ fn format_one_supervisor_trampoline(module_name: string, actor_type: string, sre
     szs: string <- atom_table@int64_to_decimal_string(sret_bytes);
     body: string <- case sret_bytes > 0 of {
         true -> concat(prologue, concat(xt_isa@xt_sub("SP", "SP", concat("#", szs)), concat(xt_isa@xt_mov("X8", "SP"), concat(init_call, concat(mid, concat(xt_isa@xt_add("SP", "SP", concat("#", szs)), epilogue))))));
-        false -> concat(concat(concat(prologue, init_call), mid), epilogue)
+        false -> concat(concat(concat(concat(prologue, xt_isa@xt_mov("X8", "XZR")), init_call), mid), epilogue)
     };
     concat(header, body)
+}
+
+// A :supervisor child whose start function sits in the same unit (`behavior: inner_start`) has
+// no `impl T for Supervisor` trampoline to name: the child spec stored a zero trampoline, so the
+// runtime never called the start function and the nested supervisor ran with no children
+// (bugaudit nest). Each such start function gets a file-local trampoline that calls that
+// function itself and materializes its children. term_child_spec@supervisor_fn_trampoline_symbol
+// spells the same symbol at the child spec.
+fn supervisor_fn_trampoline_symbol(fn_label: string) -> string {
+    concat("_silica_supervisor_start_fn_", instantiated_fn_name@link_name_to_asm_symbol(fn_label))
+}
+
+fn format_one_supervisor_fn_trampoline(module_name: string, fn_label: string) -> string {
+    sym: string <- xt_isa@xt_sym(supervisor_fn_trampoline_symbol(fn_label));
+    header: string <- supervisor_trampoline_frame_header();
+    prologue: string <- concat(control@function_prologue(sym), concat(xt_isa@xt_mov("X19", "X0"), xt_isa@xt_mov("X8", "XZR")));
+    start_sym: string <- asm_symbol_for_definition(module_name, qual_fn_name_for_linkage(fn_label));
+    start_call: string <- concat(xt_mem@xt_ldr("X0", "[X19]"), xt_isa@xt_call(start_sym));
+    mid: string <- concat(xt_isa@xt_mov("X1", "X0"), concat(xt_isa@xt_mov("X0", "X19"), xt_isa@xt_call("_silica_rt_supervisor_materialize_init_children")));
+    epilogue: string <- control@function_epilogue_with_frame();
+    concat(header, concat(prologue, concat(start_call, concat(mid, epilogue))))
+}
+
+fn string_list_contains(xs: List[string, mem(normal)], needle: string) -> boolean {
+    case xs.is_nil of {
+        true -> false;
+        false -> case xs.head == needle of {
+            true -> true;
+            false -> string_list_contains(xs.tail, needle)
+        }
+    }
+}
+
+// Unqualified function-pointer constants (SIR kind 0, type fn_ptr) in a body.
+fn collect_local_fn_ptr_labels_from_nodes(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case nodes.is_nil of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- nodes.head;
+            acc2: List[string, mem(normal)] <- case n.kind == 0 and n.type_name == "fn_ptr" and first_at_in_callee(n.value, 0) < 0 and length_bytes(n.value) > 0 and string_list_contains(acc, n.value) == false of {
+                true -> sir_ast@cons_sir_string(n.value, acc);
+                false -> acc
+            };
+            collect_local_fn_ptr_labels_from_nodes(nodes.tail, acc2)
+        }
+    }
+}
+
+fn collect_local_fn_ptr_labels(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case fns.is_nil of {
+        true -> acc;
+        false -> collect_local_fn_ptr_labels(fns.tail, collect_local_fn_ptr_labels_from_nodes(fns.head.body.nodes, acc))
+    }
+}
+
+// A supervisor start function returns (supervisor_flags, List[child_spec, ...]).
+fn is_supervisor_start_return_type(return_type: string) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(return_type);
+    length_bytes(t) > 11 and substring(t, 0, 11) == "({strategy:"
+}
+
+fn fn_with_name_is_supervisor_start(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], name: string) -> boolean {
+    case fns.is_nil of {
+        true -> false;
+        false -> case fns.head.name == name of {
+            true -> is_supervisor_start_return_type(fns.head.return_type);
+            false -> fn_with_name_is_supervisor_start(fns.tail, name)
+        }
+    }
+}
+
+fn emit_supervisor_fn_trampolines_loop(module_name: string, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], labels: List[string, mem(normal)], acc: string) -> string {
+    case labels.is_nil of {
+        true -> acc;
+        false -> {
+            stanza: string <- case fn_with_name_is_supervisor_start(fns, labels.head) of {
+                true -> format_one_supervisor_fn_trampoline(module_name, labels.head);
+                false -> ""
+            };
+            emit_supervisor_fn_trampolines_loop(module_name, fns, labels.tail, concat(acc, stanza))
+        }
+    }
+}
+
+fn emit_supervisor_fn_trampolines(module_name: string, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> string {
+    body: string <- emit_supervisor_fn_trampolines_loop(module_name, fns, collect_local_fn_ptr_labels(fns, sir_ast@nil_sir_strings()), "");
+    case length_bytes(body) == 0 of {
+        true -> "";
+        false -> concat("    # supervisor start trampolines for same-unit start functions of :supervisor children\n", body)
+    }
 }
 
 fn emit_supervisor_start_trampolines_phase_e_loop(module_name: string, rows: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], acc: string) -> string {
@@ -542,6 +632,10 @@ fn collect_child_start_types_from_functions(fns: List[{ name: string, return_typ
 fn emit_supervisor_start_trampolines(sir_module: { module_name: string, used_modules: List[string, mem(normal)], exports: List[{ fn_name: string, arity: string }, mem(normal)], export_trait_names: List[string, mem(normal)], marker_impl_types: List[string, mem(normal)], supervisor_impl_types: List[string, mem(normal)], supervisor_phase_e: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], failure_reporter_impl_types: List[string, mem(normal)], required_method_sigs: List[{ name: string, param_names: string, param_types: string, return_type: string, effects: string }, mem(normal)], runtime_dependencies: List[string, mem(normal)], is_dangerous_module: boolean, wrapper_meta_paths: List[string, mem(normal)], foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], link_libraries: List[string, mem(normal)], functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] }) -> string {
     hdr: string <- "    # supervisors Phase E (e3b): per-impl start trampolines (calls init + materialize children)\n";
     mod_name: string <- sir_module.module_name;
+    concat(emit_supervisor_impl_trampolines(sir_module, hdr, mod_name), emit_supervisor_fn_trampolines(mod_name, sir_module.functions))
+}
+
+fn emit_supervisor_impl_trampolines(sir_module: { module_name: string, used_modules: List[string, mem(normal)], exports: List[{ fn_name: string, arity: string }, mem(normal)], export_trait_names: List[string, mem(normal)], marker_impl_types: List[string, mem(normal)], supervisor_impl_types: List[string, mem(normal)], supervisor_phase_e: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], failure_reporter_impl_types: List[string, mem(normal)], required_method_sigs: List[{ name: string, param_names: string, param_types: string, return_type: string, effects: string }, mem(normal)], runtime_dependencies: List[string, mem(normal)], is_dangerous_module: boolean, wrapper_meta_paths: List[string, mem(normal)], foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], link_libraries: List[string, mem(normal)], functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] }, hdr: string, mod_name: string) -> string {
     case sir_module.supervisor_phase_e.is_nil of {
         false -> concat(hdr, emit_supervisor_start_trampolines_phase_e_loop(mod_name, sir_module.supervisor_phase_e, ""));
         true -> case sir_module.supervisor_impl_types.is_nil of {

@@ -1,0 +1,112 @@
+// Spec §15.1.4 "Named actors": a registered name is released when its actor ends, however it ends.
+// :service_a comes from spawn_registered and its actor faults (a cast of 0 divides its state by
+// zero); :service_b comes from the registry's :insert and its actor is stopped by remove_actor (from
+// a remover actor). main waits once, in wait_for_exit(), for the two failure reports (the reporter
+// ends the wait with cast_exit(0) on the second), then looks :service_a up, inserts :service_b for a
+// new actor, spawn_registers :service_a again and calls both names with 1.
+// Expected output (compared as a multiset: reports and root-exit notes are asynchronous):
+//   :ok                                            insert of :service_b
+//   report, reason_tag 1, frame div_beh            :service_a divided by zero (the runtime ends a
+//                                                  divide-by-zero actor with reason tag 1 today, as in
+//                                                  actors_addition/actor_cast_zero_int32_divisor)
+//   report, reason_tag 0, frame worker_beh         :service_b ended by remove_actor (a normal end;
+//                                                  the runtime still reports it)
+//   [silica] root actor exited (no supervisor)     once: the faulted actor had no supervisor
+//   :not_found                                     lookup of :service_a: the name was released
+//   :ok                                            :service_b inserted again, for the new actor (state 21)
+//   12                                             call_registered(:service_a, 1): new actor, state 11
+//   22                                             call_registered(:service_b, 1): new actor, state 21
+//   exit status 0
+// Atoms: every atom is already numbered earlier in actor_registration_addition, so no other trial's
+// atoms are renumbered.
+
+fn worker_beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg + state, state)
+}
+
+fn div_beh(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state / msg)
+}
+
+fn remover(msg: actor_ref, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        _: atom <- remove_actor(msg)
+    produces
+        pure (:reply, 0, state)
+    end
+}
+
+// The registry's reply atoms are named here so they are in this program's atom table (an atom a
+// program never spells has no printable name in its table; the runtime still replies with it).
+fn show(s: atom) -> atom {
+    case s of {
+        :ok -> :ok;
+        :found -> :found;
+        :not_found -> :not_found;
+        _: atom -> s
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- start_reporter(2);
+        a: actor_ref <- spawn_registered(10, div_beh, :service_a, stack_policy(0, :keep_last_message));
+        b: actor_ref <- spawn(20, worker_beh, stack_policy(0, :keep_last_message));
+        reg: actor_ref <- get_pid_registry();
+        ins: (atom, actor_ref) <- call(reg, { op: :insert, name: :service_b, pid: b } impl ActorMessage {});
+        (ri: atom, _pi: actor_ref) <- ins;
+        _: atom <- print_atom(show(ri));
+        println("");
+        k: actor_ref <- spawn(0, remover, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_registered(:service_a, 0 impl ActorMessage {});
+        _: int64 <- call(k, b impl ActorMessage {});
+        _: int64 <- wait_for_exit();
+        lk: (atom, actor_ref) <- call(reg, { op: :lookup, name: :service_a, pid: b } impl ActorMessage {});
+        (rl: atom, _pl: actor_ref) <- lk;
+        _: atom <- print_atom(show(rl));
+        println("");
+        b2: actor_ref <- spawn(21, worker_beh, stack_policy(0, :keep_last_message));
+        ins2: (atom, actor_ref) <- call(reg, { op: :insert, name: :service_b, pid: b2 } impl ActorMessage {});
+        (ri2: atom, _pi2: actor_ref) <- ins2;
+        _: atom <- print_atom(show(ri2));
+        println("");
+        a2: actor_ref <- spawn_registered(11, worker_beh, :service_a, stack_policy(0, :keep_last_message));
+        print_int64(call_registered(:service_a, 1 impl ActorMessage {}));
+        println("");
+        print_int64(call_registered(:service_b, 1 impl ActorMessage {}));
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The FailureReporter (spec §15.4.13.4) is cast-only, so main cannot ask it how many reports it has
+// had. It writes each report to stderr; its state counts down from the number of reports main waits
+// for (start_reporter's argument), and the last of them ends main's single wait_for_exit() with
+// cast_exit(0) (spec §15.1.2.5). The report is written before the cast_exit.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces
+        pure (:no_reply, left)
+    end
+}
+
+// Registered before anything is started (E2236).
+fn start_reporter(reports: int64) -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(reports, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

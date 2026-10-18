@@ -1,0 +1,107 @@
+// Board stacks (actor_memory_budget_plan.md item F, §13): an idle actor holds no stack memory at
+// all, so the number of actors a board holds is bounded by their control blocks, not by stacks. A
+// thousand actors with :release_on_return are spawned and each handles one message (so each has
+// been dispatched, grown a first stack and given it back); afterwards every one of them holds no
+// chunk and its high-water mark shows it ran, and the heap still has room. The spawning loop runs
+// in a spawner actor (its recursion is a self tail call in let-body position, a jump), because a
+// main from which recursion is reachable is unbounded for the static walk and would keep the
+// 192 KB default stacks the thousand control blocks need. Measured 2026-10-08: 321,856 of the
+// 354,816-byte heap in use at the end -- a thousand 256-byte control blocks (264 KB with the heap
+// headers), this trial's own thousand 40-byte usage records, the message-node and stack free
+// lists, the registries -- so what bounds the count is the control block (plan item I), not the
+// stacks; 16 KB of room is asserted, a third of what was left.
+// Expected:
+//   0
+//   1000
+//   true
+//   true
+//   0
+
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg + state, state + 1)
+}
+
+fn spawn_and_check(n: int64, bad: int64) -> int64 {
+    case n == 0 of {
+        true -> bad;
+        false -> {
+            sequence proc[concurrency]
+                w: actor_ref <- spawn(0, beh, stack_policy(0, :release_on_return));
+                _: int64 <- call(w, n impl ActorMessage {});
+                u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+                wrong: int64 <- case u.committed == 0 and u.retained == 0 and u.high_water == 2560 of {
+                    true -> 0;
+                    false -> 1
+                };
+                rest: int64 <- spawn_and_check(n - 1, bad + wrong)
+            produces
+                pure rest
+            end
+        }
+    }
+}
+
+fn spawner(msg: int64, state: int64) -> (:reply, int64, int64) {
+    bad: int64 <- spawn_and_check(msg, 0);
+    (:reply, bad, state)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io, mem(normal)]
+        _: atom <- start_reporter();
+        s: actor_ref <- spawn(0, spawner, stack_policy(0, :keep_last_message));
+        bad: int64 <- call(s, 1000 impl ActorMessage {});
+        print_int64(bad);
+        println("");
+        probe: actor_ref <- spawn(0, beh, stack_policy(0, :release_on_return));
+        n: int64 <- call(probe, 999 impl ActorMessage {});
+        print_int64(n + 1);
+        println("");
+        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(probe);
+        used: int64 <- heap_used();
+        print_boolean(used < u.reserved);
+        println("");
+        print_boolean(u.reserved - used > 16384);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :release_on_return));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

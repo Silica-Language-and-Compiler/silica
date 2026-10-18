@@ -1,0 +1,94 @@
+// A behaviour whose first parameter is a string and whose state is a float64 builds its result
+// tuple in the actor's reply buffer, so handling a message leaves nothing on the heap (the
+// int64-state twin is behaviour_string_message_reply_no_heap_growth). The averager below takes a
+// string message, adds 0.5 to its float64 state and ends in a sequence producing (:reply, state,
+// state); the sequence prints an empty string only so that the body is a sequence block, the form
+// that kept the most per message. A driver actor calls it with "x" once per message of its own and
+// casts itself the averager's actor_ref as the next message. The driver reads heap_used() on every
+// round through the same helper and keeps the reading from round 100; at round 1100 it prints how
+// far the heap grew over the thousand calls between and the averager's last reply, then ends the
+// program. Before the fix each call left the averager's result tuple behind (64,000 bytes over the
+// thousand on the Mac). The driver's state is one int64 holding both numbers, rounds done + 4096 *
+// heap_used() at round 100.
+// Expected output:
+//   0 550.0
+//   0
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn half_more(msg: string, state: float64) -> (:reply, float64, float64) {
+    sequence proc[device_io]
+        next: float64 <- state + 0.5;
+        _: atom <- print_string("")
+    produces
+        pure (:reply, next, next)
+    end
+}
+
+fn send_next(me: actor_ref, target: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast(me, target impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn finish(growth: int64, last: float64) -> boolean {
+    sequence proc[concurrency, device_io]
+        _: atom <- print_int64(growth);
+        _: atom <- print_string(" ");
+        _: atom <- print_float64(last);
+        _: atom <- println("");
+        ended: boolean <- cast_exit(0)
+    produces
+        pure ended
+    end
+}
+
+fn read_heap_used() -> int64 {
+    sequence proc[mem(normal)]
+        used: int64 <- heap_used()
+    produces
+        pure used
+    end
+}
+
+// state: rounds done + 4096 * heap_used() at round 100
+fn drive(target: actor_ref, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        base_then: int64 <- state / 4096;
+        last: float64 <- call(target, "x" impl ActorMessage {});
+        n: int64 <- state - 4096 * base_then + 1;
+        used: int64 <- read_heap_used();
+        base: int64 <- case n == 100 of {
+            true -> used;
+            false -> base_then
+        };
+        me: actor_ref <- self();
+        _: boolean <- case n == 1100 of {
+            true -> finish(used - base, last);
+            false -> send_next(me, target)
+        }
+    produces
+        pure (:no_reply, n + 4096 * base)
+    end
+}
+
+fn rep(report: string, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        r: actor_ref <- spawn(0, rep, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(r);
+        h: actor_ref <- spawn(0.0, half_more, stack_policy(0, :keep_last_message));
+        d: actor_ref <- spawn(0, drive, stack_policy(0, :keep_last_message));
+        _: boolean <- cast(d, h impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

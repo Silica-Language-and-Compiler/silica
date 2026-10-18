@@ -14,6 +14,8 @@ Primary families:
 
 Phase 1: trait-oriented constructors and graph traits ([Phase1_TODOs/data_structures_as_traits.md](Phase1_TODOs/data_structures_as_traits.md)). **Emitted module filenames:** representation + directedness only — e.g. `graph_wbt_directed.silica`, `graph_csr_directed.silica`, `graph_dense_directed.silica`.
 
+**Implementation status (2026-10-16):** implemented in `compiler/stdlib/data_structures/`: live `graph_wbt_core` with `graph_wbt_directed`, `graph_wbt_undirected`, `graph_weighted`, `graph_weighted_undirected`; `graph_csr_core` with `graph_csr_directed`, `graph_csr_undirected`, `graph_csr_weighted`, `graph_csr_weighted_undirected`; `graph_dense_core` with the four `graph_dense_*` modules; and the traits `DirectedGraph`, `UndirectedGraph`, `WeightedGraph`. Trials: `trials/ordered_data_structures/` (`graph_live_core`, `graph_csr_core`, `graph_dense_core`, `graph_collections`). The family names `WeightBalancedGraph`, `CompressedSparseRowGraph` and `DenseMatrixGraph` and the registry keys below are descriptive; the registered construction modules are the `graph_*` names. Dense cells are optional references over the skew RAL (`graph_dense_core.silica` header, deviation 1). Per-module deviations are numbered in the module headers.
+
 **Typing:** Phase 1 public vertex IDs, CSR/dense slots, counts, offsets, and cell indexes are **`int64`**. Public IDs and dense slots are distinct semantic domains even though their machine type is the same. Edge payload/data types remain generic.
 
 **Layout stability:** generated WBT, CSR, and dense records are distinct concrete types. CSR/dense inline layouts are private to one compiler/standard-library version, not stable source, FFI, serialization, or cross-version ABIs.

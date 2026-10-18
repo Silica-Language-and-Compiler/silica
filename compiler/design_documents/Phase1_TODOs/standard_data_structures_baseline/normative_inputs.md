@@ -120,7 +120,7 @@ The following trial trees exercise **obsolete** representations or pre-reset com
 | `trials/standard_data_structures_addition/` | Pre-reset structure registry |
 | `trials/error_enforcement_addition/standard_data_structures_phase04/` | Constructor/trait checks tied to phase-04 stubs |
 
-Phase 1 acceptance trials belong under `trials/standard_data_structures_phase1/` ([`README.md`](../../trials/standard_data_structures_phase1/README.md); Layer 0 §6.2 complete).
+Phase 1 acceptance trials belong under `trials/ordered_data_structures/` ([`README.md`](../../../../trials/ordered_data_structures/README.md); Layer 0 §6.2 complete; the directory was named `trials/standard_data_structures_phase1/` when this baseline was recorded).
 
 ### 4.3 Deleted design backups
 
@@ -224,6 +224,8 @@ Missing vs designs: `EdgeDataType`, `GraphType`, `QueueType`, `TreeType`, `Binar
 | Provided/required split | each `*_trait.md` | not enforced for collections |
 | Comparator bare `atom` | `common_contract.md` §4, trait designs | still accepted by `comparator_return_type_ok` |
 
+Implementation status (2026-10-16): this table is the 2026-06-29 baseline. The comparator rule is enforced (`trial_compile_fail_comparator_bare_atom`), all ten traits exist with provided/required blocks (`stdlib/data_structures/*.silica`), and the BinaryTree family is registered in the type checker; the Heap field-name row and the BinaryTree constructor record (`{ compare_item }` by decision 2026-10-16, not `{}`; §7.10) were not re-verified.
+
 ---
 
 ## 6. §6.1 acceptance statement
@@ -252,7 +254,7 @@ Missing vs designs: `EdgeDataType`, `GraphType`, `QueueType`, `TreeType`, `Binar
 
 ---
 
-**Layer 0 status:** §6.1–§6.4 complete. **Exit gate verified 2026-06-29:** `make record-golden` and `make integrate` pass in `trials/standard_data_structures_phase1/` (root `.integrate_counts`: `21 0`).
+**Layer 0 status:** §6.1–§6.4 complete. **Exit gate verified 2026-06-29:** `make record-golden` and `make integrate` pass in `trials/standard_data_structures_phase1/` (now `trials/ordered_data_structures/`) (root `.integrate_counts`: `21 0`).
 
 **Layer 1 §7.1 status:** Canonical arena registry and acceptance trials complete (2026-06-29).
 
@@ -260,7 +262,7 @@ Missing vs designs: `EdgeDataType`, `GraphType`, `QueueType`, `TreeType`, `Binar
 
 **Layer 1 §7.5 status:** Constructor function-record resolution complete (2026-06-29). All nine public families parse, validate, and witness constructor records; exact field-name validation; module/representation matching; canonical arena injection at constructor let-bindings; int64 literal pool collects constants inside `case` branches. Positive trials: `compiler_substrate/` → `constructor_record_resolution`, `constructor_record_field_order`, `constructor_canonical_arena_lowering`. Compile-fail goldens: `error_enforcement/` → `trial_compile_fail_constructor_*`. **Integrate verified:** `compiler_substrate/`, `error_enforcement/`, and repo `error_enforcement_addition`.
 
-**BinaryTree amendment status (2026-07-02):** Normative design added after the nine-family Layer 1 gate. Historical §7.5/§7.6/§7.9 completion remains valid for those nine families; BinaryTree parsing, empty-record constructor resolution, registry identity, lowering, and runnable stub coverage are pending implementation-plan §7.10 and block only BinaryTree-dependent work.
+**BinaryTree amendment status (2026-07-02):** Normative design added after the nine-family Layer 1 gate. Historical §7.5/§7.6/§7.9 completion remains valid for those nine families; BinaryTree parsing, `{ compare_item }` constructor-record resolution, registry identity, lowering, and runnable stub coverage are pending implementation-plan §7.10 and block only BinaryTree-dependent work.
 
 **Layer 1 §7.6 status:** Collection type witnesses and representation registry complete (2026-07-01). Representation-based module registry for all concrete families; stable specialization keys; registered-module gating and E2017 for unregistered construction modules; constructor arena/spec-key injection in function-body and `sequence proc` lets. Positive trials: `compiler_substrate/` → `collection_bracket_type_parse`, `collection_registry_specialization_distinct`, `collection_record_not_collection`. Compile-fail goldens: `error_enforcement/` → `trial_compile_fail_collection_bracket_missing_mem`, `trial_compile_fail_collection_unregistered_module`. **Integrate verified:** phase-1 root `84 0`. Proceed to Layer 1 §7.7.
 

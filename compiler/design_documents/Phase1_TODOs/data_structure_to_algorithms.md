@@ -4,7 +4,7 @@
 
 **Scope:** Logical algorithms, persistence techniques, and primary literature only. This document does not prescribe or refer to any existing Silica stdlib implementation.
 
-**Status:** Algorithm choices below are **locked** (reviewed 2026-06; BinaryTree decision 16 added 2026-07-02). Do not add parallel representations without revisiting this section.
+**Status:** Algorithm choices below are **locked** (reviewed 2026-06; BinaryTree decision 16 added 2026-07-02). Do not add parallel representations without revisiting this section. **Implementation status (2026-10-16):** every decision is implemented as locked (stdlib `compiler/stdlib/data_structures/`, trials `trials/ordered_data_structures/`); the only representation deviation is that dense graph cells are optional references over the skew RAL rather than boolean or tagged-sum cells (`graph_dense_core.silica` header). `join`/`split`/`concat` for the WBT remain deferred.
 
 ---
 

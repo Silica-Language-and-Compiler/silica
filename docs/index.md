@@ -110,9 +110,9 @@ See [brokered IPC architecture](https://github.com/yenrab/silica/blob/main/compi
 
 #### BEAM-inspired fault containment, native speed
 
-The runtime direction is lightweight actors running concurrenlty with independent stacks and no heap, message passing, and “let it crash” semantics at the process level—paired with hardware-assisted safety (e.g. MTE on AArch64) so faults become controlled events, not silent corruption.
+The runtime direction is lightweight actors running concurrently with independent stacks and no heap, message passing, and “let it crash” semantics at the process level—paired with hardware-assisted safety (e.g. MTE on AArch64) so faults become controlled events, not silent corruption.
 
-See [crash containment design](https://github.com/yenrab/silica/blob/main/compiler/design_documents/beam_like_crash_containment_design_notes.md).
+See [crash containment design](https://github.com/yenrab/silica/blob/main/compiler/design_documents/runtime_failure_reporting.md).
 
 ### Still easy to read, write, and tool
 

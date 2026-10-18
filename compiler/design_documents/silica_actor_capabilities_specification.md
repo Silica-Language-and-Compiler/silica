@@ -2,6 +2,8 @@
 
 **Status:** Draft extension. Adds mode- and protocol-typed actor references, dangerous actor capabilities, capability splitting, and formal message-order guarantees.
 
+**Implementation status (2026-10-16).** Not implemented, and still a draft. There is no `actor_ref call with P end` type form, no protocol expressions, no capability splitting and no capability consumption tracking in the lexer, parser, type checker or effect checker, and the E3500 to E3506 diagnostics of §13 are not allocated in [error_codes.md](../error_codes.md). What exists instead is a simpler mode check on plain references: the compiler follows an `actor_ref` through variables, parameters and results, tuple and record fields, list elements, actor state and message fields, and rejects a `cast` that reaches a call-only actor (**E2237**) or a `call` that reaches a cast-only actor (**E2238**); where the mode is unknown at compile time the runtime compares the convention it recorded at spawn with the operation and fails the caller with `:language_error` (silica-specification.md §16.2.6.4). The dangerous and device families keep their own typed references (`dangerous_actor_ref`, `device_actor_ref`) with no protocol parameter. Behavior hot-swapping (§9.5) has been removed from the roadmap, so that subsection has no planned implementation.
+
 **Related Documents**
 
 | Document | Purpose |

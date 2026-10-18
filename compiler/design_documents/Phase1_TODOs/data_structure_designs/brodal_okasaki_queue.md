@@ -1,5 +1,7 @@
 # Brodal–Okasaki Purely Functional Queue Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/brodal_okasaki.silica` with split units (`brodal_okasaki_node`, `_compare`, `_link`, `_forest`, `_extract`, `_boot`, `_validate`, `_dispatch_core`, `_dispatch_bulk`); trials in `trials/ordered_data_structures/brodal_okasaki_core/` (13 programs). The `Heap` and `PriorityQueue` traits sit on it through `brodal_okasaki_min`, `brodal_okasaki_max` and `brodal_okasaki_priority`.
+
 **Consumers:** `Heap`, `PriorityQueue`  
 **Algorithm:** bootstrapped skew-binomial queue [BO96]
 

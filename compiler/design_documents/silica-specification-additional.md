@@ -5,10 +5,27 @@
 | Document | Purpose |
 |----------|---------|
 | [silica-specification.md](silica-specification.md) | Core language specification |
-| [silica_sequence_blocks_tutorial_updated.md](design_documents/silica_sequence_blocks_tutorial_updated.md) | Sequence block syntax (`sequence...produces pure...end`) |
-| [sir_optimization_spec.md](sir_optimization_spec.md) | SIR optimization passes |
-| [sir_design_spec.md](sir_design_spec.md) | SIR structure, terms, types, primitives |
+| [silica_sequence_blocks_tutorial.md](../tutorials_and_howtos/silica_sequence_blocks_tutorial.md) | Sequence block syntax (`sequence...produces pure...end`) |
+| [sir_optimization_spec.md](../sir_optimization_spec.md) | SIR optimization passes |
+| [sir_design_spec.md](../sir_design_spec.md) | SIR structure, terms, types, primitives |
 | [actor_growable_stack_design.md](actor_growable_stack_design.md) | Per-actor growable stack and runtime actor loop |
+
+---
+
+## Implementation status (2026-10-16)
+
+| Rule | Status |
+| ---- | ------ |
+| 3.1 Unused bindings | Implemented as `E1055 UnusedVariable` (parse stage, `parser/constraint_extract_validate.silica`): "unused variable '<name>' in this scope; use it, pass it to a function, return it, or bind it as `_`". A discarded binding is written `_` (`_: T <- expr`). The message text is the compiler's, not the wording given below |
+| 3.2 Duplicate computation | NOT implemented; no diagnostic exists |
+| 3.3 Redundant algebraic operations | NOT implemented |
+| 3.4 Invariant guards in `case` | NOT implemented |
+| 3.5, 3.6 Loop-invariant code, constant hoisting | NOT implemented |
+| 3.7 Redundant constant expressions | NOT implemented (the compiler folds nothing and rejects nothing here) |
+| 3.8 Multiply by power of two | NOT implemented |
+| 4 Actor execution contract | Implemented as described; the behaviour's return forms are now the `(:reply, ...)` / `(:noreply, ...)` / state-only shapes of silica-specification.md section 15 |
+
+Rules 3.2 to 3.8 remain a specification of intent. A new error code for any of them must be registered in `../error_codes.md` when it is implemented.
 
 ---
 

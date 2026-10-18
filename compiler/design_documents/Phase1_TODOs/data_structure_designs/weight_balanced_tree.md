@@ -1,5 +1,7 @@
 # Corrected Adams-Family Weight-Balanced Tree Design
 
+**Implementation status (2026-10-16):** Implemented in `stdlib/data_structures/wbt_set.silica` and `wbt_map.silica`; trials in `trials/ordered_data_structures/wbt_core/` (81 programs). §13 join/split is deferred and not exported.
+
 **Consumers:** `OrderedSet`, `OrderedMap`, `SearchTree`, graph indexes and adjacency  
 **Algorithm family:** Adams WBT [Ada93], with deletion-safe parameters from [HY11]
 

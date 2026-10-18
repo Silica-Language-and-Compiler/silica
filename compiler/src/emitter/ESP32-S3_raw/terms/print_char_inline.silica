@@ -1,0 +1,149 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Fully inline emission for the print_char(value: char) built-in (spec sections 5.1.4 and 22.5.4):
+// writes the character's UTF-8 bytes to stdout and answers :ok. A char reaches the emitter as an
+// int64 holding (byte count << 56) | the bytes, first byte lowest (sir_generator/terms/literals.silica
+// char_lexeme_to_utf8_encoded), so storing the word puts the bytes in order and the top byte is the
+// count. Every call evaluates its argument into X0 and goes through one shared routine.
+
+use atom_table;
+use emitter_effects;
+use xt_isa;
+
+export emit_print_char_var/3;
+export emit_print_char_helper/0;
+export module_uses_print_char/1;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+// Emit print_char(value): X0 holds the encoded char; the shared routine writes it. The result is
+// :ok's index (atom_table@ok_atom_index), as every print built-in answers.
+fn emit_print_char_var(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    call_effects: string <- sir_term_root_node(term).value;
+    eff_comment: string <- emitter_effects@effect_annotation(call_effects);
+    pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
+    post_barrier: string <- emitter_effects@barrier_after_call(call_effects);
+    comment_line: string <- case length_bytes(eff_comment) > 0 of {
+        true -> concat(eff_comment, "\n");
+        false -> ""
+    };
+    bl_line: string <- xt_isa@xt_call("silica_rt_print_char");
+    ok_index: int64 <- atom_table@ok_atom_index(table);
+    ok_index_str: string <- atom_table@int64_to_decimal_string(ok_index);
+    mov_ret: string <- xt_isa@xt_movi(dest, ok_index);
+    with_comment: string <- concat(comment_line, bl_line);
+    with_ret: string <- concat(with_comment, mov_ret);
+    with_post: string <- case length_bytes(post_barrier) > 0 of {
+        true -> concat(with_ret, concat(concat("\n", post_barrier), "\n"));
+        false -> with_ret
+    };
+    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
+        true -> concat(pre_barrier, concat("\n", with_post));
+        false -> with_post
+    };
+    with_pre
+}
+
+// The board writes through the runtime (rt_console.S silica_rt_print_char, X0 = the encoded char),
+// so no helper routine is emitted into the program.
+fn emit_print_char_helper() -> string {
+    ""
+}
+
+// True when a print_char call appears anywhere in the term: every node's two children are
+// searched, so a call nested in another call's argument or in a case arm counts as well.
+fn term_has_print_char(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
+            case (node.kind == 4 or node.kind == 5) and node.name == "main.print_char" of {
+                true -> true;
+                false -> case node.kind == 0 or node.kind == 1 of {
+                    true -> false;
+                    false -> case term_has_print_char(sir_term_at(term, node.inner)) of {
+                        true -> true;
+                        false -> term_has_print_char(sir_term_at(term, node.right_expr))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn print_char_in_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> boolean {
+    case fns.is_nil of {
+        true -> false;
+        false -> case term_has_print_char(fns.head.body) of {
+            true -> true;
+            false -> print_char_in_functions(fns.tail)
+        }
+    }
+}
+
+// True when any function of the module calls print_char: the shared routine is emitted once then.
+fn module_uses_print_char(sir_module: { module_name: string, used_modules: List[string, mem(normal)], exports: List[{ fn_name: string, arity: string }, mem(normal)], export_trait_names: List[string, mem(normal)], marker_impl_types: List[string, mem(normal)], supervisor_impl_types: List[string, mem(normal)], supervisor_phase_e: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], failure_reporter_impl_types: List[string, mem(normal)], required_method_sigs: List[{ name: string, param_names: string, param_types: string, return_type: string, effects: string }, mem(normal)], runtime_dependencies: List[string, mem(normal)], is_dangerous_module: boolean, wrapper_meta_paths: List[string, mem(normal)], foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], link_libraries: List[string, mem(normal)], functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] }) -> boolean {
+    print_char_in_functions(sir_module.functions)
+}

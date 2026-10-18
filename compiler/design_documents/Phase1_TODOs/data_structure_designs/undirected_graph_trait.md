@@ -1,5 +1,7 @@
 # `UndirectedGraph` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/UndirectedGraph.silica` over `graph_wbt_undirected`, `graph_csr_undirected` and `graph_dense_undirected`; trials in `trials/ordered_data_structures/graph_live_core/` and `graph_collections/` (`gc_undirected_trait`, `gc_csr_undirected_trait`, `gc_dense_undirected_trait`).
+
 **Public trait:** `UndirectedGraph`
 **Generated modules:** `graph_wbt_undirected`, `graph_csr_undirected`, `graph_dense_undirected`
 **Generic placeholders:** `NodeIdType`, `EdgeDataType`, `AccType`, and `SpaceType` follow the [overriding genericity rule](common_contract.md#overriding-genericity-rule) and are determined by programmer declarations.

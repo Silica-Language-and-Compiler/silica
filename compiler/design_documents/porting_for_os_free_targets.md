@@ -1,6 +1,8 @@
 # Porting Silica for OS-free (raw metal) targets
 
-**Status:** Design plan. Not implemented. Not a substitute for [silica-specification.md](silica-specification.md). Use this document when adding a **board** or **OS-free** compiler/runtime target. Hosted ports (macOS, Linux, Windows) are out of scope except where this text contrasts them.
+**Status:** Design plan. The ESP32-S3_raw path implements the device MMIO surface (§5) and its board pack (§10); see the implementation status below. Not a substitute for [silica-specification.md](silica-specification.md). Use this document when adding a **board** or **OS-free** compiler/runtime target. Hosted ports (macOS, Linux, Windows) are out of scope except where this text contrasts them.
+
+**Implementation status (2026-10-16), ESP32-S3_raw.** Delivered: the `register_rwr` effect; device descriptions as compile-time data (`impl fn registers(device: (:tag))` of the built-in `DeviceDescription` trait, checked by E2201-E2210; stdlib `DeviceDescription.silica`, `Register8.silica`..`Register64.silica`); `map_device`, `peek` and `poke` through the shared stages (`type_checker/device/`, `type_checker/expressions/type_checker_expressions_device.silica`, `module_checker/module_checker_device.silica`, `sir_generator/terms/sir_device_calls.silica`); `spawn_device`, `spawn_device_registered`, `cast_device`, `cast_device_registered` with a third registry; the `device_*` module rules (E2216-E2233); the pre-emit rejection `sir_generator/sir_target_verify.silica` (E2220 for a prim the target cannot compile, through `emitter_core@unsupported_prim_reason`), which stops all three hosted emitters before they emit; the ESP32-S3 lowering in `emitter/ESP32-S3_raw/terms/prims/prims_device.silica` (one `memw`, one `l32i` / `s32i`, and for a `poke` a trailing `memw`; **only 32-bit accesses** are accepted, any other width is refused with an `.error` line naming it); the board pack `emitter/ESP32-S3_raw/board_pack.silica` (window table, `window_containing`, `window_allows_width`, pins, register facts) with its runtime twin `board/runtime/rt_device.S` (`silica_rt_map_device_check`, the abort `illegal device map` for a computed base outside every window); generated per-peripheral descriptions with access modes under `board/pack/` (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT; `board/tools/gen_board_pack.py`); device drivers in Silica under `board/apps/device_lib/` and the board apps `silica_16_device_uart` to `silica_22_device_buzzer`; fatal fault (status 70) and runtime abort (status 71) reports as console output before the exit marker; a first-fit heap with release; per-core cooperative schedulers on both LX7 cores; growable actor stacks. Not delivered: any bare-metal AArch64 / QEMU board pack (§11, §12 Phases B, D, E remain a plan), per-`Space` pools (the ESP32-S3 `alloc_region` still ignores its space operand), a timer-IRQ clock (the board reads the 16 MHz system timer by polling), Fifi on OS-free targets (§9.1 is planned, not implemented), the wide emitter diagnostic channel (the narrow channel is `sir_target_verify`; the ESP32-S3 refusals for foreign calls, file io, frame size and an unsupported width are still `.error` lines). The rows of §4 below describe the starting inventory; the status paragraph and the port status document win where they differ.
 
 **Audience:** someone who already knows Silica’s region/`Space`/`sequence` model and needs a single list of what a raw-metal image must provide, what the current compiler already does, and what still has to be added.
 
@@ -14,7 +16,7 @@
 | [memory-effects-aarch64-implementation-plan.md](memory-effects-aarch64-implementation-plan.md) | How each `Space` maps to AArch64 MAIR / ESP32-S3 pools |
 | [direct_machine_object_emitter_future.md](direct_machine_object_emitter_future.md) | Chip encoders and ELF / firmware objects (no `.sams` assembler) |
 | [IPC_Bare.md](IPC_Bare.md) | Embedded actor runtime sketch (scheduling, isolation, on-device IPC) |
-| [ROADMAP.md](../../../ROADMAP.md) | Target attention order (Linux, ESP32-S3, bare-metal AArch64, …) |
+| [ROADMAP.md](../../ROADMAP.md) | Target attention order (Linux, ESP32-S3, bare-metal AArch64, …) |
 
 ---
 
@@ -71,20 +73,20 @@ Raw-metal *applications* need device MMIO. Raw-metal *runtimes* also need privil
 
 | Area | Present | Missing |
 | --- | --- | --- |
-| Language names | `mem(device)`, `region(R, device)`, `device_window`, `register_rwr`, `spawn_device`, `device_actor_ref`, `DeviceDescription`, `Register8`…`Register64` in the spec | Checker does **not** yet enforce device-worker rules |
-| Device actors | Spec: [silica_device_actor_specification.md](silica_device_actor_specification.md) | No `spawn_device` runtime, third registry, device descriptions, or E2201-family checks |
+| Language names | `mem(device)`, `region(R, device)`, `device_window`, `register_rwr`, `spawn_device`, `device_actor_ref`, `DeviceDescription`, `Register8`…`Register64` in the spec | ESP32-S3_raw: the checker enforces the device-worker rules (E2201-family, status above). Other targets: shared checks only |
+| Device actors | Spec: [silica_device_actor_specification.md](silica_device_actor_specification.md) | ESP32-S3_raw: none of these is missing (third registry in `rt_actors.S`, descriptions, checks). Hosted runtimes carry the third registry; no hosted target maps a device |
 | `alloc_region(device)` | Type-checks; trial exists | Still a **heap arena** (`malloc`). Space operand **unused** on emit |
-| `register_rwr` | Emitter can emit `DSB SY` / `ISB` around calls if the effect string contains the name; FFI taint forbids mixing with `external_danger` data | Nothing that **maps** or **touches** MMIO; effect still usable in `main` until the checker lands |
-| Volatile MMIO load/store | — | `peek` / `poke` prims lowered **device-volatile** and ordered (§5.2) |
-| Bind physical/bus range | — | `map_device`: device tag + base address → `device_window` (not bump-malloc) |
+| `register_rwr` | Emitter can emit `DSB SY` / `ISB` around calls if the effect string contains the name; FFI taint forbids mixing with `external_danger` data | ESP32-S3_raw: `map_device`, `peek`, `poke` exist; the checker rejects the effect and the prims in `main` (E2219) |
+| Volatile MMIO load/store | — | ESP32-S3_raw: done, 32-bit only (§5.2). Other widths, and any other OS-free target, remain |
+| Bind physical/bus range | — | ESP32-S3_raw: done (§5.1, §10). Other OS-free targets remain |
 | `Space` → hardware | Spec + [memory-effects plan](memory-effects-aarch64-implementation-plan.md) | `MAIR_EL1`, PTEs or ESP32-S3 pools; wire `alloc_region` space tag to runtime |
 | Atomic `ref` | Plain `LDR`/`STR` | `LDAR`/`STLR` (AArch64) or Xtensa equivalents |
-| Boot / vectors / linker script | Darwin crt | Board reset, exception table, stack, `.text`/`.bss` placement |
-| Console / `device_io` print | Hosted stdout | UART (or semihosting) under board pack |
+| Boot / vectors / linker script | Darwin crt | ESP32-S3_raw: done (`rt_start.S`, `rt_vectors.S`, `silica_esp32s3.ld`). Other boards remain |
+| Console / `device_io` print | Hosted stdout | ESP32-S3_raw: UART0 from the runtime (`rt_console.S`); applications drive UART0 through a device worker (`silica_16_device_uart`). Other targets remain |
 | Time and timers | Hosted | Timer IRQ for the monotonic clock, timeouts and `send_after` (spec §22.14); no preemption of a dispatch (spec §23.1.1) |
-| Object / image | `.sams` + clang → Mach-O | `aarch64-none-elf` / Xtensa ELF or firmware image; later [direct object emitter](direct_machine_object_emitter_future.md) |
+| Object / image | `.sams` + clang → Mach-O | ESP32-S3_raw: done (`board/tools/build_image.sh` links with the Xtensa GCC toolchain and `esptool elf2image`). `aarch64-none-elf` remains; later [direct object emitter](direct_machine_object_emitter_future.md) |
 | Privileged CPU regs | — | Runtime-only access at EL1 (or ESP32 equivalent); not app MMIO |
-| Actors | Hosted runtime | [IPC_Bare](IPC_Bare.md) scheduling, no Darwin threads |
+| Actors | Hosted runtime | ESP32-S3_raw: done (`rt_actors.S`, per-core cooperative schedulers on both cores, [esp32s3_xtensa_port.md](ports/esp32s3_xtensa_port.md) §8). Other targets: [IPC_Bare](IPC_Bare.md) scheduling, no Darwin threads |
 | Fault notes | macOS FFI crash note | Per-board fault/IRQ document |
 | Fatal fault / runtime abort reports (spec §15.4.5.5) | `sigaction` + `sigaltstack` handler, `silica_rt_print_fault_site` (status 70), `silica_rt_abort_with` (status 71), on stderr | Exception vectors and stack-guard data breakpoints into the same report line, written as console output before the exit marker with status 70 / 71; see [runtime_failure_reporting.md](runtime_failure_reporting.md) |
 
@@ -159,7 +161,7 @@ The lexer, parser, checkers, and SIR generator are the same for every port; a po
 | OS-free emitter (ESP32-S3, later bare-metal AArch64) | Emits the mapping, the volatile accesses, and the port's barriers (§5.3); rejects widths the board pack does not allow. |
 | OS-hosted emitter (Apple Silicon, Linux AArch64, later hosted ports) | Rejects each poke prim in its `emit_prim_op` with a compile-time error naming the module, the enclosing function, and the prim. The rejection is explicit: the AArch64 emitters' catch-all for an unknown prim writes only a comment, which would compile the access into nothing. |
 
-Today the emitter has no way to report a compile error: it returns assembly text, and the ESP32-S3 emitter's refusals are `.error` lines that fail only when the file is assembled, with no Silica source location. Delivering the poke prims therefore includes a shared, target-neutral diagnostic channel from `emitter_core` to the driver, which prints through the normal compiler diagnostics and exits non-zero without writing a `.sams`. The first version reports the module, function, and prim, which the emitter already knows; line and column need source locations on SIR nodes, which can follow. The ESP32-S3 refusals (foreign calls, file io) can move onto the same channel.
+As written at the start of the work (the narrow channel `sir_target_verify` now exists, status above), the emitter has no way to report a compile error: it returns assembly text, and the ESP32-S3 emitter's refusals are `.error` lines that fail only when the file is assembled, with no Silica source location. Delivering the poke prims therefore includes a shared, target-neutral diagnostic channel from `emitter_core` to the driver, which prints through the normal compiler diagnostics and exits non-zero without writing a `.sams`. The first version reports the module, function, and prim, which the emitter already knows; line and column need source locations on SIR nodes, which can follow. The ESP32-S3 refusals (foreign calls, file io) can move onto the same channel.
 
 ---
 
@@ -250,13 +252,13 @@ Each pack is a per-target Silica module, `emitter/<TARGET>/board_pack.silica`, o
 | Privileged boot | who sets MAIR/PTE or IDF cache mode |
 | Fifi (optional, §9.1) | The C runtime that wrapper archives link against, and the trap vector that ends a faulting FFI worker |
 
-The register tables follow the validity rules of device spec §4.9.1 (unique names per device, width 8/16/32/64, aligned offsets, no overlap, a known access mode, non-overlapping windows). The ESP32-S3 pack does not yet list access modes (it records runtime use) and must be extended. The port's emitter refuses a constant `map_device` outside the pack’s windows (the pack is per port, so this check is not in the shared compiler). A pack is how “raw metal” stays typed instead of `uint64` everywhere.
+The register tables follow the validity rules of device spec §4.9.1 (unique names per device, width 8/16/32/64, aligned offsets, no overlap, a known access mode, non-overlapping windows). The ESP32-S3 pack's own tables record the window table and the runtime's use; the access modes live in the generated per-peripheral descriptions under `board/pack/` (`gen_board_pack.py`). The port's emitter refuses a constant `map_device` outside the pack’s windows (the pack is per port, so this check is not in the shared compiler). A pack is how “raw metal” stays typed instead of `uint64` everywhere.
 
 ---
 
 ## 11. Target attention order
 
-From [ROADMAP.md](../../../ROADMAP.md), not a schedule:
+From [ROADMAP.md](../../ROADMAP.md), not a schedule:
 
 1. **ESP32-S3**: Xtensa emit, IDF-style pools, peripheral bus. This path exists and went first.
 2. **QEMU virt AArch64 OS-free**: MAIR, UART MMIO, ELF, no vendor IDF. It is the first board pack of the planned bare-metal AArch64 path, which starts from ESP32-S3's board release (a raw path has no fixed point: the board cannot host a compiler).

@@ -32,13 +32,18 @@ def run_compiler(cwd, log=None, timeout=300):
     """Run the compiler in cwd with the exit-75 reclaim loop.  Returns exit code.
     When log is given, stdout+stderr are appended to that file exactly like the
     Makefiles do (shell redirection to a file)."""
+    for marker in ("silica.compile.inprogress", "silica.compile.crashed"):
+        try:
+            os.remove(os.path.join(cwd, marker))
+        except OSError:
+            pass
     while True:
         if log:
             with open(log, "ab") as fh:
                 p = subprocess.run([COMPILER], cwd=cwd, stdout=fh, stderr=subprocess.STDOUT, timeout=timeout)
         else:
             p = subprocess.run([COMPILER], cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
-        if p.returncode == 75:
+        if p.returncode in (75, 76):
             continue
         return p.returncode
 
@@ -274,6 +279,26 @@ def process(manifest_path, report_path, out_root, jobs=8, areas=None):
                         nxt.append(c)
             active = nxt
         print(f"   pairs kept: {len(kept)}/{len(ok_cases)}", flush=True)
+        if os.environ.get("M_SHAPE", "1") != "0":
+            # item M: the supervisor-actor shape (shape_stage.py), re-verified with this compiler
+            import shape_stage
+            pairs = [{"stem": c["stem"], "src": c["src"], "scout": c["out"] + str(c["exit"]) + "\n",
+                      "fail_src": c["_fail"]["src"], "fail_code": c["_fail"]["code"], "old_golden": None}
+                     for c in kept]
+            shaped = {r["stem"]: r for r in shape_stage.shape_area(area, pairs, extra)}
+            still = []
+            for c in kept:
+                r = shaped.get(c["stem"])
+                if not r or not r["ok"] or "golden" not in r:
+                    report["dropped_success"].append({"stem": c["stem"], "area": area,
+                                                      "why": "item M shape: " + (r or {}).get("why", r and r.get("fail_left", "?") or "?")})
+                    continue
+                c["src"], c["_sams"] = r["src"], r["sams"]
+                c["_fail"] = dict(c["_fail"], src=r["fail_src"])
+                c["_golden"] = r["golden"]
+                still.append(c)
+            kept = still
+            print(f"   pairs in the item M shape: {len(kept)}", flush=True)
         # write outputs
         adir = os.path.join(out_root, area)
         edir = os.path.join(out_root, "error_enforcement_addition")

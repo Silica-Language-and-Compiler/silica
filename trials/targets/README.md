@@ -64,7 +64,10 @@ Then, for each suite, [board_suite.sh](board_suite.sh):
    to flash), and compares its output and exit status with the trial's `.scout`, as the host does
    (`diff -Bw`; through the suite's `compare_scout_multiset.sh` for a trial marked
    `<stem>.scout.multiset`, whose actor failure reports are compared as a set with their pointers
-   folded; through the suite's `compare_scout_normalized.sh` when it has one: that folds the
+   folded (in supervisors_addition, record_shapes_actors_addition and device_actor_addition that
+   script is `../compare_scout_unordered.sh`: the FailureReporter prints reports asynchronously, so
+   report blocks and the other lines are both compared as multisets, the exit status last and
+   exact; the marker is honoured for a `<stem>.<target>.scout` golden too); through the suite's `compare_scout_normalized.sh` when it has one: that folds the
    addresses in a process-fatal report line, `[silica] fault at <PTR>` / `[silica] abort: <reason> at
    <PTR>`, which differ between the board and the host; see
    [runtime_failure_reporting.md](../../compiler/design_documents/runtime_failure_reporting.md)).

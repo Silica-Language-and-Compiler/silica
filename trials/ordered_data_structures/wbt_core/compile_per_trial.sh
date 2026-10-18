@@ -85,6 +85,7 @@ run_compiler() {
 	expected_units=$2
 	prev_left=-1
 	stalls=0
+	rm -f silica.compile.inprogress silica.compile.crashed
 	while true; do
 		set +e
 		"${SILICA_COMPILER}"
@@ -93,7 +94,7 @@ run_compiler() {
 		if [ "$ec" -eq 0 ]; then
 			return 0
 		fi
-		if [ "$ec" -eq 75 ]; then
+		if [ "$ec" -eq 75 ] || [ "$ec" -eq 76 ]; then
 			if [ -s silica.compile.order ]; then
 				left=$(grep -c '.' silica.compile.order)
 			elif [ -f silica.compile.order ]; then

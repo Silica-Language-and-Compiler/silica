@@ -27,6 +27,7 @@ export emit_var/2;
 export emit_var_reg/3;
 export emit_var_reg_outer/4;
 export strip_mov_x2_x1_then_x1_x2/1;
+export strip_mov_x2_x1_then_x1_x2_at_seams/3;
 export emit_var_sp_load/2;
 export emit_ldr_mem_ref/2;
 export emit_str_mem_ref/2;
@@ -50,6 +51,8 @@ export reg_offset_for_index/2;
 export reg_binding/2;
 export extract_sp_bindings/1;
 export is_reg_bound/2;
+export mov_imm_wide/2;
+export free_literal_pool_ptr_reg/2;
 export reg_reserved_as_sret_buffer/2;
 export next_free_int_reg/1;
 export find_last_sp_binding/2;
@@ -315,6 +318,31 @@ fn parse_x29_neg_offset_bytes(mem_ref: string) -> int64 {
     }
 }
 
+
+// MOV reg, #n for a non-negative frame offset or byte count of any size. MOV's immediate is a 16-bit
+// value (or a bitmask pattern), so `MOV X16, #76656` -- a 77 KB frame built by a large list literal --
+// does not assemble: past 65535 the value is MOVZ'd and MOVK'd 16 bits at a time.
+fn mov_imm_wide(reg: string, n: int64) -> string {
+    case n <= 65535 of {
+        true -> concat(concat(concat("    MOV ", reg), ", #"), concat(atom_table@int64_to_decimal_string(n), "\n"));
+        false -> concat(concat(concat(concat("    MOVZ ", reg), ", #"), concat(atom_table@int64_to_decimal_string(n % 65536), "\n")), movk_chunks_wide(reg, n / 65536, 16))
+    }
+}
+
+fn movk_chunks_wide(reg: string, rest: int64, shift: int64) -> string {
+    case rest == 0 of {
+        true -> "";
+        false -> {
+            chunk: int64 <- rest % 65536;
+            line: string <- case chunk == 0 of {
+                true -> "";
+                false -> concat(concat(concat(concat("    MOVK ", reg), ", #"), atom_table@int64_to_decimal_string(chunk)), concat(", LSL #", concat(atom_table@int64_to_decimal_string(shift), "\n")))
+            };
+            concat(line, movk_chunks_wide(reg, rest / 65536, shift + 16))
+        }
+    }
+}
+
 fn emit_x16_addr_fp_minus(offset: int64) -> string {
     case offset <= 4095 of {
         true -> concat("    SUB X16, X29, #", concat(atom_table@int64_to_decimal_string(offset), "\n"));
@@ -388,7 +416,7 @@ fn fp_offset_for_byte(byte_off: int64, adj: int64, spd: int64) -> string {
 // stops at 4095, so deeper frames put the displacement in a register first.
 fn fp_ptr_to_region(dest: string, n: int64) -> string {
     case n > 4095 of {
-        true -> concat("    MOV X17, #", concat(atom_table@int64_to_decimal_string(n), concat("\n    SUB ", concat(dest, ", X29, X17"))));
+        true -> concat(mov_imm_wide("X17", n), concat("    SUB ", concat(dest, ", X29, X17")));
         false -> concat("    SUB ", concat(dest, concat(", X29, #", atom_table@int64_to_decimal_string(n))))
     }
 }
@@ -887,6 +915,46 @@ fn strip_mov_x2_x1_then_x1_x2(s: string) -> string {
     }
 }
 
+// The same strip at a let's seams only. A let's text is its own prefix (the RHS and its spills),
+// the body the inner terms emitted, and a tail (promotion, region and heap releases). Every inner
+// let already stripped its own text, so a new pair can sit only in the prefix, across the seam
+// where the body starts, or across the seam where the tail starts: those windows are scanned, the
+// body never is. Scanning the whole let at every level cost a chain of n lets n^2 text
+// (actor_registration_addition/registry_many_names: 883 s of Xtensa emission, 67 s of AArch64).
+// Every pair in a window goes, so the invariant holds for the enclosing let.
+fn strip_mov_x2_x1_then_x1_x2_at_seams(prefix: string, body: string, tail: string) -> string {
+    old: string <- "    MOV X2, X1\n    MOV X1, X2\n";
+    replacement: string <- "    MOV X2, X1\n\n";
+    joined: string <- concat(concat(prefix, body), tail);
+    head_done: string <- strip_all_in_window(joined, old, replacement, 0, length_bytes(prefix));
+    tail_from: int64 <- length_bytes(head_done) - length_bytes(tail) - (length_bytes(old) - 1);
+    tail_start: int64 <- case tail_from < 0 of { true -> 0; false -> tail_from };
+    strip_all_in_window(head_done, old, replacement, tail_start, length_bytes(head_done))
+}
+
+// Replace every `old` that starts at a position in [start, limit] of s.
+fn strip_all_in_window(s: string, old: string, replacement: string, start: int64, limit: int64) -> string {
+    pos: int64 <- find_str_at_bounded(s, old, start, limit);
+    case pos < 0 of {
+        true -> s;
+        false -> {
+            next: string <- concat(substring(s, 0, pos), concat(replacement, substring(s, pos + length_bytes(old), length_bytes(s))));
+            strip_all_in_window(next, old, replacement, pos + length_bytes(replacement), limit - length_bytes(old) + length_bytes(replacement))
+        }
+    }
+}
+
+// find_str_at that gives up once start passes limit.
+fn find_str_at_bounded(haystack: string, needle: string, start: int64, limit: int64) -> int64 {
+    case start > limit or start + length_bytes(needle) > length_bytes(haystack) of {
+        true -> -1;
+        false -> case match_prefix_at(haystack, needle, start) of {
+            true -> start;
+            false -> find_str_at_bounded(haystack, needle, start + 1, limit)
+        }
+    }
+}
+
 // Emit MOV dest, reg (or FMOV for float64/float32) when var is a let-bound variable (value already in reg).
 // When dest == reg, emit nothing (no-op elimination).
 // Phase E (task e2b): if `reg` is actually a %-prefixed SIR name (e.g. `%worker`) rather than an AArch64
@@ -1012,6 +1080,30 @@ fn is_reg_bound(outer_reg: string, reg: string) -> boolean {
 
 // Return the first integer register not already bound in outer_reg.
 // Scans X0-X7 then X9-X11, X13-X15 (skipping X8 = indirect call scratch, X12 = saved tuple ptr).
+
+// The literal-pool address register for a float constant: reg_conventions' choice unless a binding
+// holds it. A record-pattern field bound to X0 (`{ x: a, y: b }` over float64 fields) was overwritten
+// by `ADRP X0, L_f64_n` when the arm compared `a + b` with a literal; the next unbound of X11, X13,
+// X14, X15 (X17 when all are bound) takes the address instead. The register is dead after the LDR.
+fn free_literal_pool_ptr_reg(outer_reg: string, preferred: string) -> string {
+    case is_reg_bound(outer_reg, preferred) of {
+        false -> preferred;
+        true -> case is_reg_bound(outer_reg, "X11") of {
+            false -> "X11";
+            true -> case is_reg_bound(outer_reg, "X13") of {
+                false -> "X13";
+                true -> case is_reg_bound(outer_reg, "X14") of {
+                    false -> "X14";
+                    true -> case is_reg_bound(outer_reg, "X15") of {
+                        false -> "X15";
+                        true -> "X17"
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn next_free_int_reg(outer_reg: string) -> string {
     case is_reg_bound(outer_reg, "X0") == false of {
         true -> "X0";

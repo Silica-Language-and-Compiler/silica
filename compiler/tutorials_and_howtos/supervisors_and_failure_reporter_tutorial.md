@@ -86,7 +86,7 @@ Each `child_spec` carries at minimum:
 - `agent_type` — the atom passed as the third argument to `spawn_linked`.
 - `start` — a `(initial_state, behavior_fn)` pair used to (re-)spawn the child.
 - `restart` — one of `:permanent`, `:temporary`, or `:transient`.
-- `shutdown` — maximum milliseconds to wait for orderly shutdown.
+- `shutdown` — `0` kills the child; greater than `0` is an orderly shutdown, with that many milliseconds as the limit (not yet enforced; see 2.4).
 
 | Restart policy | When the runtime restarts the child |
 |----------------|-------------------------------------|
@@ -94,7 +94,23 @@ Each `child_spec` carries at minimum:
 | `:transient`   | Only on abnormal exits; normal exits are not restarted. |
 | `:temporary`   | Never restarted. |
 
-### 2.3 Ad-hoc linked children
+### 2.3 Shutdown
+
+When a supervisor ends, for any reason, it first shuts down its live children, so a subtree never outlives its supervisor.
+This holds when its own supervisor terminates it, when it exceeds its restart limit, and when a restart strategy
+restarts it. The children are stopped one at a time, last child row first, and the supervisor waits for each. A child
+supervisor stops its own children before it ends. Each child's registered names are freed before the parent hears of
+the exit and may restart it.
+
+A child with `shutdown: 0` is killed and reports reason tag 1. A child with `shutdown > 0` finishes its current message
+and ends with `(:explicit, :shutdown)`, reason tag 4. Each shut-down child produces a failure report like any other death.
+
+### 2.4 Shutdown time limit
+
+The `shutdown` time limit is not enforced yet. Nothing preempts a running message, so a child always finishes its
+current message before it stops (as with `kill_abnormal`).
+
+### 2.5 Ad-hoc linked children
 
 A supervisor may also call `spawn_linked` directly in its behavior function
 without a `child_spec` row.  The child is still linked and exit notifications
@@ -222,7 +238,13 @@ directly rather than requiring the bridge to construct them.
 
 The `FailureReporter` actor **must be started and registered before any other
 actor**.  Registration queries `region_dump_limit()` immediately and caches the
-value.
+value.  The compiler enforces the order
+(spec §15.4.13.4): in `main`'s order of execution, `register_failure_reporter`
+must run before any `spawn*` call, in `main` or in any function `main` calls.
+A start that can run earlier is rejected with **E2236 StartBeforeFailureReporter**.
+The one exemption is the reporter's own `spawn`, when it is written as the
+argument of `register_failure_reporter` or bound to a name the same function
+then registers.
 
 ```silica
 fn main() -> int64 {
@@ -363,6 +385,7 @@ usefulness against the memory overhead of keeping report payloads in the
 
 The following example demonstrates three children failing under a single
 supervisor, with a `FailureReporter` that prints each full report to stderr.
+`main` registers the reporter before it spawns the supervisor, as E2236 requires.
 This is the `phase_f9_multi_fail_full_report` trial.
 
 ```silica

@@ -31,13 +31,15 @@ define APP_INTEGRATE_BODY
 	@# -n as well as -f: without it, BSD ln follows an existing symlink-to-directory and
 	@# writes the new link INSIDE the fixtures directory, which corrupts the fixtures for
 	@# every other app in the suite.
-	@ln -sfn "$(FFI_SOURCE_VIEW)" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
+	@# Relative when the view sits beside the app (every app under ffi_addition/), so a tree
+	@# synced to another host does not carry a link into this host's absolute path.
+	@ln -sfn "$(patsubst $(abspath $(APP_TRIAL_DIR)/..)/%,../%,$(FFI_SOURCE_VIEW))" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
 	@test -f "$(FFI_LEGACY_ARCHIVE)" || { echo "  ❌ $(APP_LABEL): missing $(FFI_LEGACY_ARCHIVE) (run make fixtures)"; exit 1; }
 	@for ar in $(FFI_WRAPPER_ARCHIVES); do \
 		test -f "$$ar" || { echo "  ❌ $(APP_LABEL): missing wrapper archive $$ar (run make fixtures)"; exit 1; }; \
 	done
 	@cd "$(APP_TRIAL_DIR)" && rm -f *.sams *.o *.iface $(APP_EXECUTABLES) silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms
-	@cd "$(APP_TRIAL_DIR)" && find "$(APP_TRIAL_DIR)" -maxdepth 1 -name '*.silica' | sed "s|^$(APP_TRIAL_DIR)/||" | sort > silica.config
+	@cd "$(APP_TRIAL_DIR)" && find "$(APP_TRIAL_DIR)" -maxdepth 1 -name '*.silica' | sed "s|^$(APP_TRIAL_DIR)/||" | sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
 	@cd "$(APP_TRIAL_DIR)" && if ! { $(RUN_SILICA_COMPILER); }; then echo "❌❌ $(APP_LABEL): compilation failed"; $(INTEGRATE_DOT_FAIL); printf '%d %d\n' 0 1 > .integrate_counts; exit 1; fi
 	@failed=0; ok=0; ko=0; \
 	cd "$(APP_TRIAL_DIR)"; \
@@ -89,8 +91,10 @@ define APP_INTEGRATE_BODY
 	done; \
 	for trial in $(APP_EXECUTABLES); do \
 		[ "$$failed" -ne 0 ] && break; \
+		[ -n "$$tsa_done" ] || { $(TRIAL_SUPPORT_ASSEMBLE); tsa_done=1; }; \
 		runtime_obj=""; \
 		[ -f __silica_runtime.o ] && runtime_obj=__silica_runtime.o; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$trial.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 			objs="$$trial.o $(APP_LINK_OBJECTS)"; \
 			if ! "$(RUST_LLD)" -flavor darwin -o "$$trial" $$objs $$runtime_obj $$link_archives $(LDFLAGS_rust-lld); then \

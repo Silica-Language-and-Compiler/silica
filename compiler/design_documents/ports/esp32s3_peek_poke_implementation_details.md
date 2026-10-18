@@ -5,6 +5,7 @@ section numbers here follow that plan's work items where they overlap. This is a
 shared change it needs, not a specification: where it disagrees with
 [silica_device_actor_specification.md](../silica_device_actor_specification.md) or
 [porting_for_os_free_targets.md](../porting_for_os_free_targets.md) §5, those win.
+**Implementation status (2026-10-16):** the design below is implemented as described in the plan's status table, with these differences from the text: the SIR lowering lives in `sir_generator/terms/sir_device_calls.silica`; the emitter copy of the board pack is `emitter/ESP32-S3_raw/board_pack.silica` (12 windows, with a generated per-peripheral register layer under `board/pack/`); only 32-bit accesses are lowered; the "today" statements below (codes stopping at E2114, `register_rwr` giving E3005, no diagnostic channel, the `.error`-line refusals) describe 2026-09-29 and are no longer true for the device prims (the codes are E2201 to E2233, `register_rwr` is a built-in effect, `sir_target_verify.silica` is the narrow channel).
 **Ground truth used:** the tree as of 2026-09-29. Every address, instruction, and file position below is cited to a
 file in `compiler/src/` (paths relative to it unless they start with `trials/` or `compiler/`) or to a spec section.
 Statements drawn from the Xtensa ISA or the ESP32-S3 Technical Reference Manual rather than from this tree are marked

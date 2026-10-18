@@ -44,7 +44,7 @@ integrate-run: fixtures
 	@cd "$(APP_TRIAL_DIR)" && { \
 		find "$(APP_TRIAL_DIR)" -maxdepth 1 -name '*.silica' | sed "s|^$(APP_TRIAL_DIR)/||" | sort; \
 		echo "../../../compiler/stdlib/Supervisor.silica"; \
-	} > silica.config
+	} > silica.config && $(TRIAL_PRIVATE_SUPERVISOR)
 	@$(ENSURE_SILICA_COMPILER)
 	@cd "$(APP_TRIAL_DIR)" && if ! { $(RUN_SILICA_COMPILER); }; then echo "❌❌ $(APP_LABEL): compilation failed"; $(INTEGRATE_DOT_FAIL); printf '%d %d\n' 0 1 > .integrate_counts; exit 1; fi
 	@failed=0; ok=0; ko=0; \

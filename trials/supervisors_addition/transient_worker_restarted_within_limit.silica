@@ -1,0 +1,85 @@
+// A supervisor restarts its own children on their deaths, within its restart limit (§15.4.13.2),
+// with no help from outside: no actor sends it a restart message and none polls it. The root
+// supervisor allows one restart; its child :inner is a :permanent supervisor that allows none
+// (traits/RestartWithinLimitInnerSup.silica), and :inner's one child, :divider, dies on the 0 that
+// `main` sends it. :divider's death breaches :inner's limit, so :inner fails; the root supervisor
+// restarts :inner, whose start function runs again. Each start tells the :starts counter, which
+// ends the program with status 0 at the second. The FailureReporter (§15.4.13.4) takes the unwind
+// reports of :divider and :inner and prints nothing for them; it would end the program with
+// status 1 on the root supervisor's own report.
+//
+// :inner is :permanent, not :transient: on the Mac (2026-10-10) a supervisor that ends on a
+// restart-limit breach writes reason_tag 0 in its report, and a :transient :inner was not restarted,
+// so its end was taken for a normal one. That is an open runtime question, not this trial's subject.
+use Supervisor;
+use RestartWithinLimitInnerSup;
+
+impl TransientRestartWithinLimitSup for Supervisor;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// a null pointer prints as 0x0 on Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn handle_report(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> {
+                _: atom <- println("root supervisor failure reported; exiting");
+                cast_exit(1)
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn starts_beh(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        count: int64 <- state + 1;
+        _: atom <- println("inner supervisor started");
+        _: boolean <- case count == 2 of {
+            true -> {
+                _: atom <- println("restarted by its own supervisor after its child's crash");
+                cast_exit(0)
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, count)
+    end
+}
+
+// The root: one restart allowed.
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 1, restarts_time_frame: 2000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :inner, agent_type: :supervisor, initial_state: 0, behavior: RestartWithinLimitInnerSup@RestartWithinLimitInnerSup_child_start, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        reporter: actor_ref <- spawn(0, handle_report, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter);
+        _: actor_ref <- spawn_registered(0, starts_beh, :starts, stack_policy(0, :keep_last_message));
+        _: supervisor_ref <- spawn_registered_supervisor(TransientRestartWithinLimitSup, 0, :trial_supervisor, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_registered(:divider, 0 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

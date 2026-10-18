@@ -21,7 +21,7 @@ silica.config:
 		echo "../../../compiler/stdlib/Register32.silica"; \
 		echo "../../../compiler/stdlib/Register16.silica"; \
 		echo "device_peek_marker_width.silica"; \
-	} > silica.config
+	} > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 check: silica.config
 	@cd "$(THIS_DIR)" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(COMPILER)); } > $(MAIN).cur_fail 2>&1 || true

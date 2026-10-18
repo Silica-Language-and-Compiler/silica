@@ -1,6 +1,6 @@
 # `linux_aarch64` port checklist
 
-**Status:** In progress (2026-09-11). `src/emitter/linux_aarch64/` exists: syntax, symbols, syscalls, runtime shims and the fault bridge are ported (see its `README.md`); `src/Makefile` builds on a Linux host. Gates G0 (golden-file axis) and G2+ (running on the Pi) are not done. This document is a **checklist for one hosted port**, not a specification. Where it disagrees with [silica-specification.md](../silica-specification.md), the specification wins.
+**Status:** Done through G7; this document is now the record of how the port was made (2026-10-16). `src/emitter/linux_aarch64/` is complete and self-hosts on the Pi: the fixed-point log of the 2026-10-16 build (`/Volumes/2T/silica_builds/20261016-052517/remote-linux_aarch64.log`) ends "349 units compared, 0 emitted differently by gen2 than by gen1 ... gen3 is byte-identical to gen2". The Linux AArch64 goldens are `<stem>.linux_aarch64.ascomp` beside the shared `.scout` files (§4). Later chunks are built in lock-step with Apple Silicon ([ROADMAP.md](../../../ROADMAP.md)); builds, fixed points and trial runs on the Pi go through `programmer_tools/` (`build_all_platforms.sh`, `rebuild_refresh_verify.sh`, `sync_to_hosts.sh`). The sections below keep the pre-port inventory and the measurements of 2026-09-11 (counts of sites and goldens are as measured then), and the original gate plan. This document is a **checklist for one hosted port**, not a specification. Where it disagrees with [silica-specification.md](../silica-specification.md), the specification wins.
 
 **Audience:** whoever adds `emitter/linux_aarch64/` and brings a self-hosting `silica-compiler` up on 64-bit Raspberry Pi OS (or any Debian-family AArch64 host).
 
@@ -14,7 +14,7 @@
 | [execution-environments-hosted-vs-bare-metal.md](../execution-environments-hosted-vs-bare-metal.md) | Why a hosted port makes **no** per-`Space` hardware promise |
 | [memory-effects-aarch64-implementation-plan.md](../memory-effects-aarch64-implementation-plan.md) | `Space` mapping; on hosted Linux the kernel owns the policy |
 | [silica-compiler-code-organization.md](../silica-compiler-code-organization.md) | Where emitter sources live |
-| [ROADMAP.md](../../../../ROADMAP.md) | Ranks Linux AArch64 first in the attention order |
+| [ROADMAP.md](../../../ROADMAP.md) | Ranks Linux AArch64 first in the attention order |
 
 ---
 
@@ -24,7 +24,7 @@
 
 **Out of scope, deliberately:**
 
-- Board packs, linker scripts, reset stubs, volatile MMIO. Hosted Linux is a process under a kernel; none of the [OS-free port](../porting_for_os_free_targets.md) apparatus applies. The one exception: when ESP32-S3 reaches FP1, this emitter must reject the poke prims (`map_device`, `peek`, `poke`) with a compile error, in lock-step with Apple Silicon ([porting_for_os_free_targets.md §5.5](../porting_for_os_free_targets.md)).
+- Board packs, linker scripts, reset stubs, volatile MMIO. Hosted Linux is a process under a kernel; none of the [OS-free port](../porting_for_os_free_targets.md) apparatus applies. The one exception: when ESP32-S3 reaches FP1, this emitter must reject the poke prims (`map_device`, `peek`, `poke`) with a compile error, in lock-step with Apple Silicon ([porting_for_os_free_targets.md §5.5](../porting_for_os_free_targets.md)). *As built:* the shared pre-emit pass `sir_generator/sir_target_verify.silica` reports E2220 through `emitter_core@unsupported_prim_reason`, and the emitter's `terms/prims/prims.silica` catch-all writes an `.error` line naming the prim.
 - Per-`Space` hardware guarantees. On a hosted target `mem(Space)` is discipline and API clarity, not a cache-attribute promise (spec §12.1.1.0).
 - Cross-linking from macOS. §6 avoids needing a cross toolchain at all.
 - 32-bit ARM. `armv7l` is not this port and not on the roadmap.
@@ -44,7 +44,7 @@ Keep the two axes separate — [`src/Makefile`](../../src/Makefile) line ~368 al
 | **Emit target** — what the compiler generates | `emitter/<TARGET>/`, written to `silica.target` | `linux_aarch64` |
 | **Host tag** — where the compiler runs | `binaries/silica-NNNNNN-<platform>` | `debian-aarch64` (already in `CANONICAL_PLATFORMS`) |
 
-`debian-aarch64` is already understood by [`binaries/update_silica_compiler_link.bash`](../../../../binaries/update_silica_compiler_link.bash). No new wiring is needed in either file beyond the deletion above.
+`debian-aarch64` is already understood by [`binaries/update_silica_compiler_link.bash`](../../../binaries/update_silica_compiler_link.bash). No new wiring is needed in either file beyond the deletion above.
 
 ---
 
@@ -144,7 +144,7 @@ A `linux_aarch64` emitter fails all 1357 on day one, **for the right reason**, w
 Required change, in order:
 
 1. **De-duplicate first.** The integrate rule is copy-pasted into **38 near-identical per-trial `Makefile`s** (they differ, so this is 38 edits, not one). Hoist it into a shared include alongside `trials/Makefile` before adding a target axis, or the axis lands 38 times too.
-2. **Add the target axis.** `test.ascomp.linux_aarch64` beside `test.ascomp`, or a per-target subdirectory. Fall back to the unsuffixed name so `apple_silicon_mac` keeps working untouched.
+2. **Add the target axis.** `test.ascomp.linux_aarch64` beside `test.ascomp`, or a per-target subdirectory. Fall back to the unsuffixed name so `apple_silicon_mac` keeps working untouched. *As built:* `<stem>.linux_aarch64.ascomp` (for example `trials/base/test.linux_aarch64.ascomp`), derived by `trials/silica_compiler.mk` as `ASCOMP_EXT`; the Apple goldens keep the plain `.ascomp` name.
 3. **Keep the 1207 `.scout` files shared.** Expected *program output* is target-independent. These are the real cross-target conformance suite and the thing that actually proves the port correct — an emitter can produce entirely different assembly and still be right, and `.scout` is what says so.
 
 Getting this wrong is the highest-cost mistake available in this port: it ends in a 1357-file golden regeneration that nobody can meaningfully review.

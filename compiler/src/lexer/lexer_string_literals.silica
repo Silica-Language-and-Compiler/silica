@@ -19,7 +19,8 @@
 // Supports string literals with Unicode and escape sequences: \\, \', \", \n, \t, \r, \e, \xNN
 // Per language spec §2.2: string_literal ::= "\"" {character | escape_sequence} "\""
 // Character literals use same escape sequences per character_literal grammar
-// UTF-8: advance_utf8_char advances by full character length (1-4 bytes) for multi-byte sequences
+// UTF-8: the source is read one character at a time (substring is character-indexed);
+// each character inside a literal is checked with lexer_core@utf8_char_is_valid.
 
 // Import token kind
 use lexer_token_kind;
@@ -32,39 +33,6 @@ use lexer_integer_literals;
 export read_string_literal/1;
 export read_char_literal/1;
 
-
-{-
-- Returns UTF-8 byte length (1-4) from lead byte. Used to advance past multi-byte characters.
-- 1-byte: 0x00-0x7F; 2-byte: 0xC2-0xDF; 3-byte: 0xE0-0xEF; 4-byte: 0xF0-0xF7; else 1 (fallback).
-- Last-date-modified: 2025-03-03
--}
-fn utf8_lead_byte_length(lead: string) -> int64 {
-    case lead of {
-        "\xC2" -> 2; "\xC3" -> 2; "\xC4" -> 2; "\xC5" -> 2; "\xC6" -> 2; "\xC7" -> 2; "\xC8" -> 2; "\xC9" -> 2;
-        "\xCA" -> 2; "\xCB" -> 2; "\xCC" -> 2; "\xCD" -> 2; "\xCE" -> 2; "\xCF" -> 2; "\xD0" -> 2; "\xD1" -> 2;
-        "\xD2" -> 2; "\xD3" -> 2; "\xD4" -> 2; "\xD5" -> 2; "\xD6" -> 2; "\xD7" -> 2; "\xD8" -> 2; "\xD9" -> 2;
-        "\xDA" -> 2; "\xDB" -> 2; "\xDC" -> 2; "\xDD" -> 2; "\xDE" -> 2; "\xDF" -> 2;
-        "\xE0" -> 3; "\xE1" -> 3; "\xE2" -> 3; "\xE3" -> 3; "\xE4" -> 3; "\xE5" -> 3; "\xE6" -> 3; "\xE7" -> 3;
-        "\xE8" -> 3; "\xE9" -> 3; "\xEA" -> 3; "\xEB" -> 3; "\xEC" -> 3; "\xED" -> 3; "\xEE" -> 3; "\xEF" -> 3;
-        "\xF0" -> 4; "\xF1" -> 4; "\xF2" -> 4; "\xF3" -> 4; "\xF4" -> 4; "\xF5" -> 4; "\xF6" -> 4; "\xF7" -> 4;
-        _: string -> 1
-    }
-}
-
-
-{-
-- Advances the lexer past one UTF-8 character (1-4 bytes). Uses utf8_lead_byte_length on peek_char.
-- For n=1, USE advance() to handle newline in column/line. For n>1, USE advance_by (no newline in continuation bytes).
-- Last-date-modified: 2025-03-03
--}
-fn advance_utf8_char(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } {
-    lead: string <- lexer_core@peek_char(lexer);
-    n: int64 <- utf8_lead_byte_length(lead);
-    case n of {
-        1 -> lexer_core@advance(lexer);
-        _: int64 -> lexer_core@advance_by(lexer, n)
-    }
-}
 
 fn is_simple_string_escape(next: string) -> boolean {
     case next of {
@@ -119,50 +87,76 @@ fn read_string_literal(lexer: { source: string, position: int64, line: int64, co
     sequence
         start_location: { file: string, line: int64, column: int64, offset: int64 } <- lexer_core@current_location(lexer);
         start_pos: int64 <- lexer.position;
-                after_open: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(lexer);
-        (final_lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, ok: boolean) <- read_string_content(after_open, start_pos, start_location);
-        result: ({ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) <- case ok of {
-            true -> {
+        after_open: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(lexer);
+        (final_lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, status: int64) <- read_string_content(after_open);
+        result: ({ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) <- case status of {
+            0 -> {
                 lexeme: string <- lexer_core@extract_lexeme(final_lexer, start_pos);
                 token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_string_literal(), lexeme, start_location);
                 (token, final_lexer)
             };
-            false -> {
-                error_lexeme: string <- lexer_core@extract_lexeme(final_lexer, start_pos);
-                error_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_unknown_char(), error_lexeme, start_location);
-                (error_token, final_lexer)
-            }
+            _: int64 -> (literal_error_token(status, "string", start_location, final_lexer), final_lexer)
         }
     produces
         pure result
     end
 }
 
+// The lexical error for a string or character literal whose reader stopped
+// with `status` (1 end of file, 2 bad escape at `at`, 3 ill-formed UTF-8 at
+// `at`, 4 character literal not closed after its character, 5 empty
+// character literal).
+fn literal_error_token(status: int64, what: string, start_location: { file: string, line: int64, column: int64, offset: int64 }, at: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } {
+    case status of {
+        1 -> lexer_core@lexical_error_token(unterminated_literal_code(what), unterminated_literal_message(what), start_location);
+        2 -> lexer_core@lexical_error_token("E0002", "invalid escape sequence: after '\\' a string or character literal allows only n, t, r, e, \\, ', \" or x followed by two hex digits (spec 2.2.3)", lexer_core@current_location(at));
+        3 -> lexer_core@lexical_error_token("E0007", "invalid UTF-8: the source file must be UTF-8 encoded (spec 2.1), and the bytes here do not form a UTF-8 character", lexer_core@current_location(at));
+        4 -> lexer_core@lexical_error_token("E0004", "unterminated character literal: a character literal holds exactly one character, and no closing \"'\" follows it", start_location);
+        _: int64 -> lexer_core@lexical_error_token("E0004", "empty character literal: a character literal holds exactly one character", start_location)
+    }
+}
+
+// E0003 for a string literal, E0004 for a character literal.
+fn unterminated_literal_code(what: string) -> string {
+    case what of {
+        "string" -> "E0003";
+        _: string -> "E0004"
+    }
+}
+
+fn unterminated_literal_message(what: string) -> string {
+    case what of {
+        "string" -> "unterminated string literal: this '\"' has no closing '\"' before the end of the file";
+        _: string -> "unterminated character literal: this \"'\" has no closing \"'\" before the end of the file"
+    }
+}
 
 {-
-- Recursively reads string content: normal chars, escape sequences, or closing quote.
-- Returns (lexer, ok). ok is false on unterminated string or invalid escape.
+- Reads string content up to and including the closing quote. Returns the lexer
+- after the closing quote with status 0; or status 1 at the end of the source,
+- 2 with the lexer at a backslash that starts no valid escape, 3 with the lexer
+- at an ill-formed UTF-8 character.
 -}
-fn read_string_content(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, start_pos: int64, start_location: { file: string, line: int64, column: int64, offset: int64 }) -> ({ source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, boolean) {
+fn read_string_content(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> ({ source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, int64) {
     sequence
         current: string <- lexer_core@peek_char(lexer);
-        result: ({ source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, boolean) <- case current of {
-            "" -> (lexer, false);
-            "\"" -> {
-                after_close: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(lexer);
-                (after_close, true)
-            };
+        result: ({ source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, int64) <- case current of {
+            "" -> (lexer, 1);
+            "\"" -> (lexer_core@advance(lexer), 0);
             "\\" -> {
                 after_backslash: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(lexer);
                 (after_escape: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, ok_escape: boolean) <- advance_past_string_escape(after_backslash);
                 case ok_escape of {
-                    true -> read_string_content(after_escape, start_pos, start_location);
-                    false -> (after_backslash, false)
+                    true -> read_string_content(after_escape);
+                    false -> case lexer_core@peek_char(after_backslash) == "" of {
+                        true -> (after_backslash, 1);
+                        false -> (lexer, 2)
+                    }
                 }
             };
-            _: string -> {
-                advanced: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- advance_utf8_char(lexer);
-                read_string_content(advanced, start_pos, start_location)
+            _: string -> case lexer_core@utf8_char_is_valid(current) of {
+                true -> read_string_content(lexer_core@advance(lexer));
+                false -> (lexer, 3)
             }
         }
     produces
@@ -170,83 +164,58 @@ fn read_string_content(lexer: { source: string, position: int64, line: int64, co
     end
 }
 
-
-{-
-- Reads a character literal from the current lexer position. Expects opening "'" already seen.
-- Advances past the opening quote, reads one character (or escape SEQUENCE), then expects closing "'".
-- Escape sequences: \\, \', \", \n, \t, \r. Lexeme is the raw source text including quotes.
-- Example: lexer at "'" of "'a'" — returns ({ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } char_literal "'a'", lexer past closing quote).
-- Example: lexer at "'" of "'\\n'" — consumes \n as escape, returns token with lexeme "'\\n'".
-- Time: O(1), Ω(1), Θ(1). Space: O(1), Ω(1), Θ(1).
-- Last-date-modified: 2025-02-27
--}
 fn read_char_literal(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> ({ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) {
     sequence
         start_location: { file: string, line: int64, column: int64, offset: int64 } <- lexer_core@current_location(lexer);
-            start_pos: int64 <- lexer.position;
-            
-            // Advance past opening quote
-            after_open: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(lexer);
-            current: string <- lexer_core@peek_char(after_open);
-        result: ({ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) <- case current of {
-                "" -> {
-                    error_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_unknown_char(), "", start_location);
-                    (error_token, after_open)
-                };
-                "'" -> {
-                    // Empty char or closing quote too soon - error
-                    error_lexeme: string <- lexer_core@extract_lexeme(after_open, start_pos);
-                    error_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_unknown_char(), error_lexeme, start_location);
-                    (error_token, after_open)
-                };
-                "\\" -> {
-                    // Escape sequence
-                    after_backslash: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(after_open);
-                    (after_escape: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, ok_escape: bool) <- advance_past_string_escape(after_backslash);
-                    case ok_escape of {
-                        true -> {
-                            closing: string <- lexer_core@peek_char(after_escape);
-                            case closing of {
-                                "'" -> {
-                                    after_close: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(after_escape);
-                                    lexeme: string <- lexer_core@extract_lexeme(after_close, start_pos);
-                                    token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_char_literal(), lexeme, start_location);
-                                    (token, after_close)
-                                };
-                                _: string -> {
-                                    error_lexeme: string <- lexer_core@extract_lexeme(after_escape, start_pos);
-                                    error_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_unknown_char(), error_lexeme, start_location);
-                                    (error_token, after_escape)
-                                }
-                            }
-                        };
-                        false -> {
-                            error_lexeme: string <- lexer_core@extract_lexeme(after_backslash, start_pos);
-                            error_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_unknown_char(), error_lexeme, start_location);
-                            (error_token, after_backslash)
-                        }
-                    }
-                };
-                _: string -> {
-                    // Normal character (including multi-byte UTF-8) - advance past full character, expect closing quote
-                    after_char: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- advance_utf8_char(after_open);
-                    closing: string <- lexer_core@peek_char(after_char);
-                    case closing of {
-                        "'" -> {
-                            after_close: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(after_char);
-                            lexeme: string <- lexer_core@extract_lexeme(after_close, start_pos);
-                            token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_char_literal(), lexeme, start_location);
-                            (token, after_close)
-                        };
-                        _: string -> {
-                            error_lexeme: string <- lexer_core@extract_lexeme(after_char, start_pos);
-                            error_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_unknown_char(), error_lexeme, start_location);
-                            (error_token, after_char)
-                        }
-                    }
-                }
-            }
+        start_pos: int64 <- lexer.position;
+        after_open: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(lexer);
+        (after_body: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, status: int64) <- read_char_body(after_open);
+        result: ({ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) <- case status of {
+            0 -> {
+                lexeme: string <- lexer_core@extract_lexeme(after_body, start_pos);
+                (lexer_core@make_token(lexer_token_kind@token_kind_char_literal(), lexeme, start_location), after_body)
+            };
+            _: int64 -> (literal_error_token(status, "character", start_location, after_body), after_body)
+        }
     produces
         pure result
     end
+}
+
+// Reads one character (or escape) and the closing quote; statuses as in
+// literal_error_token, 0 with the lexer after the closing quote.
+fn read_char_body(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> ({ source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, int64) {
+    sequence
+        current: string <- lexer_core@peek_char(lexer);
+        result: ({ source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, int64) <- case current of {
+            "" -> (lexer, 1);
+            "'" -> (lexer, 5);
+            "\\" -> {
+                after_backslash: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(lexer);
+                (after_escape: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, ok_escape: boolean) <- advance_past_string_escape(after_backslash);
+                case ok_escape of {
+                    true -> char_closing_quote(after_escape);
+                    false -> case lexer_core@peek_char(after_backslash) == "" of {
+                        true -> (after_backslash, 1);
+                        false -> (lexer, 2)
+                    }
+                }
+            };
+            _: string -> case lexer_core@utf8_char_is_valid(current) of {
+                true -> char_closing_quote(lexer_core@advance(lexer));
+                false -> (lexer, 3)
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+fn char_closing_quote(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> ({ source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, int64) {
+    closing: string <- lexer_core@peek_char(lexer);
+    case closing of {
+        "'" -> (lexer_core@advance(lexer), 0);
+        "" -> (lexer, 1);
+        _: string -> (lexer, 4)
+    }
 }

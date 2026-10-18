@@ -1,5 +1,7 @@
 # Embedded Actor Runtime (RTOS)
 
+> **Implementation status (2026-10-16).** Design only. No Silica target runs on an RTOS: the targets are three OS-hosted ports (Apple Silicon macOS, Linux AArch64, Linux x86-64) and the OS-free ESP32-S3_raw port, whose runtime (`rt_actors.S`) is a cooperative per-core scheduler with its own mailboxes, not RTOS tasks. There is no actor-per-RTOS-task mapping, no RTOS mailbox primitive use and no `L_ipc` static mailbox region in the compiler or runtimes. The wire record below is illustrative.
+
 ## Purpose
 
 This document describes an Erlang-inspired actor runtime for embedded systems running a Real-Time Operating System (RTOS).
@@ -82,7 +84,7 @@ Many actors may send messages.
 +---------+---------+----------+----------+
 ```
 
-Suggested wire record (selfhost dialect: inline record type, bound to a variable)
+Suggested wire record (an inline record type, bound to a variable)
 
 ```silica
 // L_ipc: static lifetime for mailbox storage (RTOS actor region)

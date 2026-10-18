@@ -1,12 +1,14 @@
 # HIGH PRIORITY — addendum (2026-09-09): two more silent miscompilations
 
+**Implementation status (2026-10-16):** both A7 and A8 are fixed. They are pinned by the installed trials `train_defect_a7_*` (one per integer width, in `int8_addition` ... `uint64_addition`) and `train_defect_a8_compound_compare_float32_0001` / `_float64_0001` (`float32_addition`, `float64_addition`); the `.sout` of each equals its hand-derived `.scout`. The fixes (operand staging in `left_reg`, quotient scratch X16, right-first with spill for a float prim on the left) landed in `emitter/*/terms/` and are described in [compiler_defects_execution_status_2026-09-10.md](./compiler_defects_execution_status_2026-09-10.md). The text below is the original report.
+
 Companion to [HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md](./HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md).
 Kept as a separate file because the main document was open in an editor when these were
 found; fold A7 and A8 into Part A of the main document when convenient. Both were found by
 the second batch of `train_*` trial generation (25 of 5,250 candidates were rejected because
 their output was wrong; every rejected program is one of these two shapes). Same seed
 compiler as before, `binaries/silica-compiler` → `silica-999994-macos-applesilicon`.
-Neither is pinned by an installed trial.
+Neither was pinned by an installed trial at the time (both are now).
 
 ## A7. A parenthesised right operand that reads a parameter sees the left operand's value instead
 

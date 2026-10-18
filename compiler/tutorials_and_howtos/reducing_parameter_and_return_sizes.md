@@ -462,11 +462,24 @@ fn weather_station(reading: int64, stats: { count: int64, total: int64, largest:
 }
 ```
 
-`main` holds only an `actor_ref` and sends one number per message:
+`main` holds only an `actor_ref` and sends one number per message. It first registers a FailureReporter, the actor that receives every failure report; the compiler requires that registration to run before `main` starts any other actor (spec §15.4.13.4, error E2236). The reporter's own `spawn`, written as `register_failure_reporter`'s argument, is the one start allowed before it:
 
 ```silica
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        _: atom <- println_stderr(report)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
+        _: atom <- register_failure_reporter(spawn(0, reporter, stack_policy(0, :keep_last_message)));
         station: actor_ref <- spawn({ count: 0, total: 0, largest: 0, smallest: 1000, last: 0 }, weather_station, stack_policy(0, :keep_last_message));
         _: int64 <- call(station, 12 impl ActorMessage {});
         _: int64 <- call(station, 30 impl ActorMessage {});

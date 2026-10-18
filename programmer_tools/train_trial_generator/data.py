@@ -153,7 +153,7 @@ def t_str_predicate(rng, area):
         val = s.endswith(needle)
     kind = rng.choice(["print", "case"])
     if kind == "print":
-        stmts = [f"s: string <- {s_lit(s)}", f"result: atom <- print_bool({fn}(s, {s_lit(needle)}))"]
+        stmts = [f"s: string <- {s_lit(s)}", f"result: atom <- print_boolean({fn}(s, {s_lit(needle)}))"]
         body = seq_block(["device_io"], stmts, "result", rng.randint(0, 2))
         hdr = f"// {fn} prints {str(val).lower()}"
         src = program(f"fn main() -> atom {{\n{body}\n}}", header=hdr)
@@ -582,7 +582,7 @@ def t_tuple_mixed_print(rng, area):
     order = rng.choice(["nsb", "sna", "bns"])
     if order == "nsb":
         tty, tup, pat = "(int64, string, boolean)", f"({n}, {s_lit(s)}, {str(b).lower()})", "(k: int64, name: string, flag: boolean)"
-        prints = ["print_int64(k)", "print_string(name)", "print_bool(flag)"]
+        prints = ["print_int64(k)", "print_string(name)", "print_boolean(flag)"]
         out = f"{n}\n{s}\n{str(b).lower()}\n"
     elif order == "sna":
         tty, tup, pat = "(string, int64, atom)", f"({s_lit(s)}, {n}, :{at})", "(name: string, k: int64, tag: atom)"
@@ -590,7 +590,7 @@ def t_tuple_mixed_print(rng, area):
         out = f"{s}\n{n}\n:{at}\n"
     else:
         tty, tup, pat = "(boolean, int64, string)", f"({str(b).lower()}, {n}, {s_lit(s)})", "(flag: boolean, k: int64, name: string)"
-        prints = ["print_bool(flag)", "print_int64(k)", "print_string(name)"]
+        prints = ["print_boolean(flag)", "print_int64(k)", "print_string(name)"]
         out = f"{str(b).lower()}\n{n}\n{s}\n"
     stmts = [f"t: {tty} <- {tup}", f"{pat} <- t"]
     for p in prints:
@@ -600,7 +600,7 @@ def t_tuple_mixed_print(rng, area):
     src = program(f"fn main() -> atom {{\n{body}\n}}", header=hdr)
     c = Case(area, "mixed", src, out, 2)
     c.info["names"] = ["t", "k", "name", "flag", "tag"]
-    c.info["fnames"] = ["print_int64", "print_string", "print_bool", "print_atom"]
+    c.info["fnames"] = ["print_int64", "print_string", "print_boolean", "print_atom"]
     c.info["has_seq"] = True
     c.add_fail("E2003", "string element printed with print_int64", rep(src, "print_string(name)", "print_int64(name)", 1))
     c.add_fail("E2005", "decomposition pattern element types in the wrong order",
@@ -838,13 +838,13 @@ def t_rec_mixed_print(rng, area):
     active = rng.choice([True, False])
     RT = "{ name: string, age: int64, active: boolean }"
     stmts = [f"person: {RT} <- {{ name: {s_lit(name)}, age: {age}, active: {str(active).lower()} }}",
-             "print_string(person.name)", 'println("")', "print_int64(person.age)", 'println("")', "print_bool(person.active)", 'println("")']
+             "print_string(person.name)", 'println("")', "print_int64(person.age)", 'println("")', "print_boolean(person.active)", 'println("")']
     body = seq_block(["device_io"], stmts, ":ok", rng.randint(0, 2))
     hdr = "// print each field of a mixed record"
     src = program(f"fn main() -> atom {{\n{body}\n}}", header=hdr)
     c = Case(area, "recprint", src, f"{name}\n{age}\n{str(active).lower()}\n", 2)
     c.info["names"] = ["person"]
-    c.info["fnames"] = ["print_string", "print_int64", "print_bool"]
+    c.info["fnames"] = ["print_string", "print_int64", "print_boolean"]
     c.info["has_seq"] = True
     c.info["has_record"] = True
     c.add_fail("E2003", "string field printed with print_int64", rep(src, "print_string(person.name)", "print_int64(person.name)", 1))

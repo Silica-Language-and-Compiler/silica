@@ -1,0 +1,172 @@
+// Spec §20.3.1 "Supervised children with the same id": adding a child (:add_child) whose id is
+// already held by a live actor or supervisor starts no child, and the actor that asked for the add
+// fails with failure_reason (:explicit, :duplicate_child_id). The supervisor DupAddActorSup is
+// started twice from the same impl: with initial_state 0 (from main) its init starts the child
+// :dup_caller; with initial_state 1 (from inside that child) it starts nothing. The child, on its
+// first message, starts the second supervisor and asks it to add a child whose id is :dup_caller,
+// the name the child itself holds. The add starts nothing and the child fails with reason tag 4
+// (:explicit) and the atom :duplicate_child_id; its supervisor delivers the failure report, and
+// as a :temporary child it is not restarted. main's call to it returns 0 once it has died.
+//
+// Expected output:
+//   <failure report of the child: reason_tag 4, agent_type_atom = the index of :worker>
+//   0
+//   done
+
+use Supervisor;
+
+impl DupAddActorSup for Supervisor;
+
+fn caller(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        inner: supervisor_ref <- spawn_registered_supervisor(DupAddActorSup, 1, :dup_add_inner_sup, stack_policy(0, :keep_last_message));
+        added: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(inner, {
+            op: :add_child,
+            child: {
+                id: :dup_caller,
+                agent_type: :worker,
+                initial_state: 20,
+                behavior: caller,
+                restart: :temporary,
+                shutdown: 0,
+                flavor: :plain
+            }
+        } impl SupervisorMessage {});
+        started: int64 <- case added.tag of {
+            :child_started -> 1;
+            _: atom -> 0
+        }
+    produces
+        pure (:reply, msg + started, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+            strategy: :one_for_one | :one_for_all | :rest_for_one,
+            allowed_restart_count: int64,
+            restarts_time_frame: int64
+        } <- { strategy: :one_for_one, allowed_restart_count: 3, restarts_time_frame: 3600 };
+        children: List[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: int64,
+                behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous
+            },
+            mem(normal)
+        ] <- case initial_state == 0 of {
+            true -> [
+                { id: :dup_caller, agent_type: :worker, initial_state: 0, behavior: caller, restart: :temporary, shutdown: 0, flavor: :plain }
+            ];
+            false -> empty[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    initial_state: int64,
+                    behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+                    restart: :permanent | :temporary | :transient,
+                    shutdown: int64,
+                    flavor: :plain | :dangerous
+                },
+                mem(normal)
+            ]()
+        }
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        sup: supervisor_ref <- spawn_registered_supervisor(DupAddActorSup, 0, :dup_add_top_sup, stack_policy(0, :keep_last_message));
+        r: int64 <- call_registered(:dup_caller, 1 impl ActorMessage {});
+        print_int64(r);
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

@@ -4,6 +4,14 @@ This TODO tracks the remaining list implementation work for `silica-compiler` af
 
 It applies only to `silica-compiler` and `compiler/trials/list_addition/`. It does not schedule work on `silica-bootstrap-compiler` or `AArch64/Apple_Silicon/experiments/`.
 
+## Implementation status (2026-10-16)
+
+- TODO 1 (`map`, `filter`, `reduce`): not done. No such list builtins exist in the type checker's builtin signature table, and no trial under `trials/list_addition/` exercises them. List iteration is by `case` on `.is_nil` / `.head` / `.tail`, by `list_at[T, S](xs, i)`, and by the fold-style functions in `stdlib/data_structures`.
+- TODO 2 (non-primitive elements): partly done. Record and tuple elements are exercised by `list_of_record_sum_elements`, `list_of_tuple_literals`, `list_of_tuple_literals_length`, `list_at_record_elem` and `list_record_actor_ref_nested_case_repro`, and elements are stored boxed (one pointer per cell) since the uniform boxed record layout. Negative trials for unsupported element shapes were not found; the list-space mismatch diagnostic is `E3011`.
+- TODO 3 (spec alignment audit): not done as a closing audit; the implementation differences are recorded in the implementation status of [list_implementation_design.md](../list_implementation_design.md). The "temporary SIR list nodes" no longer exist (lists lower to `list_*` prims).
+
+Paths in this file: `silica-compiler` means the compiler tree (`compiler/`), trials are under `trials/list_addition/`.
+
 ## Current Implemented Baseline
 
 The source already contains the core list surface and lowering for:

@@ -7,6 +7,16 @@ if [ "$#" -ne 2 ]; then
   exit 2
 fi
 
+# A marker whose content is the word `unordered` selects the shared order-free compare for a trial
+# whose output holds failure reports or the root-exit note, which the FailureReporter prints
+# asynchronously (Lee, 2026-10-12); see ../compare_scout_unordered.sh. Empty markers keep this script.
+marker="${2%.scout}"
+marker="${marker%.ESP32-S3_raw}"; marker="${marker%.linux_x86_64}"; marker="${marker%.linux_aarch64}"
+marker="$marker.scout.multiset"
+if [ -f "$marker" ] && grep -qx 'unordered' "$marker"; then
+  exec bash "$(cd "$(dirname "$0")" && pwd)/../compare_scout_unordered.sh" "$1" "$2"
+fi
+
 python3 - "$1" "$2" <<'PY'
 import re
 import sys
@@ -19,12 +29,15 @@ FAILURE_RE = re.compile(
 
 
 def normalized_text(path):
-    text = open(path, "r", encoding="utf-8", errors="replace").read()
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = open(path, "r", encoding="utf-8", errors="replace", newline="").read()
+    # The marker runner reads the output through a PTY, which can write a line end as "\r\r\n" when
+    # actors write concurrently; a run of carriage returns before a newline is one line end.
+    text = re.sub(r"\r+\n", "\n", text)
+    text = text.replace("\r", "\n")
     text = re.sub(r"(?m)^(\d+)(\[silica\])", r"\1\n\2", text)
     text = re.sub(r"(?m)^(done)(\[silica\])", r"\1\n\2", text)
     # glibc's %p prints a null pointer as "(nil)"; Darwin prints "0x0". Same value either way.
-    text = re.sub(r"(?m)^actor_id:\s*(?:0x[0-9a-fA-F]+|\(nil\))\s*$", "actor_id:        <PTR>", text)
+    text = re.sub(r"(?m)^actor_id:\s*(?:0x[0-9a-fA-F]+|\(nil\)|[0-9]+)\s*$", "actor_id:        <PTR>", text)
     text = re.sub(r"(?m)^supervisor_acb:\s*(?:0x[0-9a-fA-F]+|\(nil\))\s*$", "supervisor_acb:  <PTR>", text)
     text = re.sub(r"agent_type_atom:[ \t]*[0-9]+", "agent_type_atom: <ATOM>", text)
     # Call-stack frames name C symbols, which Mach-O decorates with a leading underscore and ELF

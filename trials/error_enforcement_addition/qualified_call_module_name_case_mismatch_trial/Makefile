@@ -41,7 +41,7 @@ silica.config:
 	@printf '%s\n' \
 		main_use_camelcase_qualifier.silica \
 		PascalCaseLib.silica \
-		> "$(THIS_DIR)silica.config"
+		> "$(THIS_DIR)silica.config" && cd "$(THIS_DIR)" && $(TRIAL_SUPPORT_CONFIG)
 
 help:
 	@echo "qualified_call_module_name_case_mismatch_trial (multi-file error enforcement)"

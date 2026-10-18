@@ -6,6 +6,25 @@ This document implements the **memory space** model from `silica-specification.m
 
 ---
 
+## Implementation status (2026-10-16)
+
+This plan is mostly NOT implemented; it remains the design for OS-free per-space hardware behaviour. What exists:
+
+| Plan item | Status |
+| --- | --- |
+| Static discipline: `mem(Space)` effects, `region(R, Space)`, `ref`, `buf`, `List[T, Space]`; six spaces accepted | implemented (type checker `type_checker_memory_regions.silica`, effect checker `effect_checker_memory_regions.silica`); trials under `trials/memory_region_addition` |
+| `alloc_region(Space)` passes the space to the runtime (section 0.2 item 2, 0.4) | NOT done: the emitters still allocate every region from the same arena and ignore the space operand (`emit_alloc_region` in `emitter/apple_silicon_mac/terms/prims/prims_memory.silica`: "X1 = space (unused)") |
+| Atomic `ref` loads and stores as `LDAR`/`STLR` | NOT done: ref and buffer accesses are plain loads and stores for every space; `LDAREX`-style instructions appear only in the hand-written actor runtime assembly |
+| `alloc_atomic` | not a builtin; atomic cells are made with `alloc_ref` in a `region(R, atomic)` (`trials/memory_region_addition/alloc_atomic_int64.silica`, requires `proc[mem(atomic), atomic]`) |
+| Phase 1 AArch64 OS-free pools, `MAIR_EL1` programming | NOT done; no AArch64 bare-metal target exists. The hosted AArch64 targets are Apple Silicon and Linux AArch64 (OS-hosted: discipline only, section 12.1.1.0) |
+| Phase 1.2 / 2.2 ESP32-S3 | the ESP32-S3 port is native Xtensa, bare metal, with no IDF: code, data, heap and stacks all live in internal SRAM (about 390 KB), no PSRAM, no `heap_caps` or DMA pools, no `sdkconfig`. Per-space pools and cache modes are NOT implemented; see `ports/esp32s3_port_status.md` and `actor_memory_budget_plan.md` for the memory model that is |
+| Phase 3 list allocation on the same space | lists take their space from the type; audit against per-space pools not applicable until pools exist |
+| Phase 4 CI matrix `board` x `space` | none; trials run per target (Apple Silicon, Linux AArch64, Linux x86-64, ESP32-S3 board) without per-space attribute checks |
+
+Read the Phase sections below as the design target. References to the IDF, `heap_caps_malloc` and `sdkconfig` in section 1.2 describe an IDF-based port that was not the one built.
+
+---
+
 ## Goals
 
 1. **Semantic match on OS-free images:** Each Silica memory space obtains **hardware-consistent** cacheability, shareability, and (for `atomic`) **ordering** behavior—not only type-checking.

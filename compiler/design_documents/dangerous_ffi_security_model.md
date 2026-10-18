@@ -2,7 +2,7 @@
 
 **Audience**: security engineers, language/runtime reviewers, C ABI reviewers, and maintainers evaluating Silica programs that cross into external native code.
 
-**Status**: design summary based on the current FFI design documents. The normative rules live in [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md). Implementation sequencing lives in [ffi_wrapper_implementation_plan.md](ffi_wrapper_implementation_plan.md). macOS crash-handling caveats live in [macos_crash_handling_for_silica.md](macos_crash_handling_for_silica.md).
+**Status**: design summary based on the current FFI design documents. The normative rules live in [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md). Implementation sequencing lived in `ffi_wrapper_implementation_plan.md`, which is no longer in the tree (current status: [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md), top). macOS crash-handling caveats live in [macos_crash_handling_for_silica.md](macos_crash_handling_for_silica.md).
 
 ## 1. Executive Summary
 
@@ -157,7 +157,7 @@ Both sides of the request path are cast-shaped. The client actor that initiates 
 
 Data returned from `dangerous_*` modules is external-danger-touched. Taint is structural: any record, tuple, list, sum, buffer, or nested value containing dangerous data is also dangerous.
 
-Current design uses strict structural taint. The one validator-based de-taint path is **re-creation**: a compiler-derived `recreate` for types that declare `Recreatable` limits ([silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md) §7.7). User-written validators still never clear taint.
+Current design uses strict structural taint (implemented). The one validator-based de-taint path is **re-creation** (designed, not yet implemented; see §13): a compiler-derived `recreate` for types that declare `Recreatable` limits ([silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md) §7.7). User-written validators still never clear taint.
 
 Key restrictions:
 
@@ -218,12 +218,12 @@ The guarded path is a fault-conversion mechanism, not a general C containment bo
 
 ## 13. Current Implementation Reading
 
-Based on the current implementation plan on disk:
+Status as of 2026-10-16, from the code and trials (the phase plan this section was written from is no longer in the tree):
 
-- Phases 0-10 are marked complete for the wrapper-first FFI path, metadata, link manifest integration, runtime marshaling, and trial integration.
-- Phases 11-13 are marked complete for the guarded runtime boundary model, per-actor FFI arena relocation, and macOS fault bridge.
-- Phases 14-15 remain open for actor failure/supervisor restart integration and final guarded macOS regression/platform notes.
-- The open design items listed in the implementation plan remain deferred: exact ptr+len transfer field syntax, standard request/result cast message shapes, pure state derivation from tainted FFI result casts, and region-to-actor-state conversion through FFI result casts.
+- Implemented: the wrapper-first FFI path (modules, `foreign c_wrapper`, sidecar metadata, `silica.link`, marshaling), `spawn_dangerous` / `spawn_dangerous_registered` / `cast_dangerous_registered`, the dangerous registry (one of three process-global registries; the third serves device workers), and the placement, ABI and structural-taint checks. Trials: `trials/ffi_addition`, `trials/error_enforcement_addition/ffi_addition`.
+- Implemented: the guarded runtime boundary (`_silica_rt_ffi_guarded_enter` / `_exit`, per-actor FFI arena, fault bridge) on Apple Silicon macOS, and the corresponding fault runtimes in the linux_aarch64 and linux_x86_64 emitters (`ffi_guarded_runtime_asm.silica`, `ffi_fault_runtime_asm.silica`). Fault and supervision behaviour is covered by `app_guarded_fault_trials` and `app_supervisor_dangerous_guarded_fault_trials`; `app_process_fatal_paths` covers faults before `main`, inside the fault handler, and with no current actor (all report `[silica] fault at` and exit 70, [runtime_failure_reporting.md](runtime_failure_reporting.md)).
+- Not implemented: **re-creation** (`Recreatable` / `recreate`, FFI wrapper specification §7.7). §9 and invariant 9 describe the design; today tainted data leaves a worker only by the designated FFI result cast, and a program cannot move it into actor state.
+- Open design items: exact ptr+len transfer field syntax and standard request/result cast message shapes (FFI specification §16).
 
 Reviewers should treat completed phases as implementation status, not as a formal security certification. The stronger claim is the explicit design boundary: what the compiler is expected to reject, what the linker can prove, and what remains wrapper/runtime responsibility.
 
@@ -306,7 +306,6 @@ untrusted, adversarial, parser-heavy, plugin-style, or high-risk library
 ## 17. Related Documents
 
 - [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md): normative FFI rules.
-- [ffi_wrapper_implementation_plan.md](ffi_wrapper_implementation_plan.md): phase plan and current completion table.
 - [macos_crash_handling_for_silica.md](macos_crash_handling_for_silica.md): macOS guarded FFI fault handling and caveats.
 - [brokered_ipc_isolation_architecture.md](brokered_ipc_isolation_architecture.md): stronger process-isolated alternative for unsafe code.
 - [silica-specification.md](silica-specification.md): core language, effects, actors, regions, and diagnostics.

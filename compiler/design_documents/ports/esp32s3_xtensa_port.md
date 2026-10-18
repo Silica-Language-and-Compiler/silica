@@ -1,6 +1,6 @@
 # `ESP32-S3_raw` port — native Xtensa LX7 code generation, bare metal
 
-**Status:** In progress (started 2026-09-12). Board pack (runtime, link script, image and flash tools,
+**Status:** In progress (started 2026-09-12); the emitter conversion is complete for the language the Apple Silicon path runs, the actor runtime runs on both cores, and peek and poke are delivered (2026-10-16; [esp32s3_port_status.md](esp32s3_port_status.md) is the current record). Board pack (runtime, link script, image and flash tools,
 bring-up apps) exists under `src/emitter/ESP32-S3_raw/board/`; the emitter conversion is
 being done file by file. This is a design record for one port, not a specification; where it
 disagrees with [silica-specification.md](../silica-specification.md), the specification wins.
@@ -22,8 +22,8 @@ disagrees with [silica-specification.md](../silica-specification.md), the specif
 | [linux_aarch64_port_checklist.md](linux_aarch64_port_checklist.md) | The sibling hosted port; same "Darwin-isms" inventory, different ISA problem |
 | [memory-effects-aarch64-implementation-plan.md](../memory-effects-aarch64-implementation-plan.md) | `Space` on ESP32-S3 (pools, not MAIR) — later phases |
 | `emitter/ESP32-S3_raw/board/README.md` | Runtime, memory map, console protocol, tools, bring-up apps |
-| [docs/required-software.md](../../../../docs/required-software.md) | The toolchain, esptool and board the port needs |
-| [trials/targets/README.md](../../../../trials/targets/README.md) | Running the trial tree on the board (`TRIAL_TARGET=ESP32-S3_raw`) |
+| [docs/required-software.md](../../../docs/required-software.md) | The toolchain, esptool and board the port needs |
+| [trials/targets/README.md](../../../trials/targets/README.md) | Running the trial tree on the board (`TRIAL_TARGET=ESP32-S3_raw`) |
 
 ---
 
@@ -145,25 +145,31 @@ here, called with the Silica pair convention of §4:
 | --- | --- |
 | `rt_vectors.S` | window overflow/underflow handlers (the ESP-IDF ones), alloca, fatal vectors, the debug vector for the stack guards |
 | `rt_start.S` | `_start`: interrupts off, VECBASE, fresh window, `THREADPTR`, stack, watchdogs, `.bss`/heap zeroing, stack-guard watchpoints, `main`, exit marker; the per-core register blocks (`silica_rt_core_regs`) and the auxiliary stack; the APP cpu: `silica_rt_start_app_cpu`, `silica_rt_start_core1`, `silica_rt_stall_app_cpu` (§8.9) |
-| `rt_console.S` | UART0 output, `print_i64/u64/bool/string`, `exit`, the runtime-abort entries (`silica_rt_abort_with`, `silica_rt_abort_<site>`), `badarith`, `case_clause`, the fatal fault report ([runtime_failure_reporting.md](../runtime_failure_reporting.md)) |
-| `rt_heap.S` | bump allocator (`alloc`, `region_alloc`, `raw_alloc`), region blocks (`region_grow`, `region_contains`), `free`/`region_free`/`region_destroy` as no-ops |
+| `rt_console.S` | UART0 output, `print_i64/u64/bool/string`, `exit`, the runtime-abort entries (`silica_rt_abort_with`, `silica_rt_abort_<site>`), `badarith`, `case_clause`, the fatal fault report ([runtime_failure_reporting.md](../runtime_failure_reporting.md)); UART0 input: the `exit` line reader (§8.1) |
+| `rt_heap.S` | first-fit free list with coalescing over a bump top, 8-byte block headers (`alloc`, `region_alloc`, `raw_alloc`), region blocks (`region_grow`, `region_contains`); `free` and `region_destroy` (the extension chain too) return memory; exhaustion is a runtime abort |
 | `rt_string.S` | `string_concat`, `length_bytes/chars`, `eq`, `cmp`, `starts_with/ends_with/contains`, `substring`, `substring_until_char`; the 24-byte string header of the host |
 | `rt_list.S` | `list_length/tail/at/prepend` over the emitter's chunked lists (constants packed into one argument word) |
 | `rt_float.S` | `print_f64/f32/f16` with the host's digit algorithm (15 / 7 digits), `h2f`, `f2h`, `trunc_f32/f64` |
 | `rt_ordering.S` | ordering identity tokens, canonical arenas, `checked_i64_add/mul/add1` |
-| `rt_board.S` | GPIO, delay, cycle counter |
-| `rt_actors.S` | the actor runtime (§8): the cooperative per-core scheduler, actor control blocks, mailboxes, `spawn`/`send`/`cast`/`call`/`self`, the PID registry actor, `remove_actor`/`kill_abnormal`, the failure report, `migrate_actor` and the topology queries, `wait_for_exit` |
+| `rt_board.S` | GPIO, delay, cycle counter (used by the `asm_*` apps) |
+| `rt_device.S` | `silica_rt_map_device_check`: the run-time twin of the board-pack window table (`emitter/ESP32-S3_raw/board_pack.silica`) for a computed `map_device` base; the abort `illegal device map` |
+| `rt_actors.S` | the actor runtime (§8): the cooperative per-core scheduler, actor control blocks, mailboxes, `spawn`/`send`/`cast`/`call`/`self`, the PID registry actor, `remove_actor`/`kill_abnormal`, the failure report, `migrate_actor` and the topology queries, `wait_for_exit` and `cast_exit` (the exit request word and `main`'s wake) |
 | `rt_supervisors.S` | the supervisor child table (§8.6): `materialize_init_children` for the start trampoline, restart policies and strategies, the `call_supervisor` helpers |
 
 ## 6. Limits of the first version
 
 - Everything runs from internal SRAM (~390 KB for code, data, heap and stack). No flash XIP, no PSRAM.
-- Machine stack 128 KB, auxiliary stack 64 KB (the emitter's `SP`), heap = the rest; `free` is a
-  no-op (bump allocator). Both stacks have a 64-byte guard at the bottom watched by an Xtensa data
-  breakpoint (`DBREAKA0/1`, store-only); an overflow is reported as a fatal fault (spec §15.4.5.5:
-  `[silica] fault at 0x<pc>`, status 70, the report a host process gives for the same overflow), with
-  cause 1006 in the details after the exit marker.
-- One core runs the scheduler (§8.8); interrupts off; no FFI (the guarded-FFI runtime is setjmp/signal based).
+- `main`'s machine and auxiliary stacks (the latter the emitter's `SP`) are sized per image by
+  `board/tools/main_stack_bound.py` through `build_image.sh` (two links; `_silica_main_stack_size`,
+  `_silica_main_aux_size` in the linker script), with 128 KB + 64 KB as the documented default for a
+  `main` the static walk cannot bound (recursion, or a call through a function value); heap = the rest.
+  Both stacks have a 64-byte guard at the bottom watched by an Xtensa data breakpoint (`DBREAKA0/1`,
+  store-only), and emitted code compares its stack pointers with the running context's limits
+  (`VRG_MLIMIT`, `VRG_ALIMIT` in the per-core register block) so a frame larger than the band cannot
+  straddle it unseen; an overflow is reported as a fatal fault (spec §15.4.5.5: `[silica] fault at
+  0x<pc>`, status 70, the report a host process gives for the same overflow), with cause 1006 in the
+  details after the exit marker. See `board/README.md`, "Stack budget".
+- One cooperative scheduler per core, both LX7 cores running actors (§8.9); interrupts off; no FFI (the guarded-FFI runtime is setjmp/signal based).
 - Non-self tail calls use stack.
 
 ## 7. Order of work
@@ -180,9 +186,10 @@ Driven by the early apps in `board/apps/silica_*` (each has the macOS reference 
 | 5 | `silica_06_strings` | string runtime (concat, length, substring) |
 | 6 | `silica_07_recursion_depth`, `silica_08_stack_guard` | frame size under deep recursion; the stack guards |
 | 7 | `silica_09_lists` … `silica_14_wbt_map` | lists, records/tuples, regions/refs/bufs, floats, checked int64, the stdlib map |
-| 8 | `asm_12_actors` and the actor trial suites | the actor runtime (§8): the cooperative scheduler, supervisors, placement |
+| 8 | the actor trial suites | the actor runtime (§8): the cooperative scheduler, supervisors, placement |
 | 9 | `actors_addition/actor_cross_core_call_reply`, `actor_cross_core_cast_stress`, the three actor suites again | core 1 (§8.9): both LX7 cores run actors |
-| 10 | next | narrow ints and uint64 apps |
+| 10 | `silica_16_device_uart` to `silica_22_device_buzzer` | peek and poke, the device workers and the drivers under `board/apps/device_lib` ([esp32s3_peek_poke_implementation_plan.md](esp32s3_peek_poke_implementation_plan.md)) |
+| 11 | next | the remaining trial suites of port status §4.3 |
 
 ## 8. Actor runtime
 
@@ -212,10 +219,28 @@ After every dispatch an actor re-queues itself (when messages wait) or parks, so
 take turns (§23.1.1). `set_actor_priority` chooses the queue an actor waits in, and the program's
 dispatch-order policy (§8.10, `set_scheduler_policy`) chooses which queue's head runs next.
 
-`main` is a context like the others: `call` from `main` suspends it; `wait_for_exit()` suspends it
-until every core is idle and every ready queue is empty, then ends the program with status 0, as the
-host's `_exit(0)` on the harness's `exit` line does (quiescence is the point where a program's casts
-have all been handled; nothing after `wait_for_exit` in `main` runs on either target).
+`main` is a context like the others: `call` from `main` suspends it; `wait_for_exit()` parks it
+(status `ST_WAITQ`, which nothing else sets) until an exit request is recorded, then returns the
+recorded `int64` value to `main` (`a2:a3`). `main` continues, and the program ends when `main`
+returns, through the image's ordinary end of `main` (`rt_start.S` -> `rt_console.S` `silica_rt_exit`:
+the exit marker with `main`'s result as the status, then halt, core 0 stalling the APP cpu first);
+the actors are abandoned. A program that has gone quiet waits (spec §15.1.2.5; the earlier
+quiescence ending is gone). The two triggers:
+
+- `cast_exit(value)` from any actor on either core: `silica_rt_cast_exit` passes the two words of the
+  value to `silica_rt_exit_request_record`, which under `silica_rt_sched_lock` records the first
+  request (`silica_rt_exit_flag` 0 -> 1, the value in `silica_rt_exit_request`) and, when `main` is
+  parked, marks it ready on core 0's queue; a later request returns 0. `wait_for_exit` checks the flag
+  under the same lock before parking, so a request made while `main` was still running (say, during a
+  `call` it was waiting on) returns the moment `main` reaches its wait, and `main`'s call wait is never
+  woken by it.
+- the console's receive side, the program's standard input on this target: core 0's scheduler loop
+  pops the UART0 RX FIFO on every pass (`rt_console.S` `silica_rt_console_poll_exit_line`, a
+  three-word matcher for a line reading exactly `exit`, one trailing carriage return ignored, every
+  other line discarded) and a completed `exit` line records a request with value 0. The scheduler is
+  the reader because it runs only while `main` has yielded, which is when a line can be acted on, and
+  a dispatch that never returns stops it along with everything else on the core. The loader's
+  leftovers in the FIFO are discarded before `main` runs (`rt_start.S`).
 
 ### 8.2 The context switch
 
@@ -240,21 +265,64 @@ stack and the loop on the thread's.
 
 ### 8.3 Stacks
 
-Spec §15.1.2.2 leaves the stack rule for targets without demand paging to the port: an actor's stacks
-are fixed heap blocks chosen at spawn. `stack_policy(0, ...)` gives 8 KB machine + 2 KB auxiliary; an
-explicit reserve is split three quarters machine, one quarter auxiliary (at least 1 KB / 512 B); a
-child spawned from a child spec inherits its supervisor's reserve. A reservation the heap cannot give
-fails the spawn exactly as the spec says (the spawning actor fails with `(:explicit,
-:stack_reserve_failed)`; in `main` a runtime abort `stack reservation failed`, status 71). The release
-algorithms have nothing to release; `get_actor_memory_usage` reports the block sizes and a measured
-high-water mark (blocks are zeroed when handed out). Freed stacks, ACBs and message nodes go on free
-lists, because the heap never frees.
+Spec §15.1.2.2: an actor's stack is runtime-managed, starts small, grows on demand with no limit and
+is released at the dispatch boundary by the actor's `stack_policy` algorithm. The board has no demand
+paging, so each of an actor's two stacks -- the machine stack of windowed frames and the auxiliary
+stack of the emitter's `SP` -- is a chain of heap chunks (`rt_actors.S`, "Growable stacks";
+`actor_memory_budget_plan.md` item F). A chunk is a 64-byte-aligned heap block: a 64-byte header
+(chain links, size, the entering frame's return address or the entering reservation's previous `SP`,
+the limit, top and band addresses, the chunk's index in the chain), a 64-byte guard band watched by a
+data breakpoint, and the frames or slabs above, filled downward from the top. Nothing is taken at
+spawn: the scheduler gives an actor its first chunks when it dispatches it with none (2 KB machine,
+512 B auxiliary, chosen from the use measured under item E so a replying worker never grows), and
+re-enters the actor loop afresh at every dispatch, so the loop's own frames are at the top of the
+first chunk and the stack is empty at the boundary.
 
-Every switch re-arms the two data breakpoints (`DBREAKA0/1`) on the guard at the bottom of the
-machine and auxiliary stack of the context about to run, `main`'s two boot stacks included; the
-scheduler runs with them disarmed. A stack overflow in an actor is therefore a debug exception that
+Growth is where emitted code checks its limits. Every prologue compares its new `a1` with the machine
+limit the context switch publishes (`VRG_MLIMIT`: the current chunk's band top plus
+`_silica_rt_depth_reserve`, the deepest runtime chain emitted code can call, which the growth chain is
+part of); below it, the frame -- which holds nothing yet -- parks itself 32 bytes under the limit with
+`MOVSP`, calls `silica_rt_stack_grow`, and moves itself with a second `MOVSP` to the top of the next
+chunk (the retained one above the current chunk when it is big enough, else a fresh one: twice the
+previous chunk up to 16 KB, or the frame plus 1 KB of headroom when that is larger). Both `MOVSP`s
+run with a windowed return address in `a0`: the alloca exception handler reads the call size from it
+when the caller's window has to be reloaded, so a plain `CALL0` return address there (an earlier
+form of this prologue) made it reload a four-register window and the frame's `RETW` then faulted. The frame's `a0` becomes `silica_rt_chunk_return`, with the real return address kept in the
+chunk header; when the frame returns, `RETW` lands there in the caller's window, the chunk below is
+made current again and the real return address is jumped to with `a0-a7` and the result intact. The
+windowed ABI stays exact across the move because every spill and reload of a frame's registers is
+addressed through the `a1` of the frame above it, and `MOVSP` reloads the caller's window through the
+alloca exception if the parked chain spilled it. Every auxiliary reservation compares the new `SP`
+with `VRG_ALIMIT`; below it the reservation's size goes to `VRG_ARG` and `silica_rt_aux_grow` moves
+`SP` to the top of the next auxiliary chunk (512 B doubling to 4 KB, or the slab plus 256), keeping
+the previous `SP` in the header; every release compares with the chunk's top (`VRG_ATOP`) and
+`silica_rt_aux_release` pops back when it is reached (a restore of a saved `SP`, the self-tail-call
+stub's, is checked on both sides and pops as far as it needs). Growth never fails as such: a heap
+exhausted is a runtime abort, the host's out-of-memory outcome. A lowered reservation
+(`stack_policy(n, ...)`) caps what the chunks of both stacks may hold together; reaching it ends the
+actor with `(:explicit, :stack_exhausted)` by a store into the guard band, the same debug exception a
+real overflow raises. `main` is not an actor: its two stacks are fixed, sized per image by
+`board/tools/main_stack_bound.py` (a static walk over the linked image, run by `build_image.sh`), and
+a limit it crosses is a fatal fault.
+
+Release is the scheduler's, after the switch back, never on the stack being released: at the
+boundary `silica_rt_actor_release_policy` keeps a prefix of each chain and frees the rest --
+`:release_on_return` nothing, `:keep_last_message` what the dispatch reached, `:track_recent_peak`
+the most any of the last 32 dispatches reached (a ring in the ACB), `:keep_high_water` everything,
+and `:release_when_idle` everything until the core's scheduler, scanning its idle actors every quarter
+second, finds one with no message for a second (the 16 MHz system timer). `get_actor_memory_usage`
+reports the chunks held (committed, retained), the most each chain has held (high water), and as
+reserved the lowered reservation or, at the default, the whole heap. The end-of-program diagnostic
+line reports the most any actor and supervisor held (`board/README.md`, "Stack budget"). Freed chunks,
+ACBs and message nodes go on free lists. `silica_rt_run_behaviour` does not pad the behaviour's frame
+region: composite replies and states are heap copies (item B), so nothing points into that region once
+the behaviour has returned.
+
+Every switch and every chunk change re-arms the two data breakpoints (`DBREAKA0/1`) on the guard at
+the bottom of the current machine and auxiliary chunk of the context about to run, `main`'s two
+stacks included; the scheduler runs with them disarmed. A store into a band is a debug exception that
 ends that actor only, with failure reason tag 4 (`(:explicit, :stack_exhausted)`), instead of
-corrupting memory.
+corrupting memory; with growth it is reached only through a lowered reservation.
 
 ### 8.4 Failures inside an actor
 
@@ -305,15 +373,15 @@ cache levels; an unknown id gives the sentinel `id: -1`).
 frequency cap in seconds from the 16 MHz system timer, and the `:one_for_one` / `:one_for_all` /
 `:rest_for_one` strategies). Exit notices are processed either by the supervisor's own loop (an
 ingress message) or, as in the reference, by whoever calls a supervisor helper (`drain_ingress`).
-A supervisor whose restart cap is breached reports and ends; children keep running.
+A supervisor whose restart cap is breached reports and ends, and an ending supervisor first shuts its children down (`silica_rt_sup_shutdown_children`, spec §15.4.8.4): deepest first, last row first, a child with shutdown 0 killed with reason tag 1 and one with shutdown > 0 ending `(:explicit, :shutdown)`; the shutdown time is not enforced because nothing is preempted. A child supervisor's `SB` is a 64-byte side block that only supervisors get, and a duplicate child id in a started `init` list ends the supervisor (`silica_rt_supervisor_fail_duplicate_child_id`; E2235 catches the literal case).
 
 ### 8.7 Registries
 
-The two PID registries are runtime actors spawned by `silica_pid_registry_init` (injected by the
-emitter at the top of `main`), with 2 KB reserves; their behaviour is written in the emitted-function
-ABI and answers `{op, name, pid}` messages with a `(status, pid)` pair; the table (240 slots of one
-word) is written directly by `register_actor_named` and read by the `_registered` call/cast forms.
-A dying actor's name is removed (§20.3.1).
+The three PID registries (ordinary, dangerous, device) are runtime actors spawned by `silica_pid_registry_init` (injected by the
+emitter at the top of `main`); their behaviour is written in the emitted-function
+ABI and answers `{op, name, pid}` messages (offsets 8/16/24 after the shape word) with a `(status, pid)` pair; each table has one slot per atom of the image
+(`silica_registry_slots`, written into `__silica_runtime.sams` by the emitter; the keyed forms use it to tell an atom from an ACB address), and is written directly by `register_actor_named` and read by the `_registered` call/cast forms.
+A name already held is refused (`:name_taken`, `:already_registered`, `:actor_not_found`; a registered spawn of a taken name fails the spawner with `:language_error`), and a dying actor's name is removed (§20.3.1).
 
 ### 8.8 What is not done
 
@@ -330,7 +398,7 @@ runnable is the following, in the order a program meets it.
   `THREADPTR` at `silica_rt_core_regs`, core 1's entry at the second block; `shared/xt_vr.silica` and
   `xt_mem.silica` emit `rur` instead of the old `movi silica_rt_vrg+off`; the runtime readers
   (`silica_rt_ctx_switch`, the fault hook, `silica_rt_actor_spawn*`, `silica_rt_region_grow` /
-  `_contains`, the supervisor child spawn, `asm_12_actors`) do the same.
+  `_contains`, the supervisor child spawn) do the same.
 - **Starting the APP cpu.** `silica_rt_actors_init` (core 0, at the first actor entry point) ends by
   calling `rt_start.S silica_rt_start_app_cpu`: the ESP-IDF sequence for the chip -- clear the RTC
   software stall of the APP cpu (`RTC_CNTL_OPTIONS0` / `SW_CPU_STALL` "c0"/"c1" fields), then in
@@ -352,10 +420,9 @@ runnable is the following, in the order a program meets it.
   context switch releases the hold, so a line waits only for straight-line code on the other core,
   never for a message. (Before the hold, `supervisors_addition/record_message_cast_between_actors`
   showed a core-1 actor's `21` inside `main`'s `println`.)
-  The actor failure report is composed in one shared buffer and written under the lock. A context
-  abandoned by a fault may hold the lock: the actor fault hook releases this core's hold, and a
-  process-fatal report (fatal or abort trampoline) on core 0 first stalls the APP cpu (RunStall) and
-  clears the lock, on core 1 releases its own hold. `silica_rt_halt` stalls the APP cpu after the
+  The actor failure report is composed in one shared buffer and written under the lock. Both cores' last-byte words start as newline (2026-10-16), so a report written before either core has printed cannot leave the lock held by a line hold. A context
+  abandoned by a fault may hold the lock: the actor fault hook releases this core's hold. A
+  process-fatal report (fatal or abort trampoline) on either core first claims the fatal-owner word; the claiming core stalls the other core (RunStall through the RTC stall bits) and clears the lock. Each core has its own fault stack and fault counter (2 KB more heap). `silica_rt_halt` stalls the APP cpu after the
   output has drained, so nothing prints after the exit marker; the chip reset before the next load
   clears the stall.
 - **Idle cores peek.** An idle scheduler spins on a lock-free read of its three ready heads (and, on

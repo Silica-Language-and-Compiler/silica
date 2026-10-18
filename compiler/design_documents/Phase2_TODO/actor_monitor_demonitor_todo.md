@@ -10,9 +10,15 @@
 > **Spec fix:** `:noproc`, the reason a `DOWN` carries when the target was already dead at `monitor` time, is now a
 > variant of `failure_reason` (spec §15.4.11.2).
 
+> **Implementation status (2026-10-16).** Unchanged: `link`, `monitor` and `demonitor` are still benign stubs in every
+> runtime (Apple Silicon, linux_aarch64, linux_x86_64 and the ESP32-S3 `rt_actors.S`). `link` and `demonitor` return 0 (the
+> emitter answers `:ok`); `monitor` returns without creating a monitor table entry or delivering `DOWN`. No runtime keeps a
+> monitor or link table. The scope of this TODO is therefore the whole of `link`, `monitor` and `demonitor`. Supervisor exit
+> reporting (the path BEES uses) is implemented separately and is not part of this work.
+
 ## Summary
 
-Silica exposes `monitor(target: actor_ref) -> monitor_ref` and `demonitor(ref: monitor_ref) -> :ok` for actors, but the current Apple Silicon runtime implementation is still placeholder-level. The type-checking and lowering surfaces exist, but the runtime must still implement real monitor state, monitor reference ownership, `DOWN` message delivery, and cancellation behavior.
+Silica exposes `monitor(target: actor_ref) -> monitor_ref` and `demonitor(ref: monitor_ref) -> :ok` for actors, but the runtime implementation on every target is still placeholder-level. The type-checking and lowering surfaces exist, but the runtime must still implement real monitor state, monitor reference ownership, `DOWN` message delivery, and cancellation behavior.
 
 This work belongs in Phase 2 because the core actor/supervisor implementation can run without full monitor semantics, while production-quality actor observability needs the runtime behavior to match the specification.
 

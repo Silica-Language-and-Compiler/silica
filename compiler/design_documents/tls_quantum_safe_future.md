@@ -1,19 +1,19 @@
 # First-Class Quantum-Safe TLS
 
-**Status:** Future development. Not implemented. Not normative for the current compiler. When this work starts, [silica-specification.md](silica-specification.md) §20.4, [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md), and the supervisor plan gain a TLS section; this document stays the design authority until then.
+**Status:** Future development. Not implemented (checked 2026-10-16: no `tls_*` types, intrinsics or runtime support exist in the compiler or runtimes). Specification §20.4 now states that networking is not part of the language and is reached through Fifi; the `net.tcp`, `tcp_connection` and `network_io` spellings below name a foreign socket wrapper's operations and effect, not language built-ins. Not normative for the current compiler. When this work starts, [silica-specification.md](silica-specification.md) §20.4, [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md), and the supervisor plan gain a TLS section; this document stays the design authority until then.
 
 **TLS is not planned as a built-in at first.** Until the intrinsics in this document exist, programs that need TLS
 wrap an engine themselves through Fifi: a `dangerous_*` module and a `spawn_dangerous` worker, with every engine
 output leaving the worker's handler only through re-creation (FFI spec §7.7). For example, the BEES project wraps
 rustls behind a C interface that owns no sockets: ciphertext goes in and ciphertext and plaintext come out, while
-Silica's own TCP/IP carries the bytes. The profile, identity and peer-information requirements in §4–§5 apply to
+the program's own socket wrapper carries the bytes (also Fifi, since the language has no built-in networking, §20.4). The profile, identity and peer-information requirements in §4–§5 apply to
 such wrappers as well, so that moving to the built-in later changes no wire behaviour.
 
 ## Related Documents
 
 | Document | Purpose |
 | --- | --- |
-| [silica-specification.md](silica-specification.md) | Effects (§9), actors and supervisors (§15), networking sketch (§20.4) |
+| [silica-specification.md](silica-specification.md) | Effects (§9), actors and supervisors (§15), networking through Fifi (§20.4) |
 | [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md) | Fifi: `dangerous_*`, `spawn_dangerous`, `external_danger`, structural taint |
 | [silica_actor_capabilities_specification.md](silica_actor_capabilities_specification.md) | Cast-only / dangerous actor capabilities |
 | [crypto-proposal-introduction.md](crypto-proposal-introduction.md) | Secret labels, constant-time rules, zeroization |
@@ -93,7 +93,7 @@ New primitives, not user structs. There is no coercion among `tls_session_ref`, 
 
 `tls_session_ref` is in the **dangerous-actor family**: it is obtained only from TLS install intrinsics, the same way `dangerous_actor_ref` is obtained only from `spawn_dangerous`.
 
-Examples below use **selfhost dialect** (inline records, `{` / `}` case arms).
+Examples below use the current syntax (inline records, `{` / `}` case arms).
 
 ```silica
 tls_policy: {

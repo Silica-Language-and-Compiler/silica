@@ -216,14 +216,14 @@ The archive name must match the sidecar `link_library` value. `link_library: "si
 
 ## Step 7: Compile Silica, Assemble, Link, and Run
 
-The repository FFI app trials use [common_app.mk](../trials/ffi_addition/common_app.mk), which does this work:
+The repository FFI app trials use [common_app.mk](../../trials/ffi_addition/common_app.mk), which does this work:
 
-1. Build the wrapper fixture archives (`integrate: fixtures` compiles C sources via [fixtures.mk](../trials/ffi_addition/fixtures.mk)).
+1. Build the wrapper fixture archives (`integrate: fixtures` compiles C sources via [fixtures.mk](../../trials/ffi_addition/fixtures.mk)).
 2. Symlink `dangerous_exposure_source/` into the app trial.
 3. Generate `silica.config`.
 4. Run `src/silica-compiler`.
 5. Assemble each emitted `.sams` file with `clang`.
-6. Read `silica.link` through [silica_link.sh](../trials/silica_link.sh).
+6. Read `silica.link` through [silica_link.sh](../../trials/silica_link.sh).
 7. Link the app object, runtime object, and wrapper archives.
 8. Run executables and compare `.sout` to `.scout` goldens.
 
@@ -261,7 +261,7 @@ For a standalone project outside the trial tree, copy the same sequence rather t
 
 ## Full Trial References
 
-Useful working examples live under [trials/ffi_addition](../trials/ffi_addition/):
+Useful working examples live under [trials/ffi_addition](../../trials/ffi_addition/):
 
 - `fixtures.mk` / `fixtures/` build wrapper archives from C sources under `fixtures/src/`.
 - `app_sidecar_legacy_math_add/` shows sidecar metadata and a legacy math wrapper.
@@ -270,7 +270,7 @@ Useful working examples live under [trials/ffi_addition](../trials/ffi_addition/
 - `app_foreign_abi_valid/` shows accepted Silica-side ABI declarations.
 - `app_e2e_scalar_string_echo/` shows scalar and string FFI calls end to end.
 
-Warning goldens for `W4001` live under [trials/warning_enforcement_addition](../trials/warning_enforcement_addition/).
+Warning goldens for `W4001` live under [trials/warning_enforcement_addition](../../trials/warning_enforcement_addition/).
 
 ---
 

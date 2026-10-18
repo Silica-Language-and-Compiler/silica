@@ -1,33 +1,63 @@
-// pid_register trial: inserting the same atom key a second time replaces the stored actor_ref.
+// pid_register trial: inserting an atom key that a live actor already holds does not replace the
+// stored actor_ref (spec §20.3.1: :name_taken), and an actor holding one name cannot take a second
+// (:already_registered). The insert statuses are printed, then each lookup still finds the name.
 // Uses the global PID registry (Option B): no local root; registry initialised by emitter injection.
 //
 // Expected output:
-//   found
-//   found
+//   :ok                  wa takes :counter
+//   :name_taken          wb cannot replace wa under :counter
+//   :found               :counter still resolves
+//   :already_registered  wa already holds :counter, so :logger is refused
+//   :ok                  wb takes :logger
+//   :found               :logger resolves
 
 fn worker_beh(msg: int64, state: int64) -> (:reply, int64, int64) {
     (:reply, msg, state)
 }
 
+// The registry's reply atoms are named here so they are in this program's atom table (an atom a
+// program never spells has no printable name in its table; the runtime still replies with it).
+fn show(s: atom) -> atom {
+    case s of {
+        :name_taken -> :name_taken;
+        :already_registered -> :already_registered;
+        :actor_not_found -> :actor_not_found;
+        _: atom -> s
+    }
+}
+
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
         wa: actor_ref <- spawn(0, worker_beh, stack_policy(0, :keep_last_message));
         wb: actor_ref <- spawn(0, worker_beh, stack_policy(0, :keep_last_message));
         dummy: actor_ref <- spawn(0, worker_beh, stack_policy(0, :keep_last_message));
         reg: actor_ref <- get_pid_registry();
-        _: (atom, actor_ref) <- call(reg,
+        i1: (atom, actor_ref) <- call(reg,
             { op: :insert, name: :counter, pid: wa } impl ActorMessage {});
-        _: (atom, actor_ref) <- call(reg,
+        (s1: atom, _q1: actor_ref) <- i1;
+        _: atom <- print_atom(show(s1));
+        println("");
+        i2: (atom, actor_ref) <- call(reg,
             { op: :insert, name: :counter, pid: wb } impl ActorMessage {});
+        (s2: atom, _q2: actor_ref) <- i2;
+        _: atom <- print_atom(show(s2));
+        println("");
         lr1: (atom, actor_ref) <- call(reg,
             { op: :lookup, name: :counter, pid: dummy } impl ActorMessage {});
         (r1: atom, _pid1: actor_ref) <- lr1;
         _: atom <- print_atom(r1);
         println("");
-        _: (atom, actor_ref) <- call(reg,
+        i3: (atom, actor_ref) <- call(reg,
             { op: :insert, name: :logger, pid: wa } impl ActorMessage {});
-        _: (atom, actor_ref) <- call(reg,
+        (s3: atom, _q3: actor_ref) <- i3;
+        _: atom <- print_atom(show(s3));
+        println("");
+        i4: (atom, actor_ref) <- call(reg,
             { op: :insert, name: :logger, pid: wb } impl ActorMessage {});
+        (s4: atom, _q4: actor_ref) <- i4;
+        _: atom <- print_atom(show(s4));
+        println("");
         lr2: (atom, actor_ref) <- call(reg,
             { op: :lookup, name: :logger, pid: dummy } impl ActorMessage {});
         (r2: atom, _pid2: actor_ref) <- lr2;
@@ -36,5 +66,43 @@ fn main() -> int64 {
         _: int64 <- wait_for_exit()
     produces
         pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
     end
 }

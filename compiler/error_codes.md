@@ -20,7 +20,14 @@ Per silica-error-code-scheme.jsonld and silica-specification.md §1.6.
 Codes with several meanings list each meaning on one line, separated by semicolons.
 
 ### Lexer (E0001-E0999)
-- No codes emitted. The lexer reports bad input as an unknown-character token, which the parser then rejects.
+The lexer stops at the first lexical error and the driver reports it as a `LexicalError` before parsing (spec §2.5). `|` and `?` still reach the parser as unknown-character tokens (sum types, `ref?`).
+- E0001 UnexpectedCharacter — a character that begins no token outside string, character and atom literals and comments: ASCII punctuation outside spec §2.2.4 (`$`, `&`, `#`, backtick, `\`, `~`, `^`), a control character such as NUL, a non-ASCII character, or a byte order mark after the first character (a leading byte order mark is skipped) (spec §2.1, §2.2)
+- E0002 InvalidEscapeSequence — a backslash in a string or character literal that starts none of the escapes of spec §2.2.3 (`\\ \' \" \n \t \r \e \xHH`)
+- E0003 UnterminatedStringLiteral — a string literal with no closing `"` before the end of the file
+- E0004 UnterminatedCharacterLiteral — a character literal with no closing `'` after its one character or escape, or the empty literal `''`
+- E0005 InvalidNumericLiteral — `0x` or `0b` without digits, a float exponent without digits, `1.` before the end of the file, `;`, `)`, `,` or `]`, a second `.` (`1.5.2`), or a literal followed directly by a letter, digit or `_` (`12abc`, `0x1G`, `0b102`, `1_000`, `1e5`) (spec §2.2.3)
+- E0006 UnterminatedBlockComment — a `{-` block comment with no closing `-}` before the end of the file (spec §2.3.2)
+- E0007 InvalidUtf8 — the source bytes do not form UTF-8 (a lone continuation byte, a lead byte C0, C1 or F5-FF, a truncated sequence, an overlong form, a surrogate, or a value above U+10FFFF), anywhere in the file including literals and comments (spec §2.1)
 
 ### Parser (E1000-E1999)
 - E1000 ParseErrorDefault — uncategorized syntactic defect (statement-boundary fall-through when the next token does not start another statement)
@@ -59,6 +66,8 @@ Codes with several meanings list each meaning on one line, separated by semicolo
 - E1068 IntrinsicNamedFunction — a module function or export line is named after an actor runtime intrinsic (`link`, `monitor`, `demonitor`; spec 15.4.8.5-15.4.8.6), which `Q@name(...)` always resolves to instead of the export
 - E1069 FunctionBodyNotParsed — a function declaration whose body the parser could not extract (for example a qualified call whose function name is a keyword)
 - E1070 FunctionTooManyParameters — a function has more than 8 parameters (parse time)
+- E1071 FunctionLiteralMissingReturnType — a function literal has no `-> type` before its body (the return type is never inferred, and the retired `: type` form is rejected; spec 3.3.6)
+- E1072 UnsupportedFunctionLiteralCapture — a function literal captures a binding that is not an integer-typed binding of an integer literal where the literal is written (a parameter, a computed value, a non-integer literal, a rebound name or an enclosing literal's formal); closure environments are not supported (spec 3.3.6)
 - E1080 ForeignDeclarationSyntax — malformed FFI surface (for example wrapper_meta not followed by a string literal path and `;`)
 
 ### Type checker (E2000-E2999)
@@ -124,6 +133,13 @@ Codes with several meanings list each meaning on one line, separated by semicolo
 - E2231 DeviceAndDangerousDependency — a dangerous_* module uses a device_* module (or the reverse)
 - E2232 DeviceSurfaceOutsideDeviceModule — spawn_device, cast_device, device_actor_ref, device_window or register_rwr outside a device_* module
 - E2233 CastRegisteredDeviceName — cast_registered with a :device_ registry name; use cast_device_registered
+- E2235 DuplicateChildId — a child_spec id appears twice in one supervisor's init child list (§20.3.1); reported at the second occurrence
+- E2236 StartBeforeFailureReporter — main can start an actor or supervisor (directly or through a called function) before register_failure_reporter runs; the reporter's own spawn is exempt (§15.4.13.4)
+- E2237 CastToCallOnlyActor — a cast (cast, cast_registered, send_after, cast_device, register_failure_reporter) reaches an actor whose behaviour returns (:reply, ...), wherever the compiler can follow the reference: variables, function parameters and results, tuple and record fields, list elements, actor state and message fields (§16.1.2, §16.2.6.3, §16.2.6.4)
+- E2238 CallToCastOnlyActor — a call (call, call_with_timeout, call_registered) reaches an actor whose behaviour returns (:no_reply, ...), followed the same way as E2237 (§16.1.1, §16.2.6.2, §16.2.6.4)
+- E2239 BoardPackDeviceDescribed — a program describes a board-pack device: `impl fn registers(device: (:tag))` whose tag the target's board pack describes, in any module other than the pack's own description module for that tag, whatever the body says (device spec §4.9 rule 5, §4.9.1)
+- E2240 CallToSelf — `call()` whose target is `self()` or a name bound from `self()`: the actor would wait for its own reply and deadlock; use `cast(self(), ...)` (spec §16.2.6.5)
+- E2241 TerminateSelfByRemoveOrKill — `remove_actor` or `kill_abnormal` whose target is `self()` or a name bound from `self()`; an actor ends itself only with `stop_self` or `fail_self`, and a target the compiler cannot see is still a run-time `:language_error` (spec §15.1.2.3)
 
 ### Effect checker (E3000-E3999)
 - E3000 EffectErrorDefault — effect failure with no code of its own
@@ -180,15 +196,19 @@ Codes with several meanings list each meaning on one line, separated by semicolo
 ### Emitter (E4050-E4099)
 - No codes emitted.
 
+### Warnings (W-codes; the compile succeeds)
+- W2201 DeviceWriteOneToClearWriteBack — in a device_* module, `poke(w, :r, v)` writes back the unmodified value just read by `v <- peek(w, :r)` from the same `:write_one_to_clear` register, which clears every bit that was set (device spec §4.9); printed as a `DeviceWarning` at the poke
+- W4001 FFI_Warning — a module declares an FFI wrapper function (a declaration of tag 9 with a foreign-symbol body); one warning per wrapper, printed at the declaration as `DANGER DANGER DANGER: this module uses FFI wrapper '<name>' for foreign symbol '<symbol>'. FFI breaks the Silica security model for this app and exposes the entire application to memory insecurity, ABI unsafety, undefined behavior, privilege-boundary collapse, and other security issues from the foreign code and wrapper boundary.` (module checker, section 3); the compile succeeds
+
 ### Notes
-- E1009-E1011 are emitted by the module checker and E2090-E2233 by the type checker's supervisor, external_danger, FFI and device checks; they sit in the E1xxx/E2xxx ranges as allocated. E4005-E4049 (module, FFI and dangerous-spawn checks) are emitted by the module and type checkers inside the E4000-E4049 range; only E4001 comes from the SIR generator.
+- E1009-E1011 are emitted by the module checker and E2090-E2241 by the type checker's supervisor, external_danger, FFI and device checks; they sit in the E1xxx/E2xxx ranges as allocated. E4005-E4049 (module, FFI and dangerous-spawn checks) are emitted by the module and type checkers inside the E4000-E4049 range; only E4001 comes from the SIR generator.
 - E2003, E2005 and E2010 are broad: they cover many messages at many sites (see the descriptions above).
 
 ## Retired names (never emitted)
 
 Names that earlier versions of this registry listed but the compiler never emitted. They are kept for history and are not reassigned.
 
-- E0000-E0006 LexerErrorDefault, UnexpectedCharacter, InvalidEscapeSequence, UnterminatedStringLiteral, UnterminatedCharacterLiteral, InvalidIntegerLiteral, UnterminatedBlockComment — the lexer emits no coded errors; bad input becomes an unknown-character token that the parser reports
+- E0000 LexerErrorDefault — never emitted. E0001-E0006 now carry the meanings this entry once listed beside it (InvalidIntegerLiteral widened to InvalidNumericLiteral), and E0007 is InvalidUtf8 (2026-10-16)
 - E1001 ExpectedToken — the code is now used as a driver fallback (ParseFailureNoCode)
 - E1002-E1008 NestedFunctionDeclaration, ExpectedIdentifier, ExpectedType, ExpectedExpression, ExpectedMemorySpace, WildcardRequiresTypeAnnotation, UnsupportedSyntax
 - E2002 UndefinedType — code now UndefinedIdentifier

@@ -8,7 +8,6 @@
 | [silica_actor_capabilities_specification.md](silica_actor_capabilities_specification.md) | Actor capabilities, protocol-typed references, and message-order guarantees (draft extension) |
 | [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md) | **Fifi** (outbound C/FFI layer): `dangerous_*` modules, cast-mediated FFI workers, `external_danger`, sidecar metadata, and link-time validation |
 | [macos_crash_handling_for_silica.md](macos_crash_handling_for_silica.md) | macOS-specific crash/fault handling notes for guarded FFI, signal/Mach exception boundaries, and actor-supervisor recovery caveats |
-| [ffi_wrapper_implementation_plan.md](ffi_wrapper_implementation_plan.md) | Compiler implementation phases for [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md) |
 | [memory-effects-aarch64-implementation-plan.md](memory-effects-aarch64-implementation-plan.md) | Memory `Space` model for OS-free AArch64 and embedded targets (implementation plan) |
 | [porting_for_os_free_targets.md](porting_for_os_free_targets.md) | OS-free / raw-metal port inventory: boot, `Space` pools, MMIO prims, board packs |
 | [silica_device_actor_specification.md](silica_device_actor_specification.md) | Device-worker actors: `register_rwr` only in `spawn_device` behaviors, `device_actor_ref`, disjoint from Fifi |
@@ -81,7 +80,7 @@ Silica is designed to be both LLM-friendly and human-readable. One way at the la
 #### 1.3.6 Explicit Effect Tracking
 - All side effects are declared on sequence blocks: `sequence proc[device_io, mem(normal)]`
 - Function declarations do not contain effect declarations; effects are declared only on sequences
-- Effect requirements propagate through sequence blocks
+- Effects are local: a sequence block declares the effects of its own operations, and calling a function does not add that function's effects to the caller
 - **Benefit**: Makes side effects visible to both LLMs and humans, enabling better code analysis
 
 #### 1.3.7 Module and Import Clarity
@@ -212,7 +211,7 @@ Each error category has a specific error code range and includes relevant metada
 ## 2. Lexical Structure
 
 ### 2.1 Character Set
-Silica source code is UTF-8 encoded. The language uses ASCII characters for keywords, operators, and punctuation. Unicode is allowed in string literals, character literals, atom literals, and comments.
+Silica source code is UTF-8 encoded. The language uses ASCII characters for keywords, operators, and punctuation. Unicode is allowed in string literals, character literals, atom literals, and comments. A byte order mark (U+FEFF) at the very start of the file is skipped; a byte order mark anywhere later is a lexical error (E0001, §2.5). Source bytes that are not valid UTF-8 are a lexical error (E0007, §2.5).
 
 ### 2.2 Tokens
 
@@ -231,6 +230,8 @@ uint8      uint16     uint32     uint64    underscore unit       use        wher
 ```
 
 `region` is both a keyword and the name of the region type constructor, so it cannot be used as the name of a binding, parameter, or field (E1040); the samples in this specification name region handles `r`.
+
+**Implementation status (2026-10-16).** Checked with the published compiler: `region` as a binding name (`region: int64 <- 3;`) is rejected by the parser with E1040, whose text is the generic "expected ';' after this statement before the next statement" at the token after `region`; `region` as a function parameter name is rejected with E1000, the uncategorized syntax error, at the parameter. A record field named `region` is accepted (`{ region: 3 }`, the type `{ region: int64 }` and the read `r.region` all compile), and the compiler's own record types use such a field. No diagnostic yet says that `region` is a reserved word, and the field case is not rejected, so the rule above is the design for fields and the codes above are what a program meets today for bindings and parameters.
 
 #### 2.2.2 Identifiers
 Identifiers start with a letter (a-z, A-Z) or underscore (_), followed by any number of letters, digits (0-9), or underscores.
@@ -397,10 +398,19 @@ Comments are ignored by the lexer and have no effect on program semantics.
 Whitespace characters (spaces, tabs, newlines) are used to separate tokens but are otherwise ignored. At least one whitespace character or comment must separate adjacent tokens.
 
 ### 2.5 Lexical Errors
-- Invalid escape sequences in literals
-- Unterminated string or character literals
-- Invalid numeric literals (e.g., `0xGG`)
-- Reserved keywords used as identifiers
+The lexer stops at the first lexical error, and the compiler reports it as a `LexicalError` before parsing begins.
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| E0001 | UnexpectedCharacter | A character that begins no token outside literals and comments (for example `$`, `#`, a control character, a non-ASCII character, or a byte order mark after the first character) |
+| E0002 | InvalidEscapeSequence | A backslash in a string or character literal that starts none of the escapes of §2.2.3 |
+| E0003 | UnterminatedStringLiteral | A string literal with no closing `"` before the end of the file |
+| E0004 | UnterminatedCharacterLiteral | A character literal with no closing `'`, or the empty literal `''` |
+| E0005 | InvalidNumericLiteral | `0x` or `0b` without digits, a float exponent without digits, a second `.` (`1.5.2`), or a literal followed directly by a letter, digit or `_` (`12abc`, `0b102`, `1_`); integer and float literals alike |
+| E0006 | UnterminatedBlockComment | A `{-` block comment with no closing `-}` before the end of the file |
+| E0007 | InvalidUtf8 | Source bytes that are not UTF-8 (lone continuation byte, lead byte C0, C1 or F5-FF, truncated or overlong sequence, surrogate, value above U+10FFFF), checked in comments, strings, characters and atoms |
+
+Reserved keywords used as identifiers are rejected by the parser, not the lexer.
 
 ## 3. Syntax
 
@@ -1540,7 +1550,7 @@ Function literals do not declare effects. When a function literal uses effectful
 
 **Syntax:**
 ```
-function_literal ::= "fn" parameter_list [":" type] "{" statement_list "}"
+function_literal ::= "fn" parameter_list "->" type "{" statement_list "}"
 ```
 
 **Example - Function literal with device_io effect (effects declared on sequence inside):**
@@ -1640,7 +1650,7 @@ fn behavior(msg: Msg, state: State) -> State {
 - Each sequence block declares its own `proc[effects]` requirements
 - Nested sequence blocks (e.g., inside function literals) each declare their own effects
 - The function signature contains only the return type: `fn name(params) -> ReturnType`
-- Effect requirements propagate upward through the call chain
+- Effects stay inside the sequence block that declares them; they do not propagate to callers (the one exception, `register_rwr`, is in §9.3.1 rule 4)
 
 **Example - Actor Behavior Function:**
 ```silica
@@ -2135,8 +2145,11 @@ Use additional patterns, guards, or nested `case` expressions for more structure
 
 #### 3.3.6 Function Literals
 ```
-function_literal ::= "fn" parameter_list [":" type] "{" statement_list "}"
+function_literal ::= "fn" parameter_list "->" type "{" statement_list "}"
 ```
+
+The return type is required and is written with `->`, as in a function declaration. A literal without one is
+rejected (error E1071); its type is not inferred.
 
 Example:
 ```silica
@@ -2149,6 +2162,8 @@ fn(msg: Message) -> atom {
     end
 }
 ```
+
+**Implementation status (2026-10-16).** Closure environments are not implemented. A function literal may capture (use) a binding of its enclosing scope only when the compiler can see that the binding holds an integer literal where the literal is written: a binding of an integer type (`int8` to `int64`, `uint8` to `uint64`) whose value is an integer literal, as in `n: int64 <- 3`. The literal's value is built into a small wrapper function, so the capturing literal can then be bound to a name, passed as an argument, called, or sent as the message of a `call` or `cast` (trial `actors_addition/actor_message_capturing_fn_literal`). Capturing anything else is rejected with error E1072: a function parameter, a computed value (`m: int64 <- n * 2`), a binding of a non-integer literal (a float, boolean, string or atom), a name that a later binding or a case pattern rebinds, or a formal of an enclosing function literal. Pass such a value to the literal as a parameter instead. A capturing literal cannot be returned from the function that owns the captured bindings either: that is rejected with E1067. The examples in §3.4.1 that return a capturing literal (`make_multiplier`, `create_function_tuple`) show the intended design and are rejected today.
 
 #### 3.3.7 Struct Literals
 Record values are written only as struct literals—there is no separate named `struct` declaration form (§3.4.2).
@@ -3312,7 +3327,7 @@ device_actor_ref                     // device-worker actor reference (primitive
 supervisor_ref                       // supervisor reference (primitive type)
 ```
 
-The `actor_ref` type is not parameterized by message type. It is a primitive type that represents a reference to an ordinary actor, created by the `spawn()` function. Every actor reference denotes its actor by a 64-bit identity that is never reused. References are compared with `actor_ref_equal` and `actor_ref_not_equal` (§22.4), which compare that identity (§15.1.4); the comparison operators do not apply to references.
+The `actor_ref` type is not parameterized by message type. It is a primitive type that represents a reference to an ordinary actor, created by the `spawn()` function. Every actor reference denotes its actor by a 64-bit identity that is never reused. References are compared with the six comparison operators (§7.4), which compare that identity as the pair (position, child number) (§15.1.4); `actor_ref_equal` and `actor_ref_not_equal` (§22.4) are equivalent built-in forms of `==` and `!=`.
 
 The `dangerous_actor_ref` type is distinct from `actor_ref`. It represents a reference to an FFI worker actor that executes outbound foreign calls inside `external_danger` sequences in its behavior. It is created only by `spawn_dangerous(...)`. There is no subtyping or coercion between `actor_ref` and `dangerous_actor_ref`.
 
@@ -3433,6 +3448,10 @@ println(value: string) -> atom proc[device_io]
 
 Print a string to stdout. `println` appends a newline. Returns `:ok` on success.
 
+`println_stderr(value: string) -> atom proc[device_io]` writes the string and a newline to standard error in the same way.
+
+A line written by `println` is not split by the output of other actors. Hosted targets write the text and its newline with one system call (`writev`); the ESP32-S3 console routines hold one console lock from the text to its newline.
+
 #### 5.1.2 Numeric Printing
 ```
 print_int8(value: int8) -> atom proc[device_io]
@@ -3442,6 +3461,15 @@ print_int64(value: int64) -> atom proc[device_io]
 ```
 
 Print integer values to stdout. Returns `:ok` on success.
+
+```
+print_uint8(value: uint8) -> atom proc[device_io]
+print_uint16(value: uint16) -> atom proc[device_io]
+print_uint32(value: uint32) -> atom proc[device_io]
+print_uint64(value: uint64) -> atom proc[device_io]
+```
+
+The unsigned forms print the value in decimal. Each argument must have exactly the named type.
 
 #### 5.1.3 Floating-Point Printing
 ```
@@ -3456,9 +3484,10 @@ Print floating-point values to stdout. Returns `:ok` on success.
 ```
 print_boolean(value: boolean) -> atom proc[device_io]
 print_char(value: char) -> atom proc[device_io]
+print_atom(value: atom) -> atom proc[device_io]
 ```
 
-Print boolean and character values to stdout. Returns `:ok` on success.
+Print boolean, character and atom values to stdout. Returns `:ok` on success.
 
 ### 5.2 File I/O Functions
 
@@ -3472,10 +3501,12 @@ read_lines(path: string) -> list<string> proc[device_io]
 
 Read entire file contents or lines from a file.
 
+**Implementation status (2026-10-16).** Only `read_lines`, `file_exists`, `append_file` and `delete_file` of §5.2 exist in the compilers. `read_lines(path: string) -> string` returns the whole content of the file as one string, not a list of lines; there is no `read_file`. `write_file`, `get_file_size`, the directory operations (§5.2.4), `exec_command` (§5.4) and `get_cpu_topology_info` (§5.5) are not implemented. The same holds for the matching entries of §22.6, §22.8 and §22.9. The intended `read_lines` result type is kept above as the design.
+
 #### 5.2.2 File Writing
 ```
 write_file(path: string, content: string) -> atom proc[device_io]
-append_file(path: string, content: string) -> atom proc[device_io]
+append_file(path: string, content: string) -> boolean proc[device_io]
 ```
 
 Write or append content to a file.
@@ -3483,7 +3514,7 @@ Write or append content to a file.
 #### 5.2.3 File Operations
 ```
 file_exists(path: string) -> boolean proc[device_io]
-delete_file(path: string) -> atom proc[device_io]
+delete_file(path: string) -> boolean proc[device_io]
 get_file_size(path: string) -> int64 proc[device_io]
 ```
 
@@ -4023,7 +4054,7 @@ m > n       // greater than
 u >= v      // greater than or equal
 ```
 
-The six comparison operators are not defined on the actor reference types (`actor_ref`, `dangerous_actor_ref`, `device_actor_ref`, `supervisor_ref`). Identity comparison on references is written with the built-in functions `actor_ref_equal` and `actor_ref_not_equal` (§22.4). Both arguments must have the same reference type, and the comparison is on actor identity (§15.1.4).
+The six comparison operators are also defined on the actor reference types (`actor_ref`, `dangerous_actor_ref`, `device_actor_ref`, `supervisor_ref`). They compare actor identities as the pair (position, child number) (§15.1.4). Both operands must have the same reference type; mixing reference types is an error (`E2003`). The built-in functions `actor_ref_equal` and `actor_ref_not_equal` (§22.4) are equivalent to `==` and `!=`.
 
 ### 7.5 Logical Expressions
 Logical operators work on booleans:
@@ -4839,18 +4870,16 @@ Effects form a subeffecting lattice:
    }
    ```
 
-4. **Effect Propagation**: Effects propagate through sequence blocks - if a sequence calls effectful functions, those effects must be declared on the sequence:
+4. **Effects Are Local**: A sequence block declares only the effects of its own operations. Calling a function never adds that function's effects to the caller: the callee's own sequence block declares and discharges them. A caller that declares an effect only because a callee uses it gets E3010 (unused effect declaration):
    ```
    fn helper() -> ref(R, normal, int) { ... }  // uses sequence proc[mem(normal)] internally
-   
+
    fn caller() -> ref(R, normal, int) {
-       sequence proc[mem(normal)]
-           ref: ref(R, normal, int) <- helper();
-       produces
-           pure ref
-       end
+       ref: ref(R, normal, int) <- helper();   // no sequence block needed: helper's effects stay in helper
+       ref
    }
    ```
+   **Exception, `register_rwr`:** a function whose body holds a `register_rwr` sequence reaches a device, so every caller must also declare `register_rwr`. This keeps device access out of `main` and ordinary behaviours transitively ([silica_device_actor_specification.md](silica_device_actor_specification.md) §4.4). No other effect is passed to callers.
 
 **Effect Set Union Algorithm:**
 
@@ -4962,7 +4991,7 @@ fn complex() -> atom {
 
 **Example 4: Effect Composition Through Nested Calls**
 
-Effects propagate through nested function calls, requiring all effects to be declared:
+Each function declares only the effects of its own operations; a caller does not redeclare its callees' effects:
 
 ```silica
 // Helper function with mem(normal) - effects on sequence
@@ -4984,14 +5013,10 @@ fn print_helper() -> atom {
     end
 }
 
-// Function that calls both helpers - effects on sequence
+// Function that calls both helpers - no sequence block: the helpers' effects stay in the helpers
 fn composed_operation() -> ref(R, normal, int) {
-    sequence proc[mem(normal), device_io]
-        ref: ref(R, normal, int) <- allocate_helper();  // mem(normal) propagates
-        print_helper();                                  // device_io propagates
-    produces
-        pure ref                                        // Combined: [mem(normal), device_io]
-    end
+    _: atom <- print_helper();                   // device_io is declared and discharged inside print_helper
+    allocate_helper()                            // mem(normal) is declared and discharged inside allocate_helper
 }
 ```
 
@@ -5203,7 +5228,7 @@ end function
 The type checker verifies that:
 1. All effects used in the function body are declared on sequence blocks
 2. All effects required by called functions are declared on the enclosing sequence
-3. Effect mismatches result in type errors (E2011)
+3. Effect mismatches are reported by the effect checker (E3001, E3002; §9.3.3)
 
 **No Effect Inference:**
 
@@ -5229,7 +5254,7 @@ fn(msg: Response, state: EchoState) -> EchoState {
 }
 ```
 
-Function literals must declare all effects they use, just like regular function declarations. If a function literal uses an effect but doesn't declare it, a type error (E2011) will occur.
+Function literals must declare all effects they use, just like regular function declarations. If a function literal uses an effect but doesn't declare it, the effect checker reports E3001.
 
 #### 9.3.3 Effect Error Examples
 
@@ -5504,7 +5529,7 @@ fn complex_operation() -> atom {
 When encountering effect errors, consider:
 
 1. **Add Missing Effects**: Declare all effects used in the function body
-2. **Propagate Effects**: If calling functions with effects, declare those effects in the caller
+2. **Remove Callee Effects**: Effects are local; if E3010 reports an effect the sequence only declared because a called function uses it, remove it from the caller (except `register_rwr`, §9.3.1 rule 4)
 3. **Effect Composition**: Use effect aliases to simplify effect declarations
 4. **Refactor**: Consider splitting functions to separate effectful and pure operations
 
@@ -5574,7 +5599,7 @@ fn nested_example() -> atom {
 ```
 
 **Effect Propagation:**
-Effects propagate through function calls and bindings. The type checker ensures all required effects are declared:
+Effects do not propagate through function calls (§9.3.1 rule 4). An effect-typed action value such as `proc[mem(normal)] int` is different: the action runs inside the sequence that runs it, so that sequence declares the action's effects:
 
 ```
 // Pure computation with logging (preserves pure effect)
@@ -5642,7 +5667,7 @@ All effects are declared on sequence blocks - no effect erasure occurs.
 #### 9.4.1 Effect Checking
 Effect capability enforcement is done at compile time. The type checker ensures:
 - All effects in a function body are declared on sequence blocks
-- Effect requirements are properly propagated through call chains
+- Effects stay local to their sequence blocks; only `register_rwr` is required of callers (§9.3.1 rule 4)
 - Effect subeffecting is respected
 - Functions requiring effects cannot be called without appropriate effect declarations
 
@@ -7544,6 +7569,8 @@ Every actor is **pinned** to a core from the moment it is spawned until it termi
 - **OS-free** (the Silica runtime owns the chip's cores; applications, libraries and firmware images running on raw cores): pinning is **exclusive and hard**. The actor executes exclusively on its core, and nothing but the program moves it.
 - **OS-hosted** (macOS, Linux, Windows, and analogous OSes): the actor is bound to the runtime's carrier thread for its logical core, and the runtime never moves it to another carrier on its own. The runtime requests affinity for that carrier thread from the OS where the OS allows it, but the OS still owns the cores: it may run other threads on the same core, may migrate the carrier thread, and on some hosts treats affinity only as a hint (Apple Silicon macOS offers no hard thread-to-core binding). Exclusive or hard placement is therefore **not** guaranteed on an OS-hosted target. On such a target `migrate_actor()` transfers the actor between carrier threads, as the BEAM migrates processes between its scheduler threads.
 
+**Implementation status (2026-10-16).** On OS-hosted targets the carrier threads described above do not exist yet: each actor is backed by its own operating-system thread, and actors do not share threads, until ROADMAP chunk 2 (the BEAM-pattern carrier model) lands. The text of this section and of §15.1.2.2 ("actors are not OS threads", "several actors share a carrier thread") is the design that chunk delivers; the ESP32-S3 already meets it with per-core cooperative schedulers.
+
 **Migration API** (`proc[concurrency]`; details in §22.10):
 
 - `migrate_actor(actor_ref, target_core: uint64) -> :ok | :invalid_target | :actor_not_found | :migration_blocked`: moves the actor from whatever core it is on to `target_core` and pins it there.
@@ -7557,7 +7584,7 @@ Every actor is **pinned** to a core from the moment it is spawned until it termi
 
 #### 15.1.2.2 Actor Stack Architecture
 
-**Runtime-Managed Stacks**: Each actor has its own **dedicated stack** maintained by the Silica runtime, **not** by the operating system. This section is the language's contract for those stacks. The hosted-platform mechanics behind it are in [actor_growable_stack_design.md](actor_growable_stack_design.md) §2, §4 and §7, and the work that implements them is chunk 1 of the [ROADMAP](../../../ROADMAP.md), planned in [Phase1_TODOs/actor_stack_growth_plan.md](Phase1_TODOs/actor_stack_growth_plan.md).
+**Runtime-Managed Stacks**: Each actor has its own **dedicated stack** maintained by the Silica runtime, **not** by the operating system. This section is the language's contract for those stacks. The hosted-platform mechanics behind it are in [actor_growable_stack_design.md](actor_growable_stack_design.md) §2, §4 and §7, and the work that implements them is chunk 1 of the [ROADMAP](../../ROADMAP.md), planned in [Phase1_TODOs/actor_stack_growth_plan.md](Phase1_TODOs/actor_stack_growth_plan.md).
 
 **Key Properties**:
 - **Not OS Threads**: Actors are not backed by OS threads. Multiple actors can execute on the same OS thread
@@ -7601,9 +7628,13 @@ stack_policy(reserve: int64, release: atom) -> stack_policy
 
 **Memory Exhaustion**: Stack growth is never a failure and never a supervision event, and there is no cap under which the runtime would refuse to grow a stack or refuse a spawn. When the machine's memory and swap are exhausted, the outcome is the host's: on a hosted platform its out-of-memory handling chooses a process, which may or may not be the Silica program. This is why `:oom` is not a `failure_reason` (§15.4.11.2).
 
-**The main Function**: `main` is not an actor and does not receive a runtime-managed stack. It runs on the platform's ordinary program stack, with no growth and no release, which is the nothing-hidden rule applied to the program's entry: nothing is provisioned that the program cannot see. A `main` is therefore kept small; a program whose work needs a deep or long-lived stack spawns an actor for it and calls or casts into it. The compiler itself is written this way. Exhausting the stack of `main` is a fatal fault: there is no supervisor to notify, so the process ends with the fault report and exit status 70 (§15.4.5.5).
+**The main Function**: `main` is not an actor and does not receive a runtime-managed stack. It runs on the platform's ordinary program stack, with no growth and no release, which is the nothing-hidden rule applied to the program's entry: nothing is provisioned that the program cannot see. A `main` is therefore kept small; a program whose work needs a deep or long-lived stack spawns an actor for it and calls or casts into it. Such a `main` usually waits in `wait_for_exit` until an actor issues `cast_exit`, then returns (§15.1.2.5). The compiler itself is written this way. Exhausting the stack of `main` is a fatal fault: there is no supervisor to notify, so the process ends with the fault report and exit status 70 (§15.4.5.5).
 
 **Platform Notes**: Lazy page migration and NUMA-aware placement of stack pages (design document §4.3, §5.3) apply on platforms that have NUMA nodes and are not implemented on those that do not. Actor stacks as described here require demand paging; the rules for targets without it are decided per target in its port design.
+
+**Implementation status (2026-10-16).** The observable stack rules of this section hold on every target; the mechanics differ from the reservation model above.
+- **Hosted targets** (Apple silicon macOS, Linux AArch64, Linux x86-64) make the reservation, the chunked commit and the release as specified. Each actor is also backed by its own operating-system thread, on which the behavior runs on the actor's reserved stack. The hosted runtime therefore does not yet hold millions of actors: the number of threads the host allows bounds it. The statements of §15.1.2.2 and §15.1.2 that actors are not threads, and that several actors share a carrier thread, state the design that this change of runtime will reach; until ROADMAP chunk 2 (carrier threads) lands, a hosted target runs one operating-system thread per actor. On a hosted target `migrate_actor` today sets an affinity hint on the actor's thread.
+- **ESP32-S3** (raw, two cores) has no address-space reservation. An actor holds no stack until its first dispatch; its machine stack and its auxiliary stack are then chains of heap chunks that grow on demand (twice the previous chunk, up to 16 KB machine and 4 KB auxiliary) and are released by the actor's release algorithm. A lowered `reserve` caps what an actor's chunks may hold together; reaching it ends the actor with `(:explicit, :stack_exhausted)`. With the default `reserve` the limit is the heap: heap exhaustion by growth is a runtime abort, status 71. `main` has two fixed stacks, sized per image from a static bound, and crossing one is a fatal fault, status 70. The target is sized for 1,000 actors and supervisors resident with heap left for the program ([actor_memory_budget_plan.md](actor_memory_budget_plan.md)).
 
 **Observing a Stack**:
 
@@ -7661,11 +7692,13 @@ An actor ends in one of these ways:
 
   - `stop_self` is an **orderly stop**. The current dispatch runs to completion: a call-only behavior still returns its `(:reply, …)` and the caller receives the reply. The runtime then ends the actor with the given `failure_reason` (§15.4.11.2).
   - `fail_self` is an **immediate abnormal stop**. It never returns. The actor ends at once with `failure_reason` `(:explicit, reason)`, and the current dispatch is abandoned. With `stop_self((:explicit, reason))`, it is how a program produces an `(:explicit, atom)` reason; the runtime produces a few itself (§15.4.11.2).
-  - An actor ends itself only with `stop_self` or `fail_self`. `remove_actor` and `kill_abnormal` must not name the calling actor: the compiler rejects the call where it can tell, and otherwise the calling actor fails with `failure_reason` `:language_error`.
+  - An actor ends itself only with `stop_self` or `fail_self`. `remove_actor` and `kill_abnormal` must not name the calling actor: the compiler rejects the call (E2241 TerminateSelfByRemoveOrKill) where the target is `self()` or a name bound from `self()`, and otherwise the calling actor fails with `failure_reason` `:language_error`. Nothing is done to it first: it is not marked killed or removed, and a `call()` it is serving receives the actor-death result (`actor_not_found` in the caller), never a reply.
 - **Being removed.** `remove_actor(target)` (§22.10) ends another actor with `failure_reason` `:normal` at its next dispatch boundary. A call in progress still receives its reply.
 - **Being killed.** `kill_abnormal(target)` (§22.4) ends another actor immediately with `failure_reason` `(:explicit, :killed)`.
 - **Being shut down by its supervisor** (§15.4.12.2).
 - **Failing:** a runtime trap, `panic` (§22.16) or a contained fault (§15.4).
+
+**Implementation status (2026-10-16).** `stop_self` and `fail_self` are not implemented: the compilers have no signature or lowering for them, so a program cannot yet end its own actor, nor produce an `(:explicit, atom)` reason of its own. An actor ends today by `remove_actor` or `kill_abnormal` from another actor, by its supervisor, or by a failure. The same holds for `panic` (§22.16) and for the `stop_self` and `fail_self` uses in §15.4.11.2, §15.5 and §16.1.4. The compile-time rejection of `remove_actor` and `kill_abnormal` whose target is `self()` or an alias bound from `self()` is implemented (E2241). A target the compiler cannot see, such as one hidden behind a function parameter, still fails the caller with `:language_error` at run time on every target (trials `actors_addition/remove_actor_self_language_error`, `kill_abnormal_self_language_error`).
 
 When an actor ends, the runtime:
 - Stops the actor’s message loop
@@ -7693,6 +7726,76 @@ fn server(msg: atom, state: int64) -> (:no_reply, int64) {
     }
 }
 ```
+
+#### 15.1.2.5 Ending the Program: `wait_for_exit` and `cast_exit`
+
+A program's `main` starts its supervision tree, casts the first work into it, and waits in `wait_for_exit`. The wait
+ends on one of two triggers; `wait_for_exit` then returns a value, `main` continues to its end, and the program ends
+with `main`'s result as it always does.
+
+```
+wait_for_exit() -> int64                  proc[concurrency, device_io]
+cast_exit(value: int64) -> boolean        proc[concurrency]
+```
+
+**`wait_for_exit`** carries `device_io` as well as `concurrency`, because it reads standard input; a `main` that calls it declares both. It is called by `main`, normally as the last step before its result. `main` is not an actor
+(§15.1.2.2), so it does not take part in dispatch while it waits; the actors run. It watches two triggers:
+
+1. **Standard input.** A line that reads exactly `exit` (a trailing carriage return is ignored) is recorded as
+   `cast_exit(0)`: `wait_for_exit` returns 0, and a `cast_exit` issued afterwards returns `false`, because the request
+   is already recorded (the first request wins, whichever trigger made it). Any other line is ignored. If standard input reaches its end, `wait_for_exit` stops
+   reading it and continues to wait for `cast_exit`; the end of input does not end the wait. On a raw target
+   standard input is the console.
+2. **`cast_exit(value)`** from an actor makes `wait_for_exit` return `value`.
+
+An idle program does not end its wait: a program that issues no `cast_exit` and receives no `exit` line waits until
+it is ended from outside. When `main` returns, the program ends; the actors are not given a chance to finish:
+running dispatches are abandoned, no exit notifications are delivered, supervisors are not notified, and messages
+still waiting in mailboxes are discarded. The one exception is the failure reports already handed to a registered
+`FailureReporter` (§15.4.13.4): the runtime lets the reporter handle them, for a bounded time, before the process ends.
+
+**`cast_exit`** asks for the wait to end. It is meant for batch programs, which do a piece of work and finish, such
+as a compiler or a converter. A long-running program that behaves like a server does not end itself with
+`cast_exit`; it runs until it is told to stop from outside, by the `exit` line or by its host. Like `cast`
+(§16.1.2) `cast_exit` does not wait: it records the request and returns at once. The first request wins.
+`cast_exit` returns `true` when its request was recorded and `false` when an earlier request had already been
+recorded, whose value is the one `wait_for_exit` returns. `cast_exit` is the one cast-family call that returns `false`, and it never raises (hosted and board runtimes: the first request wins by compare-and-swap, a later one returns 0; trial `actors_addition/cast_exit_ends_process_with_status`). `main` can return at any moment after a recorded request,
+so nothing that follows `cast_exit` in the same dispatch is guaranteed to run.
+
+- **What has finished when the program ends.** Everything the issuing actor wrote before calling `cast_exit` has
+  been written, because writes complete before they return. Work that other actors have not done yet has not: a
+  message cast to another actor may still be in its mailbox. An actor that needs another actor's work done before
+  the program ends uses `call` for that work, and issues `cast_exit` after the reply has arrived.
+- **Issued while serving a call.** `cast_exit` may be issued from any actor. If the actor is serving a `call`, the
+  caller is not guaranteed to receive its reply before the program ends.
+- **The value.** Any `int64`. `main` decides what to do with it; a `main` that returns `int64` usually returns it,
+  which makes it the exit status, but `main` may end with any result its signature allows.
+
+A program in this shape, whose worker hands the result of its work back to `main`:
+
+```silica
+fn compile_beh(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        code: int64 <- main_driver@run();
+        _: boolean <- cast_exit(code)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        pipeline: actor_ref <- spawn(0, compile_beh, stack_policy(0, :keep_high_water));
+        _: boolean <- cast(pipeline, 0 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+```
+
+A supervised program starts its supervisor first, as in "Keep `main` small" of the language guide; `pipeline` is
+then one of its children.
 
 #### 15.1.2.1 AArch64 Runtime Integration
 
@@ -8441,6 +8544,8 @@ If migration fails:
 
 **Supervisor Specification:** Full details of supervisor registration, failure notification delivery, the high-priority supervision ingress, restart protocols, and the required `Supervisor` trait are specified in **§15.4 Supervision and Fault Tolerance**. A supervisor can also forward a report of every child exit to a report sink actor (§15.4.10.5).
 
+**Root actors.** An actor or supervisor that has no supervisor, such as a root supervisor started by `main`, writes the line `[silica] root actor exited (no supervisor)` to standard error (the console on the ESP32-S3) when it ends, in addition to its failure report. When a `FailureReporter` is registered the line is written before the report is handed over, because the reporter may end the program; otherwise it follows the report.
+
 #### 15.1.4 Actor Identity
 Each actor has a unique identity. The built-in function `self()` returns the current actor's reference:
 
@@ -8469,6 +8574,8 @@ The `actor_ref` type is a primitive type (like `int` or `boolean`), representing
 - A spawner that starts other spawners at run time owns a **block of positions**. The compiler sizes the block at build time. A spawner that is itself started at run time receives a slice of its parent's block, for any spawners it starts in turn.
 - A spawner hands out positions only from its own block. No counter is shared between actors.
 - A spawner's position is **stable across its restarts**.
+
+**Implementation status (2026-10-12).** The compilers do not yet number positions at build time. Position 0 is `main`'s, and root supervisors started from `main` take 1, 2, … in start order, as above. Every other spawner takes the next free position from one run-time counter at its first spawn, so positions below the root supervisors depend on run-time order, and a spawner's restarted children take fresh positions when their supervisor restarts. Identity, equality, order, and dead-reference behaviour are otherwise as this section specifies. Build-time positions remain the specified design.
 
 **Child numbers.** A spawner numbers the actors it spawns from 0 upward and never reuses a number.
 
@@ -8728,7 +8835,7 @@ same on every target, hosted or OS-free; only where the report is written differ
 |-------|------|-------------------|-------------|
 | **Fatal fault** | A synchronous hardware exception that is not recovered: the containment gate fails (§15.4.4); the fault is outside any actor, including exhausting the stack of `main`, which is not an actor (§15.1.2.2); the fault is in trusted runtime code; a fault in guarded foreign code (§26) when no actor is current; a fault inside the fault handler itself; or debug mode (§15.4.15.1) | `[silica] fault at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>`, then `  addr=0x<fault address>` and, on targets with actors, `  actor=0x<actor>  sbase=0x<stack base>  ssize=0x<stack size>` | **70** |
 | **Runtime abort** | The runtime detects a condition it cannot continue from: a failed runtime check (region capacity, buffer validity or bounds, list index, an internal invariant), a resource the runtime cannot obtain (memory to commit for a growing stack, §15.4.10.2; an actor stack reservation requested by `main`, §15.1.2.2), or a containment failure that was not raised by hardware | `[silica] abort: <reason> at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>` | **71** |
-| **Language-level failure in `main`** | A pattern-match or arithmetic failure raised in `main`, which has no supervisor | the failure's atom name (`case_clause`, `badarith`) | **1** |
+| **Language-level failure in `main`** | A pattern-match or arithmetic failure raised in `main`, which has no supervisor; a `call` or `cast` from `main` to an ended actor (§16.1.4); a calling-convention mismatch found at run time (§16.2.6.4) | the failure's atom name (`case_clause`, `badarith`, `actor_not_found`, `language_error`) | **1** |
 
 Rules:
 
@@ -8857,6 +8964,22 @@ Rules:
 - `fault_addr` is present only on the trap path; it is omitted (not shown as zero) on the orderly path.
 - `region_dumps` appears only when `FailureReporter.region_dump_limit()` returns a value greater than zero (§15.4.13.4). One entry per region handle the actor held at time of death. Each entry shows up to `region_dump_limit()` bytes. On AArch64 with MTE, the tag for each 16-byte granule is appended as `[tags: N N N ...]` (one nibble per granule, decimal). On x86-64 the tag annotation is absent.
 - The delimiters `=== Silica Actor Failure ===` and `=== End Silica Actor Failure ===` are literal strings, enabling reliable extraction from log streams.
+
+**Implementation status (2026-10-16).** The runtimes write a shorter report than the format above, the same on every target apart from the pointer spelling:
+
+```
+=== Silica Actor Failure ===
+actor_id:        <decimal identity>
+agent_type_atom: <atom index of the agent type; 0 for a root actor>
+reason_tag:      <number of the failure reason>
+supervisor_acb:  <pointer; 0x0, (nil) or 0x00000000 when the actor has no supervisor>
+call_stack:
+  #0  <behavior symbol, or <unknown behavior>>
+  #1  _actor_thread_main
+=== End Silica Actor Failure ===
+```
+
+`actor_id` is the actor's 64-bit identity (§15.1.4) printed in decimal. `reason_tag` is the runtime's code for the failure reason; the codes used by the specification are 1 for `(:explicit, :killed)`, 2 for `:language_error` and 4 for the other `(:explicit, atom)` reasons, which includes `(:explicit, :shutdown)` and `(:explicit, :actor_not_found)`. The report has no source file or line, no `behavior` or `message_seq` field, and no `supervisor:` line. The root supervisor's own report is recognised by a null `supervisor_acb` and the frame `#0  <unknown behavior>`. The hosted runtimes append a `=== Region Dump ===` block per held region when the reporter's `region_dump_limit()` is above zero. The fault line of a process-fatal report (§15.4.5.5) prints the current actor's control-block address in `actor=0x…`, not its identity. The format above, with source file and line, `behavior`, `message_seq`, a `supervisor:` line and the MTE tags, remains the design and is what a conforming report will carry; the short form printed today is described, with the runtime symbols that print it, in [runtime_failure_reporting.md](runtime_failure_reporting.md) §7.
 
 **Example**
 
@@ -9003,11 +9126,13 @@ Any operation can return `{ tag: :error, error: reason_atom, ... }`.
 
 **`:set_report_sink`** names the actor that receives this supervisor's exit reports (§15.4.10.5).
 
+**Implementation status (2026-10-16).** `:terminate_actor` and `:set_report_sink`, with the report sink of §15.4.10.5, are not implemented. The other operations are, and `:get_child` finds a child by its `id` (trials `supervisors_addition/phase_d_protocol_restart_and_lookup`).
+
 There is no `cast_supervisor`, and `cast(supervisor_ref, ...)` is invalid. `call(supervisor_ref, ...)` is invalid; ordinary actor `call()` accepts `actor_ref`, not `supervisor_ref`.
 
 ##### 15.4.8.4 Exit Propagation
 
-Links are bidirectional. If the supervisor dies, the runtime delivers exit signals to all of its linked children. Children that do not themselves trap exits (i.e. are not supervisors) terminate on receipt of an exit signal. This enables cascading subtree shutdown when a supervisor stops.
+Links are bidirectional. A supervisor traps exits in the sense that a child's exit reaches it as a notification (§15.4.9) and never ends it. This does not let a child supervisor outlive its parent: when a supervisor ends, for any reason, it first shuts down all of its live children by the protocol of §15.4.12.2, and a child supervisor stops its own subtree before it ends. Each child's registered names are freed before the parent learns of the exit and may restart it. A subtree therefore never outlives the supervisor that started it.
 
 ##### 15.4.8.5 Post-Spawn Linking (`link`)
 
@@ -9186,7 +9311,7 @@ The failure reason is an **inline sum type** — a built-in language construct, 
 | `:normal` | The actor ended normally, through `stop_self(:normal)` or `remove_actor` (§15.1.2.3) |
 | `:language_error` | Language-level failure: pattern-match exhaustion, a type mismatch, `panic` (§22.16), or similar |
 | `:memory_fault` | Hardware-detected memory fault (MTE tag mismatch, guard page violation) |
-| `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4). |
+| `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), `(:explicit, :restart_intensity_breach)` for a supervisor that ends because it breached its restart intensity (§15.4.13.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4). |
 | `:noproc` | Used only in a `DOWN` message: the monitored actor had already ended when `monitor` was called (§15.4.8.6) |
 | `:unknown` | Runtime could not determine the reason |
 
@@ -9217,21 +9342,25 @@ When a child exits and the **row** in the internal child table (§15.4.13.3) for
 
 ##### 15.4.12.2 Coordinated Shutdown of Live Children
 
-When a supervisor is tearing down children for restart or termination:
+A supervisor tears down its children when it restarts them (§15.4.12.1) and when it ends. It ends when its own supervisor terminates it, when its restart intensity is exceeded (§15.4.13.2), when its `init` fails after some children have started, when `:terminate_child` or `:restart_child` names it, and when a `:one_for_all` or `:rest_for_one` restart reaches it. In every case:
 
-1. For each live child whose `actor_ref` is held in the supervisor child table, the runtime-owned supervisor behavior applies the child row's `shutdown` policy.
-2. If `shutdown` is `0`, the child is killed immediately.
-3. If `shutdown` is greater than `0`, the runtime performs an **orderly shutdown**:
+1. The children are stopped **one at a time, last child-table row first**, and the supervisor waits for each to finish before it stops the next. A child supervisor stops its own children first, by this same procedure.
+2. For each live child whose `actor_ref` is held in the supervisor child table, the runtime-owned supervisor behavior applies the child row's `shutdown` policy.
+3. If `shutdown` is `0`, the child is killed as by `kill_abnormal` (§22.4), with reason tag 1.
+4. If `shutdown` is greater than `0`, the runtime performs an **orderly shutdown**:
    - It stops dispatching further messages to the child.
    - It lets the dispatch in progress, if any, run to completion; a call in progress still receives its reply.
-   - It then ends the child with `failure_reason` `(:explicit, :shutdown)`.
+   - It then ends the child with `failure_reason` `(:explicit, :shutdown)` (reason tag 4).
    - No message is delivered to the child for this.
-   - If the dispatch in progress has not completed within `shutdown` milliseconds, the child is killed.
-4. If the child is already dead, the child is treated as successfully stopped.
-5. After the affected children are stopped, the supervisor may respawn them or remove their rows according to the operation and restart strategy.
-6. When a `:temporary` child ends, for any reason, its row is **removed** from the child table. Rows of `:permanent` and `:transient` children are kept.
+5. Each child that is shut down produces a failure report like any other death (§15.4.10).
+6. A child's registered names are freed when it ends, before the supervisor that is stopping it is told.
+7. If the child is already dead, the child is treated as successfully stopped.
+8. After the affected children are stopped, the supervisor may respawn them or remove their rows according to the operation and restart strategy.
+9. When a `:temporary` child ends, for any reason, its row is **removed** from the child table. Rows of `:permanent` and `:transient` children are kept.
 
 This protocol is supervisor-runtime behavior. It does not expose public shutdown supervisor messages and does not interact with the §15.4.6 trap recovery path.
+
+**Implementation status (2026-10-15).** The `shutdown` time limit is not enforced on any target. Nothing preempts a running message, so a child finishes its current dispatch before it stops, whatever `shutdown` says; `kill_abnormal` behaves the same way. Stopping children one at a time, last row first, the reasons, the freeing of names and the reports are implemented in all four runtimes. Enforcing the limit remains the specified design.
 
 ##### 15.4.12.3 Restart Policies
 
@@ -9276,7 +9405,9 @@ restart_strategy ::= :one_for_one | :one_for_all | :rest_for_one
 | `:one_for_all` | Restart all children when any one fails. |
 | `:rest_for_one` | Restart the failed child and all children started after it in declaration order. |
 
-If the number of restarts within `restarts_time_frame` seconds exceeds `allowed_restart_count`, the supervisor itself terminates, propagating the failure to its own supervisor (if any) via the link established at its spawn.
+If the number of restarts within `restarts_time_frame` seconds exceeds `allowed_restart_count`, the supervisor itself terminates, propagating the failure to its own supervisor (if any) via the link established at its spawn. The breaching supervisor shuts down its live children (§15.4.12.2) and then ends with `failure_reason` `(:explicit, :restart_intensity_breach)` (§15.4.11.2), an abnormal reason: its own supervisor therefore restarts it under `:permanent` and under `:transient`, and not under `:temporary`.
+
+**Implementation status (2026-10-17).** All runtimes end a breaching supervisor with `(:explicit, :restart_intensity_breach)` (reason tag 4), a runtime atom distinct from the `:shutdown` of orderly shutdown (§15.4.12.2). Before 2026-10-16 the breach ended with reason tag 0, which a `:transient` parent read as a normal exit and never restarted.
 
 ```
 child_spec ::= {
@@ -9285,7 +9416,7 @@ child_spec ::= {
     initial_state:  ActorState,
     behavior:       fn(msg: ActorMessage, state: ActorState) -> ChildReturn,
     restart:        :permanent | :temporary | :transient,
-    shutdown:       int   -- 0 = immediate kill; >0 = milliseconds to wait
+    shutdown:       int   -- 0 = kill; >0 = orderly shutdown, milliseconds to wait
 }
 ```
 
@@ -9298,8 +9429,10 @@ child_spec ::= {
 `ChildReturn` is the child behavior's return form: `(:reply, Reply, ActorState)` for a call-only child, or `(:no_reply, ActorState)` for a cast-only child. Each behavior uses exactly one form (§15.1.2). A state-machine child gives `behavior: state_machine_behavior(ImplType)`, the runtime-provided cast-only behavior for that `StateMachine` implementation, and its `initial_state` is the value passed to `init` (§15.5.6).
 
 `shutdown` controls how the runtime stops a live child before replacing it:
-- `0` — kill immediately without waiting.
-- `> 0` — orderly shutdown (§15.4.12.2): no further messages are dispatched, the dispatch in progress may finish for up to that many milliseconds, and the child is then ended or killed.
+- `0` — kill without waiting for further messages; the child ends with reason tag 1, as for `kill_abnormal` (§15.4.12.2).
+- `> 0` — orderly shutdown (§15.4.12.2): no further messages are dispatched, the dispatch in progress may finish for up to that many milliseconds, and the child ends with `failure_reason` `(:explicit, :shutdown)`. The time limit is not yet enforced (implementation status, §15.4.12.2).
+
+The same policy applies when the supervisor itself ends: it shuts down every live child before it ends (§15.4.8.4, §15.4.12.2).
 
 ##### 15.4.13.3 Internal child table: heap layout, declarative and dynamic children
 
@@ -9362,6 +9495,18 @@ register_failure_reporter(reporter: actor_ref) -> atom   proc[concurrency]
 
 Registration calls `region_dump_limit()` once and caches the result.
 
+**Handler before any start (E2236).** Because `main` keeps only a small stack and waits in `wait_for_exit()`, every failure — including the root supervisor's own — must reach a registered `FailureReporter`. The compiler therefore requires that, in `main`'s order of execution, `register_failure_reporter` runs before any actor or supervisor is started:
+
+- A **start** is any call to a `spawn*` builtin (`spawn`, `spawn_registered`, `spawn_registered_supervisor`, `spawn_dangerous`, `spawn_device`, and their registered forms), made directly in `main` or inside any function `main` calls, transitively.
+- **Registration** may likewise be done directly in `main` or inside a function `main` calls, as long as it runs before the first start.
+- **Exemption:** the `spawn` that creates the reporter actor itself — the one whose `actor_ref` is passed to `register_failure_reporter` — is allowed before registration.
+- A start that can run before registration is rejected with **E2236 StartBeforeFailureReporter**, reported at that start (or at the call in `main` that leads to it).
+- **Branches:** after a `case`, registration counts as done only if every arm registers; a start on any path that can run unregistered is an error. The right operand of `and` / `or` is conditional, so a registration there does not count.
+- **What is followed:** direct calls to named functions, in this unit and in other modules (through each module's interface). Behaviours and supervisor `init` functions passed to a spawn, and function-literal bodies, run in actors and are not followed. Calls through function values or trait dispatch are not followed.
+- **The exemption's reach:** a spawn bound to a name that the same function later passes to `register_failure_reporter`, or a spawn written directly as `register_failure_reporter`'s argument. A reporter created inside a helper (`r <- make_reporter(); register_failure_reporter(r)`) is not exempt: the helper's spawn is a start.
+
+The reporter recognises the root supervisor's report and ends the program with `cast_exit`. When a program's root supervisor fails, the conventional exit status is **70**, the fault status (§15.4.5.5).
+
 ```silica
 trait FailureReporter {
     fn region_dump_limit() -> int64;
@@ -9394,6 +9539,11 @@ An implementation **may realize** the **typed** layer **in milestones**: (**a**)
 - Region dumps are captured by the runtime before the dying actor's regions are reclaimed (for **non-empty** **`region_dumps`** per **§15.4.13.6** — see **Transport vs. typed report** for staged **(`b`)**). The supervisor ingress receives only structured notification fields (§15.4.11); bulk region data is never placed on the supervisor ingress.
 - The root `FailureReporter` actor must be started before any other actor in the system. If no `FailureReporter` actor is running when a report is generated, the runtime falls back to writing the report to **stderr** with an empty region dump list.
 - `handle_report` must not block indefinitely. A slow or stuck `FailureReporter` delays report delivery but does not affect actor restart logic, which proceeds independently via the supervisor ingress—consistent with **`handle_report` running only on the `FailureReporter` actor's thread** (see **Asynchronous delivery**).
+
+**Implementation status (2026-10-16).**
+- The reporter is an ordinary cast-only actor, not an implementation of the `FailureReporter` trait. Its behavior takes the report as its message, `fn reporter(report: string, state: S) -> (:no_reply, S)`, and `main` registers it with `register_failure_reporter(reporter: actor_ref) -> atom` (§15.4.13.4 above). The module that registers it also defines `region_dump_limit() -> int64`, which the runtime calls once at registration. The `region_dumps` argument of `handle_report` is not delivered; region data appears only in the report text. The compiler rejects a reporter whose behavior is call-only (E2237, §16.2.6.3).
+- Reports are delivered asynchronously. A report block is freed once the reporter has handled it. When `main` returns, the runtime waits for reports already handed over to be handled, for at most two seconds on the hosted targets and about one second on the ESP32-S3, then writes any report still pending to standard error or the console, oldest first.
+- Without a registered reporter the runtime writes each report to standard error (the console on the ESP32-S3) as it is produced.
 
 ##### 15.4.13.5 FFI Fault Containment
 
@@ -9545,6 +9695,8 @@ No open items. All previously deferred decisions have been resolved and their sp
 
 ### 15.5 State-Machine Actors
 
+**Implementation status (2026-10-16).** State-machine actors are not implemented: the compilers have no `StateMachine` trait support, `spawn_state_machine` or `state_machine_behavior`. This section, and the references to it from §15.4.13.2, §15.4.10.5 and §16.2.6.4, state the design.
+
 A **state-machine actor** is a runtime-managed actor whose behavior comes from an implementation of the `StateMachine` trait. It is Silica's counterpart of Erlang/OTP's `gen_statem`, as gen_server-style behaviors (§15.1.2) correspond to `gen_server` and the `Supervisor` trait (§15.4.13) to `supervisor`. The programmer implements the trait. The runtime provides the behavior function, which keeps the event queues, applies postponement and runs the timeouts described below.
 
 #### 15.5.1 The `StateMachine` Trait
@@ -9667,7 +9819,7 @@ If the behavior returns `(:reply, int64, State)`, then `call()` returns `int64`.
 **Type Checking Requirement**:
 - The compiler **must** verify that `actor` was spawned with a call-only behavior (one that always returns `(:reply, ...)`)
 - The compiler **must** verify that the Reply type in `(:reply, Reply, State)` matches the expected return type of `call()`
-- If `actor` is spawned with a cast-only behavior (returns `(:no_reply, ...)`), the compiler reports a **type error**: `"cannot call() a cast-only actor"`
+- If `actor` is spawned with a cast-only behavior (returns `(:no_reply, ...)`), the compiler reports a **type error** E2238 (CallToCastOnlyActor): `"cannot call() a cast-only actor"`
 - If the behavior returns a union of both `(:reply, ...)` and `(:no_reply, ...)` forms, the compiler reports a **type error**: `"behavior has inconsistent return types; cannot determine if call-safe"`
 - If Reply type does not match expected return type, the compiler reports a **type error**: `"reply type mismatch: expected X, got Y"`
 
@@ -9719,11 +9871,13 @@ call_with_timeout(actor: actor_ref, message: ActorMessage, timeout_ms: uint64)
 - A `timeout_ms` of `0` enqueues the message and returns `:timeout` without waiting.
 - Time is measured on the monotonic clock (§22.14).
 
+**Implementation status (2026-10-16).** `call_with_timeout` is not implemented, and neither are the monotonic clock and timers of §22.14. A caller cannot yet stop waiting for a reply.
+
 #### 16.1.2 Asynchronous Cast
 Messages can be sent asynchronously without blocking, with success/failure indication:
 
 ```
-cast(actor: actor_ref, message: ActorMessage) -> atom proc[concurrency]
+cast(actor: actor_ref, message: ActorMessage) -> boolean proc[concurrency]
 ```
 
 **Semantics:**
@@ -9731,12 +9885,13 @@ cast(actor: actor_ref, message: ActorMessage) -> atom proc[concurrency]
 - **No Reply Expected**: The target behavior must return `(:no_reply, new_state)` — no reply is sent back to the caller
 - **Immediate Death Detection**: Raises `actor_not_found` immediately if the actor is already dead (does not queue the message)
 - **Success/Failure**: Message is successfully enqueued if the actor exists and is alive; raises `actor_not_found` if the actor doesn't exist or is dead
+- **Result**: `true` when the message was enqueued. `cast` has no failing return: every case in which the message cannot be enqueued (the actor has ended, never existed, or is a reference to a name nobody holds) raises `actor_not_found`, so a `cast` that returns has always returned `true`. Verified 2026-10-16 in the hosted runtimes (`_silica_rt_actor_cast` turns the enqueue routine's 0 into `actor_not_found`) and the ESP32-S3 runtime (`silica_rt_actor_cast`); no mailbox-full case exists, since mailboxes are unbounded. The `boolean` in the signature is kept for source compatibility and for `cast_exit`, which does return `false` (§15.1.2.5).
 
 **Behavior Function Contract**: The target actor must be spawned with a **cast-only** behavior function that returns `(:no_reply, new_state)`.
 
 **Type Checking Requirement**:
 - The compiler **must** verify that `actor` was spawned with a cast-only behavior (one that always returns `(:no_reply, ...)`)
-- If `actor` is spawned with a call-only behavior (returns `(:reply, ...)`), the compiler reports a **type error**: `"cannot cast() to a call-only actor"`
+- If `actor` is spawned with a call-only behavior (returns `(:reply, ...)`), the compiler reports a **type error** E2237 (CastToCallOnlyActor): `"cannot cast() to a call-only actor"`
 - If the behavior returns a union of both `(:reply, ...)` and `(:no_reply, ...)` forms, the compiler reports a **type error**: `"behavior has inconsistent return types; cannot determine if cast-safe"`
 
 Mailboxes are unbounded queues that can grow without limit, so messages are never rejected due to mailbox capacity. The `message` argument must satisfy `ActorMessage` — typically `expr impl ActorMessage {}` (§3.3, §16.3.2) or a type that has `impl ConcreteType;` registered in `actormessage.silica`.
@@ -9765,6 +9920,8 @@ When a message is sent to an actor that has terminated, the following behavior a
 - **Messages are Dropped**: Messages sent to terminated actors are dropped (not queued) and will never be delivered
 - **Exception Raised**: Both `call()` and `cast()` raise `actor_not_found` when targeting a terminated actor, providing consistent error handling across all message-passing operations
 - **Explicit Handling Required**: Callers must handle the `actor_not_found` exception when calling or casting to actors that may have terminated
+
+**Implementation status (2026-10-16).** `actor_not_found` cannot be caught: Silica has no exception handler. A `call` or `cast` that raises it ends the sender. A sender that is an actor fails with `failure_reason` `(:explicit, :actor_not_found)` (reason tag 4). When the sender is `main`, which has no supervisor, the process writes `actor_not_found` to standard error and exits with status 1 (§15.4.5.5). A caller that must not fail uses a reference it knows to be alive, or learns of the end of an actor through supervision or a monitor (trial `actors_addition/identity_dead_ref_raises`).
 - **No Delivery Guarantee**: There is no guarantee that messages sent to an actor will be delivered if the actor terminates before message processing
 
 **Termination Detection:**
@@ -9958,7 +10115,7 @@ error: behavior has inconsistent return types
 
 **Rule**: `call(actor_ref, message)` is only valid if `actor_ref` was spawned with a call-only behavior (returns `(:reply, ...)` exclusively).
 
-**Compiler Error**: If `call()` is used on an actor spawned with a cast-only behavior:
+**Compiler Error**: If `call()` is used on an actor spawned with a cast-only behavior, the compiler reports E2238 (CallToCastOnlyActor):
 ```
 error: cannot call() a cast-only actor
   - actor was spawned with a behavior returning (:no_reply, ...)
@@ -9969,7 +10126,7 @@ error: cannot call() a cast-only actor
 
 **Rule**: `cast(actor_ref, message)` is only valid if `actor_ref` was spawned with a cast-only behavior (returns `(:no_reply, ...)` exclusively).
 
-**Compiler Error**: If `cast()` is used on an actor spawned with a call-only behavior:
+**Compiler Error**: If `cast()` is used on an actor spawned with a call-only behavior, the compiler reports E2237 (CastToCallOnlyActor):
 ```
 error: cannot cast() to a call-only actor
   - actor was spawned with a behavior returning (:reply, ...)
@@ -9983,17 +10140,17 @@ The compiler tracks the calling convention of each `actor_ref` based on:
 2. The return type of that behavior function
 3. All code paths in the behavior must consistently return one form
 
-This information is used at call sites of `call()` and `cast()` to enforce the type checking rules above.
+This information is used at call sites of `call()` and `cast()` to enforce the type checking rules above: E2237 (CastToCallOnlyActor) for a cast that reaches a call-only actor, E2238 (CallToCastOnlyActor) for a call that reaches a cast-only actor.
 
 **Where the convention travels.** The compiler follows the convention wherever a reference flows and it can see the flow: through variables, function parameters and results, tuple and record fields, list elements, actor state and message fields. `spawn_state_machine` and `state_machine_behavior` give cast-only references (§15.5.6). A `supervisor_ref` has no calling convention; it is used only with `call_supervisor`.
 
-**Run-time check where the convention is unknown.** Some references reach a call site with no convention the compiler can determine: a reference returned by `whereis` (§20.3.1), a `child` field in a `call_supervisor` reply, a reference in an exit report (§15.4.10.5), or a reference read from a message or state field whose type does not record where it came from. The runtime records each actor's calling convention when the actor is spawned. A `call()`, `call_with_timeout()` or `cast()` through a reference whose convention is unknown at compile time compares that recorded convention with the operation before enqueuing anything. On a mismatch, nothing is enqueued and the calling actor fails with `failure_reason` `:language_error`.
+**Run-time check where the convention is unknown.** Some references reach a call site with no convention the compiler can determine: a reference returned by `whereis` (§20.3.1), a `child` field in a `call_supervisor` reply, a reference in an exit report (§15.4.10.5), or a reference read from a message or state field whose type does not record where it came from. The runtime records each actor's calling convention when the actor is spawned. A `call()`, `call_with_timeout()` or `cast()` through a reference whose convention is unknown at compile time compares that recorded convention with the operation before enqueuing anything. On a mismatch, nothing is enqueued and the calling actor fails with `failure_reason` `:language_error`. In `main`, which is not an actor, the mismatch is the language-level failure of §15.4.5.5: `language_error` on standard error and exit status 1. The same check covers `send`, `cast_registered` and `call_registered`. The runtime's own delivery of unwind reports to the `FailureReporter` (§15.4.13.4) makes the same comparison: a reporter whose behavior is call-only gets nothing enqueued, and the report falls back to standard error as for any failed enqueue. An actor whose behavior has no recorded convention (a runtime-managed behavior) is not checked.
 
 #### 16.2.6.5 Self-Call Deadlock Prevention
 
 **Rule**: `call(self(), message)` is a **compiler error**. An actor cannot call itself synchronously, as this would cause a deadlock.
 
-**Compiler Error**: If an actor behavior attempts `call(self(), ...)`:
+**Compiler Error** (E2240 CallToSelf): If an actor behavior attempts `call(self(), ...)`, or a `call` whose target is a name bound from `self()`:
 ```
 error: cannot call(self(), ...)
   - self() returns the current actor's reference
@@ -10004,6 +10161,8 @@ error: cannot call(self(), ...)
 **Rationale**: The calling actor is suspended waiting for a reply from the same actor that is handling the current message. The reply can never come, resulting in permanent deadlock.
 
 **Alternative**: If an actor needs to message itself, use `cast(self(), ...)` (asynchronous), which enqueues the message for later processing after the current message completes.
+
+**Implementation status (2026-10-16).** The compiler rejects `call(self(), ...)` and calls through aliases bound from `self()` with E2240. `call_with_timeout` is not covered by this check.
 
 #### 16.2.6.6 Migration Message Handling
 
@@ -12062,7 +12221,7 @@ register(name: atom, actor: actor_ref)
     -> :ok | :name_taken | :already_registered | :actor_not_found   proc[concurrency]
 whereis(name: atom) -> Some(actor_ref) | None                        proc[concurrency]
 unregister(name: atom) -> :ok | :not_registered                      proc[concurrency]
-cast_registered(name: atom, message: ActorMessage) -> atom           proc[concurrency]
+cast_registered(name: atom, message: ActorMessage) -> boolean        proc[concurrency]
 call_registered(name: atom, message: ActorMessage) -> Reply          proc[concurrency]
 ```
 
@@ -12076,18 +12235,32 @@ The **ordinary registry** maps a name to a live ordinary actor. Names are atoms,
 - **`spawn_registered`** (§15.1.1) is `spawn` followed by `register`, done as one step. If the name is taken, no actor is spawned and the calling actor fails with `failure_reason` `:language_error`.
 - **`whereis`** returns the actor that holds the name, or `None`. It never returns a supervisor. The calling convention of the reference it returns is checked at run time (§16.2.6.4).
 - **`unregister`** removes a name. It returns `:not_registered` when no actor holds the name.
-- **`cast_registered`** and **`call_registered`** send to the actor that holds the name when the message is sent. They raise `actor_not_found` when no actor holds it, as `cast()` and `call()` do for an ended actor.
+- **`cast_registered`** and **`call_registered`** send to the actor that holds the name when the message is sent. They raise `actor_not_found` when no actor holds it, as `cast()` and `call()` do for an ended actor. Like `cast`, `cast_registered` therefore returns `true` whenever it returns; it never returns `false` (trial `cast_registered_unheld_name_addition/cast_registered_unheld_name_fails`: main casts to an unheld name and ends with `actor_not_found`, status 1; earlier hosted runtimes answered `false` silently).
 
 **Removal when an actor ends.** When an actor ends for any reason, its name is removed as part of its teardown (§15.1.2.3), before its supervisor handles the exit. A name therefore never refers to an ended actor.
 
+**Implementation status (2026-10-16).** On every target a name given at `spawn_registered` (and a registry `:insert`) is released when the actor ends, on every ending path; the name can then be taken again, and `whereis` and `cast_registered` see `actor_not_found` until it is.
+
+**Table size.** The registry has one slot per atom of the application, so a lookup is a direct index and a registration never fails for lack of room.
+
+**Implementation status (2026-10-16).** `register`, `whereis` and `unregister` are not implemented. A name is bound only at spawn, with `spawn_registered` and the other registered spawn forms, or as a supervised child's `id`; `cast_registered` and `call_registered` send by name.
+
+The registry is reachable today through `get_pid_registry() -> actor_ref`, the registry actor, used with `call`: `call(reg, { op: :insert | :lookup | :update | :delete, name: <atom>, pid: <actor_ref> } impl ActorMessage {})` returns `(atom, actor_ref)`. In the trials (`actor_registration_addition`), `:insert` answers `:ok`, `:name_taken` or `:already_registered`, `:lookup` answers `:found` or `:not_found`, and `:delete` removes a name; `:update` is not exercised by any trial. `spawn_registered`, `cast_registered` and `call_registered` are the name-based forms.
+
 **Names across restarts.** When a supervisor restarts a child that held a name at the moment it ended, the runtime registers the replacement under the same name before the replacement handles its first message. A name reaches the replacement, but a reference to the old actor never equals the replacement (§15.1.4).
 
-#### 20.3.2 Message Broadcasting
-```
-broadcast(actors: List[actor_ref, mem(normal)], message: ActorMessage) -> atom proc[concurrency]
-```
 
-#### 20.3.3 Actor Monitoring
+**Supervised children with the same id.** A child is registered under its child-spec `id`, in the same namespace. An `id`
+that appears twice in one supervisor's `init` child list is a compile-time error, **E2235**
+`DuplicateChildId`, reported at the second occurrence. At run time, a child whose `id` is already held by a live actor
+or supervisor (for example a child of another supervisor) is not started, and the supervisor's `init` fails with
+`failure_reason` `:language_error`, as `spawn_registered` does when its name is taken.
+Adding a child (`:add_child`) whose `id` is already held by a live actor or supervisor, and restarting a child whose
+name another actor took between the child's end and its restart, are run-time errors with the same duplicate-child
+indicator: the actor that asked for the add, or the supervisor doing the restart, fails with `failure_reason`
+`(:explicit, :duplicate_child_id)`. No child is started under a name it does not hold.
+
+#### 20.3.2 Actor Monitoring
 ```
 monitor(target: actor_ref) -> monitor_ref   proc[concurrency]
 demonitor(ref: monitor_ref) -> :ok          proc[concurrency]
@@ -14213,6 +14386,8 @@ module arch.apple.amx {
 
 This section documents all built-in functions and primitives available in Silica. These are always available without requiring imports. A builtin is always called unqualified; a module function with a builtin's name is called only as `module@name(...)` (§19.3.3).
 
+**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `stop_self`, `fail_self`, `panic`, `assert`, `unreachable` (§15.1.2.3, §22.16); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout`, `send_after`, `cancel_timer`, `monotonic_time`, `current_time` (§22.14); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations and `alloc_atomic` (§22.12); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `set_scheduler_policy`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
+
 ### 22.1 Memory Management Primitives
 
 **Lifetime Factory:**
@@ -14300,7 +14475,7 @@ As `call()`, but returns `:timeout` if no reply arrives within `timeout_ms` mill
 
 #### Asynchronous Cast (Fire-and-Forget)
 ```
-cast(actor: actor_ref, message: ActorMessage) -> atom proc[concurrency]
+cast(actor: actor_ref, message: ActorMessage) -> boolean proc[concurrency]
 ```
 
 **Casts** a message to an actor and **returns immediately** without waiting for a response. The target behavior should return `(:no_reply, new_state)`. Raises `actor_not_found` if the actor doesn't exist or has terminated.
@@ -14337,7 +14512,7 @@ actor_ref_equal(left, right) -> boolean         // []
 actor_ref_not_equal(left, right) -> boolean     // []
 ```
 
-`actor_ref_equal` returns `true` when `left` and `right` denote the same actor, comparing the 64-bit identity of §15.1.4. `actor_ref_not_equal` returns the negation. Both arguments must have the **same** reference type: `actor_ref`, `dangerous_actor_ref`, `device_actor_ref`, or `supervisor_ref`. Mixing reference types is an error (`E2003`), and so is passing a value that is not a reference.
+`actor_ref_equal` returns `true` when `left` and `right` denote the same actor, comparing the 64-bit identity of §15.1.4; it is equivalent to `left == right`. `actor_ref_not_equal` returns the negation, equivalent to `left != right`. Both arguments must have the **same** reference type: `actor_ref`, `dangerous_actor_ref`, `device_actor_ref`, or `supervisor_ref`. Mixing reference types is an error (`E2003`), and so is passing a value that is not a reference.
 
 Both functions are **pure**. They carry effect `[]`, may be called anywhere an expression is allowed, and do not require `concurrency`. They read only the reference words the caller already holds; they do not contact the actors and do not report whether either actor is still alive.
 
@@ -14412,13 +14587,13 @@ read_lines(path: string) -> list<string> proc[device_io]
 #### 22.6.2 File Writing
 ```
 write_file(path: string, content: string) -> atom proc[device_io]
-append_file(path: string, content: string) -> atom proc[device_io]
+append_file(path: string, content: string) -> boolean proc[device_io]
 ```
 
 #### 22.6.3 File Operations
 ```
 file_exists(path: string) -> boolean proc[device_io]
-delete_file(path: string) -> atom proc[device_io]
+delete_file(path: string) -> boolean proc[device_io]
 get_file_size(path: string) -> int64 proc[device_io]
 ```
 
@@ -14475,6 +14650,8 @@ get_cpu_topology_info() -> string proc[device_io]
 Get CPU topology information as a JSON string.
 
 ### 22.10 CPU Affinity Operations
+
+**Note.** Moving an actor to another core is `migrate_actor` (§15.1.2) or a `pin_actor_to_*` helper. The older three-argument builtin `move` was removed from the compilers on 2026-10-16; it is not part of the language, and a call such as `move(w, 0, 0)` is an unknown function (E2007).
 
 **CPU Affinity Types:**
 ```
@@ -15189,7 +15366,7 @@ Outbound calls to C-compatible wrapper libraries are specified in [silica_ffi_wr
 - Two-layer string marshaling (Silica `string` in adapters; pointer-plus-length at the raw ABI boundary)
 - Prebuilt wrapper static libraries under `dangerous_exposure_source/`
 
-Compiler rollout is tracked in [ffi_wrapper_implementation_plan.md](ffi_wrapper_implementation_plan.md). Inbound interop (C or another language calling into Silica) is not part of the language and is not planned: Silica programs call out through Fifi, and nothing outside calls in.
+Compiler rollout status is recorded in [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md). Inbound interop (C or another language calling into Silica) is not part of the language and is not planned: Silica programs call out through Fifi, and nothing outside calls in.
 
 Crash/fault handling for guarded FFI is platform-specific. For Apple Silicon and other macOS-hosted execution, see [macos_crash_handling_for_silica.md](macos_crash_handling_for_silica.md). That document explains why same-process recovery from arbitrary C faults is not guaranteed, and how a recognized guarded-FFI fault may be converted into actor failure only after control returns to a safe runtime boundary. Equivalent notes for Linux, Windows, bare-metal, and other runtimes will be added as Silica expands to support those platforms.
 

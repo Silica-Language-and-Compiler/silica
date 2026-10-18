@@ -32,7 +32,6 @@ use xt_isa;
 use xt_mem;
 
 export tuple_flat_memref/2;
-export emit_flat_float32_boxed_pair/3;
 export emit_reg_to_flat_qwords_memcpy_loop/5;
 export agg_shell_bytes/1;
 export agg_promote_bytes/1;
@@ -158,26 +157,6 @@ fn tuple_flat_memref_reg(store_base: string, offset: int64) -> string {
     concat(r, "]")
 }
 
-// Multi-element tuples box float32: pointer slot at byte_cursor, value at byte_cursor+8 (consumer does LDR/LDR).
-
-fn emit_flat_float32_boxed_pair(store_base: string, byte_cursor: int64, float_reg: string) -> string {
-    val_off: int64 <- byte_cursor + 8;
-    ptr_mr: string <- tuple_flat_memref(store_base, byte_cursor);
-    val_mr: string <- tuple_flat_memref(store_base, val_off);
-    // A frame-region base is a memref ("[X29, #-96]"), not a register, so the old
-    // "ADD X10, <base>, #n" form would emit garbage. Compute the element address
-    // from X29 directly in that case.
-    fb_f: int64 <- var@parse_x29_neg_offset_bytes(store_base);
-    add_ptr: string <- case fb_f > 0 of {
-        true -> concat(emit_sub_from_fp("X10", fb_f - val_off), concat("\n", concat(agg_addr_prefix(store_base, byte_cursor), xt_mem@xt_str("X10", ptr_mr))));
-        false -> case length_bytes(store_base) > 0 of {
-            true -> concat(xt_isa@xt_add("X10", store_base, concat("#", atom_table@int64_to_decimal_string(val_off))), xt_mem@xt_str("X10", ptr_mr));
-            false -> concat(xt_isa@xt_add("X10", "SP", concat("#", atom_table@int64_to_decimal_string(val_off))), xt_mem@xt_str("X10", ptr_mr))
-        }
-    };
-    concat(add_ptr, concat(agg_addr_prefix(store_base, val_off), xt_mem@xt_str(float_reg, val_mr)))
-}
-
 // Copy qword-aligned scalar fields from a stack record at src_reg into the flat tuple buffer (supervisor init:
 // inline flags record so materialize sees strategy @+0, counts @+8/+16, list head @+24 — not a dangling stack pointer).
 
@@ -194,7 +173,7 @@ fn emit_reg_to_flat_qwords_memcpy_loop(i: int64, qwords: int64, src_reg: string,
 }
 
 // Walk tuple_make chain, emit each element value and store at [SP, ...] or [store_base, ...].
-// byte_cursor = running offset for scalar fields (float32 in count>1 uses 16 bytes: ptr + value).
+// byte_cursor = running offset for scalar fields (one word each).
 // idx/count/sp_adjust: legacy path for nested aggregate elements (idx*8 + sp_adjust).
 // store_base: empty -> stack; non-empty -> sret / reply buffer register.
 
@@ -312,7 +291,7 @@ fn let_user_call_tuple_sret_stack_bytes(rhs: { nodes: List[{ kind: int64, type_n
     // Keep in lockstep with sret_alloc_bytes in term_emit_kind_call. Zero for pass-through / non-tuple.
     case (term_sir_helpers@sir_term_root_node(rhs).kind == 4 or term_sir_helpers@sir_term_root_node(rhs).kind == 5) and reg_conventions@is_tuple_type(term_sir_helpers@sir_term_root_node(rhs).type_name) of {
         false -> 0;
-        true -> case length_bytes(var@find_sp_binding(outer_reg, "_callee_sret")) > 0 and (length_bytes(bound_name) == 0 or term_sir_helpers@sir_term_root_node(rhs).kind == 5) of {
+        true -> case length_bytes(var@find_sp_binding(outer_reg, "_callee_sret")) > 0 and (length_bytes(bound_name) == 0 or term_sir_helpers@sir_term_root_node(rhs).kind == 5) and reply_result_type_agg(term_sir_helpers@sir_term_root_node(rhs).type_name) == false of {
             true -> 0;
             false -> term_user_call_abi@user_call_aggregate_return_alloc_bytes(term_sir_helpers@sir_term_root_node(rhs).type_name)
         }
@@ -331,11 +310,31 @@ fn branch_tail_user_call_sret_stack_bytes(rhs: { nodes: List[{ kind: int64, type
     // so walk the let spine to the tail before deciding (see read_hex_digits in the lexer).
     tail: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- branch_tail_strip_lets(rhs);
     tail_is_bound: boolean <- term_sir_helpers@sir_term_root_node(rhs).kind == 2 or length_bytes(bound_name) > 0;
-    case term_sir_helpers@sir_term_root_node(tail).kind == 4 and reg_conventions@is_tuple_type(term_sir_helpers@sir_term_root_node(tail).type_name) of {
+    reply_tail: boolean <- reply_result_type_agg(term_sir_helpers@sir_term_root_node(tail).type_name);
+    on_reply_spine: boolean <- reply_tail and length_bytes(var@find_sp_binding(outer_reg, "_tuple_sret")) > 0
+        and node_listed_agg(var@find_sp_binding(outer_reg, "_bsp"), concat(",", concat(atom_table@int64_to_decimal_string(tail.root), ",")), 0);
+    case term_sir_helpers@sir_term_root_node(tail).kind == 4 and reg_conventions@is_tuple_type(term_sir_helpers@sir_term_root_node(tail).type_name) and on_reply_spine == false of {
         false -> 0;
-        true -> case length_bytes(var@find_sp_binding(outer_reg, "_callee_sret")) > 0 and tail_is_bound == false of {
+        true -> case length_bytes(var@find_sp_binding(outer_reg, "_callee_sret")) > 0 and tail_is_bound == false and reply_tail == false of {
             true -> 0;
             false -> term_user_call_abi@user_call_aggregate_return_alloc_bytes(term_sir_helpers@sir_term_root_node(tail).type_name)
+        }
+    }
+}
+
+// (:reply, ..) / (:no_reply, ..): term_emit_kind_call@behaviour_result_call_type.
+fn reply_result_type_agg(t: string) -> boolean {
+    reg_conventions@is_tuple_type(t) and reg_conventions@is_sret_tuple_type(t) == false
+        and ((length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,") or (length_bytes(t) >= 11 and substring(t, 0, 11) == "(:no_reply,"))
+}
+
+// True when `key` (",<idx>,") occurs in `list` at or after i.
+fn node_listed_agg(list: string, key: string, i: int64) -> boolean {
+    case i + length_bytes(key) > length_bytes(list) of {
+        true -> false;
+        false -> case substring(list, i, i + length_bytes(key)) == key of {
+            true -> true;
+            false -> node_listed_agg(list, key, i + 1)
         }
     }
 }
@@ -565,7 +564,7 @@ fn tuple_elem_heap_promote(reg: string, nbytes: int64) -> string {
     }
 }
 
-// A let-bound record or tuple lives in this function's frame region, [SP, X29). Packed BY NAME into
+// A let-bound record or tuple lives in this function's frame region, [a1, X29) (the machine stack). Packed BY NAME into
 // a tuple that outlives the frame -- returned, stored in a collection, sent -- the element pointer
 // dangled: pair_sets@make_pair's `(a, b)` of two wbt_set records came back pointing into the
 // popped frame and wbt_set@size faulted (trials/generic_modules_addition/
@@ -582,7 +581,7 @@ fn tuple_elem_frame_var_promote(reg: string, elem: { nodes: List[{ kind: int64, 
         false -> 0
     };
     case nbytes > 0 of {
-        true -> concat(concat(xt_isa@xt_cmp_branch("LO", reg, "SP", "7f"), xt_isa@xt_cmp_branch("HS", reg, "X29", "7f")), concat(arg_aggregate_heap_promote(reg, nbytes), "7:\n"));
+        true -> concat(concat(xt_isa@xt_branch_below_frame(reg, "7f"), xt_isa@xt_cmp_branch("HS", reg, "X29", "7f")), concat(arg_aggregate_heap_promote(reg, nbytes), "7:\n"));
         false -> ""
     }
 }

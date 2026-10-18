@@ -1,0 +1,157 @@
+// Spec §15.1.4 "Named actors" and §20.3.1: the ordinary registry holds identities. A lookup returns
+// the identity the name was registered with, which equals the reference spawn returned. kill_abnormal
+// of a name and of a reference ends the actor; a second kill_abnormal of the ended reference does
+// nothing. Inserting a name for an ended actor's reference is refused with :actor_not_found, and
+// main's call to the killed registered actor raises actor_not_found: main has no supervisor, so it
+// prints actor_not_found and the process exits with status 1.
+// main waits for the two failure reports once, in wait_for_exit(), which the reporter ends with
+// cast_exit(0) on the second report (no polling: every call reply stays on the heap while main runs).
+//
+// Expected output (compared as a multiset: reports and root-exit notes are asynchronous):
+//   :found                          lookup of :worker_a
+//   true                            the looked-up reference == wa
+//   true                            the registry's reference for :named_w == nw
+//   10                              call_registered(:named_w, 1) on state 9
+//   failure report: other           nw killed by name (kill_abnormal reports reason_tag 1, not 4)
+//   failure report: other           wa killed by reference
+//   [silica] root actor exited (no supervisor)    nw had no supervisor
+//   [silica] root actor exited (no supervisor)    wa had no supervisor
+//   :actor_not_found                insert of :worker_c for the ended wa
+//   main calls the killed registered actor
+//   actor_not_found                 main's call raises; exit status 1
+//
+// Position numbering: no identity is printed; no line depends on position or child numbers.
+
+fn worker_beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg + state, state)
+}
+
+fn killer(msg: atom, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        _: atom <- kill_abnormal(msg)
+    produces
+        pure (:reply, 0, state)
+    end
+}
+
+fn ref_killer(msg: actor_ref, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        _: atom <- kill_abnormal(msg)
+    produces
+        pure (:reply, 0, state)
+    end
+}
+
+// The registry's reply atoms are named here so they are in this program's atom table (an atom a
+// program never spells has no printable name in its table; the runtime still replies with it).
+fn show(s: atom) -> atom {
+    case s of {
+        :found -> :found;
+        :actor_not_found -> :actor_not_found;
+        _: atom -> s
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- start_reporter(2);
+        wa: actor_ref <- spawn(7, worker_beh, stack_policy(0, :keep_last_message));
+        nw: actor_ref <- spawn_registered(9, worker_beh, :named_w, stack_policy(0, :keep_last_message));
+        reg: actor_ref <- get_pid_registry();
+        _: (atom, actor_ref) <- call(reg, { op: :insert, name: :worker_a, pid: wa } impl ActorMessage {});
+        lr1: (atom, actor_ref) <- call(reg, { op: :lookup, name: :worker_a, pid: wa } impl ActorMessage {});
+        (r1: atom, p1: actor_ref) <- lr1;
+        _: atom <- print_atom(show(r1));
+        println("");
+        print_boolean(p1 == wa);
+        println("");
+        lr2: (atom, actor_ref) <- call(reg, { op: :lookup, name: :named_w, pid: wa } impl ActorMessage {});
+        (_r2: atom, p2: actor_ref) <- lr2;
+        print_boolean(p2 == nw);
+        println("");
+        print_int64(call_registered(:named_w, 1 impl ActorMessage {}));
+        println("");
+        k: actor_ref <- spawn(0, killer, stack_policy(0, :keep_last_message));
+        rk: actor_ref <- spawn(0, ref_killer, stack_policy(0, :keep_last_message));
+        _: int64 <- call(k, :named_w impl ActorMessage {});
+        _: int64 <- call(rk, wa impl ActorMessage {});
+        _: int64 <- call(rk, wa impl ActorMessage {});
+        _: int64 <- wait_for_exit();
+        lr3: (atom, actor_ref) <- call(reg, { op: :insert, name: :worker_c, pid: wa } impl ActorMessage {});
+        (r3: atom, _p3: actor_ref) <- lr3;
+        _: atom <- print_atom(show(r3));
+        println("");
+        // nw is call-only, and a cast to a call-only actor is rejected at compile time (§16.1.2), so
+        // main calls it: a call to an ended actor raises actor_not_found (§16.1.1).
+        println("main calls the killed registered actor");
+        _: int64 <- call(nw, 1 impl ActorMessage {});
+        println("not reached")
+    produces
+        pure 0
+    end
+}
+
+fn print_id(label: string, r: actor_ref) -> int64 {
+    sequence proc[concurrency, device_io]
+        i: uint64 <- actor_id(r);
+        print(label);
+        print(" <");
+        print_uint64(i shr 32);
+        print(".");
+        print_uint64(i band 4294967295);
+        println(">")
+    produces
+        pure 0
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The failure reporter prints one line per report. A FailureReporter is cast-only (spec §15.4.13.4),
+// so main cannot ask it how many reports it has had. Instead its state counts down from the number of
+// reports main waits for (start_reporter's argument), and the last of them ends main's single
+// wait_for_exit() with cast_exit(0) (spec §15.1.2.5). main waits once and polls nothing, so no call
+// reply piles up on the heap while main runs. The line is printed before the cast_exit, so no report
+// line lands inside a line main prints.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        print(report_kind(report));
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces
+        pure (:no_reply, left)
+    end
+}
+
+fn report_kind(report: string) -> string {
+    case contains(report, "reason_tag:      4") of {
+        true -> "failure report: reason_tag 4\n";
+        false -> "failure report: other\n"
+    }
+}
+
+// The registry-polling version of this trial named these atoms here (and, in supervisors_addition,
+// built the registry's { op, name, pid } message); atoms and record shapes are numbered per suite in
+// first-use order, so this never-called function keeps them at the same place in the suite's tables
+// and no later trial's numbering moves.
+fn table_places(n: int64) -> atom {
+    case n of {
+        1 -> :n_001;
+        2 -> :n_002;
+        _: int64 -> :n_003
+    }
+}
+
+fn start_reporter(expected: int64) -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

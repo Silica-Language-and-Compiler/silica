@@ -1,0 +1,119 @@
+// Spec §20.3.1 "Supervised children with the same id": at run time, a child whose id is already held
+// by a live actor or supervisor (here a child of another supervisor) is not started, and the
+// supervisor's init fails with failure_reason :language_error. The same implementation type is
+// started twice: the second supervisor's init repeats :shared_worker, which the first supervisor's
+// child holds, so the second supervisor fails in its start trampoline (a root actor with no
+// supervisor: its failure report follows, as a case_clause's would). The first child keeps its name.
+//
+// Expected output:
+//   2                             call_registered(:shared_worker, 1) through the first supervisor's child
+//   <failure report of the second supervisor: reason_tag 2 (:language_error), agent_type_atom 0>
+//   11                            the first child still holds the name
+//   done
+
+use Supervisor;
+
+impl SharedIdSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    } <- { strategy: :one_for_one, allowed_restart_count: 3, restarts_time_frame: 3600 };
+        children: List[
+            {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+            mem(normal)
+        ] <- [
+            { id: :shared_worker, agent_type: :worker, initial_state: 0, behavior: shared_worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn shared_worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg + 1, state)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        first: supervisor_ref <- spawn_registered_supervisor(SharedIdSup, 0, :shared_id_sup_one, stack_policy(0, :keep_last_message));
+        r1: int64 <- call_registered(:shared_worker, 1 impl ActorMessage {});
+        print_int64(r1);
+        println("");
+        second: supervisor_ref <- spawn_registered_supervisor(SharedIdSup, 0, :shared_id_sup_two, stack_policy(0, :keep_last_message));
+        r2: int64 <- call_registered(:shared_worker, 10 impl ActorMessage {});
+        print_int64(r2);
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

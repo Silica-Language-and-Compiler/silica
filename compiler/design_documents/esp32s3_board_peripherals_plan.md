@@ -13,9 +13,25 @@ windows, §5.3 DMA buffers, §9 runtime IRQ contract, §11 compile-time enforcem
 [board_pack.silica](../src/emitter/ESP32-S3_raw/board_pack.silica),
 [PORT_TEST_BOARD_byu_idaho_v4.0_feb26.md](../src/emitter/ESP32-S3_raw/board/PORT_TEST_BOARD_byu_idaho_v4.0_feb26.md).
 
-The board is the BYU-I eBadge v4.0 (ESP32-S3-MINI-1-N4R2). Four Silica device apps already run on it
-(`silica_16_device_uart`, `silica_17_device_gpio`, `silica_18_device_display`, `silica_19_device_led_hold`;
-all run 2026-09-30 / 2026-10-01).
+The board is the BYU-I eBadge v4.0 (ESP32-S3-MINI-1-N4R2). Four Silica device apps ran on it by 2026-10-01
+(`silica_16_device_uart`, `silica_17_device_gpio`, `silica_18_device_display`, `silica_19_device_led_hold`);
+three more exist (`silica_20_device_buttons_led`, `silica_21_device_led_row`, `silica_22_device_buzzer`).
+
+**Implementation status (2026-10-16).** Items A to C are in the tree; D to R are not started, and no item
+beyond the ones named here has code.
+
+| Item | Status | Where it lives |
+| --- | --- | --- |
+| A | Display on SPI2: `silica_18_device_display` redraws the `asm_13_display_hello` picture through the SPI2 peripheral | `board/apps/device_lib/device_esp32s3_spi2.silica`, `device_st7789.silica`; SPI2 values in `board/pack/board_pack_spi2_values.silica`. The SPI2 base is still marked TRM-unconfirmed in `board_pack.silica` (`window_base_verified`); the board result of the app is not recorded in `board/README.md` beyond its expected output |
+| B | Done: the generator reads Espressif's register headers and writes per-peripheral value and description modules with access modes (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT). Not done for the other chip windows (RTC_CNTL, TIMG0/1, SYSTIMER, USB-Serial-JTAG, I2C0, SPI3, GDMA, USB OTG): the generator covers the seven peripherals above only. Whether spec §4.9.1 gained the "every register" sentence was not checked (no hit for the wording in `silica_device_actor_specification.md`) | `board/tools/gen_board_pack.py` (`--check` diffs it against the tree), `board/pack/` |
+| C | Done: buzzer on LEDC timer 0 (`silica_22_device_buzzer`: 440, 880, 2730 Hz); 24 WS2813B LEDs from RMT channel 0 (`silica_21_device_led_row`, matched its `expected.scout` on the board 2026-10-15). RMT channel RAM is written one `poke` per word; `poke_n` was not needed so far | `device_lib/device_esp32s3_ledc.silica`, `device_buzzer.silica`, `device_esp32s3_rmt.silica`, `device_ws2813b.silica` |
+| D | Partly: the GPIO worker carries `silica_17`, `silica_19` and `silica_20_device_buttons_led`; the per-app twins of `asm_01` to `asm_03`, `asm_08` to `asm_10` and the coverage check of the native apps are not recorded as done | `device_lib/device_esp32s3_gpio.silica` |
+| E to R | Not started | none |
+
+The board pack's own window table now has 12 windows (`window_count()` in `emitter/ESP32-S3_raw/board_pack.silica`):
+UART, GPIO, RTC_CNTL, IO_MUX, TIMG0, TIMG1, SYSTIMER, USB-Serial-JTAG, SYSTEM, SPI2, RMT and LEDC (RMT and LEDC
+bases from ESP-IDF headers, TRM-unconfirmed). The "State today" column of section 2 and principle 2 below are
+the 2026-10-01 starting position.
 
 ## 1. Principles (decided 2026-10-01)
 
@@ -56,7 +72,7 @@ Agreed order, steps 1 to 4. Reference apps are under `src/emitter/ESP32-S3_raw/b
 | 3 | `asm_04_buzzer` | new, LEDC | Hardware PWM sets frequency and duty; no software square wave |
 | 3 | `asm_11_addressable_leds` | new, RMT | RMT generates the WS2813B waveform (24 LEDs) from a RAM table; bit-banging cannot meet the nanosecond timing from Silica |
 | 4 | `asm_01_blink`, `asm_02_rgb`, `asm_03_buttons`, `asm_08_gpio_diag`, `asm_09_pin_readback`, `asm_10_pin_hunt` | on the GPIO device worker (extends `silica_17_device_gpio`) | Port reads and writes through the worker's described registers (set/clear/enable-style registers), no per-pin helper loops |
-| 4 | `asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault`, `asm_12_actors` | coverage check against `silica_00` to `silica_15` (and `silica_16` to `silica_19`); write whatever is missing | Native Silica already; the work is finding gaps |
+| 4 | `asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault` | coverage check against `silica_00` to `silica_15` (and `silica_16` to `silica_19`); write whatever is missing | Native Silica already; the work is finding gaps |
 
 **Step 2 detail.** Generate the full register map with access modes into `board_pack`. The compiler reads
 board-pack descriptions (spec §4.9.1), and the hand-written `device_lib` descriptions

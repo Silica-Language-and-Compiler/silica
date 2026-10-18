@@ -34,7 +34,7 @@ silica.config:
 		echo "../../../compiler/src/emitter/ESP32-S3_raw/board/apps/device_lib/device_esp32s3_rmt.silica"; \
 		echo "../../../compiler/src/emitter/ESP32-S3_raw/board/apps/device_lib/device_ws2813b.silica"; \
 		echo "device_led_row_constant_heap.silica"; \
-	} > silica.config
+	} > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 check: silica.config
 	@cd "$(THIS_DIR)" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(COMPILER)); } > $(MAIN).cur_fail 2>&1 || true

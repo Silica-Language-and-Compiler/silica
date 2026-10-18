@@ -1,6 +1,12 @@
 # Silica External Library Call Wrapper Specification
 
-**Last updated**: May 23, 2026
+**Last updated**: May 23, 2026 (implementation status added 2026-10-16)
+
+**Implementation status (2026-10-16).**
+
+- *Implemented:* the `dangerous_*` module rules, `foreign c_wrapper` declarations, sidecar loading and the `silica.link` manifest (`src/ffi/`), the placement, ABI and taint checkers, `spawn_dangerous` / `spawn_dangerous_registered` / `cast_dangerous_registered`, the split dangerous registry, cast-only FFI workers, and the guarded FFI runtime (fault handlers, per-actor FFI arena, `_silica_rt_ffi_guarded_enter` / `_exit`; sources `ffi_guarded_runtime_asm.silica` and `ffi_fault_runtime_asm.silica` in the Apple Silicon, linux_aarch64 and linux_x86_64 emitters). Codes: E2103, E2110 to E2114, E4020 to E4026, E4030 to E4034, E4040 to E4049 ([error_codes.md](../error_codes.md)). Trials: `trials/ffi_addition` (app trials including guarded-fault and supervised-dangerous-fault trials), `trials/error_enforcement_addition/ffi_addition`.
+- *Not implemented:* **re-creation (§7.7)**. No `Recreatable` trait, `recreate` or related diagnostics exist in the compiler, standard library or trials. Wherever this specification, `dangerous_ffi_security_model.md`, `crypto-proposal-introduction.md` and `tls_quantum_safe_future.md` rely on re-creation to clear taint, that is design, not behaviour; today FFI results leave a worker only by the designated result cast and external-danger-touched data stays tainted. Package declarations (§14.3) and building C wrapper sources are also future.
+- *Differences from the text below:* the process-global registries are three, not two (the third serves device workers, [silica_device_actor_specification.md](silica_device_actor_specification.md)); each is a table sized by the build's atom count with no overflow list (see [atom_actor_registry_direct_index_design.md](atom_actor_registry_direct_index_design.md)); `get_dangerous_pid_registry()` (§4.9.2) is not a builtin; `ffi_wrapper_implementation_plan.md` is not in the tree.
 
 ## Related Documents
 
@@ -8,7 +14,7 @@
 | --------------------------------------------- | ------------------------------------------------------------------------ |
 | `silica-specification.md`                     | Core language syntax, effects, actors, regions, and compiler diagnostics |
 | `silica-specification-additional.md`          | Additional compile-time failure rules                                    |
-| `ffi_wrapper_implementation_plan.md`          | Compiler implementation phases for this specification                    |
+| `ffi_wrapper_implementation_plan.md`          | Compiler implementation phases (no longer in the tree)                   |
 | `atom_actor_registry_direct_index_design.md`  | Atom-keyed direct-index registry representation (shared by both tables)   |
 | `pid_registry_process_global_actor_gate.md`   | Process-global PID registry actor and actor-gated table access           |
 
@@ -440,12 +446,12 @@ See §7.3.
 
 ### 4.9 Split actor registries
 
-Silica programs that register actors by atom name use **two separate process-global registries**:
+Silica programs that register actors by atom name use **separate process-global registries** (two for ordinary and FFI actors, and a third for device workers, which the device specification defines):
 
 1. **Ordinary registry** — stores handles for ordinary actors (`actor_ref`), including those created by `spawn_registered(...)`.
 2. **Dangerous registry** — stores handles for FFI worker actors (`dangerous_actor_ref`), including those created by `spawn_dangerous_registered(...)`.
 
-Both registries use the same direct-index table representation described in `atom_actor_registry_direct_index_design.md` (atom id → opaque handle word, with list overflow for out-of-range keys). Each registry has its own process-global root (for example `_silica_pid_registry_ref` for the ordinary table and `_silica_dangerous_pid_registry_ref` for the dangerous table), its own registry actor bootstrap, and its own fast-path lookup stubs. See `pid_registry_process_global_actor_gate.md` for the actor-gated access model; the dangerous registry follows the same shape.
+Both registries use the same direct-index table representation described in `atom_actor_registry_direct_index_design.md` (atom id → actor identity; in the runtimes the table has one slot per atom of the build and no overflow list). Each registry has its own process-global root (for example `_silica_pid_registry_ref` for the ordinary table and `_silica_dangerous_pid_registry_ref` for the dangerous table), its own registry actor bootstrap, and its own fast-path lookup stubs. See `pid_registry_process_global_actor_gate.md` for the actor-gated access model; the dangerous registry follows the same shape.
 
 #### 4.9.1 Compile-time facade, shared runtime word
 
@@ -475,7 +481,7 @@ Using two tables ensures that `cast_registered(...)` cannot accidentally reach a
 | --------- | ----- | ---------------- |
 | `spawn_dangerous_registered(initial_state, behavior_fn, name: atom [, core_id])` | 3 (+ optional 4th) | `dangerous_actor_ref` |
 | `cast_dangerous_registered(name: atom, message)` | 2 | `boolean` |
-| `get_dangerous_pid_registry()` | 0 | `actor_ref` (dangerous registry actor; table holds `dangerous_actor_ref` targets) |
+| `get_dangerous_pid_registry()` | 0 | `actor_ref` (dangerous registry actor; table holds `dangerous_actor_ref` targets). **Not implemented:** this builtin does not exist; the runtime reaches the table through `_silica_dangerous_pid_registry_ref` |
 
 Rules for `spawn_dangerous_registered`:
 

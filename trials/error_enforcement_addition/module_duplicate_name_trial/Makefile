@@ -39,7 +39,7 @@ clean:
 silica.config: | clean
 
 silica.config:
-	@cd "$(THIS_DIR)" && find "$$PWD" -type f -name '*.silica' | sed "s|^$$PWD/||" | LC_ALL=C sort > silica.config
+	@cd "$(THIS_DIR)" && find "$$PWD" -type f -name '*.silica' | sed "s|^$$PWD/||" | LC_ALL=C sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
 
 help:
 	@echo "module_duplicate_name_trial (multi-file error enforcement)"

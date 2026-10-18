@@ -31,10 +31,10 @@ Open:
   child spec's `initial_state` typed `PriorityQueue[...]` is E2003 "type mismatch: children"); the field-annotation
   and field-projection half of the same bracket-representation family was fixed on 2026-09-19 (see below).
 
-- From the effect checker (2026-09-19, open): `compile_defects_effect_propagation_addition` (a sequence that calls a
-  function whose own sequence declares `proc[mem(normal)]` must declare that effect, spec §9.3.1 rule 4; the checker
-  reports the declaration as unused, E3010, because effects never propagate through a user call. The fix was
-  deliberately left out of the 2026-09-25 merge.)
+- From the effect checker (2026-09-19, closed 2026-10-11 as not a defect): `compile_defects_effect_propagation_addition`
+  expected a caller to declare a callee's `proc[mem(normal)]`. Lee decided effects are local (spec §9.3.1 rule 4,
+  "Effects Are Local"), so the checker's E3010 on the caller's unused declaration is correct; the program is now the
+  error trial `error_enforcement_addition/effects_local_caller_declares_callee_mem`.
 
 - From defect batch 2 (2026-09-19, open): `compile_defects_float_literal_pattern_addition` (a float
   literal is not accepted as a case pattern -- on its own or as a tuple element -- because

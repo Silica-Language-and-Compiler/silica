@@ -2,48 +2,16 @@
 [ -n "$BASH_VERSION" ] || exec bash "$0" "$@"   # pipefail needs bash; /bin/sh is dash on Debian and Ubuntu
 set -euo pipefail
 
+# Golden comparison for the app trials marked <stem>.scout.sorted
+# (app_supervisor_dangerous_guarded_fault_trials/Makefile). Each such trial prints an actor failure
+# report, which the registered FailureReporter prints asynchronously (Lee, 2026-10-12), so the
+# shared order-free compare applies: report blocks and other lines as multisets, the exit-status line
+# last and exact, pointers folded. (It replaced a plain sort of the normalized lines.)
+# See ../compare_scout_unordered.sh.
+
 if [ "$#" -ne 2 ]; then
   echo "usage: compare_scout_sorted.sh <actual.sout> <golden.scout>" >&2
   exit 2
 fi
 
-actual="$1"
-golden="$2"
-
-sort_normalized_lines() {
-  awk '
-    {
-      gsub(/\r/, "", $0)
-      line = $0
-      sub(/[ \t]+$/, "", line)
-      if (line == "") next
-      if (line ~ /^[[:space:]]*actor_id:[[:space:]]*0x[0-9a-fA-F]+$/) {
-        print "actor_id:        <PTR>"
-        next
-      }
-      if (line ~ /^[[:space:]]*supervisor_acb:[[:space:]]*0x[0-9a-fA-F]+$/) {
-        print "supervisor_acb:  <PTR>"
-        next
-      }
-      # A call stack frame names a linker symbol, and Mach-O decorates those with a leading
-      # underscore while ELF does not. The same program therefore prints _actor_thread_main on
-      # macOS and actor_thread_main on Linux, so the leading underscore is dropped before the
-      # comparison and one golden serves both targets.
-      if (line ~ /^[[:space:]]*#[0-9]+[[:space:]]+_[A-Za-z_]/) {
-        sub(/_/, "", line)
-        print line
-        next
-      }
-      print line
-    }
-  ' "$1" | LC_ALL=C sort
-}
-
-tmp_actual="$(mktemp)"
-tmp_golden="$(mktemp)"
-trap 'rm -f "$tmp_actual" "$tmp_golden"' EXIT
-
-sort_normalized_lines "$actual" > "$tmp_actual"
-sort_normalized_lines "$golden" > "$tmp_golden"
-
-diff -u "$tmp_golden" "$tmp_actual"
+exec bash "$(cd "$(dirname "$0")" && pwd)/../compare_scout_unordered.sh" "$1" "$2"

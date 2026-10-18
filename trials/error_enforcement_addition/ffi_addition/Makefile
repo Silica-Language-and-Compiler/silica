@@ -159,6 +159,7 @@ archive-missing:
 	ln -s "$(THIS_DIR)error_app_sidecar_metadata/dangerous_exposure_source/bad_missing_archive.meta" "$$tmpdir/dangerous_exposure_source/bad_missing_archive.meta"; \
 	ln -s "$(THIS_DIR)$$case.silica" "$$tmpdir/$$base.silica"; \
 	printf "$$base.silica\n" > "$$tmpdir/silica.config"; \
+	$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$(THIS_DIR)$$case.silica); \
 	(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,"$(SILICA_COMPILER)"); }) > "$$cur" 2>&1 || true; \
 	rm -rf "$$tmpdir"; \
 	if [ ! -f "$$golden" ]; then \
@@ -217,6 +218,7 @@ compile-fail-goldens:
 				printf "$$base.silica\n" > "$$tmpdir/silica.config"; \
 				;; \
 		esac; \
+		$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$(THIS_DIR)$$case.silica); \
 		(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,"$(SILICA_COMPILER)"); }) > "$$cur" 2>&1 || true; \
 		rm -rf "$$tmpdir"; \
 		if [ ! -f "$$golden" ]; then \

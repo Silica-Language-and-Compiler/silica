@@ -1,0 +1,157 @@
+// ESP32-S3 code-generation defect, seen 2026-10-09 while writing
+// stack_budget_board_addition/supervisor_end_frees_child_table: a supervisor_ref bound in main by
+// spawn_registered_supervisor (or received as a function parameter) and used in a
+// call_supervisor after ten call_registered calls reaches the runtime prim as garbage, so
+// silica_rt_supervisor_terminate_child faults inside the scheduler lock and the program ends with
+// "[silica] fault at" (status 70). The same sequence with the reference first copied to a local
+// binding in a helper function (r: supervisor_ref <- rt) runs correctly, which is how the trial
+// above is written for now. The ten calls ask one worker each (a worker answers any non-zero
+// message), the ten-child supervisor (traits/CycleSup.silica) is then terminated and restarted by
+// the root.
+// The ten calls used to carry 0, so each worker ended by a division fault mid-call and the call
+// returned the death result 0. Spec §16.1.1 now makes such a call raise actor_not_found in the
+// caller, so main's calls carry 1 and return normally, and the ten workers are then ended through
+// their supervisor (:terminate_child, which returns once the worker has ended) before the root
+// terminates the supervisor: a supervisor's children outlive it, and a restarted CycleSup whose
+// child ids are still held fails its init with :language_error (spec §20.3.1).
+// The actor_not_found check is separate: after the restart a relay actor calls the new :cyc_w1
+// with 0; the worker ends by the division fault and the call raises actor_not_found in the relay,
+// which fails with reason_tag 4. main prints `done` and waits in wait_for_exit for the `exit` line.
+// Expected (compared as a multiset: the reports are asynchronous):
+//   <ten reports, #0 CycleSup_worker, reason_tag 0: the workers ended by :terminate_child>
+//   0                                        :count_children of the ten-worker supervisor
+//   <the ten-worker supervisor's report, #0 CycleSup_CycleSup_child_start, reason_tag 0>
+//   2                                        after :terminate_child
+//   3                                        after :restart_child
+//   1                                        the root's :count_children
+//   <the restarted :cyc_w1's report, #0 CycleSup_worker, reason_tag 1>
+//   <the relay's report, #0 relay, reason_tag 4>
+//   done
+//   0
+
+use Supervisor;
+use CycleSup;
+
+impl DefectRootSup for Supervisor;
+
+fn init(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 100, restarts_time_frame: 1000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :cyc_nested, agent_type: :supervisor, initial_state: 0, behavior: CycleSup@CycleSup_child_start, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+// Asks the worker: it answers its state divided by 1.
+fn ask_worker(name: atom) -> int64 {
+    sequence proc[concurrency]
+        v: int64 <- call_registered(name, 1 impl ActorMessage {})
+    produces pure v end
+}
+
+// Ends one worker through its supervisor; :terminate_child returns once the worker has ended.
+fn end_worker(sup: actor_ref, id: atom) -> int64 {
+    sequence
+        r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :terminate_child, id: id } impl SupervisorMessage {})
+    produces pure r.count end
+}
+
+fn end_workers(sup: actor_ref) -> int64 {
+    sequence
+        _e1: int64 <- end_worker(sup, :cyc_w1);
+        _e2: int64 <- end_worker(sup, :cyc_w2);
+        _e3: int64 <- end_worker(sup, :cyc_w3);
+        _e4: int64 <- end_worker(sup, :cyc_w4);
+        _e5: int64 <- end_worker(sup, :cyc_w5);
+        _e6: int64 <- end_worker(sup, :cyc_w6);
+        _e7: int64 <- end_worker(sup, :cyc_w7);
+        _e8: int64 <- end_worker(sup, :cyc_w8);
+        _e9: int64 <- end_worker(sup, :cyc_w9);
+        _e10: int64 <- end_worker(sup, :cyc_w10)
+    produces pure 0 end
+}
+
+// The relay calls the registered worker named by its state with its message; message 0 ends the
+// worker before it replies, so the call raises actor_not_found here (spec §16.1.1) and the relay
+// fails with reason_tag 4.
+fn relay(msg: int64, state: atom) -> (:no_reply, atom) {
+    sequence proc[concurrency]
+        _: int64 <- call_registered(state, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        rt: supervisor_ref <- spawn_registered_supervisor(DefectRootSup, 0, :defect_root, stack_policy(0, :keep_last_message));
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :get_child, id: :cyc_nested } impl SupervisorMessage {});
+        _s1: int64 <- ask_worker(:cyc_w1);
+        _s2: int64 <- ask_worker(:cyc_w2);
+        _s3: int64 <- ask_worker(:cyc_w3);
+        _s4: int64 <- ask_worker(:cyc_w4);
+        _s5: int64 <- ask_worker(:cyc_w5);
+        _s6: int64 <- ask_worker(:cyc_w6);
+        _s7: int64 <- ask_worker(:cyc_w7);
+        _s8: int64 <- ask_worker(:cyc_w8);
+        _s9: int64 <- ask_worker(:cyc_w9);
+        _s10: int64 <- ask_worker(:cyc_w10);
+        _e: int64 <- end_workers(got.child);
+        n: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(got.child, { op: :count_children } impl SupervisorMessage {});
+        print_int64(n.count);
+        println("");
+        _t: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :terminate_child, id: :cyc_nested } impl SupervisorMessage {});
+        print_int64(2);
+        println("");
+        _r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :restart_child, id: :cyc_nested } impl SupervisorMessage {});
+        print_int64(3);
+        println("");
+        after: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :count_children } impl SupervisorMessage {});
+        print_int64(after.count);
+        println("");
+        q: actor_ref <- spawn(:cyc_w1, relay, stack_policy(0, :keep_last_message));
+        _: boolean <- cast(q, 0 impl ActorMessage {});
+        println("done");
+        _: int64 <- wait_for_exit()
+    produces pure 0 end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

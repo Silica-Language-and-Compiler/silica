@@ -10,6 +10,10 @@ Can my runtime safely recover and continue?      Only in tightly controlled case
 Can I safely run arbitrary cleanup code there?   No.
 ```
 
+## Implementation status (2026-10-16)
+
+This note is the design reasoning; the Apple Silicon runtime follows its signal-based half. What exists: `silica_rt_install_sync_fault_handlers` (`emitter/apple_silicon_mac/terms/ffi_fault_runtime_asm.silica`) installs the handler with `sigaction` (`SA_SIGINFO | SA_ONSTACK | SA_NODEFER`) for SIGSEGV, SIGBUS, SIGILL and SIGFPE, from the program's constructor list so it is in place before `main`, and gives every thread a `sigaltstack`; a guarded foreign call keeps a per-thread 512-byte state block with a `sigsetjmp` buffer, and a fault recognised inside the guarded call returns through `siglongjmp` to the call site, after which ordinary runtime code ends the actor and the supervisor sees an ordinary failure; a fault outside a guarded call, or a runtime abort, is the process report of spec §15.4.5.5 (`[silica] fault at 0x...` status 70, `[silica] abort: <reason> at 0x...` status 71) written without allocating, from a static stack; a guarded fault with no actor to deliver to ends the process with status 70 ([runtime_failure_reporting.md](runtime_failure_reporting.md) §3.1). Mach exception ports are not used. The Linux AArch64 and Linux x86-64 runtimes carry the same bridge in their own `ffi_fault_runtime_asm.silica`. The `extern unsafe` / `guarded` / `isolated` declarations in "Best Design for Silica on macOS" are illustrative syntax, not Silica source: the language surface is Fifi (`dangerous_*` modules, wrapper archives, `spawn_dangerous`; [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md)), and no `ForeignFault` result type or isolated helper-process mode exists.
+
 ## What macOS Lets You React To
 
 For native compiled code, macOS can report faults as Unix signals and/or Mach exceptions. Common ones include:

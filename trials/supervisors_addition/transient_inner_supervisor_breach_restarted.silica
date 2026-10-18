@@ -1,0 +1,170 @@
+// A :transient inner supervisor that allows 0 restarts, under a root supervisor (spec §15.4.13).
+// The root (one_for_one, 10 restarts in 5 s) starts one child, the inner supervisor
+// :phase_e_nested_child_sup (restart :transient), whose start function is in the helper unit
+// traits/TransientBreachInnerSup.silica; the inner supervisor (one_for_one,
+// allowed_restart_count 0) starts one worker :phase_e_nested_worker_00 (state 40,
+// replies msg + state). main calls the worker with 2, then has a killer actor kill_abnormal the
+// worker by its registered name.
+// Expected, by hand:
+//   42                      the first worker: 2 + 40
+//   worker report           reason_tag 1 (killed abnormally), supervisor_acb = the inner supervisor
+//   inner supervisor report reason_tag 4: one restart is more than the 0 it allows, so it ends
+//                           (restart-intensity breach), supervisor_acb = the root; frame #0 is its
+//                           start function inner_start (frame TransientBreachInnerSup_inner_start)
+//   1                       the root restarts the :transient inner supervisor (it ended abnormally),
+//                           whose new worker registers :phase_e_nested_worker_00 again: the registry
+//                           names an actor other than the first worker
+//   43                      the new worker: 3 + 40
+//   done; exit status 0 after the harness's `exit` line.
+// The reports are printed by the FailureReporter as they arrive, so the golden is compared as a
+// multiset (.scout.multiset).
+// Atoms: every atom is already numbered earlier in supervisors_addition (the suite shares one atom
+// table), so no other trial's atoms are renumbered.
+
+use Supervisor;
+use TransientBreachInnerSup;
+
+impl TransientInnerBreachRootSup for Supervisor;
+
+fn init(initial_state: int64) -> ({
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    }, List[{
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(initial_state: int64) -> ({
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    }, List[{
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        }, mem(normal)]),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        }, mem(normal)]) {
+    sequence proc[mem(normal)]
+        flags: {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    } <- { strategy: :one_for_one, allowed_restart_count: 10, restarts_time_frame: 5 };
+        children: List[{
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(initial_state: int64) -> ({
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    }, List[{
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        }, mem(normal)]),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        }, mem(normal)] <- [
+            { id: :phase_e_nested_child_sup, agent_type: :supervisor, initial_state: 0, behavior: TransientBreachInnerSup@inner_start, restart: :transient, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn killer(msg: atom, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        _: atom <- kill_abnormal(msg)
+    produces
+        pure (:reply, 0, state)
+    end
+}
+
+// Polls the registry for :phase_e_nested_worker_00 until an actor other than old holds it, at most n times:
+// 1 when the inner supervisor was restarted (its new worker registered), 0 when not.
+fn await_restart(reg: actor_ref, old: actor_ref, n: int64) -> int64 {
+    sequence proc[concurrency]
+        got: (atom, actor_ref) <- call(reg, { op: :lookup, name: :phase_e_nested_worker_00, pid: old } impl ActorMessage {});
+        (st: atom, p: actor_ref) <- got;
+        restarted: boolean <- st == :found and not (p == old);
+        r: int64 <- case restarted of {
+            true -> 1;
+            false -> case n of {
+                0 -> 0;
+                _: int64 -> await_restart(reg, old, n - 1)
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        root: supervisor_ref <- spawn_registered_supervisor(TransientInnerBreachRootSup, 0, :phase_e_nested_root_sup, stack_policy(0, :keep_last_message));
+        ci: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)],
+            count: int64,
+            child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },
+            error: atom
+        } <- call_supervisor(root, { op: :get_child, id: :phase_e_nested_child_sup } impl SupervisorMessage {});
+        r0: int64 <- call_registered(:phase_e_nested_worker_00, 2 impl ActorMessage {});
+        reg: actor_ref <- get_pid_registry();
+        w0: (atom, actor_ref) <- call(reg, { op: :lookup, name: :phase_e_nested_worker_00, pid: root } impl ActorMessage {});
+        (_s0: atom, old_w: actor_ref) <- w0;
+        print_int64(r0);
+        println("");
+        k: actor_ref <- spawn(0, killer, stack_policy(0, :keep_last_message));
+        _: int64 <- call(k, :phase_e_nested_worker_00 impl ActorMessage {});
+        ok: int64 <- await_restart(reg, old_w, 200000);
+        print_int64(ok);
+        println("");
+        r1: int64 <- call_registered(:phase_e_nested_worker_00, 3 impl ActorMessage {});
+        print_int64(r1);
+        println("");
+        println("done");
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        _: atom <- println_stderr(report)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

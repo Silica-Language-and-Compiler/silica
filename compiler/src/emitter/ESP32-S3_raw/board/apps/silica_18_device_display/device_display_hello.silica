@@ -5,17 +5,97 @@
 // it turns the display on, so nothing but black is ever shown before the text, and the whole run
 // takes about a second where the bit-banged version took 26 s. Expected console: "text", status 0
 // (the panel shows the text).
+// main starts the app's supervisor and casts its one worker (app_worker) the work; after the text the
+// worker sends the display worker :notify, whose reply makes the finisher end the program (cast_exit).
 use device_st7789;
+use Supervisor;
+
+impl AppSupervisor for Supervisor;
+
+// The app's work, run by the supervisor's one worker (main only starts the supervisor and casts).
+// Ends the program (cast_exit, spec §15.1.2.5) when the device worker reports that everything sent
+// before its :notify is done.
+fn finisher(code: uint32, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: boolean <- cast_exit(0)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn app_worker(msg: atom, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        f: actor_ref <- spawn(0, finisher, stack_policy(0, :keep_last_message));
+        d: device_actor_ref <- spawn_device(:unmapped, device_st7789@st7789_worker, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_device(d, { op: :init, x: 0, y: 0, colour: 0, text: "", reply_to: f } impl ActorMessage {});
+        _: boolean <- cast_device(d, { op: :text, x: 42, y: 88, colour: 65535, text: "Hello from", reply_to: f } impl ActorMessage {});
+        _: boolean <- cast_device(d, { op: :text, x: 90, y: 124, colour: 65535, text: "Silica", reply_to: f } impl ActorMessage {});
+        println("text");
+        _: boolean <- cast_device(d, { op: :notify, x: 0, y: 0, colour: 0, text: "", reply_to: f } impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 1 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :app_worker, agent_type: :worker, initial_state: initial_state, behavior: app_worker, restart: :transient, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
 
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
-        d: device_actor_ref <- spawn_device(:unmapped, device_st7789@st7789_worker, stack_policy(0, :keep_last_message));
-        _: boolean <- cast_device(d, { op: :init, x: 0, y: 0, colour: 0, text: "" } impl ActorMessage {});
-        _: boolean <- cast_device(d, { op: :text, x: 42, y: 88, colour: 65535, text: "Hello from" } impl ActorMessage {});
-        _: boolean <- cast_device(d, { op: :text, x: 90, y: 124, colour: 65535, text: "Silica" } impl ActorMessage {});
-        println("text");
-        _: int64 <- wait_for_exit()
+        _: atom <- start_reporter();
+        _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_registered(:app_worker, (:start) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
     produces
-        pure 0
+        pure code
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
     end
 }

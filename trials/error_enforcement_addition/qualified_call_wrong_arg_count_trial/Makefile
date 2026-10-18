@@ -41,7 +41,7 @@ silica.config:
 	@printf '%s\n' \
 		main_wrong_arg_count.silica \
 		ArityLib.silica \
-		> "$(THIS_DIR)silica.config"
+		> "$(THIS_DIR)silica.config" && cd "$(THIS_DIR)" && $(TRIAL_SUPPORT_CONFIG)
 
 help:
 	@echo "qualified_call_wrong_arg_count_trial (multi-file error enforcement)"

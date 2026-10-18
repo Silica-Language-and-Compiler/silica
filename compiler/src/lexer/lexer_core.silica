@@ -34,6 +34,8 @@ export token_get_kind/1;
 export new_lexer/2;
 export is_whitespace/1;
 export skip_whitespace/1;
+export utf8_char_is_valid/1;
+export lexical_error_token/3;
 
 {-
 - Represents a position in source code by file name, line, column, and byte offset.
@@ -268,4 +270,107 @@ fn skip_whitespace(lexer: { source: string, position: int64, line: int64, column
             false -> lexer
         }
     }
+}
+
+// UTF-8 validation (spec 2.1). Strings carry no byte access, so the checks
+// below use the runtime's own character split: substring takes a lead byte's
+// full length (C2-DF two bytes, E0-EF three, F0-F7 four, any other byte one)
+// whatever follows it, and contains/starts_with compare bytes.
+fn utf8_high_bytes() -> string {
+    "\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9A\x9B\x9C\x9D\x9E\x9F\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xAA\xAB\xAC\xAD\xAE\xAF\xB0\xB1\xB2\xB3\xB4\xB5\xB6\xB7\xB8\xB9\xBA\xBB\xBC\xBD\xBE\xBF\xC0\xC1\xC2\xC3\xC4\xC5\xC6\xC7\xC8\xC9\xCA\xCB\xCC\xCD\xCE\xCF\xD0\xD1\xD2\xD3\xD4\xD5\xD6\xD7\xD8\xD9\xDA\xDB\xDC\xDD\xDE\xDF\xE0\xE1\xE2\xE3\xE4\xE5\xE6\xE7\xE8\xE9\xEA\xEB\xEC\xED\xEE\xEF\xF0\xF1\xF2\xF3\xF4\xF5\xF6\xF7\xF8\xF9\xFA\xFB\xFC\xFD\xFE\xFF"
+}
+
+fn utf8_continuation_bytes() -> string {
+    "\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9A\x9B\x9C\x9D\x9E\x9F\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xAA\xAB\xAC\xAD\xAE\xAF\xB0\xB1\xB2\xB3\xB4\xB5\xB6\xB7\xB8\xB9\xBA\xBB\xBC\xBD\xBE\xBF"
+}
+
+fn utf8_continuation_80_8f() -> string {
+    "\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F"
+}
+
+fn utf8_continuation_80_9f() -> string {
+    "\x80\x81\x82\x83\x84\x85\x86\x87\x88\x89\x8A\x8B\x8C\x8D\x8E\x8F\x90\x91\x92\x93\x94\x95\x96\x97\x98\x99\x9A\x9B\x9C\x9D\x9E\x9F"
+}
+
+// True when the one-character string `c` (a substring of length 1 of the
+// source) is a well-formed UTF-8 encoding of one Unicode scalar value: ASCII,
+// or a lead byte C2-F4 followed by the right number of continuation bytes, with
+// no overlong form (E0 80-9F, F0 80-8F), no surrogate (ED A0-BF) and nothing
+// above U+10FFFF (F4 90-BF, F5-F7). "" (end of input) counts as valid.
+fn utf8_char_is_valid(c: string) -> boolean {
+    n: int64 <- length_bytes(c);
+    case n of {
+        0 -> true;
+        1 -> not contains(utf8_high_bytes(), c);
+        _: int64 -> utf8_multibyte_is_valid(c, n)
+    }
+}
+
+fn utf8_multibyte_is_valid(c: string, n: int64) -> boolean {
+    // length_chars splits by lead byte without the substring cursor, so this
+    // is 4 exactly when the lead's length is n (not cut off by the end of the
+    // source).
+    case length_chars(concat(c, "\x80\x80\x80")) == 4 of {
+        false -> false;
+        true -> {
+            // A leading C2 swallows c's lead byte, so c's continuation bytes
+            // become characters 1 .. n-1 of `shifted` while they are 80-BF.
+            // They are read in increasing order only: a backward cursor step
+            // over ill-formed UTF-8 is unreliable in runtimes before 2026-10-16.
+            shifted: string <- concat("\xC2", c);
+            b1: string <- substring(shifted, 1, 2);
+            case utf8_is_continuation(b1) of {
+                false -> false;
+                true -> case n == 2 of {
+                    true -> true;
+                    false -> utf8_rest_is_valid(c, shifted, b1, n)
+                }
+            }
+        }
+    }
+}
+
+fn utf8_rest_is_valid(c: string, shifted: string, b1: string, n: int64) -> boolean {
+    b2: string <- substring(shifted, 2, 3);
+    case utf8_is_continuation(b2) of {
+        false -> false;
+        true -> case n == 3 of {
+            true -> utf8_lead_range_ok(c, b1);
+            false -> {
+                b3: string <- substring(shifted, 3, 4);
+                case utf8_is_continuation(b3) of {
+                    false -> false;
+                    true -> utf8_lead_range_ok(c, b1)
+                }
+            }
+        }
+    }
+}
+
+fn utf8_is_continuation(b: string) -> boolean {
+    case length_bytes(b) == 1 of {
+        false -> false;
+        true -> contains(utf8_continuation_bytes(), b)
+    }
+}
+
+fn utf8_lead_range_ok(c: string, second: string) -> boolean {
+    case starts_with(c, "\xE0") of {
+        true -> not contains(utf8_continuation_80_9f(), second);
+        false -> case starts_with(c, "\xED") of {
+            true -> contains(utf8_continuation_80_9f(), second);
+            false -> case starts_with(c, "\xF0") of {
+                true -> not contains(utf8_continuation_80_8f(), second);
+                false -> case starts_with(c, "\xF4") of {
+                    true -> contains(utf8_continuation_80_8f(), second);
+                    false -> not (starts_with(c, "\xF5") or starts_with(c, "\xF6") or starts_with(c, "\xF7"))
+                }
+            }
+        }
+    }
+}
+
+// A lexical-error token (spec 2.5): lexeme "<code> <message>".
+fn lexical_error_token(code: string, message: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } {
+    make_token(lexer_token_kind@token_kind_lexical_error(), concat(concat(code, " "), message), location)
 }

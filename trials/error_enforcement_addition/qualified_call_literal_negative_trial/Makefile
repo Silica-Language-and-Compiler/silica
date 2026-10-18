@@ -41,7 +41,7 @@ silica.config:
 	@printf '%s\n' \
 		main_literal_negative.silica \
 		LiteralLib.silica \
-		> "$(THIS_DIR)silica.config"
+		> "$(THIS_DIR)silica.config" && cd "$(THIS_DIR)" && $(TRIAL_SUPPORT_CONFIG)
 
 help:
 	@echo "qualified_call_literal_negative_trial (multi-file error enforcement)"

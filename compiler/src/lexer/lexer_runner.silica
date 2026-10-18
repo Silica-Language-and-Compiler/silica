@@ -28,6 +28,7 @@ use lexer_atom_literals;
 use lexer_string_literals;
 use lexer_operators;
 use lexer_comments;
+use diagnostics_core;
 
 
 // Export module function
@@ -35,8 +36,12 @@ export lexer_runner/1;
 export cons_token/2;
 export tokenize/2;
 export empty_token_list/0;
+export report_lexical_error/1;
 
-fn skip_whitespace_and_line_comments(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } {
+// Skips whitespace and comments. Returns (token, lexer): the token is a lexical
+// error (E0006, unterminated block comment) or, when there is none, an eof token
+// that the caller ignores.
+fn skip_whitespace_and_line_comments(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> ({ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) {
     skipped: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@skip_whitespace(lexer);
     case lexer_comments@is_line_comment_start(skipped) of {
         true -> {
@@ -45,11 +50,46 @@ fn skip_whitespace_and_line_comments(lexer: { source: string, position: int64, l
         };
         false -> case lexer_comments@is_block_comment_start(skipped) of {
             true -> {
-                after_block: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_comments@skip_block_comment(lexer_core@advance(lexer_core@advance(skipped)));
-                skip_whitespace_and_line_comments(after_block)
+                (after_block: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, status: int64) <- lexer_comments@skip_block_comment(lexer_core@advance(lexer_core@advance(skipped)));
+                case status == 1 of {
+                    true -> (lexer_core@lexical_error_token("E0006", "unterminated block comment: this '{-' has no closing '-}' before the end of the file", lexer_core@current_location(skipped)), after_block);
+                    false -> skip_whitespace_and_line_comments(after_block)
+                }
             };
-            false -> skipped
+            false -> (lexer_core@make_token(lexer_token_kind@token_kind_eof(), "", lexer_core@current_location(skipped)), skipped)
         }
+    }
+}
+
+// Characters outside the token set that the parser reads as unknown_char
+// tokens: `|` (sum types, spec 2.2.4) and `?` (`ref?`). Every other character
+// that begins no token is a lexical error.
+fn is_parser_punctuation_char(c: string) -> boolean {
+    c == "|" or c == "?"
+}
+
+fn unexpected_character_token(c: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } {
+    case lexer_core@utf8_char_is_valid(c) of {
+        false -> lexer_core@lexical_error_token("E0007", "invalid UTF-8: the source file must be UTF-8 encoded (spec 2.1), and the bytes here do not form a UTF-8 character", location);
+        true -> case c == "\xEF\xBB\xBF" of {
+            true -> lexer_core@lexical_error_token("E0001", "unexpected character: a byte order mark (U+FEFF) is only allowed as the first character of the file", location);
+            false -> case length_bytes(c) == 1 of {
+                true -> lexer_core@lexical_error_token("E0001", concat(concat("unexpected character ", unexpected_character_text(c)), ": it does not begin any token (spec 2.2); outside string, character and atom literals and comments only ASCII letters, digits, whitespace and the operators and punctuation of spec 2.2.4 may appear"), location);
+                false -> lexer_core@lexical_error_token("E0001", concat(concat("unexpected character '", c), "': non-ASCII characters may appear only in string, character and atom literals and in comments (spec 2.1)"), location)
+            }
+        }
+    }
+}
+
+// Printable ASCII is quoted; control characters are named.
+fn unexpected_character_text(c: string) -> string {
+    case c of {
+        "\x00" -> "NUL (byte 0x00)";
+        "\x0B" -> "vertical tab (byte 0x0B)";
+        "\x0C" -> "form feed (byte 0x0C)";
+        "\x7F" -> "DEL (byte 0x7F)";
+        "\x1B" -> "escape (byte 0x1B)";
+        _: string -> concat(concat("'", c), "'")
     }
 }
 
@@ -76,9 +116,11 @@ fn cons_token(head: { kind: int64, lexeme: string, location: { file: string, lin
 - Last-modified-by: Lee S. Barney
 -}
 fn tokenize(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }, tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
-    after_comments: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- skip_whitespace_and_line_comments(lexer);
-
-    current: string <- lexer_core@peek_char(after_comments);
+    (comment_error: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, after_comments: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) <- skip_whitespace_and_line_comments(lexer);
+    current: string <- case comment_error.kind == lexer_token_kind@token_kind_lexical_error() of {
+        true -> "";
+        false -> lexer_core@peek_char(after_comments)
+    };
 
     // DEBUG: Print peek_char result before pattern matching
     //         println("DEBUG peek_char pos=");
@@ -95,7 +137,11 @@ fn tokenize(lexer: { source: string, position: int64, line: int64, column: int64
         true -> {
                             eof_location: { file: string, line: int64, column: int64, offset: int64 } <- lexer_core@current_location(after_comments);
             eof_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_eof(), "", eof_location);
-            cons_token(eof_token, tokens )
+            // A lexical error ends the list in place of eof (report_lexical_error).
+            case comment_error.kind == lexer_token_kind@token_kind_lexical_error() of {
+                true -> cons_token(comment_error, tokens);
+                false -> cons_token(eof_token, tokens)
+            }
         };
         false -> case lexer_core@is_whitespace(current) of {
             true -> {
@@ -134,8 +180,11 @@ fn tokenize(lexer: { source: string, position: int64, line: int64, column: int64
                             "=" -> lexer_operators@read_equal(after_comments);
                             "!" -> lexer_operators@read_bang_equal(after_comments);
                             _: string -> {
-                                                                    error_location: { file: string, line: int64, column: int64, offset: int64 } <- lexer_core@current_location(after_comments);
-                                error_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- lexer_core@make_token(lexer_token_kind@token_kind_unknown_char(), current, error_location);
+                                error_location: { file: string, line: int64, column: int64, offset: int64 } <- lexer_core@current_location(after_comments);
+                                error_token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- case is_parser_punctuation_char(current) of {
+                                    true -> lexer_core@make_token(lexer_token_kind@token_kind_unknown_char(), current, error_location);
+                                    false -> unexpected_character_token(current, error_location)
+                                };
                                 (error_token, lexer_core@advance(after_comments))
                             }
                         }
@@ -143,7 +192,11 @@ fn tokenize(lexer: { source: string, position: int64, line: int64, column: int64
                 };
                 (token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, next_lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) <- token_and_lexer;
                 new_tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- cons_token(token, tokens );
-                tokenize(next_lexer, new_tokens)
+                // The first lexical error ends tokenizing; it stays at the head.
+                case token.kind == lexer_token_kind@token_kind_lexical_error() of {
+                    true -> new_tokens;
+                    false -> tokenize(next_lexer, new_tokens)
+                }
             }
         }
     }
@@ -183,10 +236,52 @@ fn lexer_runner(filename: string) -> List[{ kind: int64, lexeme: string, locatio
     // DeviceIO for read_lines; mem is encapsulated in empty_token_list / cons_token.
     sequence proc[DeviceIO]
         source: string <- read_lines(filename);
-        lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@new_lexer(source, filename);
+        lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- skip_byte_order_mark(lexer_core@new_lexer(source, filename));
         initial_tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- empty_token_list();
         result_tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- tokenize(lexer, initial_tokens)
     produces
         pure result_tokens
     end
+}
+
+// A UTF-8 byte order mark as the first character is skipped; columns still
+// count from 1 at the first real character.
+fn skip_byte_order_mark(lexer: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 }) -> { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } {
+    case lexer_core@peek_char(lexer) == "\xEF\xBB\xBF" of {
+        false -> lexer;
+        true -> {
+            after: { source: string, position: int64, line: int64, column: int64, file: string, offset: int64 } <- lexer_core@advance(lexer);
+            { source: after.source, position: after.position, line: after.line, column: 1, file: after.file, offset: after.offset }
+        }
+    }
+}
+
+// When tokenizing stopped at a lexical error (it is then the head of the
+// list), prints it as a LexicalError diagnostic and returns true.
+fn report_lexical_error(tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> boolean {
+    is_error: boolean <- case tokens.is_nil of {
+        true -> false;
+        false -> tokens.head.kind == lexer_token_kind@token_kind_lexical_error()
+    };
+    case is_error of {
+        true -> print_lexical_error(tokens.head);
+        false -> false
+    }
+}
+
+fn print_lexical_error(token: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> boolean {
+    lexeme: string <- token.lexeme;
+    code: string <- substring(lexeme, 0, 5);
+    message: string <- substring(lexeme, 6, length_chars(lexeme));
+    _: int8 <- diagnostics_core@print_compiler_error("LexicalError", code, token.location, message, lexical_error_spec_section(code));
+    true
+}
+
+fn lexical_error_spec_section(code: string) -> string {
+    case code of {
+        "E0007" -> "sect2.1";
+        "E0001" -> "sect2.2";
+        "E0006" -> "sect2.3.2";
+        _: string -> "sect2.5"
+    }
 }

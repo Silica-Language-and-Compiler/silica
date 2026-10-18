@@ -70,7 +70,8 @@ stdlib-objs:
 			echo "FAIL: missing $(STDLIB_SRC)/$$m.silica"; \
 			exit 1; \
 		fi; \
-		ln -sf "$(STDLIB_SRC)/$$m.silica" "$(SDS_STDLIB_CACHE)/lib/$$m.silica"; \
+		: "relative from .stdlib_cache/lib, so the link survives a sync to another host"; \
+		ln -sfn "../../../../compiler/stdlib/data_structures/$$m.silica" "$(SDS_STDLIB_CACHE)/lib/$$m.silica"; \
 	done
 	@{ \
 		for m in $(SDS_STDLIB_MODULES); do \

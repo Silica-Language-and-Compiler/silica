@@ -1,5 +1,7 @@
 # `WeightedGraph` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/WeightedGraph.silica` over `graph_weighted`, `graph_weighted_undirected`, `graph_csr_weighted*` and `graph_dense_weighted*`; trials in `trials/ordered_data_structures/graph_live_core/` (`gl_weighted_directed`, `gl_weighted_undirected`) and `graph_collections/` (`gc_weighted_trait*`). No constructor-record compile-fail trial exists for this family.
+
 **Public trait:** `WeightedGraph`
 **Role:** orthogonal edge-weight capability on directed or undirected graph values
 **Live storage:** inner WBT map `target -> edge data`
@@ -48,6 +50,8 @@ Vertex IDs use `NodeIdType`, which may be any valid Silica type. `EdgeDataType` 
 ```
 
 All fields participate in ordering identity because graph algorithms may rely on any of them.
+
+Implementation: the record is the `functions` argument of `graph_weighted@empty/1` and `graph_weighted_undirected@empty/1` (live WBT) and of `graph_dense_weighted@empty_for_nodes(functions, nodes)` and the undirected dense twin; the signatures are exactly those above, with `ItemType`/`ValueType`/`KeyType` as the source spells the placeholders. CSR weighted graphs take no constructor record: they are frozen from a live graph with `graph_csr_weighted@freeze_from_wbt/1` and carry the live record's functions.
 
 Weight algebra such as zero, addition, negativity checks, or infinity does **not** belong in the graph value. An algorithm such as Dijkstra receives its own inline function record:
 

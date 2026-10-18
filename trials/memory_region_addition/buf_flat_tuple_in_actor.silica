@@ -1,0 +1,67 @@
+// Defect repro (found 2026-10-10, item M): a buf whose element is a flat tuple, written and read in
+// an actor's behaviour, aborts with "buffer index out of bounds" on index 0 of a 4-element buf
+// (status 71). The same code in main or in a plain function, and an int64 buf in a behaviour, work.
+// Found when write_buf_flat_tuple.silica was moved into the supervisor-actor shape (its work then runs
+// in the trial's worker actor); that trial stays in its old shape until this is fixed.
+// Expected: 7 + 11 = 18, exit status 18.
+
+fn worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[mem(normal)]
+        L1: lifetime <- fresh_lifetime();
+        r: region(L1, normal) <- alloc_region(normal);
+        buf: buf(L1, normal, (int64, int64), 4) <- alloc_buf(r, 4);
+        _: atom <- write_buf(buf, 0, (7, 11));
+        value: (int64, int64) <- read_buf(buf, 0);
+        (a: int64, b: int64) <- value
+    produces
+        pure (:reply, a + b, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency]
+        _: atom <- start_reporter();
+        w: actor_ref <- spawn(0, worker, stack_policy(0, :keep_last_message));
+        v: int64 <- call(w, 0 impl ActorMessage {})
+    produces
+        pure v
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

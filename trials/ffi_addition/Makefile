@@ -150,6 +150,7 @@ module-valid: $(SILICA_COMPILER)
 	ln -s "$(THIS_DIR)$$silica" "$$tmpdir/$$base.silica"; \
 	ln -s "$(FFI_SOURCE_VIEW)" "$$tmpdir/dangerous_exposure_source"; \
 	echo "$$base.silica" > "$$tmpdir/silica.config"; \
+	$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$$base.silica); \
 	out="$$tmpdir/out.txt"; \
 	(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,"$(SILICA_COMPILER)"); }) > "$$out" 2>&1 || true; \
 	if grep -qE '❌|Error error|ParseError|TypeError|EffectError|ModuleError' "$$out"; then \

@@ -1,6 +1,23 @@
 // §15.1.2.2: a program may lower an actor's reservation; an actor whose stack reaches the end of a
 // lowered reservation fails with (:explicit, :stack_exhausted), reason_tag 4 in the failure report,
-// and no other actor is affected. The caller's call completes with the actor-death result (0).
+// its stack is released, and no other actor is affected.
+// Spec §16.1.1: a call to an actor that ends before replying raises actor_not_found in the caller.
+// The deep message therefore goes through a relay actor: the relay calls w, w fails, and the call
+// raises actor_not_found in the relay, which fails the same way (reason_tag 4). The work only casts
+// to the relay, then polls w's memory usage until w's reservation and committed stack are both
+// back to 0 (bounded: it prints false if they never are).
+//
+// Expected output (compared as a multiset: the reports are asynchronous):
+//   262144                                         w's lowered reservation
+//   100                                            call(w, 100) recurses 100 deep within it
+//   failure report, #0 beh, reason_tag 4           w's 1,000,000-deep message exhausts the reservation
+//   failure report, #0 the relay, reason_tag 4     its call to w raises actor_not_found
+//   true                                           w's reservation and committed stack were released
+//   300000                                         a fresh actor at the default reservation recurses 300,000 deep
+//   done                                           the marker; the harness then sends `exit`
+//   0                                              wait_for_exit returns, main produces 0
+
+use trial_wait_int64;
 
 fn depth(n: int64) -> int64 {
     case n == 0 of {
@@ -17,25 +34,68 @@ fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
     (:reply, r, state)
 }
 
+// The relay calls w with its message; w fails before replying, so the call raises actor_not_found
+// here (§16.1.1) and the relay fails with reason_tag 4.
+fn relay(msg: int64, state: actor_ref) -> (:no_reply, actor_ref) {
+    sequence proc[concurrency]
+        _: int64 <- call(state, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn spin(n: int64) -> int64 {
+    case n <= 0 of {
+        true -> 0;
+        false -> spin(n - 1)
+    }
+}
+
+// True once w holds no reservation and no committed stack; false after `tries` polls.
+fn released(w: actor_ref, tries: int64) -> boolean {
+    sequence proc[concurrency]
+        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        free: boolean <- u.reserved == 0 and u.committed == 0;
+        r: boolean <- case free or tries <= 0 of {
+            true -> free;
+            false -> released_after_spin(w, tries - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn released_after_spin(w: actor_ref, tries: int64) -> boolean {
+    _: int64 <- spin(10000);
+    released(w, tries)
+}
+
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
-        w: actor_ref <- spawn(0, beh, stack_policy(262144, :keep_high_water));
-        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
-        print_int64(u.reserved);
-        println("");
-        small: int64 <- call(w, 100 impl ActorMessage {});
-        print_int64(small);
-        println("");
-        dead: int64 <- call(w, 1000000 impl ActorMessage {});
-        print_int64(dead);
-        println("");
-        after: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
-        print_bool(after.reserved == 0 and after.committed == 0);
-        println("");
-        other: actor_ref <- spawn(0, beh, stack_policy(0, :keep_last_message));
-        still: int64 <- call(other, 300000 impl ActorMessage {});
-        print_int64(still);
-        println("")
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency, device_io]
+                w: actor_ref <- spawn(0, beh, stack_policy(262144, :keep_high_water));
+                u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+                print_int64(u.reserved);
+                println("");
+                small: int64 <- call(w, 100 impl ActorMessage {});
+                print_int64(small);
+                println("");
+                q: actor_ref <- spawn(w, relay, stack_policy(0, :keep_last_message));
+                _: boolean <- cast(q, 1000000 impl ActorMessage {});
+                print_boolean(released(w, 10000));
+                println("");
+                other: actor_ref <- spawn(0, beh, stack_policy(0, :keep_last_message));
+                still: int64 <- call(other, 300000 impl ActorMessage {});
+                print_int64(still);
+                println("");
+                println("done")
+            produces
+                pure 0
+            end
+        });
+        _: int64 <- wait_for_exit()
     produces
         pure 0
     end

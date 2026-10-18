@@ -1,5 +1,7 @@
 # Live WBT Graph Representation Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/graph_wbt_core.silica` (outer `wbt_map` of inner `wbt_map` target-to-value); trials in `trials/ordered_data_structures/graph_live_core/` (17 programs).
+
 **Consumers:** directed, undirected, and weighted graph traits
 **Role:** default persistent representation for incremental topology updates
 

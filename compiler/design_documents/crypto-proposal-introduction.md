@@ -1,5 +1,7 @@
 # Crypto Proposal Explained (Simplified)
 
+> **Implementation status (2026-10-16).** This is a proposal. None of it is implemented: the lexer, type checker, effect checker and specification have no `Secret` / `Public` labels, no `CtMask` type and no `proc[secret]` effect, and there are no secret buffers. Random bytes, hashes and HMAC are not built-ins either. The paragraphs under "Random Bytes and Hash Functions" describe how a program obtains them today, through Fifi (`dangerous_*` wrappers in `spawn_dangerous` workers; networking and other foreign access likewise go through the FFI, specification §20.4), with results that stay external-danger-touched until re-created.
+
 ## What's Being Proposed: Making Cryptography Safer by Design
 
 This proposal adds language-level protections to Silica so that cryptographic code is safer by default.

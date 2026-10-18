@@ -1,7 +1,7 @@
 # Phase 1 Standard Data Structures — Dependency-Ordered Implementation Plan
 
 **Date:** 2026-06-29; BinaryTree amendment 2026-07-02
-**Status:** Implementation sequencing authority
+**Status:** Implementation sequencing authority. Implementation status (2026-10-16): all ten public traits and the live, CSR and dense graph representations are implemented in `compiler/stdlib/data_structures/` with trials under `trials/ordered_data_structures/`; the open items are listed in the per-section status records below and in §37.
 **Design authority:** `[data_structure_designs/README.md](data_structure_designs/README.md)` and every design linked from it
 
 ## 1. Purpose
@@ -193,12 +193,12 @@ Do not copy behavior from deleted source or deleted trials. The reset is the bas
 
 ### 6.2 Create a fresh trial hierarchy
 
-**Trial root:** `[trials/standard_data_structures_phase1/](../../trials/standard_data_structures_phase1/)` (created 2026-06-29; see `[README.md](../../trials/standard_data_structures_phase1/README.md)`).
+**Trial root:** `[trials/ordered_data_structures/](../../../trials/ordered_data_structures/)` (created 2026-06-29 as `trials/standard_data_structures_phase1/`; since renamed; see `[README.md](../../../trials/ordered_data_structures/README.md)`). Implementation status (2026-10-16): the leaves with trials are `compiler_substrate`, `wbt_core`, `skew_ral_core`, `brodal_okasaki_core`, `binary_tree_core`, `ordered_collections`, `heap_collections`, `tree_collections`, `search_tree_collections`, `graph_live_core`, `graph_csr_core`, `graph_dense_core`, `graph_collections` and `self_host_maps`. `live_graphs`, `terminal_structures`, `snapshot_graphs` and `cross_representation` hold only `smoke_harness_ready`; `binary_tree/` was never created (its coverage lives in `binary_tree_core/`); compile-fail trials live in `trials/error_enforcement_addition/standard_data_structures/` rather than an `error_enforcement/` leaf.
 
 Create a new Phase 1 trial root organized by dependency rather than by public structure alone:
 
 ```text
-trials/standard_data_structures_phase1/
+trials/ordered_data_structures/   (layout as planned; see the status above for what exists)
 ├── compiler_substrate/
 ├── wbt_core/
 ├── skew_ral_core/
@@ -233,7 +233,7 @@ For every numbered design section, record at least one of:
 
 The ledger prevents apparently complete modules from omitting failure or compatibility behavior.
 
-The 2026-07-02 BinaryTree amendment adds coverage for `persistent_binary_tree.md` and `binary_tree_trait.md`. Its planned trial leaves are `binary_tree_core/` for Layer 2 invariants and `binary_tree/` for Layer 3 trait/module acceptance. This amendment does not change the recorded 2026-06-29 baseline snapshot.
+The 2026-07-02 BinaryTree amendment adds coverage for `persistent_binary_tree.md` and `binary_tree_trait.md`. Its planned trial leaves are `binary_tree_core/` for Layer 2 invariants and `binary_tree/` for Layer 3 trait/module acceptance. Implementation status (2026-10-16): both are covered in `binary_tree_core/`; `binary_tree/` was not created. This amendment does not change the recorded 2026-06-29 baseline snapshot.
 
 ### 6.4 Record the closed CSR/dense representation contract
 
@@ -384,7 +384,7 @@ Cover all public families:
 - `Heap`;
 - `PriorityQueue`;
 - `Tree`;
-- `BinaryTree` (added by the §7.10 empty-record delta).
+- `BinaryTree` (added by the §7.10 constructor-record delta).
 
 Acceptance trials:
 
@@ -486,23 +486,23 @@ Extend the completed collection substrate for the tenth public family:
 - register the `tree_binary` generated module and a `StubBinaryTree` substrate module;
 - allocate distinct family and representation IDs without changing any existing ID;
 - include item specialization and memory space in the stable specialization key;
-- accept the exact empty constructor record `{}` for `empty` and `with_root`;
-- witness `ItemType` from the declared result type and, for `with_root`, the explicit root item;
-- reject `empty({})` when the expected collection type does not determine `ItemType` and `SpaceType`;
-- reject every extra field in the empty record;
+- accept the constructor record `{ compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater }` for `empty` and `with_root` (decision 2026-10-16: the record is not `{}`; the function field is the `ItemType` witness, stored in the tree record and never called by the core);
+- witness `ItemType` from the `compare_item` field, `SpaceType` from the declared result type and, for `with_root`, the explicit root item;
+- reject `empty({ compare_item: ... })` when the expected collection type does not determine `SpaceType`;
+- reject `{}` (E2017) and every extra field in the constructor record;
 - lower constructor lets through the canonical arena/spec-key merge path;
 - carry no comparator, extractor, orientation, or ordering-identity bundle for this unordered family; and
 - preserve the rule that an unrelated coincidentally shaped record or unregistered module does not acquire BinaryTree behavior.
 
-The empty record is a deliberate extension of the common constructor-function-record rule, not an exception that permits omitting required fields from another family. Existing ordered-family lowering and bundle materialization must remain byte-for-byte behaviorally unchanged.
+The witness-only `compare_item` field is a deliberate adaptation of the common constructor-function-record rule: BinaryTree reads no ordering from it, but it follows the same record shape as every other family. Existing ordered-family lowering and bundle materialization must remain byte-for-byte behaviorally unchanged.
 
 Acceptance trials (`compiler_substrate/`):
 
 - `binary_tree_bracket_type_parse`: every supported item shape and memory space parses and type-checks;
-- `binary_tree_empty_constructor_record`: `empty({})` resolves from its binding type and `with_root({}, item)` agrees with the explicit item witness;
+- `binary_tree_empty_constructor_record`: `empty({ compare_item })` resolves from its binding type and `with_root({ compare_item }, item)` agrees with the explicit item witness;
 - `binary_tree_registry_specialization_distinct`: item and space specializations receive distinct keys while repeated construction reuses one canonical arena;
 - `binary_tree_stub_run`: runnable `StubBinaryTree@empty` and `@with_root` paths traverse parse → typecheck → SIR → emit → link → run;
-- `binary_tree_constructor_no_ordering_bundle`: the merged record contains arena/spec-key fields and no fabricated comparator or ordering token;
+- `binary_tree_constructor_no_ordering_bundle`: the merged record contains arena/spec-key fields and the witness-only `compare_item`, and no fabricated ordering token or bundle;
 - existing nine-family constructor, bundle, registry, and link-mangling trials remain unchanged and green.
 
 Compile-fail trials (`error_enforcement/`):
@@ -513,9 +513,9 @@ Compile-fail trials (`error_enforcement/`):
 - `trial_compile_fail_binary_tree_wrong_module`;
 - `trial_compile_fail_binary_tree_missing_mem`.
 
-**§7.10 exit gate:** BinaryTree has a stable bracket witness, family/representation identity, exact empty-record constructor resolution, runnable canonical-arena lowering, and deterministic negative diagnostics; the full Phase 1 root integrates with all prior Layer 1 trials.
+**§7.10 exit gate:** BinaryTree has a stable bracket witness, family/representation identity, `{ compare_item }` constructor resolution, runnable canonical-arena lowering, and deterministic negative diagnostics; the full Phase 1 root integrates with all prior Layer 1 trials.
 
-**§7.10 status:** Planned — required before §17 starts.
+**§7.10 status (2026-10-16):** Partially met; the remainder is not scheduled. The type checker parses `BinaryTree[ItemType, mem(SpaceType)]` (`type_checker_collections.silica`, `type_interner.silica`), and `binary_tree_core/binary_tree_bracket` exercises it as a return type, a binding and a trait-call receiver. §17 and §20 were implemented without the rest of this delta: there is no `StubBinaryTree`, none of the `compiler_substrate/` trials `binary_tree_*` above and none of the five `trial_compile_fail_binary_tree_*` trials exist, and the constructor record is `{ compare_item }` by decision (2026-10-16), not `{}`. `tree_binary@empty` takes `{ compare_item }` (a witness the core never calls and that produces no ordering bundle) because a bare `ItemType` resolves only from a `compare_*` field of the constructor record (`tree_binary.silica` header, deviation 1).
 
 ### Layer 1 exit gate
 
@@ -525,7 +525,7 @@ The historical nine-family Layer 1 gate is complete after §§7.1–§7.9. The a
 - At least one minimal hand-written recursive fixture passes through parse, type check, SIR, emission, link, and run.
 - Exact function identity and canonical arena identity are independently observable through test-only assertions.
 - All original nine constructor-record shapes resolve against stub concrete modules at type-check time.
-- The historical nine-family gate remains accepted; the amended ten-family suite is complete only after §7.10 adds runnable `StubBinaryTree` construction and exact empty-record enforcement.
+- The historical nine-family gate remains accepted; the amended ten-family suite is complete only after §7.10 adds runnable `StubBinaryTree` construction and `{ compare_item }` constructor-record enforcement.
 - **§7.9:** at least one runnable `@empty` trial per stub family; no registered constructor let falls back to plain let when merge lowering applies; merged constructor records carry ordering-identity bundles for ordering-relevant fields (completes §7.2 bundle embedding on the compiler path).
 - No representation algorithm has been used to compensate for missing compiler support.
 
@@ -544,7 +544,7 @@ The Adams-family WBT core (§8A) is the first representation package after Layer
 
 **Normative design:** `[data_structure_designs/weight_balanced_tree.md](data_structure_designs/weight_balanced_tree.md)`.
 **Coverage ledger:** `[standard_data_structures_baseline/requirements_to_trials_ledger.md](standard_data_structures_baseline/requirements_to_trials_ledger.md)` rows for `weight_balanced_tree.md` §§1–16.
-**Trial leaf:** `[trials/standard_data_structures_phase1/wbt_core/](../../trials/standard_data_structures_phase1/wbt_core/)`.
+**Trial leaf:** [trials/ordered_data_structures/wbt_core/](../../../trials/ordered_data_structures/wbt_core/) (formerly `trials/standard_data_structures_phase1/wbt_core/`).
 **Implementation boundary:** compiler-private WBT implementation unit(s) under `stdlib/data_structures/`; public trait wiring is §9–§10.
 
 The implementation is split into the gated work packages below. Complete them in order. A later package may add a trial for an earlier helper, but it may not compensate for an earlier gate that is still failing.
@@ -1482,7 +1482,7 @@ This is the **first** self-host source change after the parallel tree exists. Ke
 | Wave C `Expr` / `SIRTerm` | Done | Index arenas `{ nodes: List[<inline node>, mem(normal)], root: int64 }` in `parser/parser_ast.silica` and `sir_generator/sir_ast.silica`; `root = -1` replaces the cyclic dummy |
 | Wave D residuals | Done for batch-green | ~23 historical `bootstrap` workaround comments remain in `src/` (W02, W04, W15 among them); reclassify as historical or delete |
 
-**§12 open:** none for the exit gate. Housekeeping carried into §13: delete the orphan `src/btree_set_nodeid.silica` (excluded from the build by `topo_silica_config.sh`), reclassify the residual workaround comments, and either wire or delete `HOST_COMPILER` in `src/Makefile`.
+**§12 open:** none for the exit gate. Housekeeping carried into §13: the orphan `src/btree_set_nodeid.silica` (excluded from the build by `topo_silica_config.sh`) was deleted 2026-10-16, reclassify the residual workaround comments, and either wire or delete `HOST_COMPILER` in `src/Makefile`.
 
 ## 13. Cutover / fixed-point / bootstrap retirement
 
@@ -1497,7 +1497,7 @@ This is the **first** self-host source change after the parallel tree exists. Ke
 
 **§13 exit gate:** Phase 6.1 fixed-point integrate passes on the parallel tree; `make integrate` includes the self-host trial; after cutover, production compiler source has zero `type` aliases, no `bst` dependency, and builds/maintains itself without `silica-bootstrap-compiler` on the default path. Blocks §14 onward until this gate passes.
 
-**§13 status:** In progress (2026-09-08). Self-host integrate is de facto in place (all trials run on the selfhost binary), but: there is no `trials/self_host_addition/`; the selfhost has not been shown to compile 100 % of `src/` (`emitter_core.silica` outstanding; `list_nth` landed in both trees to break its memory wall, confirming build pending); no generation-2 build, differential or fixpoint exists; cutover and bootstrap removal not done. The step order is the seven-step ladder recorded in the bootstrap-retirement plan's status snapshot (liveness → memory → probe harness → per-unit sweep → gen 2 [pause] → differential → fixpoint). Also on this path: `src/fix_seed_emission.py` must be retired before any fixpoint claim, and defect A5 in `../HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md` (provided trait methods across the exit-75 restart) affects the compiler's own build.
+**§13 status (2026-10-16):** The record below is kept for history and is superseded. Per the project record the selfhost reached its fixed point on 2026-09-12 (gen3 equals gen2 modulo UUID/signature) and Linux x86-64 reached its own on 2026-09-19; commit `eff040583` records new fixed points for all three hosted platforms. `trials/self_host_addition/` does not exist. Whether `silica-bootstrap-compiler` is off the default path is not verified here; `bootstrap_retirement_and_self_host_plan.md` is the authority. **Earlier record (2026-09-08):** In progress. Self-host integrate is de facto in place (all trials run on the selfhost binary), but: there is no `trials/self_host_addition/`; the selfhost has not been shown to compile 100 % of `src/` (`emitter_core.silica` outstanding; `list_nth` landed in both trees to break its memory wall, confirming build pending); no generation-2 build, differential or fixpoint exists; cutover and bootstrap removal not done. The step order is the seven-step ladder recorded in the bootstrap-retirement plan's status snapshot (liveness → memory → probe harness → per-unit sweep → gen 2 [pause] → differential → fixpoint). Also on this path: `src/fix_seed_emission.py` had to be retired before any fixpoint claim (removed 2026-10-16), and defect A5 in `../HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md` (provided trait methods across the exit-75 restart) affects the compiler's own build.
 
 ## 14. WBT join/split/concat reopen (from §8A.9)
 
@@ -1513,7 +1513,7 @@ Reopen only if a **named** consumer requires set union, ordered concat, or key-r
 
 **§14 exit gate:** dated record either reaffirming deferral (no Phase 1 consumer) or accepting each required primitive under the §8A.9 mini-gate rules.
 
-**§14 status:** Planned — blocked on §13.
+**§14 status (2026-10-16):** Deferral reaffirmed in the code; the dated ledger record is still owed. §13 no longer blocks it. `wbt_set.silica` and `wbt_map.silica` export no `join`, `concat` or `split`, and no landed consumer (`OrderedSet`, `OrderedMap`, `SearchTree`, the live, CSR and dense graphs) uses one; fold-insert and `from_sorted` suffice.
 
 ## 15. Skew binary random-access-list core
 
@@ -1602,7 +1602,7 @@ line below.
 **Dependencies:** canonical arenas, exact ordering identity, recursive tuples, immutable Silica `List`, checked arithmetic.
 **Downstream consumers:** `Heap` and `PriorityQueue`.
 
-**§16 status:** Implementation on disk, unrecorded and uncommitted (2026-09-08 audit): 11 `stdlib/data_structures/brodal_okasaki*.silica` units and 14 trials under `trials/ordered_data_structures/brodal_okasaki_core/` exist as untracked files and were being edited during the audit; that leaf has no `.integrate_counts`, so no gate run is recorded, and the ledger row still says "planned". Whoever owns this work should add a dated status block here in the §15 style (units, dispatcher split, trials, gate result) before it is committed.
+**§16 status (2026-10-16):** Complete. `stdlib/data_structures/` holds `brodal_okasaki.silica`, its split units (`_node`, `_compare`, `_link`, `_forest`, `_extract`, `_boot`, `_validate`, `_dispatch_core`, `_dispatch_bulk`) and the forwarders `brodal_okasaki_min`, `brodal_okasaki_max`, `brodal_okasaki_priority`. `brodal_okasaki_core/` has 13 trial programs (`bo_empty_peek`, `bo_from_list`, `bo_generic_payloads`, `bo_invalid_comparator_status`, `bo_max_orientation_adapter`, `bo_meld_incompatible`, `bo_meld_tree`, `bo_old_heap_valid_after_pop`, `bo_pop_order_oracle`, `bo_pop_persistence`, `bo_push_duplicate`, `bo_rank_collisions`, `bo_validate_invariants`) plus `smoke_harness_ready`. **Earlier record (2026-09-08 audit):** Implementation on disk, unrecorded and uncommitted: 11 `stdlib/data_structures/brodal_okasaki*.silica` units and 14 trials under `trials/ordered_data_structures/brodal_okasaki_core/` exist as untracked files and were being edited during the audit; that leaf has no `.integrate_counts`, so no gate run is recorded, and the ledger row still says "planned". Whoever owns this work should add a dated status block here in the §15 style (units, dispatcher split, trials, gate result) before it is committed.
 
 Implement in this order:
 
@@ -1636,7 +1636,7 @@ Required trials:
 **Dependencies:** §7.10 BinaryTree registration delta, canonical arenas, recursive tuples, checked arithmetic, immutable Silica `List` for paths and zipper breadcrumbs.
 **Downstream consumers:** `tree_binary` / `BinaryTree` in §20; compiler-wide AST bridge and migration in the separate bootstrap-retirement plan.
 **Normative design:** `[data_structure_designs/persistent_binary_tree.md](data_structure_designs/persistent_binary_tree.md)`.
-**Trial leaf:** planned `trials/standard_data_structures_phase1/binary_tree_core/`.
+**Trial leaf:** `trials/ordered_data_structures/binary_tree_core/` (landed 2026-09-18).
 
 The core is unordered. It carries no comparator or ordering identity and does not depend on WBT, skew RAL, Brodal–Okasaki, rose-tree slots, or public trait dispatch.
 
@@ -1726,7 +1726,7 @@ Each package must run leaf `make record-golden` / `make integrate` and the Phase
 - Fixed-seed traces and complexity counters match the detailed design.
 - The core compiles into the standard library without public `BinaryTree` trait wiring or compiler-AST-specific logic.
 
-**§17 status:** Planned.
+**§17 status (2026-10-16):** Complete in substance, with deviations. `stdlib/data_structures/tree_binary.silica` implements the owning record `{ root, compare_item, region, specialization_key }`, the node `(item, subtree_node_count, left, right)`, the sole checked smart constructor, path queries, item and child replacement, the three folds, shape-preserving maps, the inline zipper and `validate` (`:ok | :cycle | :wrong_arena | :negative_count | :size_mismatch | :count_overflow`). `binary_tree_core/` has 13 trial programs (`binary_tree_bracket`, `bt_compatibility`, `bt_empty_and_root`, `bt_folds`, `bt_generic_payloads`, `bt_maps`, `bt_node_and_queries`, `bt_persistence_sharing`, `bt_replace_children`, `bt_replace_item`, `bt_trait_dispatch`, `bt_validate`, `bt_zipper`); the directed-artifact names above were not used one-for-one. Not landed: `binary_tree_randomized_oracle`, `binary_tree_complexity_observations`, and a `trial_collection_error_binary_tree_count_overflow` (a checked `count_preflight/2` is exported). Deviations (module header): constructor record `{ compare_item }`, not `{}`; queries take a placeholder item; paths are built with `path_root/path_left/path_right` because atoms are numbered per unit; `mem(normal)` only.
 
 ### 17 exit gate (representation cores)
 
@@ -1759,6 +1759,8 @@ The core must not:
 - silently add absent endpoint vertices unless the detailed design says so;
 - implement `remove_vertex`;
 - inspect CSR or dense records.
+**§18 status (2026-10-16):** Complete (landed 2026-09-18). `graph_wbt_core.silica` is the shared engine (outer WBT map node to inner WBT map target to value, over `wbt_map`); the generated modules are `graph_wbt_directed`, `graph_wbt_undirected`, `graph_weighted` (weighted directed) and `graph_weighted_undirected`. Trials: `graph_live_core/` (17 programs, among them `gl_validate`, `gl_persistence_sharing`, `gl_large_oracle`, `gl_generic_payloads`, `gl_record_edge_data`, `gl_tuple_node_ids`; the two `defect_generic_payload_*` programs there passed after the boxed record layout).
+
 ## 19. `Heap`
 
 **Dependencies:** §16 and Layer 1 trait substrate.
@@ -1773,6 +1775,8 @@ Implement:
 - exact incompatibility and empty behavior — **`meld` returns `{heap: left, compatible: false}` without allocating a merged heap when ordering or arena identity differs** (re-verifies §7.2 and §16 on the public trait surface).
 
 Acceptance must run identical abstract traces against min and max orientations and verify opposite pop order, including meld incompatibility trials aligned with `heap_trait.md`.
+
+**§19 status (2026-10-16):** Complete (landed 2026-09-18). `Heap.silica` (required `len`, `peek`, `compare_item`; provided `is_empty`) over `brodal_okasaki_min` / `brodal_okasaki_max`. The `heap_*` programs in `heap_collections/` (`heap_duplicates`, `heap_empty_and_singleton`, `heap_from_list`, `heap_generic_payloads`, `heap_large_runs`, `heap_meld`, `heap_persistence`, `heap_push_pop_order`, `heap_trait_dispatch`, `heap_validate`) are 10 of that leaf's 23. Deviations are in the `Heap.silica` header: `peek` takes a placeholder item, and a `Heap[...]` binding is accepted only for an `@empty` call.
 ## 20. `tree_binary` and `BinaryTree`
 
 **Dependencies:** §17, §7.10 family registration, trait substrate.
@@ -1783,7 +1787,7 @@ Acceptance must run identical abstract traces against min and max orientations a
 Implement:
 
 - exact `BinaryTree[ItemType, mem(SpaceType)]` generated family;
-- exact empty constructor record `{}` for `empty`, `with_root`, and `node`;
+- constructor record `{ compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater }` for `empty`, `with_root`, and `node` (decision 2026-10-16);
 - `tree_binary@empty`, `@with_root`, and compatible left/right node construction;
 - required trait methods for count, empty, root/path/child queries, and three fold orders;
 - representation-module item, left, and right replacement/clear operations;
@@ -1817,7 +1821,7 @@ Acceptance trials:
 - `BinaryTree` and rose `Tree` have distinct type, module, trait, path, update, and invariant behavior.
 - BinaryTree acceptance is complete without converting the compiler parser AST.
 
-**§20 status:** Planned.
+**§20 status (2026-10-16):** Complete in substance, with deviations. `BinaryTree.silica` is the trait (required `node_count`, `root_item`, `get`, `left_item`, `right_item` and the three folds; provided `is_empty`) over `tree_binary`. The `BinaryTree[ItemType, mem(normal)]` bracket type is accepted (`binary_tree_bracket`). The trials are in `binary_tree_core/` (e.g. `bt_trait_dispatch`, `bt_zipper`, `bt_validate`); `binary_tree/` was never created and the `binary_tree_*` public-surface trial names above were not used. Not landed: `binary_tree_inline_surface_compile`, `binary_tree_failure_matrix`, `binary_tree_string_example` and the constructor-record compile-fail trials (see §7.10).
 
 ### 20 exit gate (public backends)
 
@@ -1837,6 +1841,8 @@ Implement `graph_wbt_directed` and `DirectedGraph` conformance:
 - out-degree, neighbor traversal, edge fold, and connected query;
 - exact vertex/edge counts;
 - lookup and missing-endpoint behavior.
+**§21 status (2026-10-16):** Complete (landed 2026-09-18). `graph_wbt_directed` plus the `DirectedGraph` trait (`DirectedGraph.silica`); trials `gl_directed_vertices`, `gl_directed_add_edge`, `gl_directed_remove_edge`, `gl_directed_payloads`, `gl_directed_folds_reachable` and `graph_collections/gc_directed_trait`.
+
 ## 22. Undirected live graph
 
 Implement `graph_wbt_undirected` and `UndirectedGraph` conformance:
@@ -1847,6 +1853,8 @@ Implement `graph_wbt_undirected` and `UndirectedGraph` conformance:
 - logical edge count distinct from adjacency-entry count;
 - symmetry validation;
 - `EdgeDataType = unit` convenience path for unweighted construction.
+**§22 status (2026-10-16):** Complete (landed 2026-09-18). `graph_wbt_undirected` plus `UndirectedGraph.silica`; trials `gl_undirected_symmetry`, `gl_unit_edges` and `graph_collections/gc_undirected_trait`, `gc_undirected_trait_weighted`.
+
 ## 23. Weighted live graphs
 
 **Dependencies:** accepted directed and undirected storage behavior plus `WeightedGraph` trait substrate.
@@ -1859,6 +1867,8 @@ Implement weighted directed and weighted undirected modules:
 - undirected reverse wrappers carry comparator-equal data/weight;
 - weight validity behavior matches the detailed design;
 - a weighted value implements the applicable direction trait and the independent `WeightedGraph` trait.
+**§23 status (2026-10-16):** Complete (landed 2026-09-18). `graph_weighted`, `graph_weighted_undirected` plus `WeightedGraph.silica`; trials `gl_weighted_directed`, `gl_weighted_undirected`, `gl_record_edge_data` and `graph_collections/gc_weighted_trait`, `gc_weighted_trait_undirected`.
+
 ## 24. Live-graph acceptance matrix
 
 Run every graph operation against:
@@ -1879,6 +1889,8 @@ Add randomized traces checked against a simple mathematical graph oracle. The or
 - Weighted values satisfy both independent trait contracts.
 - The deterministic node/neighbor fold order needed by CSR freeze is stable.
 - CSR and dense remain dependency-blocked until their graph/index/buffer prerequisites are accepted.
+**§24 exit gate status (2026-10-16):** Met as far as the ledger records it: the matrix is spread over the `graph_live_core/` programs, with `gl_large_oracle` as the randomized oracle comparison and `gl_validate` as the validation sweep. Graph algorithms written once over a trait (one copy per implementation) are in `graph_collections/`.
+
 ## 25. `SearchTree`
 
 **Dependencies:** accepted `wbt_set`, `OrderedSet`, multi-trait conformance.
@@ -1891,6 +1903,8 @@ Implement `SearchTree` as the designed behavioral view:
 - search behavior, fold order, comparator identity, validation, and complexity are unchanged.
 
 Do not create a second representation, copy the tree, or add an independent arena.
+**§25 status (2026-10-16):** Complete (landed 2026-09-18). `SearchTree.silica` is a trait over the same `wbt_set` value as `OrderedSet` (required `contains_key`, `compare_item`; no provided block); `search_tree_collections/` has 14 programs (`st_*`, `ordered_set_field_annotation`, `ordered_set_field_projection`). The `SearchTree`-typed-parameter defect noted when it landed is fixed: `st_parameter_accepts_updated_tree` passes (its header records the former `compile_defects_search_tree_parameter_addition`).
+
 ## 26. `PriorityQueue`
 
 **Dependencies:** accepted §16 Brodal–Okasaki core, Heap ordering machinery, trait substrate.
@@ -1904,6 +1918,8 @@ Implement:
 - ordering and arena compatibility checks.
 
 Do not implement arbitrary-entry deletion, handles, or decrease-key.
+**§26 status (2026-10-16):** Complete (landed 2026-09-18). `PriorityQueue.silica` (required `len`, `peek`; provided `is_empty`, `peek_priority`, `peek_value`) over `brodal_okasaki_priority`; trials are the `pq_*` programs of `heap_collections/` (`pq_duplicates`, `pq_empty`, `pq_from_entries`, `pq_generic_payloads`, `pq_item_type_is_value`, `pq_large_runs`, `pq_meld`, `pq_persistence`, `pq_priority_type_composite_result`, `pq_push_pop_lexicographic`, `pq_state_in_fn_record_list`, `pq_trait_dispatch`, `pq_validate`). Deviations are in the `brodal_okasaki_priority` header (placeholders spelled `KeyType`/`ValueType`, comparator pair carried twice, entries carry their comparators, placeholder arguments to `peek`).
+
 ## 27. `Tree`
 
 **Dependencies:** §15, exact item comparator identity, canonical arenas, trait substrate.
@@ -1929,6 +1945,8 @@ Do not reuse, compact, or renumber vacant child slots.
 - SearchTree shares rather than duplicates `OrderedSet` representation.
 - PriorityQueue exposes no decrease-key/deletion surface.
 - Tree preserves every path index across removal and all later updates.
+**§27 status (2026-10-16):** Complete (landed 2026-09-18). `tree_rose.silica` (child slots are a reversed skew RAL forest spine; the stdlib exports `add_leaf/3` because `add_child` is a supervisor built-in name) and `Tree.silica` (8 required methods, no provided block). `tree_collections/` has 16 programs (`rt_*`, `tree_field_annotation`). The `Tree[ItemType, mem(normal)]` bracket type is accepted (`tree_field_annotation`). Eight numbered deviations are in the `tree_rose` header.
+
 ## 28. Shared deterministic node-slot assignment
 
 **Entry requirements (before §28):**
@@ -1953,6 +1971,8 @@ Implement one internal slot-assignment procedure used by CSR and dense construct
 Acceptance proves identical live graph values receive identical slot assignments.
 
 Public IDs use `NodeIdType` and assigned slots use `int64`. Test fixtures must include non-integer IDs as well as sparse integer IDs to prove that implementations never use an ID directly as a slot.
+**§28 status (2026-10-16):** Implemented inside `graph_csr_core.silica` and `graph_dense_core.silica` rather than as a separate shared module (comparator-order fold, slots `0..n-1`, `node_to_slot` WBT map, slot-to-node sequence); exercised by `gcsr_directed_freeze`, `gcsr_generic_payloads`, `gd_universe`, `gd_generic_payloads`. Whether both cores call one shared procedure was not verified.
+
 ## 29. CSR snapshots
 
 **Dependencies:** live graph modules, shared slot assignment, WBT map, runtime-sized immutable buffers.
@@ -1980,6 +2000,8 @@ Required trials:
 - source persistence and snapshot immutability;
 - exact-size allocation and overflow rejection;
 - malformed-buffer validation through safe test fixtures.
+**§29 status (2026-10-16):** Complete (landed 2026-09-18). `graph_csr_core` plus `graph_csr_directed`, `graph_csr_undirected`, `graph_csr_weighted`, `graph_csr_weighted_undirected`; `graph_csr_core/` has 9 programs (`gcsr_directed_freeze`, `gcsr_undirected`, `gcsr_weighted`, `gcsr_validate`, `gcsr_snapshot_isolation`, `gcsr_equivalence_large`, `gcsr_generic_payloads`, `gcsr_record_edge_data`, `defect_generic_payload_csr_record_data`). Not trialed: the overflow-rejection path of freeze (unreachable in a trial; ledger row CSR §9).
+
 ## 30. Dense matrix graphs
 
 **Dependencies:** shared slot assignment, WBT node index, skew RAL, graph traits, checked `n * n`.
@@ -2014,6 +2036,8 @@ Required trials:
 - CSR exposes no mutation path.
 - Dense vertex universes cannot grow through edge updates.
 - No graph algorithm depends on WBT, CSR, or dense fields.
+**§30 status (2026-10-16):** Complete with one deviation (landed 2026-09-18). `graph_dense_core` plus `graph_dense_directed`, `graph_dense_undirected`, `graph_dense_weighted`, `graph_dense_weighted_undirected`; `graph_dense_core/` has 9 programs (`gd_universe`, `gd_directed_updates`, `gd_undirected`, `gd_weighted`, `gd_validate`, `gd_equivalence`, `gd_generic_payloads`, `gd_record_edge_data`, `defect_generic_payload_dense_record_data`). Deviation: cells are optional references (`ref?`) for every family, not boolean or `:none | (:some, EdgeDataType)` cells (`graph_dense_core.silica` header, deviation 1; see CSR-D5/D6 in the ledger). `graph_collections/` (20 programs) runs the three graph traits over live, CSR and dense values, and `gd_equivalence` / `gcsr_equivalence_large` compare them against the live graph.
+
 ## 31. Standard-library build integration
 
 Add the new source hierarchy to the standard-library build:
@@ -2036,6 +2060,8 @@ Build order must mirror this plan:
 7. cross-representation trials.
 
 Do not restore deleted legacy source merely to satisfy an old build entry. Remove or replace stale entries with the new design-authoritative modules.
+**§31 status (2026-10-16):** Done. `trials/ordered_data_structures/Makefile` builds the 57 modules in `SDS_STDLIB_MODULES` once into a stdlib cache and every leaf reuses them; `make gate-stdlib` compares the cached objects with `stdlib_goldens/`. `gate-stdlib` is not part of `integrate` and reported 8 diffs against Sep 12 goldens on 2026-09-18 (`wbt_set`, `wbt_map`, six `skew_ral` units); the current count has not been re-measured.
+
 ## 32. Full specialization matrix
 
 Compile and run representative specializations across:
@@ -2043,7 +2069,7 @@ Compile and run representative specializations across:
 - primitive and structural keys/items;
 - top-level and closure comparators;
 - multiple memory spaces supported in Phase 1;
-- BinaryTree scalar/composite payloads, empty-record construction, and zipper signatures;
+- BinaryTree scalar/composite payloads, `{ compare_item }` construction, and zipper signatures;
 - min and max heaps;
 - directed and undirected graphs;
 - unweighted and separate edge-data types;
@@ -2093,7 +2119,7 @@ Cover:
 - malformed CSR offsets;
 - dense-capacity overflow;
 - graph endpoint and representation misuse;
-- ambiguous or field-bearing BinaryTree empty constructor records;
+- ambiguous, empty (`{}`) or extra-field BinaryTree constructor records;
 - BinaryTree missing paths, incompatible subtree arenas, count overflow, and malformed cycles.
 
 Diagnostics must be deterministic and must not depend on allocator addresses.
@@ -2135,6 +2161,10 @@ Phase 1 is complete only when:
 - no source, build entry, documentation link, or trial depends on the removed implementation;
 - the requirements-to-trials ledger has no unexplained gaps;
 
+**§32–§36 status (2026-10-16):** There is no dedicated suite for these sections. What exists is per-leaf: `*_generic_payloads` programs in every leaf (string, tuple and record payloads), the memory-space matrix in `compiler_substrate/collection_ordered_set_space_matrix`, `wbt_persistence_fanout`, `ral_persistence_fanout`, `gl_persistence_sharing` and the `*_large_*` / `*_oracle` programs, `wbt_complexity_observations`, and the compile-fail trials in `trials/error_enforcement_addition/standard_data_structures/` (18). Not landed: the `cross_representation/` three-way conformance leaf (the same comparison is made inside `gd_equivalence` and `gcsr_equivalence_large`), BinaryTree complexity counters, and a negative suite for heap orientation mismatch, malformed CSR offsets and dense-capacity overflow.
+
+**§37 status (2026-10-16):** Open. Phase 1 is not declared complete: the ledger still has `planned` rows (see its status header), the `terminal_structures`, `live_graphs`, `snapshot_graphs` and `cross_representation` leaves contain only `smoke_harness_ready`, and the BinaryTree constructor-record compile-fail trials and `StubBinaryTree` (§7.10) are not written.
+
 ## 38. Compiler parser AST → BinaryTree (withdrawn)
 
 Withdrawn 2026-09-29. The compiler's `Expr` stays an index arena; no migration to `BinaryTree` is planned. The number is kept so later references stay valid.
@@ -2145,30 +2175,30 @@ Sections §6–§37 are the authoritative serial queue. Complete each section in
 
 1. Layer 0 baseline (§6). **(complete)**
 2. Layer 1 compiler/runtime substrate (§7). **(complete)**
-3. WBT core (§8 / §8A) — finish §8A.11; §§8A.1–8A.10 accepted.
+3. WBT core (§8 / §8A). **(complete 2026-07-16)**
 4. `wbt_map` and `OrderedMap` (§9). **(complete)**
 5. `wbt_set` and `OrderedSet` (§10). **(complete)**
 6. Self-host source prerequisites on `src/` only: crafted BST → WBT, then alias ban (§11). **(complete)**
 7. Additive build-selfhost / ABI hardening on the parallel tree (§12). **(exit gate met 2026-09-02; the selfhost binary runs all trials; bootstrap now builds only the seed)**
-8. Fixed-point + cutover / bootstrap retirement (§13). **(in progress — selfhost self-compile of `emitter_core.silica`, then gen 2 → differential → fixpoint)**
-9. Join/split reopen checkpoint (§14).
+8. Fixed-point + cutover / bootstrap retirement (§13). **(fixed points reached on the hosted platforms, see §13 status; bootstrap retirement not verified)**
+9. Join/split reopen checkpoint (§14). **(deferral reaffirmed in code; ledger record owed)**
 10. Skew binary random-access-list core (§15). **(implemented 2026-09-08 ahead of §13 at Lee's direction; see §15 status)**
-11. Brodal–Okasaki core (§16).
-12. Persistent binary-tree core (§17).
-13. Generic live WBT graph core (§18).
-14. `Heap` (§19).
-15. `tree_binary` and `BinaryTree` (§20).
-16. Directed live graph (§21).
-17. Undirected live graph (§22).
-18. Weighted live graphs (§23).
-19. Live-graph acceptance matrix (§24).
-20. `SearchTree` (§25).
-21. `PriorityQueue` (§26).
-22. `Tree` (§27).
-23. Shared graph node-slot assignment (§28).
-24. CSR snapshot variants (§29).
-25. Dense graph variants (§30).
-26. Full integration and hardening (§31–§37).
+11. Brodal–Okasaki core (§16). **(complete 2026-09-18; see section status)**
+12. Persistent binary-tree core (§17). **(complete 2026-09-18; see section status)**
+13. Generic live WBT graph core (§18). **(complete 2026-09-18; see section status)**
+14. `Heap` (§19). **(complete 2026-09-18; see section status)**
+15. `tree_binary` and `BinaryTree` (§20). **(complete 2026-09-18; see section status)**
+16. Directed live graph (§21). **(complete 2026-09-18; see section status)**
+17. Undirected live graph (§22). **(complete 2026-09-18; see section status)**
+18. Weighted live graphs (§23). **(complete 2026-09-18; see section status)**
+19. Live-graph acceptance matrix (§24). **(complete 2026-09-18; see section status)**
+20. `SearchTree` (§25). **(complete 2026-09-18; see section status)**
+21. `PriorityQueue` (§26). **(complete 2026-09-18; see section status)**
+22. `Tree` (§27). **(complete 2026-09-18; see section status)**
+23. Shared graph node-slot assignment (§28). **(complete 2026-09-18; see section status)**
+24. CSR snapshot variants (§29). **(complete 2026-09-18; see section status)**
+25. Dense graph variants (§30). **(complete 2026-09-18; see section status)**
+26. Full integration and hardening (§31–§37). **(§31 done; §32–§37 partial, see status)**
 27. Phase 1 complete at §37 exit gate.
 
 
@@ -2189,6 +2219,8 @@ Sections §6–§37 are the authoritative serial queue. Complete each section in
 | `BinaryTree`      | §7.10 and §17            | trait + `tree_binary` + zipper and full design trials               |
 
 
+**Implementation status (2026-10-16):** every row is implemented; the completion artifacts are the stdlib modules and trial leaves named in the §16–§30 status records. `BinaryTree` was completed with the `{ compare_item }` constructor record (decision 2026-10-16), without the rest of the §7.10 delta. Exceptions to "full design trials": see the ledger `planned` rows.
+
 For graph traits, public-trait completion and representation-family completion are tracked separately. A live implementation can be accepted before CSR/dense, but the graph representation family is not complete until §30 passes.
 
 ## 41. Stop conditions
@@ -2203,6 +2235,6 @@ Stop downstream implementation and return to the failed dependency when:
 - a consumer needs an operation excluded from its dependency's design;
 - a proposed CSR/dense layout violates the closed compiler-version-private representation contract;
 - a proposed convenience API would add behavior excluded by the detailed designs.
-- BinaryTree empty-record construction cannot be witnessed without weakening constructor ambiguity checks.
+- BinaryTree construction cannot be witnessed without weakening constructor ambiguity checks (resolved 2026-10-16 by the witness field `{ compare_item }`).
 
 The remedy is to correct or explicitly revise the authoritative design, then resume from the affected gate. It is not to hide the discrepancy inside a generated module.

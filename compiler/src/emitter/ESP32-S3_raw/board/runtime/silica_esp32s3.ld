@@ -33,8 +33,21 @@ ENTRY(_start)
 
 _silica_iram_dram_offset = 0x6F0000;
 _silica_sram_dram_end    = 0x3FCE9700;
-_silica_stack_size       = 0x20000;   /* machine stack; the 64 KB auxiliary stack is in .bss (rt_start) */
 _silica_fault_stack_size = 0x800;
+
+/* main's two stacks are sized per image: tools/build_image.sh links once with the defaults below,
+   bounds `main` with tools/main_stack_bound.py (the deepest chain of windowed frames from _start and
+   the deepest auxiliary-stack reservation, plus margin), and links again with
+   --defsym _silica_main_stack_req=N --defsym _silica_main_aux_req=M (given before -T, so they are
+   defined when the statements below run). A `main` the walk cannot bound (recursion reachable from
+   it, or a call through a function value) keeps these defaults: 128 KB of machine stack (~2000
+   nested 48-byte frames) and 64 KB of auxiliary stack, the budget the port had before the per-image
+   bound (design_documents/actor_memory_budget_plan.md §4.1). _silica_rt_depth_reserve is the deepest
+   runtime chain emitted code can call in this image (the same tool, --defsym _silica_rt_depth_req);
+   the emitted prologue keeps that much above the machine stack's guard band. */
+_silica_main_stack_size  = DEFINED(_silica_main_stack_req) ? _silica_main_stack_req : 0x20000;
+_silica_main_aux_size    = DEFINED(_silica_main_aux_req)   ? _silica_main_aux_req   : 0x10000;
+_silica_rt_depth_reserve = DEFINED(_silica_rt_depth_req)   ? _silica_rt_depth_req   : 0x400;
 
 MEMORY
 {
@@ -104,16 +117,24 @@ SECTIONS
     *(.bss .bss.* .sbss .sbss.* COMMON)
     . = ALIGN(16);
     _silica_bss_end = ABSOLUTE(.);
+    /* one fault stack per core: core 0's ends at _silica_fault_stack_top, core 1's just below it
+       (rt_vectors.S FAULT_STACK_TOP) */
     _silica_fault_stack_bottom = ABSOLUTE(.);
-    . += _silica_fault_stack_size;
+    . += _silica_fault_stack_size * 2;
     _silica_fault_stack_top = ABSOLUTE(.);
+    /* main's auxiliary stack (the emitter's SP); 64-byte aligned for the guard watchpoint */
+    . = ALIGN(64);
+    silica_rt_aux_stack_bottom = ABSOLUTE(.);
+    . += _silica_main_aux_size;
+    silica_rt_aux_stack_top = ABSOLUTE(.);
   } > dram
 
-  _silica_heap_start = ALIGN(_silica_fault_stack_top, 16);
+  _silica_heap_start = ALIGN(silica_rt_aux_stack_top, 16);
   _silica_stack_top  = _silica_sram_dram_end & ~15;
-  _silica_heap_end   = _silica_stack_top - _silica_stack_size;
+  _silica_heap_end   = (_silica_stack_top - _silica_main_stack_size) & ~63;
 
   ASSERT(_silica_heap_start < _silica_heap_end, "program too large: no room left for the heap")
+  ASSERT((_silica_main_aux_size & 63) == 0, "_silica_main_aux_size must be a multiple of 64")
   ASSERT((_silica_vecbase & 0x3FF) == 0, "VECBASE must be 1 KB aligned")
 
   /* .xt.prop / .xt.lit are kept: the linker's literal and branch relaxation reads them. */

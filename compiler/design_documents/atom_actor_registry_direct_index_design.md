@@ -1,5 +1,15 @@
 # Atom-keyed actor registry — direct indexing design
 
+## Implementation status (2026-10-16)
+
+The design is implemented in the runtimes, with these specifics:
+
+- **Table sizing.** The table is not the 240-slot `buf` plus overflow list of the former `runtime_modules/pid_registry_actor.silica` / `pid_register_runtime.silica` (removed 2026-10-16). Each registry is a calloc block sized by `silica_registry_slots`, which `emitter_core.silica` emits into `__silica_runtime.sams` as the build's atom count: occupancy words `[0, N)` then actor-identity words `[N, 2N)`. Atoms are fixed when a program is built (specification §4.1.7), so the table is allocated once and never grows or overflows; the growth path of §4 and the overflow list are unused. Reads are one bounds check and two indexed loads (acquire load of the occupancy word, then the slot).
+- **Atom numbering (§2).** One merged atom table per application (a multi-unit build merges its units' tables, `build_atom_table_executable`); see [APPLICATION_IS_ONE_COMPILATION_UNIT.md](APPLICATION_IS_ONE_COMPILATION_UNIT.md). Ids are dense `0 … N-1` with a fixed pre-seeded prefix.
+- **Three tables** (ordinary, dangerous, device), each in its own registry actor; see [pid_registry_process_global_actor_gate.md](pid_registry_process_global_actor_gate.md).
+- **Slot values** are actor identities (specification §15.1.4), not raw pointers; liveness is checked against the identity table, and the exit path clears the name.
+- **ESP32-S3.** Same layout; the slot count is the same `silica_registry_slots` word, which also distinguishes an atom from an ACB address in the keyed forms. Hand-written asm board apps link a weak default of zero slots.
+
 ## 1. Purpose
 
 Silica currently has no built-in hash map type. Recursive user-defined tree shapes for associative lookup are awkward or forbidden under structural typing. At the same time, process registries keyed by **`atom`** and storing runtime references such as **`actor_ref`** and **`supervisor_ref`** need expected **O(1)** lookup—not **O(n)** scans over **`List`**.
@@ -112,7 +122,7 @@ Deleting a registration entry does **not** shrink **`atom`** ids; **`high_water`
 
 | Approach | Complexity | Fits Silica today? |
 |-----------|-------------|---------------------|
-| **`List`** scan | **O(n)** | Yes, assoc-list overflow (same shape as PID registry private overflow in **`pid_registry_actor`**) |
+| **`List`** scan | **O(n)** | Yes, assoc-list overflow (same shape as the PID registry private overflow in the removed `pid_registry_actor` module) |
 | **BST / tree** recursive type | **`O(log n)`** nominal | Structural typing friction; user trees painful |
 | **Hash table (arbitrary keys)** | **`O(1)`** expectation | No language **`Map`**; hand-built open addressing works but unnecessary when **`atom_id`** is dense **`0…N`** |
 | **Direct index (**this doc**)** | **`O(1)`** | Yes, **minimal code**, **minimal metadata** |
@@ -121,7 +131,7 @@ Deleting a registration entry does **not** shrink **`atom`** ids; **`high_water`
 
 ## 7. Integration points
 
-- **`pid_registry_actor`** (or successors): swap internal **`List`** for **indexed buffer + `high_water` + grow path**; **`call`** handlers branch on **`atom → id`** (**`call`** payloads carry **`atom`**; **`==`** / id comparison aligns with **`atom`** lowering). Safe only if callers and registry agree on the **same process-wide atom id** encoding (§2).
+- Former **`pid_registry_actor`** module (removed 2026-10-16; the live behaviour is the runtime assembly `silica_rt_pid_registry_beh`): swap internal **`List`** for **indexed buffer + `high_water` + grow path**; **`call`** handlers branch on **`atom → id`** (**`call`** payloads carry **`atom`**; **`==`** / id comparison aligns with **`atom`** lowering). Safe only if callers and registry agree on the **same process-wide atom id** encoding (§2).
 - **Compiler / linker / loader**: expose or consume a **unified atom table artifact** so every object in the image agrees on **`spelling ↔ id`**; codegen that today builds a **per-TU atom table during emission** must be superseded by, or fused with, whichever pass produces the **process-wide** table (or relocate final id assignment to link/runtime per §2).
 - **Compiler**: if **`atoms_count`/`max_atom_id`** is surfaced **for the merged image**, allocate registry capacity **once** and skip the **`grow`** path in steady state.
 - **`remove_actor`/GC**: orthogonal—registry row eviction does **not** recycle **`atom`** numbers.

@@ -1,0 +1,107 @@
+// idle_actor_capacity: how many actors that do nothing can this machine hold?
+//
+// DO NOT run this casually. It spawns idle actors without end, in batches, and prints the running
+// total after every batch. On a hosted target each actor is still its own operating-system thread
+// (until ROADMAP chunk 2's carrier threads), so it consumes threads, memory and address space until
+// something gives out: the operating system refuses a thread, a stack reservation fails (the spawner
+// then fails with (:explicit, :stack_reserve_failed)), or the machine runs out of memory and swap and
+// the host's out-of-memory handling takes over. Close other work first, watch Activity Monitor, and stop
+// it with Ctrl-C (or by typing `exit` and Return). The last total printed is the answer.
+//
+// Shape: main registers a FailureReporter (spec §15.4.13.4; it writes each failure report to stderr),
+// starts one registered spawner actor, casts it the first message, and waits. Each message
+// makes the spawner start batch_size() idle actors, print the new total, and cast itself the next
+// message, so the work runs on the spawner's runtime-managed stack and main stays small.
+
+// How many actors each message starts. Larger batches print less often.
+fn batch_size() -> int64 {
+    1000
+}
+
+// Each idle actor's stack reservation in bytes. 0 takes the default, which reserves the machine's
+// memory plus swap of address space per actor: then address space, not memory, is what runs out,
+// after a few thousand actors. A small reserve measures what the actors really cost.
+fn reserve_bytes() -> int64 {
+    65536
+}
+
+// The actor that does nothing: it never receives a message after it starts.
+fn idle(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state)
+}
+
+// Starts n idle actors and returns total + n.
+fn spawn_batch(n: int64, total: int64) -> int64 {
+    sequence proc[concurrency]
+        result: int64 <- case n <= 0 of {
+            true -> total;
+            false -> {
+                _: actor_ref <- spawn(0, idle, stack_policy(reserve_bytes(), :release_when_idle));
+                spawn_batch(n - 1, total + 1)
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+// The spawner's state is the number of idle actors started so far.
+fn spawner(msg: int64, total: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        new_total: int64 <- spawn_batch(batch_size(), total);
+        _: atom <- print_int64(new_total);
+        _: atom <- println(" idle actors");
+        _: boolean <- cast_registered(:spawner, 0 impl ActorMessage {})
+    produces
+        pure (:no_reply, new_total)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: actor_ref <- spawn_registered(0, spawner, :spawner, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_registered(:spawner, 0 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

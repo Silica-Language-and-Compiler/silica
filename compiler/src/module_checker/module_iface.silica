@@ -24,6 +24,7 @@ use type_checker_callee_env;
 use effect_checker_core;
 use atom_table;
 use module_iface_type_dag;
+use type_checker_start_order;
 
 export iface_format_version/0;
 export iface_compiler_stamp/0;
@@ -485,6 +486,44 @@ fn write_export_blocks(path: string, exports: List[{ name: string, arity: int64,
     }
 }
 
+// The dependency ifaces that carry E2236 start-order codes (a `start_order=` header line,
+// type_checker_start_order).
+// The raw text is checked first, so ifaces without a code are never parsed here.
+fn start_order_dep_ifaces(names: List[string, mem(normal)], config: List[string, mem(normal)], acc: List[{ module_name: string, source_path: string, export_trait: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] }, mem(normal)]) -> List[{ module_name: string, source_path: string, export_trait: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] }, mem(normal)] {
+    case names.is_nil of {
+        true -> acc;
+        false -> {
+            src: string <- iface_config_path_for_module(names.head, config);
+            case string_nonempty_i(src) < 1 of {
+                true -> start_order_dep_ifaces(names.tail, config, acc);
+                false -> {
+                    sequence proc[DeviceIO]
+                        ipath: string <- iface_path_from_source(src);
+                        present: boolean <- file_exists(ipath);
+                        text: string <- case present of {
+                            true -> read_lines(ipath);
+                            false -> ""
+                        };
+                        marked: boolean <- contains(text, "\nstart_order=");
+                        result: List[{ module_name: string, source_path: string, export_trait: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] }, mem(normal)] <- case marked of {
+                            false -> start_order_dep_ifaces(names.tail, config, acc);
+                            true -> {
+                                (ok: boolean, iface: { module_name: string, source_path: string, export_trait: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] }) <- load_iface_file(ipath);
+                                case ok of {
+                                    true -> start_order_dep_ifaces(names.tail, config, cons_module_iface(iface, acc));
+                                    false -> start_order_dep_ifaces(names.tail, config, acc)
+                                }
+                            }
+                        }
+                    produces
+                        pure result
+                    end
+                }
+            }
+        }
+    }
+}
+
 // Publish after SIR/emit (caller), not after TC — write_dag intern must not sit under SIR.
 fn publish_module_iface(module_name: string, source_path: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }, config: List[string, mem(normal)]) -> int64 {
     // Nested arms declare their own effects; extract_iface_tables encapsulates mem in helpers.
@@ -507,6 +546,8 @@ fn publish_module_iface(module_name: string, source_path: string, program: { dec
                     deps: List[string, mem(normal)] <- reverse_iface_strings(deps_rev, empty_iface_strings());
                     src_hash: string <- source_content_hash_iface(source_path);
                     d_hash: string <- deps_hash_for_names(deps, config);
+                    start_ifaces: List[{ module_name: string, source_path: string, export_trait: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] }, mem(normal)] <- start_order_dep_ifaces(deps, config, empty_module_iface_list());
+                    marked_exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] <- type_checker_start_order@start_order_mark_exports(module_name, program, start_ifaces, exports);
                     delete_file(path);
                     _: int64 <- append_line(path, "SILICA_IFACE_V1");
                     _: int64 <- append_line(path, concat("module=", module_name));
@@ -519,6 +560,13 @@ fn publish_module_iface(module_name: string, source_path: string, program: { dec
                     _: int64 <- append_line(path, concat("export_trait=", export_trait));
                     _: int64 <- append_line(path, concat("export_count=", atom_table@int64_to_decimal_string(count_iface_exports(exports))));
                     _: int64 <- append_line(path, concat("impl_count=", atom_table@int64_to_decimal_string(count_iface_exports(impls))));
+                    // E2236 start-order codes of exported functions (type_checker_start_order); a header
+                    // line, which readers that do not know it skip. Written only when some code is not 0.
+                    start_order_text: string <- type_checker_start_order@start_order_header_text(marked_exports);
+                    _: int64 <- case length_bytes(start_order_text) == 0 of {
+                        true -> 0;
+                        false -> append_line(path, concat("start_order=", start_order_text))
+                    };
                     dag_lines: List[string, mem(normal)] <- module_iface_type_dag@dag_section_lines(exports, impls);
                     _: int64 <- write_iface_string_lines(path, dag_lines);
                     _: int64 <- write_export_blocks(path, exports);
@@ -945,13 +993,15 @@ fn load_iface_file_validated(iface_path: string, expected_source: string, config
                             true -> parse_export_blocks_iface(export_lines2, empty_iface_exports());
                             false -> (true, all_blocks)
                         };
+                        start_order_text: string <- iface_header_field_scan(lines, "start_order=");
+                        coded_blocks: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] <- type_checker_start_order@start_order_apply_header(start_order_text, blocks);
                         case blocks.is_nil of {
                             true -> (false, { module_name: "", source_path: "", export_trait: "", exports: empty_iface_exports(), impls: empty_iface_exports() });
                             false -> (true, {
                                 module_name: mod_name,
                                 source_path: source_path,
                                 export_trait: export_trait,
-                                exports: blocks,
+                                exports: coded_blocks,
                                 impls: empty_iface_exports()
                             })
                         }
@@ -1144,9 +1194,12 @@ fn parse_effects_iface_split(s: string, i: int64, acc: List[{ name: string, para
 }
 
 fn parse_effects_iface_string(s: string) -> List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
-    case length_bytes(s) == 0 of {
+    // The E2236 start-order code (`!sr=<code>`, added in memory from the `start_order=` header by
+    // type_checker_start_order@start_order_apply_header) is not an effect.
+    effects: string <- type_checker_start_order@start_order_strip_marker(s);
+    case length_bytes(effects) == 0 of {
         true -> parser_ast@empty_effect_name_list();
-        false -> parse_effects_iface_split(s, 0, parser_ast@empty_effect_name_list())
+        false -> parse_effects_iface_split(effects, 0, parser_ast@empty_effect_name_list())
     }
 }
 

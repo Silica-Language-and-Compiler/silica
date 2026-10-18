@@ -37,6 +37,11 @@
 //   silica_rt_print_u32(v)             unsigned decimal
 //   silica_rt_print_hex32(v)           0x-prefixed, 8 digits
 //   silica_rt_flush()                  wait until the TX FIFO has drained
+//   silica_rt_console_rx_drain()       discard whatever waits in the RX FIFO (program start)
+//   silica_rt_console_poll_exit_line() read what waits in the RX FIFO; 1 when a line reading exactly
+//                                      "exit" (a trailing CR ignored) has just completed, else 0. The
+//                                      console is standard input on this target (spec §15.1.2.5): core
+//                                      0's scheduler polls it, and rt_actors.S ends the program
 //   silica_rt_exit(status)             exit marker with (status & 0xFF), then halt
 //   silica_rt_abort_with(reason)       runtime abort: "[silica] abort: <reason> at 0x<pc>" as program output,
 //                                      then exit status 71 (spec §15.4.5.5); pc is the CALL8 that got here
@@ -64,6 +69,8 @@
 #define UART0_FIFO_REG    0x60000000
 #define UART0_STATUS_REG  0x6000001C
 #define UART_TXFIFO_MAX   120          // FIFO holds 128; leave slack
+// UART_STATUS_REG: bits 9:0 rxfifo_cnt, bits 25:16 txfifo_cnt. UART_FIFO_REG: a read pops one RX byte
+// (bits 7:0), a write pushes one TX byte (ESP-IDF uart_ll.h for the ESP32-S3).
 
 // \r = this core's id (0 or 1) from PRID (0xCDCD on the PRO cpu, 0xABAB on the APP cpu: bit 13).
 .macro THIS_CORE r
@@ -97,6 +104,7 @@ silica_rt_console_lock:
     .space  4
 silica_rt_console_depth:
     .space  8                          // one word per core
+    .global silica_rt_console_last
 silica_rt_console_last:
     .space  8                          // the last byte each core wrote
 
@@ -175,18 +183,31 @@ silica_rt_console_release_if_mine:
 1:  retw
     .size   silica_rt_console_release_if_mine, . - silica_rt_console_release_if_mine
 
-// A fatal fault or abort: the process ends on this core (rt_vectors.S). On core 0 the APP cpu is
-// stalled first (rt_start.S), so nothing else prints while the report is written, and the lock is
-// cleared whoever held it. On core 1 only this core's own hold is released: the PRO cpu keeps
-// running, and whatever it prints after the exit marker is board-only detail to the runner.
+// A fatal fault or abort: the process ends (spec §15.4.5.5), whichever core raised it (rt_vectors.S).
+// The first core to get here owns the end (silica_rt_fatal_owner, core id + 1, by compare-and-swap):
+// it stalls the other core (rt_start.S silica_rt_stall_other_cpu: core 1 by RunStall, core 0 by the
+// RTC software stall), so nothing else runs or prints while the report is written, and clears the
+// console lock whoever held it. A core that loses the claim (both cores failing at once) halts here;
+// the owner stalls it. A second entry by the owner (a fault in its own report) carries on.
     .align  4
     .global silica_rt_console_fatal_reset
     .type   silica_rt_console_fatal_reset, @function
 silica_rt_console_fatal_reset:
     entry   a1, 32
     THIS_CORE a2
-    bnez    a2, 1f
-    call8   silica_rt_stall_app_cpu
+    addi    a3, a2, 1
+    movi    a4, silica_rt_fatal_owner
+    l32i    a5, a4, 0
+    beq     a5, a3, 2f                 // already ours
+    movi    a5, 0
+    wsr     a5, scompare1
+    mov     a5, a3
+    s32c1i  a5, a4, 0
+    beqz    a5, 2f                     // claimed
+    beq     a5, a3, 2f
+1:  waiti   15                         // the other core owns the end and stalls this one
+    j       1b
+2:  call8   silica_rt_stall_other_cpu
     movi    a4, silica_rt_console_lock
     movi    a5, 0
     s32i    a5, a4, 0
@@ -194,8 +215,6 @@ silica_rt_console_fatal_reset:
     s32i    a5, a4, 0
     s32i    a5, a4, 4
     memw
-    retw
-1:  call8   silica_rt_console_release_if_mine
     retw
     .size   silica_rt_console_fatal_reset, . - silica_rt_console_fatal_reset
 
@@ -318,6 +337,102 @@ silica_rt_flush:
     retw
     .size   silica_rt_flush, . - silica_rt_flush
 
+// ---------------------------------------------------------------------------------------------
+// Input: the exit line (spec §15.1.2.5). The ROM left UART0's receive side running at the baud the
+// loader chose; nothing else reads it. The runtime takes no interrupts, so the FIFO (128 bytes) is
+// polled: silica_rt_console_poll_exit_line pops every byte that waits and feeds it to a matcher for
+// the one line that means anything, "exit" (optionally followed by one carriage return) ended by a
+// newline. Every other line is discarded byte by byte; no line is buffered. The matcher's state is
+// three words: bytes of "exit" matched so far, whether the current line has already failed to match,
+// and whether the last byte was a carriage return (a CR that is not followed by the newline is an
+// ordinary byte, so "ex\rit" is not "exit").
+
+    .section .bss.silica_rt_console_rx, "aw", @nobits
+    .align  4
+silica_rt_exit_line_state:
+    .space  12                         // [0] matched length  [4] line failed  [8] CR pending
+
+    .section .text.silica_rt_console, "ax"
+
+// silica_rt_console_rx_drain(): pop and discard every byte in the RX FIFO, and start a fresh line.
+    .align  4
+    .global silica_rt_console_rx_drain
+    .type   silica_rt_console_rx_drain, @function
+silica_rt_console_rx_drain:
+    entry   a1, 32
+    movi    a3, UART0_STATUS_REG
+    movi    a4, UART0_FIFO_REG
+1:  l32i    a5, a3, 0
+    extui   a5, a5, 0, 10
+    beqz    a5, 2f
+    l32i    a5, a4, 0
+    j       1b
+2:  movi    a5, silica_rt_exit_line_state
+    movi    a6, 0
+    s32i    a6, a5, 0
+    s32i    a6, a5, 4
+    s32i    a6, a5, 8
+    retw
+    .size   silica_rt_console_rx_drain, . - silica_rt_console_rx_drain
+
+// silica_rt_console_poll_exit_line() -> 1 when a line reading exactly "exit" has just completed, 0
+// otherwise. Pops what waits in the RX FIFO; returns at the newline that completes an "exit" line,
+// leaving any later bytes for the next poll (the program ends before they matter).
+    .align  4
+    .global silica_rt_console_poll_exit_line
+    .type   silica_rt_console_poll_exit_line, @function
+silica_rt_console_poll_exit_line:
+    entry   a1, 32
+    movi    a2, 0
+    movi    a3, UART0_STATUS_REG
+    movi    a4, UART0_FIFO_REG
+    movi    a5, silica_rt_exit_line_state
+1:  l32i    a6, a3, 0
+    extui   a6, a6, 0, 10              // rxfifo_cnt
+    beqz    a6, 9f
+    l32i    a6, a4, 0
+    extui   a6, a6, 0, 8               // the byte
+    movi    a7, 10
+    beq     a6, a7, 5f                 // newline: the line is complete
+    l32i    a7, a5, 8
+    beqz    a7, 2f
+    movi    a7, 1                      // a CR followed by something other than a newline: an
+    s32i    a7, a5, 4                  // ordinary byte, so this line is not "exit"
+    movi    a7, 0
+    s32i    a7, a5, 8
+2:  movi    a7, 13
+    bne     a6, a7, 3f
+    movi    a7, 1
+    s32i    a7, a5, 8                  // CR: decided by the next byte
+    j       1b
+3:  l32i    a7, a5, 4
+    bnez    a7, 1b                     // this line has already failed
+    l32i    a7, a5, 0
+    movi    a8, 4
+    bgeu    a7, a8, 4f                 // longer than "exit"
+    movi    a8, silica_rt_exit_word
+    add     a8, a8, a7
+    l8ui    a8, a8, 0
+    bne     a6, a8, 4f
+    addi    a7, a7, 1
+    s32i    a7, a5, 0
+    j       1b
+4:  movi    a7, 1
+    s32i    a7, a5, 4
+    j       1b
+5:  l32i    a7, a5, 0                  // matched length
+    l32i    a8, a5, 4                  // failed
+    movi    a9, 0
+    s32i    a9, a5, 0
+    s32i    a9, a5, 4
+    s32i    a9, a5, 8
+    bnez    a8, 1b
+    movi    a9, 4
+    bne     a7, a9, 1b
+    movi    a2, 1
+9:  retw
+    .size   silica_rt_console_poll_exit_line, . - silica_rt_console_poll_exit_line
+
 // Exit marker: \x02SILICA:EXIT:<status>\x03, status = low byte like a host exit code.
     .align  4
     .global silica_rt_exit_marker
@@ -336,35 +451,73 @@ silica_rt_exit_marker:
     retw
     .size   silica_rt_exit_marker, . - silica_rt_exit_marker
 
-// The end of the program on this core. From core 0 the APP cpu is stalled too, once the output has
-// drained, so an idle or still-running core 1 prints nothing after the exit marker.
+// The end of the program. The other core is stalled too, once the output has drained, so an idle or
+// still-running core prints nothing and does nothing after the exit marker (core 1 ends the program
+// after its own fatal report).
     .align  4
     .global silica_rt_halt
     .type   silica_rt_halt, @function
 silica_rt_halt:
     entry   a1, 32
     call8   silica_rt_flush
-    THIS_CORE a2
-    bnez    a2, 1f
-    call8   silica_rt_stall_app_cpu
+    call8   silica_rt_stall_other_cpu
 1:  waiti   15
     j       1b
     .size   silica_rt_halt, . - silica_rt_halt
 
 // The lock is taken for the marker and its newline together and never released: this core halts.
+// After the marker on its line (so outside the program's output, where the fault report puts its
+// details too; run_on_board.py passes that text to its stderr) one diagnostic reports how deep
+// main's two stacks went, against their per-image sizes:
+//   [silica] stacks: machine <high-water>/<size> aux <high-water>/<size> actors <n> actor-max
+//   machine <bytes> aux <bytes> sup-max machine <bytes> aux <bytes>
+// The high-water mark is the distance from the top to the lowest non-zero word (both stacks start
+// zeroed: rt_start.S step 4, .bss); the actor figures are rt_actors.S silica_rt_actor_stacks_report.
     .align  4
     .global silica_rt_exit
     .type   silica_rt_exit, @function
 silica_rt_exit:
-    entry   a1, 32
+    entry   a1, 48
     call8   silica_rt_console_acquire
     mov     a10, a2
     call8   silica_rt_exit_marker
+    movi    a10, silica_rt_stacks_pre
+    call8   silica_rt_puts
+    movi    a10, _silica_heap_end
+    movi    a11, _silica_stack_top
+    call8   silica_rt_stack_high_water
+    movi    a10, _silica_main_stack_size
+    call8   silica_rt_print_u32
+    movi    a10, silica_rt_stacks_aux
+    call8   silica_rt_puts
+    movi    a10, silica_rt_aux_stack_bottom
+    movi    a11, silica_rt_aux_stack_top
+    call8   silica_rt_stack_high_water
+    movi    a10, _silica_main_aux_size
+    call8   silica_rt_print_u32
+    call8   silica_rt_actor_stacks_report   // rt_actors.S: the actors' deepest stacks
     movi    a10, 10
     call8   silica_rt_putc
     call8   silica_rt_halt
     retw
     .size   silica_rt_exit, . - silica_rt_exit
+
+// silica_rt_stack_high_water(bottom, top): prints "<top - lowest non-zero word>/".
+    .align  4
+silica_rt_stack_high_water:
+    entry   a1, 32
+    mov     a4, a2
+1:  bgeu    a4, a3, 2f
+    l32i    a5, a4, 0
+    bnez    a5, 2f
+    addi    a4, a4, 4
+    j       1b
+2:  sub     a10, a3, a4
+    call8   silica_rt_print_u32
+    movi    a10, 47                   // '/'
+    call8   silica_rt_putc
+    retw
+    .size   silica_rt_stack_high_water, . - silica_rt_stack_high_water
 
 // Runtime abort. Every entry is a windowed function reached with CALL8: it names its reason in a2 and
 // jumps to silica_rt_abort_body in the same window, where a0 still holds the return address into the
@@ -400,7 +553,6 @@ silica_rt_abort_with:
     ABORT_ENTRY silica_rt_abort_arena_full, silica_rt_reason_arena_full
     ABORT_ENTRY silica_rt_abort_not_a_string, silica_rt_reason_not_a_string
     ABORT_ENTRY silica_rt_abort_heap_exhausted, silica_rt_reason_heap_exhausted
-    ABORT_ENTRY silica_rt_abort_stack_reserve, silica_rt_reason_stack_reserve
     ABORT_ENTRY silica_rt_abort_ingress_full, silica_rt_reason_ingress_full
 
 // a2 = reason, a0 = return address of the CALL8 into the entry. Never returns.
@@ -449,9 +601,7 @@ silica_rt_badarith:
     movi    a10, 1
     call8   silica_rt_actor_trap
 1:  movi    a10, silica_rt_badarith_msg
-    call8   silica_rt_puts
-    movi    a10, 1
-    call8   silica_rt_exit
+    call8   silica_rt_main_fail_exit      // rt_actors.S: the name, the pending reports, status 1
     retw
     .size   silica_rt_badarith, . - silica_rt_badarith
 
@@ -465,9 +615,7 @@ silica_rt_case_clause:
     movi    a10, 2                         // reason tag 2 (:language_error), as the host's
     call8   silica_rt_actor_trap
 1:  movi    a10, silica_rt_case_clause_msg
-    call8   silica_rt_puts
-    movi    a10, 1
-    call8   silica_rt_exit
+    call8   silica_rt_main_fail_exit      // rt_actors.S: the name, the pending reports, status 1
     retw
     .size   silica_rt_case_clause, . - silica_rt_case_clause
 
@@ -542,6 +690,22 @@ silica_rt_print_bool:
     retw
     .size   silica_rt_print_bool, . - silica_rt_print_bool
 
+// silica_rt_print_char(X0 = the encoded char: a2 low word, a3 high word). The UTF-8 bytes sit
+// lowest first in the word and the count is its top byte (sir_generator char_lexeme_to_utf8_encoded),
+// so both words are stored to the frame and written from there. Frame 48: [sp+0, sp+8) the word.
+    .align  4
+    .global silica_rt_print_char
+    .type   silica_rt_print_char, @function
+silica_rt_print_char:
+    entry   a1, 48
+    s32i    a2, a1, 0
+    s32i    a3, a1, 4
+    extui   a12, a3, 24, 8
+    mov     a10, a1
+    call8   silica_rt_write
+    retw
+    .size   silica_rt_print_char, . - silica_rt_print_char
+
     .align  4
     .global silica_rt_print_string
     .global silica_rt_print_string_stderr
@@ -565,7 +729,7 @@ silica_rt_print_string_stderr:
 // the causes that set EXCVADDR (the address is never invented: a stack-guard hit, cause 1006, is a data
 // breakpoint and has none), as program output; then the exit marker with status 70, and after the marker
 // the board-only details (cause, both registers, the stack-guard note), which run_on_board.py sends to
-// stderr. There is no symbol (no symbol table on the board) and no actor field (no actor runtime yet).
+// stderr. There is no symbol (no symbol table on the board) and no actor field (the fault banner names no actor; the actor runtime is rt_actors.S).
     .align  4
     .global silica_rt_fatal_report
     .type   silica_rt_fatal_report, @function
@@ -637,6 +801,12 @@ silica_rt_fatal_last_resort:
 silica_rt_exit_prefix:
     .byte   0x02
     .asciz  "SILICA:EXIT:"
+silica_rt_stacks_pre:
+    .asciz  " [silica] stacks: machine "
+silica_rt_stacks_aux:
+    .asciz  " aux "
+silica_rt_exit_word:
+    .ascii  "exit"
 silica_rt_fault_pre:
     .asciz  "[silica] fault at "
 silica_rt_fault_addr:
@@ -661,8 +831,6 @@ silica_rt_reason_arena_full:
     .asciz  "canonical arena table is full"
 silica_rt_reason_not_a_string:
     .asciz  "not a Silica string"
-silica_rt_reason_stack_reserve:
-    .asciz  "stack reservation failed"
 silica_rt_reason_ingress_full:
     .asciz  "supervision ingress queue full"
 silica_rt_reason_heap_exhausted:

@@ -39,6 +39,7 @@ use string_literal_pool;
 use print_int64_inline;
 use print_atom_inline;
 use print_bool_inline;
+use print_char_inline;
 use print_float64_inline;
 use print_float32_inline;
 use print_float16_inline;
@@ -260,6 +261,11 @@ fn emit_module_with_atom_and_debug(sir_module: { module_name: string, used_modul
             true -> concat("\n", print_bool_inline@emit_print_bool_helper());
             false -> ""
         };
+        needs_pc_helper: boolean <- print_char_inline@module_uses_print_char(sir_module);
+        pc_helper: string <- case needs_pc_helper of {
+            true -> concat("\n", print_char_inline@emit_print_char_helper());
+            false -> ""
+        };
         needs_pf64_helper: boolean <- float64_rodata@module_uses_float64_print(sir_module);
         pf64_helper: string <- case needs_pf64_helper of {
             true -> concat("\n", print_float64_inline@emit_print_float64_helper());
@@ -373,7 +379,7 @@ fn emit_module_with_atom_and_debug(sir_module: { module_name: string, used_modul
         fwh_0: string <- concat(funcs, pi_helper);
         fwh_1: string <- concat(fwh_0, pu_helper);
         fwh_1b: string <- concat(fwh_1, pa_helper);
-        fwh_2: string <- concat(fwh_1b, pb_helper);
+        fwh_2: string <- concat(concat(fwh_1b, pb_helper), pc_helper);
         fwh_3: string <- concat(fwh_2, pf64_helper);
         fwh_4: string <- concat(fwh_3, pf32_helper);
         fwh_4b: string <- concat(fwh_4, pf16_helper);
@@ -1125,18 +1131,27 @@ fn tuple_callee_skips_tuple_ret_dealloc(body: { nodes: List[{ kind: int64, type_
     }
 }
 
-// Actor runtime passes X2 = sret pointer; store reply tuple there (not callee stack). Skip when first param uses X19 shadow (string or list; X20 may hold second param shadow).
+// Actor runtime passes X2 = sret pointer; store reply tuple there (not callee stack).
+//
+// A string or list first parameter (the X19 entry shadow) takes the buffer too: the buffer pointer
+// goes to the callee-saved register after the shadow (actor_reply_sret_reg). Leaving those
+// behaviours out made every dispatch heap-promote its result tuple once per enclosing let level and
+// again in the epilogue, and nothing ever freed the copies: 48 B per message in a sequence-bodied
+// `(:no_reply, n)` behaviour, in the actor's region on a host and in the heap on a board.
+// See trials/actors_addition/behaviour_string_message_reply_no_heap_growth.
 fn use_actor_reply_sret_buffer(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> boolean {
     case sir_term_root_node(fn_val.body).kind == 5 of {
         true -> false;
-        false -> case behavior_return_uses_actor_sret_tuple(fn_val.return_type) of {
-            false -> false;
-            true -> case first_param_x0_shadow_enabled(fn_val.param_types, sir_term_root_node(fn_val.body).kind) of {
-                true -> false;
-                false -> true
-            }
-        }
+        false -> behavior_return_uses_actor_sret_tuple(fn_val.return_type)
     }
+}
+
+// The reply buffer sits after the string/list entry shadow: X20 when only the first parameter is
+// shadowed, X21 when X20 holds the second.
+fn actor_reply_sret_follows_string_shadow(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> boolean {
+    use_actor_reply_sret_buffer(fn_val)
+        and use_full_param_shadow(fn_val) == false
+        and first_param_x0_shadow_enabled(fn_val.param_types, sir_term_root_node(fn_val.body).kind)
 }
 
 // Reply sret uses X20 for the buffer pointer (MOV X20, X2) after int64 ABI shadow MOV X19,X0 / MOV X20,X1 — that clobbers the second GPR parameter. When both apply and there are two int64/uint64 params, hold the second param in X21 instead (prologue must save X21 via needs_actor_ref_x21_x22_frame).
@@ -2030,7 +2045,10 @@ fn use_full_param_shadow(fn_val: { name: string, return_type: string, effects: s
 fn actor_reply_sret_reg(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
     case use_full_param_shadow(fn_val) of {
         true -> concat("X", atom_table@int64_to_decimal_string(19 + fs_gpr_param_count(fn_val.param_types, fs_count_params(fn_val.param_names))));
-        false -> "X20"
+        false -> case actor_reply_sret_follows_string_shadow(fn_val) and second_param_shadow_enabled(fn_val.param_types, true) of {
+            true -> "X21";
+            false -> "X20"
+        }
     }
 }
 
@@ -2063,9 +2081,10 @@ fn full_shadow_pressure_bump(fn_val: { name: string, return_type: string, effect
 fn shadowed_param_reg_count(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> int64 {
     case first_param_x0_shadow_enabled(fn_val.param_types, sir_term_root_node(fn_val.body).kind) of {
         false -> int64_abi_shadow_reg_count(fn_val);
+        // The reply buffer register after the shadow counts as one more (actor_reply_sret_reg).
         true -> case second_param_shadow_enabled(fn_val.param_types, true) of {
-            true -> 2;
-            false -> 1
+            true -> 2 + actor_reply_sret_shadow_regs(fn_val);
+            false -> 1 + actor_reply_sret_shadow_regs(fn_val)
         }
     }
 }
@@ -2216,7 +2235,7 @@ fn needs_actor_ref_x21_x22_frame(fn_val: { name: string, return_type: string, ef
     true -> true;
     false ->     case sir_term_root_node(fn_val.body).kind == 5 of {
         true -> count_callee_saved_spill_pressure(fn_val.body) + full_shadow_pressure_bump(fn_val) >= 2;
-        false -> case actor_reply_sret_second_param_uses_x21(fn_val) of {
+        false -> case actor_reply_sret_second_param_uses_x21(fn_val) or (actor_reply_sret_follows_string_shadow(fn_val) and second_param_shadow_enabled(fn_val.param_types, true)) of {
             true -> true;
             false -> case needs_second_param_x21_bl_survival(fn_val) of {
                 true -> true;
@@ -2322,7 +2341,7 @@ fn return_type_carries_region(t: string) -> boolean {
 
 fn rgn_addr_x16(off: int64) -> string {
     case off > 4095 of {
-        true -> concat("    MOV X17, #", concat(atom_table@int64_to_decimal_string(off), "\n    SUB X16, X29, X17\n"));
+        true -> concat(var@mov_imm_wide("X17", off), "    SUB X16, X29, X17\n");
         false -> concat("    SUB X16, X29, #", concat(atom_table@int64_to_decimal_string(off), "\n"))
     }
 }
@@ -2437,7 +2456,9 @@ fn frame_spill_slot_count(fn_val: { name: string, return_type: string, effects: 
     // +1 slot holds the owned region handle from entry to the epilogue: the
     // parameter register is not stable across the body.
     rgn: int64 <- case fn_destroys_region_param(fn_val) of { true -> 1; false -> 0 };
-    reg_backed + sc_depth(fn_val.body) + (agg_region_bytes(fn_val.body) + 15) / 16 + rgn + case_bind_slots(fn_val.body)
+    // +1 slot holds the caller's result buffer (X8) of an sret tuple function from entry to the epilogue.
+    sret_slot: int64 <- case fn_returns_sret_tuple(fn_val) of { true -> 1; false -> 0 };
+    reg_backed + sc_depth(fn_val.body) + (agg_region_bytes(fn_val.body) + 15) / 16 + rgn + sret_slot + case_bind_slots(fn_val.body)
 }
 fn agg_region_bytes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
     term_reg_spill@agg_subtree_bytes(term, term.root)
@@ -2651,6 +2672,206 @@ fn sum_variant_record_return_promotes_in_epilogue(fn_val: { name: string, return
         and sir_term_root_node(fn_val.body).name == "record_make"
 }
 
+// --- sret tuple return (reg_conventions@is_sret_tuple_type) -----------------------------------------
+//
+// The caller names the result buffer in X8 (call@sret_x8_setup): a home in its frame, its own caller's
+// buffer, or 0. The callee parks X8 in a frame slot at entry -- X8 is caller-saved and every call in
+// the body sets it for itself -- and the epilogue copies the result shell there and returns the buffer
+// in X0, or, for X8 = 0, copies it to a fresh region block exactly as every tuple return did before.
+// Along the return spine (`_rsp`) nothing is promoted on the way: a tail make stays in its frame
+// region and a tail call writes straight into this function's own buffer, so one copy at most.
+fn fn_returns_sret_tuple(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> boolean {
+    prims_tuple@is_sret_aggregate_type(fn_val.return_type) and use_actor_reply_sret_buffer(fn_val) == false
+}
+
+// [X29, #-N] of the X8 slot: the deepest slot, or the one above it when the owned region handle
+// (rgn_save) has the deepest.
+fn sret_slot_offset(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> int64 {
+    case fn_destroys_region_param(fn_val) of {
+        true -> frame_spill_bytes(fn_val) - 16;
+        false -> frame_spill_bytes(fn_val)
+    }
+}
+
+// X16 <- X29 - off.
+fn sret_x16_fp_sub(off: int64) -> string {
+    case off <= 4095 of {
+        true -> concat("    SUB X16, X29, #", concat(atom_table@int64_to_decimal_string(off), "\n"));
+        false -> concat("    MOV X16, #", concat(atom_table@int64_to_decimal_string(off), "\n    SUB X16, X29, X16\n"))
+    }
+}
+
+fn sret_save_x8(off: int64) -> string {
+    concat(sret_x16_fp_sub(off), "    STR X8, [X16]\n")
+}
+
+fn sret_copy_words(i: int64, words: int64) -> string {
+    case i >= words of {
+        true -> "";
+        false -> {
+            o: string <- atom_table@int64_to_decimal_string(i * 8);
+            concat(concat(concat("    LDR X17, [X0, #", o), concat("]\n    STR X17, [X16, #", o)), concat("]\n", sret_copy_words(i + 1, words)))
+        }
+    }
+}
+
+fn sret_tuple_epilogue_copy(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, off: int64) -> string {
+    nbytes: int64 <- prims_tuple@sret_aggregate_bytes(fn_val.return_type);
+    head: string <- concat(sret_x16_fp_sub(off), "    LDR X16, [X16]\n    CBZ X16, 81f\n    CMP X0, X16\n    B.EQ 82f\n");
+    copy: string <- concat(sret_copy_words(0, nbytes / 8), "    MOV X0, X16\n    B 82f\n81:\n");
+    concat(concat(head, copy), concat(term_aggregate_helpers@aggregate_return_heap_promote_x0(nbytes), "82:\n"))
+}
+
+// Comma-wrapped node list of the return spine: the body root, a let's body, a case's arm bodies.
+fn sret_spine_nodes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64, acc: string) -> string {
+    case idx < 0 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, idx));
+            acc1: string <- concat(acc, concat(atom_table@int64_to_decimal_string(idx), ","));
+            case n.kind == 2 of {
+                true -> {
+                    body_n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, n.right_expr));
+                    acc2: string <- case body_n.kind == 1 and body_n.name == n.name of {
+                        true -> sret_spine_nodes(term, n.inner, acc1);
+                        false -> acc1
+                    };
+                    sret_spine_nodes(term, n.right_expr, acc2)
+                };
+                false -> case n.kind == 3 of {
+                    true -> sret_spine_arms(term, n.right_expr, acc1);
+                    false -> acc1
+                }
+            }
+        }
+    }
+}
+
+fn sret_spine_arms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64, acc: string) -> string {
+    case idx < 0 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, idx));
+            case n.kind == 7 of {
+                false -> acc;
+                true -> {
+                    acc2: string <- case n.inner >= 0 of {
+                        true -> sret_spine_nodes(term, sir_term_root_node(sir_term_at(term, n.inner)).right_expr, acc);
+                        false -> acc
+                    };
+                    sret_spine_arms(term, n.right_expr, acc2)
+                }
+            }
+        }
+    }
+}
+
+// Markers for the body: where X8 was parked, and the return spine.
+fn sret_outer_markers(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    case fn_returns_sret_tuple(fn_val) of {
+        false -> "";
+        true -> concat(concat("|_rsret=", atom_table@int64_to_decimal_string(sret_slot_offset(fn_val))), concat("|_rsp=", sret_spine_nodes(fn_val.body, fn_val.body.root, ",")))
+    }
+}
+
+// The body root and the tails of its let bodies: the calls whose result is the function's own result
+// and whose caller slab nothing would pop (a let RHS is popped at let end, a case arm by the arm).
+fn reply_tail_nodes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64, acc: string) -> string {
+    case idx < 0 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, idx));
+            acc1: string <- concat(acc, concat(atom_table@int64_to_decimal_string(idx), ","));
+            case n.kind == 2 of {
+                true -> reply_tail_nodes(term, n.right_expr, acc1);
+                false -> case n.kind == 3 of {
+                    true -> reply_tail_arms(term, n.right_expr, acc1);
+                    false -> acc1
+                }
+            }
+        }
+    }
+}
+
+// A case on the spine hands the buffer to its arms' results as well: a reply-form call in an arm
+// wrote its result into a slab the arm then copied to the heap and popped -- one block per message in
+// the actor's region, where a tuple-literal arm builds in the buffer and allocates nothing.
+fn reply_tail_arms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64, acc: string) -> string {
+    case idx < 0 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, idx));
+            case n.kind == 7 of {
+                false -> acc;
+                true -> {
+                    acc2: string <- case n.inner >= 0 of {
+                        true -> reply_tail_nodes(term, sir_term_root_node(sir_term_at(term, n.inner)).right_expr, acc);
+                        false -> acc
+                    };
+                    reply_tail_arms(term, n.right_expr, acc2)
+                }
+            }
+        }
+    }
+}
+
+// The register the reply buffer arrives in: the one after the parameters (X2 for a behaviour, which
+// the runtime calls with the message and the state). See term_emit_kind_call@reply_buffer_call_reg.
+fn reply_buffer_entry_reg(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    concat("X", atom_table@int64_to_decimal_string(fs_count_params(fn_val.param_names)))
+}
+
+// Markers for calls that return (:reply, ..) / (:no_reply, ..) (term_emit_kind_call: the X2 reply
+// buffer at a call). A call-bodied (kind 5) function of that shape hands its own incoming X2 to the
+// root call (`_x2root`); a function holding the buffer in a register (`_tuple_sret`) hands it to the
+// calls that are its result (`_bsp`, reply_tail_nodes).
+fn reply_buffer_outer_markers(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    case behavior_return_uses_actor_sret_tuple(fn_val.return_type) of {
+        false -> "";
+        true -> case sir_term_root_node(fn_val.body).kind == 5 of {
+            true -> concat(concat("|_x2root=", atom_table@int64_to_decimal_string(fn_val.body.root)), concat("|_rbin=", reply_buffer_entry_reg(fn_val)));
+            false -> case use_actor_reply_sret_buffer(fn_val) of {
+                true -> concat("|_bsp=", reply_tail_nodes(fn_val.body, fn_val.body.root, ","));
+                false -> ""
+            }
+        }
+    }
+}
+
+// The boundary move may overwrite the actor's current state block in place
+// (prims_actors@bmv_state_reuse_asm) only when nothing but the actor can hold a pointer to it: the
+// state is a plain tuple or a boxed record, and this behaviour reads its state parameter only through
+// a destructuring let (`(a, b) <- state`) or a field projection, so the old block cannot have been
+// stored, sent, returned or captured. Before this every message copied the new state to a fresh block
+// and the old one stayed in the actor's region until the actor ended.
+fn behaviour_state_reusable(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(fn_val.return_type);
+    reply_form: boolean <- length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,";
+    stype: string <- case reply_form of {
+        true -> prims_tuple@tuple_type_nth_element(t, 2);
+        false -> prims_tuple@tuple_type_nth_element(t, 1)
+    };
+    plain: boolean <- reg_conventions@is_sret_tuple_type(stype) or (reg_conventions@is_inline_struct_type(stype) and prims_record@record_type_keeps_inline_layout(stype) == false);
+    pname: string <- fs_name_at_index(fn_val.param_names, 1);
+    plain and length_bytes(pname) > 0 and find_pipe_in_param_names(fn_val.param_names, 0) >= 0 and state_param_uses_ok(fn_val.body, fn_val.body.root, pname, false)
+}
+
+fn state_param_uses_ok(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64, pname: string, allowed: boolean) -> boolean {
+    case idx < 0 of {
+        true -> true;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, idx));
+            case n.kind == 1 and (n.name == pname or n.name == concat("%", pname)) of {
+                true -> allowed;
+                false -> {
+                    inner_ok: boolean <- (n.kind == 2 and length_bytes(n.name) >= 5 and substring(n.name, 0, 5) == "%_td_") or (n.kind == 6 and n.name == "record_proj");
+                    state_param_uses_ok(term, n.inner, pname, inner_ok) and state_param_uses_ok(term, n.right_expr, pname, false)
+                }
+            }
+        }
+    }
+}
+
 fn esf_tuple_ret_promote(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, kind5_tail_returns_directly: boolean) -> string {
     case kind5_tail_returns_directly of {
             true -> "";
@@ -2813,7 +3034,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             }
         };
         actor_sret_mov: string <- case use_actor_reply_sret_buffer(fn_val) of {
-            true -> concat("    MOV ", concat(actor_reply_sret_reg(fn_val), ", X2\n"));
+            true -> concat("    MOV ", concat(actor_reply_sret_reg(fn_val), concat(", ", concat(reply_buffer_entry_reg(fn_val), "\n"))));
             false -> ""
         };
         param_outer_emit: string <- case use_actor_reply_sret_buffer(fn_val) of {
@@ -2835,7 +3056,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             true -> concat(param_outer_emit_lm, concat("|_ffi=", ffi_enc));
             false -> param_outer_emit_lm
         };
-        param_outer_emit_fnret: string <- concat(param_outer_emit_ffi, concat("|_fnret=", fn_val.return_type));
+        param_outer_emit_fnret: string <- concat(concat(concat(param_outer_emit_ffi, concat("|_fnret=", fn_val.return_type)), sret_outer_markers(fn_val)), reply_buffer_outer_markers(fn_val));
         frame_spill_nbytes: int64 <- frame_spill_bytes(fn_val);
         frame_spill_alloc: string <- emit_sp_add_sub_imm("SUB", frame_spill_nbytes);
         frame_spill_dealloc: string <- emit_sp_add_sub_imm("ADD", frame_spill_nbytes);
@@ -2957,7 +3178,14 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             true -> concat("|_tco=L_tco_", concat(entry_label, concat("|_tcon=", tco_nodes)));
             false -> ""
         };
-        body_outer_root: string <- concat(concat(param_outer_emit_fnret, concat("|_broot=", concat(atom_table@int64_to_decimal_string(fn_val.body.root), concat("|_aggb=", atom_table@int64_to_decimal_string((agg_region_bytes(fn_val.body) + 15) / 16 * 16))))), tco_outer);
+        // The make offsets come from one walk (term_reg_spill@agg_offset_table); a body with many
+        // makes carries them as `_aoff` so frame_region_for need not re-walk the body per make.
+        (agg_bytes_body: int64, aoff_tab: string, aoff_count: int64) <- term_reg_spill@agg_offset_table(fn_val.body);
+        aoff_outer: string <- case aoff_count >= 32 of {
+            true -> concat("|_aoff=", aoff_tab);
+            false -> ""
+        };
+        body_outer_root: string <- concat(concat(concat(param_outer_emit_fnret, concat("|_broot=", concat(atom_table@int64_to_decimal_string(fn_val.body.root), concat("|_aggb=", atom_table@int64_to_decimal_string((agg_bytes_body + 15) / 16 * 16))))), aoff_outer), tco_outer);
         body: string <- case sir_term_root_node(fn_val.body).kind == 5 of {
             true -> case kind5_no_tail of {
                 true -> term_emitter@emit_function_non_tail_user_call_root(fn_val.body, dest_reg, { table: ctx.table, int64_table: ctx.int64_table, int32_table: ctx.int32_table, int16_table: ctx.int16_table, int8_table: ctx.int8_table, literal_table: ctx.literal_table, float64_literal_table: ctx.float64_literal_table, float32_literal_table: ctx.float32_literal_table, string_literal_table: ctx.string_literal_table }, param_outer_emit_fnret, fn_val.effects, ctx.debug, main_k5_asm_line_before_call);
@@ -2986,11 +3214,28 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
                 }
             }
         };
-        tuple_ret_promote: string <- esf_tuple_ret_promote(fn_val, kind5_tail_returns_directly);
-        tuple_ret_dealloc: string <- esf_tuple_ret_dealloc(fn_val, kind5_tail_returns_directly);
+        fn_sret: boolean <- fn_returns_sret_tuple(fn_val);
+        sret_off: int64 <- case fn_sret of { true -> sret_slot_offset(fn_val); false -> 0 };
+        tuple_ret_promote: string <- case fn_sret of {
+            true -> case kind5_tail_returns_directly of {
+                true -> "";
+                false -> sret_tuple_epilogue_copy(fn_val, sret_off)
+            };
+            false -> esf_tuple_ret_promote(fn_val, kind5_tail_returns_directly)
+        };
+        // No caller slab is reserved for an sret tuple call, so the tail of an sret function has
+        // nothing on SP for the epilogue to pop.
+        tuple_ret_dealloc: string <- case fn_sret of {
+            true -> "";
+            false -> esf_tuple_ret_dealloc(fn_val, kind5_tail_returns_directly)
+        };
+        sret_save: string <- case fn_sret of {
+            true -> sret_save_x8(sret_off);
+            false -> ""
+        };
         // A kind-5 body's callee has this return type too and runs the move itself.
         behaviour_move: string <- case kind5_tail_returns_directly == false and sir_term_root_node(fn_val.body).kind != 5 and behavior_return_uses_actor_sret_tuple(fn_val.return_type) of {
-            true -> prims_actors@behaviour_result_move_asm(fn_val.return_type, entry_label);
+            true -> prims_actors@behaviour_result_move_asm(fn_val.return_type, entry_label, behaviour_state_reusable(fn_val));
             false -> ""
         };
 
@@ -3113,7 +3358,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             true -> "    LDP X16, X17, [SP], #16\n    BL L_sc_arena_release_to\n";
             false -> ""
         };
-        concat(concat(concat(eff_comment, "\n"), concat(concat(concat(concat(concat(concat(fpb_comment, ra_comment), prologue_full), rgn_save), region_mark_push), arena_mark_push), "\n")), concat(registry_init_inject, concat(concat(concat(concat(tco_body_label, body), "\n"), float_to_exit), concat(arena_release_pop, concat(region_release_pop, concat(epilogue, tco_stub))))))
+        concat(concat(concat(eff_comment, "\n"), concat(concat(concat(concat(concat(concat(concat(fpb_comment, ra_comment), prims_actors@behaviour_convention_prefix(fn_val.return_type)), prologue_full), concat(rgn_save, sret_save)), region_mark_push), arena_mark_push), "\n")), concat(registry_init_inject, concat(concat(concat(concat(tco_body_label, body), "\n"), float_to_exit), concat(arena_release_pop, concat(region_release_pop, concat(epilogue, tco_stub))))))
 }
 
 // True when main returns float64: emit FCVTZS W0, D0 so process exit code reflects computed value.

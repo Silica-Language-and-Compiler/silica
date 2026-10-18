@@ -2,292 +2,153 @@
 
 ## Overview
 
-This document defines the code organization structure for the Phase 2 Silica compiler written in Silica. The organization is designed to be both human-friendly and LLM-friendly, following Silica's design principles of explicit structure and clear naming conventions.
+This document describes how the Silica compiler, which is written in Silica, is organized on disk. It
+is the only compiler source tree: `compiler/src/` (the former `src_selfhost`). There is no bootstrap
+compiler tree and no separate seed tree; the Rust bootstrap was retired and the seed is a published
+Silica-built binary reached through `binaries/seed-compiler`. The layout follows Silica's design
+principles of explicit structure and clear naming, for human and LLM readers alike.
 
 **Key Principles:**
-- Feature-group modularity: Each language feature has dedicated files in lexer, parser, and codegen
-- Clear separation: Lexer, parser, and codegen are separate directories
-- Consistent naming: Files use descriptive names with grouping prefixes to avoid conflicts
-- Hierarchical organization: Subdirectories group related features
-- Incremental development: New features can be added without modifying existing files
+- One directory per compiler phase (lexer, parser, module checker, type checker, effect checker, SIR generator, emitter)
+- One emitter backend directory per target, selected at build time
+- Small units: a phase is split into many small modules, named by the feature they implement, so a feature change touches few files and one unit's compile fits in memory
+- Consistent naming: file names carry the phase or feature prefix, and the module name equals the file stem
+- New features add files and are wired in at a dispatcher; they do not rewrite existing files
 
 ## Directory Structure
 
 ```
-silica-compiler/src/
-├── lexer/
-│   ├── lexer_core.silica              -- Core token types, source location, basic tokenization
-│   ├── lexer_keywords.silica          -- Keyword recognition
-│   ├── lexer_literals.silica           -- Integer, float, string, char, boolean, unit literals
-│   ├── lexer_operators.silica         -- Operator recognition (arithmetic, comparison, logical)
-│   └── lexer_comments.silica           -- Comment handling
-│
-├── parser/
-│   ├── parser_core.silica              -- Parser state, basic parsing utilities, error types
-│   ├── declarations/
-│   │   ├── parser_declarations_functions.silica     -- Function declarations
-│   │   ├── parser_declarations_types.silica         -- Type declarations, type aliases
-│   │   ├── parser_declarations_structs.silica       -- Struct declarations
-│   │   ├── parser_declarations_enums.silica         -- Enum declarations
-│   │   ├── parser_declarations_traits.silica        -- Trait declarations
-│   │   ├── parser_declarations_impls.silica         -- Impl declarations
-│   │   ├── parser_declarations_modules.silica       -- Module, import, export declarations
-│   │   └── parser_declarations_effects.silica       -- Effect declarations
-│   ├── expressions/
-│   │   ├── parser_expressions_literals.silica        -- Literal expressions
-│   │   ├── parser_expressions_calls.silica          -- Function calls, qualified method calls
-│   │   ├── parser_expressions_function_literals.silica  -- Function literal expressions
-│   │   ├── parser_expressions_case.silica           -- Case expressions
-│   │   ├── parser_expressions_if.silica             -- If expressions
-│   │   ├── parser_expressions_do.silica             -- Do expressions
-│   │   ├── parser_expressions_structs.silica        -- Struct literals, field access
-│   │   ├── parser_expressions_tuples.silica         -- Tuple literals
-│   │   ├── parser_expressions_constructors.silica  -- Constructor calls
-│   │   ├── parser_expressions_casts.silica          -- Cast and as-type expressions
-│   │   ├── parser_expressions_operators.silica      -- Binary and unary operators
-│   │   └── parser_expressions_lists.silica          -- List literals and list operations
-│   ├── patterns/
-│   │   ├── parser_patterns_basic.silica            -- Basic patterns (identifiers, literals, wildcards)
-│   │   ├── parser_patterns_structs.silica          -- Struct patterns
-│   │   ├── parser_patterns_tuples.silica          -- Tuple patterns
-│   │   ├── parser_patterns_enums.silica            -- Enum/constructor patterns
-│   │   └── parser_patterns_lists.silica            -- List patterns (empty, cons)
-│   ├── types/
-│   │   ├── parser_types_primitives.silica          -- Primitive types
-│   │   ├── parser_types_functions.silica           -- Function types
-│   │   ├── parser_types_tuples.silica              -- Tuple types
-│   │   ├── parser_types_records.silica              -- Record types
-│   │   ├── parser_types_variants.silica            -- Variant/enum types
-│   │   ├── parser_types_processes.silica           -- Process types
-│   │   ├── parser_types_regions.silica             -- Region and reference types
-│   │   ├── parser_types_actors.silica              -- Actor types
-│   │   └── parser_types_lists.silica               -- List types
-│   └── effects/
-│       └── parser_effects_effects.silica           -- Effect parsing (device_io, concurrency, mem)
-│
-├── codegen/
-│   ├── codegen_core.silica                         -- Code generation state, basic utilities
-│   ├── declarations/
-│   │   ├── codegen_declarations_functions.silica   -- Function code generation
-│   │   ├── codegen_declarations_types.silica       -- Type code generation
-│   │   ├── codegen_declarations_structs.silica     -- Struct code generation
-│   │   ├── codegen_declarations_enums.silica       -- Enum code generation
-│   │   ├── codegen_declarations_traits.silica      -- Trait method dispatch code generation
-│   │   └── codegen_declarations_modules.silica     -- Module-level code generation
-│   ├── expressions/
-│   │   ├── codegen_expressions_literals.silica     -- Literal code generation
-│   │   ├── codegen_expressions_calls.silica        -- Function call code generation
-│   │   ├── codegen_expressions_function_literals.silica  -- Closure code generation
-│   │   ├── codegen_expressions_case.silica         -- Case expression code generation
-│   │   ├── codegen_expressions_if.silica           -- If expression code generation
-│   │   ├── codegen_expressions_do.silica           -- Do expression code generation
-│   │   ├── codegen_expressions_structs.silica       -- Struct literal and field access code generation
-│   │   ├── codegen_expressions_tuples.silica       -- Tuple code generation
-│   │   ├── codegen_expressions_constructors.silica -- Constructor call code generation
-│   │   ├── codegen_expressions_casts.silica        -- Cast code generation
-│   │   ├── codegen_expressions_operators.silica    -- Operator code generation
-│   │   └── codegen_expressions_lists.silica        -- List operation code generation
-│   ├── patterns/
-│   │   └── codegen_patterns_matching.silica       -- Pattern matching code generation
-│   ├── effects/
-│   │   └── codegen_effects_effects.silica         -- Effect handling code generation
-│   ├── actors/
-│   │   ├── codegen_actors_spawn.silica            -- Actor spawn code generation
-│   │   ├── codegen_actors_messaging.silica         -- Send/recv/cast code generation
-│   │   └── codegen_actors_mailbox.silica           -- Mailbox code generation
-│   └── memory/
-│       ├── codegen_memory_regions.silica          -- Region allocation code generation
-│       └── codegen_memory_references.silica       -- Reference operations code generation
-│
-├── ast/
-│   ├── ast_core.silica                            -- Core AST types (Program, SourceLocation)
-│   ├── ast_declarations.silica                    -- Declaration AST nodes
-│   ├── ast_expressions.silica                     -- Expression AST nodes
-│   ├── ast_patterns.silica                        -- Pattern AST nodes
-│   ├── ast_types.silica                           -- Type AST nodes
-│   └── ast_effects.silica                         -- Effect AST nodes
-│
-└── compiler.silica                                -- Main compiler entry point, pipeline orchestration
+compiler/src/
+├── main.silica, main_*.silica      -- Driver: entry point, topo-sorted unit list, first/resume processes,
+│                                      world/lists/specialize, per-unit pipeline (main_compile_pipeline),
+│                                      emit, hygiene, iface skip, crash handling
+├── lexer/                          -- lexer_core, lexer_keywords, lexer_operators, lexer_comments,
+│                                      integer/float/float32/float64/boolean/string/atom literal lexers,
+│                                      lexer_token_kind, lexer_runner, lexer_recursion_phases,
+│                                      lexer_supervisor_phases
+├── parser/                         -- constraint-propagation parser (see parser_design.md)
+│   ├── constraint_core, constraint_extract_*   -- constraints and the extraction passes (decls, params,
+│   │                                              slots, expr, expr_bindings, expr_lits, lambda_lift,
+│   │                                              hof_wrap, validate)
+│   ├── capabilities/                -- one file per parsing capability (capability_fn_decl, _case,
+│   │                                   _list, _sequence, _trait, _actors, _foreign, _memory_region,
+│   │                                   _module, _effect_decl, _supervisor_phases, _tuple_decompose, ...)
+│   ├── parser_core, parser_ast, parser_tuples, parser_runner, constraint_runner,
+│   │   instantiated_fn_name, parse_in_actor
+├── module_checker/                 -- module_checker_core/_device/_ffi; module_iface and
+│                                      module_iface_type_dag (the .iface interface files)
+├── type_checker/                   -- type_checker_core, _runner, _modules, _lists, _collections,
+│   │                                  _memory_regions, _recursion, _recursive_tuples, _supervisor,
+│   │                                  _failure_reporter, _cast_convention, _start_order,
+│   │                                  _builtin_signatures, _callee_env(_cache), type_interner,
+│   │                                  type_surface_cache
+│   ├── declarations/                -- function declaration validation
+│   ├── expressions/                 -- about 56 files: dispatch_*, call_*, user_call_* (check,
+│   │                                   resolve, world), actors, atoms, bindings, control, data,
+│   │                                   literals, tuples, numeric builtins, strings, regions, device
+│   ├── traits/                      -- type_checker_traits, trait_specialization, placeholders
+│   └── device/                      -- device description checks
+├── trait_checker/                  -- trait_checker_core
+├── effect_checker/                 -- effect_checker_core, _capabilities, _declarations, _lists,
+│                                      _memory_regions, _propagation
+├── ffi/                            -- ffi_abi_checker, ffi_placement_checker, ffi_taint_checker,
+│                                      ffi_sidecar_loader, ffi_link_manifest
+├── sir_generator/                  -- AST to SIR (see sir_design_spec.md)
+│   ├── sir_generator_core, sir_ast, sir_call_verify, sir_target_verify
+│   ├── declarations/                -- functions, traits, dispatcher, ffi, overload and qualified-call mangling
+│   ├── terms/                       -- about 45 files: per-type binary ops and calls (int8 ... uint64,
+│   │                                   float16/32/64), literals, identifiers, lists, tuples, structs,
+│   │                                   case/sequence/region/actor lowering, user calls, device calls
+│   ├── patterns/, effects/, types/
+├── lowering_cleanup/               -- lowering_cleanup_core
+├── diagnostics/                    -- diagnostics_core (error codes and messages; registry in ../error_codes.md)
+├── data_structures/                -- compiler_maps, string_escapes, string_parse
+├── build_output/                   -- build_output (compiler artifacts written by the driver)
+├── lib/                            -- OrderedMap, wbt_map, Supervisor (the compiler's own library copies)
+├── emitter/                        -- one backend per target; see below
+└── runtime_asm/                    -- hand-written assembly shims per hosted target
+                                       (silica_rt_shim.s, deviceio_link_thunks.s)
 ```
+
+The pipeline runs per compilation unit in this order: lex, parse, module check (interface files),
+type check, trait check, effect check, FFI checks, SIR generation, lowering cleanup, emit. The stage
+sequence is wired in `main_compile_pipeline.silica`; the driver processes (`main_driver*.silica`)
+decide which units run in which process (`main_driver_first` computes the compile order and the
+process exits 75 between units to be resumed; the prefix-only use-tree pass is still a design,
+`Phase2_TODO/use_tree_first_pass.md`).
+
+### Emitter backends
+
+`emitter/<target>/` holds one code-generation backend. Targets present today:
+
+| Directory | Target |
+| --------- | ------ |
+| `apple_silicon_mac/` | macOS on Apple Silicon (AArch64) |
+| `linux_aarch64/` | Linux AArch64 hosted |
+| `linux_x86_64/` | Linux x86-64 hosted (`regs/` holds the register and frame model README; `ladder/` the bring-up ladder programs) |
+| `ESP32-S3_raw/` | ESP32-S3 bare metal, native Xtensa (`board/` holds the board runtime, apps and tools; `board_pack.silica` the board pack) |
+
+Every backend has the same internal shape: `emitter_core.silica`, `module_linkage.silica`, and the
+subdirectories `atoms/` (atom table and read-only data pools), `constraints/`, `control/`,
+`effects/`, `recursion/`, `shared/` (register conventions; ISA helpers on Xtensa) and `terms/`
+(per-term emission: calls, case, let, primitives, inline print and string routines, FFI and runtime
+assembly). The target is chosen with `make TARGET=<name>` (see `emit_target.mk`); the platform table
+of record is `project_makefiles/platform/platforms.mk`. A backend other than the host's is
+published as `binaries/silica-compiler-<target>`.
 
 ## Naming Convention
 
-Files follow the pattern: `{phase}_{group}_{feature}.silica`
+Files are named for the phase or feature they implement; the module name equals the file stem.
+Prefixes group related files within a phase and avoid collisions:
 
-Where:
-- `{phase}` is one of: `lexer`, `parser`, `codegen`, `ast`
-- `{group}` is optional and represents a subdirectory grouping (e.g., `declarations`, `expressions`, `patterns`, `types`, `effects`, `actors`, `memory`)
-- `{feature}` is the specific feature name (e.g., `functions`, `structs`, `case`, `lists`)
+- `lexer_*` and `<type>_lexer_literals` in `lexer/`
+- `constraint_*`, `capability_*`, `parser_*` in `parser/`
+- `type_checker_*` (and `tc_decl_*`, `trait_*`) in `type_checker/`
+- `effect_checker_*`, `sir_*`, `terms_*`, `module_checker_*`, `ffi_*`, `main_*`
+- `term_*`, `print_*_inline`, `*_runtime_asm` in an emitter's `terms/`
 
 Examples:
-- `lexer_core.silica` - Core lexer functionality
-- `parser_declarations_functions.silica` - Function declaration parsing
-- `parser_expressions_case.silica` - Case expression parsing
-- `codegen_expressions_lists.silica` - List expression code generation
-- `ast_declarations.silica` - Declaration AST nodes
-
-## Module Structure
-
-Each file defines a module following Silica's module naming conventions:
-
-```silica
--- parser/expressions/parser_expressions_case.silica
-module parser.expressions.case;
-
-use ast_expressions;
-use parser_core;
-use parser_patterns_basic;
-
--- Parse case expression
-fn parse_case_expression(
-    parser: ref(R, normal, Parser)
-) -> ResultCaseExprParseError proc[mem(normal)] {
-    -- Implementation
-}
-
--- Parse case branch
-fn parse_case_branch(
-    parser: ref(R, normal, Parser)
-) -> ResultCaseBranchParseError proc[mem(normal)] {
-    -- Implementation
-}
-```
-
-## Feature Groups
-
-### Lexer Features
-- **Core**: Token types, source location, basic tokenization
-- **Keywords**: Keyword recognition (fn, struct, trait, etc.)
-- **Literals**: Integer, float, string, char, boolean, unit literals
-- **Operators**: Arithmetic, comparison, logical operators
-- **Comments**: Line and block comment handling
-
-### Parser Declarations
-- **Functions**: Function declarations with parameters, return types, effects
-- **Types**: Type declarations and type aliases
-- **Structs**: Struct declarations with fields
-- **Enums**: Enum declarations with variants
-- **Traits**: Trait declarations with method signatures
-- **Impls**: Trait implementation declarations
-- **Modules**: Module, import, and export declarations
-- **Effects**: Effect declarations
-
-### Parser Expressions
-- **Literals**: Literal expression parsing
-- **Calls**: Function calls and qualified method calls
-- **Function Literals**: Anonymous function/closure parsing
-- **Case**: Case expression parsing with pattern matching
-- **If**: If expression parsing
-- **Do**: Do expression parsing (process monad)
-- **Structs**: Struct literal and field access parsing
-- **Tuples**: Tuple literal parsing
-- **Constructors**: Constructor call parsing
-- **Casts**: Cast and as-type expression parsing
-- **Operators**: Binary and unary operator parsing
-- **Lists**: List literal and list operation parsing
-
-### Parser Patterns
-- **Basic**: Identifier, literal, and wildcard patterns
-- **Structs**: Struct pattern matching
-- **Tuples**: Tuple pattern matching
-- **Enums**: Enum/constructor pattern matching
-- **Lists**: List pattern matching (empty, cons)
-
-### Parser Types
-- **Primitives**: Primitive type parsing (int64, bool, etc.)
-- **Functions**: Function type parsing
-- **Tuples**: Tuple type parsing
-- **Records**: Record type parsing
-- **Variants**: Variant/enum type parsing
-- **Processes**: Process type parsing with effects
-- **Regions**: Region and reference type parsing
-- **Actors**: Actor type parsing
-- **Lists**: List type parsing
-
-### Parser Effects
-- **Effects**: Effect parsing (device_io, concurrency, mem(normal))
-
-### Codegen Declarations
-- **Functions**: Function code generation
-- **Types**: Type code generation
-- **Structs**: Struct code generation
-- **Enums**: Enum code generation
-- **Traits**: Trait method dispatch code generation
-- **Modules**: Module-level code generation
-
-### Codegen Expressions
-- **Literals**: Literal code generation
-- **Calls**: Function call code generation
-- **Function Literals**: Closure code generation
-- **Case**: Case expression code generation
-- **If**: If expression code generation
-- **Do**: Do expression code generation
-- **Structs**: Struct literal and field access code generation
-- **Tuples**: Tuple code generation
-- **Constructors**: Constructor call code generation
-- **Casts**: Cast code generation
-- **Operators**: Operator code generation
-- **Lists**: List operation code generation
-
-### Codegen Patterns
-- **Matching**: Pattern matching code generation (decision trees, jump tables)
-
-### Codegen Effects
-- **Effects**: Effect handling code generation
-
-### Codegen Actors
-- **Spawn**: Actor spawn code generation
-- **Messaging**: Send/recv/cast code generation
-- **Mailbox**: Mailbox code generation
-
-### Codegen Memory
-- **Regions**: Region allocation code generation
-- **References**: Reference operations code generation
-
-### AST Nodes
-- **Core**: Program, SourceLocation, basic AST infrastructure
-- **Declarations**: Declaration AST node types
-- **Expressions**: Expression AST node types
-- **Patterns**: Pattern AST node types
-- **Types**: Type AST node types
-- **Effects**: Effect AST node types
+- `lexer/lexer_core.silica` - core lexer functionality
+- `parser/capabilities/capability_case.silica` - case-expression parsing capability
+- `type_checker/expressions/type_checker_expressions_user_call_resolve.silica` - user-call resolution
+- `sir_generator/terms/int64_binary_ops.silica` - int64 binary operators in SIR
+- `emitter/apple_silicon_mac/terms/term_emit_kind_case.silica` - case emission
 
 ## Adding a New Feature
 
-When adding a new language feature (e.g., "match expressions"):
+1. **Lexer**: add a token kind or literal lexer under `lexer/` only if new tokens are needed.
+2. **Parser**: add a capability file under `parser/capabilities/` and wire it in at the constraint dispatcher.
+3. **Type checker**: add the rule under `type_checker/expressions/` (or `declarations/`, `traits/`), and register builtin signatures in `type_checker_builtin_signatures.silica` when it is a builtin.
+4. **Effect checker and diagnostics**: add effect rules to `effect_checker/`; register any new error code in `error_codes.md` and `diagnostics/`.
+5. **SIR**: add lowering under `sir_generator/terms/` (or `declarations/`, `patterns/`).
+6. **Emitters**: implement the term in every backend under `emitter/*/terms/`; a backend that cannot yet do it must reject the program with a diagnostic rather than emit wrong code.
+7. **Trials**: add a trial under `trials/` with its `.scout` golden; a defect with no covering trial gets a trial even if the fix is deferred.
 
-1. **Add AST nodes**: Update `ast/ast_expressions.silica` to add `MatchExpr` variant
-2. **Add lexer support**: Create `lexer/lexer_match_expressions.silica` (if new tokens needed)
-3. **Add parser support**: Create `parser/expressions/parser_expressions_match.silica`
-4. **Add codegen support**: Create `codegen/expressions/codegen_expressions_match.silica`
-5. **Update core**: Update `parser/parser_core.silica` to wire in the new parser function
-
-This keeps changes localized and makes the compiler easy to extend and maintain.
-
-## Benefits
-
-1. **Easy Navigation**: Developers and LLMs can quickly locate code for any feature
-2. **Incremental Development**: Features can be added without modifying existing files
-3. **LLM-Friendly**: Clear file names and structure make code easy to understand
-4. **Human-Friendly**: Small, focused files are easier to read and maintain
-5. **Testable**: Each feature can be tested independently
-6. **Scalable**: New features follow the same pattern, maintaining consistency
+Edits are crafted one scoped site at a time; no tree-wide batch rewrites (see `compiler/src/README.md`).
 
 ## List trials (`trials/list_addition/`)
 
-Executable **list** trials live under **`silica-compiler/trials/list_addition/`** and follow the **implementation** design in **`design_documents/list_implementation_design.md`**: list operations run inside **`sequence proc[mem(<space>)] … produces pure … end`**, with **`device_io`** **added** when **printing**. **Non-**`normal` **memory** **spaces** (e.g. **`normal_writethrough`**) are illustrated in **`list_int64_mem_writethrough.silica`**. **`list_uint32_prepend_second_chunk.silica`** **stresses** **multi-chunk** **spines** **via** **repeated** **`prepend`**; **`list_int64_recursive_sum.silica`** **covers** **recursive** **helpers** **with** **`sequence proc[mem]`** **inside** **the** **function** **(no** **`proc`** **on** **the** **function)**. Parser/codegen work for lists uses **`parser_expressions_lists.silica`**, **`parser_patterns_lists.silica`**, **`parser_types_lists.silica`**, and matching **codegen** paths as listed above.
+Executable **list** trials live under `trials/list_addition/` and follow the implementation design in
+`design_documents/list_implementation_design.md`: list operations run inside
+`sequence proc[mem(<space>)] ... produces pure ... end`, with `device_io` added when printing.
+Non-`normal` memory spaces (for example `normal_writethrough`) are illustrated in
+`list_int64_mem_writethrough.silica`. `list_uint32_prepend_second_chunk.silica` stresses multi-chunk
+spines via repeated `prepend`; `list_int64_recursive_sum.silica` covers recursive helpers with
+`sequence proc[mem]` inside the function (no `proc` on the function). List support lives in
+`parser/capabilities/capability_list.silica`, `type_checker/type_checker_lists.silica`,
+`effect_checker/effect_checker_lists.silica`, `sir_generator/terms/list_terms.silica`, and the
+emitters' `terms/prims/prims_list.silica`.
 
 ---
 
 ## Relationship to Specification
 
-This organization maps directly to the Silica language specification sections:
+- **Lexical Structure** -> `lexer/`
+- **Syntax** -> `parser/`
+- **Type System** -> `type_checker/`
+- **Effect System** -> `effect_checker/`
+- **Actor Model** -> `type_checker/expressions/type_checker_expressions_actor*.silica`, `sir_generator/terms/actor_calls.silica`, the emitters' runtime assembly
+- **Memory Model** -> `type_checker/type_checker_memory_regions.silica`, `effect_checker/effect_checker_memory_regions.silica`, `sir_generator/terms/memory_region_calls.silica`
 
-- **Section 2 (Lexical Structure)** → `lexer/` directory
-- **Section 3 (Syntax)** → `parser/` directory
-- **Section 8 (Type System)** → `parser/types/` and `ast/ast_types.silica`
-- **Section 9 (Effect System)** → `parser/effects/` and `codegen/effects/`
-- **Section 15 (Actor Model)** → `codegen/actors/`
-- **Section 12 (Memory Model)** → `codegen/memory/`
-
-Each feature group corresponds to a specific section or subsection of the specification, making it easy to verify completeness and correctness.
+Section numbers are in `silica-specification.md`; each feature group corresponds to a specification
+section, which makes completeness easy to verify.

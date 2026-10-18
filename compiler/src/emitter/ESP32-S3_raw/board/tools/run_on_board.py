@@ -15,7 +15,8 @@
 
 """Run a bare-metal ESP32-S3 image on the board and capture the program's run.
 
-    run_on_board.py [--port P] [--timeout S] [--out FILE] [--flash | --no-flash] image.bin
+    run_on_board.py [--port P] [--timeout S] [--out FILE] [--flash | --no-flash]
+                    [--send TEXT [--send-delay S]] image.bin
     run_on_board.py --probe [--port P] [--expect-mac MAC]
     run_on_board.py --list-ports
 
@@ -34,6 +35,13 @@ Modes:
 
 Port: --port, else $BOARD_PORT, else the one candidate USB serial port. No candidate, or more than
 one, is an error (exit 4) so a caller never runs on an unexpected device.
+
+Input: --send TEXT writes TEXT to the console's receive side (the program's standard input on this
+target, spec §15.1.2.5) once the start marker has been seen and --send-delay seconds (default 1)
+have passed; Python escapes are honoured, so --send 'exit\\n' sends the exit line that makes a
+main waiting in wait_for_exit return 0 (the program ends when main returns, spec §15.1.2.5). The
+delay lets the program's output settle first,
+as the host harness sends `exit` only after a trial's marker.
 
 The runtime (board/runtime/rt_start.S, rt_console.S) brackets program output with
     \\x02SILICA:START\\x03 ... \\x02SILICA:EXIT:<status>\\x03 [diagnostic]
@@ -55,6 +63,7 @@ Must run under the ESP-IDF Python environment (it provides esptool and pyserial)
 import argparse
 import glob
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -130,13 +139,21 @@ def mac_of(esp):
     return ":".join("%02x" % b for b in mac)
 
 
-def capture(port, timeout):
+def capture(port, timeout, send=None, send_delay=1.0):
     buf = bytearray()
     deadline = time.time() + timeout
+    send_at = None
     while time.time() < deadline:
         buf += port.read(4096)
         i = buf.find(START)
         if i >= 0:
+            if send is not None:
+                if send_at is None:
+                    send_at = time.time() + send_delay
+                elif time.time() >= send_at:
+                    port.write(send)
+                    port.flush()
+                    send = None
             j = buf.find(EXIT_PREFIX, i)
             if j >= 0:
                 k = buf.find(b"\x03", j + len(EXIT_PREFIX))
@@ -152,7 +169,7 @@ def capture(port, timeout):
     return None, None, bytes(buf)
 
 
-def run_from_ram(port_name, image, timeout):
+def run_from_ram(port_name, image, timeout, send=None, send_delay=1.0):
     from esptool.bin_image import LoadFirmwareImage
     from esptool.util import div_roundup
     esp = connect(port_name)
@@ -169,7 +186,13 @@ def run_from_ram(port_name, image, timeout):
                 data = data[esp.ESP_RAM_BLOCK:]
                 seq += 1
         esp.change_baud(RUN_BAUD)
-        esp.mem_finish(img.entrypoint)
+        # MEM_END without reading its response (esptool's mem_finish would read it): the program
+        # starts printing as soon as the ROM jumps to the entry point, and when the host is slow
+        # esptool's SLIP reader consumes those first bytes (the START marker included) with the
+        # response, so the capture below never sees the marker. Same packet as mem_finish
+        # (checked against esptool 5.4.0).
+        esp.command(esp.ESP_CMDS["MEM_END"], struct.pack("<II", int(img.entrypoint == 0), img.entrypoint),
+                    wait_response=False)
     except BoardUnavailable:
         raise
     except Exception as e:
@@ -177,7 +200,7 @@ def run_from_ram(port_name, image, timeout):
     port = esp._port
     port.timeout = 0.05
     try:
-        return capture(port, timeout)
+        return capture(port, timeout, send, send_delay)
     finally:
         port.close()
 
@@ -193,7 +216,7 @@ def flash(port, image):
         raise BoardUnavailable("flashing failed")
 
 
-def reset_and_capture(port_name, timeout):
+def reset_and_capture(port_name, timeout, send=None, send_delay=1.0):
     import serial  # from the ESP-IDF Python environment
     try:
         s = serial.Serial(port_name, 115200, timeout=0.05)
@@ -207,7 +230,7 @@ def reset_and_capture(port_name, timeout):
     s.reset_input_buffer()
     s.rts = False
     try:
-        return capture(s, timeout)
+        return capture(s, timeout, send, send_delay)
     finally:
         s.close()
 
@@ -225,7 +248,12 @@ def main():
     mode.add_argument("--list-ports", action="store_true", help="print the candidate serial ports")
     ap.add_argument("--expect-mac", default=os.environ.get("BOARD_MAC", ""),
                     help="with --probe: fail unless the board has this MAC (default $BOARD_MAC)")
+    ap.add_argument("--send", help="text to write to the console after the start marker (Python escapes, e.g. 'exit\\n')")
+    ap.add_argument("--send-delay", type=float, default=1.0, help="seconds after the start marker before --send is written")
     a = ap.parse_args()
+    send = None
+    if a.send is not None:
+        send = a.send.encode("utf-8").decode("unicode_escape").encode("latin-1")
 
     if a.list_ports:
         for p in candidate_ports():
@@ -250,11 +278,11 @@ def main():
             ap.error("an image is required")
         if a.flash:
             flash(port, a.image)
-            out, status, diag = reset_and_capture(port, a.timeout)
+            out, status, diag = reset_and_capture(port, a.timeout, send, a.send_delay)
         elif a.no_flash:
-            out, status, diag = reset_and_capture(port, a.timeout)
+            out, status, diag = reset_and_capture(port, a.timeout, send, a.send_delay)
         else:
-            out, status, diag = run_from_ram(port, a.image, a.timeout)
+            out, status, diag = run_from_ram(port, a.image, a.timeout, send, a.send_delay)
     except BoardUnavailable as e:
         sys.stderr.write("run_on_board: %s\n" % e)
         return EXIT_BOARD

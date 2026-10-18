@@ -1,5 +1,7 @@
 # `OrderedSet` Detailed Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/OrderedSet.silica` over `wbt_set.silica`; trials in `trials/ordered_data_structures/ordered_collections/` (`ordered_set_*`, `wbt_set_empty_insert`) and `wbt_core/`.
+
 **Public trait:** `OrderedSet`  
 **Generated representation module:** `wbt_set`  
 **Shared core:** [`weight_balanced_tree.md`](weight_balanced_tree.md)

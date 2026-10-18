@@ -1,5 +1,7 @@
 # Persistent Fixed-Arity Binary Tree Design
 
+**Implementation status (2026-10-16):** Implemented as `stdlib/data_structures/tree_binary.silica`; trials in `trials/ordered_data_structures/binary_tree_core/` (13 programs). See `binary_tree_trait.md` for the deviations; the randomized-oracle and complexity-counter trials were not landed.
+
 **Consumer:** `BinaryTree`  
 **Algorithm family:** purely functional binary tree with path copying; optional Huet-style zipper for focused traversal and reconstruction  
 **Purpose:** general fixed-role binary structure, including syntax-tree and expression-tree workloads
@@ -84,6 +86,7 @@ The generated owning value contains, conceptually:
 {
     r: region(R, SpaceType),
     root: ref?(R, SpaceType, RecursiveBinaryNode),
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
     specialization_key: int64
 }
 ```
@@ -94,8 +97,9 @@ The owning value carries:
 
 - the canonical application-lifetime arena for the exact generated representation specialization;
 - the optional root;
-- the stable specialization key required by the collection registry; and
-- no comparator, ordering bundle, orientation, or user-forgeable identity token.
+- the stable specialization key required by the collection registry;
+- the witness-only `compare_item` function from the constructor record (decision 2026-10-16), which the tree never calls and which is not an ordering identity (see `binary_tree_trait.md` §2); and
+- no ordering bundle, orientation, or user-forgeable identity token.
 
 Different `ItemType` or `SpaceType` specializations are distinct generated representations. Repeated construction of one specialization and space resolves the same canonical arena.
 
