@@ -551,11 +551,12 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
   [runtime_failure_reporting.md](runtime_failure_reporting.md) §5).
 
 - **N. Hosted carrier threads** (added 2026-10-08, after the lettered items; the hosted part of ROADMAP chunk 2).
-  Today every hosted actor is its own operating-system thread, with a 128 KB thread stack and a 64 KB
-  signal stack, so threads, mappings and address space bound the count long before memory does (§15), and
-  pinning is only a thread-affinity hint (`thread_policy_set` with an affinity tag on macOS;
-  `set_scheduler_policy` answers `:ok` with no effect). N replaces that with the BEAM pattern the board
-  already uses per core:
+  When this item was written every hosted actor was its own operating-system thread, with a 128 KB thread
+  stack and a 64 KB signal stack, so threads, mappings and address space bound the count long before memory
+  did (§15), pinning was only a thread-affinity hint (`thread_policy_set` with an affinity tag on macOS) and
+  `set_scheduler_policy` answered `:ok` with no effect (with the gate off, and on the Linux targets, that is
+  still what happens; with it on, stages 3 and 4 below made placement and the policies real). N replaces
+  the thread per actor with the BEAM pattern the board already uses per core:
   - one carrier thread per logical core, each running many actors from its own run queue;
   - cooperative switching only at the specification's yield points: a behaviour returning (the dispatch
     boundary), or a wait such as a `call` awaiting its reply or `wait_for_exit`;
@@ -1010,6 +1011,148 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       `pin_actor_realtime` and `pin_actor_to_numa_node` stay stubs; the ROADMAP chunk 2 and
       specification "implementation status" paragraphs (§15.1.2, §15.1.2.2) still describe the
       thread-per-actor runtime and should be refreshed once this branch is published.
+  - **Stage 4 status (2026-10-19, `apple_silicon_mac` only, same branch, same gate): the dispatch-order
+    policies and the priority levels are real per carrier.** `set_scheduler_policy` has a runtime
+    symbol on the Mac for the first time (`_silica_rt_set_scheduler_policy`, in
+    `prims_actors_carrier_asm.silica`; the emitter's inline `MOV dest, #:ok` is gone), so the `.sams`
+    of every program that calls it changes (the six `scheduler_policy_addition` host `.ascomp` are
+    stale) and the runtime text moves again (every suite's `__silica_runtime.ascomp`); no other trial
+    `.sams` changes. With the gate off the behaviour is stage 3's, plus the two answer changes marked
+    "either gate" below.
+    - *Scope.* One policy word for the process (`_silica_rt_sched_policy`, 0 = `:priority_fifo`),
+      applied by every carrier to its own run queues: the board's rule ("one policy is in force for
+      the whole program and every core applies it to its own ready queues", rt_actors.S), and the
+      specification's reading (`set_scheduler_policy` names no core; §22.10 and §23.1.1 make the
+      priority levels hints to "the per-core scheduler"). "Per carrier" in this item means that each
+      carrier orders its own ready set under the one policy, as each board core does, not that a
+      carrier has a policy of its own; a per-carrier word would need a core argument the call does
+      not have and would make a call from `main` (no carrier) meaningless.
+    - *Storage.* The carrier block is 256 B (128 before): +128 three run queues, 24 B each at
+      +128 + 24 q (q = 0 high, 1 normal, 2 low: head, tail, length), +200 the weighted-fair tier
+      being served, +208 its credit (4 at creation: a round starts at the high tier with its
+      quantum, as a board core's does), +216 the lottery's xorshift64 state; +24/+32, the one
+      queue of stages 1 to 3, are unused. ACB #520 (the stage 3 spare) is the priority level (0
+      low, 1 normal, 2 high), written as 1 right after both `calloc`s (every actor starts at
+      `:normal`, §22.10) and in `_silica_rt_dead_acb`; the layout comments in
+      `prims_actors_runtime_asm.silica` and the carrier header are updated. The three sites that
+      stepped through the table by 128 (`_silica_rt_carrier_adopt`, `_silica_rt_carrier_for_core`,
+      `_silica_rt_carrier_pick_kind`) step by 256.
+    - *Where the policy is read.* Only `_silica_rt_rq_push` (from `_silica_rt_carrier_push`, the
+      one way an actor enters a run queue: mail, a wrapper wake, a started store, a wait-list
+      wake, a stop, a requeue) and `_silica_rt_rq_pop` (from the carrier loop, `Lcar_have`),
+      both under the carrier's lock, which stays a leaf of the stage 2 lock order; the loop's
+      "anything queued" check reads the three heads. Cooperative throughout: a policy orders
+      dispatch and never preempts a running behaviour (spec §15.1.2 yield points).
+
+      | policy | push (the queue the ready actor is appended to) | pop (the actor that runs next) | starvation |
+      | --- | --- | --- | --- |
+      | `:priority_fifo` (default, 0) | its priority tier | the head of the highest-priority non-empty queue; an actor with more mail goes back to the tail of its tier at its dispatch boundary, so a high actor with mail runs before any normal one, a normal before any low one | strict within a carrier: the bound of §22.10 holds only while the higher tiers drain; a program whose high actors always have mail selects `:weighted_fair` or `:lottery` (the board's semantics; `workers_zsched_priority_per_carrier` shows the caveat) |
+      | `:round_robin` (1) | the normal queue, whatever the level | the same scan, so one flat queue in strict arrival order | none |
+      | `:weighted_fair` (2) | its priority tier | deficit round robin over the tiers, quanta high 4 / normal 2 / low 1, a unit cost per dispatch: the tier being served runs its head while it has credit and actors, then the next tier starts with its quantum; an empty tier forfeits it | none: a low actor waits at most 4 + 2 dispatches, a normal one at most 4 + 1 |
+      | `:lottery` (3) | its priority tier | tickets = weight x queued actors per tier (4 / 2 / 1); a xorshift64 draw per carrier (seeded from the clock and the carrier's index at the first draw) picks the tier in proportion, the tier's head runs | none in expectation (a low actor against one busy high actor is drawn with probability 1/5 per dispatch), no hard bound |
+
+      A policy change (any time, from anywhere) takes effect at the next push or pop on every
+      carrier and leaves queued actors where they are, the board's rule: a switch to `:round_robin`
+      first drains what waits in the high and low queues (the pop scan is the same), and every push
+      from then on lands in the normal queue; a switch away from it treats what waits in the flat
+      queue as normal until each actor's next push (`workers_zsched_policy_change_while_ready`
+      derives H N H N H N H N L L L L from exactly this).
+    - *Priority levels.* `set_actor_priority(ref, level)` stores the level in #520 for every
+      actor (an unknown level is normal, as on the board). A carrier actor's level is the tier of
+      its next push and its weight class: an actor already queued stays in the queue it was pushed
+      to (the board's rule; `workers_zsched_priority_change_of_ready_actor` derives
+      H N N N N L L L L H H H). A thread actor's level is also mapped to a pthread QoS class as
+      before (gate off, supervisors, dangerous actors). Answers, either gate: `:ok`;
+      `:actor_not_found` for a null reference and now also for an actor that has ended (the alive
+      flag, as `migrate_actor` and the board check; before, an ended thread actor's dead thread
+      was given a QoS class and `:ok` answered).
+    - *Return atoms.* `set_scheduler_policy` answers `:ok` for the four names and
+      `:invalid_policy` for any other atom, the board's atoms, either gate (the policy word is
+      stored with the gate off and nothing reads it: the four names stay accepted and have no
+      effect, since the OS schedules the threads). The emitter maps the program's atom indices to
+      the codes 0..3 before the call (an atom the program never names gets no compare; the code
+      stays 4, rejected) and the code back to `:ok` / `:invalid_policy` after it
+      (`prims_actors.silica emit_set_scheduler_policy_with_atoms`, the `migrate_actor` pattern;
+      `:invalid_policy` was already interned for the prim by `atom_table.silica`). Consequence
+      for an existing golden: `scheduler_policy_addition/scheduler_policy_names_accepted` now
+      prints `:invalid_policy` / `rejected` on the Mac, the lines of its board golden
+      (`.ESP32-S3_raw.scout`), not of its shared `.scout` (`:ok` / `accepted`, written when the
+      hosted call was a no-op). Not changed here: a `.scout` moves only with Lee's decision; the
+      options are to take the board's lines into the shared `.scout` (the per-target golden then
+      says nothing the shared one does not) or to keep accepting every atom with the gate off,
+      which would make a program's answer depend on an environment variable and is not
+      recommended.
+    - *Trials* (`trials/carriers_addition`, `workers_zsched_*`, on `trial_wait_int64` so that
+      their atoms are numbered after every existing trial's and no `.ascomp` moves; compile
+      order is topological, `trial_support` users first). The order trials put the three actors
+      AND a driver actor on core 1's carrier (`core mod N`: the same carrier at every count) and
+      the driver's one dispatch sets the levels and the policy and queues the twelve casts, so
+      nothing runs before everything is queued, which is what main's casts achieve on the board
+      (core 0 dispatches only when main suspends) and what main's casts cannot achieve on a
+      host (main is a thread; the carrier runs beside it). Their goldens are exact under the
+      gate; with the gate off the actors are threads and the same lines are compared as a
+      multiset: a new marker, `<stem>.scout.ordered_on_carriers`, which the suite's Makefile
+      reads as "in order under `SILICA_CARRIERS=1`, multiset otherwise". `priority_fifo_order`
+      (H H H H N N N N L L L L), `round_robin_order` (L N H ...), `weighted_fair_order`
+      (H H H H N N L N N L L L), `weighted_fair_counts` (eighteen casts; the three reports in the
+      order H, N, L, derived from the quanta), `lottery_all_run` (multiset under either gate),
+      `policy_change_while_ready`, `priority_change_of_ready_actor` (both derived above),
+      `priority_per_carrier` (a high actor feeding itself 100,000 steps on core 1's carrier and a
+      low actor on core 2's: the mark the low actor sends arrives while the high one is still
+      counting when they are on different carriers and exactly at the end of the drain when they
+      share one, `:priority_fifo`; the trial reads which case holds from `actor_carrier_index`,
+      -1 under the gate off counting as independent, so the verdict holds at every count and
+      either gate), `no_starvation_weighted_fair` (the same shape on one carrier: the mark is
+      handled at step 5 of the drain, the verdict asks for at most 8, the spec's bounded number
+      of dispatches; with the gate off, below 100,000), `no_starvation_lottery` (below 100,000
+      under either gate), `policy_names` (the four names, a rejection, a change after it, under
+      either gate). Three front-end facts met on the way, worked around in the trial sources and
+      not fixed: a call in a `case` subject (`case next < k() of`), a `cast(..., v impl
+      ActorMessage {})` in a `case` arm, and `self()` in a `case` arm each answer E2005 "invalid
+      or unsupported case pattern" (the arm's braces and the subject's call confuse the case
+      parser); the trials bind the comparison and `self()` first and cast through a helper.
+    - *Verified 2026-10-19 on the Mac* with the compiler built from this branch (13 s
+      incremental; a gen1 whose own runtime is the installed compiler's, so the gate reaches only
+      the trial processes): `carriers_addition` 80/80 (40 trials, two checks each) at
+      `SILICA_CARRIER_COUNT=1`, 2 and 4 under `SILICA_CARRIERS=1` and 80/80 with the gate off;
+      every hand-derived order golden matched at its first run and the eleven `.ascomp` were
+      recorded from runs whose `.sout` matched. The hammer: each of the eleven new trials run 30
+      times at counts 1, 2 and 4 under the gate and 30 times with it off, compared as the suite
+      compares: 2 failures in 1,320 runs, both `policy_change_while_ready` with the gate off,
+      where the driver's second `print_atom` (after the casts) shared a line with a turn actor's
+      `println` on another thread (`:okturn L`): the known interleaving of thread actors, not a
+      scheduler fault; the print was removed and the trial re-recorded, then 0 failures in 120
+      more runs of it over the four configurations. `scheduler_policy_addition` with the branch
+      compiler, with the gate off and at count 2 under it: the five order and count trials'
+      outputs match their shared `.scout` (multiset), `scheduler_policy_names_accepted`'s does
+      not (`:invalid_policy` / `rejected`, above), and all six `.sams` differ from the host
+      `.ascomp` (the policy call), which are to be refreshed once the `.scout` question is
+      settled. Whether the existing hosted `*_order` trials could now take exact goldens: no, as
+      they stand. Measured over 30 runs each under the gate, `main`'s casts from its own thread
+      race carrier 0's dispatch: at count 2 all three printed the board's order 30/30, at count 1
+      `priority_fifo_order` 28/30 (`N H H H H N N N L L L L`, `L H H H H ...` once each),
+      `weighted_fair_order` 26/30, `round_robin_order` 30/30; the order is the policy's only when
+      every message is queued before the first dispatch, which `main` on a host cannot guarantee.
+      Recommendation: keep their multiset goldens, and take the exact-order fact from the
+      `workers_zsched_*` twins; or, if one source is wanted for both targets, reshape the three
+      trials to the driver-actor form (a driver on the actors' core issues the casts in one
+      dispatch), which is deterministic on the board as well, and then give them exact goldens
+      on every target. The pin/migrate subset of `actors_addition` (`actor_cross_core_call_reply`,
+      `actor_cross_core_cast_stress`, `actor_migrate_and_move`, `identity_cross_core`,
+      `migrate_actor_expression_core`, `actor_builtins_return_ok`) at count 2 under the gate:
+      6/6, every `.sams` unchanged against its `.ascomp`. **Unverified:** the whole of
+      `actors_addition`, `supervisors_addition`, `actor_stacks_addition`,
+      `supervisors_host_defects_addition` and `actor_registration_addition` after stage 4 under
+      either gate (a full run is pending; the runtime text moved, the trial `.sams` did not, so
+      only run-time behaviour can differ); `scheduler_policy_addition` at counts 1 and 4; any
+      Linux target; the compiler compiling itself on carriers (still no gen2).
+    - **Not done in stage 4:** supervisors on carriers; the Linux runtimes (no carriers, no policy
+      symbol: their `set_scheduler_policy` is still the inline `:ok`); materialising the
+      `(int64, affinity_error)` tuple; time (`send_after`, `call_with_timeout`) and any
+      preemption or reduction budget (ROADMAP chunk 11; the port design's §8.10 says why a
+      budget needs a specification change first); the `scheduler_policy_addition` hosted goldens
+      (above); the ROADMAP chunk 2 and port-design §8.10 sentences that call the hosted
+      `set_scheduler_policy` a no-op, to be refreshed when this branch is published.
 
 ## 6. Gate (common)
 
@@ -1537,7 +1680,7 @@ Checked from the hosted runtime source on 2026-10-07 and again on 2026-10-16 (si
 | K | done | `cast_exit` / `wait_for_exit` in the hosted runtimes; trial-verified 2026-10-08 (§5 K) |
 | L | done | `compiler/src/main.silica` (§5 L) |
 | M | done | `trials/lib_trial_support`, `programmer_tools/trial_shape_m` (§5 M) |
-| N | stage 2 built 2026-10-19, `apple_silicon_mac` only, gated off by default (`SILICA_CARRIERS=1`; `SILICA_CARRIER_COUNT=<n>` overrides the core count) | one carrier thread per logical core for plain workers, bound at spawn (`core mod N`, else in turn), per-carrier idle sweep; supervisors, dangerous and registry actors keep threads; §5 N "Stage 2 status" |
+| N | stage 4 built 2026-10-19, `apple_silicon_mac` only, gated off by default (`SILICA_CARRIERS=1`; `SILICA_CARRIER_COUNT=<n>` overrides the core count) | one carrier thread per logical core for plain workers, bound at spawn (`core mod N`, else in turn), per-carrier idle sweep; placement (`migrate_actor`, the `pin_actor_*` family) real on carriers; the four dispatch-order policies and the three priority levels real per carrier; supervisors, dangerous and registry actors keep threads; §5 N "Stage 2", "Stage 3" and "Stage 4 status" |
 | J | done 2026-10-09 | per-image `silica_registry_slots` (one per atom) sizes the three registries and the keyed-form discriminator; duplicates refused per §20.3.1; names removed at teardown (§5 J) |
 
 ## 18. Gate (hosted)

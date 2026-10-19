@@ -1,5 +1,11 @@
 # Makefile for the carrier-thread trials in carriers_addition (actor_memory_budget_plan.md item N,
-# stages 1 to 3; the stage-3 placement trials are the workers_zpin_* ones).
+# stages 1 to 4; the stage-3 placement trials are the workers_zpin_* ones, the stage-4 dispatch-order
+# policy and priority trials the workers_zsched_* ones).
+#
+# A trial marked <base>.scout.ordered_on_carriers prints lines whose order the carrier's dispatch
+# policy defines when the gate is on, and the OS's thread scheduling leaves undefined when it is
+# off: its .scout is compared in order under SILICA_CARRIERS=1 and as a multiset (like a
+# .scout.multiset trial) otherwise.
 #
 # The trial executables run with SILICA_CARRIERS=$(SILICA_CARRIERS) in their environment: 1 (the
 # default here) puts every plain actor on a carrier thread, 0 keeps a thread per actor; the suite
@@ -205,7 +211,9 @@ integrate-run:
 						ko=$$((ko + 1)); failed=1; continue; \
 					fi; \
 				fi; \
-				if [ -f "$$base.scout.multiset" ]; then \
+				multiset=0; [ -f "$$base.scout.multiset" ] && multiset=1; \
+				[ -f "$$base.scout.ordered_on_carriers" ] && [ "$(SILICA_CARRIERS)" != "1" ] && multiset=1; \
+				if [ "$$multiset" = 1 ]; then \
 					if [ -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset.sh" "$$base.sout" "$$base.scout"; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout multiset-compare differs from .scout"; \
 						$(INTEGRATE_DOT_FAIL); \

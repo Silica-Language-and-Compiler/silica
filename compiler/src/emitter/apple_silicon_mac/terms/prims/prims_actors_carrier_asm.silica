@@ -15,7 +15,7 @@
    limitations under the License.
 -}
 
-// Carrier threads (actor_memory_budget_plan.md item N, stages 1 to 3; ROADMAP chunk 2, hosted part).
+// Carrier threads (actor_memory_budget_plan.md item N, stages 1 to 4; ROADMAP chunk 2, hosted part).
 //
 // Behind a process-start gate: `SILICA_CARRIERS=1` in the environment, read once by
 // _silica_rt_stack_runtime_init into _silica_rt_carriers_enabled. Off (the default), every actor is
@@ -25,15 +25,51 @@
 // stage, as do dangerous actors and the runtime's own registry actors), on the BEAM pattern the
 // board already uses per core (rt_actors.S sched_loop / yield_to_sched / make_ready):
 //
-//   - The carrier table (_silica_rt_carriers): N blocks of 128 B, calloc'd at the first adoption
+//   - The carrier table (_silica_rt_carriers): N blocks of 256 B, calloc'd at the first adoption
 //     (_silica_rt_carriers_ensure); a carrier's thread is created the first time an actor is bound
 //     to it (_silica_rt_carrier_ensure_started). A block: +0 lock (os_unfair_lock), +8 futex word
-//     the carrier sleeps on when its run queue is empty, +16 idle (1 while asleep), +24/+32 run
-//     queue head/tail (control blocks linked through ACB #456), +40 the actor being run, +48 the
-//     carrier's base SP, +56 its 64 KB signal alternate stack, +64 pthread_t, +72 started, +80
-//     created, +88/+96 the thread's record (below), +104 the sweep list head (idle
-//     :release_when_idle actors of this carrier still holding committed stack, linked through
-//     ACB #456), +112 the carrier's index, +120 the time of its last sweep.
+//     the carrier sleeps on when its run queues are empty, +16 idle (1 while asleep), +24/+32
+//     unused since stage 4 (the one run queue they held became the three below), +40 the actor
+//     being run, +48 the carrier's base SP, +56 its 64 KB signal alternate stack, +64 pthread_t,
+//     +72 started, +80 created, +88/+96 the thread's record (below), +104 the sweep list head
+//     (idle :release_when_idle actors of this carrier still holding committed stack, linked
+//     through ACB #456), +112 the carrier's index, +120 the time of its last sweep; +128 the
+//     three run queues, one per priority tier, 24 B each at +128 + 24 * q (q = 0 high, 1 normal,
+//     2 low): head, tail (control blocks linked through ACB #456) and length; +200 the
+//     weighted-fair tier being served and +208 its remaining credit; +216 the lottery's xorshift64
+//     state (0 until the first draw); +224..+255 spare.
+//   - Dispatch order (stage 4; the board's rt_actors.S silica_rt_rq_push / _rq_pop, design in
+//     design_documents/ports/esp32s3_xtensa_port.md §8.10): set_scheduler_policy chooses how the
+//     READY actors of one carrier take turns. One policy word for the process
+//     (_silica_rt_sched_policy: 0 :priority_fifo, the default, 1 :round_robin, 2 :weighted_fair,
+//     3 :lottery), applied by every carrier to its own queues, as the board applies one policy per
+//     core: the call names no core and the specification's hints (§22.10, §23.1.1) are per-core
+//     scheduler hints, so "per carrier" means each carrier orders its own ready set under the one
+//     policy, never that a carrier has a policy of its own. The policy decides only which ready
+//     actor runs next: never when a running one stops (nothing preempts between the yield points
+//     of §15.1.2) and never which carrier an actor is on. Only _silica_rt_rq_push (the queue an
+//     actor is appended to: its priority tier, or the normal queue under :round_robin) and
+//     _silica_rt_rq_pop (the queue whose head runs: the highest-priority non-empty one under
+//     :priority_fifo and :round_robin; deficit round robin over the tiers with quanta 4 / 2 / 1
+//     and a unit cost per dispatch under :weighted_fair, an empty tier forfeiting its quantum; a
+//     draw over weight x queued actors tickets, 4 / 2 / 1, under :lottery, the drawn tier's head
+//     running) read the policy, both under the carrier's lock. A policy change takes effect at the
+//     next push or pop on every carrier and leaves queued actors where they are (the board's rule):
+//     a switch to :round_robin first drains what waits in the high and low queues, in the old
+//     order; a switch away from it treats what waits in the flat queue as normal until each actor's
+//     next push. An actor with more mail goes back to the tail of its queue at its dispatch
+//     boundary (_silica_rt_carrier_requeue), so under :priority_fifo a high actor with mail runs
+//     before any normal one and a normal one before any low one, as on the board; the bound of
+//     §22.10 (every actor with mail dispatched within a bounded number of dispatches) holds there
+//     only while the higher tiers drain, and a program whose high actors always have mail selects
+//     :weighted_fair (every tier served each round: a low actor waits at most 4 + 2 dispatches) or
+//     :lottery (a low actor's expected wait is 7 draws, with no bound) for it.
+//   - Priority (stage 4): set_actor_priority stores the level in ACB #520 (0 low, 1 normal, 2
+//     high; every actor starts at normal, written at both calloc sites) for every actor; a carrier
+//     actor's level is the tier it is pushed to and its weight class, read at its next push (a
+//     queued actor stays where it is, as on the board); a thread actor's level is also mapped to a
+//     pthread QoS class as before. Both calls are process-wide and lock nothing of a carrier but
+//     the push and pop sites.
 //   - The thread record: the pthread key (_silica_actor_pthread_key) names a two-word record per
 //     thread, the current actor and the carrier (0 when the thread is not a carrier's). A carrier's
 //     record is in its block (+88, +96 = the block itself) and the carrier writes the current actor
@@ -76,18 +112,19 @@
 //     own; a program that wants BEAM-style balancing moves actors itself. The test-only query
 //     actor_carrier_index(ref) reports the bound carrier's index (-1 for a thread actor).
 //   - ACB fields (prims_actors_runtime_asm.silica layout): #440 the carrier (0 = a thread actor),
-//     #448 status (0 none, 1 idle, 2 ready: in the run queue, 3 running, 4 parked in a runtime
+//     #448 status (0 none, 1 idle, 2 ready: in a run queue, 3 running, 4 parked in a runtime
 //     wait, 5 idle on the carrier's sweep list), #456 run-queue, wait-list or sweep-list link, #464
 //     the SP of a parked context (0 = none), #472 the actor parked in a spawn until this actor has
-//     started, #480 the wait list the actor is parked on, #512 the pending migration target.
+//     started, #480 the wait list the actor is parked on, #512 the pending migration target, #520
+//     the priority level.
 //     Invariant: an actor on a carrier's run queue or sweep list has #440 = that carrier (the push
 //     and the listing read #440 after any pending move is applied, and #440 changes only when the
 //     actor is on neither, under its lock); so a carrier runs only actors bound to it, and every
 //     path that leaves an actor re-enters the loop of the carrier the thread is, read before the
 //     actor's status was published (not #440 afterwards, which a move may have changed).
-//   - Dispatch: the carrier pops a ready actor, writes its record's current actor and enters the
-//     mailbox loop of _actor_thread_main (LBB1_loop) with X19 = the ACB, exactly as that actor's
-//     own thread would. A behaviour runs on the actor's reservation with the carrier's SP kept in
+//   - Dispatch: the carrier pops a ready actor (_silica_rt_rq_pop, the policy's choice), writes its
+//     record's current actor and enters the mailbox loop of _actor_thread_main (LBB1_loop) with
+//     X19 = the ACB, exactly as that actor's own thread would. A behaviour runs on the actor's reservation with the carrier's SP kept in
 //     ACB #368 and returns to the carrier on the dispatch boundary; the release algorithm then runs
 //     on the carrier's stack. After the message the actor is re-queued when more mail waits, else
 //     marked idle (_silica_rt_carrier_mark_idle: on the sweep list when it is :release_when_idle
@@ -150,8 +187,8 @@
 // those are different wrappers from the one a replier holds (an actor cannot reply and die at
 // once), the order that held with one carrier and with none.
 //
-// Not in this stage (actor_memory_budget_plan.md §5 N, "Stage 3 status"): scheduler policies and
-// priorities on carriers (stage 4), supervisors on carriers.
+// Not in this stage (actor_memory_budget_plan.md §5 N, "Stage 4 status"): supervisors on carriers;
+// time (send_after, call_with_timeout) and any preemption (ROADMAP chunk 11).
 
 export emit_actor_carrier_runtime_asm/0;
 
@@ -185,6 +222,9 @@ _silica_rt_pcore_count:
 _silica_rt_pcore_next:
 	.zero	8
 _silica_rt_ecore_next:
+	.zero	8
+	.globl	_silica_rt_sched_policy
+_silica_rt_sched_policy:
 	.zero	8
 	.section	__TEXT,__cstring,cstring_literals
 L_srt_carriers_env:
@@ -267,7 +307,7 @@ Lcad_turn_store:
 	stlxr	w12, x11, [x8]
 	cbnz	w12, Lcad_turn_loop
 Lcad_have_index:
-	add	x20, x21, x9, lsl #7
+	add	x20, x21, x9, lsl #8
 	mov	x0, x20
 	bl	_silica_rt_carrier_ensure_started
 	str	x20, [x19, #440]
@@ -292,9 +332,11 @@ Lcad_ret:
 	.globl	_silica_rt_carriers_ensure
 	.p2align	2
 _silica_rt_carriers_ensure:
-; -> X0 = the carrier table, made the first time: _silica_rt_carrier_count blocks of 128 B (the
+; -> X0 = the carrier table, made the first time: _silica_rt_carrier_count blocks of 256 B (the
 ; count was read by _silica_rt_stack_runtime_init; 1 when it was not), each knowing itself (+96)
-; and its index (+112). Failure to make it is a runtime abort.
+; and its index (+112), its weighted-fair round starting at the high tier with its quantum (+200
+; = 0 from calloc, +208 = 4, as the board's core block starts). Failure to make it is a runtime
+; abort.
 	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -316,18 +358,20 @@ _silica_rt_carriers_ensure:
 	str	x20, [x8]
 Lcen_have_count:
 	mov	x0, x20
-	mov	x1, #128
+	mov	x1, #256
 	bl	_calloc
 	cbz	x0, Lcen_failed
 	mov	x21, x0
 	mov	x9, x0
 	mov	x10, xzr
+	mov	x11, #4
 Lcen_fill:
 	cmp	x10, x20
 	b.hs	Lcen_filled
 	str	x9, [x9, #96]
 	str	x10, [x9, #112]
-	add	x9, x9, #128
+	str	x11, [x9, #208]
+	add	x9, x9, #256
 	add	x10, x10, #1
 	b	Lcen_fill
 Lcen_filled:
@@ -488,8 +532,12 @@ Lcar_loop:
 	mov	x0, x19
 	bl	_os_unfair_lock_lock
 Lcar_pop:
-	ldr	x20, [x19, #24]
-	cbz	x20, Lcar_empty
+	ldr	x9, [x19, #128]
+	ldr	x10, [x19, #152]
+	orr	x9, x9, x10
+	ldr	x10, [x19, #176]
+	orr	x9, x9, x10
+	cbz	x9, Lcar_empty
 ; A busy carrier sweeps its idle :release_when_idle actors at most every quarter second.
 	ldr	x9, [x19, #104]
 	cbz	x9, Lcar_have
@@ -516,13 +564,10 @@ Lcar_empty:
 	str	xzr, [x19, #16]
 	b	Lcar_pop
 Lcar_have:
-	ldr	x20, [x19, #24]
-	ldr	x9, [x20, #456]
-	str	x9, [x19, #24]
-	cbnz	x9, Lcar_have_tail
-	str	xzr, [x19, #32]
-Lcar_have_tail:
-	str	xzr, [x20, #456]
+; The policy's choice among the ready actors (some queue is non-empty, checked under this lock).
+	mov	x0, x19
+	bl	_silica_rt_rq_pop
+	mov	x20, x0
 	mov	x0, x19
 	bl	_os_unfair_lock_unlock
 	mov	x9, #3
@@ -607,10 +652,11 @@ Lcap_ret:
 	.p2align	2
 _silica_rt_carrier_push:
 ; X0 = a carrier actor whose status its caller has just set to ready (2), under the lock that guards
-; that status. Appends it to its own carrier's run queue (#440: the caller may be anywhere) and
-; wakes that carrier when it sleeps. A pending migration is not applied here: a parked actor
-; resumes on the carrier it parked on, inside the same dispatch (spec §15.1.2, scheduler yield
-; points), and moves at its dispatch boundary (_silica_rt_carrier_requeue).
+; that status. Appends it to the run queue of its own carrier (#440: the caller may be anywhere)
+; that the policy chooses (_silica_rt_rq_push) and wakes that carrier when it sleeps. A pending
+; migration is not applied here: a parked actor resumes on the carrier it parked on, inside the
+; same dispatch (spec §15.1.2, scheduler yield points), and moves at its dispatch boundary
+; (_silica_rt_carrier_requeue).
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -619,14 +665,9 @@ _silica_rt_carrier_push:
 	str	xzr, [x20, #456]
 	mov	x0, x19
 	bl	_os_unfair_lock_lock
-	ldr	x9, [x19, #32]
-	cbz	x9, Lcpu_empty
-	str	x20, [x9, #456]
-	b	Lcpu_tail
-Lcpu_empty:
-	str	x20, [x19, #24]
-Lcpu_tail:
-	str	x20, [x19, #32]
+	mov	x0, x19
+	mov	x1, x20
+	bl	_silica_rt_rq_push
 	ldr	x9, [x19, #16]
 	cbz	x9, Lcpu_unlock
 	add	x0, x19, #8
@@ -1402,7 +1443,7 @@ _silica_rt_carrier_for_core:
 	ldr	x10, [x8]
 	udiv	x11, x19, x10
 	msub	x9, x11, x10, x19
-	add	x0, x0, x9, lsl #7
+	add	x0, x0, x9, lsl #8
 	ldr	x19, [sp, #16]
 	ldp	x29, x30, [sp], #32
 	ret
@@ -1532,7 +1573,7 @@ Lcpk_turn_store:
 Lcpk_turn_in_range:
 	add	x19, x14, x12
 	bl	_silica_rt_carriers_ensure
-	add	x0, x0, x19, lsl #7
+	add	x0, x0, x19, lsl #8
 	b	Lcpk_ret
 Lcpk_stay:
 	mov	x0, xzr
@@ -1610,6 +1651,208 @@ _silica_rt_ctx_resume:
 "
 }
 
+// The run queues and the dispatch-order policy (stage 4; the board's silica_rt_rq_push / _rq_take /
+// _rq_pop and silica_rt_set_scheduler_policy, rt_actors.S). Every function here is entered with
+// the carrier's lock held, except _silica_rt_set_scheduler_policy, which holds nothing.
+fn carrier_asm_run_queues() -> string {
+    "	.globl	_silica_rt_rq_push
+	.p2align	2
+_silica_rt_rq_push:
+; X0 = a carrier (its lock held), X1 = an actor its caller has made ready (status 2). Appends it
+; to the tail of the queue the policy chooses: the actor's priority tier (ACB #520: 0 low, 1
+; normal, 2 high -> queue 2 - level; a level above 2, never stored, counts as normal) or, under
+; :round_robin (1), the normal queue, whatever the level, so ready actors run in arrival order.
+	adrp	x8, _silica_rt_sched_policy@PAGE
+	add	x8, x8, _silica_rt_sched_policy@PAGEOFF
+	ldr	x9, [x8]
+	cmp	x9, #1
+	b.eq	Lrqp_normal
+	ldr	x9, [x1, #520]
+	cmp	x9, #2
+	b.hi	Lrqp_normal
+	mov	x10, #2
+	sub	x9, x10, x9
+	b	Lrqp_have_q
+Lrqp_normal:
+	mov	x9, #1
+Lrqp_have_q:
+	mov	x10, #24
+	madd	x9, x9, x10, x0
+	add	x9, x9, #128
+	ldr	x10, [x9, #16]
+	add	x10, x10, #1
+	str	x10, [x9, #16]
+	str	xzr, [x1, #456]
+	ldr	x10, [x9, #8]
+	cbz	x10, Lrqp_empty
+	str	x1, [x10, #456]
+	str	x1, [x9, #8]
+	ret
+Lrqp_empty:
+	str	x1, [x9]
+	str	x1, [x9, #8]
+	ret
+	.globl	_silica_rt_rq_take
+	.p2align	2
+_silica_rt_rq_take:
+; X0 = a carrier (its lock held), X1 = a queue index whose queue is not empty -> X0 = that queue's
+; head, taken off it (its link cleared).
+	mov	x10, #24
+	madd	x9, x1, x10, x0
+	add	x9, x9, #128
+	ldr	x0, [x9]
+	ldr	x10, [x0, #456]
+	str	x10, [x9]
+	cbnz	x10, Lrqt_len
+	str	xzr, [x9, #8]
+Lrqt_len:
+	ldr	x10, [x9, #16]
+	sub	x10, x10, #1
+	str	x10, [x9, #16]
+	str	xzr, [x0, #456]
+	ret
+	.globl	_silica_rt_rq_pop
+	.p2align	2
+_silica_rt_rq_pop:
+; X0 = a carrier (its lock held) -> X0 = the next actor to run under the policy in force, 0 when
+; every queue is empty.
+;   :priority_fifo (0), and :round_robin (1), whose pushes all land in the normal queue: the head
+;   of the highest-priority non-empty queue.
+;   :weighted_fair (2): deficit round robin. The tier being served (+200) runs its head while it
+;   has credit (+208) and actors, a unit cost per dispatch; otherwise the next tier starts with
+;   its quantum (high 4, normal 2, low 1), an empty tier forfeiting its turn (DRR zeroes the
+;   deficit of an idle queue). Some queue is non-empty, so at most three tier changes reach a
+;   tier that runs.
+;   :lottery (3): tickets = weight x actors queued, per tier, the same weights; a draw in
+;   [0, total) picks the tier in proportion to its tickets and the tier's head runs. The
+;   generator is a xorshift64 (Marsaglia 2003: 13, 7, 17) per carrier (+216, under this lock),
+;   seeded from the clock and the carrier's index at the first draw, kept non-zero; nothing of
+;   cryptographic strength is needed.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	adrp	x8, _silica_rt_sched_policy@PAGE
+	add	x8, x8, _silica_rt_sched_policy@PAGEOFF
+	ldr	x9, [x8]
+	cmp	x9, #2
+	b.eq	Lrqo_wf
+	cmp	x9, #3
+	b.eq	Lrqo_lottery
+	mov	x1, xzr
+Lrqo_scan:
+	mov	x10, #24
+	madd	x9, x1, x10, x19
+	ldr	x9, [x9, #128]
+	cbnz	x9, Lrqo_take
+	add	x1, x1, #1
+	cmp	x1, #3
+	b.lo	Lrqo_scan
+	mov	x0, xzr
+	b	Lrqo_ret
+Lrqo_take:
+	mov	x0, x19
+	bl	_silica_rt_rq_take
+	b	Lrqo_ret
+Lrqo_wf:
+	ldr	x9, [x19, #128]
+	ldr	x10, [x19, #152]
+	orr	x9, x9, x10
+	ldr	x10, [x19, #176]
+	orr	x9, x9, x10
+	cbnz	x9, Lrqo_wf_have
+	mov	x0, xzr
+	b	Lrqo_ret
+Lrqo_wf_have:
+	ldr	x1, [x19, #200]
+	ldr	x2, [x19, #208]
+Lrqo_wf_try:
+	mov	x10, #24
+	madd	x9, x1, x10, x19
+	ldr	x9, [x9, #128]
+	cbz	x9, Lrqo_wf_next
+	cbz	x2, Lrqo_wf_next
+	sub	x2, x2, #1
+	str	x1, [x19, #200]
+	str	x2, [x19, #208]
+	b	Lrqo_take
+Lrqo_wf_next:
+	add	x1, x1, #1
+	cmp	x1, #3
+	b.lo	Lrqo_wf_quantum
+	mov	x1, xzr
+Lrqo_wf_quantum:
+	mov	x2, #4
+	cbz	x1, Lrqo_wf_try
+	mov	x2, #2
+	cmp	x1, #1
+	b.eq	Lrqo_wf_try
+	mov	x2, #1
+	b	Lrqo_wf_try
+Lrqo_lottery:
+	ldr	x9, [x19, #216]
+	cbnz	x9, Lrqo_lot_seeded
+	bl	_silica_rt_stack_now_ns
+	ldr	x9, [x19, #112]
+	add	x9, x9, #1
+	eor	x0, x0, x9, lsl #32
+	orr	x0, x0, #1
+	str	x0, [x19, #216]
+Lrqo_lot_seeded:
+	ldr	x11, [x19, #144]
+	lsl	x11, x11, #2
+	ldr	x12, [x19, #168]
+	lsl	x12, x12, #1
+	ldr	x13, [x19, #192]
+	add	x14, x11, x12
+	add	x14, x14, x13
+	cbnz	x14, Lrqo_lot_draw
+	mov	x0, xzr
+	b	Lrqo_ret
+Lrqo_lot_draw:
+	ldr	x9, [x19, #216]
+	eor	x9, x9, x9, lsl #13
+	eor	x9, x9, x9, lsr #7
+	eor	x9, x9, x9, lsl #17
+	str	x9, [x19, #216]
+	udiv	x10, x9, x14
+	msub	x9, x10, x14, x9
+	mov	x1, xzr
+	cmp	x9, x11
+	b.lo	Lrqo_take
+	sub	x9, x9, x11
+	mov	x1, #1
+	cmp	x9, x12
+	b.lo	Lrqo_take
+	mov	x1, #2
+	b	Lrqo_take
+Lrqo_ret:
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_set_scheduler_policy
+	.p2align	2
+_silica_rt_set_scheduler_policy:
+; set_scheduler_policy(policy): X0 = the policy code (0 :priority_fifo, 1 :round_robin, 2
+; :weighted_fair, 3 :lottery; the emitter maps the program's atoms to the codes and the result
+; back, prims_actors emit_set_scheduler_policy_with_atoms) -> X0 = 0 (:ok) or 1 (:invalid_policy:
+; any other code, the policy unchanged). One word for the process, read by every carrier at its
+; next push or pop (this module's header says what happens to actors already queued). With the
+; gate off the word is stored and nothing reads it: the four names are accepted and have no
+; effect, since the OS schedules the actor threads.
+	cmp	x0, #4
+	b.hs	Lssp_invalid
+	adrp	x8, _silica_rt_sched_policy@PAGE
+	add	x8, x8, _silica_rt_sched_policy@PAGEOFF
+	stlr	x0, [x8]
+	mov	x0, xzr
+	ret
+Lssp_invalid:
+	mov	x0, #1
+	ret
+"
+}
+
 fn emit_actor_carrier_runtime_asm() -> string {
-    concat(concat(concat(concat(concat(carrier_asm_data(), carrier_asm_adopt()), carrier_asm_loop()), carrier_asm_wakes()), carrier_asm_placement()), carrier_asm_context())
+    concat(concat(concat(concat(concat(concat(carrier_asm_data(), carrier_asm_adopt()), carrier_asm_loop()), carrier_asm_wakes()), carrier_asm_placement()), carrier_asm_run_queues()), carrier_asm_context())
 }

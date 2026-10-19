@@ -767,15 +767,6 @@ fn release_algorithm_index(lexeme: string) -> int64 {
     }
 }
 
-// set_scheduler_policy(policy) -> :ok. A hosted runtime has no ready queue of its own to order
-// (actors are threads the OS schedules), so the per-core dispatch-order policy of the ESP32-S3_raw
-// runtime has nothing to select here: the call is accepted and answers :ok (index 2 of the fixed atom
-// prefix, atoms/atom_table.silica), as pin_actor_to_efficiency_core is a no-op on a board whose cores
-// are alike. The argument (X9) is not read.
-fn emit_set_scheduler_policy_noop(dest: string) -> string {
-    concat(concat("    MOV ", gpr_x_view(dest)), ", #2\n")
-}
-
 fn emit_stack_policy(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
     alg: int64 <- release_algorithm_index(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).value);
     pack: string <- concat(concat("    ADD X9, X9, #15\n    AND X9, X9, #0xfffffffffffffff0\n    MOV X10, #", atom_table@int64_to_decimal_string(alg)), "\n    ORR X9, X9, X10\n");
@@ -856,6 +847,7 @@ fn runtime_label(name: string) -> string {
         "pin_actor_to_numa_node" -> "_silica_rt_pin_actor_to_numa_node";
         "unpin_actor" -> "_silica_rt_unpin_actor";
         "set_actor_priority" -> "_silica_rt_set_actor_priority";
+        "set_scheduler_policy" -> "_silica_rt_set_scheduler_policy";
         "get_actor_memory_usage" -> "_silica_rt_get_actor_memory_usage";
         "migrate_actor" -> "_silica_rt_migrate_actor";
         "start_child" -> "_silica_rt_supervisor_start_child";
@@ -979,6 +971,32 @@ fn emit_set_actor_priority_with_atoms(term: { nodes: List[{ kind: int64, type_na
     concat(concat(concat(to_code, call_asm), map_asm), concat(concat("    MOV ", gpr_x_view(dest)), ", X12\n"))
 }
 
+// set_scheduler_policy(policy) -> :ok | :invalid_policy: the order in which the ready actors of one
+// carrier are dispatched (actor_memory_budget_plan.md item N stage 4; the policies are the ESP32-S3_raw
+// runtime's, design_documents/ports/esp32s3_xtensa_port.md §8.10). The policy atom arrives in X9; the
+// runtime takes a code (0 :priority_fifo, 1 :round_robin, 2 :weighted_fair, 3 :lottery, anything else
+// rejected) and answers 0 :ok or 1 :invalid_policy, so this site maps the program's atom indices to
+// the codes before the call and the code back to an atom after it, as the ESP32-S3_raw emitter does.
+// An atom the program never names has index -1 and gets no compare (X9 cannot hold it); the code
+// then stays 4, rejected. With the carrier gate off the runtime stores the policy and nothing reads
+// it (the OS schedules the actor threads); the answer is the same either way.
+fn policy_atom_to_code(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, lexeme: string, code: int64) -> string {
+    idx: int64 <- atom_table@atom_lexeme_to_index(table, lexeme);
+    case idx < 0 of {
+        true -> "";
+        false -> select_eq("X0", imm_of_index(code), "X9", imm_of_index(idx))
+    }
+}
+
+fn emit_set_scheduler_policy_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
+    inv_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":invalid_policy");
+    to_code: string <- concat("    MOV X0, #4\n", concat(concat(policy_atom_to_code(table, ":priority_fifo", 0), policy_atom_to_code(table, ":round_robin", 1)), concat(policy_atom_to_code(table, ":weighted_fair", 2), policy_atom_to_code(table, ":lottery", 3))));
+    call_asm: string <- asm_bl(runtime_label("set_scheduler_policy"));
+    map_asm: string <- concat(concat("    MOV X12, #", concat(atom_table@int64_to_decimal_string(ok_idx), "\n")), select_eq_idx("X12", inv_idx, "X0", "#1"));
+    concat(concat(concat(to_code, call_asm), map_asm), concat(concat("    MOV ", gpr_x_view(dest)), ", X12\n"))
+}
+
 fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, outer_reg: string) -> string {
     ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
     case sir_term_root_node(term).name of {
@@ -987,9 +1005,7 @@ fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string,
         "register_failure_reporter" -> emit_register_failure_reporter(dest, term, caller_module_from_outer_reg(outer_reg));
         "migrate_actor" -> emit_migrate_actor_with_atoms(term, dest, table);
         "set_actor_priority" -> emit_set_actor_priority_with_atoms(term, dest, table);
-        // set_scheduler_policy(policy) -> :ok: a hosted runtime has no ready queue of its own to order
-        // (actors are threads the OS schedules), so the policy is accepted and :ok answered.
-        "set_scheduler_policy" -> concat(concat("    MOV ", gpr_x_view(dest)), concat(", #", concat(atom_table@int64_to_decimal_string(ok_idx), "\n")));
+        "set_scheduler_policy" -> emit_set_scheduler_policy_with_atoms(term, dest, table);
         _: string -> case always_ok_prim(sir_term_root_node(term).name) of {
             true -> concat(emit_prim_op(term, dest), concat(concat("    MOV ", gpr_x_view(dest)), concat(", #", concat(atom_table@int64_to_decimal_string(ok_idx), "\n"))));
             false -> emit_prim_op(term, dest)
@@ -1044,7 +1060,7 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "pin_actor_to_numa_node" -> emit_runtime_binary(dest, term);
         "unpin_actor" -> emit_runtime_unary(dest, term);
         "set_actor_priority" -> emit_runtime_binary(dest, term);
-        "set_scheduler_policy" -> emit_set_scheduler_policy_noop(dest);
+        "set_scheduler_policy" -> emit_runtime_unary(dest, term);
         "get_actor_memory_usage" -> emit_runtime_unary(dest, term);
         "migrate_actor" -> emit_runtime_binary(dest, term);
         "start_child" -> emit_runtime_unary(dest, term);
