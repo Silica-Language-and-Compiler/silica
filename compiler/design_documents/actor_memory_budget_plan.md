@@ -1662,6 +1662,35 @@ What stands between today and millions, in order: the carriers (the thread per a
 and address space per actor once there are no threads, the registry, and the ACB. The stack mechanism itself
 is already in the form millions needs: nothing committed at spawn and release at the message boundary.
 
+### Measured 2026-10-19: carriers (step 4)
+
+Apple Silicon Mac, 10 logical cores, 16 GB, branch `hosted-carriers-item-n` (HEAD 732fcea93), the branch compiler.
+Program: the `docs/examples/idle_actor_capacity` shape bounded at T, each spawned actor sent one message right
+after spawn, reserve 65536 with `:release_when_idle` unless noted. RSS is `ps -o rss=` three seconds after the
+total line; regions come from `footprint`/`vmmap` of the whole process. Carriers: `SILICA_CARRIERS=1` (10 carriers).
+
+| Configuration | T | Wall s | RSS MB | B/actor | Threads | Regions | Regions/actor | Outcome |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| carriers | 1,000 | 0.21 | 2.5 | 2,605 | 14 | 3,130 | 2.8 (baseline included) | clean |
+| carriers | 10,000 | 0.34 | 8.8 | 918 | 14 | 21,133 | 2.1 | clean |
+| carriers | 100,000 | 2.73 / 2.41 | 68.3 / 68.3 | 716 / 716 | 14 | 201,149 | 2.0 | clean (twice); polled RSS peaked at 811 MB, footprint peak 856-878 MB |
+| carriers, `:release_on_return` | 100,000 | 0.86 | 68.7 | 720 | 14 | 200,214 | 2.0 | clean; footprint peak 68.5 MB |
+| carriers, `:release_on_return` | 1,000,000 | 6.17 | 630 | 661 | 14 | 1,999,370 | 2.0 | clean; footprint peak equals final |
+| thread per actor | 1,000 | 0.02 | 33.4 | 35,062 | 1,006 | 5,275 | 5.3 | clean |
+| thread per actor | 10,000 | n/a | 196 at kill | n/a | n/a | n/a | n/a | failure report from the spawner after 4,000 actors (`kern.num_taskthreads` is 4096) |
+
+Marginal cost under carriers is about 650-700 B per actor (the 512 B ACB plus malloc rounding and the message),
+not the 2.6 KB of the 1,000 stage, which is mostly the fixed process baseline. Two mappings per actor remain
+(the reservation), no thread and no alt stack per actor; threads are constant at 14. The thread-per-actor path
+stops at the per-task thread limit of 4,096 on this host (4,000 actors), so the earlier README figure of
+411,000 thread-backed actors in 2 s (never of this build, with no cast per actor) does not reproduce here and is unexplained.
+`:release_when_idle` commits stacks at first dispatch and the idle sweep gives them back only later: at 100,000
+the transient peak is about 8 KB per actor (about 850 MB) before settling at 68 MB, so a million under that
+policy was not run (extrapolated peak about 8.5 GB); `:release_on_return` has no transient. The
+`get_actor_memory_usage` probe was not taken: `whereis` is not a function in this compiler (E2007), and the
+actor ref is not otherwise reachable after the spawner returns. Zero committed stack is inferred from the
+RSS figures only (608 MB dirty at a million, about 640 B per actor).
+
 ## 17. Hosted status per work item
 
 Checked from the hosted runtime source on 2026-10-07 and again on 2026-10-16 (sizes and K, L, M, N); none of the hosted trials were re-run for this plan.
