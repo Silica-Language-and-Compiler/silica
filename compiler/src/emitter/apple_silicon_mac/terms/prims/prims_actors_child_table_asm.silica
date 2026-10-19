@@ -34,19 +34,26 @@
 // wait and no party clears what another still waits for.
 // Phase E e3f tombstone: child_ref==0 means inactive; len stays high-water for :rest_for_one ordering.
 //
-// The restart protocol (one for the supervisor's own thread, a draining caller and parked carrier
+// The restart protocol (one for the supervisor's own dispatch, a draining caller and parked carrier
 // actors; prims_actors_carrier_asm.silica holds the primitives): the supervision block's restart
 // token (#120) has one holder at a time; only the holder dequeues the ingress and runs
-// maybe_restart, so no two cascades overlap. The supervisor's thread takes it as it dequeues a
-// notice (LBB1_wait) and skips the ingress while another holder has it (the release signals its
-// mailbox when notices remain). A dying row child on its own thread handles only its own notice,
-// and only when it is first (_silica_rt_supervisor_drain_own_exit); it never waits in its exit path.
-// Every other drainer (kill_abnormal, the call_supervisor operations) goes through
+// maybe_restart, so no two cascades overlap. The supervisor is a carrier actor (every actor but a
+// dangerous one is): its own dispatch takes the token as it dequeues a notice (LBB1_wait), serves the
+// notice in the behaviour's place on its own stack (LBB1_ingress_no_beh: maybe_restart, whose
+// cascade waits and respawn waits park the supervisor while its carrier runs on, the stopped
+// siblings and the new children among them, on this or any carrier), and releases the token when
+// the node is served; it skips the ingress while another holder has the token (the release signals
+// its mailbox when notices remain). A dying carrier actor never drains anything in its exit path
+// (its supervisor's dispatch restarts it); a dying DANGEROUS row child, on its own thread, handles
+// only its own notice, and only when it is first (_silica_rt_supervisor_drain_own_exit), and never
+// waits in its exit path. Every other drainer (kill_abnormal, the call_supervisor operations, a
+// supervisor replying to a call from its standard mailbox) goes through
 // _silica_rt_supervisor_drain_ingress / _drain_hold: a row child of the supervisor never takes the
 // token (the cascade it would run could stop the child itself) but waits until the token is free and
 // the ingress empty; every stop goes through _silica_rt_actor_stop, which also ends a wait the
 // stopped actor is parked or spinning in (a killer stopped by the cascade of the death it caused
-// returns from kill_abnormal at once).
+// returns from kill_abnormal at once). Exactly one cascade holder at a time, with parks where the
+// thread-per-actor runtime blocked.
 
 use atom_table;
 use prims_list;
@@ -131,10 +138,12 @@ Lct_free_none:
 ; ends at its next dispatch boundary in both cases: a dispatch in progress runs to completion, and
 ; the shutdown time is not enforced. The wait is for the row's exit_done, the child's last act, so
 ; its registered name (§20.3.1) is gone before this returns and a restarted supervisor can register
-; its children again. It runs only on the supervisor's own thread (its exit path: deliver_exit, and
-; again, idempotent, child_table_free; maybe_restart's synchronous root report): a wait for the
-; children on another thread could wait on that thread's own actor. A row holding the running
-; actor itself is skipped all the same. The block
+; its children again. It runs only as the supervisor's own dispatch, on the supervisor's own stack
+; (its exit path: deliver_exit, and again, idempotent, child_table_free; maybe_restart's
+; synchronous root report, _silica_rt_sup_on_own_dispatch), where the wait for each child parks
+; the supervisor and its carrier runs on (a child bound to the same carrier can only end that
+; way): a wait on another actor's stack could wait on that actor itself. A row holding the
+; running actor itself is skipped all the same. The block
 ; is held (#112) for the walk, so the rows outlive a concurrent teardown of the supervisor.
 	.globl	_silica_rt_sup_shutdown_children
 	.p2align	2
@@ -381,7 +390,8 @@ fn child_table_rt_spawn_child_row_by_flavor_asm(danger_idx: int64) -> string {
         true -> "";
         false -> concat(concat("	ldr	x9, [x19, #64]\n	cmp	x9, #", atom_table@int64_to_decimal_string(danger_idx)), "\n	b.eq	Lsscr_register_dangerous\n")
     };
-    // X6 of the spawn: 1 for a :dangerous row (it keeps a thread under carriers, item N stage 1).
+    // X6 of the spawn: 1 for a :dangerous row (it keeps a thread of its own; every other row child is
+    // a carrier actor, item N).
     danger_flag: string <- case danger_idx < 0 of {
         true -> "	mov	x6, xzr\n";
         false -> concat(concat("	ldr	x9, [x19, #64]\n	cmp	x9, #", atom_table@int64_to_decimal_string(danger_idx)), "\n	cset	x6, eq\n")
@@ -790,10 +800,10 @@ Lsdrain_empty:
 ; _silica_rt_supervisor_drain_ingress(X0 = supervisor, X1 = the actor draining; 0 = main): the
 ; restart protocol's entry for everyone but the supervisor's own thread and a dying row child. The
 ; restart token (block #120, _silica_rt_sup_restart_acquire) is taken, every notice is dequeued and
-; handled, and the token is released: a notice that arrives after that is the supervisor's thread's
-; (signalled at the enqueue and again by the release). A row child of this supervisor never takes
-; the token (the cascade it would run could stop the child itself): it waits until the token is
-; free and the ingress empty, so the supervisor's thread does the restarts. Returns when every
+; handled, and the token is released: a notice that arrives after that is the supervisor's own
+; dispatch's (signalled at the enqueue and again by the release). A row child of this supervisor
+; never takes the token (the cascade it would run could stop the child itself): it waits until the
+; token is free and the ingress empty, so the supervisor's dispatch does the restarts. Returns when every
 ; notice that was in the ingress at entry has been handled by some holder, or at once when the
 ; supervisor has ended or the draining actor was ended meanwhile.
 _silica_rt_supervisor_drain_ingress:
@@ -853,13 +863,13 @@ Lsdh_ret:
 	ldp	x29, x30, [sp], #32
 	ret
 	.cfi_endproc
-; _silica_rt_supervisor_drain_own_exit(X0 = supervisor, X1 = a row child in its exit path, on its
-; own thread): the child restarts itself when it can. If the token is free and its own exit notice
-; is the first in the ingress, it takes the token, handles that one notice (maybe_restart: under
-; :one_for_all or :rest_for_one the cascade stops its siblings, never its own row, and respawns
-; them) and releases. Otherwise it leaves the ingress to the supervisor's thread: another holder is
-; at work, or notices precede its own and a restart it ran could stop this very actor. A carrier
-; actor never comes here (its exit path cannot wait).
+; _silica_rt_supervisor_drain_own_exit(X0 = supervisor, X1 = a DANGEROUS row child in its exit path,
+; on its own thread): the child restarts itself when it can. If the token is free and its own exit
+; notice is the first in the ingress, it takes the token, handles that one notice (maybe_restart:
+; under :one_for_all or :rest_for_one the cascade stops its siblings, never its own row, and
+; respawns them) and releases. Otherwise it leaves the ingress to the supervisor's own dispatch:
+; another holder is at work, or notices precede its own and a restart it ran could stop this very
+; actor. A carrier actor never comes here: its supervisor's dispatch restarts it.
 _silica_rt_supervisor_drain_own_exit:
 	.cfi_startproc
 	stp	x29, x30, [sp, #-48]!
@@ -1161,17 +1171,17 @@ Lmr_freq_escalate:
 ; observe alive==0, take LBB1_exit, and emit a duplicate root failure banner/note.
 	ldr	x8, [x20, #192]
 	cbnz	x8, Lmr_freq_escalate_mark_dead
-; The synchronous report (children shut down first) is made only on the supervisor's own thread.
-; Elsewhere (a dying child draining the ingress in its exit path, a kill_abnormal or call_supervisor
-; caller) the wait for the children could wait on this very thread: a child blocked in kill_abnormal
-; waits for the dying child's exit_done. The supervisor is then only marked ended; its own exit path
-; shuts the children down and reports (deliver_exit, as for any root actor).
-; The test is the thread, not the current actor: a drain on another thread runs this with the
-; supervisor installed as the current actor (supervisor_drain_ingress). ACB #144 is the thread.
-	bl	_pthread_self
-	ldr	x8, [x20, #144]
-	cmp	x0, x8
-	b.ne	Lmr_freq_escalate_mark_dead
+; The synchronous report (children shut down first) is made only by the supervisor's own dispatch,
+; on its own stack. Elsewhere (a dying dangerous child draining the ingress in its exit path, a
+; kill_abnormal or call_supervisor caller) the wait for the children could wait on the drainer
+; itself: a child blocked in kill_abnormal waits for the dying child's exit_done. The supervisor
+; is then only marked ended; its own exit path shuts the children down and reports (deliver_exit,
+; as for any root actor). The test is the carrier's running actor, not the thread's current
+; actor: a drain on another actor's stack runs this with the supervisor installed as the current
+; actor (supervisor_drain_ingress). _silica_rt_sup_on_own_dispatch, prims_actors_carrier_asm.
+	mov	x0, x20
+	bl	_silica_rt_sup_on_own_dispatch
+	cbz	x0, Lmr_freq_escalate_mark_dead
 	ldr	x8, [x27, #40]
 	cbnz	x8, Lmr_freq_escalate_mark_dead
 	mov	x8, #1
@@ -1234,7 +1244,8 @@ Lmr_ofa_kill_at_idx:
 	cbz	x27, Lmr_ofa_kill_next
 ; Sequential stop (spec §15.4.12.2): the sibling is ended (reason kept: the supervisor's own stop)
 ; and this row's exit_done is waited for, with the identity read before the stop (row +112), so
-; two teardowns never overlap; a carrier actor draining the ingress parks for it, a thread spins
+; two teardowns never overlap; the supervisor in its own dispatch, or a carrier actor draining the
+; ingress, parks for it on its own stack; main and a dangerous actor's thread spin
 ; (prims_actors_carrier_asm.silica, _silica_rt_row_wait). The holder of the restart token is never
 ; a row this cascade stops (child_table header), so the wait cannot be for the holder itself.
 	ldr	x28, [x26, #112]
@@ -2127,11 +2138,10 @@ _silica_rt_supervisor_fail_duplicate_child_id:
 	mov	x20, #0
 	ldr	x8, [x19, #192]
 	cbnz	x8, Lfdc_mark_dead
-; The synchronous report only on the supervisor's own thread (maybe_restart, Lmr_freq_escalate).
-	bl	_pthread_self
-	ldr	x8, [x19, #144]
-	cmp	x0, x8
-	b.ne	Lfdc_mark_dead
+; The synchronous report only as the supervisor's own dispatch (maybe_restart, Lmr_freq_escalate).
+	mov	x0, x19
+	bl	_silica_rt_sup_on_own_dispatch
+	cbz	x0, Lfdc_mark_dead
 	ldr	x9, [x19, #216]
 	cbz	x9, Lfdc_mark_dead
 	ldr	x8, [x9, #40]

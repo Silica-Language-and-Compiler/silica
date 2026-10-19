@@ -45,13 +45,13 @@
 // zero at the start of every message (fresh pages are zero and the runtime zeroes what a message used
 // before the next one), so the lowest page holding a nonzero word after the behavior returns is the
 // message's depth. The scan costs the untouched pages, which are exactly the ones about to be released.
-// :release_when_idle has no carrier thread to sweep for it in this thread-per-actor runtime: the actor's
-// own mailbox wait carries a one-second timeout while it holds committed stack, and releases on expiry.
-// (Under SILICA_CARRIERS=1, item N stage 1, a carrier actor has no such wait and no sweep yet: its
-// stack is released at its next message boundary instead.)
+// :release_when_idle: a carrier actor is swept by its carrier (prims_actors_carrier_asm.silica,
+// _silica_rt_carrier_sweep) a second after its last message; a dangerous actor, on a thread of its own,
+// waits for mail with a one-second timeout while it holds committed stack and releases on expiry
+// (_silica_rt_stack_idle_check, the same check the sweep makes).
 //
-// _silica_rt_stack_runtime_init also reads the carrier gate: SILICA_CARRIERS=1 in the environment sets
-// _silica_rt_carriers_enabled (prims_actors_carrier_asm.silica). The emitted text is the same either way.
+// _silica_rt_stack_runtime_init also reads the carrier count (SILICA_CARRIER_COUNT, else the machine's
+// logical cores) and the machine's core counts (prims_actors_carrier_asm.silica).
 
 use atom_table;
 
@@ -145,23 +145,9 @@ Lsri_have_total:
 	adrp	x8, _silica_rt_stack_default_reserve@PAGE
 	add	x8, x8, _silica_rt_stack_default_reserve@PAGEOFF
 	str	x9, [x8]
-; The carrier gate (item N stage 1): SILICA_CARRIERS=1 in the environment.
-	adrp	x0, L_srt_carriers_env@PAGE
-	add	x0, x0, L_srt_carriers_env@PAGEOFF
-	bl	_getenv
-	cbz	x0, Lsri_gate_done
-	ldrb	w9, [x0]
-	cmp	w9, #49
-	b.ne	Lsri_gate_done
-	ldrb	w9, [x0, #1]
-	cbnz	w9, Lsri_gate_done
-	adrp	x8, _silica_rt_carriers_enabled@PAGE
-	add	x8, x8, _silica_rt_carriers_enabled@PAGEOFF
-	mov	x9, #1
-	str	x9, [x8]
-Lsri_gate_done:
-; The carrier count (item N stage 2): SILICA_CARRIER_COUNT=<n> in the environment (decimal, n >= 1;
-; anything else is ignored), else the machine's logical cores (hw.logicalcpu), at least 1.
+; The carrier count (item N): SILICA_CARRIER_COUNT=<n> in the environment (decimal, n >= 1; unset,
+; 0 or anything else is ignored), else the machine's logical cores (hw.logicalcpu), at least 1.
+; Carriers are the only model (prims_actors_carrier_asm.silica header): there is no gate.
 	adrp	x0, L_srt_carrier_count_env@PAGE
 	add	x0, x0, L_srt_carrier_count_env@PAGEOFF
 	bl	_getenv
@@ -741,11 +727,17 @@ fn stack_asm_fail_and_report() -> string {
 	.p2align	2
 _silica_rt_actor_fail_current:
 ; X0 = the current actor's ACB, X1 = reason atom. Ends the actor with (:explicit, atom): wakes its
-; waiters, delivers the exit to its supervisor, frees what it owns and exits the thread. Runs on the
-; signal alt stack (stack exhaustion) or on the actor stack (a spawn whose reservation failed). For
-; a carrier actor it runs on the carrier's stack (the fault handler returns into it there, through
-; the signal frame, so the carrier's alternate-stack state is intact for the next fault) and ends
-; in the carrier loop.
+; waiters, delivers the exit to its supervisor, frees what it owns and exits the thread. For a
+; dangerous actor (a thread of its own) it runs on the signal alt stack (stack exhaustion) or on
+; the actor stack (a spawn whose reservation failed). For a carrier actor it is entered on the
+; carrier's stack (the fault handler returns into it there, through the signal frame, so the
+; carrier's alternate-stack state is intact for the next fault) or on the actor's own (a failed
+; spawn inside a behaviour or a start trampoline, a duplicate child id) and ends in the carrier
+; loop; the reservation is freed first, before any waiter is woken, unless the actor has a
+; supervision block (X20 = 1): then its children are shut down in the delivering phase, each
+; waited for, and the waits park, which needs a stack the carrier loop leaves alone: the top of
+; its own reservation (every frame below it is abandoned: a fault's signal frame was unwound by
+; the kernel, a failed spawn never returns), unmapped after that phase instead.
 	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -753,7 +745,18 @@ _silica_rt_actor_fail_current:
 	mov	x19, x0
 	str	x1, [x19, #384]
 	ldr	x21, [x19, #440]
+	mov	x20, xzr
 	cbz	x21, Lafc_thread_actor
+	ldr	x9, [x19, #216]
+	cbz	x9, Lafc_carrier_stack
+	ldr	x9, [x19, #272]
+	cbz	x9, Lafc_carrier_stack
+	ldr	x10, [x19, #280]
+	add	x9, x9, x10
+	mov	sp, x9
+	mov	x20, #1
+	b	Lafc_deliver
+Lafc_carrier_stack:
 	ldr	x9, [x21, #48]
 	mov	sp, x9
 	b	Lafc_on_stack
@@ -771,6 +774,7 @@ Lafc_on_stack:
 	mov	x0, x19
 	mov	x1, #1
 	bl	_silica_rt_actor_stack_free
+Lafc_deliver:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 	mov	x8, #4
@@ -806,6 +810,15 @@ Lafc_started_set:
 	bl	_silica_rt_ffi_arena_teardown
 	mov	x0, x19
 	bl	_silica_rt_child_table_free
+; The delivering phase ran on the reservation (X20): nothing waits any more, so onto the carrier's
+; stack and the reservation goes.
+	cbz	x20, Lafc_stack_done
+	ldr	x9, [x21, #48]
+	mov	sp, x9
+	mov	x0, x19
+	mov	x1, xzr
+	bl	_silica_rt_actor_stack_free
+Lafc_stack_done:
 	mov	x0, x19
 	bl	_silica_rt_actor_dealloc_region
 	mov	x0, x19

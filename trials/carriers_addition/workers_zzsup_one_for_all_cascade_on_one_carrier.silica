@@ -1,0 +1,127 @@
+// Supervisors on carriers (actor_memory_budget_plan.md item N, "Carriers are the only model"): a
+// :one_for_all supervisor, its three row children and the killer all on ONE carrier, core 1's
+// (`core mod N`: the same carrier at every carrier count). The supervisor and the killer are
+// spawned for core 1; the rows are bound in turn and the program moves them to core 1. The killer
+// kills b: it parks on b's row wait list; the carrier runs b's exit; the supervisor's own dispatch
+// takes the exit notice with the restart token and runs the :one_for_all cascade on its own stack
+// (LBB1_ingress_no_beh): it stops a and PARKS for a's exit_done, the carrier runs a's exit, it
+// resumes, the same for c, then respawns a, b and c (plain workers, started at adoption). With
+// the supervisor on the same carrier as the children a blocking wait there would never let a
+// child's exit run; the park does. The killer's drain finds the restart settled.
+//
+//   call a 5, b 5, c 5          -> 505, 605, 705
+//   a, b, c moved to core 1     -> all on core 1's carrier (9: equal to a probe spawned for core 1)
+//   call the killer             -> kill_abnormal(b) returns :ok, 9
+//   call a 5, b 5, c 5          -> 505, 605, 705  (all three restarted from their initial state)
+//
+// Expected output: 505, 605, 705, 9, 9, 505, 605, 705, three failure reports of the counter (b with
+// reason_tag 1 from kill_abnormal; a and c with reason_tag 0 from the supervisor's stop), done,
+// exit status 0, compared as a multiset (the printed values avoid the digits 1-4 and 8, which
+// compare_scout_multiset.sh folds: 9 is a check that holds, 6 one that does not).
+
+use Supervisor;
+use trial_wait_int64;
+
+impl ZzsupOneForAllOneCarrierSup for Supervisor;
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn probe(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// Kills b and replies 9 when kill_abnormal returned :ok, else 6.
+fn ofa_killer(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        killed: atom <- kill_abnormal(:zzsup_ofa_b)
+    produces
+        pure (:reply, verdict(case killed of { :ok -> true; _: atom -> false }), state + msg)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_all, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :zzsup_ofa_a, agent_type: :worker, initial_state: initial_state + 500, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :zzsup_ofa_b, agent_type: :worker, initial_state: initial_state + 600, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :zzsup_ofa_c, agent_type: :worker, initial_state: initial_state + 700, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+// Moves the supervisor's child of this id to core 1 and makes the move apply (a call: the move is
+// applied at the child's next dispatch boundary); answers the child's carrier index after it.
+fn move_child_to_core_1(sup: supervisor_ref, id: atom) -> int64 {
+    sequence proc[concurrency]
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: id } impl SupervisorMessage {});
+        child: actor_ref <- got.child;
+        _: atom <- migrate_actor(child, 1);
+        _: int64 <- call(child, 0 impl ActorMessage {});
+        idx: int64 <- actor_carrier_index(child)
+    produces
+        pure idx
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        p1: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 1);
+        i_p1: int64 <- actor_carrier_index(p1);
+        sup: supervisor_ref <- spawn_registered_supervisor(ZzsupOneForAllOneCarrierSup, 0, :zzsup_ofa_sup, stack_policy(0, :keep_last_message), 1);
+        a1: int64 <- call_registered(:zzsup_ofa_a, 5 impl ActorMessage {});
+        b1: int64 <- call_registered(:zzsup_ofa_b, 5 impl ActorMessage {});
+        c1: int64 <- call_registered(:zzsup_ofa_c, 5 impl ActorMessage {});
+        ia: int64 <- move_child_to_core_1(sup, :zzsup_ofa_a);
+        ib: int64 <- move_child_to_core_1(sup, :zzsup_ofa_b);
+        ic: int64 <- move_child_to_core_1(sup, :zzsup_ofa_c);
+        k: actor_ref <- spawn(0, ofa_killer, stack_policy(1048576, :keep_last_message), 1);
+        killed: int64 <- call(k, 5 impl ActorMessage {});
+        a2: int64 <- call_registered(:zzsup_ofa_a, 5 impl ActorMessage {});
+        b2: int64 <- call_registered(:zzsup_ofa_b, 5 impl ActorMessage {});
+        c2: int64 <- call_registered(:zzsup_ofa_c, 5 impl ActorMessage {});
+        print_int64(a1);
+        println("");
+        print_int64(b1);
+        println("");
+        print_int64(c1);
+        println("");
+        print_int64(verdict(ia == i_p1 and ib == i_p1 and ic == i_p1));
+        println("");
+        print_int64(killed);
+        println("");
+        print_int64(a2);
+        println("");
+        print_int64(b2);
+        println("");
+        print_int64(c2);
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 { drive() });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

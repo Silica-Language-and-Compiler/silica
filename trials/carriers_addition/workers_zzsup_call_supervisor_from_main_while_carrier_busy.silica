@@ -1,0 +1,143 @@
+// Supervisors on carriers (actor_memory_budget_plan.md item N, "Carriers are the only model"):
+// call_supervisor from main, which is not an actor and has no carrier, while the supervisor's
+// carrier is busy. The supervisor and a feeder are both spawned for core 1 (`core mod N`: one
+// carrier at every count); the feeder casts itself its next step 20,000 times, so that carrier
+// has a ready actor at every dispatch boundary. main blocks in the futex / polling waits it kept
+// (a drain of the supervisor's ingress polls for the restart token; a terminate_child spins for
+// the child's exit_done): count_children, get_child and a call to the child, terminate_child
+// (the child's exit runs on the busy carrier, between the feeder's steps, cooperatively) and
+// restart_child (the supervisor's respawn runs there too), a call to the replacement, and at
+// last the feeder's count, which it hands to a sink at its last step and main reads from the
+// sink (a cast-only feeder cannot be called, E2237; main asks the sink until the count is there,
+// at most 5,000 times).
+//
+// Expected output: 9 (one child), 505, 9 (one child after the restart), 505 (the replacement's
+// initial state), 9 (the feeder counted to 5,000), one failure report (the terminated child,
+// reason_tag 0: a :terminate_child stop keeps the child's own reason, unlike a supervisor's
+// shutdown of a child with shutdown 0, which is reason_tag 1; frame #0 the counter), exit status
+// 0, compared as a multiset (the report is asynchronous; the printed values avoid the digits 1-4
+// and 8, which compare_scout_multiset.sh folds). The trial support used is trial_wait_int64 (its
+// start only, for the reporter) so that this unit is compiled after the suite's other
+// trial_wait users and its new atoms renumber none of theirs.
+
+use Supervisor;
+use trial_wait_int64;
+
+impl ZzsupBusyCarrierSup for Supervisor;
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+fn k() -> int64 {
+    5000
+}
+
+// Casts the next step to the feeder (a cast inside a case arm is not parsed: the `impl` braces).
+fn feed(me: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast(me, 1 impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// Hands the final count to the sink (a call: the sink answers calls, so it is never cast to,
+// E2237; the feeder parks on its carrier for the reply).
+fn report_count(sink: actor_ref, count: int64) -> boolean {
+    sequence proc[concurrency]
+        got: int64 <- call(sink, count impl ActorMessage {})
+    produces
+        pure got == count
+    end
+}
+
+// Each message is a step: the count rises by one and, below K, the next step is cast to itself; at
+// K the count goes to the sink.
+fn feeder(msg: int64, st: { count: int64, sink: actor_ref }) -> (:no_reply, { count: int64, sink: actor_ref }) {
+    sequence proc[concurrency]
+        next: int64 <- st.count + 1;
+        below: boolean <- next < k();
+        me: actor_ref <- self();
+        _: boolean <- case below of {
+            true -> feed(me);
+            false -> report_count(st.sink, next)
+        }
+    produces
+        pure (:no_reply, { count: next, sink: st.sink })
+    end
+}
+
+// The sink: a message of 0 asks for the count it holds; any other message is the count.
+fn sink(msg: int64, state: int64) -> (:reply, int64, int64) {
+    case msg == 0 of {
+        true -> (:reply, state, state);
+        false -> (:reply, msg, msg)
+    }
+}
+
+// Asks the sink for the count until it is K, at most `tries` times more.
+fn poll(s: actor_ref, tries: int64) -> int64 {
+    sequence proc[concurrency]
+        v: int64 <- call(s, 0 impl ActorMessage {});
+        settled: boolean <- v == k() or tries == 0;
+        r: int64 <- case settled of {
+            true -> v;
+            false -> poll(s, tries - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :zzsup_busy_child, agent_type: :worker, initial_state: initial_state + 500, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        sup: supervisor_ref <- spawn_registered_supervisor(ZzsupBusyCarrierSup, 0, :zzsup_busy_sup, stack_policy(0, :keep_last_message), 1);
+        s: actor_ref <- spawn(0, sink, stack_policy(1048576, :keep_last_message), 2);
+        f: actor_ref <- spawn({ count: 0, sink: s }, feeder, stack_policy(1048576, :keep_last_message), 1);
+        _: boolean <- cast(f, 1 impl ActorMessage {});
+        counted: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
+        print_int64(verdict(counted.count == 1));
+        println("");
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: :zzsup_busy_child } impl SupervisorMessage {});
+        child: actor_ref <- got.child;
+        r1: int64 <- call(child, 5 impl ActorMessage {});
+        print_int64(r1);
+        println("");
+        _t: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :terminate_child, id: :zzsup_busy_child } impl SupervisorMessage {});
+        _r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :restart_child, id: :zzsup_busy_child } impl SupervisorMessage {});
+        again: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
+        print_int64(verdict(again.count == 1));
+        println("");
+        r2: int64 <- call_registered(:zzsup_busy_child, 5 impl ActorMessage {});
+        print_int64(r2);
+        println("");
+        fed: int64 <- poll(s, 5000);
+        print_int64(verdict(fed == k()));
+        println("")
+    produces
+        pure 0
+    end
+}
