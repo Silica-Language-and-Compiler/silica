@@ -623,21 +623,33 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       the fault handler into `_silica_rt_actor_fail_current(ACB, atom)` by rewriting the ucontext (Darwin
       mcontext x0 +16, x1 +24, sp +264, pc +272), so the kernel unwinds the signal frame and the carrier's
       alternate-stack state and mask are clean for the next fault.
-    - *Loud, not silent.* A carrier actor that would spin for another carrier actor's exit — `kill_abnormal`
-      (`Lkab_wait_exit_done`), a stop or restart's wait for a row's `exit_done` (`Lssc_wait`, `Lsterm_wait`,
-      `Lsrestart_wait`, `Lsrestart_ofa_wait`) — is a runtime abort (`_silica_rt_carrier_wait_check`, reason
-      "a carrier actor waited for another actor of its carrier") rather than a deadlocked carrier. A
-      carrier actor's exit path neither drains its supervisor's ingress nor waits for its replacement
-      (`LBB1_exit` and the trap paths skip both; the supervisor's own thread restarts it), because a
-      `:one_for_all` restart stops siblings on the same carrier and would wait for this very path.
+    - *Waits for a row child's exit park too (2026-10-19, after the four supervisors failures).* The seven
+      spins on a row's `exit_done` — `kill_abnormal` (`Lkab_wait_exit_done`), `stop_child` /
+      `remove_child` (`Lsterm_wait`), `restart_child` (`Lsrestart_wait`, `Lsrestart_ofa_wait`), the
+      cascade stop (`Lssc_wait`) and the `:one_for_all` / `:rest_for_one` kill loops of `maybe_restart`
+      (`Lmr_ofa_kill_wait`, `Lmr_rfo_kill_wait`) — first call `_silica_rt_row_wait_exit_done(row, child)`:
+      a carrier actor on its own stack (the carrier's current actor, carrier +40, with SP inside its
+      reservation; not the TLS actor, which an ingress drain sets to the supervisor) links itself into
+      the row's wait list (row +120, through ACB #456; row nodes are 128 B now) and parks; the check of
+      `exit_done` and the push are one critical section under `_silica_rt_row_wait_lock`, which the
+      ended child's last act (`_silica_rt_sb_child_done` → `_silica_rt_row_exit_done_store`) also holds
+      to set `exit_done` and take the list, making every actor on it ready. A resumed waiter restores
+      the TLS actor the wait was entered with (the supervisor, during a drain). Anything else (main,
+      an actor thread, a runtime path on the carrier's own stack) gets 0 back and spins as before, so
+      the gate-off paths are unchanged; a carrier actor on the carrier's own stack that would spin for
+      another carrier actor is still a runtime abort ("a carrier actor waited on the carrier's own stack
+      for another actor of its carrier"), as is an actor found on a wait list not parked. A carrier
+      actor's exit path neither drains its supervisor's ingress nor waits for its replacement
+      (`LBB1_exit` and the trap paths skip both; the supervisor's own thread, or the woken
+      `kill_abnormal` caller's drain, restarts it).
     - **Not done in stage 1:** several carriers, pinning (`spawn(..., core)`, `pin_actor_*`), `migrate_actor`,
       `set_scheduler_policy` / `set_actor_priority` on carriers (stages 3–4); supervisors on carriers; the
-      parked form of the five spin waits above; the `:release_when_idle` sweep for carrier actors (their
+      `:release_when_idle` sweep for carrier actors (their
       stack is released at the next message boundary instead, and the idle timed wait does not exist for
       them); the TLS indirection of risk R2.1 (`pthread_setspecific` per dispatch for now); the Linux
-      runtimes; the idle-actor capacity measurement. The supervisors suite has not been run under the gate
-      and is expected to show the two documented differences (restart ordering after `kill_abnormal`; the
-      abort where a worker stops a sibling).
+      runtimes; the idle-actor capacity measurement. The row wait list is reached through the single
+      carrier block (`_silica_rt_carrier0`); with several carriers the parker must be found through the
+      thread's own carrier.
     - **Trials:** `trials/carriers_addition` (host-only; its Makefile passes `SILICA_CARRIERS=$(SILICA_CARRIERS)`,
       default 1, to the trial processes only; `make integrate SILICA_CARRIERS=0` runs the same trials a
       thread per actor): `two_actors_one_carrier`, `many_actors_one_carrier` (1,000 actors, each called
@@ -656,8 +668,19 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       both failure reports are right (the exhaustion exit through the rewritten ucontext works and the
       carrier went on to run a 300,000-deep recursion afterwards) but the trial's `true` is `false`
       because its worker busy-polls the exhausted actor's memory from the same carrier, which under
-      cooperative one-carrier scheduling never gets to run until the poll gives up. **Unverified:**
-      every other suite under the gate (the supervisors suite in particular), the `:dangerous` row
+      cooperative one-carrier scheduling never gets to run until the poll gives up. `supervisors_addition`
+      with the gate exported to the compiler too: 282/286 before the row wait (the four failures,
+      `phase_e_root_restart_cap_exceeded`, `phase_e_root_restart_cap_zero_no_drain`,
+      `transient_inner_supervisor_breach_restarted`, `working_registry_restarted_child_reachable`, were
+      all the same shape: a plain worker on the carrier calling `kill_abnormal` on a sibling plain worker
+      of the same carrier, hitting the stage 1 abort at `Lkab_wait_exit_done`); with the row wait those
+      four pass under `SILICA_CARRIERS=1` (six runs each) and `=0`, their `.sams` unchanged against the
+      `.ascomp` goldens, and `carriers_addition` is 8/8 under both gates, all with the compiler built
+      from this tree. **Unverified:** the whole of `supervisors_addition`, `actor_stacks_addition` and
+      `actors_addition` under both gates after the row wait (only the four trials and `carriers_addition`
+      were rerun), the six other wait sites as parked waits (no trial reaches them from a carrier actor
+      yet: a worker calling `stop_child` / `restart_child` on a sibling of its carrier, a
+      `:one_for_all` / `:rest_for_one` restart drained by a carrier actor), the `:dangerous` row
       flavour path, a spawn from a carrier actor of a supervisor whose init needs the registry (the
       spawn-park path was exercised only by the trial support's shape), and any Linux target.
 

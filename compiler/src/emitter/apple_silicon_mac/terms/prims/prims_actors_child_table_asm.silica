@@ -20,10 +20,12 @@
 // actor_memory_budget_plan.md): SB #24 head (first node ptr), #32 len (i64 row count / list length),
 // #40 sync_failure_reported (0/1; root cap-breach reports synchronously, later thread exit skips duplicate).
 // An actor without a block has no table; start_child and materialize make one for the running actor.
-// Node size 120 B: payload 80 B (same row layout as e3a), next ptr @ +80 (0 = end), the supervision block @ +88
+// Node size 128 B: payload 80 B (same row layout as e3a), next ptr @ +80 (0 = end), the supervision block @ +88
 // (sb_child_done finds it there; the child's reference keeps the node alive), the child's spawner record
 // @ +96 (position + 1) / +104 (next child number), kept across the child's restarts (spec §15.1.4,
-// §15.4.12.1), and the current child's identity @ +112 (what call_supervisor answers with).
+// §15.4.12.1), the current child's identity @ +112 (what call_supervisor answers with), and @ +120 the
+// carrier actors parked for this row's exit_done (linked through ACB #456; _silica_rt_row_wait_exit_done
+// in prims_actors_carrier_asm.silica, emptied by the child's exit_done store).
 // Offsets in row payload: +0 child_ref, +8 id atom, +16 agent_type, +24 start.0, +32 start.1, +40 restart atom,
 // +48 shutdown i64, +56 exit_done / sync, +64 flavor atom (:plain | :dangerous), +72 supervisor_start_trampoline (0 for worker).
 // Phase E e3f tombstone: child_ref==0 means inactive; len stays high-water for :rest_for_one ordering.
@@ -238,9 +240,6 @@ Lssc_at:
 	bl	_silica_rt_ref_hold
 	mov	x24, x0
 	cbz	x24, Lssc_wait
-; Carriers stage 1: a carrier actor cannot wait for an actor of its carrier (runtime abort).
-	mov	x0, x24
-	bl	_silica_rt_carrier_wait_check
 	add	x0, x24, #16
 	bl	_os_unfair_lock_lock
 	ldr	w8, [x24, #152]
@@ -268,11 +267,18 @@ Lssc_unlock:
 	mov	x0, x24
 	bl	_silica_rt_acb_release
 Lssc_wait:
+; A carrier actor parks for the row's exit_done (prims_actors_carrier_asm.silica); anything else
+; sleeps and polls it as before.
+	mov	x0, x23
+	mov	x1, x24
+	bl	_silica_rt_row_wait_exit_done
+	cbnz	x0, Lssc_next
+Lssc_poll:
 	ldr	x8, [x23, #56]
 	cbnz	x8, Lssc_next
 	mov	w0, #50
 	bl	_usleep
-	b	Lssc_wait
+	b	Lssc_poll
 Lssc_unref:
 	mov	x0, x20
 	bl	_silica_rt_sb_unref
@@ -341,12 +347,17 @@ Lsbu_ret:
 	.p2align	2
 _silica_rt_sb_child_done:
 ; X0 = the ended child's row (0: not a row child). Its last two acts, after its ACB is gone: the
-; row's exit_done = 1 (a cascade stop or kill_abnormal waits for it), then its block reference.
+; row's exit_done = 1 (a cascade stop or kill_abnormal waits for it; a carrier actor parked for it
+; is made ready: _silica_rt_row_exit_done_store), then its block reference.
 	cbz	x0, Lscd_ret
-	ldr	x1, [x0, #88]
-	mov	x9, #1
-	str	x9, [x0, #56]
-	mov	x0, x1
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	ldr	x19, [x0, #88]
+	bl	_silica_rt_row_exit_done_store
+	mov	x0, x19
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
 	b	_silica_rt_sb_unref
 Lscd_ret:
 	ret
@@ -388,7 +399,7 @@ Lct_count_done:
 	cmp	x22, x20
 	b.hs	Lct_ens_ok
 	mov	w0, #1
-	mov	w1, #120
+	mov	w1, #128
 	bl	_calloc
 	cbz	x0, Lct_ens_fail
 	mov	x24, x0
@@ -1142,9 +1153,15 @@ Lmr_ofa_kill_at_idx:
 ; has fully unwound (ACB freed) and stamped row[+56]=1. Only then proceed to the next sibling,
 ; so two children's teardowns never overlap (no concurrent libsystem_malloc cleanup races).
 ; Reset the flag once observed so a future cascade restart targeting this row can re-arm.
+; A carrier actor draining the ingress parks for it (prims_actors_carrier_asm.silica).
+	mov	x0, x26
+	mov	x1, x27
+	bl	_silica_rt_row_wait_exit_done
+	cbnz	x0, Lmr_ofa_kill_exited
 Lmr_ofa_kill_wait:
 	ldr	x8, [x26, #56]
 	cbz	x8, Lmr_ofa_kill_wait
+Lmr_ofa_kill_exited:
 	str	xzr, [x26, #56]
 Lmr_ofa_kill_next:
 	add	x25, x25, #1
@@ -1199,10 +1216,16 @@ Lmr_rfo_kill_at_idx:
 	bl	_os_unfair_lock_unlock
 ; Phase E e4f: per-user-spec sequential stop — wait for this child's actor_thread_main
 ; to retire (row[+56]=1 set after its full ACB free) before signalling the next row.
-; No two cascaded teardowns ever overlap.
+; No two cascaded teardowns ever overlap. A carrier actor draining the ingress parks for it
+; (prims_actors_carrier_asm.silica).
+	mov	x0, x26
+	mov	x1, x27
+	bl	_silica_rt_row_wait_exit_done
+	cbnz	x0, Lmr_rfo_kill_exited
 Lmr_rfo_kill_wait:
 	ldr	x8, [x26, #56]
 	cbz	x8, Lmr_rfo_kill_wait
+Lmr_rfo_kill_exited:
 	mov	x0, x20
 	mov	x1, x27
 	bl	_silica_rt_supervisor_drop_pending_exit
@@ -1765,8 +1788,6 @@ Lsterm_find:
 	cmp	x8, x20
 	b.ne	Lsterm_next
 	str	xzr, [x23]
-	mov	x0, x22
-	bl	_silica_rt_carrier_wait_check
 	add	x0, x22, #16
 	bl	_os_unfair_lock_lock
 	str	wzr, [x22, #152]
@@ -1774,9 +1795,16 @@ Lsterm_find:
 	bl	_silica_rt_actor_mail_signal
 	add	x0, x22, #16
 	bl	_os_unfair_lock_unlock
+; A carrier actor parks for the row's exit_done (prims_actors_carrier_asm.silica); anything else
+; spins on it as before.
+	mov	x0, x23
+	mov	x1, x22
+	bl	_silica_rt_row_wait_exit_done
+	cbnz	x0, Lsterm_exited
 Lsterm_wait:
 	ldr	x8, [x23, #56]
 	cbz	x8, Lsterm_wait
+Lsterm_exited:
 	mov	x0, x19
 	mov	x1, x22
 	bl	_silica_rt_supervisor_drop_pending_exit
@@ -1845,8 +1873,6 @@ Lsrestart_find:
 ", ofa_branch), "	ldr	x22, [x23]
 	cbz	x22, Lsrestart_spawn
 	str	xzr, [x23]
-	mov	x0, x22
-	bl	_silica_rt_carrier_wait_check
 	add	x0, x22, #16
 	bl	_os_unfair_lock_lock
 	str	wzr, [x22, #152]
@@ -1854,9 +1880,14 @@ Lsrestart_find:
 	bl	_silica_rt_actor_mail_signal
 	add	x0, x22, #16
 	bl	_os_unfair_lock_unlock
+	mov	x0, x23
+	mov	x1, x22
+	bl	_silica_rt_row_wait_exit_done
+	cbnz	x0, Lsrestart_exited
 Lsrestart_wait:
 	ldr	x8, [x23, #56]
 	cbz	x8, Lsrestart_wait
+Lsrestart_exited:
 	mov	x0, x19
 	mov	x1, x22
 	bl	_silica_rt_supervisor_drop_pending_exit
@@ -1880,8 +1911,6 @@ Lsrestart_ofa_kill_loop:
 	ldr	x22, [x24]
 	cbz	x22, Lsrestart_ofa_kill_next
 	str	xzr, [x24]
-	mov	x0, x22
-	bl	_silica_rt_carrier_wait_check
 	add	x0, x22, #16
 	bl	_os_unfair_lock_lock
 	str	wzr, [x22, #152]
@@ -1889,9 +1918,14 @@ Lsrestart_ofa_kill_loop:
 	bl	_silica_rt_actor_mail_signal
 	add	x0, x22, #16
 	bl	_os_unfair_lock_unlock
+	mov	x0, x24
+	mov	x1, x22
+	bl	_silica_rt_row_wait_exit_done
+	cbnz	x0, Lsrestart_ofa_exited
 Lsrestart_ofa_wait:
 	ldr	x8, [x24, #56]
 	cbz	x8, Lsrestart_ofa_wait
+Lsrestart_ofa_exited:
 	mov	x0, x19
 	mov	x1, x22
 	bl	_silica_rt_supervisor_drop_pending_exit

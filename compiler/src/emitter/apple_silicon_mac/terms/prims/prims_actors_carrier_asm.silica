@@ -51,13 +51,23 @@
 //     _silica_rt_actor_mail_signal, which also makes an idle carrier actor ready and wakes the
 //     carrier's futex when it sleeps; every wake of a call wrapper goes through
 //     _silica_rt_call_wrapper_wake.
-//   - A wait a carrier actor cannot park in (kill_abnormal / stop_child / a restart's wait for a
-//     sibling's exit, all spins on a row's exit_done) is a runtime abort when its target is also a
-//     carrier actor, instead of a silent deadlock of the carrier (stage 1; parked waits come later).
+//   - A wait for a row child's exit (kill_abnormal, stop_child / remove_child / restart_child, a
+//     supervisor's cascade stop, a :one_for_all or :rest_for_one restart's stops: the seven spins on
+//     a row's exit_done, +56) parks too when the waiter is a carrier actor on its own stack
+//     (_silica_rt_row_wait_exit_done): the waiter links itself, through ACB #456, into the row's
+//     wait list (row +120) under _silica_rt_row_wait_lock, which the child's last act
+//     (_silica_rt_sb_child_done -> _silica_rt_row_exit_done_store) also holds to set exit_done and
+//     take the list; every actor on it is made ready. The check of exit_done and the push are one
+//     critical section, so no wake is lost; the wake side never holds the row lock while it takes
+//     an actor's lock, so the two orders (actor then row; row, then actor) cannot deadlock. A wait
+//     entered while the thread's current actor was another (an ingress drain installs the
+//     supervisor) restores that actor after the resume. Anything that is not a carrier actor on
+//     its own stack spins as before; a carrier actor on the carrier's own stack (an exit path) that
+//     would spin for another carrier actor is a runtime abort rather than a silent deadlock.
 //
 // Not in this stage (actor_memory_budget_plan.md §5 N, "Stage 1 status"): several carriers, pinning,
-// migrate_actor, scheduler policies and priorities, supervisors on carriers, the :release_when_idle
-// sweep on carriers, and the spin sites above as parked waits.
+// migrate_actor, scheduler policies and priorities, supervisors on carriers, and the
+// :release_when_idle sweep on carriers.
 
 export emit_actor_carrier_runtime_asm/0;
 
@@ -72,11 +82,16 @@ _silica_rt_carriers_enabled:
 	.globl	_silica_rt_carrier0
 _silica_rt_carrier0:
 	.zero	128
+	.globl	_silica_rt_row_wait_lock
+_silica_rt_row_wait_lock:
+	.zero	16
 	.section	__TEXT,__cstring,cstring_literals
 L_srt_carriers_env:
 	.asciz	\"SILICA_CARRIERS\"
 Lrta_r_carrier_wait:
-	.asciz	\"a carrier actor waited for another actor of its carrier (carriers stage 1: not supported)\"
+	.asciz	\"a carrier actor waited on the carrier's own stack for another actor of its carrier\"
+Lrta_r_row_wake:
+	.asciz	\"a row child's exit found an actor on its wait list that was not parked for it\"
 Lrta_r_carrier_thread:
 	.asciz	\"the carrier thread could not be created\"
 	.section	__TEXT,__text,regular,pure_instructions
@@ -458,27 +473,141 @@ Lsws_ret:
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
 	ret
-	.globl	_silica_rt_carrier_wait_check
+	.globl	_silica_rt_row_wait_exit_done
 	.p2align	2
-_silica_rt_carrier_wait_check:
-; X0 = an actor about to be spun on (its row's exit_done) by the current actor. A carrier actor
-; cannot spin for another actor of its carrier: that is a runtime abort in this stage, not a hang.
-	stp	x29, x30, [sp, #-32]!
+_silica_rt_row_wait_exit_done:
+; X0 = a row, X1 = the child whose exit is waited for (0 = unknown). -> X0 = 1 once the row's
+; exit_done (+56) is set, having parked for it: the caller was a carrier actor on its own stack.
+; -> X0 = 0 at once when the caller cannot park (main, an actor thread, a runtime path on the
+; carrier's own stack): it spins on exit_done as it always did. A caller on the carrier's own
+; stack that would spin for another carrier actor is a runtime abort, not a silent deadlock.
+; The parked actor is the one the carrier runs (carrier +40), not the thread's current actor: an
+; ingress drain installs the supervisor as the current actor while it runs on the drainer's stack.
+	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
-	str	x19, [sp, #16]
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
 	mov	x19, x0
-	cbz	x19, Lcwc_ret
-	ldr	x9, [x19, #440]
-	cbz	x9, Lcwc_ret
+	mov	x22, x1
+	adrp	x20, _silica_rt_carrier0@PAGE
+	add	x20, x20, _silica_rt_carrier0@PAGEOFF
+	ldr	x9, [x20, #64]
+	cbz	x9, Lrwe_no
+	bl	_pthread_self
+	ldr	x9, [x20, #64]
+	cmp	x0, x9
+	b.ne	Lrwe_no
+	ldr	x20, [x20, #40]
+	cbz	x20, Lrwe_no
+	mov	x9, sp
+	ldr	x10, [x20, #272]
+	cmp	x9, x10
+	b.lo	Lrwe_off_stack
+	ldr	x11, [x20, #280]
+	add	x10, x10, x11
+	cmp	x9, x10
+	b.hs	Lrwe_off_stack
 	bl	_silica_rt_tls_current_actor_get
-	cbz	x0, Lcwc_ret
-	ldr	x9, [x0, #440]
-	cbz	x9, Lcwc_ret
+	mov	x21, x0
+Lrwe_loop:
+; The check of exit_done and the push onto the row's wait list are one critical section under the
+; row wait lock (the exit side sets exit_done and takes the list under it), and the status becomes
+; parked under this actor's own lock before either is released: the wake finds it parked.
+	add	x0, x20, #16
+	bl	_os_unfair_lock_lock
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_lock
+	ldr	x8, [x19, #56]
+	cbnz	x8, Lrwe_done
+	mov	x0, x20
+	bl	_silica_rt_ctx_save
+	cbnz	x0, Lrwe_resumed
+	ldr	x9, [x19, #120]
+	str	x9, [x20, #456]
+	str	x20, [x19, #120]
+	mov	x9, #4
+	str	x9, [x20, #448]
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_unlock
+	add	x0, x20, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x20
+	b	_silica_rt_carrier_leave
+Lrwe_resumed:
+; Resumed with no lock held. The carrier made this actor the thread's current actor at the resume;
+; the wait was entered with X21 as the current actor (the supervisor, in an ingress drain).
+	cmp	x21, x20
+	b.eq	Lrwe_loop
+	mov	x0, x21
+	bl	_silica_rt_tls_actor_set
+	b	Lrwe_loop
+Lrwe_done:
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_unlock
+	add	x0, x20, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, #1
+	b	Lrwe_ret
+Lrwe_off_stack:
+	cbz	x22, Lrwe_no
+	ldr	x9, [x22, #440]
+	cbz	x9, Lrwe_no
 	adrp	x0, Lrta_r_carrier_wait@PAGE
 	add	x0, x0, Lrta_r_carrier_wait@PAGEOFF
 	bl	_silica_rt_abort_with
-Lcwc_ret:
-	ldr	x19, [sp, #16]
+Lrwe_no:
+	mov	x0, xzr
+Lrwe_ret:
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #48
+	ret
+	.globl	_silica_rt_row_exit_done_store
+	.p2align	2
+_silica_rt_row_exit_done_store:
+; X0 = a row whose child has ended (_silica_rt_sb_child_done, the child's last act): its exit_done
+; (+56) = 1 and every carrier actor parked for it (+120, linked through ACB #456) is made ready,
+; each under its own lock, none under the row wait lock. An actor on the list that is not parked
+; cannot happen (it was parked under both locks and only this store wakes it): a runtime abort.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_lock
+	mov	x9, #1
+	str	x9, [x19, #56]
+	ldr	x20, [x19, #120]
+	str	xzr, [x19, #120]
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_unlock
+Lres_wake:
+	cbz	x20, Lres_ret
+	ldr	x19, [x20, #456]
+	add	x0, x20, #16
+	bl	_os_unfair_lock_lock
+	ldr	x9, [x20, #448]
+	cmp	x9, #4
+	b.ne	Lres_not_parked
+	mov	x9, #2
+	str	x9, [x20, #448]
+	mov	x0, x20
+	bl	_silica_rt_carrier_push
+	add	x0, x20, #16
+	bl	_os_unfair_lock_unlock
+	mov	x20, x19
+	b	Lres_wake
+Lres_not_parked:
+	adrp	x0, Lrta_r_row_wake@PAGE
+	add	x0, x0, Lrta_r_row_wake@PAGEOFF
+	bl	_silica_rt_abort_with
+Lres_ret:
+	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
 	ret
 "
