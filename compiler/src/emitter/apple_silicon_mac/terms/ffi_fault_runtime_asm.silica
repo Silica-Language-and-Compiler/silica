@@ -443,6 +443,26 @@ Lsfh_pc_done:
 	b	L_sfh_crash
 L_sfh_exhausted:
 ; The end of a reservation the program lowered: (:explicit, :stack_exhausted) for this actor only.
+	ldr	x9, [x20, #440]
+	cbz	x9, L_sfh_exhausted_thread
+; A carrier actor (item N stage 1): the exit runs on the carrier's stack, reached by returning from
+; this handler into _silica_rt_actor_fail_current(ACB, atom) with the signal frame unwound by the
+; kernel, so the carrier thread's alternate-stack state and signal mask are those of a thread
+; outside a handler when the next actor on it faults. Darwin arm64 mcontext: x0 at +16, x1 at +24,
+; sp at +264, pc at +272 (the handler reads pc from +272 above).
+	ldr	x10, [x24, #48]
+	str	x20, [x10, #16]
+	adrp	x8, _silica_rt_stack_exhausted_atom@PAGE
+	add	x8, x8, _silica_rt_stack_exhausted_atom@PAGEOFF
+	ldr	x8, [x8]
+	str	x8, [x10, #24]
+	ldr	x11, [x9, #48]
+	str	x11, [x10, #264]
+	adrp	x11, _silica_rt_actor_fail_current@PAGE
+	add	x11, x11, _silica_rt_actor_fail_current@PAGEOFF
+	str	x11, [x10, #272]
+	b	L_sfh_done
+L_sfh_exhausted_thread:
 	mov	x0, x20
 	adrp	x8, _silica_rt_stack_exhausted_atom@PAGE
 	add	x8, x8, _silica_rt_stack_exhausted_atom@PAGEOFF
@@ -598,8 +618,8 @@ L_gff_have_actor:
 	mov	x8, #5
 	str	x8, [x19, #232]
 	str	wzr, [x19, #152]
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	ldr	x8, [x19, #216]
@@ -622,14 +642,25 @@ L_gff_after_report:
 ; exit notice is parked at #400 until its spawner has committed it to the row.
 	ldr	x8, [x19, #224]
 	cbnz	x8, L_gff_started_set
-	mov	x8, #2
-	add	x9, x19, #224
-	stlr	x8, [x9]
+	mov	x0, x19
+	mov	x1, #2
+	bl	_silica_rt_started_store
 L_gff_started_set:
 	mov	x0, x19
 	bl	_silica_rt_actor_signal_pending_call_deaths
 ; The recovery siglongjmp'd back onto the actor stack; this thread ends here, so move onto its alt
 ; stack (top; nothing there is needed again) before that stack is unmapped, as fail_current does.
+; A carrier actor (not reachable in stage 1: the FFI is confined to dangerous actors, which keep a
+; thread) would move onto its carrier's stack instead and end in the carrier loop.
+	ldr	x21, [x19, #440]
+	cbz	x21, L_gff_thread_actor
+	ldr	x9, [x21, #48]
+	mov	sp, x9
+	mov	x0, x19
+	mov	x1, xzr
+	bl	_silica_rt_actor_stack_free
+	b	L_gff_keep_stack
+L_gff_thread_actor:
 	ldr	x9, [x19, #352]
 	cbz	x9, L_gff_keep_stack
 	mov	x10, #65536
@@ -647,6 +678,9 @@ L_gff_keep_stack:
 	bl	_silica_rt_actor_dealloc_region
 	mov	x0, x19
 	bl	_silica_rt_actor_final_release
+	cbz	x21, L_gff_thread_exit
+	mov	x0, x21
+	b	_silica_rt_carrier_loop_enter
 L_gff_thread_exit:
 	mov	x0, xzr
 	bl	_pthread_exit

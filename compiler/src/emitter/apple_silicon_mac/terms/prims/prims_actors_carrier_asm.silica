@@ -1,0 +1,536 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Carrier threads (actor_memory_budget_plan.md item N, stage 1; ROADMAP chunk 2, hosted part).
+//
+// Behind a process-start gate: `SILICA_CARRIERS=1` in the environment, read once by
+// _silica_rt_stack_runtime_init into _silica_rt_carriers_enabled. Off (the default), every actor is
+// its own thread as before and nothing here runs. On, one carrier thread runs every plain actor
+// spawned without a start trampoline (workers; supervisors keep a thread each in this stage, as do
+// dangerous actors and the runtime's own registry actors), on the BEAM pattern the board already uses
+// per core (rt_actors.S sched_loop / yield_to_sched / make_ready):
+//
+//   - The carrier block (_silica_rt_carrier0): +0 lock (os_unfair_lock), +8 futex word the carrier
+//     sleeps on when its run queue is empty, +16 idle (1 while asleep), +24/+32 run queue head/tail
+//     (control blocks linked through ACB #456), +40 the actor being run, +48 the carrier's base SP,
+//     +56 its 64 KB signal alternate stack, +64 pthread_t, +72 started, +80 created.
+//   - ACB fields (prims_actors_runtime_asm.silica layout): #440 the carrier (0 = a thread actor),
+//     #448 status (0 none, 1 idle, 2 ready: in the run queue, 3 running, 4 parked in a runtime wait),
+//     #456 run-queue link, #464 the SP of a parked context (0 = none), #472 the actor parked in a
+//     spawn until this actor has started.
+//   - Dispatch: the carrier pops a ready actor, sets the thread's current actor (the TLS word every
+//     runtime entry and the fault handler attribute by), and enters the mailbox loop of
+//     _actor_thread_main (LBB1_loop) with X19 = the ACB, exactly as that actor's own thread would. A
+//     behaviour runs on the actor's reservation with the carrier's SP kept in ACB #368 and returns to
+//     the carrier on the dispatch boundary; the release algorithm then runs on the carrier's stack.
+//     After the message the actor is re-queued when more mail waits, else marked idle.
+//   - The carrier loop is re-entered afresh (SP reset to the base, current actor cleared) from every
+//     path that leaves an actor: a dispatch boundary with an empty mailbox, an exit path (which runs on
+//     the carrier's stack, like the board's scheduler running a faulted actor's exit), or a park.
+//   - Parking: an actor that must wait inside a behaviour (a `call` awaiting its reply; a spawn
+//     waiting for its child's start) saves X19-X30 and D8-D15 on its own stack, records that SP in
+//     #464 and leaves for the carrier loop; the wake side (the reply, the call death, the child's
+//     started store) moves it from parked to ready under the same lock the parker used, and the
+//     carrier resumes it by reloading the context. The actor's return into the carrier's dispatch
+//     code reads nothing from the carrier's abandoned frame: the node being dispatched is ACB #240.
+//   - Mail: every wake of a mailbox (the sites that signalled ACB+80) goes through
+//     _silica_rt_actor_mail_signal, which also makes an idle carrier actor ready and wakes the
+//     carrier's futex when it sleeps; every wake of a call wrapper goes through
+//     _silica_rt_call_wrapper_wake.
+//   - A wait a carrier actor cannot park in (kill_abnormal / stop_child / a restart's wait for a
+//     sibling's exit, all spins on a row's exit_done) is a runtime abort when its target is also a
+//     carrier actor, instead of a silent deadlock of the carrier (stage 1; parked waits come later).
+//
+// Not in this stage (actor_memory_budget_plan.md §5 N, "Stage 1 status"): several carriers, pinning,
+// migrate_actor, scheduler policies and priorities, supervisors on carriers, the :release_when_idle
+// sweep on carriers, and the spin sites above as parked waits.
+
+export emit_actor_carrier_runtime_asm/0;
+
+fn carrier_asm_data() -> string {
+    "	.section	__DATA,__data
+	.p2align	3
+	.globl	_silica_rt_carriers_enabled
+_silica_rt_carriers_enabled:
+	.quad	0
+	.section	__DATA,__bss
+	.p2align	4
+	.globl	_silica_rt_carrier0
+_silica_rt_carrier0:
+	.zero	128
+	.section	__TEXT,__cstring,cstring_literals
+L_srt_carriers_env:
+	.asciz	\"SILICA_CARRIERS\"
+Lrta_r_carrier_wait:
+	.asciz	\"a carrier actor waited for another actor of its carrier (carriers stage 1: not supported)\"
+Lrta_r_carrier_thread:
+	.asciz	\"the carrier thread could not be created\"
+	.section	__TEXT,__text,regular,pure_instructions
+"
+}
+
+fn carrier_asm_adopt() -> string {
+    "	.globl	_silica_rt_carrier_adopt
+	.p2align	2
+_silica_rt_carrier_adopt:
+; X0 = a new ACB (reservation made, arena bookkeeping set), X1 = its start trampoline (0 = none),
+; X2 = 1 for a dangerous actor. -> X0 = 1 when the actor was given to the carrier (no thread is to
+; be made; it is idle and started), 0 when it keeps a thread of its own: the gate is off, it has a
+; trampoline (a supervisor, this stage), it is dangerous (its foreign calls may block), or it is one
+; of the runtime's own actors (_silica_rt_spawn_rec_override is set around their spawns).
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	cbnz	x1, Lcad_no
+	cbnz	x2, Lcad_no
+	adrp	x8, _silica_rt_carriers_enabled@PAGE
+	add	x8, x8, _silica_rt_carriers_enabled@PAGEOFF
+	ldr	x9, [x8]
+	cbz	x9, Lcad_no
+	adrp	x8, _silica_rt_spawn_rec_override@PAGE
+	add	x8, x8, _silica_rt_spawn_rec_override@PAGEOFF
+	ldr	x9, [x8]
+	cbnz	x9, Lcad_no
+	adrp	x20, _silica_rt_carrier0@PAGE
+	add	x20, x20, _silica_rt_carrier0@PAGEOFF
+	mov	x0, x20
+	bl	_silica_rt_carrier_ensure_started
+	str	x20, [x19, #440]
+	mov	x9, #1
+	str	x9, [x19, #448]
+	str	xzr, [x19, #456]
+	str	xzr, [x19, #464]
+	str	xzr, [x19, #472]
+	mov	x0, x19
+	mov	x1, #1
+	bl	_silica_rt_started_store
+	mov	x0, #1
+	b	Lcad_ret
+Lcad_no:
+	mov	x0, xzr
+Lcad_ret:
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_carrier_ensure_started
+	.p2align	2
+_silica_rt_carrier_ensure_started:
+; X0 = carrier block. Creates its thread the first time.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	add	x9, x19, #80
+	ldar	x8, [x9]
+	cbnz	x8, Lces_ret
+	mov	x0, x19
+	bl	_os_unfair_lock_lock
+	ldr	x8, [x19, #80]
+	cbnz	x8, Lces_unlock
+	add	x0, x19, #64
+	mov	x1, xzr
+	adrp	x2, _silica_rt_carrier_main@PAGE
+	add	x2, x2, _silica_rt_carrier_main@PAGEOFF
+	mov	x3, x19
+	bl	_pthread_create
+	cbnz	w0, Lces_failed
+	ldr	x0, [x19, #64]
+	bl	_pthread_detach
+	mov	x8, #1
+	add	x9, x19, #80
+	stlr	x8, [x9]
+Lces_unlock:
+	mov	x0, x19
+	bl	_os_unfair_lock_unlock
+Lces_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+Lces_failed:
+	adrp	x0, Lrta_r_carrier_thread@PAGE
+	add	x0, x0, Lrta_r_carrier_thread@PAGEOFF
+	bl	_silica_rt_abort_with
+	b	Lces_failed
+	.globl	_silica_rt_tls_actor_set
+	.p2align	2
+_silica_rt_tls_actor_set:
+; X0 = ACB or 0: this thread's current actor.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x0, [sp, #16]
+	bl	_silica_rt_ensure_actor_tls_key
+	ldr	x1, [sp, #16]
+	adrp	x8, _silica_actor_pthread_key@PAGE
+	add	x8, x8, _silica_actor_pthread_key@PAGEOFF
+	ldr	x0, [x8]
+	bl	_pthread_setspecific
+	ldp	x29, x30, [sp], #32
+	ret
+"
+}
+
+fn carrier_asm_loop() -> string {
+    "	.globl	_silica_rt_carrier_main
+	.p2align	2
+_silica_rt_carrier_main:
+; Thread entry: X0 = carrier block. Never returns.
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	mov	x19, x0
+	bl	_silica_rt_ensure_actor_tls_key
+	add	x0, x19, #56
+	bl	_silica_rt_altstack_install_at
+	mov	x9, sp
+	str	x9, [x19, #48]
+	mov	x8, #1
+	add	x9, x19, #72
+	stlr	x8, [x9]
+Lcar_loop:
+; Entered afresh from every path that leaves an actor: the stack below the base is abandoned.
+	ldr	x9, [x19, #48]
+	mov	sp, x9
+	str	xzr, [x19, #40]
+	mov	x0, xzr
+	bl	_silica_rt_tls_actor_set
+	mov	x0, x19
+	bl	_os_unfair_lock_lock
+Lcar_pop:
+	ldr	x20, [x19, #24]
+	cbnz	x20, Lcar_have
+	mov	x9, #1
+	str	x9, [x19, #16]
+	add	x0, x19, #8
+	mov	x1, x19
+	bl	_silica_rt_cv_wait
+	str	xzr, [x19, #16]
+	b	Lcar_pop
+Lcar_have:
+	ldr	x9, [x20, #456]
+	str	x9, [x19, #24]
+	cbnz	x9, Lcar_have_tail
+	str	xzr, [x19, #32]
+Lcar_have_tail:
+	str	xzr, [x20, #456]
+	mov	x0, x19
+	bl	_os_unfair_lock_unlock
+	mov	x9, #3
+	str	x9, [x20, #448]
+	str	x20, [x19, #40]
+	mov	x0, x20
+	bl	_silica_rt_tls_actor_set
+	ldr	x9, [x20, #464]
+	cbnz	x9, Lcar_resume
+	mov	x19, x20
+	b	LBB1_loop
+Lcar_resume:
+; Parked inside a behaviour: the dispatch frame its behaviour will return into is the same 48 bytes
+; below the base that its dispatch used (the post-behaviour code reads the node from ACB #240).
+	ldr	x9, [x19, #48]
+	sub	x9, x9, #48
+	str	x9, [x20, #368]
+	mov	x0, x20
+	b	_silica_rt_ctx_resume
+	.globl	_silica_rt_carrier_loop_enter
+	.p2align	2
+_silica_rt_carrier_loop_enter:
+; X0 = carrier block. An actor's exit path, run on the carrier's stack, ends here. Never returns.
+	mov	x19, x0
+	b	Lcar_loop
+	.globl	_silica_rt_carrier_leave
+	.p2align	2
+_silica_rt_carrier_leave:
+; X0 = a carrier actor that has parked (context saved, status 4 published). Never returns.
+	ldr	x19, [x0, #440]
+	b	Lcar_loop
+	.globl	_silica_rt_carrier_requeue
+	.p2align	2
+_silica_rt_carrier_requeue:
+; X0 = a carrier actor whose message has been served: ready again when mail waits or it has been
+; ended meanwhile (its exit path runs at its next dispatch), idle otherwise; then back to the
+; carrier loop. Never returns.
+	mov	x19, x0
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	w9, [x19, #152]
+	cbz	w9, Lcrq_ready
+	ldr	x9, [x19, #216]
+	cbz	x9, Lcrq_std
+	ldr	x10, [x9]
+	ldr	x11, [x9, #8]
+	orr	x10, x10, x11
+	cbnz	x10, Lcrq_ready
+Lcrq_std:
+	ldr	x10, [x19, #128]
+	ldr	x11, [x19, #136]
+	orr	x10, x10, x11
+	cbnz	x10, Lcrq_ready
+	mov	x9, #1
+	str	x9, [x19, #448]
+	b	Lcrq_unlock
+Lcrq_ready:
+	mov	x9, #2
+	str	x9, [x19, #448]
+	mov	x0, x19
+	bl	_silica_rt_carrier_push
+Lcrq_unlock:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	ldr	x0, [x19, #440]
+	b	_silica_rt_carrier_loop_enter
+	.globl	_silica_rt_carrier_push
+	.p2align	2
+_silica_rt_carrier_push:
+; X0 = a carrier actor whose status its caller has just set to ready (2), under the lock that guards
+; that status. Appends it to its carrier's run queue and wakes the carrier when it sleeps.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x20, x0
+	ldr	x19, [x20, #440]
+	str	xzr, [x20, #456]
+	mov	x0, x19
+	bl	_os_unfair_lock_lock
+	ldr	x9, [x19, #32]
+	cbz	x9, Lcpu_empty
+	str	x20, [x9, #456]
+	b	Lcpu_tail
+Lcpu_empty:
+	str	x20, [x19, #24]
+Lcpu_tail:
+	str	x20, [x19, #32]
+	ldr	x9, [x19, #16]
+	cbz	x9, Lcpu_unlock
+	add	x0, x19, #8
+	bl	_silica_rt_cv_signal
+Lcpu_unlock:
+	mov	x0, x19
+	bl	_os_unfair_lock_unlock
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+"
+}
+
+fn carrier_asm_wakes() -> string {
+    "	.globl	_silica_rt_actor_mail_signal
+	.p2align	2
+_silica_rt_actor_mail_signal:
+; X0 = ACB; the caller holds ACB+16 and has enqueued mail or ended the actor. Signals the mailbox
+; futex (an actor thread waits on it) and, for an idle carrier actor, makes it ready.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	add	x0, x19, #80
+	bl	_silica_rt_cv_signal
+	ldr	x9, [x19, #440]
+	cbz	x9, Lams_ret
+	ldr	x9, [x19, #448]
+	cmp	x9, #1
+	b.ne	Lams_ret
+	mov	x9, #2
+	str	x9, [x19, #448]
+	mov	x0, x19
+	bl	_silica_rt_carrier_push
+Lams_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_call_wrapper_wake
+	.p2align	2
+_silica_rt_call_wrapper_wake:
+; X0 = call wrapper; the caller holds wrapper+72 and has set reply_set. Signals the wrapper's futex
+; (a thread waits on it) and makes a carrier actor parked on it (wrapper+48) ready.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	add	x0, x19, #24
+	bl	_silica_rt_cv_signal
+	ldr	x9, [x19, #48]
+	cbz	x9, Lcww_ret
+	ldr	x10, [x9, #448]
+	cmp	x10, #4
+	b.ne	Lcww_ret
+	mov	x10, #2
+	str	x10, [x9, #448]
+	mov	x0, x9
+	bl	_silica_rt_carrier_push
+Lcww_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_started_store
+	.p2align	2
+_silica_rt_started_store:
+; X0 = ACB, X1 = its started word (#224): 1 started, 2 its start trampoline failed. Stores it and
+; makes a carrier actor parked in the spawn (#472) ready. The parker stores #472 and then reads #224
+; under its own lock; this side stores #224 and then reads #472: with the barriers one of them sees
+; the other's store, and the status check under the parker's lock settles the rest.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	add	x9, x0, #224
+	stlr	x1, [x9]
+	dmb	ish
+	ldr	x19, [x0, #472]
+	cbz	x19, Lsts_ret
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	x10, [x19, #448]
+	cmp	x10, #4
+	b.ne	Lsts_unlock
+	mov	x10, #2
+	str	x10, [x19, #448]
+	mov	x0, x19
+	bl	_silica_rt_carrier_push
+Lsts_unlock:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+Lsts_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_spawn_wait_started
+	.p2align	2
+_silica_rt_spawn_wait_started:
+; X0 = a child just spawned. Returns once its started word (#224) is set. A carrier actor on its own
+; stack parks (the child's started store wakes it); anything else spins, as the spawn always did.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	bl	_silica_rt_tls_current_actor_get
+	mov	x20, x0
+	cbz	x20, Lsws_spin
+	ldr	x9, [x20, #440]
+	cbz	x9, Lsws_spin
+	mov	x9, sp
+	ldr	x10, [x20, #272]
+	cmp	x9, x10
+	b.lo	Lsws_spin
+	ldr	x11, [x20, #280]
+	add	x10, x10, x11
+	cmp	x9, x10
+	b.hs	Lsws_spin
+	str	x20, [x19, #472]
+	dmb	ish
+Lsws_park_loop:
+	add	x0, x20, #16
+	bl	_os_unfair_lock_lock
+	add	x9, x19, #224
+	ldar	x8, [x9]
+	cbnz	x8, Lsws_started
+	mov	x0, x20
+	bl	_silica_rt_ctx_save
+	cbnz	x0, Lsws_park_loop
+	mov	x9, #4
+	str	x9, [x20, #448]
+	add	x0, x20, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x20
+	b	_silica_rt_carrier_leave
+Lsws_started:
+	add	x0, x20, #16
+	bl	_os_unfair_lock_unlock
+	b	Lsws_ret
+Lsws_spin:
+	add	x9, x19, #224
+Lsws_spin_loop:
+	ldar	x8, [x9]
+	cbz	x8, Lsws_spin_loop
+Lsws_ret:
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_carrier_wait_check
+	.p2align	2
+_silica_rt_carrier_wait_check:
+; X0 = an actor about to be spun on (its row's exit_done) by the current actor. A carrier actor
+; cannot spin for another actor of its carrier: that is a runtime abort in this stage, not a hang.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	cbz	x19, Lcwc_ret
+	ldr	x9, [x19, #440]
+	cbz	x9, Lcwc_ret
+	bl	_silica_rt_tls_current_actor_get
+	cbz	x0, Lcwc_ret
+	ldr	x9, [x0, #440]
+	cbz	x9, Lcwc_ret
+	adrp	x0, Lrta_r_carrier_wait@PAGE
+	add	x0, x0, Lrta_r_carrier_wait@PAGEOFF
+	bl	_silica_rt_abort_with
+Lcwc_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+"
+}
+
+fn carrier_asm_context() -> string {
+    "	.globl	_silica_rt_ctx_save
+	.p2align	2
+_silica_rt_ctx_save:
+; X0 = the current carrier actor, on its own stack. Saves X19-X30 and D8-D15 below SP and records
+; that SP in #464. Returns 0 at once with SP left lowered (the frame is live until the actor leaves
+; through _silica_rt_carrier_leave); returns 1, with SP and the registers restored, when the
+; carrier resumes the actor.
+	sub	sp, sp, #176
+	stp	x19, x20, [sp]
+	stp	x21, x22, [sp, #16]
+	stp	x23, x24, [sp, #32]
+	stp	x25, x26, [sp, #48]
+	stp	x27, x28, [sp, #64]
+	stp	x29, x30, [sp, #80]
+	stp	d8, d9, [sp, #96]
+	stp	d10, d11, [sp, #112]
+	stp	d12, d13, [sp, #128]
+	stp	d14, d15, [sp, #144]
+	mov	x9, sp
+	str	x9, [x0, #464]
+	mov	x0, xzr
+	ret
+	.globl	_silica_rt_ctx_resume
+	.p2align	2
+_silica_rt_ctx_resume:
+; X0 = a carrier actor with a parked context (#464). Never returns to its caller: continues the
+; actor after its _silica_rt_ctx_save, with X0 = 1.
+	ldr	x9, [x0, #464]
+	str	xzr, [x0, #464]
+	mov	sp, x9
+	ldp	x19, x20, [sp]
+	ldp	x21, x22, [sp, #16]
+	ldp	x23, x24, [sp, #32]
+	ldp	x25, x26, [sp, #48]
+	ldp	x27, x28, [sp, #64]
+	ldp	x29, x30, [sp, #80]
+	ldp	d8, d9, [sp, #96]
+	ldp	d10, d11, [sp, #112]
+	ldp	d12, d13, [sp, #128]
+	ldp	d14, d15, [sp, #144]
+	add	sp, sp, #176
+	mov	x0, #1
+	ret
+"
+}
+
+fn emit_actor_carrier_runtime_asm() -> string {
+    concat(concat(concat(concat(carrier_asm_data(), carrier_asm_adopt()), carrier_asm_loop()), carrier_asm_wakes()), carrier_asm_context())
+}

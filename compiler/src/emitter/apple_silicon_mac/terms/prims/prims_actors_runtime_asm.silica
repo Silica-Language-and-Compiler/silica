@@ -26,8 +26,8 @@
 // cpu_topology / cache / NUMA helpers (_silica_rt_apple_*, sysctl hw.*): macOS Apple Silicon only (see cpu_topology_implementation_plan Phase G).
 // ABI: spawn(X0,X1,X2)->X0  send(X0,X1)  cast(X0,X1)->W0  call(X0,X1)->X0  self()->X0  recv()->X0
 // X2=optional core_id (0 default) per §15.1.1, X4=packed stack_policy (0 = inherit the spawner's; see prims_actors_stack_asm).
-// Actor control block 408 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
-// the holder count and the parked exit notice): #0..#215 the
+// Actor control block 480 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
+// the holder count and the parked exit notice; 2026-10-19 +32 for the carrier fields, item N): #0..#215 the
 // actor runtime's, #216 the supervision block pointer (SB, 112 B, only a supervisor has one; layout at
 // _silica_rt_sb_require), #224 started flag, #232 pending exit reason_tag, #240 active call wrapper,
 // #248/#256/#264 FFI arena base/end/bump (Phase 12), #272..#391 the runtime-managed stack fields
@@ -38,7 +38,11 @@
 // #416/#424 its spawner record (position + 1, 0 none yet; next child number) unless it is a row child,
 // whose record is its row's +96/+104 (actor_rt_identity_chunk).
 // #432 the calling convention recorded at spawn (spec §16.2.6.4; _silica_rt_beh_convention: 0 not
-// checked, 1 call-only, 2 cast-only), #440 spare. Control block 448 B.
+// checked, 1 call-only, 2 cast-only).
+// #440..#479 the carrier fields (prims_actors_carrier_asm.silica, item N stage 1): #440 the carrier
+// block (0 = the actor has a thread of its own), #448 status (1 idle, 2 ready, 3 running, 4 parked),
+// #456 run-queue link, #464 the SP of a parked context, #472 the actor parked in a spawn waiting for
+// this one to start. Control block 480 B.
 // spawn_linked Phase A (supervisors_implementation_development_plan): spawn_linked(X0,X1,X2,X3,X4)->X0
 // X0=init X1=beh X2=agent_type (int64) X3=row/core metadata (0 default), X4=optional supervisor trampoline.
 // Offsets: #192 supervisor actor_ref (0 root), #200 agent_type atom, #208 core_id (the row pointer of a
@@ -73,6 +77,7 @@
 
 use prims_actors_child_table_asm;
 use prims_actors_stack_asm;
+use prims_actors_carrier_asm;
 use atom_table;
 use ffi_arena_runtime_asm;
 use ffi_guarded_runtime_asm;
@@ -112,7 +117,7 @@ _silica_rt_actor_spawn:                 ; @silica_rt_actor_spawn
 	mov	x21, x0
 	mov	w22, #1                         ; =0x1
 	mov	w0, #1                          ; =0x1
-	mov	w1, #448
+	mov	w1, #480
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBB0_4
@@ -160,6 +165,13 @@ Lsp0_no_sb:
 	bl	_silica_rt_install_sync_fault_handlers
 	mov	x0, x19
 	bl	_silica_rt_actor_init_region
+; Item N stage 1: with carriers enabled a plain actor without a trampoline joins the carrier
+; (idle, started) instead of getting a thread.
+	mov	x0, x19
+	mov	x1, x24
+	mov	x2, xzr
+	bl	_silica_rt_carrier_adopt
+	cbnz	x0, LBB0_adopted
 	sub	sp, sp, #64
 	mov	x0, sp
 	bl	_pthread_attr_init
@@ -208,13 +220,13 @@ LBB0_reserve_failed:
 LBB0_3:
 	ldur	x0, [x19, #144]
 	bl	_pthread_detach
-; Phase E: supervisor trampoline (ACB#280) runs on the new thread; wait until #288 is set so
-; callers see a materialized child table before receiving the actor_ref.
+LBB0_adopted:
+; Phase E: supervisor trampoline (SB#48) runs on the new thread; wait until #224 is set so
+; callers see a materialized child table before receiving the actor_ref (a carrier actor spawning
+; parks instead of spinning: _silica_rt_spawn_wait_started).
 	cbz	x24, LBB0_4
-	add	x9, x19, #224
-LBB0_tramp_spin:
-	ldar	x8, [x9]
-	cbz	x8, LBB0_tramp_spin
+	mov	x0, x19
+	bl	_silica_rt_spawn_wait_started
 ; 2 = the trampoline failed and the actor has ended: the spawn returns _silica_rt_dead_acb
 ; (_silica_rt_spawner_let_go), and the actor's own block goes with its last holder.
 LBB0_4:
@@ -247,6 +259,9 @@ LBB0_wr_skip:
 	.p2align	2
 _silica_rt_actor_spawn_linked:          ; @silica_rt_actor_spawn_linked
 	.cfi_startproc
+	mov	x6, xzr
+Lsl_entry:
+; X6 = 1 for a dangerous actor (spawn_dangerous_linked): it keeps a thread of its own under carriers.
 	mov	x5, xzr
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
@@ -255,6 +270,7 @@ _silica_rt_actor_spawn_linked:          ; @silica_rt_actor_spawn_linked
 	ldp	x29, x30, [sp], #16
 	ret
 LBBsl_common:
+; X0-X5 as above, X6 = 1 dangerous (kept in X26).
 	stp	x26, x25, [sp, #-80]!
 	stp	x24, x23, [sp, #16]
 	stp	x22, x21, [sp, #32]
@@ -272,6 +288,7 @@ LBBsl_common:
 	.cfi_offset w24, -64
 	.cfi_offset w25, -72
 	.cfi_offset w26, -80
+	mov	x26, x6
 	mov	x25, x5
 	mov	x23, x2
 	mov	x24, x3
@@ -279,7 +296,7 @@ LBBsl_common:
 	mov	x20, x1
 	mov	x21, x0
 	mov	w0, #1
-	mov	w1, #448
+	mov	w1, #480
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBBsl_4
@@ -356,6 +373,12 @@ Lslp_skip_list:
 	bl	_silica_rt_install_sync_fault_handlers
 	mov	x0, x19
 	bl	_silica_rt_actor_init_region
+; Item N stage 1: a plain worker (no trampoline, not dangerous) joins the carrier when enabled.
+	mov	x0, x19
+	mov	x1, x22
+	mov	x2, x26
+	bl	_silica_rt_carrier_adopt
+	cbnz	x0, LBBsl_adopted
 	sub	sp, sp, #64
 	mov	x0, sp
 	bl	_pthread_attr_init
@@ -411,14 +434,14 @@ LBBsl_reserve_failed:
 LBBsl_3:
 	ldur	x0, [x19, #144]
 	bl	_pthread_detach
-; Phase E e4f: spin until the new actor's thread has finished its TLS init / trampoline
-; (signalled by ACB[+288] == 1 in actor_thread_main). Keeps spawn ordering strictly
-; sequential — the supervisor never overlaps two children's startup, eliminating the
-; libsystem mfm_alloc / TLS-instantiate race observed with 3+ concurrent spawns.
-	add	x9, x19, #224
-LBBsl_started_spin:
-	ldar	x8, [x9]
-	cbz	x8, LBBsl_started_spin
+LBBsl_adopted:
+; Phase E e4f: wait until the new actor's thread has finished its TLS init / trampoline
+; (signalled by ACB #224 == 1 in actor_thread_main; a carrier actor is started at adoption).
+; Keeps spawn ordering strictly sequential — the supervisor never overlaps two children's
+; startup, eliminating the libsystem mfm_alloc / TLS-instantiate race observed with 3+
+; concurrent spawns. A carrier actor spawning parks instead of spinning.
+	mov	x0, x19
+	bl	_silica_rt_spawn_wait_started
 LBBsl_4:
 	mov	x0, x19
 	ldp	x29, x30, [sp, #64]
@@ -433,13 +456,14 @@ LBBsl_4:
 	.globl	_silica_rt_actor_spawn_dangerous_linked
 	.p2align	2
 _silica_rt_actor_spawn_dangerous_linked:
-	b	_silica_rt_actor_spawn_linked
+	mov	x6, #1
+	b	Lsl_entry
 	.globl	_silica_rt_actor_spawn_linked_row
 	.p2align	2
 _silica_rt_actor_spawn_linked_row:
 ; A supervisor starts the child of one of its rows: X0-X4 as spawn_linked, X3 = the row, X5 = the
-; supervisor's ACB. The child's reference on the supervision block (the row's +88) is taken here,
-; before its thread can run and end; a spawn that fails gives it back.
+; supervisor's ACB, X6 = 1 for a :dangerous row. The child's reference on the supervision block (the
+; row's +88) is taken here, before its thread can run and end; a spawn that fails gives it back.
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
 	add	x29, sp, #16
@@ -514,11 +538,14 @@ LBB1_skip_tramp:
 ; spawn / spawn_linked callers can serialize on +288 == 1 for both supervisors and workers.
 ; This delivers the user-requested ordering: each child starts one at a time, waiting until
 ; the previous child's actor_thread_main has materialised before the next spawn proceeds.
-	mov	x8, #1
-	add	x9, x19, #224
-	stlr	x8, [x9]
+	mov	x0, x19
+	mov	x1, #1
+	bl	_silica_rt_started_store
 	mov	w22, #1                         ; =0x1
 LBB1_loop:
+; The mailbox loop. An actor thread stays here for the actor's life; a carrier enters here with
+; X19 = the actor it dispatches (prims_actors_carrier_asm.silica, Lcar_loop) and leaves through
+; LBB1_again or the exit path.
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 LBB1_wait:
@@ -543,6 +570,16 @@ LBB1_try_std:
 	cbnz	x20, LBB1_process
 	ldr	w9, [x19, #152]
 	cbz	w9, LBB1_exit
+; A carrier actor with no mail is idle: back to the carrier loop (mail makes it ready again).
+	ldr	x9, [x19, #440]
+	cbz	x9, LBB1_thread_wait
+	mov	x9, #1
+	str	x9, [x19, #448]
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	ldr	x0, [x19, #440]
+	b	_silica_rt_carrier_loop_enter
+LBB1_thread_wait:
 ; Phase E e4f: blocking _silica_rt_cv_wait (os_unfair_lock + ___ulock_wait UL_COMPARE_AND_WAIT_SHARED).
 ; Earlier pthread_cond_timedwait_relative_np drove libpthread kwq malloc churn racing TLS instantiation
 ; (mfm_alloc SIGBUS). Wake paths hold ACB+16, signal ACB+80, then unlock before _silica_rt_cv_wait.
@@ -576,7 +613,8 @@ fn actor_rt_asm_chunk_2() -> string {
 	ldr	x11, [x11, _silica_rt_no_reply_tag@PAGEOFF]
 	cmp	x10, x11
 	b.eq	LBB1_no_reply_result
-	ldr	w8, [sp, #32]
+	ldr	x8, [x19, #240]
+	ldr	w8, [x8, #16]
 	cbz	w8, LBB1_no_reply_result
 LBB1_reply_result:
 ";
@@ -588,17 +626,17 @@ LBB1_reply_result:
 	ldr	x11, [x11, _silica_rt_no_reply_tag@PAGEOFF]
 	cmp	x10, x11
 	b.eq	LBB1_ingress_no_reply_result
-	ldr	w8, [sp, #32]
+	ldr	x8, [x19, #240]
+	ldr	w8, [x8, #16]
 	cbz	w8, LBB1_ingress_no_reply_result
 LBB1_ingress_reply_result:
 ";
     p0: string <- "	sub	sp, sp, #48
-	str	x20, [sp, #24]
-	ldr	w8, [x20, #16]
-	str	w8, [sp, #32]
 ; ACB+240 names the node being dispatched, a cast's as well as a call's: an actor that ends inside
 ; its behaviour (badarith, case_clause, fail_current, a guarded FFI fault) never reaches LBB1_free,
-; so its teardown (signal_pending_call_deaths) completes the call or frees the cast node.
+; so its teardown (signal_pending_call_deaths) completes the call or frees the cast node. The code
+; after the behaviour reads the node (and its call flag, node+16) from there, never from this frame:
+; a carrier actor parked inside the behaviour returns into a frame rebuilt by the carrier.
 	str	x20, [x19, #240]
 	mov	w22, w21
 	cbnz	w22, LBB1_ingress_check_kind
@@ -683,8 +721,8 @@ LBB1_post_beh:
 	mov	x0, x19
 	bl	_silica_rt_stack_on_message_return
 	mov	x9, x23
-	ldr	x20, [sp, #24]
-	ldr	w8, [sp, #32]
+	ldr	x20, [x19, #240]
+	ldr	w8, [x20, #16]
 	add	sp, sp, #48
 	str	xzr, [x19, #240]
 	cbnz	w22, LBB1_skip_actor_state
@@ -738,11 +776,11 @@ LBB1_drain_ingress_done:
 	str	x21, [x20, #144]
 	mov	w8, #1
 	str	w8, [x20, #136]
-	add	x0, x20, #24
-	bl	_silica_rt_cv_signal
+	mov	x0, x20
+	bl	_silica_rt_call_wrapper_wake
 	add	x0, x20, #72
 	bl	_os_unfair_lock_unlock
-	b	LBB1_loop
+	b	LBB1_again
 LBB1_free:
 ; Phase E e3c+e4b: if this was an ingress message (w22==1), attempt automatic restart before freeing. X2 = reason_tag from payload+8 (e4b).
 ; Payload ptr must live in a callee-saved reg across maybe_restart — x8 is caller-saved and was clobbered, yielding free(non-heap) (e.g. 0x1).
@@ -769,10 +807,19 @@ LBB1_free_skip_restart:
 LBB1_free_node:
 	mov	x0, x20
 	bl	_free
-	b	LBB1_loop
+LBB1_again:
+; The message is served. An actor thread goes back to its mailbox; a carrier actor is re-queued
+; or marked idle by the carrier.
+	ldr	x9, [x19, #440]
+	cbz	x9, LBB1_loop
+	mov	x0, x19
+	b	_silica_rt_carrier_requeue
 LBB1_exit:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
+; X24 = the carrier when this is a carrier actor (read before the block can be freed below): its
+; exit path runs here on the carrier's stack and ends in the carrier loop.
+	ldr	x24, [x19, #440]
 	mov	x0, x19
 	bl	_silica_rt_registry_forget_actor
 	ldr	x8, [x19, #216]
@@ -797,7 +844,10 @@ LBB1_exit_report_already_done:
 	mov	x20, #0
 LBB1_exit_after_report:
 ; A notice parked at #400 (this row child ended before its spawner committed it) is not in the
-; supervisor's ingress yet: nothing to drain or wait for.
+; supervisor's ingress yet: nothing to drain or wait for. A carrier actor neither drains its
+; supervisor's ingress nor waits for its replacement (carriers stage 1: the supervisor's own thread
+; restarts it; a restart that stops siblings on this carrier would wait for this very path).
+	cbnz	x24, LBB1_exit_no_sup_drain
 	ldr	x8, [x19, #400]
 	cmp	x8, #1
 	b.ne	LBB1_exit_no_sup_drain
@@ -857,6 +907,10 @@ LBB1_exit_skip_legacy_root:
 	mov	x0, x19
 	bl	_silica_rt_actor_final_release
 LBB1_exit_no_row:
+	cbz	x24, LBB1_thread_done
+	mov	x0, x24
+	b	_silica_rt_carrier_loop_enter
+LBB1_thread_done:
 	mov	x0, #0                          ; =0x0
 	ldp	x29, x30, [sp, #32]             ; 16-byte Folded Reload
 	ldp	x20, x19, [sp, #16]             ; 16-byte Folded Reload
@@ -957,8 +1011,8 @@ LBB2_5:
 	ldp	x22, x21, [sp], #48             ; 16-byte Folded Reload
 	ret
 LBB2_7:
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	ldp	x29, x30, [sp, #32]             ; 16-byte Folded Reload
@@ -1040,8 +1094,8 @@ fn actor_rt_asm_chunk_4() -> string {
 	add	x0, x19, #128
 	mov	x1, x20
 	bl	_silica_rt_q_enqueue_locked
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	mov	w21, #1                         ; =0x1
@@ -1080,8 +1134,8 @@ _silica_rt_actor_signal_call_death:
 ; reply_set 2: the target ended before replying; the caller raises actor_not_found (§16.1.1).
 	mov	w8, #2
 	str	w8, [x19, #136]
-	add	x0, x19, #24
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_call_wrapper_wake
 LBBsig_unlock:
 	add	x0, x19, #72
 	bl	_os_unfair_lock_unlock
@@ -1239,8 +1293,8 @@ _silica_rt_actor_call_acb:
 }
 
 fn actor_rt_asm_chunk_5() -> string {
-    "	add	x0, x20, #80
-	bl	_silica_rt_cv_signal
+    "	mov	x0, x20
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x20, #16
 	bl	_os_unfair_lock_unlock
 	b	LBB4_wait_start
@@ -1255,6 +1309,34 @@ LBB4_wait_start:
 	bl	_os_unfair_lock_lock
 	ldr	w8, [x19, #136]
 	cbnz	w8, LBB4_8
+; A carrier actor calling from its behaviour parks instead of blocking its carrier (item N stage
+; 1): its context is saved first, then the wrapper names it (wrapper+48) and its status is parked,
+; all under wrapper+72, which the reply side (_silica_rt_call_wrapper_wake) also holds. When resumed
+; the reply is re-checked under the lock, as a woken thread does. main (no current actor), an actor
+; thread, and a runtime path running on the carrier's own stack keep the futex wait.
+	bl	_silica_rt_tls_current_actor_get
+	mov	x20, x0
+	cbz	x20, LBB4_7
+	ldr	x9, [x20, #440]
+	cbz	x9, LBB4_7
+	mov	x9, sp
+	ldr	x10, [x20, #272]
+	cmp	x9, x10
+	b.lo	LBB4_7
+	ldr	x11, [x20, #280]
+	add	x10, x10, x11
+	cmp	x9, x10
+	b.hs	LBB4_7
+	mov	x0, x20
+	bl	_silica_rt_ctx_save
+	cbnz	x0, LBB4_wait_start
+	str	x20, [x19, #48]
+	mov	x9, #4
+	str	x9, [x20, #448]
+	add	x0, x19, #72
+	bl	_os_unfair_lock_unlock
+	mov	x0, x20
+	b	_silica_rt_carrier_leave
 LBB4_7:                                 ; =>This Inner Loop Header: Depth=1
 ; Phase E e4f: blocking pthread_cond_wait. Earlier 1 ms timedwait_relative_np was a missed-signal
 ; band-aid that, under macOS arm64 with 3+ concurrent supervised actors, drove a libpthread
@@ -1967,8 +2049,8 @@ _silica_rt_remove_actor_acb:                ; @silica_rt_remove_actor
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 	str	wzr, [x19, #152]
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	mov	x0, #0
@@ -2263,8 +2345,8 @@ Lkab_no_ref:
 	mov	x8, #1
 	str	x8, [x19, #232]
 	str	wzr, [x19, #152]
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	cmp	x20, #4096
@@ -2272,6 +2354,9 @@ Lkab_no_ref:
 	bl	_silica_rt_tls_current_actor_get
 	cmp	x0, x19
 	b.eq	Lkab_not_found
+; Carriers stage 1: a carrier actor cannot wait here for an actor of its carrier (runtime abort).
+	mov	x0, x19
+	bl	_silica_rt_carrier_wait_check
 Lkab_wait_exit_done:
 	ldr	x8, [x20, #56]
 	cbz	x8, Lkab_wait_exit_done
@@ -3481,8 +3566,8 @@ _silica_rt_actor_supervision_ingress_enqueue_acb:
 	ldr	w9, [x8, #16]
 	add	w9, w9, #1
 	str	w9, [x8, #16]
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	mov	x0, #0
@@ -3804,8 +3889,8 @@ _silica_rt_sup_enqueue_exit:
 	ldr	w9, [x8, #16]
 	add	w9, w9, #1
 	str	w9, [x8, #16]
-	add	x0, x20, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x20
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x20, #16
 	bl	_os_unfair_lock_unlock
 	mov	x0, #0
@@ -5533,13 +5618,20 @@ _silica_rt_badarith:
 	bl	_silica_rt_tls_current_actor_get
 	mov	x19, x0
 	cbz	x19, Lbadarith_process
+; A carrier actor ends on the carrier's stack: its own is abandoned here (unmapped below) and
+; the exit path ends in the carrier loop; X23 = the carrier (0 for an actor thread).
+	ldr	x23, [x19, #440]
+	cbz	x23, Lbadarith_on_thread
+	ldr	x9, [x23, #48]
+	mov	sp, x9
+Lbadarith_on_thread:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 	mov	x8, #1
 	str	x8, [x19, #232]
 	str	wzr, [x19, #152]
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	ldr	x8, [x19, #216]
@@ -5562,11 +5654,13 @@ Lbadarith_after_report:
 ; exit notice is parked at #400 until its spawner has committed it to the row.
 	ldr	x8, [x19, #224]
 	cbnz	x8, Lbadarith_started_set
-	mov	x8, #2
-	add	x9, x19, #224
-	stlr	x8, [x9]
+	mov	x0, x19
+	mov	x1, #2
+	bl	_silica_rt_started_store
 	b	Lbadarith_no_supervisor
 Lbadarith_started_set:
+; A carrier actor leaves the restart to its supervisor's thread (carriers stage 1; see LBB1_exit).
+	cbnz	x23, Lbadarith_no_supervisor
 	ldr	x8, [x19, #400]
 	cmp	x8, #1
 	b.ne	Lbadarith_no_supervisor
@@ -5609,8 +5703,17 @@ Lbadarith_no_supervisor:
 	bl	_silica_rt_ffi_arena_teardown
 	mov	x0, x19
 	bl	_silica_rt_actor_dealloc_region
+	cbz	x23, Lbadarith_release
+; Nothing runs on a carrier actor's stack any more: it is unmapped now, before the block can go.
+	mov	x0, x19
+	mov	x1, xzr
+	bl	_silica_rt_actor_stack_free
+Lbadarith_release:
 	mov	x0, x19
 	bl	_silica_rt_actor_final_release
+	cbz	x23, Lbadarith_thread_exit
+	mov	x0, x23
+	b	_silica_rt_carrier_loop_enter
 Lbadarith_thread_exit:
 	mov	x0, #0
 	bl	_pthread_exit
@@ -5648,13 +5751,20 @@ _silica_rt_case_clause:
 	bl	_silica_rt_tls_current_actor_get
 	mov	x19, x0
 	cbz	x19, Lcaseclause_process
+; A carrier actor ends on the carrier's stack: its own is abandoned here (unmapped below) and
+; the exit path ends in the carrier loop; X23 = the carrier (0 for an actor thread).
+	ldr	x23, [x19, #440]
+	cbz	x23, Lcaseclause_on_thread
+	ldr	x9, [x23, #48]
+	mov	sp, x9
+Lcaseclause_on_thread:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 	mov	x8, #2
 	str	x8, [x19, #232]
 	str	wzr, [x19, #152]
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	ldr	x8, [x19, #216]
@@ -5677,11 +5787,13 @@ Lcaseclause_after_report:
 ; exit notice is parked at #400 until its spawner has committed it to the row.
 	ldr	x8, [x19, #224]
 	cbnz	x8, Lcaseclause_started_set
-	mov	x8, #2
-	add	x9, x19, #224
-	stlr	x8, [x9]
+	mov	x0, x19
+	mov	x1, #2
+	bl	_silica_rt_started_store
 	b	Lcaseclause_no_supervisor
 Lcaseclause_started_set:
+; A carrier actor leaves the restart to its supervisor's thread (carriers stage 1; see LBB1_exit).
+	cbnz	x23, Lcaseclause_no_supervisor
 	ldr	x8, [x19, #400]
 	cmp	x8, #1
 	b.ne	Lcaseclause_no_supervisor
@@ -5724,8 +5836,17 @@ Lcaseclause_no_supervisor:
 	bl	_silica_rt_ffi_arena_teardown
 	mov	x0, x19
 	bl	_silica_rt_actor_dealloc_region
+	cbz	x23, Lcaseclause_release
+; Nothing runs on a carrier actor's stack any more: it is unmapped now, before the block can go.
+	mov	x0, x19
+	mov	x1, xzr
+	bl	_silica_rt_actor_stack_free
+Lcaseclause_release:
 	mov	x0, x19
 	bl	_silica_rt_actor_final_release
+	cbz	x23, Lcaseclause_thread_exit
+	mov	x0, x23
+	b	_silica_rt_carrier_loop_enter
 Lcaseclause_thread_exit:
 	mov	x0, #0
 	bl	_pthread_exit
@@ -5903,6 +6024,7 @@ _silica_rt_dead_acb:
 	.quad	-1
 	.quad	0, 0
 	.quad	0, 0
+	.quad	0, 0, 0, 0
 	.section	__TEXT,__text,regular,pure_instructions
 ; _silica_rt_registry_name_taken: a registered name was already held by a live actor or supervisor
 ; (spec §20.3.1: spawn_registered, spawn_registered_supervisor, a supervised child id). Ends the current
@@ -5950,12 +6072,19 @@ _silica_rt_registry_name_taken:
 	cbz	x19, Lnametaken_process
 	mov	x20, #2
 Lnametaken_fail_actor:
+; A carrier actor ends on the carrier's stack: its own is abandoned here (unmapped below) and
+; the exit path ends in the carrier loop; X23 = the carrier (0 for an actor thread).
+	ldr	x23, [x19, #440]
+	cbz	x23, Lnametaken_on_thread
+	ldr	x9, [x23, #48]
+	mov	sp, x9
+Lnametaken_on_thread:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 	str	x20, [x19, #232]
 	str	wzr, [x19, #152]
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	ldr	x8, [x19, #216]
@@ -5980,11 +6109,13 @@ Lnametaken_after_report:
 ; spun on freed memory: working_registry_child_id_taken_across_supervisors hung in actor_spawn).
 	ldr	x8, [x19, #224]
 	cbnz	x8, Lnametaken_started_set
-	mov	x8, #2
-	add	x9, x19, #224
-	stlr	x8, [x9]
+	mov	x0, x19
+	mov	x1, #2
+	bl	_silica_rt_started_store
 	b	Lnametaken_no_supervisor
 Lnametaken_started_set:
+; A carrier actor leaves the restart to its supervisor's thread (carriers stage 1; see LBB1_exit).
+	cbnz	x23, Lnametaken_no_supervisor
 	ldr	x8, [x19, #400]
 	cmp	x8, #1
 	b.ne	Lnametaken_no_supervisor
@@ -6027,8 +6158,17 @@ Lnametaken_no_supervisor:
 	bl	_silica_rt_ffi_arena_teardown
 	mov	x0, x19
 	bl	_silica_rt_actor_dealloc_region
+	cbz	x23, Lnametaken_release
+; Nothing runs on a carrier actor's stack any more: it is unmapped now, before the block can go.
+	mov	x0, x19
+	mov	x1, xzr
+	bl	_silica_rt_actor_stack_free
+Lnametaken_release:
 	mov	x0, x19
 	bl	_silica_rt_actor_final_release
+	cbz	x23, Lnametaken_thread_exit
+	mov	x0, x23
+	b	_silica_rt_carrier_loop_enter
 Lnametaken_thread_exit:
 	mov	x0, #0
 	bl	_pthread_exit
@@ -6520,6 +6660,6 @@ fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref
     canonical_arena_asm: string <- canonical_arena_runtime_asm@emit_canonical_arena_runtime_asm();
     ordering_identity_asm: string <- ordering_identity_runtime_asm@emit_ordering_identity_runtime_asm();
     checked_int64_asm: string <- checked_int64_runtime_asm@emit_checked_int64_runtime_asm();
-    stack_asm: string <- prims_actors_stack_asm@emit_actor_stack_runtime_asm(table);
+    stack_asm: string <- concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
     concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), actor_rt_asm_chunk_9()), actor_rt_asm_chunk_10()), actor_rt_asm_chunk_11()), actor_rt_asm_chunk_12()), actor_rt_asm_chunk_13()), actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), actor_rt_asm_badarith_chunk()), concat(actor_rt_asm_case_clause_chunk(), concat(actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, checked_int64_asm))))))))), stack_asm)
 }

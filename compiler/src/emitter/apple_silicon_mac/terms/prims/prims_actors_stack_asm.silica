@@ -27,14 +27,15 @@
 // MAP_FIXED remap to PROT_NONE, the only call on Darwin that actually returns the pages (madvise and
 // mprotect alone keep them resident or merely re-account them).
 //
-// ACB fields owned by this module (the control block is 408 B; 0..271 and 392..407 are the actor runtime's,
-// actor_memory_budget_plan.md item I):
+// ACB fields owned by this module (the control block is 480 B; 0..271 and 392..479 are the actor runtime's,
+// actor_memory_budget_plan.md items I and N):
 //   #272 stack base (reservation low address; 0 = none)   #280 reservation bytes
 //   #288 committed bytes (the run [top-committed, top))     #296 high-water committed bytes
 //   #304 next growth chunk bytes                           #312 release algorithm 1..5
 //   #320 retained bytes (what the algorithm holds now)     #328 32-entry usage ring (track_recent_peak)
 //   #336 ring index                                        #344 last message time, monotonic ns
-//   #352 per-thread signal alt stack (64 KB mapping)       #360 policy as given (for children to inherit)
+//   #352 per-thread signal alt stack (64 KB mapping; 0 for a carrier actor, whose carrier has one)
+//   #360 policy as given (for children to inherit)
 //   #368 runtime SP saved while a behavior runs on the actor stack   #376 1 = reservation was lowered
 //   #384 pending (:explicit, atom) reason atom for the exit payload
 // Release algorithms: 1 :release_on_return, 2 :keep_last_message, 3 :track_recent_peak,
@@ -46,6 +47,11 @@
 // message's depth. The scan costs the untouched pages, which are exactly the ones about to be released.
 // :release_when_idle has no carrier thread to sweep for it in this thread-per-actor runtime: the actor's
 // own mailbox wait carries a one-second timeout while it holds committed stack, and releases on expiry.
+// (Under SILICA_CARRIERS=1, item N stage 1, a carrier actor has no such wait and no sweep yet: its
+// stack is released at its next message boundary instead.)
+//
+// _silica_rt_stack_runtime_init also reads the carrier gate: SILICA_CARRIERS=1 in the environment sets
+// _silica_rt_carriers_enabled (prims_actors_carrier_asm.silica). The emitted text is the same either way.
 
 use atom_table;
 
@@ -139,6 +145,21 @@ Lsri_have_total:
 	adrp	x8, _silica_rt_stack_default_reserve@PAGE
 	add	x8, x8, _silica_rt_stack_default_reserve@PAGEOFF
 	str	x9, [x8]
+; The carrier gate (item N stage 1): SILICA_CARRIERS=1 in the environment.
+	adrp	x0, L_srt_carriers_env@PAGE
+	add	x0, x0, L_srt_carriers_env@PAGEOFF
+	bl	_getenv
+	cbz	x0, Lsri_gate_done
+	ldrb	w9, [x0]
+	cmp	w9, #49
+	b.ne	Lsri_gate_done
+	ldrb	w9, [x0, #1]
+	cbnz	w9, Lsri_gate_done
+	adrp	x8, _silica_rt_carriers_enabled@PAGE
+	add	x8, x8, _silica_rt_carriers_enabled@PAGEOFF
+	mov	x9, #1
+	str	x9, [x8]
+Lsri_gate_done:
 	mov	x8, #1
 	str	x8, [x19]
 Lsri_done:
@@ -291,7 +312,13 @@ Lasr_ret:
 	.p2align	2
 _silica_rt_actor_altstack_install:
 ; X0 = ACB. Every actor thread faults with SP inside its own inaccessible reservation, so the
-; handler needs an alternate stack of its own on this thread.
+; handler needs an alternate stack of its own on this thread (#352). A carrier installs one for
+; its thread the same way (_silica_rt_altstack_install_at, the word in its own block).
+	add	x0, x0, #352
+	.globl	_silica_rt_altstack_install_at
+	.p2align	2
+_silica_rt_altstack_install_at:
+; X0 = the word that records the 64 KB mapping for this thread's signal alternate stack.
 	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	str	x19, [sp, #16]
@@ -305,7 +332,7 @@ _silica_rt_actor_altstack_install:
 	bl	_mmap
 	cmn	x0, #1
 	b.eq	Lsai_ret
-	str	x0, [x19, #352]
+	str	x0, [x19]
 	str	x0, [sp, #24]
 	mov	x8, #65536
 	str	x8, [sp, #32]
@@ -662,13 +689,22 @@ fn stack_asm_fail_and_report() -> string {
 _silica_rt_actor_fail_current:
 ; X0 = the current actor's ACB, X1 = reason atom. Ends the actor with (:explicit, atom): wakes its
 ; waiters, delivers the exit to its supervisor, frees what it owns and exits the thread. Runs on the
-; signal alt stack (stack exhaustion) or on the actor stack (a spawn whose reservation failed).
+; signal alt stack (stack exhaustion) or on the actor stack (a spawn whose reservation failed). For
+; a carrier actor it runs on the carrier's stack (the fault handler returns into it there, through
+; the signal frame, so the carrier's alternate-stack state is intact for the next fault) and ends
+; in the carrier loop.
 	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
 	str	x21, [sp, #32]
 	mov	x19, x0
 	str	x1, [x19, #384]
+	ldr	x21, [x19, #440]
+	cbz	x21, Lafc_thread_actor
+	ldr	x9, [x21, #48]
+	mov	sp, x9
+	b	Lafc_on_stack
+Lafc_thread_actor:
 ; Move onto the thread's alt stack (its top; nothing there is needed again) so the actor stack
 ; this may be running on can be unmapped now. On the exhaustion path we are already there.
 ; The stack is given back before any waiter is woken, as at a message boundary: a caller that
@@ -687,8 +723,8 @@ Lafc_on_stack:
 	mov	x8, #4
 	str	x8, [x19, #232]
 	str	wzr, [x19, #152]
-	add	x0, x19, #80
-	bl	_silica_rt_cv_signal
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	ldr	x8, [x19, #216]
@@ -707,9 +743,9 @@ Lafc_report_done:
 ; exit notice is parked at #400 until its spawner has committed it to the row.
 	ldr	x8, [x19, #224]
 	cbnz	x8, Lafc_started_set
-	mov	x8, #2
-	add	x9, x19, #224
-	stlr	x8, [x9]
+	mov	x0, x19
+	mov	x1, #2
+	bl	_silica_rt_started_store
 Lafc_started_set:
 	mov	x0, x19
 	bl	_silica_rt_actor_signal_pending_call_deaths
@@ -721,6 +757,9 @@ Lafc_started_set:
 	bl	_silica_rt_actor_dealloc_region
 	mov	x0, x19
 	bl	_silica_rt_actor_final_release
+	cbz	x21, Lafc_thread_exit
+	mov	x0, x21
+	b	_silica_rt_carrier_loop_enter
 Lafc_thread_exit:
 	mov	x0, xzr
 	bl	_pthread_exit
