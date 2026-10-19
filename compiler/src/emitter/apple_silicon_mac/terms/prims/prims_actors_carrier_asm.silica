@@ -51,19 +51,25 @@
 //     _silica_rt_actor_mail_signal, which also makes an idle carrier actor ready and wakes the
 //     carrier's futex when it sleeps; every wake of a call wrapper goes through
 //     _silica_rt_call_wrapper_wake.
-//   - A wait for a row child's exit (kill_abnormal, stop_child / remove_child / restart_child, a
-//     supervisor's cascade stop, a :one_for_all or :rest_for_one restart's stops: the seven spins on
-//     a row's exit_done, +56) parks too when the waiter is a carrier actor on its own stack
-//     (_silica_rt_row_wait_exit_done): the waiter links itself, through ACB #456, into the row's
-//     wait list (row +120) under _silica_rt_row_wait_lock, which the child's last act
-//     (_silica_rt_sb_child_done -> _silica_rt_row_exit_done_store) also holds to set exit_done and
-//     take the list; every actor on it is made ready. The check of exit_done and the push are one
-//     critical section, so no wake is lost; the wake side never holds the row lock while it takes
-//     an actor's lock, so the two orders (actor then row; row, then actor) cannot deadlock. A wait
-//     entered while the thread's current actor was another (an ingress drain installs the
-//     supervisor) restores that actor after the resume. Anything that is not a carrier actor on
-//     its own stack spins as before; a carrier actor on the carrier's own stack (an exit path) that
-//     would spin for another carrier actor is a runtime abort rather than a silent deadlock.
+//   - The restart protocol's primitives live here (the protocol itself is described in
+//     prims_actors_child_table_asm.silica's header): _silica_rt_row_wait, the one wait for a row
+//     child's exit (kill_abnormal, terminate_child / remove_child / restart_child, a supervisor's
+//     shutdown, a :one_for_all or :rest_for_one cascade), for one identity in the row's exit_done
+//     (+56, a generation word that is never cleared); _silica_rt_actor_stop, the one way another
+//     actor is ended, which also ends a wait the stopped actor is parked or spinning in;
+//     _silica_rt_sup_restart_try / _acquire / _release, the supervision block's restart token
+//     (#120) with one holder at a time and a wait list (+128) for carrier actors parked for it. A
+//     carrier actor on its own stack parks (_silica_rt_wait_park): it links itself, through ACB
+//     #456, into the list (its head's address kept in ACB #480) under _silica_rt_row_wait_lock,
+//     which guards every wait list; the wake side (_silica_rt_wait_list_wake: the child's last act,
+//     _silica_rt_row_exit_done_store, or a token release) holds it to take the list and never holds
+//     it while it takes an actor's lock; a stop holds the actor's lock and then the wait lock to
+//     unlink. The check and the push are one critical section, so no wake is lost. Lock order
+//     everywhere: the waiting actor, then the supervisor, then the wait lock. A wait entered while
+//     the thread's current actor was another (an ingress drain installs the supervisor) restores
+//     that actor after the resume. Anything that is not a carrier actor on its own stack spins
+//     (main, an actor thread); a carrier actor on the carrier's own stack (an exit path) that would
+//     spin for another carrier actor is a runtime abort rather than a silent deadlock.
 //
 // Not in this stage (actor_memory_budget_plan.md §5 N, "Stage 1 status"): several carriers, pinning,
 // migrate_actor, scheduler policies and priorities, supervisors on carriers, and the
@@ -473,105 +479,107 @@ Lsws_ret:
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
 	ret
-	.globl	_silica_rt_row_wait_exit_done
+	.globl	_silica_rt_on_carrier_thread
 	.p2align	2
-_silica_rt_row_wait_exit_done:
-; X0 = a row, X1 = the child whose exit is waited for (0 = unknown). -> X0 = 1 once the row's
-; exit_done (+56) is set, having parked for it: the caller was a carrier actor on its own stack.
-; -> X0 = 0 at once when the caller cannot park (main, an actor thread, a runtime path on the
-; carrier's own stack): it spins on exit_done as it always did. A caller on the carrier's own
-; stack that would spin for another carrier actor is a runtime abort, not a silent deadlock.
-; The parked actor is the one the carrier runs (carrier +40), not the thread's current actor: an
-; ingress drain installs the supervisor as the current actor while it runs on the drainer's stack.
+_silica_rt_on_carrier_thread:
+; -> X0 = the carrier block when this thread is the carrier's, else 0.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	adrp	x19, _silica_rt_carrier0@PAGE
+	add	x19, x19, _silica_rt_carrier0@PAGEOFF
+	ldr	x9, [x19, #64]
+	cbz	x9, Loct_no
+	bl	_pthread_self
+	ldr	x9, [x19, #64]
+	cmp	x0, x9
+	b.ne	Loct_no
+	mov	x0, x19
+	b	Loct_ret
+Loct_no:
+	mov	x0, xzr
+Loct_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_carrier_self_on_own_stack
+	.p2align	2
+_silica_rt_carrier_self_on_own_stack:
+; -> X0 = the carrier actor this thread runs when the caller is on that actor's own stack (it can
+; park), else 0: main, an actor thread, or a runtime path on the carrier's own stack. The parked
+; actor is the one the carrier runs (carrier +40), not the thread's current actor: an ingress drain
+; installs the supervisor as the current actor while it runs on the drainer's stack.
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	bl	_silica_rt_on_carrier_thread
+	cbz	x0, Lcso_ret
+	ldr	x0, [x0, #40]
+	cbz	x0, Lcso_ret
+	mov	x9, sp
+	ldr	x10, [x0, #272]
+	cmp	x9, x10
+	b.lo	Lcso_no
+	ldr	x11, [x0, #280]
+	add	x10, x10, x11
+	cmp	x9, x10
+	b.hs	Lcso_no
+	b	Lcso_ret
+Lcso_no:
+	mov	x0, xzr
+Lcso_ret:
+	ldp	x29, x30, [sp], #16
+	ret
+	.globl	_silica_rt_wait_park
+	.p2align	2
+_silica_rt_wait_park:
+; X0 = the carrier actor parking (on its own stack), X1 = the wait list it joins (the address of
+; the head word: a row's +120 or a supervision block's +128; the links are ACB #456, the list is
+; recorded in #480 for a stop to find), X2 = the thread's current actor to restore after the
+; resume. Called with the actor's lock and the wait lock held: it publishes status 4 (parked)
+; under both, releases them and leaves for the carrier loop. Returns, with no lock held, when the
+; actor has been made ready again (by the list's wake or by a stop that unlinked it).
 	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
-	stp	x21, x22, [sp, #32]
+	str	x21, [sp, #32]
 	mov	x19, x0
-	mov	x22, x1
-	adrp	x20, _silica_rt_carrier0@PAGE
-	add	x20, x20, _silica_rt_carrier0@PAGEOFF
-	ldr	x9, [x20, #64]
-	cbz	x9, Lrwe_no
-	bl	_pthread_self
-	ldr	x9, [x20, #64]
-	cmp	x0, x9
-	b.ne	Lrwe_no
-	ldr	x20, [x20, #40]
-	cbz	x20, Lrwe_no
-	mov	x9, sp
-	ldr	x10, [x20, #272]
-	cmp	x9, x10
-	b.lo	Lrwe_off_stack
-	ldr	x11, [x20, #280]
-	add	x10, x10, x11
-	cmp	x9, x10
-	b.hs	Lrwe_off_stack
-	bl	_silica_rt_tls_current_actor_get
-	mov	x21, x0
-Lrwe_loop:
-; The check of exit_done and the push onto the row's wait list are one critical section under the
-; row wait lock (the exit side sets exit_done and takes the list under it), and the status becomes
-; parked under this actor's own lock before either is released: the wake finds it parked.
-	add	x0, x20, #16
-	bl	_os_unfair_lock_lock
-	adrp	x0, _silica_rt_row_wait_lock@PAGE
-	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
-	bl	_os_unfair_lock_lock
-	ldr	x8, [x19, #56]
-	cbnz	x8, Lrwe_done
-	mov	x0, x20
+	mov	x20, x1
+	mov	x21, x2
+	mov	x0, x19
 	bl	_silica_rt_ctx_save
-	cbnz	x0, Lrwe_resumed
-	ldr	x9, [x19, #120]
-	str	x9, [x20, #456]
-	str	x20, [x19, #120]
+	cbnz	x0, Lwpk_resumed
+	ldr	x9, [x20]
+	str	x9, [x19, #456]
+	str	x19, [x20]
+	str	x20, [x19, #480]
 	mov	x9, #4
-	str	x9, [x20, #448]
+	str	x9, [x19, #448]
 	adrp	x0, _silica_rt_row_wait_lock@PAGE
 	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
 	bl	_os_unfair_lock_unlock
-	add	x0, x20, #16
+	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
-	mov	x0, x20
+	mov	x0, x19
 	b	_silica_rt_carrier_leave
-Lrwe_resumed:
-; Resumed with no lock held. The carrier made this actor the thread's current actor at the resume;
-; the wait was entered with X21 as the current actor (the supervisor, in an ingress drain).
-	cmp	x21, x20
-	b.eq	Lrwe_loop
+Lwpk_resumed:
+; The carrier made this actor the thread's current actor at the resume; the wait was entered with
+; X21 as the current actor (the supervisor, in an ingress drain).
+	cmp	x21, x19
+	b.eq	Lwpk_ret
 	mov	x0, x21
 	bl	_silica_rt_tls_actor_set
-	b	Lrwe_loop
-Lrwe_done:
-	adrp	x0, _silica_rt_row_wait_lock@PAGE
-	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
-	bl	_os_unfair_lock_unlock
-	add	x0, x20, #16
-	bl	_os_unfair_lock_unlock
-	mov	x0, #1
-	b	Lrwe_ret
-Lrwe_off_stack:
-	cbz	x22, Lrwe_no
-	ldr	x9, [x22, #440]
-	cbz	x9, Lrwe_no
-	adrp	x0, Lrta_r_carrier_wait@PAGE
-	add	x0, x0, Lrta_r_carrier_wait@PAGEOFF
-	bl	_silica_rt_abort_with
-Lrwe_no:
-	mov	x0, xzr
-Lrwe_ret:
-	ldp	x21, x22, [sp, #32]
+Lwpk_ret:
+	ldr	x21, [sp, #32]
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #48
 	ret
-	.globl	_silica_rt_row_exit_done_store
+	.globl	_silica_rt_wait_list_wake
 	.p2align	2
-_silica_rt_row_exit_done_store:
-; X0 = a row whose child has ended (_silica_rt_sb_child_done, the child's last act): its exit_done
-; (+56) = 1 and every carrier actor parked for it (+120, linked through ACB #456) is made ready,
-; each under its own lock, none under the row wait lock. An actor on the list that is not parked
-; cannot happen (it was parked under both locks and only this store wakes it): a runtime abort.
+_silica_rt_wait_list_wake:
+; X0 = the address of a wait list's head word: takes the whole list under the wait lock and makes
+; every actor on it ready, each under its own lock, none under the wait lock. An actor on the list
+; that is not parked cannot happen (it was parked under both locks, and only this wake or a stop,
+; which unlinks it under the wait lock first, changes that): a runtime abort.
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -579,21 +587,20 @@ _silica_rt_row_exit_done_store:
 	adrp	x0, _silica_rt_row_wait_lock@PAGE
 	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
 	bl	_os_unfair_lock_lock
-	mov	x9, #1
-	str	x9, [x19, #56]
-	ldr	x20, [x19, #120]
-	str	xzr, [x19, #120]
+	ldr	x20, [x19]
+	str	xzr, [x19]
 	adrp	x0, _silica_rt_row_wait_lock@PAGE
 	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
 	bl	_os_unfair_lock_unlock
-Lres_wake:
-	cbz	x20, Lres_ret
+Lwlw_wake:
+	cbz	x20, Lwlw_ret
 	ldr	x19, [x20, #456]
 	add	x0, x20, #16
 	bl	_os_unfair_lock_lock
 	ldr	x9, [x20, #448]
 	cmp	x9, #4
-	b.ne	Lres_not_parked
+	b.ne	Lwlw_not_parked
+	str	xzr, [x20, #480]
 	mov	x9, #2
 	str	x9, [x20, #448]
 	mov	x0, x20
@@ -601,14 +608,365 @@ Lres_wake:
 	add	x0, x20, #16
 	bl	_os_unfair_lock_unlock
 	mov	x20, x19
-	b	Lres_wake
-Lres_not_parked:
+	b	Lwlw_wake
+Lwlw_not_parked:
 	adrp	x0, Lrta_r_row_wake@PAGE
 	add	x0, x0, Lrta_r_row_wake@PAGEOFF
 	bl	_silica_rt_abort_with
-Lres_ret:
+Lwlw_ret:
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_row_wait
+	.p2align	2
+_silica_rt_row_wait:
+; X0 = a row, X1 = the identity (ACB #408) of the child whose exit is waited for, X2 = 1 when that
+; child is a carrier actor (0 = unknown), X3 = the waiting actor or 0 (main, or a wait that no stop
+; may end). -> X0 = 1 once the row's exit_done (+56) holds that identity, 2 when X3 was ended
+; meanwhile (its supervisor's cascade stops it while it waits in kill_abnormal: the wait is over
+; and the victim is dead or dying). exit_done is a generation word, never cleared: the identity of
+; the last child of the row that ended; a stale value from an earlier incarnation never matches.
+; A carrier actor on its own stack parks on the row's wait list (the exit_done store wakes it, so
+; does a stop of the waiter); anything else spins (main, an actor thread, a runtime path on the
+; carrier's own stack; the last is a runtime abort when the awaited child is a carrier actor, which
+; could never run on the stack being spun on).
+	stp	x29, x30, [sp, #-64]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
+	stp	x23, x24, [sp, #48]
+	mov	x19, x0
+	mov	x20, x1
+	mov	x22, x2
+	mov	x23, x3
+	bl	_silica_rt_carrier_self_on_own_stack
+	mov	x21, x0
+	cbz	x21, Lrw_spin
+	bl	_silica_rt_tls_current_actor_get
+	mov	x24, x0
+Lrw_park_loop:
+; The check and the push onto the row's wait list are one critical section under the wait lock
+; (the exit side stores exit_done and takes the list under it; a stop sets the waiter's alive flag
+; under the waiter's own lock), so no wake is lost.
+	add	x0, x21, #16
+	bl	_os_unfair_lock_lock
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_lock
+	ldr	x8, [x19, #56]
+	cmp	x8, x20
+	b.eq	Lrw_done_locked
+	cbz	x23, Lrw_park
+	ldr	w8, [x23, #152]
+	cbz	w8, Lrw_stopped_locked
+Lrw_park:
+	mov	x0, x21
+	add	x1, x19, #120
+	mov	x2, x24
+	bl	_silica_rt_wait_park
+	b	Lrw_park_loop
+Lrw_done_locked:
+	mov	x23, #1
+	b	Lrw_unlock_ret
+Lrw_stopped_locked:
+	mov	x23, #2
+Lrw_unlock_ret:
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_unlock
+	add	x0, x21, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x23
+	b	Lrw_ret
+Lrw_spin:
+	cbz	x22, Lrw_spin_loop
+	bl	_silica_rt_on_carrier_thread
+	cbz	x0, Lrw_spin_loop
+	adrp	x0, Lrta_r_carrier_wait@PAGE
+	add	x0, x0, Lrta_r_carrier_wait@PAGEOFF
+	bl	_silica_rt_abort_with
+Lrw_spin_loop:
+	ldr	x8, [x19, #56]
+	cmp	x8, x20
+	b.eq	Lrw_spin_done
+	cbz	x23, Lrw_spin_loop
+	ldr	w8, [x23, #152]
+	cbnz	w8, Lrw_spin_loop
+	mov	x0, #2
+	b	Lrw_ret
+Lrw_spin_done:
+	mov	x0, #1
+Lrw_ret:
+	ldp	x23, x24, [sp, #48]
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #64
+	ret
+	.globl	_silica_rt_row_exit_done_store
+	.p2align	2
+_silica_rt_row_exit_done_store:
+; X0 = a row whose child has ended (_silica_rt_sb_child_done, the child's last act), X1 = that
+; child's identity: exit_done (+56) = the identity, under the wait lock, then every carrier actor
+; parked on the row's wait list (+120) is made ready; each re-checks the identity it waits for.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	mov	x20, x1
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_lock
+	str	x20, [x19, #56]
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_unlock
+	add	x0, x19, #120
+	bl	_silica_rt_wait_list_wake
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_actor_stop
+	.p2align	2
+_silica_rt_actor_stop:
+; X0 = an actor to end at its next dispatch boundary, X1 = the exit reason tag to give it (0 keeps
+; what it has: a supervisor's own stop, reason 0 in its report), X2 = the reason atom that goes
+; with a tag (#384; 0 = none). -> X0 = 1 when it is a carrier actor. The one way the runtime ends
+; another actor: under the target's lock its alive flag goes, the reason (tag and atom) is set
+; only while it was still alive (an actor already ending keeps its own), its
+; mailbox is signalled (an idle carrier actor is made ready), and an actor parked on a wait list
+; (a row's exit_done, a supervision block's restart token: #480 names the list) is unlinked under
+; the wait lock and made ready, so a wait that this stop ends (kill_abnormal's) sees it at once. A
+; parked actor the list's wake has already taken (not found on the list) is made ready by that wake.
+	stp	x29, x30, [sp, #-48]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
+	mov	x19, x0
+	mov	x20, x1
+	mov	x21, x2
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	w8, [x19, #152]
+	cbz	w8, Lsto_was_ended
+	cbz	x20, Lsto_was_ended
+	str	x20, [x19, #232]
+	cbz	x21, Lsto_was_ended
+	str	x21, [x19, #384]
+Lsto_was_ended:
+	str	wzr, [x19, #152]
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
+	ldr	x22, [x19, #440]
+	cbz	x22, Lsto_unlock
+	ldr	x9, [x19, #448]
+	cmp	x9, #4
+	b.ne	Lsto_unlock
+	ldr	x21, [x19, #480]
+	cbz	x21, Lsto_unlock
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_lock
+	ldr	x9, [x21]
+	mov	x10, xzr
+Lsto_find:
+	cbz	x9, Lsto_not_found
+	cmp	x9, x19
+	b.eq	Lsto_found
+	mov	x10, x9
+	ldr	x9, [x9, #456]
+	b	Lsto_find
+Lsto_found:
+	ldr	x11, [x19, #456]
+	cbz	x10, Lsto_unlink_head
+	str	x11, [x10, #456]
+	b	Lsto_unlinked
+Lsto_unlink_head:
+	str	x11, [x21]
+Lsto_unlinked:
+	str	xzr, [x19, #480]
+	str	xzr, [x19, #456]
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_unlock
+	mov	x9, #2
+	str	x9, [x19, #448]
+	mov	x0, x19
+	bl	_silica_rt_carrier_push
+	b	Lsto_unlock
+Lsto_not_found:
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_unlock
+Lsto_unlock:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	cmp	x22, #0
+	cset	x0, ne
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #48
+	ret
+	.globl	_silica_rt_sup_restart_try
+	.p2align	2
+_silica_rt_sup_restart_try:
+; X0 = a supervisor, X1 = the actor asking (0 = main). -> X0 = 1 when the caller now holds the
+; supervisor's restart token (supervision block #120: the holder, or 1 for main), 0 when another
+; holder has it, or the supervisor has no block or has ended. One holder at a time dequeues its
+; ingress and runs the restarts (maybe_restart with its cascades), so no two cascades overlap.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	mov	x20, x1
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	x8, [x19, #216]
+	cbz	x8, Lsrt_no
+	ldr	w9, [x19, #152]
+	cbz	w9, Lsrt_no
+	ldr	x9, [x8, #120]
+	cbnz	x9, Lsrt_no
+	mov	x9, x20
+	cbnz	x9, Lsrt_take
+	mov	x9, #1
+Lsrt_take:
+	str	x9, [x8, #120]
+	mov	x20, #1
+	b	Lsrt_unlock
+Lsrt_no:
+	mov	x20, xzr
+Lsrt_unlock:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x20
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_sup_restart_release
+	.p2align	2
+_silica_rt_sup_restart_release:
+; X0 = a supervisor whose restart token the caller holds: lets it go. Notices still in the ingress
+; are the supervisor's own thread's to drain (its mailbox is signalled; the thread skips the ingress
+; while another holder has the token), and every actor parked for the token (block +128) is made
+; ready to re-check.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	x20, [x19, #216]
+	cbz	x20, Lsrr_unlock
+	str	xzr, [x20, #120]
+	ldr	x9, [x20]
+	ldr	x10, [x20, #8]
+	orr	x9, x9, x10
+	cbz	x9, Lsrr_unlock
+	mov	x0, x19
+	bl	_silica_rt_actor_mail_signal
+Lsrr_unlock:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	cbz	x20, Lsrr_ret
+	add	x0, x20, #128
+	bl	_silica_rt_wait_list_wake
+Lsrr_ret:
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_sup_restart_acquire
+	.p2align	2
+_silica_rt_sup_restart_acquire:
+; X0 = a supervisor, X1 = the actor asking (0 = main), X2 = 1 to take the restart token, 0 to wait
+; until the token is free and the ingress is empty (a row child of this supervisor never takes the
+; token: the cascade it would run could stop the child itself; it waits for the holder, the
+; supervisor's thread, to finish). -> X0 = 1 taken / settled, 2 when X1 was ended while it waited
+; (its supervisor's cascade stops it: the caller's wait is over), 0 when the supervisor has no
+; block or has ended (nothing to drain or wait for). A carrier actor on its own stack parks on the
+; block's wait list (+128; a release wakes it, so does a stop of the waiter); anything else polls.
+; Lock order everywhere: the waiting actor, then the supervisor, then the wait lock.
+	stp	x29, x30, [sp, #-80]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
+	stp	x23, x24, [sp, #48]
+	str	x25, [sp, #64]
+	mov	x19, x0
+	mov	x20, x1
+	mov	x21, x2
+	bl	_silica_rt_carrier_self_on_own_stack
+	mov	x22, x0
+	bl	_silica_rt_tls_current_actor_get
+	mov	x24, x0
+Lsra_loop:
+	cbz	x22, Lsra_lock_sup
+	add	x0, x22, #16
+	bl	_os_unfair_lock_lock
+Lsra_lock_sup:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	mov	x23, xzr
+	ldr	x8, [x19, #216]
+	cbz	x8, Lsra_unlock
+	mov	x25, x8
+	ldr	w9, [x19, #152]
+	cbz	w9, Lsra_unlock
+	cbz	x20, Lsra_self_ok
+	ldr	w9, [x20, #152]
+	cbnz	w9, Lsra_self_ok
+	mov	x23, #2
+	b	Lsra_unlock
+Lsra_self_ok:
+	ldr	x9, [x8, #120]
+	cbnz	x9, Lsra_wait
+	cbz	x21, Lsra_settle
+	mov	x9, x20
+	cbnz	x9, Lsra_take
+	mov	x9, #1
+Lsra_take:
+	str	x9, [x8, #120]
+	mov	x23, #1
+	b	Lsra_unlock
+Lsra_settle:
+	ldr	x9, [x8]
+	ldr	x10, [x8, #8]
+	orr	x9, x9, x10
+	cbnz	x9, Lsra_wait
+	mov	x23, #1
+Lsra_unlock:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	cbz	x22, Lsra_ret
+	add	x0, x22, #16
+	bl	_os_unfair_lock_unlock
+	b	Lsra_ret
+Lsra_wait:
+	cbz	x22, Lsra_poll
+; Park: the wait lock is taken before the supervisor's lock goes, so a release that follows cannot
+; take the list before this actor is on it.
+	adrp	x0, _silica_rt_row_wait_lock@PAGE
+	add	x0, x0, _silica_rt_row_wait_lock@PAGEOFF
+	bl	_os_unfair_lock_lock
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x22
+	add	x1, x25, #128
+	mov	x2, x24
+	bl	_silica_rt_wait_park
+	b	Lsra_loop
+Lsra_poll:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	mov	w0, #50
+	bl	_usleep
+	b	Lsra_loop
+Lsra_ret:
+	mov	x0, x23
+	ldr	x25, [sp, #64]
+	ldp	x23, x24, [sp, #48]
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #80
 	ret
 "
 }

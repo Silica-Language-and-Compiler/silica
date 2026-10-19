@@ -26,9 +26,10 @@
 // cpu_topology / cache / NUMA helpers (_silica_rt_apple_*, sysctl hw.*): macOS Apple Silicon only (see cpu_topology_implementation_plan Phase G).
 // ABI: spawn(X0,X1,X2)->X0  send(X0,X1)  cast(X0,X1)->W0  call(X0,X1)->X0  self()->X0  recv()->X0
 // X2=optional core_id (0 default) per §15.1.1, X4=packed stack_policy (0 = inherit the spawner's; see prims_actors_stack_asm).
-// Actor control block 480 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
-// the holder count and the parked exit notice; 2026-10-19 +32 for the carrier fields, item N): #0..#215 the
-// actor runtime's, #216 the supervision block pointer (SB, 112 B, only a supervisor has one; layout at
+// Actor control block 496 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
+// the holder count and the parked exit notice; 2026-10-19 +32 for the carrier fields, item N, and +16 for
+// the wait-list word of the restart protocol): #0..#215 the
+// actor runtime's, #216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
 // _silica_rt_sb_require), #224 started flag, #232 pending exit reason_tag, #240 active call wrapper,
 // #248/#256/#264 FFI arena base/end/bump (Phase 12), #272..#391 the runtime-managed stack fields
 // (prims_actors_stack_asm.silica). A worker carries no supervision field.
@@ -39,11 +40,12 @@
 // whose record is its row's +96/+104 (actor_rt_identity_chunk).
 // #432 the calling convention recorded at spawn (spec §16.2.6.4; _silica_rt_beh_convention: 0 not
 // checked, 1 call-only, 2 cast-only).
-// #440..#479 the carrier fields (prims_actors_carrier_asm.silica, item N stage 1): #440 the carrier
+// #440..#495 the carrier fields (prims_actors_carrier_asm.silica, item N stage 1): #440 the carrier
 // block (0 = the actor has a thread of its own), #448 status (1 idle, 2 ready, 3 running, 4 parked),
-// #456 run-queue link (the link in a row's wait list, row +120, while parked for a row child's exit_done),
-// #464 the SP of a parked context, #472 the actor parked in a spawn waiting for
-// this one to start. Control block 480 B.
+// #456 run-queue link (the link in a wait list while parked for a row child's exit_done, row +120, or
+// for a supervisor's restart token, block +128), #464 the SP of a parked context, #472 the actor parked
+// in a spawn waiting for this one to start, #480 the wait list (the address of its head word) the actor
+// is parked on, 0 when none: a stop (_silica_rt_actor_stop) unlinks and wakes it. Control block 496 B.
 // spawn_linked Phase A (supervisors_implementation_development_plan): spawn_linked(X0,X1,X2,X3,X4)->X0
 // X0=init X1=beh X2=agent_type (int64) X3=row/core metadata (0 default), X4=optional supervisor trampoline.
 // Offsets: #192 supervisor actor_ref (0 root), #200 agent_type atom, #208 core_id (the row pointer of a
@@ -118,7 +120,7 @@ _silica_rt_actor_spawn:                 ; @silica_rt_actor_spawn
 	mov	x21, x0
 	mov	w22, #1                         ; =0x1
 	mov	w0, #1                          ; =0x1
-	mov	w1, #480
+	mov	w1, #496
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBB0_4
@@ -297,7 +299,7 @@ LBBsl_common:
 	mov	x20, x1
 	mov	x21, x0
 	mov	w0, #1
-	mov	w1, #480
+	mov	w1, #496
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBBsl_4
@@ -550,12 +552,19 @@ LBB1_loop:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 LBB1_wait:
+; The ingress is this thread's to dequeue only while no other holder has the restart token (block
+; #120; the protocol in prims_actors_child_table_asm.silica's header): the token is taken with the
+; node, under this lock, and released once the node is served (LBB1_free, or the reply path).
+; Another holder's release signals this mailbox when notices remain.
 	ldr	x0, [x19, #216]
 	cbz	x0, LBB1_try_std
+	ldr	x8, [x0, #120]
+	cbnz	x8, LBB1_try_std
 	bl	_silica_rt_q_dequeue_locked
 	mov	x20, x0
 	cbz	x20, LBB1_try_std
 	ldr	x8, [x19, #216]
+	str	x19, [x8, #120]
 	ldr	w9, [x8, #16]
 	sub	w9, w9, #1
 	str	w9, [x8, #16]
@@ -743,37 +752,14 @@ LBB1_after_w21:
 ; phase_e4f_rest_for_one.
 	add	x0, x20, #72
 	bl	_os_unfair_lock_lock
-LBB1_drain_ingress:
-	add	x0, x19, #16
-	bl	_os_unfair_lock_lock
-	ldr	x0, [x19, #216]
-	cbz	x0, LBB1_drain_ingress_done
-	bl	_silica_rt_q_dequeue_locked
-	mov	x23, x0
-	cbz	x23, LBB1_drain_ingress_done
-	ldr	x8, [x19, #216]
-	ldr	w9, [x8, #16]
-	sub	w9, w9, #1
-	str	w9, [x8, #16]
-	add	x0, x19, #16
-	bl	_os_unfair_lock_unlock
-	ldr	w9, [x23, #24]
-	cbnz	w9, LBB1_drain_ingress_free_msg
-	ldr	x22, [x23, #8]
-	cbz	x22, LBB1_drain_ingress_free_msg
-	ldr	x0, [x22]
+; An ingress node served with a reply (w22) held the restart token (LBB1_wait): released first.
+	cbz	w22, LBB1_reply_drain
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_release
+LBB1_reply_drain:
+	mov	x0, x19
 	mov	x1, x19
-	ldr	x2, [x22, #8]
-	bl	_silica_rt_supervisor_maybe_restart
-	mov	x0, x22
-	bl	_silica_rt_exit_payload_free
-LBB1_drain_ingress_free_msg:
-	mov	x0, x23
-	bl	_free
-	b	LBB1_drain_ingress
-LBB1_drain_ingress_done:
-	add	x0, x19, #16
-	bl	_os_unfair_lock_unlock
+	bl	_silica_rt_supervisor_drain_ingress
 	str	x21, [x20, #144]
 	mov	w8, #1
 	str	w8, [x20, #136]
@@ -788,15 +774,19 @@ LBB1_free:
 ; Phase B trial: message[+24]!=0 and +8 is inline int64 — do not treat +8 as heap or call maybe_restart (phase_b_ingress_before_cast).
 	cbz	w22, LBB1_free_skip_restart
 	ldr	w9, [x20, #24]
-	cbnz	w9, LBB1_free_skip_restart
+	cbnz	w9, LBB1_free_release
 	ldr	x25, [x20, #8]
-	cbz	x25, LBB1_free_skip_restart
+	cbz	x25, LBB1_free_release
 	ldr	x0, [x25]
 	mov	x1, x19
 	ldr	x2, [x25, #8]
 	bl	_silica_rt_supervisor_maybe_restart
 	mov	x0, x25
 	bl	_silica_rt_exit_payload_free
+LBB1_free_release:
+; The ingress node is served: the restart token taken with it (LBB1_wait) goes.
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_release
 LBB1_free_skip_restart:
 ; A payload the message owns (the FailureReporter's report string) goes back now that the
 ; behaviour has returned, unless the behaviour kept it (_silica_rt_report_release).
@@ -844,10 +834,17 @@ LBB1_exit_note_later:
 LBB1_exit_report_already_done:
 	mov	x20, #0
 LBB1_exit_after_report:
+; Callers parked in a call to this actor learn of its death now, before a restart drained below
+; stops them (a sibling parked in a call to it, under :one_for_all).
+	mov	x0, x19
+	bl	_silica_rt_actor_signal_pending_call_deaths
 ; A notice parked at #400 (this row child ended before its spawner committed it) is not in the
-; supervisor's ingress yet: nothing to drain or wait for. A carrier actor neither drains its
-; supervisor's ingress nor waits for its replacement (carriers stage 1: the supervisor's own thread
-; restarts it; a restart that stops siblings on this carrier would wait for this very path).
+; supervisor's ingress yet: nothing to drain. A carrier actor does not drain its supervisor's
+; ingress (its exit path runs on the carrier's stack and cannot wait; the supervisor's thread
+; restarts it). A thread actor restarts itself when its own notice is first in the ingress
+; (_silica_rt_supervisor_drain_own_exit; the protocol in prims_actors_child_table_asm.silica's
+; header) and never waits for its replacement: a caller in kill_abnormal waits for this row's
+; exit_done, the last act below, and then for the restart to settle.
 	cbnz	x24, LBB1_exit_no_sup_drain
 	ldr	x8, [x19, #400]
 	cmp	x8, #1
@@ -855,38 +852,9 @@ LBB1_exit_after_report:
 	ldr	x21, [x19, #192]
 	cbz	x21, LBB1_exit_no_sup_drain
 	mov	x0, x21
-	bl	_silica_rt_supervisor_drain_ingress
-	ldr	w23, [x19, #232]
-	cbz	w23, LBB1_exit_no_sup_drain
-	ldr	x22, [x19, #208]
-	cbz	x22, LBB1_exit_no_sup_drain
-	mov	x0, x21
-	bl	_silica_rt_sup_wait_enter
-	cbz	x0, LBB1_exit_no_sup_drain
-; Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
-; (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
-; restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
-; row (its policy restarts nothing); before, the child and that caller spun forever
-; (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
-; supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
-; keeps the rows until it stops: a row freed under the wait was read as a garbage child
-; (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
-LBB1_exit_wait_new_child:
-	ldr	w8, [x21, #152]
-	cbz	w8, LBB1_exit_wait_done
-	ldr	x0, [x22]
-	cbz	x0, LBB1_exit_wait_done
-	cmp	x0, x19
-	beq	LBB1_exit_wait_new_child
-	add	x9, x0, #224
-	ldar	x8, [x9]
-	cbz	x8, LBB1_exit_wait_new_child
-LBB1_exit_wait_done:
-	mov	x0, x21
-	bl	_silica_rt_sup_wait_leave
+	mov	x1, x19
+	bl	_silica_rt_supervisor_drain_own_exit
 LBB1_exit_no_sup_drain:
-	mov	x0, x19
-	bl	_silica_rt_actor_signal_pending_call_deaths
 	mov	x0, x19
 	mov	x1, xzr
 	bl	_silica_rt_actor_stack_free
@@ -2302,88 +2270,102 @@ Lkabn_none:
 	.globl	_silica_rt_actor_kill_abnormal
 	.p2align	2
 _silica_rt_actor_kill_abnormal:
-; X0 = reference (held while the kill runs; an ended actor is :ok).
+; X0 = reference (held while the kill runs; an ended actor is :ok). Spec §15.1.2.3: kill_abnormal
+; must not name the calling actor; the caller fails with :language_error and nothing is changed on
+; it (a call it is serving gets no reply). The target is ended with reason tag 1
+; (_silica_rt_actor_stop). When it is a row child the caller waits for its row's exit_done to
+; carry the target's identity (its last act), then for the restart to settle
+; (_silica_rt_supervisor_drain_ingress: the caller drains the supervisor's ingress itself unless
+; it is a row child of that supervisor, which waits for the supervisor's thread to do it), so the
+; replacement, when the policy makes one, exists when this returns. Both waits end at once when
+; the caller itself is ended meanwhile (the target's :one_for_all or :rest_for_one cascade stops
+; the caller): the target is dead or dying, :ok.
 	.cfi_startproc
-	stp	x21, x20, [sp, #-48]!
-	stp	x29, x30, [sp, #16]
-	str	x19, [sp, #32]
-	str	xzr, [sp, #40]
-	add	x29, sp, #16
-	.cfi_def_cfa w29, 16
-	.cfi_offset w30, -8
-	.cfi_offset w29, -16
-	.cfi_offset w19, -24
-	.cfi_offset w20, -32
+	stp	x29, x30, [sp, #-80]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
+	stp	x23, x24, [sp, #48]
+	str	x25, [sp, #64]
+	.cfi_def_cfa w29, 80
+	.cfi_offset w30, -72
+	.cfi_offset w29, -80
 	bl	_silica_rt_ref_hold
 	mov	x19, x0
 	cbz	x19, Lkab_not_found
-; Spec §15.1.2.3: kill_abnormal must not name the calling actor; the caller fails with
-; :language_error and nothing is changed on it (a call it is serving gets no reply).
 	bl	_silica_rt_tls_current_actor_get
-	cmp	x0, x19
+	mov	x22, x0
+	cmp	x22, x19
 	b.eq	Lkab_self
 	ldr	x20, [x19, #208]
 	ldr	x21, [x19, #192]
+	mov	x23, xzr
+	mov	x24, xzr
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
-; While the target is still alive it holds its block reference, so one taken now keeps the row this
-; call waits on alive even if the supervisor ends meanwhile ([sp, #40]; dropped at the end).
+; While the target is still alive it holds its block reference and its supervisor, so ones taken
+; now keep the row this call waits on and the supervisor it drains alive even if the supervisor
+; ends meanwhile (X23 = the block, X24 = 1 when the supervisor is held; dropped at the end). A
+; target that has ended, or has no row, is :ok with no wait.
 	ldr	w8, [x19, #152]
-	cbz	w8, Lkab_no_ref
-	cbz	x21, Lkab_no_ref
+	cbz	w8, Lkab_unlock
+	cbz	x21, Lkab_unlock
 	cmp	x20, #4096
-	b.lo	Lkab_no_ref
-	ldr	x8, [x20, #88]
-	cbz	x8, Lkab_no_ref
-	str	x8, [sp, #40]
-	add	x9, x8, #112
+	b.lo	Lkab_unlock
+	ldr	x23, [x20, #88]
+	cbz	x23, Lkab_unlock
+	add	x9, x23, #112
 Lkab_ref:
 	ldaxr	x10, [x9]
 	add	x10, x10, #1
 	stlxr	w11, x10, [x9]
 	cbnz	w11, Lkab_ref
-Lkab_no_ref:
-	mov	x8, #1
-	str	x8, [x19, #232]
-	str	wzr, [x19, #152]
-	mov	x0, x19
-	bl	_silica_rt_actor_mail_signal
+	mov	x0, x21
+	bl	_silica_rt_acb_hold
+	mov	x24, #1
+Lkab_unlock:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
-	cmp	x20, #4096
-	b.lo	Lkab_not_found
-	bl	_silica_rt_tls_current_actor_get
-	cmp	x0, x19
-	b.eq	Lkab_not_found
-; A carrier actor parks for the row's exit_done (prims_actors_carrier_asm.silica: the target's exit
-; path, on the same carrier, wakes it); anything else spins on it as before.
+	ldr	x25, [x19, #408]
+	mov	x0, x19
+	mov	x1, #1
+	mov	x2, xzr
+	bl	_silica_rt_actor_stop
+	cbz	x23, Lkab_done
+	mov	x2, x0
 	mov	x0, x20
-	mov	x1, x19
-	bl	_silica_rt_row_wait_exit_done
-	cbnz	x0, Lkab_exited
-Lkab_wait_exit_done:
-	ldr	x8, [x20, #56]
-	cbz	x8, Lkab_wait_exit_done
-Lkab_exited:
-	cbz	x21, Lkab_not_found
+	mov	x1, x25
+	mov	x3, x22
+	bl	_silica_rt_row_wait
+	cmp	x0, #1
+	b.ne	Lkab_done
 	mov	x0, x21
+	mov	x1, x22
 	bl	_silica_rt_supervisor_drain_ingress
-Lkab_not_found:
-	ldr	x0, [sp, #40]
+Lkab_done:
+	mov	x0, x23
 	bl	_silica_rt_sb_unref
+	cbz	x24, Lkab_not_found
+	mov	x0, x21
+	bl	_silica_rt_acb_release
+Lkab_not_found:
 	mov	x0, x19
 	bl	_silica_rt_acb_release
 	mov	x0, #0
-	ldr	x19, [sp, #32]
-	ldp	x29, x30, [sp, #16]
-	ldp	x21, x20, [sp], #48
+	ldr	x25, [sp, #64]
+	ldp	x23, x24, [sp, #48]
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #80
 	ret
 Lkab_self:
 	mov	x0, x19
 	bl	_silica_rt_acb_release
-	ldr	x19, [sp, #32]
-	ldp	x29, x30, [sp, #16]
-	ldp	x21, x20, [sp], #48
+	ldr	x25, [sp, #64]
+	ldp	x23, x24, [sp, #48]
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #80
 	b	_silica_rt_language_error_current
 	.cfi_endproc
                                         ; -- End function
@@ -3596,9 +3578,12 @@ Lsie_abort:
 	.globl	_silica_rt_sb_require
 	.p2align	2
 _silica_rt_sb_require:
-; X0 = ACB -> X0 = its supervision block (SB, 112 B: #0/#8 ingress front/rear, #16 depth u32,
+; X0 = ACB -> X0 = its supervision block (SB, 144 B: #0/#8 ingress front/rear, #16 depth u32,
 ; #24 child-table head, #32 len, #40 sync_failure_reported, #48 start trampoline, #56 strategy,
-; #64 allowed restarts, #72 time frame, #80 restart count, #88 window start, #96 children counted in a replacement wait, #104 tearing down: sup_wait_enter, #112 references: sb_unref), made now when the
+; #64 allowed restarts, #72 time frame, #80 restart count, #88 window start, #96/#104 unused,
+; #112 references: sb_unref, #120 the holder of the restart token (0 free; the protocol in
+; prims_actors_child_table_asm.silica's header), #128 the carrier actors parked for the token,
+; #136 unused), made now when the
 ; actor had none: by spawn for an actor with a trampoline, by the ingress enqueue for any other
 ; actor that receives an exit notice (an add_child parent; the caller holds the target's lock),
 ; by the child-table paths for the running actor. Freed by its last reference (sb_unref).
@@ -3609,7 +3594,7 @@ _silica_rt_sb_require:
 	ldr	x0, [x19, #216]
 	cbnz	x0, Lsbr_have
 	mov	w0, #1
-	mov	w1, #120
+	mov	w1, #144
 	bl	_calloc
 	str	x0, [x19, #216]
 	mov	x9, #1
@@ -3935,12 +3920,16 @@ _silica_rt_actor_supervision_wait_and_drain_one:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 Lswd_try:
+; The restart token (block #120) is taken with the node, as LBB1_wait does, and released after.
 	ldr	x0, [x19, #216]
 	cbz	x0, Lswd_wait
+	ldr	x8, [x0, #120]
+	cbnz	x8, Lswd_wait
 	bl	_silica_rt_q_dequeue_locked
 	cbz	x0, Lswd_wait
 	mov	x20, x0
 	ldr	x8, [x19, #216]
+	str	x19, [x8, #120]
 	ldr	w9, [x8, #16]
 	sub	w9, w9, #1
 	str	w9, [x8, #16]
@@ -3958,6 +3947,8 @@ Lswd_try:
 	ldr	x0, [x21]
 	bl	_silica_rt_acb_release
 Lswd_free_wrap:
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_release
 	mov	x0, x20
 	bl	_free
 	mov	x0, x21
@@ -5657,6 +5648,8 @@ Lbadarith_after_report:
 ; spawn_linked, while this actor's start trampoline ran) proceeds: 2 = the init trampoline divided by zero. The ACB is
 ; not freed under the spawner: it goes with its last holder (_silica_rt_acb_release); a row child's
 ; exit notice is parked at #400 until its spawner has committed it to the row.
+	mov	x0, x19
+	bl	_silica_rt_actor_signal_pending_call_deaths
 	ldr	x8, [x19, #224]
 	cbnz	x8, Lbadarith_started_set
 	mov	x0, x19
@@ -5664,7 +5657,10 @@ Lbadarith_after_report:
 	bl	_silica_rt_started_store
 	b	Lbadarith_no_supervisor
 Lbadarith_started_set:
-; A carrier actor leaves the restart to its supervisor's thread (carriers stage 1; see LBB1_exit).
+; A carrier actor leaves the restart to its supervisor's thread (see LBB1_exit); a thread actor
+; restarts itself when its own notice is first in the ingress (_silica_rt_supervisor_drain_own_exit)
+; and never waits for its replacement (a kill_abnormal caller waits for this row's exit_done and
+; then for the restart to settle).
 	cbnz	x23, Lbadarith_no_supervisor
 	ldr	x8, [x19, #400]
 	cmp	x8, #1
@@ -5672,36 +5668,9 @@ Lbadarith_started_set:
 	ldr	x21, [x19, #192]
 	cbz	x21, Lbadarith_no_supervisor
 	mov	x0, x21
-	bl	_silica_rt_supervisor_drain_ingress
-	ldr	x22, [x19, #208]
-	cbz	x22, Lbadarith_no_supervisor
-	mov	x0, x21
-	bl	_silica_rt_sup_wait_enter
-	cbz	x0, Lbadarith_no_supervisor
-; Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
-; (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
-; restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
-; row (its policy restarts nothing); before, the child and that caller spun forever
-; (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
-; supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
-; keeps the rows until it stops: a row freed under the wait was read as a garbage child
-; (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
-Lbadarith_wait_new_child:
-	ldr	w8, [x21, #152]
-	cbz	w8, Lbadarith_wait_done
-	ldr	x0, [x22]
-	cbz	x0, Lbadarith_wait_done
-	cmp	x0, x19
-	beq	Lbadarith_wait_new_child
-	add	x9, x0, #224
-	ldar	x8, [x9]
-	cbz	x8, Lbadarith_wait_new_child
-Lbadarith_wait_done:
-	mov	x0, x21
-	bl	_silica_rt_sup_wait_leave
+	mov	x1, x19
+	bl	_silica_rt_supervisor_drain_own_exit
 Lbadarith_no_supervisor:
-	mov	x0, x19
-	bl	_silica_rt_actor_signal_pending_call_deaths
 	mov	x0, x19
 	bl	_silica_rt_child_table_free
 	mov	x0, x19
@@ -5790,6 +5759,8 @@ Lcaseclause_after_report:
 ; spawn_linked, while this actor's start trampoline ran) proceeds: 2 = the init trampoline matched no case arm. The ACB is
 ; not freed under the spawner: it goes with its last holder (_silica_rt_acb_release); a row child's
 ; exit notice is parked at #400 until its spawner has committed it to the row.
+	mov	x0, x19
+	bl	_silica_rt_actor_signal_pending_call_deaths
 	ldr	x8, [x19, #224]
 	cbnz	x8, Lcaseclause_started_set
 	mov	x0, x19
@@ -5797,7 +5768,10 @@ Lcaseclause_after_report:
 	bl	_silica_rt_started_store
 	b	Lcaseclause_no_supervisor
 Lcaseclause_started_set:
-; A carrier actor leaves the restart to its supervisor's thread (carriers stage 1; see LBB1_exit).
+; A carrier actor leaves the restart to its supervisor's thread (see LBB1_exit); a thread actor
+; restarts itself when its own notice is first in the ingress (_silica_rt_supervisor_drain_own_exit)
+; and never waits for its replacement (a kill_abnormal caller waits for this row's exit_done and
+; then for the restart to settle).
 	cbnz	x23, Lcaseclause_no_supervisor
 	ldr	x8, [x19, #400]
 	cmp	x8, #1
@@ -5805,36 +5779,9 @@ Lcaseclause_started_set:
 	ldr	x21, [x19, #192]
 	cbz	x21, Lcaseclause_no_supervisor
 	mov	x0, x21
-	bl	_silica_rt_supervisor_drain_ingress
-	ldr	x22, [x19, #208]
-	cbz	x22, Lcaseclause_no_supervisor
-	mov	x0, x21
-	bl	_silica_rt_sup_wait_enter
-	cbz	x0, Lcaseclause_no_supervisor
-; Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
-; (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
-; restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
-; row (its policy restarts nothing); before, the child and that caller spun forever
-; (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
-; supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
-; keeps the rows until it stops: a row freed under the wait was read as a garbage child
-; (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
-Lcaseclause_wait_new_child:
-	ldr	w8, [x21, #152]
-	cbz	w8, Lcaseclause_wait_done
-	ldr	x0, [x22]
-	cbz	x0, Lcaseclause_wait_done
-	cmp	x0, x19
-	beq	Lcaseclause_wait_new_child
-	add	x9, x0, #224
-	ldar	x8, [x9]
-	cbz	x8, Lcaseclause_wait_new_child
-Lcaseclause_wait_done:
-	mov	x0, x21
-	bl	_silica_rt_sup_wait_leave
+	mov	x1, x19
+	bl	_silica_rt_supervisor_drain_own_exit
 Lcaseclause_no_supervisor:
-	mov	x0, x19
-	bl	_silica_rt_actor_signal_pending_call_deaths
 	mov	x0, x19
 	bl	_silica_rt_child_table_free
 	mov	x0, x19
@@ -5963,25 +5910,29 @@ Lacbrel_ret:
 	.p2align	2
 _silica_rt_actor_final_release:
 ; X0 = an ended actor's ACB; the last act of its thread before it exits. Its identity stops resolving
-; (§15.1.4: a reference to it is dead from here on), its own hold goes, then its row's exit_done and
-; block reference (sb_child_done), then its hold on its supervisor.
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
+; (§15.1.4: a reference to it is dead from here on), its own hold goes, then its row's exit_done (=
+; its identity) and block reference (sb_child_done), then its hold on its supervisor.
+	stp	x22, x21, [sp, #-48]!
+	stp	x20, x19, [sp, #16]
+	stp	x29, x30, [sp, #32]
+	add	x29, sp, #32
 	mov	x19, x0
 	bl	_silica_rt_idt_remove
 	mov	x0, x19
+	ldr	x21, [x0, #408]
 	ldr	x19, [x0, #192]
 	ldr	x20, [x0, #208]
 	cmp	x19, #0
 	csel	x20, x20, xzr, ne
 	bl	_silica_rt_acb_release
 	mov	x0, x20
+	mov	x1, x21
 	bl	_silica_rt_sb_child_done
 	mov	x0, x19
 	bl	_silica_rt_acb_release
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldp	x29, x30, [sp, #32]
+	ldp	x20, x19, [sp, #16]
+	ldp	x22, x21, [sp], #48
 	ret
 	.globl	_silica_rt_spawner_let_go
 	.p2align	2
@@ -6030,6 +5981,7 @@ _silica_rt_dead_acb:
 	.quad	0, 0
 	.quad	0, 0
 	.quad	0, 0, 0, 0
+	.quad	0, 0
 	.section	__TEXT,__text,regular,pure_instructions
 ; _silica_rt_registry_name_taken: a registered name was already held by a live actor or supervisor
 ; (spec §20.3.1: spawn_registered, spawn_registered_supervisor, a supervised child id). Ends the current
@@ -6112,6 +6064,8 @@ Lnametaken_after_report:
 ; row; its exit notice is parked at #400 for the spawner) and its ACB stays until its last holder lets
 ; go (_silica_rt_acb_release; before, the actor freed it at once and a spawner descheduled until then
 ; spun on freed memory: working_registry_child_id_taken_across_supervisors hung in actor_spawn).
+	mov	x0, x19
+	bl	_silica_rt_actor_signal_pending_call_deaths
 	ldr	x8, [x19, #224]
 	cbnz	x8, Lnametaken_started_set
 	mov	x0, x19
@@ -6119,7 +6073,10 @@ Lnametaken_after_report:
 	bl	_silica_rt_started_store
 	b	Lnametaken_no_supervisor
 Lnametaken_started_set:
-; A carrier actor leaves the restart to its supervisor's thread (carriers stage 1; see LBB1_exit).
+; A carrier actor leaves the restart to its supervisor's thread (see LBB1_exit); a thread actor
+; restarts itself when its own notice is first in the ingress (_silica_rt_supervisor_drain_own_exit)
+; and never waits for its replacement (a kill_abnormal caller waits for this row's exit_done and
+; then for the restart to settle).
 	cbnz	x23, Lnametaken_no_supervisor
 	ldr	x8, [x19, #400]
 	cmp	x8, #1
@@ -6127,36 +6084,9 @@ Lnametaken_started_set:
 	ldr	x21, [x19, #192]
 	cbz	x21, Lnametaken_no_supervisor
 	mov	x0, x21
-	bl	_silica_rt_supervisor_drain_ingress
-	ldr	x22, [x19, #208]
-	cbz	x22, Lnametaken_no_supervisor
-	mov	x0, x21
-	bl	_silica_rt_sup_wait_enter
-	cbz	x0, Lnametaken_no_supervisor
-; Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
-; (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
-; restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
-; row (its policy restarts nothing); before, the child and that caller spun forever
-; (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
-; supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
-; keeps the rows until it stops: a row freed under the wait was read as a garbage child
-; (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
-Lnametaken_wait_new_child:
-	ldr	w8, [x21, #152]
-	cbz	w8, Lnametaken_wait_done
-	ldr	x0, [x22]
-	cbz	x0, Lnametaken_wait_done
-	cmp	x0, x19
-	beq	Lnametaken_wait_new_child
-	add	x9, x0, #224
-	ldar	x8, [x9]
-	cbz	x8, Lnametaken_wait_new_child
-Lnametaken_wait_done:
-	mov	x0, x21
-	bl	_silica_rt_sup_wait_leave
+	mov	x1, x19
+	bl	_silica_rt_supervisor_drain_own_exit
 Lnametaken_no_supervisor:
-	mov	x0, x19
-	bl	_silica_rt_actor_signal_pending_call_deaths
 	mov	x0, x19
 	bl	_silica_rt_child_table_free
 	mov	x0, x19

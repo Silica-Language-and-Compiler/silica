@@ -24,11 +24,29 @@
 // (sb_child_done finds it there; the child's reference keeps the node alive), the child's spawner record
 // @ +96 (position + 1) / +104 (next child number), kept across the child's restarts (spec §15.1.4,
 // §15.4.12.1), the current child's identity @ +112 (what call_supervisor answers with), and @ +120 the
-// carrier actors parked for this row's exit_done (linked through ACB #456; _silica_rt_row_wait_exit_done
-// in prims_actors_carrier_asm.silica, emptied by the child's exit_done store).
+// carrier actors parked for this row's exit_done (linked through ACB #456; _silica_rt_row_wait in
+// prims_actors_carrier_asm.silica, emptied by the child's exit_done store).
 // Offsets in row payload: +0 child_ref, +8 id atom, +16 agent_type, +24 start.0, +32 start.1, +40 restart atom,
-// +48 shutdown i64, +56 exit_done / sync, +64 flavor atom (:plain | :dangerous), +72 supervisor_start_trampoline (0 for worker).
+// +48 shutdown i64, +56 exit_done, +64 flavor atom (:plain | :dangerous), +72 supervisor_start_trampoline (0 for worker).
+// exit_done is a generation word: the identity (ACB #408) of the last child of the row that ended, stored
+// as that child's last act (_silica_rt_row_exit_done_store) and never cleared; every wait on it is for
+// one identity (_silica_rt_row_wait), so a stale value from an earlier incarnation never satisfies a
+// wait and no party clears what another still waits for.
 // Phase E e3f tombstone: child_ref==0 means inactive; len stays high-water for :rest_for_one ordering.
+//
+// The restart protocol (one for the supervisor's own thread, a draining caller and parked carrier
+// actors; prims_actors_carrier_asm.silica holds the primitives): the supervision block's restart
+// token (#120) has one holder at a time; only the holder dequeues the ingress and runs
+// maybe_restart, so no two cascades overlap. The supervisor's thread takes it as it dequeues a
+// notice (LBB1_wait) and skips the ingress while another holder has it (the release signals its
+// mailbox when notices remain). A dying row child on its own thread handles only its own notice,
+// and only when it is first (_silica_rt_supervisor_drain_own_exit); it never waits in its exit path.
+// Every other drainer (kill_abnormal, the call_supervisor operations) goes through
+// _silica_rt_supervisor_drain_ingress / _drain_hold: a row child of the supervisor never takes the
+// token (the cascade it would run could stop the child itself) but waits until the token is free and
+// the ingress empty; every stop goes through _silica_rt_actor_stop, which also ends a wait the
+// stopped actor is parked or spinning in (a killer stopped by the cascade of the death it caused
+// returns from kill_abnormal at once).
 
 use atom_table;
 use prims_list;
@@ -90,8 +108,10 @@ _silica_rt_child_table_free:
 	cbz	x8, Lct_free_none
 	mov	x0, x19
 	bl	_silica_rt_sup_shutdown_children
-	mov	x0, x19
-	bl	_silica_rt_sup_quiesce
+; An actor parked for this supervisor's restart token (block +128) re-checks and finds it ended.
+	ldr	x0, [x19, #216]
+	add	x0, x0, #128
+	bl	_silica_rt_wait_list_wake
 ; The rows and the block outlive this actor while a linked child still holds a reference: the
 ; child's last act is its row's exit_done store (sb_child_done), after its own teardown. This
 ; actor's teardown drops its reference; the last one frees the rows and the block (sb_unref).
@@ -103,84 +123,6 @@ Lct_free_none:
 	ldp	x20, x19, [sp], #32
 	ret
 	.cfi_endproc
-; Supervisor teardown vs. a dying child's wait for its replacement (actor_thread_main and the
-; badarith / case_clause / name-taken ends): the child counts itself in the supervisor's block (#96)
-; while it reads the row, only while the supervisor is alive and not tearing down (#104), under the
-; supervisor's lock; the teardown (child_table_free) marks #104 and waits for the count to reach 0
-; before the rows, the block and the ACB go.
-	.globl	_silica_rt_sup_wait_enter
-	.p2align	2
-_silica_rt_sup_wait_enter:
-; X0 = supervisor ACB -> X0 = 1 counted, 0 not (the child does not wait).
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
-	mov	x19, x0
-	mov	x20, xzr
-	add	x0, x19, #16
-	bl	_os_unfair_lock_lock
-	ldr	w8, [x19, #152]
-	cbz	w8, Lswe_unlock
-	ldr	x9, [x19, #216]
-	cbz	x9, Lswe_unlock
-	ldr	x10, [x9, #104]
-	cbnz	x10, Lswe_unlock
-	ldr	x10, [x9, #96]
-	add	x10, x10, #1
-	str	x10, [x9, #96]
-	mov	x20, #1
-Lswe_unlock:
-	add	x0, x19, #16
-	bl	_os_unfair_lock_unlock
-	mov	x0, x20
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
-	ret
-	.globl	_silica_rt_sup_wait_leave
-	.p2align	2
-_silica_rt_sup_wait_leave:
-; X0 = supervisor ACB: the child has stopped reading its row.
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
-	mov	x19, x0
-	add	x0, x19, #16
-	bl	_os_unfair_lock_lock
-	ldr	x9, [x19, #216]
-	ldr	x10, [x9, #96]
-	sub	x10, x10, #1
-	str	x10, [x9, #96]
-	add	x0, x19, #16
-	bl	_os_unfair_lock_unlock
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
-	ret
-	.globl	_silica_rt_sup_quiesce
-	.p2align	2
-_silica_rt_sup_quiesce:
-; X0 = an ending actor with a supervision block: no child starts counting from now on, and the
-; children still counted are waited for (each stops at once: this actor is no longer alive).
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
-	mov	x19, x0
-	add	x0, x19, #16
-	bl	_os_unfair_lock_lock
-	ldr	x20, [x19, #216]
-	mov	x9, #1
-	str	x9, [x20, #104]
-	add	x0, x19, #16
-	bl	_os_unfair_lock_unlock
-Lsq_wait:
-	ldr	x9, [x20, #96]
-	cbz	x9, Lsq_done
-	mov	w0, #100
-	bl	_usleep
-	b	Lsq_wait
-Lsq_done:
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
-	ret
 ; _silica_rt_sup_shutdown_children(X0 = a supervisor that has ended: alive (#152) is 0): the
 ; coordinated shutdown of its live children (spec §15.4.8.4, §15.4.12.2), last row first, one at a
 ; time. Each row is tombstoned before its child is told (maybe_restart no longer finds it, and a
@@ -197,11 +139,12 @@ Lsq_done:
 	.globl	_silica_rt_sup_shutdown_children
 	.p2align	2
 _silica_rt_sup_shutdown_children:
-	stp	x24, x23, [sp, #-64]!
-	stp	x22, x21, [sp, #16]
-	stp	x20, x19, [sp, #32]
-	stp	x29, x30, [sp, #48]
-	add	x29, sp, #48
+	stp	x26, x25, [sp, #-80]!
+	stp	x24, x23, [sp, #16]
+	stp	x22, x21, [sp, #32]
+	stp	x20, x19, [sp, #48]
+	stp	x29, x30, [sp, #64]
+	add	x29, sp, #64
 	mov	x19, x0
 	ldr	x20, [x19, #216]
 	cbz	x20, Lssc_ret
@@ -236,57 +179,49 @@ Lssc_at:
 	cmp	x8, x21
 	b.eq	Lssc_next
 	str	xzr, [x23]
-	ldr	x0, [x23, #112]
+; The identity the wait is for (row +112) is read before the stop; the child may already be ending
+; (its identity no longer resolves: no stop, only the wait for its exit_done).
+	ldr	x25, [x23, #112]
+	mov	x26, xzr
+	mov	x0, x25
 	bl	_silica_rt_ref_hold
 	mov	x24, x0
 	cbz	x24, Lssc_wait
-	add	x0, x24, #16
-	bl	_os_unfair_lock_lock
-	ldr	w8, [x24, #152]
-	cbz	w8, Lssc_unlock
 	ldr	x8, [x23, #48]
 	cmp	x8, #0
 	b.le	Lssc_kill
-	mov	x8, #4
-	str	x8, [x24, #232]
+	mov	x1, #4
 	adrp	x8, _silica_rt_shutdown_atom@PAGE
 	add	x8, x8, _silica_rt_shutdown_atom@PAGEOFF
-	ldr	x8, [x8]
-	str	x8, [x24, #384]
+	ldr	x2, [x8]
 	b	Lssc_stop
 Lssc_kill:
-	mov	x8, #1
-	str	x8, [x24, #232]
+	mov	x1, #1
+	mov	x2, xzr
 Lssc_stop:
-	str	wzr, [x24, #152]
 	mov	x0, x24
-	bl	_silica_rt_actor_mail_signal
-Lssc_unlock:
-	add	x0, x24, #16
-	bl	_os_unfair_lock_unlock
+	bl	_silica_rt_actor_stop
+	mov	x26, x0
 	mov	x0, x24
 	bl	_silica_rt_acb_release
 Lssc_wait:
-; A carrier actor parks for the row's exit_done (prims_actors_carrier_asm.silica); anything else
-; sleeps and polls it as before.
+; The wait is for the row's exit_done to carry the child's identity (its last act): a carrier
+; actor on its own stack parks for it, anything else spins (prims_actors_carrier_asm.silica).
 	mov	x0, x23
-	mov	x1, x24
-	bl	_silica_rt_row_wait_exit_done
-	cbnz	x0, Lssc_next
-Lssc_poll:
-	ldr	x8, [x23, #56]
-	cbnz	x8, Lssc_next
-	mov	w0, #50
-	bl	_usleep
-	b	Lssc_poll
+	mov	x1, x25
+	mov	x2, x26
+	mov	x3, xzr
+	bl	_silica_rt_row_wait
+	b	Lssc_next
 Lssc_unref:
 	mov	x0, x20
 	bl	_silica_rt_sb_unref
 Lssc_ret:
-	ldp	x29, x30, [sp, #48]
-	ldp	x20, x19, [sp, #32]
-	ldp	x22, x21, [sp, #16]
-	ldp	x24, x23, [sp], #64
+	ldp	x29, x30, [sp, #64]
+	ldp	x20, x19, [sp, #48]
+	ldp	x22, x21, [sp, #32]
+	ldp	x24, x23, [sp, #16]
+	ldp	x26, x25, [sp], #80
 	ret
 ; Supervision-block lifetime. SB #112 counts references: the owning actor's (sb_require) and one per
 ; linked child started from a row (actor_spawn_linked_row, taken before the child's thread exists).
@@ -346,9 +281,10 @@ Lsbu_ret:
 	.globl	_silica_rt_sb_child_done
 	.p2align	2
 _silica_rt_sb_child_done:
-; X0 = the ended child's row (0: not a row child). Its last two acts, after its ACB is gone: the
-; row's exit_done = 1 (a cascade stop or kill_abnormal waits for it; a carrier actor parked for it
-; is made ready: _silica_rt_row_exit_done_store), then its block reference.
+; X0 = the ended child's row (0: not a row child), X1 = its identity. Its last two acts, after its
+; ACB is gone: the row's exit_done = its identity (a cascade stop or kill_abnormal waits for it; a
+; carrier actor parked for it is made ready: _silica_rt_row_exit_done_store), then its block
+; reference.
 	cbz	x0, Lscd_ret
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
@@ -470,7 +406,6 @@ _silica_rt_supervisor_spawn_child_row_by_flavor:
 	add	x29, sp, #32
 	mov	x19, x0
 	mov	x20, x1
-	str	xzr, [x19, #56]
 	ldr	x0, [x19, #24]
 	ldr	x1, [x19, #32]
 	ldr	x2, [x19, #16]
@@ -740,7 +675,7 @@ Lsc_post_row:
 	ldr	x4, [x20, #64]
 	str	x4, [x27, #72]
 ";
-    post: string <- concat("    ldr x9, [x20, #56]\n    str xzr, [x27]\n    str x21, [x27, #8]\n    str x22, [x27, #16]\n    str x23, [x27, #24]\n    str x24, [x27, #32]\n    str x25, [x27, #40]\n    str x26, [x27, #48]\n    str xzr, [x27, #56]\n    str x9, [x27, #64]\n    str xzr, [x27, #96]\n    str xzr, [x27, #104]\n", "    mov x0, x27\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n    mov x20, x0\n");
+    post: string <- concat("    ldr x9, [x20, #56]\n    str xzr, [x27]\n    str x21, [x27, #8]\n    str x22, [x27, #16]\n    str x23, [x27, #24]\n    str x24, [x27, #32]\n    str x25, [x27, #40]\n    str x26, [x27, #48]\n    str x9, [x27, #64]\n    str xzr, [x27, #96]\n    str xzr, [x27, #104]\n", "    mov x0, x27\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n    mov x20, x0\n");
     tail: string <- "	cbz	x28, Lsc_done
 	ldr	x10, [x19, #216]
 	ldr	x9, [x10, #32]
@@ -772,13 +707,48 @@ Lsc_ret:
 // public supervisor calls are made by ordinary actors/main, not from inside the supervisor thread.
 fn child_table_rt_asm_chunk_2b() -> string {
     "	.p2align	2
-_silica_rt_supervisor_drain_ingress:
+; _silica_rt_supervisor_handle_notice(X0 = supervisor, X1 = its ingress node, X2 = the exit notice
+; payload): maybe_restart with the supervisor installed as the thread's current actor (the row
+; walks and spawns read it), the previous one restored after; then the payload (and its hold on
+; the ended child) and the node go.
+_silica_rt_supervisor_handle_notice:
 	.cfi_startproc
-	stp	x24, x23, [sp, #-64]!
+	stp	x24, x23, [sp, #-48]!
 	stp	x22, x21, [sp, #16]
-	stp	x20, x19, [sp, #32]
-	stp	x29, x30, [sp, #48]
-	add	x29, sp, #48
+	stp	x29, x30, [sp, #32]
+	add	x29, sp, #32
+	mov	x24, x0
+	mov	x22, x1
+	mov	x21, x2
+	bl	_silica_rt_tls_current_actor_get
+	mov	x23, x0
+	mov	x0, x24
+	bl	_silica_rt_tls_actor_set
+	ldr	x0, [x21]
+	mov	x1, x24
+	ldr	x2, [x21, #8]
+	bl	_silica_rt_supervisor_maybe_restart
+	mov	x0, x23
+	bl	_silica_rt_tls_actor_set
+	mov	x0, x21
+	bl	_silica_rt_exit_payload_free
+	mov	x0, x22
+	bl	_free
+	ldp	x29, x30, [sp, #32]
+	ldp	x22, x21, [sp, #16]
+	ldp	x24, x23, [sp], #48
+	ret
+	.cfi_endproc
+; _silica_rt_supervisor_drain_run(X0 = a supervisor whose restart token the caller holds): every
+; node in the ingress is dequeued (under the supervisor's lock) and handled; one that is not an
+; exit notice (+24 != 0, a trial hook's message) is dropped here, the supervisor's own thread runs
+; those.
+_silica_rt_supervisor_drain_run:
+	.cfi_startproc
+	stp	x22, x21, [sp, #-48]!
+	stp	x20, x19, [sp, #16]
+	stp	x29, x30, [sp, #32]
+	add	x29, sp, #32
 	mov	x19, x0
 Lsdrain_loop:
 	add	x0, x19, #16
@@ -800,20 +770,11 @@ Lsdrain_depth_done:
 	cbnz	w9, Lsdrain_free_msg
 	ldr	x21, [x20, #8]
 	cbz	x21, Lsdrain_free_msg
-	mov	x24, x19
-	bl	_silica_rt_tls_current_actor_get
-	mov	x23, x0
-	mov	x19, x24
-	bl	_silica_rt_tls_actor_set_from_x19
-	ldr	x0, [x21]
-	mov	x1, x24
-	ldr	x2, [x21, #8]
-	bl	_silica_rt_supervisor_maybe_restart
-	mov	x19, x23
-	bl	_silica_rt_tls_actor_set_from_x19
-	mov	x19, x24
-	mov	x0, x21
-	bl	_silica_rt_exit_payload_free
+	mov	x0, x19
+	mov	x1, x20
+	mov	x2, x21
+	bl	_silica_rt_supervisor_handle_notice
+	b	Lsdrain_loop
 Lsdrain_free_msg:
 	mov	x0, x20
 	bl	_free
@@ -821,10 +782,137 @@ Lsdrain_free_msg:
 Lsdrain_empty:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
-	ldp	x29, x30, [sp, #48]
-	ldp	x20, x19, [sp, #32]
-	ldp	x22, x21, [sp, #16]
-	ldp	x24, x23, [sp], #64
+	ldp	x29, x30, [sp, #32]
+	ldp	x20, x19, [sp, #16]
+	ldp	x22, x21, [sp], #48
+	ret
+	.cfi_endproc
+; _silica_rt_supervisor_drain_ingress(X0 = supervisor, X1 = the actor draining; 0 = main): the
+; restart protocol's entry for everyone but the supervisor's own thread and a dying row child. The
+; restart token (block #120, _silica_rt_sup_restart_acquire) is taken, every notice is dequeued and
+; handled, and the token is released: a notice that arrives after that is the supervisor's thread's
+; (signalled at the enqueue and again by the release). A row child of this supervisor never takes
+; the token (the cascade it would run could stop the child itself): it waits until the token is
+; free and the ingress empty, so the supervisor's thread does the restarts. Returns when every
+; notice that was in the ingress at entry has been handled by some holder, or at once when the
+; supervisor has ended or the draining actor was ended meanwhile.
+_silica_rt_supervisor_drain_ingress:
+	.cfi_startproc
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	mov	x2, #1
+	cbz	x1, Lsdi_acquire
+	ldr	x8, [x1, #192]
+	cmp	x8, x19
+	b.ne	Lsdi_acquire
+	ldr	x8, [x1, #208]
+	cmp	x8, #4096
+	b.lo	Lsdi_acquire
+	mov	x2, xzr
+Lsdi_acquire:
+	mov	x20, x2
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_acquire
+	cmp	x0, #1
+	b.ne	Lsdi_ret
+	cbz	x20, Lsdi_ret
+	mov	x0, x19
+	bl	_silica_rt_supervisor_drain_run
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_release
+Lsdi_ret:
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.cfi_endproc
+; _silica_rt_supervisor_drain_hold(X0 = supervisor, X1 = the actor draining; 0 = main) -> X0 = 1
+; when the caller holds the restart token after draining (the operations that stop or respawn
+; rows, terminate_child and restart_child, hold it across their work and release it after), 0 when
+; the supervisor has ended or has no block, or the caller was ended while it waited (nothing
+; drained, nothing held).
+_silica_rt_supervisor_drain_hold:
+	.cfi_startproc
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	mov	x2, #1
+	bl	_silica_rt_sup_restart_acquire
+	cmp	x0, #1
+	b.ne	Lsdh_no
+	mov	x0, x19
+	bl	_silica_rt_supervisor_drain_run
+	mov	x0, #1
+	b	Lsdh_ret
+Lsdh_no:
+	mov	x0, xzr
+Lsdh_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.cfi_endproc
+; _silica_rt_supervisor_drain_own_exit(X0 = supervisor, X1 = a row child in its exit path, on its
+; own thread): the child restarts itself when it can. If the token is free and its own exit notice
+; is the first in the ingress, it takes the token, handles that one notice (maybe_restart: under
+; :one_for_all or :rest_for_one the cascade stops its siblings, never its own row, and respawns
+; them) and releases. Otherwise it leaves the ingress to the supervisor's thread: another holder is
+; at work, or notices precede its own and a restart it ran could stop this very actor. A carrier
+; actor never comes here (its exit path cannot wait).
+_silica_rt_supervisor_drain_own_exit:
+	.cfi_startproc
+	stp	x29, x30, [sp, #-48]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
+	mov	x19, x0
+	mov	x20, x1
+	bl	_silica_rt_sup_restart_try
+	cbz	x0, Lsdo_ret
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	x0, [x19, #216]
+	cbz	x0, Lsdo_unlock
+	bl	_silica_rt_q_dequeue_locked
+	mov	x21, x0
+	cbz	x21, Lsdo_unlock
+	ldr	w9, [x21, #24]
+	cbnz	w9, Lsdo_put_back
+	ldr	x22, [x21, #8]
+	cbz	x22, Lsdo_put_back
+	ldr	x8, [x22]
+	cmp	x8, x20
+	b.ne	Lsdo_put_back
+	ldr	x8, [x19, #216]
+	ldr	w9, [x8, #16]
+	cbz	w9, Lsdo_depth_done
+	sub	w9, w9, #1
+	str	w9, [x8, #16]
+Lsdo_depth_done:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x19
+	mov	x1, x21
+	mov	x2, x22
+	bl	_silica_rt_supervisor_handle_notice
+	b	Lsdo_release
+Lsdo_put_back:
+; Not this actor's notice: back to the front, in its place (the front list is the queue's head).
+	ldr	x8, [x19, #216]
+	ldr	x9, [x8]
+	str	x9, [x21]
+	str	x21, [x8]
+Lsdo_unlock:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+Lsdo_release:
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_release
+Lsdo_ret:
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #48
 	ret
 	.cfi_endproc
 	.globl	_silica_rt_supervisor_add_child
@@ -845,9 +933,11 @@ _silica_rt_supervisor_add_child_acb:
 	add	x29, sp, #32
 	mov	x20, x0
 	mov	x21, x1
-	bl	_silica_rt_supervisor_drain_ingress
 	bl	_silica_rt_tls_current_actor_get
 	mov	x22, x0
+	mov	x1, x22
+	mov	x0, x20
+	bl	_silica_rt_supervisor_drain_ingress
 ; §20.3.1: an id a live actor or supervisor already holds starts no child; the actor that asked for
 ; the add fails with (:explicit, :duplicate_child_id). In main (no current actor) it is the
 ; language-level failure of §15.4.5.5: the atom's name on standard error, exit status 1.
@@ -1142,27 +1232,21 @@ Lmr_ofa_kill_walk_idx:
 Lmr_ofa_kill_at_idx:
 	ldr	x27, [x26]
 	cbz	x27, Lmr_ofa_kill_next
-	add	x0, x27, #16
-	bl	_os_unfair_lock_lock
-	str	wzr, [x27, #152]
+; Sequential stop (spec §15.4.12.2): the sibling is ended (reason kept: the supervisor's own stop)
+; and this row's exit_done is waited for, with the identity read before the stop (row +112), so
+; two teardowns never overlap; a carrier actor draining the ingress parks for it, a thread spins
+; (prims_actors_carrier_asm.silica, _silica_rt_row_wait). The holder of the restart token is never
+; a row this cascade stops (child_table header), so the wait cannot be for the holder itself.
+	ldr	x28, [x26, #112]
 	mov	x0, x27
-	bl	_silica_rt_actor_mail_signal
-	add	x0, x27, #16
-	bl	_os_unfair_lock_unlock
-; Phase E e4f: per-user-spec sequential stop — block here until this child's actor_thread_main
-; has fully unwound (ACB freed) and stamped row[+56]=1. Only then proceed to the next sibling,
-; so two children's teardowns never overlap (no concurrent libsystem_malloc cleanup races).
-; Reset the flag once observed so a future cascade restart targeting this row can re-arm.
-; A carrier actor draining the ingress parks for it (prims_actors_carrier_asm.silica).
+	mov	x1, xzr
+	mov	x2, xzr
+	bl	_silica_rt_actor_stop
+	mov	x2, x0
 	mov	x0, x26
-	mov	x1, x27
-	bl	_silica_rt_row_wait_exit_done
-	cbnz	x0, Lmr_ofa_kill_exited
-Lmr_ofa_kill_wait:
-	ldr	x8, [x26, #56]
-	cbz	x8, Lmr_ofa_kill_wait
-Lmr_ofa_kill_exited:
-	str	xzr, [x26, #56]
+	mov	x1, x28
+	mov	x3, xzr
+	bl	_silica_rt_row_wait
 Lmr_ofa_kill_next:
 	add	x25, x25, #1
 	b	Lmr_ofa_kill_loop
@@ -1207,29 +1291,21 @@ Lmr_rfo_kill_walk_idx:
 Lmr_rfo_kill_at_idx:
 	ldr	x27, [x26]
 	cbz	x27, Lmr_rfo_kill_next
-	add	x0, x27, #16
-	bl	_os_unfair_lock_lock
-	str	wzr, [x27, #152]
+; Sequential stop, as the :one_for_all loop above: stop, then the wait for this row's exit_done to
+; carry the identity read before the stop.
+	ldr	x28, [x26, #112]
 	mov	x0, x27
-	bl	_silica_rt_actor_mail_signal
-	add	x0, x27, #16
-	bl	_os_unfair_lock_unlock
-; Phase E e4f: per-user-spec sequential stop — wait for this child's actor_thread_main
-; to retire (row[+56]=1 set after its full ACB free) before signalling the next row.
-; No two cascaded teardowns ever overlap. A carrier actor draining the ingress parks for it
-; (prims_actors_carrier_asm.silica).
+	mov	x1, xzr
+	mov	x2, xzr
+	bl	_silica_rt_actor_stop
+	mov	x2, x0
 	mov	x0, x26
-	mov	x1, x27
-	bl	_silica_rt_row_wait_exit_done
-	cbnz	x0, Lmr_rfo_kill_exited
-Lmr_rfo_kill_wait:
-	ldr	x8, [x26, #56]
-	cbz	x8, Lmr_rfo_kill_wait
-Lmr_rfo_kill_exited:
+	mov	x1, x28
+	mov	x3, xzr
+	bl	_silica_rt_row_wait
 	mov	x0, x20
 	mov	x1, x27
 	bl	_silica_rt_supervisor_drop_pending_exit
-	str	xzr, [x26, #56]
 ; Tombstone the row only after the child has fully exited so Lmr_rfo_spawn does not run
 ; with a stale child_ref in the slot.
 	str	xzr, [x26]
@@ -1395,6 +1471,9 @@ _silica_rt_supervisor_count_children_acb:
 	str	x30, [sp, #32]
 	add	x29, sp, #16
 	mov	x19, x0
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_ingress
 	ldr	x20, [x19, #216]
 	cbz	x20, Lsbh_2
@@ -1433,6 +1512,9 @@ _silica_rt_supervisor_get_child_acb:
 	add	x29, sp, #16
 	mov	x19, x0
 	mov	x20, x1
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_ingress
 	ldr	x9, [x19, #216]
 	cbz	x9, Lsbh_3
@@ -1477,6 +1559,9 @@ _silica_rt_supervisor_get_child_info_acb:
 	add	x29, sp, #16
 	mov	x19, x0
 	mov	x20, x1
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_ingress
 	ldr	x9, [x19, #216]
 	cbz	x9, Lsbh_5
@@ -1556,6 +1641,9 @@ _silica_rt_supervisor_get_child_id_acb:
 	add	x29, sp, #16
 	mov	x19, x0
 	mov	x20, x1
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_ingress
 	ldr	x9, [x19, #216]
 	cbz	x9, Lsbh_7
@@ -1598,6 +1686,9 @@ _silica_rt_supervisor_get_child_agent_type_acb:
 	add	x29, sp, #16
 	mov	x19, x0
 	mov	x20, x1
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_ingress
 	ldr	x9, [x19, #216]
 	cbz	x9, Lsbh_8
@@ -1640,6 +1731,9 @@ _silica_rt_supervisor_get_child_restart_acb:
 	add	x29, sp, #16
 	mov	x19, x0
 	mov	x20, x1
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_ingress
 	ldr	x9, [x19, #216]
 	cbz	x9, Lsbh_9
@@ -1685,6 +1779,9 @@ _silica_rt_supervisor_which_children_acb:
 	stp	x29, x30, [sp, #80]
 	add	x29, sp, #80
 	mov	x19, x0
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_ingress
 	ldr	x20, [x19, #216]
 	cbz	x20, Lsbh_10
@@ -1775,45 +1872,48 @@ _silica_rt_supervisor_terminate_child_acb:
 	add	x29, sp, #48
 	mov	x19, x0
 	mov	x20, x1
-	bl	_silica_rt_supervisor_drain_ingress
+; The restart token is held across the stop and the wait (no cascade runs meanwhile); 0 = the
+; supervisor has ended, has no block, or this caller was ended while it waited: nothing to do.
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
+	bl	_silica_rt_supervisor_drain_hold
+	cbz	x0, Lsterm_done
 	ldr	x23, [x19, #216]
 	cbz	x23, Lsbh_11
 	ldr	x23, [x23, #24]
 Lsbh_11:
 Lsterm_find:
-	cbz	x23, Lsterm_done
+	cbz	x23, Lsterm_release
 	ldr	x22, [x23]
 	cbz	x22, Lsterm_next
 	ldr	x8, [x23, #8]
 	cmp	x8, x20
 	b.ne	Lsterm_next
 	str	xzr, [x23]
-	add	x0, x22, #16
-	bl	_os_unfair_lock_lock
-	str	wzr, [x22, #152]
+	ldr	x24, [x23, #112]
 	mov	x0, x22
-	bl	_silica_rt_actor_mail_signal
-	add	x0, x22, #16
-	bl	_os_unfair_lock_unlock
-; A carrier actor parks for the row's exit_done (prims_actors_carrier_asm.silica); anything else
-; spins on it as before.
+	mov	x1, xzr
+	mov	x2, xzr
+	bl	_silica_rt_actor_stop
+	mov	x2, x0
+; The wait is for the row's exit_done to carry the stopped child's identity: a carrier actor parks
+; for it, anything else spins (prims_actors_carrier_asm.silica).
 	mov	x0, x23
-	mov	x1, x22
-	bl	_silica_rt_row_wait_exit_done
-	cbnz	x0, Lsterm_exited
-Lsterm_wait:
-	ldr	x8, [x23, #56]
-	cbz	x8, Lsterm_wait
-Lsterm_exited:
+	mov	x1, x24
+	mov	x3, xzr
+	bl	_silica_rt_row_wait
 	mov	x0, x19
 	mov	x1, x22
 	bl	_silica_rt_supervisor_drop_pending_exit
 	str	xzr, [x23]
-	str	xzr, [x23, #56]
-	b	Lsterm_done
+	b	Lsterm_release
 Lsterm_next:
 	ldr	x23, [x23, #80]
 	b	Lsterm_find
+Lsterm_release:
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_release
 Lsterm_done:
 	mov	x0, #0
 	ldp	x29, x30, [sp, #48]
@@ -1860,7 +1960,15 @@ _silica_rt_supervisor_restart_child_acb:
 	add	x29, sp, #64
 	mov	x19, x0
 	mov	x20, x1
-	bl	_silica_rt_supervisor_drain_ingress
+; The restart token is held across the stops and the respawns (no cascade runs meanwhile; X21 = 1
+; while held); 0 = the supervisor has ended, has no block, or this caller was ended while it
+; waited: no child.
+	bl	_silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
+	bl	_silica_rt_supervisor_drain_hold
+	mov	x21, x0
+	cbz	x21, Lsrestart_none
 	ldr	x23, [x19, #216]
 	cbz	x23, Lsbh_12
 	ldr	x23, [x23, #24]
@@ -1873,21 +1981,16 @@ Lsrestart_find:
 ", ofa_branch), "	ldr	x22, [x23]
 	cbz	x22, Lsrestart_spawn
 	str	xzr, [x23]
-	add	x0, x22, #16
-	bl	_os_unfair_lock_lock
-	str	wzr, [x22, #152]
+	ldr	x24, [x23, #112]
 	mov	x0, x22
-	bl	_silica_rt_actor_mail_signal
-	add	x0, x22, #16
-	bl	_os_unfair_lock_unlock
+	mov	x1, xzr
+	mov	x2, xzr
+	bl	_silica_rt_actor_stop
+	mov	x2, x0
 	mov	x0, x23
-	mov	x1, x22
-	bl	_silica_rt_row_wait_exit_done
-	cbnz	x0, Lsrestart_exited
-Lsrestart_wait:
-	ldr	x8, [x23, #56]
-	cbz	x8, Lsrestart_wait
-Lsrestart_exited:
+	mov	x1, x24
+	mov	x3, xzr
+	bl	_silica_rt_row_wait
 	mov	x0, x19
 	mov	x1, x22
 	bl	_silica_rt_supervisor_drop_pending_exit
@@ -1911,26 +2014,20 @@ Lsrestart_ofa_kill_loop:
 	ldr	x22, [x24]
 	cbz	x22, Lsrestart_ofa_kill_next
 	str	xzr, [x24]
-	add	x0, x22, #16
-	bl	_os_unfair_lock_lock
-	str	wzr, [x22, #152]
+	ldr	x23, [x24, #112]
 	mov	x0, x22
-	bl	_silica_rt_actor_mail_signal
-	add	x0, x22, #16
-	bl	_os_unfair_lock_unlock
+	mov	x1, xzr
+	mov	x2, xzr
+	bl	_silica_rt_actor_stop
+	mov	x2, x0
 	mov	x0, x24
-	mov	x1, x22
-	bl	_silica_rt_row_wait_exit_done
-	cbnz	x0, Lsrestart_ofa_exited
-Lsrestart_ofa_wait:
-	ldr	x8, [x24, #56]
-	cbz	x8, Lsrestart_ofa_wait
-Lsrestart_ofa_exited:
+	mov	x1, x23
+	mov	x3, xzr
+	bl	_silica_rt_row_wait
 	mov	x0, x19
 	mov	x1, x22
 	bl	_silica_rt_supervisor_drop_pending_exit
 	str	xzr, [x24]
-	str	xzr, [x24, #56]
 Lsrestart_ofa_kill_next:
 	ldr	x24, [x24, #80]
 	b	Lsrestart_ofa_kill_loop
@@ -1963,6 +2060,12 @@ Lsrestart_next:
 Lsrestart_none:
 	mov	x0, #-1
 Lsrestart_done:
+	mov	x27, x0
+	cbz	x21, Lsrestart_ret
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_release
+Lsrestart_ret:
+	mov	x0, x27
 	ldp	x29, x30, [sp, #64]
 	ldp	x28, x27, [sp, #48]
 	ldp	x20, x19, [sp, #32]
