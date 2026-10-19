@@ -1,4 +1,5 @@
-# Makefile for the carrier-thread trials in carriers_addition (actor_memory_budget_plan.md item N, stage 1).
+# Makefile for the carrier-thread trials in carriers_addition (actor_memory_budget_plan.md item N,
+# stages 1 to 3; the stage-3 placement trials are the workers_zpin_* ones).
 #
 # The trial executables run with SILICA_CARRIERS=$(SILICA_CARRIERS) in their environment: 1 (the
 # default here) puts every plain actor on a carrier thread, 0 keeps a thread per actor; the suite

@@ -26,9 +26,10 @@
 // cpu_topology / cache / NUMA helpers (_silica_rt_apple_*, sysctl hw.*): macOS Apple Silicon only (see cpu_topology_implementation_plan Phase G).
 // ABI: spawn(X0,X1,X2)->X0  send(X0,X1)  cast(X0,X1)->W0  call(X0,X1)->X0  self()->X0  recv()->X0
 // X2=optional core_id (0 default) per §15.1.1, X4=packed stack_policy (0 = inherit the spawner's; see prims_actors_stack_asm).
-// Actor control block 512 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
+// Actor control block 528 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
 // the holder count and the parked exit notice; 2026-10-19 +32 for the carrier fields, item N, +16 for
-// the wait-list word of the restart protocol, and +16 for the thread record, item N stage 2): #0..#215 the
+// the wait-list word of the restart protocol, +16 for the thread record, item N stage 2, and +16 for the
+// pending migration target, stage 3): #0..#215 the
 // actor runtime's, #216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
 // _silica_rt_sb_require), #224 started flag, #232 pending exit reason_tag, #240 active call wrapper,
 // #248/#256/#264 FFI arena base/end/bump (Phase 12), #272..#391 the runtime-managed stack fields
@@ -48,7 +49,9 @@
 // is parked on, 0 when none: a stop (_silica_rt_actor_stop) unlinks and wakes it. #496/#504 the thread
 // record of an actor that has a thread of its own (the pthread key names it: the thread's current actor,
 // and 0 = not a carrier's thread; _silica_rt_tls_record_set); unused for a carrier actor, whose carrier's
-// block holds its thread's record. Control block 512 B.
+// block holds its thread's record. #512 the pending migration target (a carrier block, 0 none; item N
+// stage 3: set by migrate_actor for a ready, running or parked carrier actor, applied at its next dispatch
+// boundary by _silica_rt_carrier_apply_pending); #520 spare. Control block 528 B.
 // spawn_linked Phase A (supervisors_implementation_development_plan): spawn_linked(X0,X1,X2,X3,X4)->X0
 // X0=init X1=beh X2=agent_type (int64) X3=row/core metadata (0 default), X4=optional supervisor trampoline.
 // Offsets: #192 supervisor actor_ref (0 root), #200 agent_type atom, #208 core_id (the row pointer of a
@@ -123,7 +126,7 @@ _silica_rt_actor_spawn:                 ; @silica_rt_actor_spawn
 	mov	x21, x0
 	mov	w22, #1                         ; =0x1
 	mov	w0, #1                          ; =0x1
-	mov	w1, #512
+	mov	w1, #528
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBB0_4
@@ -302,7 +305,7 @@ LBBsl_common:
 	mov	x20, x1
 	mov	x21, x0
 	mov	w0, #1
-	mov	w1, #512
+	mov	w1, #528
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBBsl_4
@@ -587,14 +590,16 @@ LBB1_try_std:
 	ldr	w9, [x19, #152]
 	cbz	w9, LBB1_exit
 ; A carrier actor with no mail is idle (on its carrier's sweep list when it is :release_when_idle
-; with committed stack): back to the carrier loop (mail makes it ready again).
-	ldr	x9, [x19, #440]
-	cbz	x9, LBB1_thread_wait
+; with committed stack): back to the loop of the carrier this thread is (X20, read before
+; mark_idle applies a pending migration, after which #440 may name another carrier); mail makes
+; the actor ready again.
+	ldr	x20, [x19, #440]
+	cbz	x20, LBB1_thread_wait
 	mov	x0, x19
 	bl	_silica_rt_carrier_mark_idle
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
-	ldr	x0, [x19, #440]
+	mov	x0, x20
 	b	_silica_rt_carrier_loop_enter
 LBB1_thread_wait:
 ; Phase E e4f: blocking _silica_rt_cv_wait (os_unfair_lock + ___ulock_wait UL_COMPARE_AND_WAIT_SHARED).
@@ -1303,6 +1308,7 @@ LBB4_wait_start:
 	add	x10, x10, x11
 	cmp	x9, x10
 	b.hs	LBB4_7
+	ldr	x22, [x20, #440]
 	mov	x0, x20
 	bl	_silica_rt_ctx_save
 	cbnz	x0, LBB4_wait_start
@@ -1311,8 +1317,10 @@ LBB4_wait_start:
 	str	x9, [x20, #448]
 	add	x0, x19, #72
 	bl	_os_unfair_lock_unlock
-	mov	x0, x20
-	b	_silica_rt_carrier_leave
+; Back to the loop of the carrier this thread is (X22, read before the park was published: once
+; parked the actor may be moved at its next boundary and its #440 name another carrier).
+	mov	x0, x22
+	b	_silica_rt_carrier_loop_enter
 LBB4_7:                                 ; =>This Inner Loop Header: Depth=1
 ; Phase E e4f: blocking pthread_cond_wait. Earlier 1 ms timedwait_relative_np was a missed-signal
 ; band-aid that, under macOS arm64 with 3+ concurrent supervised actors, drove a libpthread
@@ -1872,38 +1880,19 @@ _silica_rt_pin_actor_to_core:
 	.p2align	2
 _silica_rt_pin_actor_to_core_acb:           ; @silica_rt_pin_actor_to_core
 	.cfi_startproc
-	cbz	x0, Lpin_actor_to_core_none
-; A carrier actor has no thread of its own (#144 = 0; item N): it is placed by its carrier binding,
-; and the affinity hint has nothing to apply to. Exclusive pinning on carriers is stage 3; the
-; answer is the success the hint would report.
-	ldr	x9, [x0, #144]
-	cbz	x9, Lpin_actor_to_core_none
-; %bb.0: X0=actor_ref X1=core_id; thread_policy_set(THREAD_AFFINITY_POLICY)
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
+; X0 = ACB (held) or 0, X1 = core id. A shorthand for migrate_actor (spec §15.1.2: the pin_actor_to_*
+; helpers migrate to a chosen core): a carrier actor moves to the core's carrier (item N stage
+; 3), a thread actor gets the affinity hint. The result word is 0 whatever migrate_actor
+; answered: the (int64, affinity_error) tuple of §22.10 is not materialised by any emitter, which
+; is pre-existing, and the program's view of it is this word.
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
 	.cfi_def_cfa w29, 16
 	.cfi_offset w30, -8
 	.cfi_offset w29, -16
-	.cfi_offset w19, -24
-	.cfi_offset w20, -32
-	mov	x19, x1
-	ldr	x0, [x0, #144]
-	bl	_pthread_mach_thread_np
-	mov	x20, x0
-	sub	sp, sp, #16
-	str	w19, [sp]
-	mov	x0, x20
-	mov	w1, #4
-	mov	x2, sp
-	mov	w3, #1
-	bl	_thread_policy_set
-	add	sp, sp, #16
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
-	ret
-Lpin_actor_to_core_none:
+	bl	_silica_rt_migrate_actor_acb
 	mov	x0, #0
+	ldp	x29, x30, [sp], #16
 	ret
 	.cfi_endproc
                                         ; -- End function
@@ -1918,9 +1907,27 @@ _silica_rt_pin_actor_to_efficiency_core:
 _silica_rt_pin_actor_to_efficiency_core_acb: ; @silica_rt_pin_actor_to_efficiency_core
 	.cfi_startproc
 	cbz	x0, Lpin_actor_to_efficiency_core_none
-; A carrier actor (#144 = 0, item N) has no thread for the hint: the success answer, as pin_actor_to_core.
+; A carrier actor (#144 = 0, item N stage 3) moves to an efficiency-core carrier chosen by
+; _silica_rt_carrier_pick_kind (none when it is on one already, or the machine or the carrier
+; count has none); the result word is 0 as for pin_actor_to_core.
 	ldr	x9, [x0, #144]
-	cbz	x9, Lpin_actor_to_efficiency_core_none
+	cbnz	x9, Lpin_actor_to_efficiency_core_thread
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	mov	x1, xzr
+	bl	_silica_rt_carrier_pick_kind
+	cbz	x0, Lpin_actor_to_efficiency_core_stay
+	mov	x1, x0
+	mov	x0, x19
+	bl	_silica_rt_carrier_migrate
+Lpin_actor_to_efficiency_core_stay:
+	mov	x0, #0
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+Lpin_actor_to_efficiency_core_thread:
 ; %bb.0: X0=actor_ref; pin to any E-core via affinity tag 0x45 ('E')
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
@@ -1965,9 +1972,27 @@ fn actor_rt_asm_chunk_7() -> string {
 _silica_rt_pin_actor_to_performance_core_acb: ; @silica_rt_pin_actor_to_performance_core
 	.cfi_startproc
 	cbz	x0, Lpin_actor_to_performance_core_none
-; A carrier actor (#144 = 0, item N) has no thread for the hint: the success answer, as pin_actor_to_core.
+; A carrier actor (#144 = 0, item N stage 3) moves to a performance-core carrier chosen by
+; _silica_rt_carrier_pick_kind (none when it is on one already); the result word is 0 as for
+; pin_actor_to_core.
 	ldr	x9, [x0, #144]
-	cbz	x9, Lpin_actor_to_performance_core_none
+	cbnz	x9, Lpin_actor_to_performance_core_thread
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	mov	x1, #1
+	bl	_silica_rt_carrier_pick_kind
+	cbz	x0, Lpin_actor_to_performance_core_stay
+	mov	x1, x0
+	mov	x0, x19
+	bl	_silica_rt_carrier_migrate
+Lpin_actor_to_performance_core_stay:
+	mov	x0, #0
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+Lpin_actor_to_performance_core_thread:
 ; %bb.0: X0=actor_ref; pin to any P-core via affinity tag 0x50 ('P')
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
@@ -2407,7 +2432,9 @@ _silica_rt_unpin_actor:
 _silica_rt_unpin_actor_acb:                 ; @silica_rt_unpin_actor
 	.cfi_startproc
 	cbz	x0, Lunpin_actor_none
-; A carrier actor (#144 = 0, item N) has no thread for the hint: the success answer, as pin_actor_to_core.
+; unpin_actor is not part of the language (spec §22.10: an actor has no unpinned state); the
+; compiler still accepts it and the emitter answers :ok. A carrier actor (#144 = 0, item N) keeps
+; its binding: nothing to do. A thread actor clears its affinity hint, as before.
 	ldr	x9, [x0, #144]
 	cbz	x9, Lunpin_actor_none
 ; %bb.0: X0=actor_ref; clear affinity by setting tag=0
@@ -2771,9 +2798,13 @@ _silica_rt_sysctl_u64:
 	mov	x29, sp
 	mov	x19, x0
 	sub	sp, sp, #16
+; The value word is zeroed first and the length (8) stored after it: before 2026-10-19 the stp
+; of zeros followed the length store and wiped it, so sysctlbyname saw oldlen 0, answered ENOMEM,
+; and every caller got 0 (the default carrier count of stage 2 fell to 1, hw.memsize to 0, the
+; cache sizes to 0).
+	stp	xzr, xzr, [sp]
 	mov	w0, #8
 	str	w0, [sp, #8]
-	stp	xzr, xzr, [sp]
 	mov	x0, x19
 	mov	x1, sp
 	add	x2, sp, #8
@@ -3259,12 +3290,24 @@ _silica_rt_migrate_actor:
 	.p2align	2
 _silica_rt_migrate_actor_acb:               ; @silica_rt_migrate_actor
 	.cfi_startproc
-; X0=actor_ref X1=target_core -> X0 = 0 (:ok) or 2 (:actor_not_found, a null reference); the emitter
-; maps the code to the program's atom (prims_actors emit_prim_op_with_atoms). Hosted pinning is the
-; thread's affinity hint; the OS may still share or move the thread (spec §22.10), so the hint's own
-; result is not reported. A carrier actor (#144 = 0, item N) has no thread for the hint: :ok with no
-; effect (a move between carriers is stage 3).
+; X0 = ACB (held) or 0, X1 = target core -> X0 = 0 (:ok: the move is requested, and done at the
+; actor's next dispatch boundary, at once when it is idle), 1 (:invalid_target: no logical core of
+; that id on this machine, _silica_rt_logical_cpu_count, the count get_cpu_topology reports),
+; 2 (:actor_not_found: a null reference, or an actor that has ended); the emitter maps the code to
+; the program's atom (prims_actors emit_prim_op_with_atoms). 3 (:migration_blocked) is never
+; produced on this target: nothing blocks a move. A carrier actor (#144 = 0, item N stage 3) is
+; moved to the carrier of the core, `core mod N` as at spawn (_silica_rt_carrier_migrate, which
+; says what happens per status). A thread actor (the gate off, a supervisor, a dangerous actor)
+; gets the thread's affinity hint, as before; the OS may still share or move the thread (spec
+; §22.10), so the hint's own result is not reported.
 	cbz	x0, Lmig_not_found
+	ldr	w9, [x0, #152]
+	cbz	w9, Lmig_not_found
+	adrp	x8, _silica_rt_logical_cpu_count@PAGE
+	add	x8, x8, _silica_rt_logical_cpu_count@PAGEOFF
+	ldr	x9, [x8]
+	cmp	x1, x9
+	b.hs	Lmig_invalid
 	ldr	x9, [x0, #144]
 	cbz	x9, Lmig_carrier
 	stp	x20, x19, [sp, #-32]!
@@ -3292,7 +3335,20 @@ _silica_rt_migrate_actor_acb:               ; @silica_rt_migrate_actor
 	ldp	x20, x19, [sp], #32
 	ret
 Lmig_carrier:
-	mov	x0, #0
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	mov	x0, x1
+	bl	_silica_rt_carrier_for_core
+	mov	x1, x0
+	mov	x0, x19
+	bl	_silica_rt_carrier_migrate
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+Lmig_invalid:
+	mov	x0, #1
 	ret
 Lmig_not_found:
 	mov	x0, #2
@@ -6010,6 +6066,7 @@ _silica_rt_dead_acb:
 	.quad	-1
 	.quad	0, 0
 	.quad	0, 0
+	.space	80
 	.quad	0, 0, 0, 0
 	.quad	0, 0
 	.quad	0, 0

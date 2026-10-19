@@ -1,0 +1,104 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 3): casts flooding an actor while another
+// actor moves it back and forth. The counter (cast-only, core 1) receives 1,000 casts of 1 from
+// the driver while the mover (core 3) migrates it 400 times, alternating cores 1 and 2 (the last
+// move is to core 2): every move finds the counter idle, ready, running or just moved, so every
+// path of _silica_rt_carrier_migrate and the pending apply at the dispatch boundary is taken
+// under load, with the counter's mail pushed to whichever carrier it is bound to at each push. A
+// call to the mover settles the moves (its mailbox is served in order), then a cast of 0 is behind
+// every other cast and every move: the counter prints its count (1,000) and whether it is on core
+// 2's carrier, an equality with the index of a probe spawned for core 2 that it was given as
+// state (the last move was applied at once or at the boundary of a dispatch before this one),
+// then the `done` marker; main waits for the `exit` line.
+//
+// Expected output: 1000, 9, done, exit status 0. The same with SILICA_CARRIERS=0 and at every
+// carrier count.
+
+use trial_wait_int64;
+
+fn probe(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// state.n: the casts of 1 seen; state.p2: core 2's carrier index.
+fn counter(msg: int64, state: { n: int64, p2: int64 }) -> (:no_reply, { n: int64, p2: int64 }) {
+    case msg == 0 of {
+        true -> {
+            sequence proc[concurrency, device_io]
+                print_int64(state.n);
+                println("");
+                here: int64 <- actor_carrier_index(self());
+                print_int64(verdict(here == state.p2));
+                println("");
+                println("done")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        false -> (:no_reply, { n: state.n + msg, p2: state.p2 })
+    }
+}
+
+fn bounce(target: actor_ref, n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            sequence proc[concurrency]
+                _: atom <- migrate_actor(target, 1 + n % 2);
+                rest: int64 <- bounce(target, n - 1)
+            produces
+                pure rest
+            end
+        }
+    }
+}
+
+// The mover: migrates its target msg times (0 times for the settling call), replies bounce's 0.
+fn mover(msg: int64, target: actor_ref) -> (:reply, int64, actor_ref) {
+    (:reply, bounce(target, msg), target)
+}
+
+fn flood(c: actor_ref, n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(c, 1 impl ActorMessage {});
+                rest: int64 <- flood(c, n - 1)
+            produces
+                pure rest
+            end
+        }
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency]
+        p2: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 2);
+        i_p2: int64 <- actor_carrier_index(p2);
+        c: actor_ref <- spawn({ n: 0, p2: i_p2 }, counter, stack_policy(1048576, :keep_last_message), 1);
+        mv: actor_ref <- spawn(c, mover, stack_policy(1048576, :keep_last_message), 3);
+        _: int64 <- call(mv, 400 impl ActorMessage {});
+        _: int64 <- flood(c, 1000);
+        _: int64 <- call(mv, 0 impl ActorMessage {});
+        _: boolean <- cast(c, 0 impl ActorMessage {})
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 { drive() });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

@@ -15,7 +15,7 @@
    limitations under the License.
 -}
 
-// Carrier threads (actor_memory_budget_plan.md item N, stages 1 and 2; ROADMAP chunk 2, hosted part).
+// Carrier threads (actor_memory_budget_plan.md item N, stages 1 to 3; ROADMAP chunk 2, hosted part).
 //
 // Behind a process-start gate: `SILICA_CARRIERS=1` in the environment, read once by
 // _silica_rt_stack_runtime_init into _silica_rt_carriers_enabled. Off (the default), every actor is
@@ -42,17 +42,49 @@
 //     time something installs a current actor on it (an ingress drain). Every runtime entry and
 //     the fault handler read the current actor through the record (_silica_rt_tls_current_actor_get),
 //     and _silica_rt_on_carrier_thread is the record's second word.
-//   - Binding: an actor is bound at adoption to one carrier (ACB #440) for its life. A nonzero
-//     core id given to spawn (ACB #208; a row child's spec has none) binds it to carrier
-//     `core mod N`, so a program that places on cores 1 and 2 lands on different carriers whenever
-//     there are two and is deterministic at every N; without a core id the carriers are taken in
-//     turn (_silica_rt_carrier_next, the board's rule in rt_actors.S spawn), which spreads the load
-//     over the cores. Exclusive pinning, migration and priorities are stages 3 and 4.
+//   - Binding: an actor is bound at adoption to one carrier (ACB #440) and stays there until the
+//     program moves it (stage 3) or it ends; the runtime never moves an actor on its own. A core
+//     id given to spawn (ACB #208; a row child's spec has none) that names one of the machine's
+//     logical cores (1 .. _silica_rt_logical_cpu_count - 1, the count get_cpu_topology reports;
+//     0 is the default) binds it to carrier `core mod N`, so a program that places on cores 1 and
+//     2 lands on different carriers whenever there are two and is deterministic at every N; a
+//     core the machine does not have, or no core id, takes the carriers in turn
+//     (_silica_rt_carrier_next, the board's rule in rt_actors.S spawn), which spreads the load
+//     over the cores. With the default count N is the machine's logical core count and carrier
+//     i is logical core i's; a SILICA_CARRIER_COUNT below it folds the core ids onto the
+//     carriers (a trial knob).
+//   - Placement (stage 3; the spec's Actor Pinning Policy, §15.1.2, and §22.10): migrate_actor
+//     moves a carrier actor to the carrier of the target core (_silica_rt_carrier_migrate): an
+//     idle actor is bound at once (one on its carrier's sweep list is unlisted and relisted on the
+//     target); a ready, running or parked actor has the target left pending in ACB #512 and
+//     applied at its next dispatch boundary (_silica_rt_carrier_apply_pending, from
+//     _silica_rt_carrier_requeue and _silica_rt_carrier_mark_idle), never while it runs and never
+//     at a resume (a parked actor resumes on the carrier it parked on, inside the same
+//     dispatch). The mailbox is the actor's own and moves with it. Codes: 0 :ok, 1
+//     :invalid_target (no such logical core), 2 :actor_not_found (null or ended); 3
+//     :migration_blocked is never produced here. pin_actor_to_core is that move;
+//     pin_actor_to_performance_core / _efficiency_core pick a carrier by core kind
+//     (_silica_rt_carrier_pick_kind: P carriers [0, min(P, N)), E carriers [P, N), in turn per
+//     kind, no move when already on one of the kind or none exists); unpin_actor,
+//     pin_actor_realtime and pin_actor_to_numa_node change nothing for a carrier actor (no
+//     unpinned state; no real-time policy or NUMA domain is honoured on this target). Thread
+//     actors (the gate off, supervisors, dangerous actors) keep the affinity-hint path. Each
+//     carrier thread asks the OS for affinity to its core with THREAD_AFFINITY_POLICY, tag
+//     index + 1, as the thread actors did: a hint at best, and KERN_NOT_SUPPORTED on Apple
+//     Silicon, so placement on a core is never guaranteed on this target (spec §15.1.2,
+//     OS-hosted); what is guaranteed is the carrier. The hosted runtime balances nothing on its
+//     own; a program that wants BEAM-style balancing moves actors itself. The test-only query
+//     actor_carrier_index(ref) reports the bound carrier's index (-1 for a thread actor).
 //   - ACB fields (prims_actors_runtime_asm.silica layout): #440 the carrier (0 = a thread actor),
 //     #448 status (0 none, 1 idle, 2 ready: in the run queue, 3 running, 4 parked in a runtime
 //     wait, 5 idle on the carrier's sweep list), #456 run-queue, wait-list or sweep-list link, #464
 //     the SP of a parked context (0 = none), #472 the actor parked in a spawn until this actor has
-//     started, #480 the wait list the actor is parked on.
+//     started, #480 the wait list the actor is parked on, #512 the pending migration target.
+//     Invariant: an actor on a carrier's run queue or sweep list has #440 = that carrier (the push
+//     and the listing read #440 after any pending move is applied, and #440 changes only when the
+//     actor is on neither, under its lock); so a carrier runs only actors bound to it, and every
+//     path that leaves an actor re-enters the loop of the carrier the thread is, read before the
+//     actor's status was published (not #440 afterwards, which a move may have changed).
 //   - Dispatch: the carrier pops a ready actor, writes its record's current actor and enters the
 //     mailbox loop of _actor_thread_main (LBB1_loop) with X19 = the ACB, exactly as that actor's
 //     own thread would. A behaviour runs on the actor's reservation with the carrier's SP kept in
@@ -118,8 +150,8 @@
 // those are different wrappers from the one a replier holds (an actor cannot reply and die at
 // once), the order that held with one carrier and with none.
 //
-// Not in this stage (actor_memory_budget_plan.md §5 N, "Stage 2 status"): exclusive pinning,
-// migrate_actor, scheduler policies and priorities, supervisors on carriers.
+// Not in this stage (actor_memory_budget_plan.md §5 N, "Stage 3 status"): scheduler policies and
+// priorities on carriers (stage 4), supervisors on carriers.
 
 export emit_actor_carrier_runtime_asm/0;
 
@@ -144,6 +176,16 @@ _silica_rt_carriers_lock:
 	.globl	_silica_rt_row_wait_lock
 _silica_rt_row_wait_lock:
 	.zero	16
+	.globl	_silica_rt_logical_cpu_count
+_silica_rt_logical_cpu_count:
+	.zero	8
+	.globl	_silica_rt_pcore_count
+_silica_rt_pcore_count:
+	.zero	8
+_silica_rt_pcore_next:
+	.zero	8
+_silica_rt_ecore_next:
+	.zero	8
 	.section	__TEXT,__cstring,cstring_literals
 L_srt_carriers_env:
 	.asciz	\"SILICA_CARRIERS\"
@@ -151,6 +193,8 @@ L_srt_carrier_count_env:
 	.asciz	\"SILICA_CARRIER_COUNT\"
 L_srt_hw_logicalcpu:
 	.asciz	\"hw.logicalcpu\"
+L_srt_hw_perf0_logicalcpu:
+	.asciz	\"hw.perflevel0.logicalcpu\"
 Lrta_r_carrier_wait:
 	.asciz	\"a carrier actor waited on the carrier's own stack for another actor of its carrier\"
 Lrta_r_row_wake:
@@ -174,8 +218,10 @@ _silica_rt_carrier_adopt:
 ; be made; it is idle and started), 0 when it keeps a thread of its own: the gate is off, it has a
 ; trampoline (a supervisor, this stage), it is dangerous (its foreign calls may block), or it is one
 ; of the runtime's own actors (_silica_rt_spawn_rec_override is set around their spawns). The
-; carrier: `core mod N` for a nonzero core id (#208; a row child's #208 is its row, no core id),
-; else the next carrier in turn.
+; carrier: `core mod N` for a core id (#208) that names one of the machine's logical cores, 1 ..
+; _silica_rt_logical_cpu_count - 1 (a row child's #208 is its row pointer, no core id; 0 is the
+; default; a core the machine does not have is placed in turn, the board's rule for an
+; out-of-range core at spawn); else the next carrier in turn.
 	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -200,6 +246,11 @@ _silica_rt_carrier_adopt:
 	cmp	x9, #4096
 	b.hs	Lcad_in_turn
 	cbz	x9, Lcad_in_turn
+	adrp	x8, _silica_rt_logical_cpu_count@PAGE
+	add	x8, x8, _silica_rt_logical_cpu_count@PAGEOFF
+	ldr	x11, [x8]
+	cmp	x9, x11
+	b.hs	Lcad_in_turn
 	udiv	x11, x9, x10
 	msub	x9, x11, x10, x9
 	b	Lcad_have_index
@@ -225,6 +276,7 @@ Lcad_have_index:
 	str	xzr, [x19, #456]
 	str	xzr, [x19, #464]
 	str	xzr, [x19, #472]
+	str	xzr, [x19, #512]
 	mov	x0, x19
 	mov	x1, #1
 	bl	_silica_rt_started_store
@@ -405,6 +457,23 @@ _silica_rt_carrier_main:
 	bl	_silica_rt_tls_record_set
 	add	x0, x19, #56
 	bl	_silica_rt_altstack_install_at
+; Affinity for logical core i (the carrier's index), asked of the OS as the thread actors asked
+; it: THREAD_AFFINITY_POLICY with tag i + 1 (0 is the null tag). On macOS the tag is a placement
+; hint the scheduler may ignore (Apple Silicon has no hard thread-to-core binding, and the call
+; may answer KERN_NOT_SUPPORTED): best effort, the result is not checked.
+	bl	_pthread_self
+	bl	_pthread_mach_thread_np
+	mov	x20, x0
+	sub	sp, sp, #16
+	ldr	x9, [x19, #112]
+	add	w9, w9, #1
+	str	w9, [sp]
+	mov	x0, x20
+	mov	w1, #4
+	mov	x2, sp
+	mov	w3, #1
+	bl	_thread_policy_set
+	add	sp, sp, #16
 	mov	x9, sp
 	str	x9, [x19, #48]
 	mov	x8, #1
@@ -478,21 +547,20 @@ _silica_rt_carrier_loop_enter:
 ; X0 = carrier block. An actor's exit path, run on the carrier's stack, ends here. Never returns.
 	mov	x19, x0
 	b	Lcar_loop
-	.globl	_silica_rt_carrier_leave
-	.p2align	2
-_silica_rt_carrier_leave:
-; X0 = a carrier actor that has parked (context saved, status 4 published). Never returns.
-	ldr	x19, [x0, #440]
-	b	Lcar_loop
 	.globl	_silica_rt_carrier_requeue
 	.p2align	2
 _silica_rt_carrier_requeue:
-; X0 = a carrier actor whose message has been served: ready again when mail waits or it has been
-; ended meanwhile (its exit path runs at its next dispatch), idle otherwise; then back to the
-; carrier loop. Never returns.
+; X0 = a carrier actor whose message has been served (the dispatch boundary): a pending migration
+; (#512) is applied first, then it is ready again when mail waits or it has been ended meanwhile
+; (its exit path runs at its next dispatch), idle otherwise; then back to the loop of the carrier
+; this thread is (X20, read before the move: after it the actor's #440 may name another carrier,
+; whose thread may already be running the actor). Never returns.
 	mov	x19, x0
+	ldr	x20, [x19, #440]
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
+	mov	x0, x19
+	bl	_silica_rt_carrier_apply_pending
 	ldr	w9, [x19, #152]
 	cbz	w9, Lcrq_ready
 	ldr	x9, [x19, #216]
@@ -517,14 +585,32 @@ Lcrq_ready:
 Lcrq_unlock:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
-	ldr	x0, [x19, #440]
+	mov	x0, x20
 	b	_silica_rt_carrier_loop_enter
+	.globl	_silica_rt_carrier_apply_pending
+	.p2align	2
+_silica_rt_carrier_apply_pending:
+; X0 = a carrier actor between dispatches (its message served, or dispatched with no mail), its
+; lock held, not on any run queue or sweep list: a pending migration (#512, the target carrier
+; block) becomes its binding (#440). The word is taken atomically, so a migrate_actor that stores
+; a new target meanwhile (under the same lock today; the swap keeps it safe without) is not lost.
+	add	x8, x0, #512
+Lcap_swap:
+	ldaxr	x9, [x8]
+	stlxr	w10, xzr, [x8]
+	cbnz	w10, Lcap_swap
+	cbz	x9, Lcap_ret
+	str	x9, [x0, #440]
+Lcap_ret:
+	ret
 	.globl	_silica_rt_carrier_push
 	.p2align	2
 _silica_rt_carrier_push:
 ; X0 = a carrier actor whose status its caller has just set to ready (2), under the lock that guards
 ; that status. Appends it to its own carrier's run queue (#440: the caller may be anywhere) and
-; wakes that carrier when it sleeps.
+; wakes that carrier when it sleeps. A pending migration is not applied here: a parked actor
+; resumes on the carrier it parked on, inside the same dispatch (spec §15.1.2, scheduler yield
+; points), and moves at its dispatch boundary (_silica_rt_carrier_requeue).
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -554,13 +640,15 @@ Lcpu_unlock:
 	.globl	_silica_rt_carrier_mark_idle
 	.p2align	2
 _silica_rt_carrier_mark_idle:
-; X0 = a carrier actor with no mail, on its carrier's thread, its lock held: idle (1), or, when it
-; is :release_when_idle (#312 = 4) and still holds committed stack (#288), idle on its carrier's
-; sweep list (5), linked through #456 under the carrier's lock.
+; X0 = a carrier actor with no mail, between dispatches, its lock held: a pending migration is
+; applied, then it is idle (1), or, when it is :release_when_idle (#312 = 4) and still holds
+; committed stack (#288), idle on its carrier's sweep list (5), linked through #456 under that
+; carrier's lock (the carrier may be the one just moved to: its list changes under its lock).
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
 	mov	x19, x0
+	bl	_silica_rt_carrier_apply_pending
 	ldr	x9, [x19, #312]
 	cmp	x9, #4
 	b.ne	Lcmi_plain
@@ -755,15 +843,16 @@ Lsts_ret:
 _silica_rt_spawn_wait_started:
 ; X0 = a child just spawned. Returns once its started word (#224) is set. A carrier actor on its own
 ; stack parks (the child's started store wakes it); anything else spins, as the spawn always did.
-	stp	x29, x30, [sp, #-32]!
+	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
+	str	x21, [sp, #32]
 	mov	x19, x0
 	bl	_silica_rt_tls_current_actor_get
 	mov	x20, x0
 	cbz	x20, Lsws_spin
-	ldr	x9, [x20, #440]
-	cbz	x9, Lsws_spin
+	ldr	x21, [x20, #440]
+	cbz	x21, Lsws_spin
 	mov	x9, sp
 	ldr	x10, [x20, #272]
 	cmp	x9, x10
@@ -787,8 +876,10 @@ Lsws_park_loop:
 	str	x9, [x20, #448]
 	add	x0, x20, #16
 	bl	_os_unfair_lock_unlock
-	mov	x0, x20
-	b	_silica_rt_carrier_leave
+; The loop of the carrier this thread is (X21, read while the actor still ran here): the actor's
+; #440 may change once it is parked (a migration applied at its boundary elsewhere).
+	mov	x0, x21
+	b	_silica_rt_carrier_loop_enter
 Lsws_started:
 	add	x0, x20, #16
 	bl	_os_unfair_lock_unlock
@@ -799,8 +890,9 @@ Lsws_spin_loop:
 	ldar	x8, [x9]
 	cbz	x8, Lsws_spin_loop
 Lsws_ret:
+	ldr	x21, [sp, #32]
 	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #32
+	ldp	x29, x30, [sp], #48
 	ret
 	.globl	_silica_rt_on_carrier_thread
 	.p2align	2
@@ -855,13 +947,14 @@ _silica_rt_wait_park:
 ; resume. Called with the actor's lock and the wait lock held: it publishes status 4 (parked)
 ; under both, releases them and leaves for the carrier loop. Returns, with no lock held, when the
 ; actor has been made ready again (by the list's wake or by a stop that unlinked it).
-	stp	x29, x30, [sp, #-48]!
+	stp	x29, x30, [sp, #-64]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
-	str	x21, [sp, #32]
+	stp	x21, x22, [sp, #32]
 	mov	x19, x0
 	mov	x20, x1
 	mov	x21, x2
+	ldr	x22, [x19, #440]
 	mov	x0, x19
 	bl	_silica_rt_ctx_save
 	cbnz	x0, Lwpk_resumed
@@ -876,8 +969,9 @@ _silica_rt_wait_park:
 	bl	_os_unfair_lock_unlock
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
-	mov	x0, x19
-	b	_silica_rt_carrier_leave
+; The loop of the carrier this thread is (X22, read before the park was published).
+	mov	x0, x22
+	b	_silica_rt_carrier_loop_enter
 Lwpk_resumed:
 ; The carrier made this actor the thread's current actor at the resume; the wait was entered with
 ; X21 as the current actor (the supervisor, in an ingress drain).
@@ -886,9 +980,9 @@ Lwpk_resumed:
 	mov	x0, x21
 	bl	_silica_rt_tls_actor_set
 Lwpk_ret:
-	ldr	x21, [sp, #32]
+	ldp	x21, x22, [sp, #32]
 	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #48
+	ldp	x29, x30, [sp], #64
 	ret
 	.globl	_silica_rt_wait_list_wake
 	.p2align	2
@@ -1289,6 +1383,186 @@ Lsra_ret:
 "
 }
 
+// Placement on carriers (stage 3): migrate_actor and the pin_actor_* family for a carrier actor
+// (their entries in prims_actors_runtime_asm.silica resolve the reference and keep the thread
+// path for a thread actor), and the test-only query actor_carrier_index.
+fn carrier_asm_placement() -> string {
+    "	.globl	_silica_rt_carrier_for_core
+	.p2align	2
+_silica_rt_carrier_for_core:
+; X0 = a core id below _silica_rt_logical_cpu_count -> X0 = the carrier block for it, `core mod N`
+; (the carrier the same core id binds to at spawn), the table made if need be.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	bl	_silica_rt_carriers_ensure
+	adrp	x8, _silica_rt_carrier_count@PAGE
+	add	x8, x8, _silica_rt_carrier_count@PAGEOFF
+	ldr	x10, [x8]
+	udiv	x11, x19, x10
+	msub	x9, x11, x10, x19
+	add	x0, x0, x9, lsl #7
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_carrier_migrate
+	.p2align	2
+_silica_rt_carrier_migrate:
+; X0 = a carrier actor (#440 != 0), held by the caller, X1 = the target carrier block. -> X0 = 0
+; (:ok, the move is requested or done) or 2 (:actor_not_found: it has ended). Under the actor's
+; lock, by its status: idle (1) it is bound to the target at once (nothing of it is queued or
+; listed, and mail for it takes this lock); idle on its carrier's sweep list (5) it is taken off
+; that list (under the old carrier's lock), bound, and listed again on the target by
+; _silica_rt_carrier_mark_idle (under the target's lock); ready (2, queued on its carrier), running
+; (3) or parked (4, inside a dispatch) the target is left pending in #512 and applied at the
+; actor's next dispatch boundary (_silica_rt_carrier_requeue, or _silica_rt_carrier_mark_idle when
+; the dispatch finds no mail), never while it runs and never at a resume: a parked actor resumes
+; where it parked, inside the same dispatch. At most one carrier lock is held at any point, never
+; with the target's and the old carrier's locks together, so the lock order of this module's
+; header holds. The mailbox is the actor's own and moves with it; message order is unchanged.
+; The target's thread is created first when it has none yet (nothing held).
+	stp	x29, x30, [sp, #-48]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	str	x21, [sp, #32]
+	mov	x19, x0
+	mov	x20, x1
+	mov	x0, x20
+	bl	_silica_rt_carrier_ensure_started
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	w9, [x19, #152]
+	cbz	w9, Lcmg_ended
+	ldr	x9, [x19, #448]
+	cmp	x9, #1
+	b.eq	Lcmg_idle
+	cmp	x9, #5
+	b.eq	Lcmg_listed
+	str	x20, [x19, #512]
+	b	Lcmg_ok
+Lcmg_listed:
+	mov	x0, x19
+	bl	_silica_rt_carrier_unlist
+	mov	x9, #1
+	str	x9, [x19, #448]
+	str	x20, [x19, #440]
+	mov	x0, x19
+	bl	_silica_rt_carrier_mark_idle
+	b	Lcmg_ok
+Lcmg_idle:
+	str	x20, [x19, #440]
+Lcmg_ok:
+	mov	x21, xzr
+	b	Lcmg_unlock
+Lcmg_ended:
+	mov	x21, #2
+Lcmg_unlock:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x21
+	ldr	x21, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #48
+	ret
+	.globl	_silica_rt_carrier_pick_kind
+	.p2align	2
+_silica_rt_carrier_pick_kind:
+; X0 = a carrier actor, X1 = 1 for a performance core, 0 for an efficiency core -> X0 = the carrier
+; to move it to, or 0 when it stays: it is on a carrier of that kind already, or no carrier of
+; that kind exists. Carrier i is the carrier of logical core i, and the topology the runtime
+; reports (get_cpu_topology, get_performance_cores: sysctl hw.perflevel0 / 1) puts the P cores at
+; [0, P) and the E cores at [P, P + E), so the P carriers are [0, min(P, N)) and the E carriers
+; [P, N) (none when P >= N, as under a SILICA_CARRIER_COUNT below P, or when the machine reports
+; no E cores: a uniform topology is all P). Among the carriers of a kind the choice is in turn
+; (_silica_rt_pcore_next / _ecore_next), a round robin per kind, so repeated pins spread over
+; them, the hosted balance of the BEAM pattern; no exclusivity is implied.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	ldr	x9, [x0, #440]
+	ldr	x9, [x9, #112]
+	adrp	x8, _silica_rt_carrier_count@PAGE
+	add	x8, x8, _silica_rt_carrier_count@PAGEOFF
+	ldr	x10, [x8]
+	adrp	x8, _silica_rt_pcore_count@PAGE
+	add	x8, x8, _silica_rt_pcore_count@PAGEOFF
+	ldr	x11, [x8]
+	cbnz	x11, Lcpk_have_p
+	mov	x11, x10
+Lcpk_have_p:
+	cmp	x11, x10
+	b.ls	Lcpk_p_clamped
+	mov	x11, x10
+Lcpk_p_clamped:
+; X9 = the actor's carrier index, X10 = N, X11 = P clamped to N: P carriers [0, X11), E [X11, N).
+	cbz	x1, Lcpk_efficiency
+	cmp	x9, x11
+	b.lo	Lcpk_stay
+	cbz	x11, Lcpk_stay
+	adrp	x8, _silica_rt_pcore_next@PAGE
+	add	x8, x8, _silica_rt_pcore_next@PAGEOFF
+	mov	x12, xzr
+	mov	x13, x11
+	b	Lcpk_turn
+Lcpk_efficiency:
+	cmp	x9, x11
+	b.hs	Lcpk_stay
+	cmp	x11, x10
+	b.hs	Lcpk_stay
+	adrp	x8, _silica_rt_ecore_next@PAGE
+	add	x8, x8, _silica_rt_ecore_next@PAGEOFF
+	mov	x12, x11
+	mov	x13, x10
+Lcpk_turn:
+; The next index in turn over [X12, X13): the counter at X8 counts from 0 over the range's length.
+	sub	x13, x13, x12
+Lcpk_turn_loop:
+	ldaxr	x14, [x8]
+	add	x15, x14, #1
+	cmp	x15, x13
+	b.lo	Lcpk_turn_store
+	mov	x15, xzr
+Lcpk_turn_store:
+	stlxr	w16, x15, [x8]
+	cbnz	w16, Lcpk_turn_loop
+	cmp	x14, x13
+	b.lo	Lcpk_turn_in_range
+	mov	x14, xzr
+Lcpk_turn_in_range:
+	add	x19, x14, x12
+	bl	_silica_rt_carriers_ensure
+	add	x0, x0, x19, lsl #7
+	b	Lcpk_ret
+Lcpk_stay:
+	mov	x0, xzr
+Lcpk_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+	.globl	_silica_rt_actor_carrier_index
+	.p2align	2
+_silica_rt_actor_carrier_index:
+; actor_carrier_index(ref) -> int64, a test-only query (trials/carriers_addition): the index of the
+; carrier the actor is bound to now (#440, +112), -1 for an actor with a thread of its own (the
+; gate off, a supervisor, a dangerous actor) or a reference that names no actor. A pending
+; migration is not reported until it is applied.
+	adrp	x9, _silica_rt_actor_carrier_index_acb@PAGE
+	add	x9, x9, _silica_rt_actor_carrier_index_acb@PAGEOFF
+	b	_silica_rt_ref_call
+	.p2align	2
+_silica_rt_actor_carrier_index_acb:
+	cbz	x0, Laci_none
+	ldr	x9, [x0, #440]
+	cbz	x9, Laci_none
+	ldr	x0, [x9, #112]
+	ret
+Laci_none:
+	mov	x0, #-1
+	ret
+"
+}
+
 fn carrier_asm_context() -> string {
     "	.globl	_silica_rt_ctx_save
 	.p2align	2
@@ -1337,5 +1611,5 @@ _silica_rt_ctx_resume:
 }
 
 fn emit_actor_carrier_runtime_asm() -> string {
-    concat(concat(concat(concat(carrier_asm_data(), carrier_asm_adopt()), carrier_asm_loop()), carrier_asm_wakes()), carrier_asm_context())
+    concat(concat(concat(concat(concat(carrier_asm_data(), carrier_asm_adopt()), carrier_asm_loop()), carrier_asm_wakes()), carrier_asm_placement()), carrier_asm_context())
 }

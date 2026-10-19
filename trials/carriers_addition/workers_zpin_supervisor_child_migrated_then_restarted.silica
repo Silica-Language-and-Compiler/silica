@@ -1,0 +1,112 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 3) and the restart protocol: a supervisor's
+// row child (bound in turn, its spec has no core id) is migrated to core 2, killed, and the
+// replacement the supervisor spawns is a new actor bound in turn again, which the program
+// migrates in its turn. The old reference names an actor that has ended: :actor_not_found.
+// Facts are equalities with a probe spawned for core 2, so they hold at every carrier count and
+// with the gate off. One failure report (the kill, reason_tag 1) is printed asynchronously by the
+// reporter: compared as a multiset; printed values avoid the digits 1-4 and 8, which
+// compare_scout_multiset.sh folds (505 = 500 + 5, 9 holds, 6 does not).
+//
+//   call child 5 -> 505; migrate child to 2 -> :ok; after a call it is on core 2's carrier (9);
+//   the killer's kill_abnormal -> :ok (9); the replacement answers 505 again (initial state);
+//   migrate of the old reference -> :actor_not_found; migrate of the replacement to 2 -> :ok and
+//   after a call it is on core 2's carrier (9).
+//
+// Expected output: 505, :ok, 9, 9, 505, :actor_not_found, :ok, 9, one failure report, exit
+// status 0, as a multiset. The same with SILICA_CARRIERS=0 and at every carrier count.
+
+use Supervisor;
+use trial_support_int64;
+
+impl ZpinMigratedChildSup for Supervisor;
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn probe(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// The killer: a plain worker outside the supervisor, so its wait for the row's exit_done is a
+// park on its own carrier (or a spin on its own thread). Replies 9 when kill_abnormal answered :ok.
+fn killer(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        killed: atom <- kill_abnormal(:zpin_sup_child);
+        v: int64 <- case killed of { :ok -> 9; _: atom -> 6 }
+    produces
+        pure (:reply, v, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :zpin_sup_child, agent_type: :worker, initial_state: initial_state + 500, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        p2: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 2);
+        i_p2: int64 <- actor_carrier_index(p2);
+        sup: supervisor_ref <- spawn_registered_supervisor(ZpinMigratedChildSup, 0, :zpin_sup, stack_policy(0, :keep_last_message));
+        b1: int64 <- call_registered(:zpin_sup_child, 5 impl ActorMessage {});
+        print_int64(b1);
+        println("");
+        first: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: :zpin_sup_child } impl SupervisorMessage {});
+        child: actor_ref <- first.child;
+        m1: atom <- migrate_actor(child, 2);
+        _: atom <- print_atom(m1);
+        println("");
+        _: int64 <- call_registered(:zpin_sup_child, 0 impl ActorMessage {});
+        i1: int64 <- actor_carrier_index(child);
+        print_int64(verdict(i1 == i_p2));
+        println("");
+        k: actor_ref <- spawn(0, killer, stack_policy(1048576, :keep_last_message));
+        killed: int64 <- call(k, 0 impl ActorMessage {});
+        print_int64(killed);
+        println("");
+        a1: int64 <- call_registered(:zpin_sup_child, 5 impl ActorMessage {});
+        print_int64(a1);
+        println("");
+        m2: atom <- migrate_actor(child, 2);
+        _: atom <- print_atom(m2);
+        println("");
+        second: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: :zpin_sup_child } impl SupervisorMessage {});
+        replacement: actor_ref <- second.child;
+        m3: atom <- migrate_actor(replacement, 2);
+        _: atom <- print_atom(m3);
+        println("");
+        _: int64 <- call_registered(:zpin_sup_child, 0 impl ActorMessage {});
+        i2: int64 <- actor_carrier_index(replacement);
+        print_int64(verdict(i2 == i_p2));
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
