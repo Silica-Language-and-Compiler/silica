@@ -1,9 +1,11 @@
 # Makefile for the carrier-thread trials in carriers_addition (actor_memory_budget_plan.md item N, stage 1).
 #
 # The trial executables run with SILICA_CARRIERS=$(SILICA_CARRIERS) in their environment: 1 (the
-# default here) puts every plain actor on the carrier thread, 0 keeps a thread per actor; the suite
-# must pass both ways (`make integrate SILICA_CARRIERS=0`). The compiler itself is not given the
-# variable: it runs with whatever the caller's environment holds.
+# default here) puts every plain actor on a carrier thread, 0 keeps a thread per actor; the suite
+# must pass both ways (`make integrate SILICA_CARRIERS=0`). SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT)
+# goes with it: the number of carriers (stage 2), 0 (the default) meaning the machine's logical
+# cores; the suite must pass at 1, 2 and 4 (`make integrate SILICA_CARRIER_COUNT=2`). The compiler
+# itself is not given the variables: it runs with whatever the caller's environment holds.
 # Uses silica-compiler to generate assembly, then assembles and links.
 #
 # silica-compiler reads silica.config in this directory and emits .sams files.
@@ -18,6 +20,7 @@ include $(THIS_DIR)../silica_compiler.mk
 TRIAL_DIR := $(notdir $(patsubst %/,%,$(THIS_DIR)))
 MSG_PREFIX := $(TRIAL_DIR)/
 SILICA_CARRIERS ?= 1
+SILICA_CARRIER_COUNT ?= 0
 
 # Rust toolchain linker (rust-lld) - optional override
 RUST_SYSROOT := $(shell rustc --print sysroot 2>/dev/null)
@@ -181,7 +184,7 @@ integrate-run:
 					if [ -f "$(THIS_DIR)run_integration_exit_after_marker.py" ]; then \
 						marker=$$(awk 'NF { print $$1; found=1; exit } END { if (!found) print "done" }' "$$base.wait_for_exit"); \
 						marker_count=$$(awk 'NF { print ($$2 == "" ? 1 : $$2); found=1; exit } END { if (!found) print 1 }' "$$base.wait_for_exit"); \
-						$(call INTEGRATE_EXEC_TRIAL,$(MSG_PREFIX)$$base,env SILICA_CARRIERS=$(SILICA_CARRIERS) python3 "$(THIS_DIR)run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "$$marker" "$$marker_count"); \
+						$(call INTEGRATE_EXEC_TRIAL,$(MSG_PREFIX)$$base,env SILICA_CARRIERS=$(SILICA_CARRIERS) SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) python3 "$(THIS_DIR)run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "$$marker" "$$marker_count"); \
 						if [ "$$integrate_killed" = 1 ]; then \
 							echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 							$(INTEGRATE_DOT_FAIL); \
@@ -194,7 +197,7 @@ integrate-run:
 						continue; \
 					fi; \
 				else \
-					$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,env SILICA_CARRIERS=$(SILICA_CARRIERS) ./$$base); \
+					$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,env SILICA_CARRIERS=$(SILICA_CARRIERS) SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) ./$$base); \
 					if [ "$$integrate_killed" = 1 ]; then \
 						echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 						$(INTEGRATE_DOT_FAIL); \

@@ -26,9 +26,9 @@
 // cpu_topology / cache / NUMA helpers (_silica_rt_apple_*, sysctl hw.*): macOS Apple Silicon only (see cpu_topology_implementation_plan Phase G).
 // ABI: spawn(X0,X1,X2)->X0  send(X0,X1)  cast(X0,X1)->W0  call(X0,X1)->X0  self()->X0  recv()->X0
 // X2=optional core_id (0 default) per §15.1.1, X4=packed stack_policy (0 = inherit the spawner's; see prims_actors_stack_asm).
-// Actor control block 496 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
-// the holder count and the parked exit notice; 2026-10-19 +32 for the carrier fields, item N, and +16 for
-// the wait-list word of the restart protocol): #0..#215 the
+// Actor control block 512 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
+// the holder count and the parked exit notice; 2026-10-19 +32 for the carrier fields, item N, +16 for
+// the wait-list word of the restart protocol, and +16 for the thread record, item N stage 2): #0..#215 the
 // actor runtime's, #216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
 // _silica_rt_sb_require), #224 started flag, #232 pending exit reason_tag, #240 active call wrapper,
 // #248/#256/#264 FFI arena base/end/bump (Phase 12), #272..#391 the runtime-managed stack fields
@@ -45,7 +45,10 @@
 // #456 run-queue link (the link in a wait list while parked for a row child's exit_done, row +120, or
 // for a supervisor's restart token, block +128), #464 the SP of a parked context, #472 the actor parked
 // in a spawn waiting for this one to start, #480 the wait list (the address of its head word) the actor
-// is parked on, 0 when none: a stop (_silica_rt_actor_stop) unlinks and wakes it. Control block 496 B.
+// is parked on, 0 when none: a stop (_silica_rt_actor_stop) unlinks and wakes it. #496/#504 the thread
+// record of an actor that has a thread of its own (the pthread key names it: the thread's current actor,
+// and 0 = not a carrier's thread; _silica_rt_tls_record_set); unused for a carrier actor, whose carrier's
+// block holds its thread's record. Control block 512 B.
 // spawn_linked Phase A (supervisors_implementation_development_plan): spawn_linked(X0,X1,X2,X3,X4)->X0
 // X0=init X1=beh X2=agent_type (int64) X3=row/core metadata (0 default), X4=optional supervisor trampoline.
 // Offsets: #192 supervisor actor_ref (0 root), #200 agent_type atom, #208 core_id (the row pointer of a
@@ -120,7 +123,7 @@ _silica_rt_actor_spawn:                 ; @silica_rt_actor_spawn
 	mov	x21, x0
 	mov	w22, #1                         ; =0x1
 	mov	w0, #1                          ; =0x1
-	mov	w1, #496
+	mov	w1, #512
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBB0_4
@@ -299,7 +302,7 @@ LBBsl_common:
 	mov	x20, x1
 	mov	x21, x0
 	mov	w0, #1
-	mov	w1, #496
+	mov	w1, #512
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBBsl_4
@@ -508,8 +511,11 @@ fn actor_rt_asm_chunk_1() -> string {
 	.cfi_offset w21, -40
 	.cfi_offset w22, -48
 	mov	x19, x0
-	bl	_silica_rt_ensure_actor_tls_key
-	bl	_silica_rt_tls_actor_set_from_x19
+; This thread's record (item N stage 2): the current actor is this actor, and it is no carrier's.
+	str	x19, [x19, #496]
+	str	xzr, [x19, #504]
+	add	x0, x19, #496
+	bl	_silica_rt_tls_record_set
 	mov	x0, x19
 	bl	_silica_rt_actor_altstack_install
 ; Phase E e3b: first-schedule supervisor trampoline hook. It runs on the actor's stack, like a
@@ -580,11 +586,12 @@ LBB1_try_std:
 	cbnz	x20, LBB1_process
 	ldr	w9, [x19, #152]
 	cbz	w9, LBB1_exit
-; A carrier actor with no mail is idle: back to the carrier loop (mail makes it ready again).
+; A carrier actor with no mail is idle (on its carrier's sweep list when it is :release_when_idle
+; with committed stack): back to the carrier loop (mail makes it ready again).
 	ldr	x9, [x19, #440]
 	cbz	x9, LBB1_thread_wait
-	mov	x9, #1
-	str	x9, [x19, #448]
+	mov	x0, x19
+	bl	_silica_rt_carrier_mark_idle
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	ldr	x0, [x19, #440]
@@ -1866,6 +1873,11 @@ _silica_rt_pin_actor_to_core:
 _silica_rt_pin_actor_to_core_acb:           ; @silica_rt_pin_actor_to_core
 	.cfi_startproc
 	cbz	x0, Lpin_actor_to_core_none
+; A carrier actor has no thread of its own (#144 = 0; item N): it is placed by its carrier binding,
+; and the affinity hint has nothing to apply to. Exclusive pinning on carriers is stage 3; the
+; answer is the success the hint would report.
+	ldr	x9, [x0, #144]
+	cbz	x9, Lpin_actor_to_core_none
 ; %bb.0: X0=actor_ref X1=core_id; thread_policy_set(THREAD_AFFINITY_POLICY)
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
@@ -1906,6 +1918,9 @@ _silica_rt_pin_actor_to_efficiency_core:
 _silica_rt_pin_actor_to_efficiency_core_acb: ; @silica_rt_pin_actor_to_efficiency_core
 	.cfi_startproc
 	cbz	x0, Lpin_actor_to_efficiency_core_none
+; A carrier actor (#144 = 0, item N) has no thread for the hint: the success answer, as pin_actor_to_core.
+	ldr	x9, [x0, #144]
+	cbz	x9, Lpin_actor_to_efficiency_core_none
 ; %bb.0: X0=actor_ref; pin to any E-core via affinity tag 0x45 ('E')
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
@@ -1950,6 +1965,9 @@ fn actor_rt_asm_chunk_7() -> string {
 _silica_rt_pin_actor_to_performance_core_acb: ; @silica_rt_pin_actor_to_performance_core
 	.cfi_startproc
 	cbz	x0, Lpin_actor_to_performance_core_none
+; A carrier actor (#144 = 0, item N) has no thread for the hint: the success answer, as pin_actor_to_core.
+	ldr	x9, [x0, #144]
+	cbz	x9, Lpin_actor_to_performance_core_none
 ; %bb.0: X0=actor_ref; pin to any P-core via affinity tag 0x50 ('P')
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
@@ -2389,6 +2407,9 @@ _silica_rt_unpin_actor:
 _silica_rt_unpin_actor_acb:                 ; @silica_rt_unpin_actor
 	.cfi_startproc
 	cbz	x0, Lunpin_actor_none
+; A carrier actor (#144 = 0, item N) has no thread for the hint: the success answer, as pin_actor_to_core.
+	ldr	x9, [x0, #144]
+	cbz	x9, Lunpin_actor_none
 ; %bb.0: X0=actor_ref; clear affinity by setting tag=0
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
@@ -2429,8 +2450,12 @@ _silica_rt_set_actor_priority:
 _silica_rt_set_actor_priority_acb:          ; @silica_rt_set_actor_priority
 	.cfi_startproc
 ; %bb.0: X0=actor_ref X1=level (0 low, 1 normal, 2 high; the emitter maps the program's atoms) -> X0 = 0
-; (:ok) or 1 (:actor_not_found, a null reference); the level maps to a pthread QoS class.
+; (:ok) or 1 (:actor_not_found, a null reference); the level maps to a pthread QoS class. A carrier
+; actor (#144 = 0, item N) has no thread to give a class to: :ok, with no effect (priorities on
+; carriers are stage 4).
 	cbz	x0, Lsp_not_found
+	ldr	x9, [x0, #144]
+	cbz	x9, Lsp_carrier
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
 	add	x29, sp, #16
@@ -2468,6 +2493,9 @@ LBBsp_set:
 	mov	x0, #0
 	ldp	x29, x30, [sp, #16]
 	ldp	x20, x19, [sp], #32
+	ret
+Lsp_carrier:
+	mov	x0, #0
 	ret
 Lsp_not_found:
 	mov	x0, #1
@@ -3046,6 +3074,9 @@ L_tlse_done:
 	.p2align	2
 _silica_rt_tls_current_actor_get:
 	.cfi_startproc
+; -> X0 = this thread's current actor: the first word of the thread's record (the pthread key names
+; it; _silica_rt_tls_record_set), 0 on a thread with no record (main before any drain) or whose
+; record holds none (a carrier between actors).
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
 	.cfi_def_cfa w29, 16
@@ -3056,6 +3087,9 @@ _silica_rt_tls_current_actor_get:
 	add	x8, x8, _silica_actor_pthread_key@PAGEOFF
 	ldr	x0, [x8]
 	bl	_pthread_getspecific
+	cbz	x0, L_tcag_ret
+	ldr	x0, [x0]
+L_tcag_ret:
 	ldp	x29, x30, [sp], #16
 	ret
 	.cfi_endproc
@@ -3063,19 +3097,9 @@ _silica_rt_tls_current_actor_get:
 	.p2align	2
 _silica_rt_tls_actor_set_from_x19:
 	.cfi_startproc
-; Preserve ACB on the stack across pthread_setspecific without clobbering callee-saved x21.
-	stp	x29, x30, [sp, #-32]!
-	mov	x29, sp
-	str	x19, [sp, #16]
-	bl	_silica_rt_ensure_actor_tls_key
-	ldr	x1, [sp, #16]
-	adrp	x8, _silica_actor_pthread_key@PAGE
-	add	x8, x8, _silica_actor_pthread_key@PAGEOFF
-	ldr	x0, [x8]
-	bl	_pthread_setspecific
-	ldr	x19, [sp, #16]
-	ldp	x29, x30, [sp], #32
-	ret
+; X19 = the ACB to install as this thread's current actor; X19 is kept (callee-saved below).
+	mov	x0, x19
+	b	_silica_rt_tls_actor_set
 	.cfi_endproc
 	.p2align	2
 _silica_rt_actor_init_region:           ; arena bookkeeping for the actor's implicit heap
@@ -3238,8 +3262,11 @@ _silica_rt_migrate_actor_acb:               ; @silica_rt_migrate_actor
 ; X0=actor_ref X1=target_core -> X0 = 0 (:ok) or 2 (:actor_not_found, a null reference); the emitter
 ; maps the code to the program's atom (prims_actors emit_prim_op_with_atoms). Hosted pinning is the
 ; thread's affinity hint; the OS may still share or move the thread (spec §22.10), so the hint's own
-; result is not reported.
+; result is not reported. A carrier actor (#144 = 0, item N) has no thread for the hint: :ok with no
+; effect (a move between carriers is stage 3).
 	cbz	x0, Lmig_not_found
+	ldr	x9, [x0, #144]
+	cbz	x9, Lmig_carrier
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
 	add	x29, sp, #16
@@ -3263,6 +3290,9 @@ _silica_rt_migrate_actor_acb:               ; @silica_rt_migrate_actor
 	mov	x0, #0
 	ldp	x29, x30, [sp, #16]
 	ldp	x20, x19, [sp], #32
+	ret
+Lmig_carrier:
+	mov	x0, #0
 	ret
 Lmig_not_found:
 	mov	x0, #2
@@ -5981,6 +6011,7 @@ _silica_rt_dead_acb:
 	.quad	0, 0
 	.quad	0, 0
 	.quad	0, 0, 0, 0
+	.quad	0, 0
 	.quad	0, 0
 	.section	__TEXT,__text,regular,pure_instructions
 ; _silica_rt_registry_name_taken: a registered name was already held by a live actor or supervisor

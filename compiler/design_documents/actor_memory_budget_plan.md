@@ -573,7 +573,8 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
     order trials pass on the hosts; a hosted machine holds millions of idle actors with no thread per actor
     and no starvation under load; with trials on every hosted target.
   *Stage 1 built 2026-10-19 on `apple_silicon_mac` only (branch `hosted-carriers-item-n`, unpublished); the
-  Linux runtimes are untouched.*
+  Linux runtimes are untouched. Stage 2 (N carriers) built the same day on the same branch: "Stage 2
+  status" below.*
   - **Stage 1 status.** The carrier infrastructure exists behind a process-start gate and is off by default:
     `SILICA_CARRIERS=1` in the environment, read once by `_silica_rt_stack_runtime_init` (`getenv`) into
     `_silica_rt_carriers_enabled`. The emitted runtime text is the same either way, so the gate perturbs no
@@ -711,6 +712,139 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       target (the Linux runtimes have neither the carriers nor the protocol: the three
       `working_restart_protocol_*` trials will hang or fail there until it is ported, and they have no
       Linux `.ascomp` yet).
+  - **Stage 2 status (2026-10-19, `apple_silicon_mac` only, same branch, same gate).** The one static
+    carrier became N carriers, one thread per logical core, and every place that assumed carrier 0 is
+    per carrier. The emitted runtime text changes (so every suite's `__silica_runtime.ascomp` moves
+    once more); the trial `.sams` do not, and with the gate off the behaviour is the one of stage 1 and
+    before (the only gate-off difference is the thread record below, a plain store where
+    `pthread_setspecific` was).
+    - *Count.* `_silica_rt_stack_runtime_init` reads `SILICA_CARRIER_COUNT` (decimal, >= 1; anything
+      else ignored) and otherwise `hw.logicalcpu` (`_silica_rt_sysctl_u64`), at least 1, into
+      `_silica_rt_carrier_count`. The table (`_silica_rt_carriers`, N blocks of 128 B) is `calloc`'d at
+      the first adoption (`_silica_rt_carriers_ensure`, under `_silica_rt_carriers_lock`); each
+      carrier's thread is created the first time an actor is bound to it, so an idle machine with one
+      worker has one carrier thread.
+    - *Carrier block (128 B).* +0 lock, +8 futex word, +16 idle, +24/+32 run queue head/tail (links
+      ACB #456), +40 the actor being run, +48 base SP, +56 the 64 KB signal alternate stack (one per
+      carrier, installed by its thread), +64 pthread_t, +72 started, +80 created, +88/+96 the thread
+      record (current actor; the carrier itself), +104 the sweep list head, +112 the index, +120 the
+      time of the last sweep.
+    - *Thread record (risk R2.1).* The pthread key no longer names the ACB: it names a two-word record,
+      the thread's current actor and its carrier (0 = not a carrier's thread). A carrier's record is in
+      its block, written with a plain store at each dispatch (`Lcar_have`) and cleared at each re-entry
+      of the loop, so no `pthread_setspecific` per switch; an actor thread's record is ACB #496/#504
+      (ACB 512 B, both `calloc` sites, `_silica_rt_dead_acb` extended; `_actor_thread_main` installs it
+      with `_silica_rt_tls_record_set`); main gets a `calloc`'d record the first time an ingress drain
+      installs a current actor on it. `_silica_rt_tls_current_actor_get` reads the record's first word,
+      `_silica_rt_tls_actor_set` writes it, `_silica_rt_on_carrier_thread` reads the second (no
+      `pthread_self` comparison, no static block). Fault attribution is therefore "the actor this
+      carrier is running", which the handler's growth test and the exhaustion rewrite (both per ACB
+      #440 already) rely on. Pre-existing and unchanged: an ingress drain installs the supervisor as
+      the current actor while it runs on the drainer's stack (`_silica_rt_supervisor_handle_notice`),
+      on every kind of thread, so a growth fault inside `maybe_restart` would be attributed to the
+      supervisor; stage 1 had the same through `pthread_setspecific`.
+    - *Binding.* `_silica_rt_carrier_adopt` binds at spawn, for life (ACB #440): a nonzero core id
+      (ACB #208; a row child's #208 is its row pointer and counts as none) binds to carrier
+      `core mod N`; none, or 0, takes the next carrier in turn (`_silica_rt_carrier_next`, an atomic
+      round robin, process-wide). Why in turn rather than the spawner's carrier: it is the board's rule
+      (rt_actors.S spawn: "the argument when it names a running core (0 is also default), else round
+      robin"), so a program places the same way on every target; it spreads the load, which is what N
+      carriers are for; and inheriting needs a fallback anyway (supervisors and main have no carrier).
+      Why `core mod N` rather than the board's "out of range is round robin": a program written for
+      cores 1 and 2 lands on two carriers whenever there are two and on the same one when there is one,
+      deterministically at every count, which the trials need (a difference from the board, noted). The
+      cost of the choice is that a call from a worker to a child it spawned is usually cross-carrier: a
+      park on one carrier and a push plus futex wake on the other, instead of a same-carrier park and
+      pop. Exclusive pinning, `pin_actor_*`, `migrate_actor`, priorities and policies are stages 3 and 4.
+    - *Per-carrier everywhere.* Every wake pushes to the TARGET actor's carrier
+      (`_silica_rt_carrier_push` reads #440: mail, the call wrapper wake, the started store, the wait
+      list wake, a stop), waking that carrier's futex when it sleeps; the parker lookups
+      (`_silica_rt_on_carrier_thread`, `_silica_rt_carrier_self_on_own_stack`) go through the thread's
+      record; every exit path on the carrier's stack and the fault handler's exhaustion rewrite read the
+      actor's own carrier (#440, then its base SP +48); `_silica_rt_carrier_leave`, `_requeue` and
+      `_loop_enter` take the carrier from the actor or their caller. The spawn park, the row and
+      token waits and `_silica_rt_actor_stop` were already written against #440 and needed nothing.
+      The `Lrw_spin` abort (an exit path on a carrier's stack spinning for a carrier actor) is kept
+      as it was: with several carriers the awaited child may be elsewhere and a spin would merely
+      stall this carrier, but the callers do not say which carrier the child is on, so the conservative
+      abort stands.
+    - *Lock order with N carriers* (in `prims_actors_carrier_asm.silica`'s header): a call wrapper's
+      lock (+72) > the waiting actor's lock > the supervisor's lock > `_silica_rt_row_wait_lock` > a
+      carrier's lock (+0). The carrier lock is a leaf: the loop takes it with nothing held; push,
+      mark_idle, unlist and the sweep take it with at most one actor's lock (and what is above it)
+      held; no path holds two carriers' locks. So a reply on carrier 2 pushing its parked caller to
+      carrier 1, a cascade on a supervisor's thread stopping siblings on two carriers, and two
+      carriers waking each other's actors take the locks in one order. `_silica_rt_carriers_lock`
+      (the table's creation) is taken with nothing held.
+    - *Idle sweep (the `:release_when_idle` gap of stage 1, closed).* An actor marked idle with
+      policy 4 and committed stack goes on its carrier's sweep list (status 5, `_silica_rt_carrier_mark_idle`,
+      linked through #456; the list changes only on the carrier's own thread or under its lock). The
+      carrier sweeps (`_silica_rt_carrier_sweep`, lock held) before sleeping on an empty queue and
+      sleeps with the earliest due time as its timeout (`_silica_rt_cv_wait_timeout`), and, so that a
+      busy carrier releases too (cooperative scheduling: a carrier ping-ponging two actors never has
+      an empty queue), at a dispatch at most every quarter second while the list is not empty. A listed
+      actor a second past its last message (#344) is released by `_silica_rt_stack_idle_check`, the
+      same check an actor thread makes in its timed wait, and becomes plainly idle; mail for a listed
+      actor takes it off the list first (`_silica_rt_carrier_unlist`, under the carrier lock, so it
+      never races the sweep). Nothing of a listed actor runs: it is off the run queue, and its ACB goes
+      only after a dispatch (its exit path), which the unlist precedes.
+    - *Trials* (`trials/carriers_addition`; the Makefile also passes `SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT)`,
+      default 0 = the machine's count; named `workers_*` so they sort after the stage-1 trials and renumber
+      no atom): `workers_call_cross_carrier` (300 calls A on core 1 -> B on core 2, the carriers wake each
+      other), `workers_cast_stress_cross_carrier` (111 casts to each of four cast-only counters on
+      cores 1..4 from a fifth carrier, multiset), `workers_two_carriers_interleaved_growth` (500,000-deep
+      recursions on two carriers at once, `:keep_high_water` read back per actor: growth faults
+      attributed per carrier), `workers_supervisor_children_on_different_carriers` (`:rest_for_one`
+      rows bound in turn, the middle one killed by a plain worker on another carrier, restart, count,
+      calls), `workers_exhaustion_on_one_carrier_keeps_siblings` (a 256 KB reservation exhausted on
+      carrier 1 through a relay; siblings on carriers 1 and 2 recurse 300,000 deep afterwards; the poll
+      for the release goes through a call so a shared carrier can run the exit),
+      `workers_call_cycle_across_carriers` (documents today's behaviour: A on core 1 calls B on core 2
+      which calls A; both park for ever with their kicker, the carriers are free and siblings on both
+      still answer; the process ends through `exit`; to be re-derived when R1.5 lands),
+      `workers_spawn_from_actor_binds_per_policy` (cores 0, 1, 2, 7, none from an actor, a registered
+      spawn for core 3 from the driver, calls across every pair). No thread-count probe trial: nothing a
+      program can observe is deterministic in the thread count (the registries' and supervisors'
+      threads vary with what the trial support starts), so it is not written.
+    - *Verified 2026-10-19 on the Mac* with the compiler built from this branch
+      (`compiler/build/apple_silicon_mac/silica-compiler`, 13 s incremental, not installed):
+      `carriers_addition` 36/36 (18 trials, two checks each) at `SILICA_CARRIER_COUNT=1`, 2 and 4 under
+      `SILICA_CARRIERS=1` and 36/36 with the gate off (the 11 stage-1 trials' `.sams` unchanged against
+      their `.ascomp`; the seven new `.ascomp` taken from runs whose `.sout` matched the hand-derived
+      `.scout`, which every one did at the first run). The binding policy was
+      confirmed with an instrumented `__silica_runtime.sams` (a `write(2)` of core id and carrier index
+      in `_silica_rt_carrier_adopt`, built in the scratchpad, never in the tree): at N = 4 core 2 -> 2,
+      core 7 -> 3, core 3 -> 3, no core id -> 0, 1, 2, 3 in turn; at N = 2 core 7 -> 1, core 2 -> 0; at
+      N = 1 everything -> 0. `actor_stacks_addition` with the gate and count exported to the compiler too:
+      25/26 at counts 1 and 2, `stack_release_when_idle_after_second` now passing (the sweep); the one
+      failure is stage 1's `stack_lowered_reservation_exhausted`, whose worker busy-polls from a carrier
+      shared with the relay it is waiting for (the exhaustion itself is handled and the carrier recurses
+      300,000 deep afterwards): the trial assumes preemption, which the specification's cooperative
+      yield points do not promise, so it is a trial shape to decide on, not a runtime defect. The
+      hammer: every `carriers_addition` trial (18) run 30 times at each of counts 1, 2 and 4 under
+      `SILICA_CARRIERS=1`, outputs compared as the suite compares them: 0 failures in 1,620 runs. With
+      the gate and count exported to the compiler as well (so the compiler's own actors ran on carriers
+      while it compiled each suite): `scheduler_policy_addition` 12/12 at counts 2 and 1 and with the
+      gate off; `actors_addition` 753/753 at counts 1 and 2 and with the gate off (two of its runs,
+      queued right behind another suite, stopped after 2 s with no trial run and no message the log
+      kept; both passed when rerun alone: a harness-level stop, not reproduced); `supervisors_addition`
+      292/292 at counts 2 and 1 and with the gate off; no trial `.sams` changed in any of them. The
+      suites' `__silica_runtime.ascomp` goldens are not compared by `integrate` and are stale since
+      stage 1 (the runtime text moved then and again now): to be refreshed per suite once each
+      suite's `.sout` matches its `.scout`.
+    - **Unverified:** `supervisors_host_defects_addition` and `actor_registration_addition` under both
+      gates; every big suite at count 4; `actor_stacks_addition` with the gate off after stage 2; the
+      `:dangerous` row flavour; a carrier actor spawning a supervisor; the compiler compiling itself on
+      N carriers (risk R3.3's order); any Linux target.
+    - **Not done in stage 2:** exclusive pinning, `migrate_actor`, `set_actor_priority` and
+      `set_scheduler_policy` on carriers (stages 3 and 4). Until then `pin_actor_to_core`,
+      `pin_actor_to_efficiency_core`, `pin_actor_to_performance_core`, `unpin_actor`,
+      `set_actor_priority` and `migrate_actor` answer their success value for a carrier actor and do
+      nothing (the thread-affinity and QoS hints need a thread, and a carrier actor's ACB #144 is 0:
+      in stage 1 they dereferenced it, a crash under the gate for any program that pinned a plain
+      worker, found while reading the `scheduler_policy_addition` sources); supervisors on
+      carriers; cycle detection and the self-call failure (R1.5); the Linux runtimes; the idle-actor
+      capacity measurement.
 
 ## 6. Gate (common)
 
@@ -1137,7 +1271,7 @@ mappings).
 
 | Item | Size | Source |
 | --- | ---: | --- |
-| ACB, `calloc`'d per spawn (at two spawn sites); 0–215 runtime, 216 supervision block pointer, 224 started, 232 reason tag, 240 active call, 248–264 FFI arena, 272–391 stack module, 392 holders, 400 parked exit notice, 408 identity, 416/424 spawner record, 432 calling convention, 440–472 carrier fields (item N stage 1, `apple_silicon_mac` only: carrier, status, run-queue link, parked SP, spawn waiter) (item I, 2026-10-09: 392 B, 512 before; 448 B since the identity and holder words of 2026-10-12; 480 B on the Mac since 2026-10-19) | 480 B (Mac); 448 B (Linux) | `prims_actors_runtime_asm.silica` `mov w1, #480`; `mov esi, 448` on x86-64 |
+| ACB, `calloc`'d per spawn (at two spawn sites); 0–215 runtime, 216 supervision block pointer, 224 started, 232 reason tag, 240 active call, 248–264 FFI arena, 272–391 stack module, 392 holders, 400 parked exit notice, 408 identity, 416/424 spawner record, 432 calling convention, 440–480 carrier fields (item N stage 1, `apple_silicon_mac` only: carrier, status, run-queue link, parked SP, spawn waiter, wait list), 496/504 the thread record (item N stage 2: an actor thread's current actor and 0 = not a carrier's thread) (item I, 2026-10-09: 392 B, 512 before; 448 B since the identity and holder words of 2026-10-12; 496 B on the Mac since 2026-10-19 (stage 1 + the restart protocol), 512 B since stage 2) | 512 B (Mac); 448 B (Linux) | `prims_actors_runtime_asm.silica` `mov w1, #512`; `mov esi, 448` on x86-64 |
 | Supervision block, `calloc`'d for a supervisor (spawn with a trampoline) or on the first exit notice an actor receives: ingress front 0, rear 8, depth 16, child-table head 24, len 32, sync_failure_reported 40, trampoline 48, strategy 56, allowed 64, time frame 72, restarts 80, window 88, children counted in a replacement wait 96, tearing down 104, references 112; freed by its last reference (`sb_unref`) | 120 B | `silica_rt_sb_require` |
 | Identity table: one entry per actor that has not finished ending (identity → ACB), open addressing, plus the spawner records | not measured | `actor_rt_identity_chunk`, `prims_actors_runtime_asm.silica` |
 | ACB stack-module fields: base 272, reserve 280, committed 288, high water 296, next chunk 304, algorithm 312, retained 320, 32-entry usage ring 328, ring index 336, last message time 344, alt stack 352, policy 360, saved SP 368, lowered 376, exit reason 384 | within the 448 B | `prims_actors_stack_asm.silica` header |
@@ -1238,7 +1372,7 @@ Checked from the hosted runtime source on 2026-10-07 and again on 2026-10-16 (si
 | K | done | `cast_exit` / `wait_for_exit` in the hosted runtimes; trial-verified 2026-10-08 (§5 K) |
 | L | done | `compiler/src/main.silica` (§5 L) |
 | M | done | `trials/lib_trial_support`, `programmer_tools/trial_shape_m` (§5 M) |
-| N | stage 1 built 2026-10-19, `apple_silicon_mac` only, gated off by default (`SILICA_CARRIERS=1`) | one carrier thread for plain workers; supervisors, dangerous and registry actors keep threads; §5 N "Stage 1 status" |
+| N | stage 2 built 2026-10-19, `apple_silicon_mac` only, gated off by default (`SILICA_CARRIERS=1`; `SILICA_CARRIER_COUNT=<n>` overrides the core count) | one carrier thread per logical core for plain workers, bound at spawn (`core mod N`, else in turn), per-carrier idle sweep; supervisors, dangerous and registry actors keep threads; §5 N "Stage 2 status" |
 | J | done 2026-10-09 | per-image `silica_registry_slots` (one per atom) sizes the three registries and the keyed-form discriminator; duplicates refused per §20.3.1; names removed at teardown (§5 J) |
 
 ## 18. Gate (hosted)
