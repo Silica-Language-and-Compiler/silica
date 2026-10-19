@@ -835,7 +835,55 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
     - **Unverified:** `supervisors_host_defects_addition` and `actor_registration_addition` under both
       gates; every big suite at count 4; `actor_stacks_addition` with the gate off after stage 2; the
       `:dangerous` row flavour; a carrier actor spawning a supervisor; the compiler compiling itself on
-      N carriers (risk R3.3's order); any Linux target.
+      N carriers (risk R3.3's order); any Linux target. **The compiler has not run on carriers at all
+      yet** (found 2026-10-19, below): `compiler/build/apple_silicon_mac/silica-compiler` is a gen1
+      built by the installed `binaries/silica-compiler` (999945), so the runtime linked into it is the
+      installed compiler's, with no carrier code (`nm` finds no `silica_rt_carrier*` symbol in either
+      binary). Exporting `SILICA_CARRIERS` to the compiler process in the suite runs above changed
+      nothing in it; every "compiler's own actors on carriers" claim in the stage 1 and 2 status is
+      void until a gen2 (the branch compiler compiling itself) exists and runs the suites.
+    - *The `train_actors_twoactors_0012` fault (2026-10-19, later): not a carrier defect.* A
+      verification run of `actors_addition` with the gate exported to the compiler aborted once with
+      exit 70 in `constraint_core_narrow_slot_backward+0x1e0`, `addr` outside the actor's reservation.
+      Reproduced in a scratch copy of the suite (the batch's first pass, which parses all 382 units,
+      is the process that faults, always at the 321st unit): fresh first passes fail 8/25 with the gate
+      off, 8/25, 7/25, 6/25 and 4/25 at counts 1, 2, 4 and 8 (noise: the binary has no carrier code),
+      and 8/25 with the installed 999945 compiler, so the defect predates the branch. The faulting
+      instruction is `LDR X3, [X1, #24]` in the sret epilogue's heap promote
+      (`emitter_core@sret_tuple_epilogue_copy`): a function returning a record it was given as a
+      parameter copied `sret_aggregate_bytes` = 32 bytes (the 16-byte-rounded shell of the two-field
+      `{ token, possible_roles }` slot record) out of the value in X0, while the value was a 24-byte
+      region box made by `cons_slot`'s list cons (`emit_list_head_box`, `MOV X0, #24`). A `mmap`
+      interposer (`DYLD_INSERT_LIBRARIES`, scratchpad only) showed the fault address equal to the end
+      of the actor's 64 MB arena block (`0x15fe04000 + 0x4000000`): the box was that block's last 24
+      bytes, the list handle after it had opened the next block, and the next block had not been placed
+      adjacently, so the rounding word was on an unmapped page. In passing runs the next block is
+      adjacent and the over-read reads its header harmlessly; the rate is the kernel's placement, not
+      a race (under lldb, which perturbs the layout, 0 faults in 40 runs). Every record with an even
+      field count was over-read by one word at every sret return of a value that was a box (a list
+      head, a nested-record field copy, a parameter returned as is). Fix (all three emitters, same
+      text): `prims_tuple@sret_aggregate_copy_bytes` (the value's flat size; tuples unchanged) is what
+      both epilogue branches copy, through `term_aggregate_helpers@aggregate_return_heap_promote_x0_copy`
+      (allocates the shell, copies the flat size); the caller's home and the promoted block keep their
+      rounded size. Verified on the Mac: the build-dir compiler relinked with a `constraint_core.o`
+      emitted by the fixed compiler (the lexer units with it) passed 25/25 fresh first passes with the
+      gate off and 25/25 at count 4; the emitted `ident`/`narrow_slot_backward` epilogues copy three
+      words. In `actors_addition` the fix changes two trials' `.sams` only
+      (`record_float32_fields_state_reply`, `zero_heap_growth_record_call_per_message`: the fourth
+      word's copy pair removed in both epilogue branches), so those two `.ascomp` move once their
+      `.sout` matches. Trial `carriers_addition/workers_two_field_record_return_at_arena_block_end`
+      (sorts last; no atom renumbered): worker a counts its own arena through `heap_used()` (exact for
+      region allocations on hosted targets), fills its first block with 32-byte promoted records until a
+      prepended two-field record's box is the block's last 24 bytes, and worker b's block, mapped right
+      after a's first block and unmapped when b is removed (polled through calls to a relay, so a shared
+      carrier runs b's exit), leaves the page after a's block unmapped; `ident(state.head)` then faulted
+      10/10 with the unfixed compiler under the gate off and counts 1, 2 and 4, and answers 3 with the
+      fixed one (40/40; `carriers_addition` 38/38 at counts 1, 2, 4 and with the gate off, its
+      `.ascomp` recorded from a run whose `.sout` matched the hand-written `.scout`). The Linux
+      emitters carry the identical edit, compiled only as a front-end check with the Mac compiler; the
+      installed compilers (999945 and the Linux fixed points) still have the over-read, and the
+      compiler will keep faulting this way one run in three on the suite's first pass until a compiler
+      built by the fixed compiler is installed.
     - **Not done in stage 2:** exclusive pinning, `migrate_actor`, `set_actor_priority` and
       `set_scheduler_policy` on carriers (stages 3 and 4). Until then `pin_actor_to_core`,
       `pin_actor_to_efficiency_core`, `pin_actor_to_performance_core`, `unpin_actor`,

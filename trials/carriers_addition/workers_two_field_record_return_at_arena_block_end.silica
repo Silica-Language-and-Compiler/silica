@@ -1,0 +1,202 @@
+// A function that returns a two-field record it was given as a parameter, when that record is a
+// 24-byte region box ending exactly at the end of the actor's 64 MB arena block. The sret epilogue
+// used to copy the record's 16-byte-rounded shell (32 bytes) out of the value in X0, reading one word
+// past the box; the word is the first byte of the next page, which is unmapped unless another arena
+// block happened to be placed right after this one (the compiler itself faulted this way once in
+// three runs, in constraint_core narrow_slot_backward, while parsing trials/actors_addition). The
+// epilogue now copies the value's flat size (emitter prims_tuple sret_aggregate_copy_bytes).
+//
+// The shape makes the next page unmapped on purpose. Three workers: a, whose block is the one filled;
+// b, whose arena block is mapped right after a's first block (mmap places the next 64 MB mapping at
+// the lowest hole, which is the space after a's block) and is unmapped again when b is removed; c, a
+// relay the driver polls through. In one message a: reads heap_used() before its first allocation
+// (so its block starts 16 bytes before the bytes it counts from there); allocates once (its first
+// block is mapped); calls b, which allocates once too (b's block, right after a's) and replies the
+// bytes it allocated, which a subtracts; fills its block with 32-byte records (mk, a let-bound
+// record promoted to the region) until exactly 32 + 24 bytes remain; builds one more record (32,
+// leaving 24) and prepends it to an empty list: the list head is boxed first, in the last 24 bytes
+// of the block, and the list handle that follows does not fit, so it opens a's second block (which
+// lands after b's). Every count is through heap_used(), which is exact on hosted targets for
+// region allocations and is read while nothing else allocates (the driver is parked in its call).
+// The driver then removes b and polls heap_used() through calls to c until b's block is given back
+// (an actor's blocks are unmapped in its exit path, which a call lets a shared carrier run), and
+// asks a to return its boxed record through ident/1: before the fix the copy of the rounding word
+// read the unmapped page after a's first block and a faulted (exit 70); now a answers the sum of the
+// record's fields.
+//
+// Expected output:
+//   9        a's first block was placed and filled as counted (the probe found the box at its end)
+//   3        ident returned the boxed record { 1, 2 }: 1 + 2
+//   0        exit status
+// The same with SILICA_CARRIERS=0 and at every carrier count: the block layout is the same on a
+// thread actor, and polling through c never busy-waits on a carrier that still has to run b's exit.
+// Printed checks avoid the digits 1-4 and 8 (see compare_scout_normalized.sh): 9 holds, 6 does not.
+
+use trial_support_int64;
+
+fn mk(a: int64) -> { a: int64, b: int64 } {
+    { a: a, b: a + 1 }
+}
+
+fn ident(r: { a: int64, b: int64 }) -> { a: int64, b: int64 } {
+    r
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+fn cons_int(x: int64, acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[int64, mem(normal)] <- prepend[int64, mem(normal)](x, acc)
+    produces
+        pure r
+    end
+}
+
+fn nil_int() -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[int64, mem(normal)] <- empty[int64, mem(normal)]()
+    produces
+        pure r
+    end
+}
+
+fn nil_rec() -> List[{ a: int64, b: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[{ a: int64, b: int64 }, mem(normal)] <- empty[{ a: int64, b: int64 }, mem(normal)]()
+    produces
+        pure r
+    end
+}
+
+fn cons_rec(x: { a: int64, b: int64 }, acc: List[{ a: int64, b: int64 }, mem(normal)]) -> List[{ a: int64, b: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[{ a: int64, b: int64 }, mem(normal)] <- prepend[{ a: int64, b: int64 }, mem(normal)](x, acc)
+    produces
+        pure r
+    end
+}
+
+// Bytes a has counted since h0, less what b counted in its own block.
+fn used(h0: int64, b_bytes: int64) -> int64 {
+    sequence proc[mem(normal)]
+        h: int64 <- heap_used()
+    produces
+        pure h - h0 - b_bytes
+    end
+}
+
+// Allocates 32-byte records (each let-bound mk result is promoted to the region) until used equals
+// target; the records are kept in a list so nothing is released. Returns the record count.
+fn fill(h0: int64, b_bytes: int64, target: int64, acc: List[{ a: int64, b: int64 }, mem(normal)], n: int64) -> int64 {
+    case used(h0, b_bytes) >= target of {
+        true -> n;
+        false -> {
+            r: { a: int64, b: int64 } <- mk(n);
+            fill(h0, b_bytes, target, keep(r, acc), n + 1)
+        }
+    }
+}
+
+// Keeps r reachable without allocating: the list is only rebuilt when it is empty, once.
+fn keep(r: { a: int64, b: int64 }, acc: List[{ a: int64, b: int64 }, mem(normal)]) -> List[{ a: int64, b: int64 }, mem(normal)] {
+    acc
+}
+
+// b: one allocation (its block is mapped by it) and the bytes it counted as its reply.
+fn beh_b(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[mem(normal)]
+        h0: int64 <- heap_used();
+        l: List[int64, mem(normal)] <- cons_int(msg, nil_int());
+        h1: int64 <- heap_used()
+    produces
+        pure (:reply, h1 - h0, h1 - h0 + l.head - msg)
+    end
+}
+
+// c: a relay for the driver's polls; answers heap_used().
+fn beh_c(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[mem(normal)]
+        h: int64 <- heap_used()
+    produces
+        pure (:reply, h, state)
+    end
+}
+
+// a: message 1 is the setup described above (the state becomes the list whose head is the box);
+// message 2 returns the box through ident.
+fn beh_a(msg: (int64, actor_ref), state: List[{ a: int64, b: int64 }, mem(normal)]) -> (:reply, int64, List[{ a: int64, b: int64 }, mem(normal)]) {
+    (which: int64, b: actor_ref) <- msg;
+    case which == 1 of {
+        true -> {
+            sequence proc[mem(normal), concurrency]
+                h0: int64 <- heap_used();
+                first: List[int64, mem(normal)] <- cons_int(1, nil_int());
+                b_bytes: int64 <- call(b, 1 impl ActorMessage {});
+                // 64 MB block: 16 bytes of header, then what is counted from h0. The last record
+                // (32) and the box (24) take the final 56 bytes.
+                filled: int64 <- fill(h0, b_bytes, 67108864 - 16 - 56, nil_rec(), 1);
+                last: { a: int64, b: int64 } <- mk(1);
+                at_box: int64 <- used(h0, b_bytes);
+                boxed: List[{ a: int64, b: int64 }, mem(normal)] <- cons_rec(last, nil_rec());
+                placed: int64 <- case at_box == 67108864 - 16 - 24 and filled > 0 and first.head == 1 of {
+                    true -> 9;
+                    false -> 6
+                }
+            produces
+                pure (:reply, placed, boxed)
+            end
+        };
+        false -> {
+            got: { a: int64, b: int64 } <- ident(state.head);
+            (:reply, got.a + got.b, state)
+        }
+    }
+}
+
+// True once heap_used() has fallen by more than b's block (its 64 MB go back when its exit path
+// unmaps them); false after `tries` polls, each a call to c (a park, so a carrier shared with b
+// runs b's exit).
+fn released(before: int64, c: actor_ref, tries: int64) -> boolean {
+    sequence proc[concurrency]
+        h: int64 <- call(c, 1 impl ActorMessage {});
+        gone: boolean <- before - h > 60000000;
+        r: boolean <- case gone or tries <= 0 of {
+            true -> gone;
+            false -> released(before, c, tries - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 {
+            sequence proc[concurrency, device_io, mem(normal)]
+                a: actor_ref <- spawn(nil_rec(), beh_a, stack_policy(0, :keep_last_message));
+                b: actor_ref <- spawn(0, beh_b, stack_policy(0, :keep_last_message));
+                c: actor_ref <- spawn(0, beh_c, stack_policy(0, :keep_last_message));
+                placed: int64 <- call(a, (1, b) impl ActorMessage {});
+                print_int64(placed);
+                println("");
+                before: int64 <- heap_used();
+                _: atom <- remove_actor(b);
+                _: boolean <- released(before, c, 100000);
+                sum: int64 <- call(a, (2, c) impl ActorMessage {});
+                print_int64(sum);
+                println("")
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
