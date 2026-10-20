@@ -48,12 +48,21 @@
 // only its own notice, and only when it is first (_silica_rt_supervisor_drain_own_exit), and never
 // waits in its exit path. Every other drainer (kill_abnormal, the call_supervisor operations, a
 // supervisor replying to a call from its standard mailbox) goes through
-// _silica_rt_supervisor_drain_ingress / _drain_hold: a row child of the supervisor never takes the
-// token (the cascade it would run could stop the child itself) but waits until the token is free and
-// the ingress empty; every stop goes through _silica_rt_actor_stop, which also ends a wait the
-// stopped actor is parked or spinning in (a killer stopped by the cascade of the death it caused
-// returns from kill_abnormal at once). Exactly one cascade holder at a time, with parks where the
-// thread-per-actor runtime blocked.
+// _silica_rt_supervisor_drain_ingress / _drain_hold: a row child of the supervisor never drains
+// (the cascade a pending notice would run could stop the child itself) but waits until the token
+// is free and the ingress empty (_drain_hold then takes the token with nothing to drain, acquire
+// mode 2); every stop goes through _silica_rt_actor_stop, which also ends a wait the stopped actor
+// is parked or spinning in (a killer stopped by the cascade of the death it caused returns from
+// kill_abnormal at once). Exactly one cascade holder at a time, with parks where the
+// thread-per-actor runtime blocked. A row child asking its own supervisor to stop or restart its
+// own row (terminate_child / remove_child / restart_child naming its id, or restart_child of any
+// existing id under :one_for_all, whose group it is in) would wait for an exit only it can
+// complete: the operation answers -2 at once and the lowering (terms_actor_lowering,
+// _silica_rt_sup_op_tag / _error / _child) replies (tag :error, error :language_error) with
+// nothing stopped; the same request from main, a sibling, an unrelated actor or the supervisor
+// itself is unchanged. No drain installs the supervisor as the thread's current actor
+// (supervisor_handle_notice): the drainer stays what a failure, a report or a park is attributed
+// to, and the supervisor is passed explicitly wherever a row walk or a respawn needs it.
 
 use atom_table;
 use prims_list;
@@ -605,6 +614,18 @@ fn child_table_rt_asm_chunk_2(danger_idx: int64) -> string {
 	.p2align	2
 _silica_rt_supervisor_start_child:
 	.cfi_startproc
+; The builtin start_child(spec): the supervisor is the thread's current actor (the supervisor's own
+; init or behaviour). X1 = 0 asks the body to read it.
+	mov	x1, xzr
+	b	_silica_rt_supervisor_start_child_in
+	.cfi_endproc
+	.globl	_silica_rt_supervisor_start_child_in
+	.p2align	2
+_silica_rt_supervisor_start_child_in:
+	.cfi_startproc
+; X0 = child_spec, X1 = the supervisor (0 = the thread's current actor). supervisor_add_child
+; names it, so that a call_supervisor :add_child from any actor leaves that actor the current
+; one (supervisor_handle_notice).
 ; Phase E e4f: extend the prologue to also save x27 (row_ptr) and x28 (appended flag) so we can
 ; locate / allocate the table row first, then call spawn_linked with X3 = row_ptr (callee-saved).
 	stp	x28, x27, [sp, #-96]!
@@ -626,6 +647,7 @@ _silica_rt_supervisor_start_child:
 	.cfi_offset w27, -88
 	.cfi_offset w28, -80
 	mov	x20, x0
+	mov	x19, x1
 	ldr	x21, [x20, #8]
 	ldr	x22, [x20, #16]
 	ldr	x23, [x20, #24]
@@ -636,8 +658,10 @@ _silica_rt_supervisor_start_child:
 	bl	_silica_rt_registry_name_held
 	cbnz	x0, Lsc_id_taken
 Lsc_tls_prep:
+	cbnz	x19, Lsc_have_sup
 	bl	_silica_rt_tls_current_actor_get
 	mov	x19, x0
+Lsc_have_sup:
 ; Phase E e4f + Option B: tombstone scan / append on singly-linked row nodes (+80).
 	mov	x0, x19
 	bl	_silica_rt_sb_require
@@ -718,9 +742,16 @@ Lsc_ret:
 fn child_table_rt_asm_chunk_2b() -> string {
     "	.p2align	2
 ; _silica_rt_supervisor_handle_notice(X0 = supervisor, X1 = its ingress node, X2 = the exit notice
-; payload): maybe_restart with the supervisor installed as the thread's current actor (the row
-; walks and spawns read it), the previous one restored after; then the payload (and its hold on
-; the ended child) and the node go.
+; payload): maybe_restart on the draining actor's stack, then the payload (and its hold on the
+; ended child) and the node go. The thread's current actor stays the drainer (or none, for main):
+; the supervisor is passed to maybe_restart (X1) and from there to every row walk and respawn
+; (respawn_row, spawn_child_row_by_flavor, actor_spawn_linked_row X5, which also names the
+; supervisor's stack policy for the child), so nothing attributed to the current actor during
+; the drain (a failure of the drainer, a fault's report, a park decision, self()) names the
+; supervisor. Until 2026-10-20 the supervisor was installed as the current actor here for the
+; duration (and in add_child), which made a respawn's wait for a child supervisor's start spin
+; instead of park (spawn_wait_started read the current actor) and would have failed the
+; supervisor, on the drainer's stack, for a failure of the drainer.
 _silica_rt_supervisor_handle_notice:
 	.cfi_startproc
 	stp	x24, x23, [sp, #-48]!
@@ -730,16 +761,10 @@ _silica_rt_supervisor_handle_notice:
 	mov	x24, x0
 	mov	x22, x1
 	mov	x21, x2
-	bl	_silica_rt_tls_current_actor_get
-	mov	x23, x0
-	mov	x0, x24
-	bl	_silica_rt_tls_actor_set
 	ldr	x0, [x21]
 	mov	x1, x24
 	ldr	x2, [x21, #8]
 	bl	_silica_rt_supervisor_maybe_restart
-	mov	x0, x23
-	bl	_silica_rt_tls_actor_set
 	mov	x0, x21
 	bl	_silica_rt_exit_payload_free
 	mov	x0, x22
@@ -841,7 +866,10 @@ Lsdi_ret:
 ; when the caller holds the restart token after draining (the operations that stop or respawn
 ; rows, terminate_child and restart_child, hold it across their work and release it after), 0 when
 ; the supervisor has ended or has no block, or the caller was ended while it waited (nothing
-; drained, nothing held).
+; drained, nothing held). A row child of this supervisor never drains (the rule of
+; drain_ingress: a pending notice's cascade could stop the child itself, and it would then wait
+; for its own exit): it takes the token only once the ingress is empty (acquire mode 2) and holds
+; it with nothing to drain.
 _silica_rt_supervisor_drain_hold:
 	.cfi_startproc
 	stp	x29, x30, [sp, #-32]!
@@ -849,6 +877,15 @@ _silica_rt_supervisor_drain_hold:
 	str	x19, [sp, #16]
 	mov	x19, x0
 	mov	x2, #1
+	cbz	x1, Lsdh_acquire
+	ldr	x8, [x1, #192]
+	cmp	x8, x19
+	b.ne	Lsdh_acquire
+	ldr	x8, [x1, #208]
+	cmp	x8, #4096
+	b.lo	Lsdh_acquire
+	mov	x2, #2
+Lsdh_acquire:
 	bl	_silica_rt_sup_restart_acquire
 	cmp	x0, #1
 	b.ne	Lsdh_no
@@ -954,14 +991,11 @@ _silica_rt_supervisor_add_child_acb:
 	ldr	x0, [x21, #8]
 	bl	_silica_rt_registry_name_held
 	cbnz	x0, Ladd_child_duplicate
-	mov	x19, x20
-	bl	_silica_rt_tls_actor_set_from_x19
+; The supervisor is named to start_child (X1) and stays off the thread's current actor, as in
+; supervisor_handle_notice: the asking actor remains what a failure or a park is attributed to.
 	mov	x0, x21
-	bl	_silica_rt_supervisor_start_child
-	mov	x20, x0
-	mov	x19, x22
-	bl	_silica_rt_tls_actor_set_from_x19
-	mov	x0, x20
+	mov	x1, x20
+	bl	_silica_rt_supervisor_start_child_in
 	ldp	x29, x30, [sp, #32]
 	ldp	x20, x19, [sp, #16]
 	ldp	x22, x21, [sp], #48
@@ -1465,7 +1499,13 @@ fn child_table_rt_asm_chunk_6(ofa_idx: int64) -> string {
             true -> "";
             false -> concat(concat("	ldr	x8, [x19, #216]\n	ldr	x8, [x8, #56]\n	cmp	x8, #", atom_table@int64_to_decimal_string(ofa_idx)), "\n	b.eq	Lsrestart_ofa\n")
         };
-        concat(concat("	.globl	_silica_rt_supervisor_count_children
+        // The self check's :one_for_all arm (restart_child_acb): a row child asking for the group it
+        // is in, by any id a row bears. A program that never spells :one_for_all has no such group.
+        ofa_self_branch: string <- case ofa_idx < 0 of {
+            true -> "";
+            false -> concat(concat("	ldr	x8, [x19, #216]\n	ldr	x8, [x8, #56]\n	cmp	x8, #", atom_table@int64_to_decimal_string(ofa_idx)), "\n	b.ne	Lsrestart_not_self\n	ldr	x9, [x19, #216]\n	ldr	x9, [x9, #24]\nLsrestart_self_find:\n	cbz	x9, Lsrestart_not_self\n	ldr	x8, [x9, #8]\n	cmp	x8, x20\n	b.eq	Lsrestart_self\n	ldr	x9, [x9, #80]\n	b	Lsrestart_self_find\n")
+        };
+        concat(concat(concat(concat("	.globl	_silica_rt_supervisor_count_children
 	.p2align	2
 _silica_rt_supervisor_count_children:
 ; X0 = the supervisor's reference: resolved and held for the body (_silica_rt_sup_ref_call; an ended
@@ -1887,6 +1927,24 @@ _silica_rt_supervisor_terminate_child_acb:
 ; supervisor has ended, has no block, or this caller was ended while it waited: nothing to do.
 	bl	_silica_rt_tls_current_actor_get
 	mov	x1, x0
+; A row child of this supervisor naming its own row (its row, ACB #208, still holds it and bears
+; the id) would stop itself and wait for an exit only it can complete: answered at once with -2,
+; which the lowering turns into the error reply (tag :error, error :language_error), and nothing
+; is stopped. Anything else (main, a sibling, an unrelated actor, the supervisor) goes on.
+	cbz	x0, Lsterm_not_self
+	ldr	x8, [x0, #192]
+	cmp	x8, x19
+	b.ne	Lsterm_not_self
+	ldr	x9, [x0, #208]
+	cmp	x9, #4096
+	b.lo	Lsterm_not_self
+	ldr	x8, [x9]
+	cmp	x8, x0
+	b.ne	Lsterm_not_self
+	ldr	x8, [x9, #8]
+	cmp	x8, x20
+	b.eq	Lsterm_self
+Lsterm_not_self:
 	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_hold
 	cbz	x0, Lsterm_done
@@ -1927,6 +1985,10 @@ Lsterm_release:
 	bl	_silica_rt_sup_restart_release
 Lsterm_done:
 	mov	x0, #0
+	b	Lsterm_ret
+Lsterm_self:
+	mov	x0, #-2
+Lsterm_ret:
 	ldp	x29, x30, [sp, #48]
 	ldp	x20, x19, [sp, #32]
 	ldp	x22, x21, [sp, #16]
@@ -1971,11 +2033,32 @@ _silica_rt_supervisor_restart_child_acb:
 	add	x29, sp, #64
 	mov	x19, x0
 	mov	x20, x1
+	mov	x21, xzr
 ; The restart token is held across the stops and the respawns (no cascade runs meanwhile; X21 = 1
 ; while held); 0 = the supervisor has ended, has no block, or this caller was ended while it
 ; waited: no child.
 	bl	_silica_rt_tls_current_actor_get
 	mov	x1, x0
+; A row child of this supervisor (its row, ACB #208, still holds it) whose restart would stop its
+; own row, its own id named or, under :one_for_all, any row's id that exists (the group it is in
+; is stopped and respawned), would wait for an exit only it can complete: answered at once with
+; -2, the error reply (tag :error, error :language_error), and nothing is stopped. An id no row
+; bears keeps its answer (-1, no child); anything else (main, a sibling, an unrelated actor, the
+; supervisor) goes on.
+	cbz	x0, Lsrestart_not_self
+	ldr	x8, [x0, #192]
+	cmp	x8, x19
+	b.ne	Lsrestart_not_self
+	ldr	x9, [x0, #208]
+	cmp	x9, #4096
+	b.lo	Lsrestart_not_self
+	ldr	x8, [x9]
+	cmp	x8, x0
+	b.ne	Lsrestart_not_self
+	ldr	x8, [x9, #8]
+	cmp	x8, x20
+	b.eq	Lsrestart_self
+", ofa_self_branch), "Lsrestart_not_self:
 	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_hold
 	mov	x21, x0
@@ -1989,7 +2072,7 @@ Lsrestart_find:
 	ldr	x8, [x23, #8]
 	cmp	x8, x20
 	b.ne	Lsrestart_next
-", ofa_branch), "	ldr	x22, [x23]
+"), ofa_branch), "	ldr	x22, [x23]
 	cbz	x22, Lsrestart_spawn
 	str	xzr, [x23]
 	ldr	x24, [x23, #112]
@@ -2070,6 +2153,9 @@ Lsrestart_next:
 	b	Lsrestart_find
 Lsrestart_none:
 	mov	x0, #-1
+	b	Lsrestart_done
+Lsrestart_self:
+	mov	x0, #-2
 Lsrestart_done:
 	mov	x27, x0
 	cbz	x21, Lsrestart_ret

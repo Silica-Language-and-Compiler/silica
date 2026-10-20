@@ -1,0 +1,77 @@
+// Two Phase B trial-hook nodes in one ingress (prims_actors_runtime_asm.silica LBB1_wait;
+// carriers_addition/workers_zzzgap_ingress_hook_takes_no_restart_token is the same check driven
+// from a carrier actor): a hooker actor, given a plain counter as its message, puts two hook nodes
+// (supervision_ingress_enqueue: an inline int64 the target's behaviour runs on) in the counter's
+// ingress, then calls the counter. The hook nodes are served before standard mail. Before the fix
+// the first hook node took the supervision block's restart token with it at LBB1_wait and neither
+// result path released it (both clear w22), so the counter skipped its own ingress for the rest of
+// its life: the second hook was never run and the call answered 5. Now a hook node takes no token:
+// 5, then 7, then the call answers 12. The hooks are behaviour-only builtins (E2091), so main asks
+// the hooker.
+//
+// Expected output: 12, exit status 0 (5 before the fix).
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn hooker(msg: actor_ref, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        _: atom <- supervision_ingress_enqueue(msg, 5);
+        _: atom <- supervision_ingress_enqueue(msg, 7);
+        total: int64 <- call(msg, 0 impl ActorMessage {})
+    produces
+        pure (:reply, total, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        w: actor_ref <- spawn(0, counter, stack_policy(0, :keep_last_message));
+        h: actor_ref <- spawn(0, hooker, stack_policy(0, :keep_last_message));
+        total: int64 <- call(h, w impl ActorMessage {});
+        print_int64(total);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}
