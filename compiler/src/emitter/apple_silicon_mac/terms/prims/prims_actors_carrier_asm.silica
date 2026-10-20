@@ -338,6 +338,15 @@ Lcad_have_index:
 	add	x20, x21, x9, lsl #8
 	mov	x0, x20
 	bl	_silica_rt_carrier_ensure_started
+	cbz	x0, Lcad_bound
+; The host refused this carrier's thread (dangerous actors may hold every thread it allows, item N
+; #5): the actor goes to a carrier that runs instead of its `core mod N` or in-turn one. None running
+; (the first adoption only) is the runtime abort: the carrier thread could not be created.
+	mov	x0, x21
+	bl	_silica_rt_carrier_started_any
+	cbz	x0, Lcad_no_carrier
+	mov	x20, x0
+Lcad_bound:
 	str	x20, [x19, #440]
 	mov	x9, #1
 	str	x9, [x19, #448]
@@ -364,6 +373,11 @@ Lcad_ready:
 	bl	_os_unfair_lock_unlock
 	mov	x0, #1
 	b	Lcad_ret
+Lcad_no_carrier:
+	adrp	x0, Lrta_r_carrier_thread@PAGE
+	add	x0, x0, Lrta_r_carrier_thread@PAGEOFF
+	bl	_silica_rt_abort_with
+	b	Lcad_no_carrier
 Lcad_no:
 	mov	x0, xzr
 Lcad_ret:
@@ -436,11 +450,16 @@ Lcen_failed:
 	.globl	_silica_rt_carrier_ensure_started
 	.p2align	2
 _silica_rt_carrier_ensure_started:
-; X0 = carrier block. Creates its thread the first time.
+; X0 = carrier block. Creates its thread the first time. -> X0 = 0 when the carrier runs (it did
+; already, or its thread was made now), 1 when the host refused the thread (item N #5: dangerous
+; actors, each on a thread of its own, may hold every thread the host allows): the carrier stays
+; without one, and the caller places the actor on a carrier that runs (_silica_rt_carrier_adopt)
+; or answers :migration_blocked (_silica_rt_carrier_migrate).
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
-	str	x19, [sp, #16]
+	stp	x19, x20, [sp, #16]
 	mov	x19, x0
+	mov	x20, xzr
 	add	x9, x19, #80
 	ldar	x8, [x9]
 	cbnz	x8, Lces_ret
@@ -464,14 +483,34 @@ Lces_unlock:
 	mov	x0, x19
 	bl	_os_unfair_lock_unlock
 Lces_ret:
-	ldr	x19, [sp, #16]
+	mov	x0, x20
+	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
 	ret
 Lces_failed:
-	adrp	x0, Lrta_r_carrier_thread@PAGE
-	add	x0, x0, Lrta_r_carrier_thread@PAGEOFF
-	bl	_silica_rt_abort_with
-	b	Lces_failed
+	mov	x20, #1
+	b	Lces_unlock
+	.globl	_silica_rt_carrier_started_any
+	.p2align	2
+_silica_rt_carrier_started_any:
+; X0 = the carrier table -> X0 = the first carrier whose thread runs (+80), or 0 when none does
+; (only before the first adoption). Leaf; X9-X11.
+	adrp	x9, _silica_rt_carrier_count@PAGE
+	add	x9, x9, _silica_rt_carrier_count@PAGEOFF
+	ldr	x9, [x9]
+	add	x10, x0, x9, lsl #8
+Lcsa_loop:
+	cmp	x0, x10
+	b.hs	Lcsa_none
+	add	x11, x0, #80
+	ldar	x11, [x11]
+	cbnz	x11, Lcsa_ret
+	add	x0, x0, #256
+	b	Lcsa_loop
+Lcsa_none:
+	mov	x0, xzr
+Lcsa_ret:
+	ret
 	.globl	_silica_rt_tls_record_set
 	.p2align	2
 _silica_rt_tls_record_set:
@@ -1591,7 +1630,8 @@ _silica_rt_carrier_migrate:
 ; where it parked, inside the same dispatch. At most one carrier lock is held at any point, never
 ; with the target's and the old carrier's locks together, so the lock order of this module's
 ; header holds. The mailbox is the actor's own and moves with it; message order is unchanged.
-; The target's thread is created first when it has none yet (nothing held).
+; The target's thread is created first when it has none yet (nothing held); 3 (:migration_blocked)
+; when the host refuses it (item N #5).
 	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -1600,6 +1640,7 @@ _silica_rt_carrier_migrate:
 	mov	x20, x1
 	mov	x0, x20
 	bl	_silica_rt_carrier_ensure_started
+	cbnz	x0, Lcmg_blocked
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 	ldr	w9, [x19, #152]
@@ -1631,6 +1672,13 @@ Lcmg_unlock:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
 	mov	x0, x21
+	ldr	x21, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #48
+	ret
+Lcmg_blocked:
+; The target has no thread and the host refused one (nothing held yet): 3, :migration_blocked.
+	mov	x0, #3
 	ldr	x21, [sp, #32]
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #48

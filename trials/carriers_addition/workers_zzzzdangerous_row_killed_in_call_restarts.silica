@@ -1,0 +1,113 @@
+// A :dangerous row child ended while it is in a call (actor_memory_budget_plan.md item N): the
+// row child keeps a thread of its own, so a call from it blocks that thread (a carrier actor
+// parks); the stop by its sibling's kill_abnormal must wake that thread, and the exit path runs
+// on it. As worker_kills_sibling_parked_in_call with the caller row :dangerous: the driver casts 5
+// to the dangerous caller (cast_dangerous_registered: a dangerous name), which calls the server;
+// the killer row kills the caller and then tells the server 1000; the driver polls the server for
+// the 1000 and then reads the row again: the supervisor replaced the caller.
+//
+//   cast_dangerous_registered to the caller   -> 9
+//   cast_registered to the killer             -> 9
+//   the server saw the killer's 1000          -> 9
+//   the caller's row holds a new child        -> 9
+//
+// Expected output: 9, 9, 9, 9, the killed caller's failure report (reason_tag 1, kill_abnormal),
+// done, exit status 0, compared as a multiset (the report goes through the FailureReporter).
+// Printed values avoid the digits 1-4 (folded by the comparer): 9 is a check that holds.
+
+use Supervisor;
+use trial_wait_int64;
+
+impl ZzzzDangerousRowKilledInCallSup for Supervisor;
+
+fn caller(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        r: int64 <- call_registered(:zzzzd3_server, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state + r)
+    end
+}
+
+fn killer(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: atom <- kill_abnormal(:dangerous_zzzzd3_caller);
+        _: int64 <- call_registered(:zzzzd3_server, 1000 impl ActorMessage {})
+    produces
+        pure (:no_reply, state + msg)
+    end
+}
+
+fn server(msg: int64, state: int64) -> (:reply, int64, int64) {
+    case msg == 0 of {
+        true -> (:reply, state, state);
+        false -> (:reply, msg + 50, state + msg)
+    }
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :dangerous_zzzzd3_caller, agent_type: :worker, initial_state: initial_state, behavior: caller, restart: :permanent, shutdown: 0, flavor: :dangerous },
+            { id: :zzzzd3_killer, agent_type: :worker, initial_state: initial_state, behavior: killer, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// Polls the server until the killer's 1000 has reached it (or the bound runs out).
+fn wait_for_kill(n: int64) -> int64 {
+    sequence proc[concurrency]
+        seen: int64 <- call_registered(:zzzzd3_server, 0 impl ActorMessage {});
+        r: int64 <- case seen >= 1000 or n == 0 of {
+            true -> seen;
+            false -> wait_for_kill(n - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- spawn_registered(0, server, :zzzzd3_server, stack_policy(0, :keep_last_message));
+        sup: supervisor_ref <- spawn_registered_supervisor(ZzzzDangerousRowKilledInCallSup, 0, :zzzzd3_sup, stack_policy(0, :keep_last_message));
+        before: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: :dangerous_zzzzd3_caller } impl SupervisorMessage {});
+        to_caller: boolean <- cast_dangerous_registered(:dangerous_zzzzd3_caller, 5 impl ActorMessage {});
+        to_killer: boolean <- cast_registered(:zzzzd3_killer, 1 impl ActorMessage {});
+        seen: int64 <- wait_for_kill(100000);
+        after: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: :dangerous_zzzzd3_caller } impl SupervisorMessage {});
+        print_int64(verdict(to_caller));
+        println("");
+        print_int64(verdict(to_killer));
+        println("");
+        print_int64(verdict(seen >= 1000));
+        println("");
+        print_int64(verdict(before.child_info.child != after.child_info.child));
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

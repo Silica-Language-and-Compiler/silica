@@ -56,7 +56,8 @@ APP_DIRS := \
 	$(APP_SUPERVISOR_DANGEROUS_FAULT_DIR) \
 	app_worker_second_message \
 	app_foreign_call_from_deep_stack \
-	app_process_fatal_paths
+	app_process_fatal_paths \
+	app_dangerous_spawn_thread_limit
 
 GUARDED_APP_DIRS := \
 	$(APP_GUARDED_ONCE_DIR) \

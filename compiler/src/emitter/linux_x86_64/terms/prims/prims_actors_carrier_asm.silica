@@ -333,6 +333,17 @@ Lcad_have_index:
 	mov	QWORD PTR [rbp - 16], rcx
 	mov	rdi, rcx
 	call	silica_rt_carrier_ensure_started
+	test	rdi, rdi
+	jz	Lcad_bound
+# The host refused this carrier's thread (dangerous actors may hold every thread it allows, item N
+# #5): the actor goes to a carrier that runs instead of its `core mod N` or in-turn one. None running
+# (the first adoption only) is the runtime abort: the carrier thread could not be created.
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_carrier_started_any
+	test	rdi, rdi
+	jz	Lcad_no_carrier
+	mov	QWORD PTR [rbp - 16], rdi
+Lcad_bound:
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	rcx, QWORD PTR [rbp - 16]
 	mov	QWORD PTR [rax + 440], rcx
@@ -362,6 +373,10 @@ Lcad_ready:
 	call	silica_rt_lock_unlock
 	mov	edi, 1
 	jmp	Lcad_ret
+Lcad_no_carrier:
+	lea	rdi, [rip + Lrta_r_carrier_thread]
+	call	silica_rt_abort_with
+	jmp	Lcad_no_carrier
 Lcad_no:
 	xor	edi, edi
 Lcad_ret:
@@ -428,11 +443,17 @@ Lcen_failed:
 	.globl	silica_rt_carrier_ensure_started
 	.p2align	4
 silica_rt_carrier_ensure_started:
-# rdi = carrier block. Creates its thread the first time. Frame: [rbp-8] carrier (x19).
+# rdi = carrier block. Creates its thread the first time. -> rdi = 0 when the carrier runs (it did
+# already, or its thread was made now), 1 when the host refused the thread (item N #5: dangerous
+# actors, each on a thread of its own, may hold every thread the host allows): the carrier stays
+# without one, and the caller places the actor on a carrier that runs (silica_rt_carrier_adopt)
+# or answers :migration_blocked (silica_rt_carrier_migrate). Frame: [rbp-8] carrier (x19),
+# [rbp-16] the result (x20).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 16
 	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], 0
 	cmp	QWORD PTR [rdi + 80], 0
 	jne	Lces_ret
 	call	silica_rt_lock_lock
@@ -455,12 +476,31 @@ Lces_unlock:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_lock_unlock
 Lces_ret:
+	mov	rdi, QWORD PTR [rbp - 16]
 	leave
 	ret
 Lces_failed:
-	lea	rdi, [rip + Lrta_r_carrier_thread]
-	call	silica_rt_abort_with
-	jmp	Lces_failed
+	mov	QWORD PTR [rbp - 16], 1
+	jmp	Lces_unlock
+	.globl	silica_rt_carrier_started_any
+	.p2align	4
+silica_rt_carrier_started_any:
+# rdi = the carrier table -> rdi = the first carrier whose thread runs (+80), or 0 when none does
+# (only before the first adoption). Leaf; r10.
+	mov	r10, QWORD PTR [rip + silica_rt_carrier_count]
+	shl	r10, 8
+	add	r10, rdi
+Lcsa_loop:
+	cmp	rdi, r10
+	jae	Lcsa_none
+	cmp	QWORD PTR [rdi + 80], 0
+	jne	Lcsa_ret
+	add	rdi, 256
+	jmp	Lcsa_loop
+Lcsa_none:
+	xor	edi, edi
+Lcsa_ret:
+	ret
 	.globl	silica_rt_tls_record_set
 	.p2align	4
 silica_rt_tls_record_set:
@@ -1665,7 +1705,8 @@ silica_rt_carrier_migrate:
 # where it parked, inside the same dispatch. At most one carrier lock is held at any point, never
 # with the target's and the old carrier's locks together, so the lock order of this module's
 # header holds. The mailbox is the actor's own and moves with it; message order is unchanged.
-# The target's thread is created first when it has none yet (nothing held).
+# The target's thread is created first when it has none yet (nothing held); 3 (:migration_blocked)
+# when the host refuses it (item N #5).
 # Frame: [rbp-8] actor (x19), [rbp-16] target (x20), [rbp-24] result (x21).
 	push	rbp
 	mov	rbp, rsp
@@ -1674,6 +1715,8 @@ silica_rt_carrier_migrate:
 	mov	QWORD PTR [rbp - 16], rsi
 	mov	rdi, rsi
 	call	silica_rt_carrier_ensure_started
+	test	rdi, rdi
+	jnz	Lcmg_blocked
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_lock
@@ -1711,6 +1754,11 @@ Lcmg_unlock:
 	add	rdi, 16
 	call	silica_rt_lock_unlock
 	mov	rdi, QWORD PTR [rbp - 24]
+	leave
+	ret
+Lcmg_blocked:
+# The target has no thread and the host refused one (nothing held yet): 3, :migration_blocked.
+	mov	edi, 3
 	leave
 	ret
 	.globl	silica_rt_carrier_pick_kind
