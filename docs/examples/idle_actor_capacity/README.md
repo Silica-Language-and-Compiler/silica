@@ -39,7 +39,7 @@ Since 2026-10-11 `main` registers a FailureReporter before it starts the spawner
 E2236 otherwise); the reporter writes each failure report to stderr, as the runtime did before. That version
 was compiled, assembled and linked again on 2026-10-16 with a private build of the current tree (a 106 KB
 executable), and run for two seconds on macOS before being stopped: it printed `1000 idle actors`,
-`2000 idle actors`, and so on, reaching `411000 idle actors` in those two seconds, with no failure. The
+`2000 idle actors`, and so on, reaching `411000 idle actors` in those two seconds, with no failure. (Later note, 2026-10-20: that figure could not be reproduced; the thread-backed program reaches about 4,000 actors. The measured carrier figure is 1,000,000 idle actors, 630 MB RSS, item N stage 4.) The
 compile writes its outputs next to `main.silica`, so build in a scratch copy of this directory rather than in
 the repository tree.
 

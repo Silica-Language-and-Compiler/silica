@@ -810,7 +810,8 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       for the release goes through a call so a shared carrier can run the exit),
       `workers_call_cycle_across_carriers` (documents today's behaviour: A on core 1 calls B on core 2
       which calls A; both park for ever with their kicker, the carriers are free and siblings on both
-      still answer; the process ends through `exit`; to be re-derived when R1.5 lands),
+      still answer; the process ends through `exit`; longer cycles are deliberately not checked, see the
+      decisions of the final status),
       `workers_spawn_from_actor_binds_per_policy` (cores 0, 1, 2, 7, none from an actor, a registered
       spawn for core 3 from the driver, calls across every pair). No thread-count probe trial: nothing a
       program can observe is deterministic in the thread count (the registries' and supervisors'
@@ -900,8 +901,8 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       nothing (the thread-affinity and QoS hints need a thread, and a carrier actor's ACB #144 is 0:
       in stage 1 they dereferenced it, a crash under the gate for any program that pinned a plain
       worker, found while reading the `scheduler_policy_addition` sources); supervisors on
-      carriers; cycle detection and the self-call failure (R1.5); the Linux runtimes; the idle-actor
-      capacity measurement.
+      carriers; the Linux runtimes; the idle-actor capacity measurement. (The self-call failure of R1.5
+      became the compile-time error E2240; longer call cycles are not checked, by decision.)
   - **Stage 3 status (2026-10-19, `apple_silicon_mac` only, same branch; record of the gated build):
     placement is real on carriers.** The runtime text changes (every suite's `__silica_runtime.ascomp`
     moves again); the trial `.sams` do not, except where a trial now uses the test-only query below.
@@ -1305,6 +1306,118 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       actor is one thread each); the hosted `scheduler_policy_addition` goldens question of stage 4;
       the ROADMAP chunk 2 and specification "implementation status" paragraphs (§15.1.2, §15.1.2.2),
       to be refreshed when this branch is published.
+  - **Linux AArch64 port status (2026-10-19/20, `linux_aarch64`, same branch; superseded by the final status of item N below).** The
+    final `apple_silicon_mac` state (the delta `5135f543a^..87e0a61e2e` of the seven runtime and
+    emitter units) ported to `compiler/src/emitter/linux_aarch64`: `terms/prims/prims_actors_runtime_asm.silica`,
+    `prims_actors_child_table_asm.silica`, `prims_actors_stack_asm.silica`, `prims_actors.silica`,
+    `terms/ffi_fault_runtime_asm.silica`, the new `terms/prims/prims_actors_carrier_asm.silica`
+    (1,999 lines) and three sysctl rows in `terms/linux_rt_shims_asm.silica`. Method: the Apple
+    delta translated mechanically (Mach-O to ELF sections, `;` to `//` comments, `@PAGE`/`@PAGEOFF`
+    to `:lo12:`, `_sym` to `sym`, `os_unfair_lock` to the shim's futex lock) and applied to the
+    committed Linux files (0 fuzz, 1 hunk by hand: the `silica_rt_actor_spawn_dangerous` entry,
+    whose context is the unit's first string line), then the Linux-only edits below. Lee's
+    uncommitted `silica_rt_sysctl_u64` length-word reorder is kept verbatim.
+    - *Linux-specific semantics* (everything else is the Apple text line for line):
+
+      | Topic | `apple_silicon_mac` | `linux_aarch64` |
+      |---|---|---|
+      | Carrier count | `hw.logicalcpu` via `sysctlbyname` | the shim's sysctl table: `hw.logicalcpu` and `hw.perflevel0.logicalcpu` answer `sysconf(_SC_NPROCESSORS_ONLN)`, `hw.perflevel1.logicalcpu` answers 0 (rows added to `linux_rt_shims_asm.silica`); `SILICA_CARRIER_COUNT` as on the Mac |
+      | Core kinds | P cores `[0, P)`, E cores `[P, P+E)` | every core is a performance core, no efficiency carrier exists: `pin_actor_to_efficiency_core` moves nothing (the actor stays, the call answers as a no-move) |
+      | Carrier affinity | `thread_policy_set` with an affinity tag: a hint the kernel ignores on Apple Silicon | real: each carrier thread calls `pthread_setaffinity_np(self, 128, cpu_set_t{cpu = index})` directly (`silica_rt_carrier_main`); the result (0 or the errno, EINVAL for an index that is no cpu, as under a `SILICA_CARRIER_COUNT` above the core count) is stored in the carrier block at +224 and never checked; the shim's tag scheme is kept only for a dangerous actor's thread (`migrate_actor` / `pin_actor_*` on `#440 = 0`) |
+      | Stack-exhaustion exit of a carrier actor | rewrite the Darwin mcontext (x0 +16, x1 +24, sp +264, pc +272) and return | rewrite the `ucontext_t` at X24: x0 at +184, x1 at +192, sp at +432, pc at +440 (`uc_mcontext` inline at +176, `regs[]` at +8 of it); the handler returns normally and glibc's `sa_restorer` runs `rt_sigreturn`, which restores the mask and lands in `silica_rt_actor_fail_current(ACB, atom)` on the carrier's stack |
+      | Signal plumbing (unchanged from before N) | `sigaction` via libSystem | `sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER` (`0x48000004`), SIGBUS = 7, `siginfo.si_addr` at +16, `stack_t` = `ss_sp` 0 / `ss_flags` 8 / `ss_size` 16 (`silica_rt_altstack_install_at` and the in-handler `ss_flags` read are the Linux layout) |
+      | Locks and sleeps | `os_unfair_lock` (not recursive), `__ulock_wait/wake` | the shim's futex lock (`silica_rt_lock_lock/unlock`, no owner check: every park site unlocks on the thread that locked) and `silica_rt_cv_wait_timeout`'s futex wait with the sweep's due time |
+      | Clock | `clock_gettime(6)` (`CLOCK_MONOTONIC`) | `clock_gettime(1)` (the Linux `CLOCK_MONOTONIC`; the base already had it, the delta did not touch the line) |
+      | Carrier thread stack | the pthread default, 512 KB | the pthread default, 8 MB virtual (RLIMIT_STACK); `pthread_create` with no attribute as on the Mac |
+      | Section syntax | `__DATA,__bss`, bare `.rodata` after a Mach-O section name | `.bss`, `.section .rodata` (GNU as rejects a bare `.rodata`) |
+      | Failure-report text | `supervisor_acb: 0x0`, `#1 _actor_thread_main` | `(nil)`, `actor_thread_main`: `carriers_addition/compare_scout_normalized.sh` now folds both as `supervisors_addition`'s already did (a harness change, no `.scout` touched) |
+
+    - *Done and verified on pix (Raspberry Pi 5, 4 cores, 4 GB, 16 KB pages, glibc 2.41), with a gen1
+      built there from this tree by the installed Linux compiler (`make build TARGET=linux_aarch64
+      SILICA_TARGET_PROMPT=0 INSTALL_SELFHOST=0`, 350 units, 28 min, not installed; the tree pushed
+      with `programmer_tools/sync_to_hosts.sh --targets linux_aarch64 --apply`: delete 0, pull 0).* The
+      seven units also pass the branch Mac compiler's front end (`scratchpad/fe2`). Results, every
+      suite run with `SILICA_COMPILER=<that gen1>` as a make variable (no first-pass compile fault was
+      seen in any run; the sret over-read of the installed compiler did not show):
+      `carriers_addition` 46 trials: 46/46 `.sout` at `SILICA_CARRIER_COUNT=1`, 45/46 at unset (4), 2
+      and 4; the one difference is `workers_zpin_pin_performance_efficiency`, whose last two
+      verdicts place two actors on core 5 and expect the same carrier: pix has four cores, so core 5
+      is "a core the machine does not have" and the two actors take the carriers in turn (the
+      trial assumes a machine with at least six cores; it holds at count 1; no `.scout` was
+      changed). The hammer (`pix_hammer.sh`, each stem 30 times, compared as the suite
+      compares) over the 17 supervisor and cross-carrier stems at counts unset, 1, 2 and 4: 2,040
+      runs, 0 failures. `supervisors_addition`: 289/292 at counts 1, 2 and 4, the three misses being
+      the `working_restart_protocol_*` trials that had no Linux golden (recorded now); all 150
+      trial `.sams` matched the existing `.linux_aarch64.ascomp` goldens. (The pin trial was fixed
+      afterwards, `e2356a05a2`: it spawns `e` for core 5 when that core exists, else the machine's last
+      core; no `.scout` changed.)
+    - *Goldens recorded on pix from runs whose `.sout` matched `.scout`, pulled back with the
+      official script:* `carriers_addition` 46 new `<stem>.linux_aarch64.ascomp` plus its
+      `__silica_runtime.linux_aarch64.ascomp` (new); `supervisors_addition` 3 new
+      `working_restart_protocol_*.linux_aarch64.ascomp` and its `__silica_runtime.linux_aarch64.ascomp`
+      refreshed (runtime-text class). The port commit `aa8101edf2` records 75 goldens from matching runs.
+    - **Unverified / not done on Linux (as of the pix port):** a `:dangerous` row child restarted by a
+      supervisor on a carrier; `device_actor_addition`, `cpu_discovery_and_spawn_pinning` and the rest
+      of the trial tree beyond the suites listed; the idle-actor capacity measurement on pix; whether
+      `pthread_setaffinity_np`'s binding (verified only as "the call is made and its result stored")
+      improves anything measurable. `linux_x86_64` and the compiler on carriers are covered below.
+  - **Item N final status (2026-10-20, branch `hosted-carriers-item-n`).** Hosted carriers are the only
+    execution model on Apple Silicon, Linux AArch64 and Linux x86-64; the ESP32-S3 board has its own
+    per-core schedulers and only the gap fixes below were mirrored to it.
+    - *Linux x86-64 (nix), `ef2e778126`:* hand translation of the Apple Silicon design (carrier module,
+      528-byte ACB, restart protocol, park rule, affinity through `pthread_setaffinity_np`, sysconf
+      topology, dangerous actors on their own thread, the `sysctl_u64` length-word fix). Verified on nix
+      at carrier counts unset, 1, 2 and 4. 74 goldens recorded from matching runs (22 refreshed, 49 new,
+      3 cpu/trial). Goldens: the Linux AArch64 port 75 (`aa8101edf2`), the x86-64 port 74.
+    - *Linux AArch64 (pix), `aa8101edf2`:* as described above, 75 goldens; the hosted
+      `compare_scout_normalized.sh` was rewritten to normalise `actor_id`, `supervisor_acb` and C-symbol
+      frame lines (accepted by Lee).
+    - *Gap fixes (Apple Silicon `dad0168c19`; mirrored by `1fb0357e30`):*
+      - Gap 3: a row asking its own supervisor to terminate or restart its own row, or a `:one_for_all`
+        group containing it, waited for ever. It now gets `:error` with `:language_error` at once; the
+        reply record is built by the prims `supervisor_op_tag`, `supervisor_op_error` and
+        `supervisor_op_child`. Lee accepted these semantics. A row child draining a sibling's notice now
+        waits for the restart token without draining (acquire mode 2).
+      - Gap 4: supervisor drains no longer install the supervisor as the current actor (the drainer
+        stays current); `add_child` of a supervisor child from a carrier actor no longer spins at one
+        carrier.
+      - Gap 7: a Phase B ingress hook node no longer takes a restart token (it held its supervisor's
+        token for the actor's life).
+      - Mirror: Linux AArch64 and x86-64 carry all three (self checks, acquire mode 2, no TLS install in
+        drains, `start_child_in`, the three reply prims, no token for hook nodes); the ESP32-S3 board got
+        gap 3/4/7 as far as they apply (reply prims and the self check) but acquire mode 2 is not
+        mirrored (the board drains in the caller's context). The board was not built or run.
+      - Goldens: 54 for the mirror in all (19 refreshed + 8 new per Linux platform); 8 new trials, 19 Mac goldens refreshed in `dad0168c19`.
+    - *Verification:* carrier counts unset, 1, 2 and 4 on Mac, pix and nix. Hammer runs of
+      `supervisor_shutdown_reason_orderly`: 200 on pix, 60 each on nix and the Mac. Hammer of the 8 new
+      gap trials: 960 runs on nix and 480 on pix. `e810d164d4` made that trial print each count in one
+      write (as `e2356a05a2` did for `supervisor_child_names_freed_on_end`: the reporter's `done` could
+      land between two writes, about 1 run in 24 on pix). `workers_zpin_pin_performance_efficiency` is
+      fixed (`e2356a05a2`): `e` takes core 5 if it exists, else the last core, so a 4-core host holds.
+      `ab30cb6c91` and `3fe9811e88` adopted the newer recorded Linux goldens (11,875 x86-64, 11,060
+      AArch64).
+    - *Decisions:*
+      - A call to oneself is rejected at compile time as E2240 (commit `146f34bf19`, spec §16.2.6.5).
+        By design it does not catch: a reference received in a message or state, `call_registered(:own_name, ...)`,
+        a tuple-destructured `self()`.
+      - Longer call cycles (A calls B calls A) are intentionally not checked; Lee wants no runtime check
+        at this point. The trial `workers_call_cycle_across_carriers` documents the behaviour: both
+        actors and the kicker park for ever, the carriers stay free and siblings still answer. This
+        replaces the earlier plan to detect cycles (R1.5).
+      - `actor_carrier_index` stays a user-visible builtin (Lee).
+    - *Remaining gaps / follow-ups:*
+      1. Compiler-on-carriers gen2/gen3 verification on Mac, pix and nix (Lee's builds, held).
+      2. Dangerous-actor thread cap: option C is in progress (`spawn_dangerous` reports a
+         `pthread_create` failure; macOS `kern.num_taskthreads` is 4096, so about the 4,080th spawn
+         fails). Option A, a pooled FFI worker, is deferred until Fifi networking shows a
+         worker-per-connection demand. Open semantic question: thread-affine libraries.
+      3. Board: row-child drain protection (acquire mode 2) not mirrored; to be done on a separate
+         branch.
+      4. `get_efficiency_cores` / `get_performance_cores` return wrong core-id lists.
+      5. `:release_when_idle` idle sweep costs about 8 KB per actor at peak (design in progress).
+      6. Linux idle-actor capacity, `get_actor_memory_usage` and x86-64 timing are unmeasured (held).
+      7. Stale `__silica_runtime.*.ascomp` goldens (the harness never compares them).
+      8. About 30 trial comments still mention `SILICA_CARRIERS=0`; left as history.
 
 ## 6. Gate (common)
 
