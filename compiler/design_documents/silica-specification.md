@@ -7577,7 +7577,7 @@ Every actor is **pinned** to a core from the moment it is spawned until it termi
   - `:ok` means the move has been **requested**; it takes effect at the actor's next dispatch boundary.
   - `:invalid_target` means the core does not exist or is unavailable.
   - `:actor_not_found` means the actor has terminated.
-  - `:migration_blocked` means the actor cannot be moved right now.
+  - `:migration_blocked` means the actor cannot be moved right now. A hosted runtime answers it when the target carrier's thread cannot be started (for example because dangerous actors hold every thread the host allows, §15.4.13.5).
   - On any error atom, the actor stays pinned to its current core.
 
 <a id="spec-actor-stack-architecture"></a>
@@ -8848,7 +8848,7 @@ Rules:
   told apart from them by the absence of the report line.
 - The report line is all a process-fatal path writes. It runs in a signal or exception handler, where delivering an unwind report through `FailureReporter` (§15.4.13.4) is not possible, so unwind reports belong to actor failures (§15.4.6.4) and are not part of a process-fatal report.
 - A failure inside an actor that the containment gate recovers, and every actor exit reason in §15.4.11 (including
-  `(:explicit, :stack_exhausted)` and `(:explicit, :stack_reserve_failed)`), is delivered through supervision and is
+  `(:explicit, :stack_exhausted)`, `(:explicit, :stack_reserve_failed)` and `(:explicit, :thread_limit)`), is delivered through supervision and is
   not a process-fatal report.
 - **Where the report goes.** Hosted: the report line is written to standard error and the process exits with the
   status. OS-free: the report line is written to the console as program output, followed by the console's exit
@@ -9311,7 +9311,7 @@ The failure reason is an **inline sum type** — a built-in language construct, 
 | `:normal` | The actor ended normally, through `stop_self(:normal)` or `remove_actor` (§15.1.2.3) |
 | `:language_error` | Language-level failure: pattern-match exhaustion, a type mismatch, `panic` (§22.16), or similar |
 | `:memory_fault` | Hardware-detected memory fault (MTE tag mismatch, guard page violation) |
-| `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), `(:explicit, :restart_intensity_breach)` for a supervisor that ends because it breached its restart intensity (§15.4.13.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4). |
+| `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :thread_limit)` for a spawn of a dangerous actor whose thread the host refused (§15.4.13.5), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), `(:explicit, :restart_intensity_breach)` for a supervisor that ends because it breached its restart intensity (§15.4.13.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4). `:thread_limit` is a runtime atom appended after `:restart_intensity_breach`, so no program atom moves. |
 | `:noproc` | Used only in a `DOWN` message: the monitored actor had already ended when `monitor` was called (§15.4.8.6) |
 | `:unknown` | Runtime could not determine the reason |
 
@@ -9577,6 +9577,14 @@ Protocol:
 
 PAC-signed return addresses in Silica frames are never on the FFI thread's stack, so return address corruption by foreign code cannot propagate into Silica frames.
 
+**Dangerous actors: one thread each**
+
+A dangerous actor (§15.1.1, `spawn_dangerous`, `spawn_dangerous_registered`, or a `:dangerous` supervisor row) runs on its own OS thread for its whole life; it is not scheduled on a carrier, so a foreign call that blocks suspends only that actor. The number of dangerous actors alive at once is therefore bounded by the host's thread limit (on macOS `kern.num_taskthreads`, 4096, so about the 4,080th `spawn_dangerous` fails; on Linux the host's thread or mapping limit).
+
+When the host refuses to create the thread, the spawn gives back everything it took (identity, stack reservation, alternate stack, control block, the hold on the supervisor and, for a supervisor row, the row child's reference to the supervision block). The **spawning** actor then fails with `failure_reason` `(:explicit, :thread_limit)` (reason tag 4), delivered to its supervisor and to the `FailureReporter` like `(:explicit, :stack_reserve_failed)` (§15.1.2.2). When the spawner is `main`, which is not an actor and has no supervisor, the process ends with a runtime abort, reason `the thread of a dangerous actor could not be created`, exit status 71 (§15.4.5.5). A spawn never returns a null or dead reference. A program that spawns many dangerous actors is the one that knows their number, so the failure is that program's to handle.
+
+A hosted runtime starts a carrier's thread lazily. If the host refuses that thread because dangerous actors hold every thread, an actor adopted by that carrier goes to a carrier that runs, and the process ends only when no carrier runs at all. `migrate_actor` to such a carrier answers `:migration_blocked`.
+
 **Unwind report for FFI faults**
 
 The `reason` field is `:memory_fault` (or `:language_error` if the fault was a language-level check triggered by the foreign call result). The `stack_trace` notes the FFI boundary:
@@ -9592,7 +9600,7 @@ The `reason` field is `:memory_fault` (or `:language_error` if the fault was a l
 **Limits**
 
 - Only 16 MPK protection keys are available system-wide on x86-64; the runtime uses one for all Silica regions.
-- AArch64 thread isolation adds one thread per actor that makes FFI calls; the FFI thread is pooled where possible.
+- AArch64 thread isolation adds one thread per actor that makes FFI calls. A dangerous actor is its own thread (above), and the cap on such threads is the host's; a pooled FFI worker that would lift the cap is not built.
 - Faults in foreign code that corrupt the FFI thread's own stack beyond recovery end the process with a fatal fault report (§15.4.5.5, exit status 70). The report line is all that path writes (§15.4.5.5).
 
 ##### 15.4.13.6 Region Dump Format

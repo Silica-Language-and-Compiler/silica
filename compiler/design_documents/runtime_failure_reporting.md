@@ -258,6 +258,7 @@ Hosted runtime (`emitter/<target>/terms/`):
 | `prims_actors_runtime_asm` (x86-64: `_c`): `Lde_abort`, exit delivery into a supervisor's ingress at its bound | `silica_rt_abort_exit_queue_full` | `supervisor ingress queue is full (exit delivery)` |
 | `ffi_fault_runtime_asm`: `L_sfh_unrecoverable` (host refused to commit a growing stack) | `silica_rt_abort_with_pc` at the faulting pc | `cannot commit memory for a growing actor stack` |
 | `prims_actors_stack_asm`: `silica_rt_spawn_reserve_failed` with `main` as the spawner | `silica_rt_abort_stack_reserve` | `stack reservation failed` |
+| `spawn_dangerous` / `spawn_dangerous_registered` with `main` as the spawner, `pthread_create` refused | the dangerous-thread abort entry (`ffafc09791`) | `the thread of a dangerous actor could not be created` |
 
 Board runtime (`board/runtime/`):
 
@@ -396,6 +397,13 @@ process-fatal reports of §1 to §5. Checked against the hosted and board runtim
 - **Restart-intensity breach (2026-10-16, spec §15.4.13.2).** A supervisor that exceeds its restart intensity ends,
   after shutting down its children, with `(:explicit, :restart_intensity_breach)` (reason tag 4) on every target. It used to end with
   reason tag 0, so a `:transient` parent never restarted it. The atom is a dedicated runtime atom, distinct from the `:shutdown` of orderly shutdown.
+
+- **Dangerous-actor thread limit (2026-10-20, spec §15.4.13.5).** When the host refuses the thread of a dangerous actor
+  (`spawn_dangerous`, `spawn_dangerous_registered`, a `:dangerous` supervisor row; macOS `kern.num_taskthreads` is 4096), the spawning actor fails
+  with `(:explicit, :thread_limit)` (reason tag 4) on every hosted target, delivered like `:stack_reserve_failed`; the spawn has already released
+  what it took. With `main` as the spawner it is a runtime abort, status 71, `the thread of a dangerous actor could not be created` (section 4).
+  Covered by `ffi_addition/app_dangerous_spawn_thread_limit`. A carrier thread the host refuses is not fatal: the actor goes to a running
+  carrier, and the process aborts only when none runs.
 
 ## 8. Where the code is
 

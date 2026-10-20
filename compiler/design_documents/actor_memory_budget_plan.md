@@ -915,7 +915,7 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       | call | effect | answer |
       | --- | --- | --- |
       | `spawn(..., core)` | bound at spawn to carrier `core mod N` when `core` is one of the machine's logical cores (1 .. `hw.logicalcpu` - 1, what `get_cpu_topology` reports; 0 is the default); a core the machine does not have, or none, binds in turn (the board's rule for an out-of-range core at spawn). Stays there for life unless the program moves it: the runtime never moves an actor on its own (spec §15.1.2, no rebalancing is implemented). | the reference |
-      | `migrate_actor(ref, core)` | idle: bound to the target's carrier at once; idle on its carrier's sweep list: unlisted, bound, listed on the target; ready (queued), running or parked in a call: the target is pending in ACB #512 and applied at the next dispatch boundary (`_silica_rt_carrier_requeue`, or `_silica_rt_carrier_mark_idle` when the dispatch finds no mail); never while running, never at a resume (a parked actor resumes on the carrier it parked on, inside the same dispatch, spec §15.1.2). The mailbox is the actor's own and moves with it: message order is unchanged. Target carrier: `core mod N`. | `:ok`; `:invalid_target` when `core >= hw.logicalcpu` (either kind of actor); `:actor_not_found` for a null reference or an actor whose alive flag is clear (an ended actor, or one `remove_actor` has stopped); `:migration_blocked` is never produced on this target (nothing blocks a move) |
+      | `migrate_actor(ref, core)` | idle: bound to the target's carrier at once; idle on its carrier's sweep list: unlisted, bound, listed on the target; ready (queued), running or parked in a call: the target is pending in ACB #512 and applied at the next dispatch boundary (`_silica_rt_carrier_requeue`, or `_silica_rt_carrier_mark_idle` when the dispatch finds no mail); never while running, never at a resume (a parked actor resumes on the carrier it parked on, inside the same dispatch, spec §15.1.2). The mailbox is the actor's own and moves with it: message order is unchanged. Target carrier: `core mod N`. | `:ok`; `:invalid_target` when `core >= hw.logicalcpu` (either kind of actor); `:actor_not_found` for a null reference or an actor whose alive flag is clear (an ended actor, or one `remove_actor` has stopped); `:migration_blocked` when the target carrier's thread cannot be started (the host refused it because dangerous actors hold every thread); otherwise nothing blocks a move |
       | `pin_actor_to_core(ref, core)` | the move above (spec §15.1.2: the helpers are shorthands for `migrate_actor`) | the word 0 whatever the move answered: the `(int64, affinity_error)` tuple of §22.10 is not materialised by any emitter (pre-existing) |
       | `pin_actor_to_performance_core(ref)` | carrier i is logical core i's; the P carriers are `[0, min(P, N))`, P = `hw.perflevel0.logicalcpu` (all cores when the machine does not answer: a uniform topology is all P). Already on one: no move; else the move to the next P carrier in turn (`_silica_rt_pcore_next`) | 0 |
       | `pin_actor_to_efficiency_core(ref)` | the E carriers are `[P, N)`: none when `N <= P` (a `SILICA_CARRIER_COUNT` of P or less) or the machine has no E cores. Already on one, or none: no move; else the move to the next E carrier in turn | 0 |
@@ -1407,17 +1407,51 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       - `actor_carrier_index` stays a user-visible builtin (Lee).
     - *Remaining gaps / follow-ups:*
       1. Compiler-on-carriers gen2/gen3 verification on Mac, pix and nix (Lee's builds, held).
-      2. Dangerous-actor thread cap: option C is in progress (`spawn_dangerous` reports a
-         `pthread_create` failure; macOS `kern.num_taskthreads` is 4096, so about the 4,080th spawn
-         fails). Option A, a pooled FFI worker, is deferred until Fifi networking shows a
-         worker-per-connection demand. Open semantic question: thread-affine libraries.
+      2. Dangerous-actor thread cap. *Diagnosis done; option C chosen and built (`ffafc09791`).* A
+         dangerous actor is its own OS thread; macOS `kern.num_taskthreads` is 4096, so about the
+         4,080th `spawn_dangerous` fails (Linux hits the host thread or map limit). When
+         `pthread_create` is refused in `spawn_dangerous`, `spawn_dangerous_registered` or the start of
+         a `:dangerous` row, the spawn releases everything it took (identity-table entry, reservation,
+         alternate stack and ring, ACB, supervisor hold, and a row child's supervision-block
+         reference) and the *spawning* actor fails with `(:explicit, :thread_limit)` (reason tag 4,
+         delivered to its supervisor and the FailureReporter like `:stack_reserve_failed`); in `main`
+         it is a runtime abort, status 71, "the thread of a dangerous actor could not be created".
+         Nothing returns a null or dead reference. `:thread_limit` is a new runtime atom appended after
+         `:restart_intensity_breach`. Second defect fixed with it: with about 4,080 dangerous threads
+         alive the next lazily started carrier aborted the process; carrier adoption now falls back to
+         a running carrier (abort only when none runs) and `migrate_actor` to a carrier that cannot
+         start answers `:migration_blocked`. Trials: `ffi_addition/app_dangerous_spawn_thread_limit`;
+         coverage of the `:dangerous` row path in `carriers_addition/workers_zzzzdangerous_row_*`.
+         Linux goldens pending. *Option A, a pooled FFI worker, is deferred* until Fifi networking
+         shows a worker-per-connection demand. Open question for A: thread-affine libraries (a library
+         that must be called from the thread that initialised it cannot move between pooled workers).
+         The first five trials for A: `app_ffi_blocking_call_keeps_carrier_free`,
+         `app_ffi_many_dangerous_actors`, `app_ffi_kill_during_foreign_call`,
+         `app_ffi_thread_affinity`, and the option C trial `app_dangerous_spawn_thread_limit`.
       3. Board: row-child drain protection (acquire mode 2) not mirrored; to be done on a separate
          branch.
       4. `get_efficiency_cores` / `get_performance_cores` return wrong core-id lists.
-      5. `:release_when_idle` idle sweep costs about 8 KB per actor at peak (design in progress).
+      5. `:release_when_idle` idle sweep costs about 8 KB per actor at peak. A design exists
+         (`release_when_idle_design.md`, scratchpad of 2026-10-20); it is **not implemented**. In brief:
+         (a) the 8 KB is a transient that scales with the spawn-and-dispatch rate, not a per-actor
+         cost: each dispatched actor holds one committed page until a sweep finds its stack idle for
+         one second; (b) the sweep walks the whole list under the carrier lock, so it stalls spawners
+         as the population grows; (c) the list becomes FIFO by idle stamp with a listed-bytes total, and
+         the sweep stops at the first entry not yet due; (d) the sweep works in incremental batches of
+         64 and releases outside the carrier lock, through a new actor status 6 (sweeping); (e) a
+         per-carrier idle-stack budget (machine memory plus swap over 32, split over the carriers,
+         `SILICA_IDLE_STACK_BUDGET` overriding) makes the sweep take the oldest first when exceeded;
+         (f) about 260 lines per port, Apple Silicon first, five new `carriers_addition` trials;
+         (g) pending Lee's decision on a spec sentence that makes the one-second idle an upper bound
+         on how long an idle stack is kept; without it the lock stall goes but the transient stays
+         bounded only by rate times one second times a page; (h) not implemented.
       6. Linux idle-actor capacity, `get_actor_memory_usage` and x86-64 timing are unmeasured (held).
       7. Stale `__silica_runtime.*.ascomp` goldens (the harness never compares them).
       8. About 30 trial comments still mention `SILICA_CARRIERS=0`; left as history.
+      9. Checker gap, to be filed and not fixed: E2094 and E2095 (a `:dangerous` row must be cast-type
+         and carry a `:dangerous_` id) are enforced only for a module's `init`, not for the start
+         functions of child supervisors. A call-type `:dangerous` row in a sub-supervisor compiles and
+         runs.
 
 ## 6. Gate (common)
 
