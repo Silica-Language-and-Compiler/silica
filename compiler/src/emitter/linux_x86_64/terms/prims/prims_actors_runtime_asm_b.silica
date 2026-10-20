@@ -20,7 +20,7 @@
 // concatenates these in the same order as the AArch64 original; every chunk starts at a section
 // boundary (chunk 9 .rodata, 10 .bss, 11 .text, 12 .rodata, 13 .text), so no routine straddles into
 // or out of this module. All data layouts, control-block offsets and constants are those documented
-// in prims_actors_runtime_asm.silica (ACB 408 B, item I, 152 B message nodes, mailbox pairs at #128/#136 and
+// in prims_actors_runtime_asm.silica (ACB 528 B, items I and N, 152 B message nodes, mailbox pairs at #128/#136 and
 // #232/#240 with the u32 depth at #248, arena fields #160..#184, region list cells [next][size]).
 //
 // Register model (shared by the linux_x86_64 runtime modules): X0..X7 -> rdi rsi rdx rcx r8 r9 r14 r15,
@@ -37,7 +37,8 @@
 // Cross-routine register contracts kept from the AArch64 text:
 //   silica_rt_tls_actor_set_from_x19: on x86-64 the ACB arrives in rdi (X0); callers load their X19
 //     value into rdi before the call (the caller's [rbp-8] slot is not read: C-called routines may
-//     have pushed registers there).
+//     have pushed registers there). Since item N it is silica_rt_tls_actor_set (prims_actors_carrier_asm):
+//     the pthread key names a two-word thread record, the current actor and the carrier, not the ACB.
 //   silica_rt_region_mark returns the mark in rax (X16) and silica_rt_region_release_to takes it
 //     in rax (X16), preserving rdi/rsi (X0/X1) as the original preserved X0/X1.
 //   L_bc_push (private to silica_rt_apple_build_cache_levels) now takes the list head in rdi instead
@@ -287,9 +288,12 @@ silica_rt_sysctl_u64:
 	mov	rbp, rsp
 	sub	rsp, 96
 	mov	QWORD PTR [rbp - 8], rdi
-	mov	DWORD PTR [rsp + 8], 8
+# The value and length words are zeroed first and the length (8) stored after them: before
+# 2026-10-19 the zeroing followed the length store and wiped it, so the query saw a length of 0
+# and every caller got 0 (hw.memsize for get_cpu_topology among them). Same fix as apple_silicon_mac.
 	mov	QWORD PTR [rsp], 0
 	mov	QWORD PTR [rsp + 8], 0
+	mov	DWORD PTR [rsp + 8], 8
 	mov	rdi, QWORD PTR [rbp - 8]
 	mov	rsi, rsp
 	lea	rdx, [rsp + 8]
@@ -603,7 +607,9 @@ L_tlse_done:
 	.globl	silica_rt_tls_current_actor_get
 	.p2align	2
 silica_rt_tls_current_actor_get:
-# -> rdi = current actor (pthread_getspecific result) or 0
+# -> rdi = this thread's current actor: the first word of the thread's record (the pthread key names
+# it; silica_rt_tls_record_set), 0 on a thread with no record (main before any drain) or whose
+# record holds none (a carrier between actors).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -611,26 +617,19 @@ silica_rt_tls_current_actor_get:
 	lea	rax, [rip + silica_actor_pthread_key]
 	mov	rdi, QWORD PTR [rax]
 	call	pthread_getspecific
-	mov	rdi, rax
+	xor	edi, edi
+	test	rax, rax
+	jz	L_tcag_ret
+	mov	rdi, QWORD PTR [rax]
+L_tcag_ret:
 	leave
 	ret
 	.globl	silica_rt_tls_actor_set_from_x19
 	.p2align	2
 silica_rt_tls_actor_set_from_x19:
-# rdi = ACB (the caller's X19 value, moved into rdi by the caller); kept in [rsp] across
-# silica_rt_ensure_actor_tls_key. Nothing of the caller's frame is read or reloaded.
-	push	rbp
-	mov	rbp, rsp
-	sub	rsp, 96
-	mov	QWORD PTR [rsp], rdi
-	call	silica_rt_ensure_actor_tls_key
-	mov	rsi, QWORD PTR [rsp]
-	lea	rax, [rip + silica_actor_pthread_key]
-	mov	rdi, QWORD PTR [rax]
-	call	pthread_setspecific
-	mov	rdi, rax
-	leave
-	ret
+# rdi = the ACB to install as this thread's current actor (the caller's X19 value, moved into rdi
+# by the caller). The record's first word (prims_actors_carrier_asm.silica).
+	jmp	silica_rt_tls_actor_set
 	.p2align	2
 silica_rt_actor_init_region: # arena bookkeeping for the actor's implicit heap
 # rdi=actor_ptr. The arena is a chain of anonymous blocks allocated on demand by
@@ -763,12 +762,24 @@ silica_rt_migrate_actor:
 	jmp	silica_rt_ref_call
 	.p2align	2
 silica_rt_migrate_actor_acb:
-# rdi=actor_ref rsi=target_core -> rdi = 0 (:ok) or 2 (:actor_not_found, a null reference); the emitter
-# maps the code to the program's atom (prims_actors emit_prim_op_with_atoms). Hosted pinning is the
-# thread's affinity hint; the OS may still share or move the thread (spec §22.10), so the hint's own
-# result is not reported.
+# rdi = ACB (held) or 0, rsi = target core -> rdi = 0 (:ok: the move is requested, and done at the
+# actor's next dispatch boundary, at once when it is idle), 1 (:invalid_target: no logical core of
+# that id on this machine, silica_rt_logical_cpu_count, the count get_cpu_topology reports),
+# 2 (:actor_not_found: a null reference, or an actor that has ended); the emitter maps the code to
+# the program's atom (prims_actors emit_prim_op_with_atoms). 3 (:migration_blocked) is never
+# produced on this target: nothing blocks a move. A carrier actor (#144 = 0, item N stage 3) is
+# moved to the carrier of the core, `core mod N` as at spawn (silica_rt_carrier_migrate, which
+# says what happens per status). A dangerous actor (a thread of its own, #144) gets the thread's
+# affinity hint, as every actor did before carriers; the OS may still share or move the thread
+# (spec §22.10), so the hint's own result is not reported.
 	test	rdi, rdi
 	jz	Lmig_not_found
+	cmp	DWORD PTR [rdi + 152], 0
+	je	Lmig_not_found
+	cmp	rsi, QWORD PTR [rip + silica_rt_logical_cpu_count]
+	jae	Lmig_invalid
+	cmp	QWORD PTR [rdi + 144], 0
+	je	Lmig_carrier
 # frame: [rbp-8] target core (X19), [rbp-16] thread (X20); [rsp] the 4-byte policy tag
 	push	rbp
 	mov	rbp, rsp
@@ -786,6 +797,22 @@ silica_rt_migrate_actor_acb:
 	call	silica_rt_thread_policy_set
 	xor	edi, edi
 	leave
+	ret
+Lmig_carrier:
+# frame: [rbp-8] ACB (X19)
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rdi, rsi
+	call	silica_rt_carrier_for_core
+	mov	rsi, rdi
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_carrier_migrate
+	leave
+	ret
+Lmig_invalid:
+	mov	edi, 1
 	ret
 Lmig_not_found:
 	mov	edi, 2
@@ -1063,8 +1090,8 @@ silica_rt_actor_supervision_ingress_enqueue_acb:
 	mov	r10d, DWORD PTR [rcx + 16]
 	add	r10d, 1
 	mov	DWORD PTR [rcx + 16], r10d
-	lea	rdi, [rax + 80]
-	call	silica_rt_cv_signal
+	mov	rdi, rax
+	call	silica_rt_actor_mail_signal
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
@@ -1085,9 +1112,12 @@ Lsie_abort:
 	.globl	silica_rt_sb_require
 	.p2align	2
 silica_rt_sb_require:
-# rdi = ACB -> rdi = its supervision block (SB, 112 B: +0/+8 ingress front/rear, +16 depth u32,
+# rdi = ACB -> rdi = its supervision block (SB, 144 B: +0/+8 ingress front/rear, +16 depth u32,
 # +24 child-table head, +32 len, +40 sync_failure_reported, +48 start trampoline, +56 strategy,
-# +64 allowed restarts, +72 time frame, +80 restart count, +88 window start, +96 children counted in a replacement wait, +104 tearing down: sup_wait_enter, +112 references: sb_unref), made now when the
+# +64 allowed restarts, +72 time frame, +80 restart count, +88 window start, +96/+104 unused,
+# +112 references: sb_unref, +120 the holder of the restart token (0 free; the protocol in
+# prims_actors_child_table_asm.silica's header), +128 the carrier actors parked for the token,
+# +136 unused), made now when the
 # actor had none: by spawn for an actor with a trampoline, by the ingress enqueue for any other
 # actor that receives an exit notice (an add_child parent; the caller holds the target's lock),
 # by the child-table paths for the running actor. Freed by its last reference (sb_unref).
@@ -1099,7 +1129,7 @@ silica_rt_sb_require:
 	test	rdi, rdi
 	jnz	Lsbr_have
 	mov	edi, 1
-	mov	esi, 120
+	mov	esi, 144
 	call	calloc
 	mov	rdi, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rdi + 216], rax

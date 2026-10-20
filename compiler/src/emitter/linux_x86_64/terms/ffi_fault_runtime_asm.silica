@@ -418,6 +418,27 @@ Lsfh_pc_done:
 L_sfh_exhausted:
 # The end of a reservation the program lowered: (:explicit, :stack_exhausted) for this actor only.
 	mov	rdi, QWORD PTR [rbp - 16]
+	mov	r10, QWORD PTR [rdi + 440]
+	test	r10, r10
+	jz	L_sfh_exhausted_thread
+# A carrier actor (item N): the exit runs on the carrier's stack, reached by returning from this
+# handler into silica_rt_actor_fail_current(ACB, atom) with the signal frame unwound by the
+# kernel, so the carrier thread's alternate-stack state and signal mask are those of a thread
+# outside a handler when the next actor on it faults. Linux x86-64 ucontext_t gregs: RDI +104,
+# RSI +112, RSP +160, RIP +168 (the handler reads RIP from +168 above). RSP is the carrier's base
+# less 8, the state of a function just called, so fail_current's frame is aligned as any other.
+	mov	rdx, QWORD PTR [rbp - 48]
+	mov	QWORD PTR [rdx + 104], rdi
+	mov	rax, QWORD PTR [rip + silica_rt_stack_exhausted_atom]
+	mov	QWORD PTR [rdx + 112], rax
+	mov	r11, QWORD PTR [r10 + 48]
+	sub	r11, 8
+	mov	QWORD PTR [rdx + 160], r11
+	lea	rax, [rip + silica_rt_actor_fail_current]
+	mov	QWORD PTR [rdx + 168], rax
+	jmp	L_sfh_done
+L_sfh_exhausted_thread:
+	mov	rdi, QWORD PTR [rbp - 16]
 	lea	rax, [rip + silica_rt_stack_exhausted_atom]
 	mov	rsi, QWORD PTR [rax]
 	call	silica_rt_actor_fail_current
@@ -534,7 +555,8 @@ L_gft_no:
 	.globl	silica_rt_ffi_guarded_fault_finish
 	.p2align	4
 silica_rt_ffi_guarded_fault_finish:
-# Frame slots: [rbp-8] x19 actor, [rbp-16] x20 guarded state / exit payload, [rbp-24] x21 ACB flag.
+# Frame slots: [rbp-8] x19 actor, [rbp-16] x20 guarded state / exit payload, [rbp-24] x21 ACB flag,
+# [rbp-32] the actor's carrier (0 for a dangerous actor's thread, the only kind that reaches here).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -571,8 +593,7 @@ L_gff_have_actor:
 	mov	QWORD PTR [rax + 232], 5
 	mov	DWORD PTR [rax + 152], 0
 	mov	rdi, QWORD PTR [rbp - 8]
-	add	rdi, 80
-	call	silica_rt_cv_signal
+	call	silica_rt_actor_mail_signal
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
@@ -600,7 +621,9 @@ L_gff_after_report:
 	mov	r10, QWORD PTR [rbp - 8]
 	cmp	QWORD PTR [r10 + 224], 0
 	jne	L_gff_started_set
-	mov	QWORD PTR [r10 + 224], 2
+	mov	rdi, r10
+	mov	esi, 2
+	call	silica_rt_started_store
 L_gff_started_set:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_signal_pending_call_deaths
@@ -613,6 +636,24 @@ L_gff_started_set:
 # stack (top; nothing there is needed again) before that stack is unmapped, as fail_current does.
 # The three live values sit in this frame, which is on the stack about to go, so they ride across
 # in registers and a fresh frame holding them is built on the alt stack.
+# A carrier actor is not reachable here (the FFI is confined to dangerous actors, which keep a
+# thread each; prims_actors_carrier_asm.silica header); the branch would move onto its carrier's
+# stack (a fresh frame there, [rbp - 32] = the carrier) and end in the carrier loop.
+	mov	r11, QWORD PTR [rax + 440]
+	mov	QWORD PTR [rbp - 32], r11
+	test	r11, r11
+	jz	L_gff_thread_actor
+	mov	rdi, rax
+	mov	rsp, QWORD PTR [r11 + 48]
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 32], r11
+	xor	esi, esi
+	call	silica_rt_actor_stack_free
+	jmp	L_gff_keep_stack
+L_gff_thread_actor:
+	mov	QWORD PTR [rbp - 32], 0
 	mov	r10, QWORD PTR [rax + 352]
 	test	r10, r10
 	jz	L_gff_keep_stack
@@ -638,6 +679,10 @@ L_gff_keep_stack:
 	call	silica_rt_actor_dealloc_region
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_final_release
+	cmp	QWORD PTR [rbp - 32], 0
+	je	L_gff_thread_exit
+	mov	rdi, QWORD PTR [rbp - 32]
+	jmp	silica_rt_carrier_loop_enter
 L_gff_thread_exit:
 	xor	edi, edi
 	call	pthread_exit

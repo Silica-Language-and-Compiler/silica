@@ -24,7 +24,7 @@
 //   badarith_chunk, case_clause_chunk.
 // Every symbol, control-block offset, data layout, message-node shape and atom-index parameter is the
 // same as in emitter/linux_aarch64/terms/prims/prims_actors_runtime_asm.silica (header there documents
-// the 408 B ACB (item I), the 152 B message nodes and the two-list mailboxes). Only the instruction text changed.
+// the 528 B ACB (items I and N), the 152 B message nodes and the two-list mailboxes). Only the instruction text changed.
 //
 // Register model (shared with prims_actors_runtime_asm / _b): internal convention X0..X7 = rdi rsi rdx rcx
 // r8 r9 r14 r15, result in rdi (never rax); C library results arrive in rax and are moved. AArch64
@@ -176,8 +176,8 @@ silica_rt_sup_enqueue_exit:
 	mov	r11d, DWORD PTR [rcx + 16]
 	add	r11d, 1
 	mov	DWORD PTR [rcx + 16], r11d
-	lea	rdi, [r10 + 80]
-	call	silica_rt_cv_signal
+	mov	rdi, r10
+	call	silica_rt_actor_mail_signal
 	mov	rdi, QWORD PTR [rbp - 16]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
@@ -212,16 +212,20 @@ silica_rt_actor_supervision_wait_and_drain_one:
 	add	rdi, 16
 	call	silica_rt_lock_lock
 Lswd_try:
+# The restart token (block #120) is taken with the node, as LBB1_wait does, and released after.
 	mov	rdi, QWORD PTR [rbp - 8]
 	mov	rdi, QWORD PTR [rdi + 216]
 	test	rdi, rdi
 	jz	Lswd_wait
+	cmp	QWORD PTR [rdi + 120], 0
+	jne	Lswd_wait
 	call	silica_rt_q_dequeue_locked
 	test	rdi, rdi
 	jz	Lswd_wait
 	mov	QWORD PTR [rbp - 16], rdi
 	mov	r10, QWORD PTR [rbp - 8]
 	mov	rcx, QWORD PTR [r10 + 216]
+	mov	QWORD PTR [rcx + 120], r10
 	mov	r11d, DWORD PTR [rcx + 16]
 	sub	r11d, 1
 	mov	DWORD PTR [rcx + 16], r11d
@@ -244,6 +248,8 @@ Lswd_try:
 	mov	rdi, QWORD PTR [r11]
 	call	silica_rt_acb_release
 Lswd_free_wrap:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_sup_restart_release
 	mov	rdi, QWORD PTR [rbp - 16]
 	call	free
 	mov	rdi, QWORD PTR [rbp - 24]
@@ -1768,15 +1774,20 @@ Lce_lost:
 }
 
 // Actor-death paths for the two language errors raised from emitted code. Both mark the ACB dead under its
-// lock (reason tag 1 = badarith, 2 = case_clause at #336; running flag #152 = 0), report once (#272 guards
-// the duplicate), let the supervisor drain its ingress and wait for the replacement child to start, then
-// tear the actor down and exit the thread. Outside an actor the process writes the message and exits 1.
+// lock (reason tag 1 = badarith, 2 = case_clause at #232; running flag #152 = 0), report once (SB #40 guards
+// the duplicate), then tear the actor down. A dangerous actor's thread restarts itself when its own notice
+// is first in the supervisor's ingress and exits the thread; a carrier actor (item N) leaves the restart to
+// its supervisor's dispatch, runs the delivering phase on its own reservation (the frame of these routines
+// is there: they are called from the behaviour or the start trampoline), moves to the carrier's stack with
+// a fresh frame holding the actor and the carrier to unmap the reservation, and ends in the carrier loop.
+// Outside an actor the process writes the message and exits 1.
 fn actor_rt_asm_badarith_chunk() -> string {
     "
 	.globl	silica_rt_badarith
 	.p2align	2
 silica_rt_badarith:
-# slots: [rbp-8] = x19 self, [rbp-16] = x20 deliver_exit result, [rbp-24] = x21 supervisor, [rbp-32] = x22 ACB[#208]
+# slots: [rbp-8] = x19 self, [rbp-16] = x20 deliver_exit result, [rbp-24] = x21 supervisor,
+# [rbp-40] = x23 the carrier (0 for a dangerous actor's thread)
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -1784,13 +1795,15 @@ silica_rt_badarith:
 	mov	QWORD PTR [rbp - 8], rdi
 	test	rdi, rdi
 	jz	Lbadarith_process
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 40], rax
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	r10, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [r10 + 232], 1
 	mov	DWORD PTR [r10 + 152], 0
-	lea	rdi, [r10 + 80]
-	call	silica_rt_cv_signal
+	mov	rdi, r10
+	call	silica_rt_actor_mail_signal
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
@@ -1815,69 +1828,60 @@ Lbadarith_after_report:
 # spawn_linked, while this actor's start trampoline ran) proceeds: 2 = the init trampoline divided by zero. The ACB is
 # not freed under the spawner: it goes with its last holder (silica_rt_acb_release); a row child's
 # exit notice is parked at #400 until its spawner has committed it to the row.
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_signal_pending_call_deaths
 	mov	r10, QWORD PTR [rbp - 8]
 	cmp	QWORD PTR [r10 + 224], 0
 	jne	Lbadarith_started_set
-	mov	QWORD PTR [r10 + 224], 2
+	mov	rdi, r10
+	mov	esi, 2
+	call	silica_rt_started_store
 	jmp	Lbadarith_no_supervisor
 Lbadarith_started_set:
-# A notice parked at #400 (this row child ended before its spawner committed it) is not in the
-# supervisor's ingress yet: nothing to drain or wait for.
+# A carrier actor leaves the restart to its supervisor's own dispatch (see LBB1_exit); a dangerous
+# actor's thread restarts itself when its own notice is first in the ingress
+# (silica_rt_supervisor_drain_own_exit) and never waits for its replacement (a kill_abnormal
+# caller waits for this row's exit_done and then for the restart to settle). A notice parked at
+# #400 (this row child ended before its spawner committed it) is not in the ingress yet.
+	cmp	QWORD PTR [rbp - 40], 0
+	jne	Lbadarith_no_supervisor
 	mov	r10, QWORD PTR [rbp - 8]
 	cmp	QWORD PTR [r10 + 400], 1
 	jne	Lbadarith_no_supervisor
-	mov	r10, QWORD PTR [rbp - 8]
 	mov	r11, QWORD PTR [r10 + 192]
 	mov	QWORD PTR [rbp - 24], r11
 	test	r11, r11
 	jz	Lbadarith_no_supervisor
 	mov	rdi, r11
-	call	silica_rt_supervisor_drain_ingress
-	mov	r10, QWORD PTR [rbp - 8]
-	mov	r11, QWORD PTR [r10 + 208]
-	mov	QWORD PTR [rbp - 32], r11
-	test	r11, r11
-	jz	Lbadarith_no_supervisor
-	mov	rdi, QWORD PTR [rbp - 24]
-	call	silica_rt_sup_wait_enter
-	test	rdi, rdi
-	jz	Lbadarith_no_supervisor
-# Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
-# (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
-# restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
-# row (its policy restarts nothing); before, the child and that caller spun forever
-# (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
-# supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
-# keeps the rows until it stops: a row freed under the wait was read as a garbage child
-# (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
-Lbadarith_wait_new_child:
-	mov	r10, QWORD PTR [rbp - 24]
-	mov	eax, DWORD PTR [r10 + 152]
-	test	eax, eax
-	jz	Lbadarith_wait_done
-	mov	r11, QWORD PTR [rbp - 32]
-	mov	rdi, QWORD PTR [r11]
-	test	rdi, rdi
-	jz	Lbadarith_wait_done
-	cmp	rdi, QWORD PTR [rbp - 8]
-	je	Lbadarith_wait_new_child
-	mov	rax, QWORD PTR [rdi + 224]
-	test	rax, rax
-	jz	Lbadarith_wait_new_child
-Lbadarith_wait_done:
-	mov	rdi, QWORD PTR [rbp - 24]
-	call	silica_rt_sup_wait_leave
+	mov	rsi, r10
+	call	silica_rt_supervisor_drain_own_exit
 Lbadarith_no_supervisor:
-	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_actor_signal_pending_call_deaths
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_child_table_free
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_ffi_arena_teardown
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_dealloc_region
+	cmp	QWORD PTR [rbp - 40], 0
+	je	Lbadarith_release
+# Nothing of the actor waits any more: onto the carrier's stack with a fresh frame (this one is on
+# the reservation about to go), and the reservation is unmapped before the block can go.
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	r11, QWORD PTR [rbp - 40]
+	mov	rsp, QWORD PTR [r11 + 48]
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 40], r11
+	xor	esi, esi
+	call	silica_rt_actor_stack_free
+Lbadarith_release:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_final_release
+	cmp	QWORD PTR [rbp - 40], 0
+	je	Lbadarith_thread_exit
+	mov	rdi, QWORD PTR [rbp - 40]
+	jmp	silica_rt_carrier_loop_enter
 Lbadarith_thread_exit:
 	xor	edi, edi
 	call	pthread_exit
@@ -1903,7 +1907,8 @@ fn actor_rt_asm_case_clause_chunk() -> string {
 	.globl	silica_rt_case_clause
 	.p2align	2
 silica_rt_case_clause:
-# slots: [rbp-8] = x19 self, [rbp-16] = x20 deliver_exit result, [rbp-24] = x21 supervisor, [rbp-32] = x22 ACB[#208]
+# slots: [rbp-8] = x19 self, [rbp-16] = x20 deliver_exit result, [rbp-24] = x21 supervisor,
+# [rbp-40] = x23 the carrier (0 for a dangerous actor's thread)
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -1911,13 +1916,15 @@ silica_rt_case_clause:
 	mov	QWORD PTR [rbp - 8], rdi
 	test	rdi, rdi
 	jz	Lcaseclause_process
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 40], rax
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	r10, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [r10 + 232], 2
 	mov	DWORD PTR [r10 + 152], 0
-	lea	rdi, [r10 + 80]
-	call	silica_rt_cv_signal
+	mov	rdi, r10
+	call	silica_rt_actor_mail_signal
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
@@ -1942,69 +1949,60 @@ Lcaseclause_after_report:
 # spawn_linked, while this actor's start trampoline ran) proceeds: 2 = the init trampoline matched no case arm. The ACB is
 # not freed under the spawner: it goes with its last holder (silica_rt_acb_release); a row child's
 # exit notice is parked at #400 until its spawner has committed it to the row.
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_signal_pending_call_deaths
 	mov	r10, QWORD PTR [rbp - 8]
 	cmp	QWORD PTR [r10 + 224], 0
 	jne	Lcaseclause_started_set
-	mov	QWORD PTR [r10 + 224], 2
+	mov	rdi, r10
+	mov	esi, 2
+	call	silica_rt_started_store
 	jmp	Lcaseclause_no_supervisor
 Lcaseclause_started_set:
-# A notice parked at #400 (this row child ended before its spawner committed it) is not in the
-# supervisor's ingress yet: nothing to drain or wait for.
+# A carrier actor leaves the restart to its supervisor's own dispatch (see LBB1_exit); a dangerous
+# actor's thread restarts itself when its own notice is first in the ingress
+# (silica_rt_supervisor_drain_own_exit) and never waits for its replacement (a kill_abnormal
+# caller waits for this row's exit_done and then for the restart to settle). A notice parked at
+# #400 (this row child ended before its spawner committed it) is not in the ingress yet.
+	cmp	QWORD PTR [rbp - 40], 0
+	jne	Lcaseclause_no_supervisor
 	mov	r10, QWORD PTR [rbp - 8]
 	cmp	QWORD PTR [r10 + 400], 1
 	jne	Lcaseclause_no_supervisor
-	mov	r10, QWORD PTR [rbp - 8]
 	mov	r11, QWORD PTR [r10 + 192]
 	mov	QWORD PTR [rbp - 24], r11
 	test	r11, r11
 	jz	Lcaseclause_no_supervisor
 	mov	rdi, r11
-	call	silica_rt_supervisor_drain_ingress
-	mov	r10, QWORD PTR [rbp - 8]
-	mov	r11, QWORD PTR [r10 + 208]
-	mov	QWORD PTR [rbp - 32], r11
-	test	r11, r11
-	jz	Lcaseclause_no_supervisor
-	mov	rdi, QWORD PTR [rbp - 24]
-	call	silica_rt_sup_wait_enter
-	test	rdi, rdi
-	jz	Lcaseclause_no_supervisor
-# Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
-# (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
-# restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
-# row (its policy restarts nothing); before, the child and that caller spun forever
-# (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
-# supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
-# keeps the rows until it stops: a row freed under the wait was read as a garbage child
-# (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
-Lcaseclause_wait_new_child:
-	mov	r10, QWORD PTR [rbp - 24]
-	mov	eax, DWORD PTR [r10 + 152]
-	test	eax, eax
-	jz	Lcaseclause_wait_done
-	mov	r11, QWORD PTR [rbp - 32]
-	mov	rdi, QWORD PTR [r11]
-	test	rdi, rdi
-	jz	Lcaseclause_wait_done
-	cmp	rdi, QWORD PTR [rbp - 8]
-	je	Lcaseclause_wait_new_child
-	mov	rax, QWORD PTR [rdi + 224]
-	test	rax, rax
-	jz	Lcaseclause_wait_new_child
-Lcaseclause_wait_done:
-	mov	rdi, QWORD PTR [rbp - 24]
-	call	silica_rt_sup_wait_leave
+	mov	rsi, r10
+	call	silica_rt_supervisor_drain_own_exit
 Lcaseclause_no_supervisor:
-	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_actor_signal_pending_call_deaths
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_child_table_free
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_ffi_arena_teardown
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_dealloc_region
+	cmp	QWORD PTR [rbp - 40], 0
+	je	Lcaseclause_release
+# Nothing of the actor waits any more: onto the carrier's stack with a fresh frame (this one is on
+# the reservation about to go), and the reservation is unmapped before the block can go.
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	r11, QWORD PTR [rbp - 40]
+	mov	rsp, QWORD PTR [r11 + 48]
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 40], r11
+	xor	esi, esi
+	call	silica_rt_actor_stack_free
+Lcaseclause_release:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_final_release
+	cmp	QWORD PTR [rbp - 40], 0
+	je	Lcaseclause_thread_exit
+	mov	rdi, QWORD PTR [rbp - 40]
+	jmp	silica_rt_carrier_loop_enter
 Lcaseclause_thread_exit:
 	xor	edi, edi
 	call	pthread_exit
@@ -2101,15 +2099,17 @@ Lacbrel_ret:
 	.p2align	4
 silica_rt_actor_final_release:
 # rdi = an ended actor's ACB; the last act of its thread before it exits. Its identity stops resolving
-# (§15.1.4: a reference to it is dead from here on), its own hold goes, then its row's exit_done and
-# block reference (sb_child_done), then its hold on its supervisor.
-# slots: [rbp-8] = supervisor, [rbp-16] = row, [rbp-24] = ACB
+# (§15.1.4: a reference to it is dead from here on), its own hold goes, then its row's exit_done (=
+# its identity) and block reference (sb_child_done), then its hold on its supervisor.
+# slots: [rbp-8] = supervisor, [rbp-16] = row, [rbp-24] = ACB, [rbp-32] = its identity
 	push	rbp
 	mov	rbp, rsp
-	sub	rsp, 32
+	sub	rsp, 48
 	mov	QWORD PTR [rbp - 24], rdi
 	call	silica_rt_idt_remove
 	mov	rdi, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [rdi + 408]
+	mov	QWORD PTR [rbp - 32], rax
 	mov	rax, QWORD PTR [rdi + 192]
 	mov	QWORD PTR [rbp - 8], rax
 	mov	rcx, QWORD PTR [rdi + 208]
@@ -2118,6 +2118,7 @@ silica_rt_actor_final_release:
 	mov	QWORD PTR [rbp - 16], rcx
 	call	silica_rt_acb_release
 	mov	rdi, QWORD PTR [rbp - 16]
+	mov	rsi, QWORD PTR [rbp - 32]
 	call	silica_rt_sb_child_done
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_acb_release
@@ -2172,6 +2173,8 @@ silica_rt_dead_acb:
 	.quad	-1
 	.quad	0, 0
 	.quad	0, 0
+	.space	72
+	.quad	1
 	.text
 
 # silica_rt_registry_name_taken: a registered name was already held by a live actor or supervisor
@@ -2214,8 +2217,12 @@ Lbcx_none:
 silica_rt_convention_mismatch:
 silica_rt_language_error_current:
 silica_rt_registry_name_taken:
-# slots: [rbp-8] = x19 self, [rbp-16] = x20 deliver_exit result, [rbp-24] = x21 supervisor, [rbp-32] = x22 ACB[#208],
-# [rbp-40] = the exit reason tag (2 here, 4 from silica_rt_actor_not_found, which shares this body)
+# slots: [rbp-8] = x19 self, [rbp-16] = x20 deliver_exit result, [rbp-24] = x21 supervisor,
+# [rbp-40] = the exit reason tag (2 here, 4 from silica_rt_actor_not_found, which shares this body),
+# [rbp-48] = x23 the carrier (0 for a dangerous actor's thread). A carrier actor stays on its own
+# stack for the delivering phase (as silica_rt_badarith: a supervisor failing in its start
+# trampoline after some children were started shuts them down here, parking for each) and moves
+# to the carrier's stack only to unmap the reservation; the exit path ends in the carrier loop.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -2225,14 +2232,16 @@ silica_rt_registry_name_taken:
 	jz	Lnametaken_process
 	mov	QWORD PTR [rbp - 40], 2
 Lnametaken_fail_actor:
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 48], rax
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	r10, QWORD PTR [rbp - 8]
 	mov	rax, QWORD PTR [rbp - 40]
 	mov	QWORD PTR [r10 + 232], rax
 	mov	DWORD PTR [r10 + 152], 0
-	lea	rdi, [r10 + 80]
-	call	silica_rt_cv_signal
+	mov	rdi, r10
+	call	silica_rt_actor_mail_signal
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
@@ -2259,14 +2268,23 @@ Lnametaken_after_report:
 # row; its exit notice is parked at #400 for the spawner) and its ACB stays until its last holder lets
 # go (silica_rt_acb_release; before, the actor freed it at once and a spawner descheduled until then
 # spun on freed memory: working_registry_child_id_taken_across_supervisors hung in actor_spawn).
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_signal_pending_call_deaths
 	mov	r10, QWORD PTR [rbp - 8]
 	cmp	QWORD PTR [r10 + 224], 0
 	jne	Lnametaken_started_set
-	mov	QWORD PTR [r10 + 224], 2
+	mov	rdi, r10
+	mov	esi, 2
+	call	silica_rt_started_store
 	jmp	Lnametaken_no_supervisor
 Lnametaken_started_set:
-# A notice parked at #400 (this row child ended before its spawner committed it) is not in the
-# supervisor's ingress yet: nothing to drain or wait for.
+# A carrier actor leaves the restart to its supervisor's own dispatch (see LBB1_exit); a dangerous
+# actor's thread restarts itself when its own notice is first in the ingress
+# (silica_rt_supervisor_drain_own_exit) and never waits for its replacement (a kill_abnormal
+# caller waits for this row's exit_done and then for the restart to settle). A notice parked at
+# #400 (this row child ended before its spawner committed it) is not in the ingress yet.
+	cmp	QWORD PTR [rbp - 48], 0
+	jne	Lnametaken_no_supervisor
 	mov	r10, QWORD PTR [rbp - 8]
 	cmp	QWORD PTR [r10 + 400], 1
 	jne	Lnametaken_no_supervisor
@@ -2275,52 +2293,35 @@ Lnametaken_started_set:
 	test	r11, r11
 	jz	Lnametaken_no_supervisor
 	mov	rdi, r11
-	call	silica_rt_supervisor_drain_ingress
-	mov	r10, QWORD PTR [rbp - 8]
-	mov	r11, QWORD PTR [r10 + 208]
-	mov	QWORD PTR [rbp - 32], r11
-	test	r11, r11
-	jz	Lnametaken_no_supervisor
-	mov	rdi, QWORD PTR [rbp - 24]
-	call	silica_rt_sup_wait_enter
-	test	rdi, rdi
-	jz	Lnametaken_no_supervisor
-# Wait for the supervisor to start this row's replacement, so a caller blocked in kill_abnormal
-# (it waits for row.exit_done) sees it. The wait ends without one when the supervisor has ended (a
-# restart-intensity breach or a duplicate id, possibly decided on its own thread) or tombstoned the
-# row (its policy restarts nothing); before, the child and that caller spun forever
-# (supervisors_addition/phase_e_root_restart_cap_zero_no_drain). The child is counted in the
-# supervisor's block while it reads the row (sup_wait_enter/leave), so the supervisor's teardown
-# keeps the rows until it stops: a row freed under the wait was read as a garbage child
-# (linux_x86_64 fault in Lbadarith_wait_new_child, transient_worker_restarted_within_limit).
-Lnametaken_wait_new_child:
-	mov	r10, QWORD PTR [rbp - 24]
-	mov	eax, DWORD PTR [r10 + 152]
-	test	eax, eax
-	jz	Lnametaken_wait_done
-	mov	r11, QWORD PTR [rbp - 32]
-	mov	rdi, QWORD PTR [r11]
-	test	rdi, rdi
-	jz	Lnametaken_wait_done
-	cmp	rdi, QWORD PTR [rbp - 8]
-	je	Lnametaken_wait_new_child
-	mov	rax, QWORD PTR [rdi + 224]
-	test	rax, rax
-	jz	Lnametaken_wait_new_child
-Lnametaken_wait_done:
-	mov	rdi, QWORD PTR [rbp - 24]
-	call	silica_rt_sup_wait_leave
+	mov	rsi, r10
+	call	silica_rt_supervisor_drain_own_exit
 Lnametaken_no_supervisor:
-	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_actor_signal_pending_call_deaths
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_child_table_free
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_ffi_arena_teardown
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_dealloc_region
+	cmp	QWORD PTR [rbp - 48], 0
+	je	Lnametaken_release
+# Nothing of the actor waits any more: onto the carrier's stack with a fresh frame (this one is on
+# the reservation about to go), and the reservation is unmapped before the block can go.
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	r11, QWORD PTR [rbp - 48]
+	mov	rsp, QWORD PTR [r11 + 48]
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 48], r11
+	xor	esi, esi
+	call	silica_rt_actor_stack_free
+Lnametaken_release:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_final_release
+	cmp	QWORD PTR [rbp - 48], 0
+	je	Lnametaken_thread_exit
+	mov	rdi, QWORD PTR [rbp - 48]
+	jmp	silica_rt_carrier_loop_enter
 Lnametaken_thread_exit:
 	xor	edi, edi
 	call	pthread_exit
