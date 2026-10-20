@@ -207,8 +207,11 @@
 //     silica_rt_row_exit_done_store, or a token release) holds it to take the list and never holds
 //     it while it takes an actor's lock; a stop holds the actor's lock and then the wait lock to
 //     unlink. The check and the push are one critical section, so no wake is lost. A wait entered
-//     while the thread's current actor was another (an ingress drain installs the supervisor)
-//     restores that actor after the resume. Anything that is not a carrier actor on its own stack
+//     while the thread's current actor was another restores that actor after the resume (no
+//     runtime path installs another actor any more: an ingress drain used to install the
+//     supervisor, until 2026-10-20; the supervisor is passed explicitly instead, so the drainer
+//     stays the current actor and every park decision is by the carrier's running actor,
+//     silica_rt_carrier_self_on_own_stack). Anything that is not a carrier actor on its own stack
 //     spins (main, a dangerous actor's thread). A carrier actor on the carrier's own stack that
 //     would spin for another carrier actor is a runtime abort (Lrw_spin): with every waiting
 //     path above moved onto the actor's own stack it is unreachable, and it is kept as the
@@ -984,25 +987,21 @@ silica_rt_spawn_wait_started:
 // X0 = a child just spawned. Returns once its started word (#224) is set (at adoption for a plain
 // actor; after the trampoline of its first dispatch for a supervisor). A carrier actor on its own
 // stack parks (the child's started store wakes it); anything else spins (main spawning a root
-// supervisor, a dangerous actor's thread), as the spawn always did.
+// supervisor, a dangerous actor's thread), as the spawn always did. The parker is the actor this
+// carrier runs, on whose stack this runs (silica_rt_carrier_self_on_own_stack: carrier +40 and
+// the SP), never the thread's current actor: a respawn from a drain of a supervisor's ingress on
+// another actor's stack would otherwise have spun (and, with the child bound to this carrier,
+// never seen it start).
 	stp	x29, x30, [sp, #-48]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
 	str	x21, [sp, #32]
 	mov	x19, x0
-	bl	silica_rt_tls_current_actor_get
+	bl	silica_rt_carrier_self_on_own_stack
 	mov	x20, x0
 	cbz	x20, Lsws_spin
 	ldr	x21, [x20, #440]
 	cbz	x21, Lsws_spin
-	mov	x9, sp
-	ldr	x10, [x20, #272]
-	cmp	x9, x10
-	b.lo	Lsws_spin
-	ldr	x11, [x20, #280]
-	add	x10, x10, x11
-	cmp	x9, x10
-	b.hs	Lsws_spin
 	str	x20, [x19, #472]
 	dmb	ish
 Lsws_park_loop:
@@ -1144,7 +1143,9 @@ silica_rt_wait_park:
 	b	silica_rt_carrier_loop_enter
 Lwpk_resumed:
 // The carrier made this actor the thread's current actor at the resume; the wait was entered with
-// X21 as the current actor (the supervisor, in an ingress drain).
+// X21 as the current actor (the actor itself since 2026-10-20: no drain installs the supervisor
+// any more, prims_actors_child_table_asm.silica supervisor_handle_notice; the restore is kept
+// for any future caller that parks with another actor installed).
 	cmp	x21, x19
 	b.eq	Lwpk_ret
 	mov	x0, x21
@@ -1462,8 +1463,12 @@ Lsrr_ret:
 silica_rt_sup_restart_acquire:
 // X0 = a supervisor, X1 = the actor asking (0 = main), X2 = 1 to take the restart token, 0 to wait
 // until the token is free and the ingress is empty (a row child of this supervisor never takes the
-// token: the cascade it would run could stop the child itself; it waits for the holder, the
-// supervisor's own dispatch or another drainer, to finish). -> X0 = 1 taken / settled, 2 when X1
+// token to DRAIN: the cascade it would run could stop the child itself; it waits for the holder,
+// the supervisor's own dispatch or another drainer, to finish), 2 to take the token only once the
+// ingress is empty (a row child holding the token across a terminate_child / restart_child of a
+// sibling, supervisor_drain_hold: it waits as with 0, then holds with nothing to drain, so no
+// cascade of a pending notice runs on it; a notice that arrives while it holds the token is the
+// supervisor's own dispatch's after the release). -> X0 = 1 taken / settled, 2 when X1
 // was ended while it waited (its supervisor's cascade stops it: the caller's wait is over), 0 when
 // the supervisor has no block or has ended (nothing to drain or wait for). A carrier actor on its
 // own stack parks on the block's wait list (+128; a release wakes it, so does a stop of the
@@ -1509,6 +1514,15 @@ Lsra_self_ok:
 	ldr	x9, [x8, #120]
 	cbnz	x9, Lsra_wait
 	cbz	x21, Lsra_settle
+	cmp	x21, #2
+	b.ne	Lsra_take_now
+// Mode 2: the token is free; take it only with an empty ingress, else wait for the supervisor's
+// dispatch to serve the notices (each release wakes this actor to look again).
+	ldr	x9, [x8]
+	ldr	x10, [x8, #8]
+	orr	x9, x9, x10
+	cbnz	x9, Lsra_wait
+Lsra_take_now:
 	mov	x9, x20
 	cbnz	x9, Lsra_take
 	mov	x9, #1

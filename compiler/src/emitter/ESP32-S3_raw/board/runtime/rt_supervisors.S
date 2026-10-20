@@ -1695,7 +1695,13 @@ silica_rt_supervisor_which_children:
     retw
     .size   silica_rt_supervisor_which_children, . - silica_rt_supervisor_which_children
 
-// silica_rt_supervisor_terminate_child / remove_child (X0 sup, X1 id) -> 0
+// silica_rt_supervisor_terminate_child / remove_child (X0 sup, X1 id) -> 0, or -2 when the running
+// actor is a row child of this supervisor naming its own row: it would end itself and then wait,
+// in silica_rt_supervisor_stop_child, for an exit only it can complete (the running actor ends
+// after its behaviour returns, silica_rt_end_actor). The lowering turns -2 into the error reply
+// (tag :error, error :language_error; silica_rt_sup_op_tag and its siblings below) and nothing
+// is stopped. Main (no running actor), a sibling, an unrelated actor and the supervisor itself go
+// on as before.
     .align  4
     .global silica_rt_supervisor_terminate_child
     .global silica_rt_supervisor_remove_child
@@ -1713,6 +1719,19 @@ silica_rt_supervisor_remove_child:
     mov     a10, a6
     call8   silica_rt_child_table_enter
     mov     a10, a6
+    mov     a11, a7
+    call8   silica_rt_live_row_by_id
+    beqz    a10, 1f
+    mov     a5, a10
+    call8   silica_rt_current_actor
+    l32i    a4, a5, ROW_CHILD
+    bne     a4, a10, 1f
+    movi    a2, -2
+    movi    a3, -1
+    mov     a10, a6
+    call8   silica_rt_child_table_leave
+    retw
+1:  mov     a10, a6
     call8   silica_rt_supervisor_drain_ingress
     mov     a10, a6
     mov     a11, a7
@@ -1731,7 +1750,73 @@ silica_rt_supervisor_remove_child:
     retw
     .size   silica_rt_supervisor_terminate_child, . - silica_rt_supervisor_terminate_child
 
-// silica_rt_supervisor_restart_child(X0 sup, X1 id) -> the restarted child (0 when the id is unknown)
+// The reply fields of call_supervisor's :terminate_child / :remove_child / :restart_child
+// (terms_actor_lowering build_call_supervisor_op_reply): the operation answers -2 when the asking
+// actor is a row child of the supervisor naming its own row (above and below), and the reply is
+// then the error shape (tag :error, status :error, error :language_error, child 0) instead of
+// the operation's own. The atoms are the image's words (silica_rt_sup_error_tag, this build's
+// :error or -1; silica_rt_sup_self_error_atom, :language_error), emitted with the registry words
+// (emitter_core.silica xt_runtime_registry_words), so no program's atom table gains an atom.
+// silica_rt_sup_op_tag(X0 = the operation's answer, X1 = the tag or status of the operation's
+// own reply) -> X1, or this build's :error for the -2 answer.
+    .align  4
+    .global silica_rt_sup_op_tag
+    .type   silica_rt_sup_op_tag, @function
+silica_rt_sup_op_tag:
+    entry   a1, 32
+    movi    a6, -2
+    bne     a2, a6, 1f
+    movi    a6, -1
+    bne     a3, a6, 1f
+    movi    a6, silica_rt_sup_error_tag
+    l32i    a4, a6, 0
+    srai    a5, a4, 31
+1:  mov     a2, a4
+    mov     a3, a5
+    retw
+    .size   silica_rt_sup_op_tag, . - silica_rt_sup_op_tag
+
+// silica_rt_sup_op_error(X0 = the answer, X1 = the error atom of the operation's own reply, :ok)
+// -> X1, or :language_error for the -2 answer.
+    .align  4
+    .global silica_rt_sup_op_error
+    .type   silica_rt_sup_op_error, @function
+silica_rt_sup_op_error:
+    entry   a1, 32
+    movi    a6, -2
+    bne     a2, a6, 1f
+    movi    a6, -1
+    bne     a3, a6, 1f
+    movi    a6, silica_rt_sup_self_error_atom
+    l32i    a4, a6, 0
+    srai    a5, a4, 31
+1:  mov     a2, a4
+    mov     a3, a5
+    retw
+    .size   silica_rt_sup_op_error, . - silica_rt_sup_op_error
+
+// silica_rt_sup_op_child(X0 = :restart_child's answer: the started child's identity, all ones for
+// no child) -> the answer, or 0 (the error reply's child) for the -2 answer.
+    .align  4
+    .global silica_rt_sup_op_child
+    .type   silica_rt_sup_op_child, @function
+silica_rt_sup_op_child:
+    entry   a1, 32
+    movi    a6, -2
+    bne     a2, a6, 1f
+    movi    a6, -1
+    bne     a3, a6, 1f
+    movi    a2, 0
+    movi    a3, 0
+1:  retw
+    .size   silica_rt_sup_op_child, . - silica_rt_sup_op_child
+
+// silica_rt_supervisor_restart_child(X0 sup, X1 id) -> the restarted child (all ones when the id is
+// unknown), or -2 when the running actor is a row child of this supervisor whose restart would stop
+// its own row: its own id named or, under :one_for_all, any id a row bears (the group it is in is
+// stopped and respawned). It would wait in silica_rt_supervisor_stop_child for an exit only it can
+// complete (as terminate_child above); the lowering turns -2 into the error reply and nothing is
+// stopped.
     .align  4
     .global silica_rt_supervisor_restart_child
     .type   silica_rt_supervisor_restart_child, @function
@@ -1746,7 +1831,37 @@ silica_rt_supervisor_restart_child:
     mov     a7, a4
     mov     a10, a6
     call8   silica_rt_child_table_enter
+    // the self check: the row of this supervisor whose child is the running actor, if any
+    call8   silica_rt_current_actor
+    beqz    a10, 4f
+    mov     a4, a10
+    l32i    a5, a6, ACB_SB
+    beqz    a5, 4f
+    l32i    a5, a5, SB_CT_HEAD
+41: beqz    a5, 4f
+    l32i    a8, a5, ROW_CHILD
+    beq     a8, a4, 42f
+    l32i    a5, a5, ROW_NEXT
+    j       41b
+42: l32i    a8, a5, ROW_ID               // its own id, or under :one_for_all any id a row bears
+    beq     a8, a7, 7f
+    l32i    a8, a6, ACB_SB
+    l32i    a8, a8, SB_STRATEGY
+    movi    a9, ATOM_ONE_FOR_ALL
+    bne     a8, a9, 4f
+    l32i    a5, a6, ACB_SB
+    l32i    a5, a5, SB_CT_HEAD
+43: beqz    a5, 4f
+    l32i    a8, a5, ROW_ID
+    beq     a8, a7, 7f
+    l32i    a5, a5, ROW_NEXT
+    j       43b
+7:  movi    a2, -2
+    movi    a3, -1
     mov     a10, a6
+    call8   silica_rt_child_table_leave
+    retw
+4:  mov     a10, a6
     call8   silica_rt_supervisor_drain_ingress
     // the row with this id, live or tombstoned
     l32i    a5, a6, ACB_SB

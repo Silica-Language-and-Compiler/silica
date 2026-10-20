@@ -387,6 +387,15 @@ silica_rt_reply_tag:
     .weak   silica_rt_no_reply_tag
 silica_rt_no_reply_tag:
     .word   -1
+    // call_supervisor's error reply for a supervisor operation a row child aimed at its own row
+    // (rt_supervisors.S silica_rt_sup_op_tag): this build's :error (-1 when the program never
+    // spells it) and :language_error (4, fixed in every build: the prefix above).
+    .weak   silica_rt_sup_error_tag
+silica_rt_sup_error_tag:
+    .word   -1
+    .weak   silica_rt_sup_self_error_atom
+silica_rt_sup_self_error_atom:
+    .word   4
     .text
 #define INGRESS_LIMIT         1024
 

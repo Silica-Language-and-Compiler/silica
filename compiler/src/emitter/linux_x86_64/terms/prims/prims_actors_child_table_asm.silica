@@ -620,12 +620,23 @@ fn child_table_rt_asm_chunk_2(danger_idx: int64) -> string {
     pre: string <- "	.globl	silica_rt_supervisor_start_child
 	.p2align	2
 silica_rt_supervisor_start_child:
+# The builtin start_child(spec): the supervisor is the thread's current actor (the supervisor's own
+# init or behaviour). rsi = 0 asks the body to read it.
+	xor	esi, esi
+	jmp	silica_rt_supervisor_start_child_in
+	.globl	silica_rt_supervisor_start_child_in
+	.p2align	2
+silica_rt_supervisor_start_child_in:
+# rdi = child_spec, rsi = the supervisor (0 = the thread's current actor). supervisor_add_child
+# names it, so that a call_supervisor :add_child from any actor leaves that actor the current
+# one (supervisor_handle_notice).
 # Phase E e4f: the frame also keeps x27 (row_ptr) and x28 (appended flag) so we can
 # locate / allocate the table row first, then call spawn_linked with X3 = row_ptr.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 16], rdi
+	mov	QWORD PTR [rbp - 8], rsi
 	mov	rax, QWORD PTR [rdi + 8]
 	mov	QWORD PTR [rbp - 24], rax
 	mov	rax, QWORD PTR [rdi + 16]
@@ -643,9 +654,13 @@ silica_rt_supervisor_start_child:
 	test	rax, rax
 	jnz	Lsc_id_taken
 Lsc_tls_prep:
+	cmp	QWORD PTR [rbp - 8], 0
+	jne	Lsc_have_sup
 	call	silica_rt_tls_current_actor_get
 	mov	QWORD PTR [rbp - 8], rdi
+Lsc_have_sup:
 # Phase E e4f + Option B: tombstone scan / append on singly-linked row nodes (+80).
+	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_sb_require
 	mov	r8, QWORD PTR [rdi + 24]
 	mov	r9, QWORD PTR [rdi + 32]
@@ -732,10 +747,17 @@ Lsc_ret:
 fn child_table_rt_asm_chunk_2b() -> string {
     "	.p2align	2
 # silica_rt_supervisor_handle_notice(rdi = supervisor, rsi = its ingress node, rdx = the exit notice
-# payload): maybe_restart with the supervisor installed as the thread's current actor (the row
-# walks and spawns read it), the previous one restored after; then the payload (and its hold on
-# the ended child) and the node go. [rbp-8] supervisor (x24), [rbp-16] node (x22), [rbp-24]
-# payload (x21), [rbp-32] the previous current actor (x23).
+# payload): maybe_restart on the draining actor's stack, then the payload (and its hold on the
+# ended child) and the node go. The thread's current actor stays the drainer (or none, for main):
+# the supervisor is passed to maybe_restart (rsi) and from there to every row walk and respawn
+# (respawn_row, spawn_child_row_by_flavor, actor_spawn_linked_row r9, which also names the
+# supervisor's stack policy for the child), so nothing attributed to the current actor during
+# the drain (a failure of the drainer, a fault's report, a park decision, self()) names the
+# supervisor. Until 2026-10-20 the supervisor was installed as the current actor here for the
+# duration (and in add_child), which made a respawn's wait for a child supervisor's start spin
+# instead of park (spawn_wait_started read the current actor) and would have failed the
+# supervisor, on the drainer's stack, for a failure of the drainer.
+# [rbp-8] supervisor (x24), [rbp-16] node (x22), [rbp-24] payload (x21).
 silica_rt_supervisor_handle_notice:
 	push	rbp
 	mov	rbp, rsp
@@ -743,17 +765,11 @@ silica_rt_supervisor_handle_notice:
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rbp - 16], rsi
 	mov	QWORD PTR [rbp - 24], rdx
-	call	silica_rt_tls_current_actor_get
-	mov	QWORD PTR [rbp - 32], rdi
-	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_tls_actor_set
 	mov	rax, QWORD PTR [rbp - 24]
 	mov	rdi, QWORD PTR [rax]
 	mov	rsi, QWORD PTR [rbp - 8]
 	mov	rdx, QWORD PTR [rax + 8]
 	call	silica_rt_supervisor_maybe_restart
-	mov	rdi, QWORD PTR [rbp - 32]
-	call	silica_rt_tls_actor_set
 	mov	rdi, QWORD PTR [rbp - 24]
 	call	silica_rt_exit_payload_free
 	mov	rdi, QWORD PTR [rbp - 16]
@@ -859,7 +875,10 @@ Lsdi_ret:
 # when the caller holds the restart token after draining (the operations that stop or respawn
 # rows, terminate_child and restart_child, hold it across their work and release it after), 0 when
 # the supervisor has ended or has no block, or the caller was ended while it waited (nothing
-# drained, nothing held). [rbp-8] supervisor (x19).
+# drained, nothing held). A row child of this supervisor never drains (the rule of
+# drain_ingress: a pending notice's cascade could stop the child itself, and it would then wait
+# for its own exit): it takes the token only once the ingress is empty (acquire mode 2) and holds
+# it with nothing to drain. [rbp-8] supervisor (x19).
 	.p2align	2
 silica_rt_supervisor_drain_hold:
 	push	rbp
@@ -867,6 +886,14 @@ silica_rt_supervisor_drain_hold:
 	sub	rsp, 16
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	edx, 1
+	test	rsi, rsi
+	jz	Lsdh_acquire
+	cmp	QWORD PTR [rsi + 192], rdi
+	jne	Lsdh_acquire
+	cmp	QWORD PTR [rsi + 208], 4096
+	jb	Lsdh_acquire
+	mov	edx, 2
+Lsdh_acquire:
 	call	silica_rt_sup_restart_acquire
 	cmp	rdi, 1
 	jne	Lsdh_no
@@ -981,18 +1008,11 @@ silica_rt_supervisor_add_child_acb:
 	call	silica_rt_registry_name_held
 	test	rax, rax
 	jnz	Ladd_child_duplicate
-	mov	rax, QWORD PTR [rbp - 16]
-	mov	QWORD PTR [rbp - 8], rax
-	mov	rdi, rax
-	call	silica_rt_tls_actor_set_from_x19
+# The supervisor is named to start_child (rsi) and stays off the thread's current actor, as in
+# supervisor_handle_notice: the asking actor remains what a failure or a park is attributed to.
 	mov	rdi, QWORD PTR [rbp - 24]
-	call	silica_rt_supervisor_start_child
-	mov	QWORD PTR [rbp - 16], rdi
-	mov	rax, QWORD PTR [rbp - 32]
-	mov	QWORD PTR [rbp - 8], rax
-	mov	rdi, rax
-	call	silica_rt_tls_actor_set_from_x19
-	mov	rdi, QWORD PTR [rbp - 16]
+	mov	rsi, QWORD PTR [rbp - 16]
+	call	silica_rt_supervisor_start_child_in
 	leave
 	ret
 Ladd_child_duplicate:
@@ -1550,7 +1570,14 @@ fn child_table_rt_asm_chunk_6(ofa_idx: int64) -> string {
             true -> "";
             false -> concat(concat("	mov	rax, QWORD PTR [rbp - 8]\n	mov	rax, QWORD PTR [rax + 216]\n	mov	r8, QWORD PTR [rax + 56]\n	cmp	r8, ", atom_table@int64_to_decimal_string(ofa_idx)), "\n	je	Lsrestart_ofa\n")
         };
-        concat(concat("	.globl	silica_rt_supervisor_count_children
+        // The self check's :one_for_all arm (restart_child_acb): a row child asking for the group it
+        // is in, by any id a row bears. A program that never spells :one_for_all has no such group.
+        // rdi (the current actor) is kept for Lsrestart_not_self.
+        ofa_self_branch: string <- case ofa_idx < 0 of {
+            true -> "";
+            false -> concat(concat("	mov	rax, QWORD PTR [rbp - 8]\n	mov	rax, QWORD PTR [rax + 216]\n	mov	r8, QWORD PTR [rax + 56]\n	cmp	r8, ", atom_table@int64_to_decimal_string(ofa_idx)), "\n	jne	Lsrestart_not_self\n	mov	r9, QWORD PTR [rax + 24]\nLsrestart_self_find:\n	test	r9, r9\n	jz	Lsrestart_not_self\n	mov	r8, QWORD PTR [r9 + 8]\n	cmp	r8, QWORD PTR [rbp - 16]\n	je	Lsrestart_self\n	mov	r9, QWORD PTR [r9 + 80]\n	jmp	Lsrestart_self_find\n")
+        };
+        concat(concat(concat(concat("	.globl	silica_rt_supervisor_count_children
 	.p2align	2
 silica_rt_supervisor_count_children:
 # rdi = the supervisor's reference: resolved and held for the body (silica_rt_sup_ref_call; an ended
@@ -1976,6 +2003,24 @@ silica_rt_supervisor_terminate_child_acb:
 # The restart token is held across the stop and the wait (no cascade runs meanwhile); 0 = the
 # supervisor has ended, has no block, or this caller was ended while it waited: nothing to do.
 	call	silica_rt_tls_current_actor_get
+# A row child of this supervisor naming its own row (its row, ACB #208, still holds it and bears
+# the id) would stop itself and wait for an exit only it can complete: answered at once with -2,
+# which the lowering turns into the error reply (tag :error, error :language_error), and nothing
+# is stopped. Anything else (main, a sibling, an unrelated actor, the supervisor) goes on.
+	test	rdi, rdi
+	jz	Lsterm_not_self
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [rdi + 192], rax
+	jne	Lsterm_not_self
+	mov	rcx, QWORD PTR [rdi + 208]
+	cmp	rcx, 4096
+	jb	Lsterm_not_self
+	cmp	QWORD PTR [rcx], rdi
+	jne	Lsterm_not_self
+	mov	rax, QWORD PTR [rcx + 8]
+	cmp	rax, QWORD PTR [rbp - 16]
+	je	Lsterm_self
+Lsterm_not_self:
 	mov	rsi, rdi
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_supervisor_drain_hold
@@ -2028,6 +2073,10 @@ Lsterm_release:
 	call	silica_rt_sup_restart_release
 Lsterm_done:
 	xor	edi, edi
+	jmp	Lsterm_ret
+Lsterm_self:
+	mov	rdi, -2
+Lsterm_ret:
 	leave
 	ret
 	.globl	silica_rt_supervisor_remove_child
@@ -2064,10 +2113,31 @@ silica_rt_supervisor_restart_child_acb:
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rbp - 16], rsi
+	mov	QWORD PTR [rbp - 24], 0
 # The restart token is held across the stops and the respawns (no cascade runs meanwhile;
 # [rbp - 24] = 1 while held); 0 = the supervisor has ended, has no block, or this caller was ended
 # while it waited: no child.
 	call	silica_rt_tls_current_actor_get
+# A row child of this supervisor (its row, ACB #208, still holds it) whose restart would stop its
+# own row, its own id named or, under :one_for_all, any row's id that exists (the group it is in
+# is stopped and respawned), would wait for an exit only it can complete: answered at once with
+# -2, the error reply (tag :error, error :language_error), and nothing is stopped. An id no row
+# bears keeps its answer (-1, no child); anything else (main, a sibling, an unrelated actor, the
+# supervisor) goes on.
+	test	rdi, rdi
+	jz	Lsrestart_not_self
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [rdi + 192], rax
+	jne	Lsrestart_not_self
+	mov	rcx, QWORD PTR [rdi + 208]
+	cmp	rcx, 4096
+	jb	Lsrestart_not_self
+	cmp	QWORD PTR [rcx], rdi
+	jne	Lsrestart_not_self
+	mov	rax, QWORD PTR [rcx + 8]
+	cmp	rax, QWORD PTR [rbp - 16]
+	je	Lsrestart_self
+", ofa_self_branch), "Lsrestart_not_self:
 	mov	rsi, rdi
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_supervisor_drain_hold
@@ -2088,7 +2158,7 @@ Lsrestart_find:
 	mov	r8, QWORD PTR [rax + 8]
 	cmp	r8, QWORD PTR [rbp - 16]
 	jne	Lsrestart_next
-", ofa_branch), "	mov	rax, QWORD PTR [rbp - 40]
+"), ofa_branch), "	mov	rax, QWORD PTR [rbp - 40]
 	mov	rcx, QWORD PTR [rax]
 	mov	QWORD PTR [rbp - 32], rcx
 	test	rcx, rcx
@@ -2200,6 +2270,9 @@ Lsrestart_next:
 	jmp	Lsrestart_find
 Lsrestart_none:
 	mov	rdi, -1
+	jmp	Lsrestart_done
+Lsrestart_self:
+	mov	rdi, -2
 Lsrestart_done:
 	mov	QWORD PTR [rbp - 72], rdi
 	cmp	QWORD PTR [rbp - 24], 0

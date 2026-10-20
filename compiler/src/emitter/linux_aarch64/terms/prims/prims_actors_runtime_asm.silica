@@ -403,9 +403,18 @@ Lslp_skip_list:
 // OS_UNFAIR_LOCK_INIT == 0, seq baseline 0; no init call required.
 	mov	w8, #1
 	str	w8, [x19, #152]
-// Children started from child specs inherit the spawning actor's stack policy (X1 = 0).
+// Children started from child specs inherit the spawning actor's stack policy: a row child its
+// supervisor's (X5, #360; the default, 2, when it has none), named here rather than read from the
+// thread's current actor (X1 = 0), since a row is respawned from any actor's drain of the
+// supervisor's ingress (prims_actors_child_table_asm.silica, supervisor_drain_ingress), which no
+// longer installs the supervisor as the current actor; anything else the current actor's.
 	mov	x0, x19
 	mov	x1, xzr
+	cbz	x25, Lslp_policy
+	ldr	x1, [x25, #360]
+	cbnz	x1, Lslp_policy
+	mov	x1, #2
+Lslp_policy:
 	bl	silica_rt_actor_stack_reserve
 	cbnz	x0, LBBsl_reserve_failed
 	bl	silica_rt_install_sync_fault_handlers
@@ -604,11 +613,17 @@ LBB1_wait:
 	mov	x20, x0
 	cbz	x20, LBB1_try_std
 	ldr	x8, [x19, #216]
-	str	x19, [x8, #120]
 	ldr	w9, [x8, #16]
 	sub	w9, w9, #1
 	str	w9, [x8, #16]
 	mov	w21, #1
+// A Phase B trial-hook node (+24 != 0: an inline int64 the behaviour runs on, no restart) does
+// not take the token: both of its result paths clear w22 so that the new state is stored, and
+// neither LBB1_free nor the reply path would release it, so a token taken here stayed held for
+// the rest of the actor's life. Only an exit notice (+24 == 0) takes it.
+	ldr	w9, [x20, #24]
+	cbnz	w9, LBB1_process
+	str	x19, [x8, #120]
 	b	LBB1_process
 LBB1_try_std:
 	ldr	w9, [x19, #152]
@@ -876,8 +891,9 @@ LBB1_reply_drain_done:
 	b	LBB1_again
 LBB1_free:
 // An ingress node (w22 == 1) was served at LBB1_ingress_no_beh (an exit notice: its payload is
-// gone and +8 cleared) or by the behaviour (the Phase B trial hook, +24 != 0, +8 an inline
-// int64): only the restart token taken with it is left to release.
+// gone and +8 cleared): only the restart token taken with it is left to release. A Phase B
+// trial-hook node (+24 != 0, +8 an inline int64) was run by the behaviour, which cleared w22,
+// and took no token at LBB1_wait.
 	cbz	w22, LBB1_free_skip_restart
 LBB1_free_release:
 // The ingress node is served: the restart token taken with it (LBB1_wait) goes.
@@ -4972,6 +4988,13 @@ fn actor_rt_pid_registry_chunk(table: { is_empty: boolean, index_map: { root: re
     slots: string <- atom_table@int64_to_decimal_string(atom_table@atom_count(table));
     reply_tag: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":reply"));
     no_reply_tag: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":no_reply"));
+    // call_supervisor's error reply for an operation a row child aimed at itself (the supervisor
+    // operations, prims_actors_child_table_asm.silica): the tag :error as this build spells it (-1
+    // when the program never spells it: no arm of its can name that tag) and the reason atom,
+    // :language_error, a fixed atom of every build (atom_table seed_actor_runtime_atoms). Published
+    // words rather than SIR atom constants so that no program's atom table gains an atom.
+    sup_error_tag: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":error"));
+    sup_self_error_atom: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":language_error"));
     p0: string <- "
 // The registry slot count of this image: one slot per atom of the build (atoms/atom_table.silica
 // build_runtime_atom_table; actor_memory_budget_plan.md item J). Atoms are interned when the program
@@ -4991,8 +5014,56 @@ silica_rt_reply_tag:
 	.globl	silica_rt_no_reply_tag
 silica_rt_no_reply_tag:
 	.quad	"), no_reply_tag);
-    p0c: string <- concat(p0b, "
+    p0b2: string <- concat(concat(concat(concat(p0b, "
+	.globl	silica_rt_sup_error_tag
+silica_rt_sup_error_tag:
+	.quad	"), sup_error_tag), "
+	.globl	silica_rt_sup_self_error_atom
+silica_rt_sup_self_error_atom:
+	.quad	"), sup_self_error_atom);
+    p0c: string <- concat(p0b2, "
 	.text
+// The reply fields of call_supervisor's :terminate_child / :remove_child / :restart_child
+// (terms_actor_lowering): the operation answers -2 when the asking actor is a row child of the
+// supervisor and the operation would stop its own row (prims_actors_child_table_asm.silica,
+// Lsterm_self / Lsrestart_self), and the reply is then the error shape (tag :error, status
+// :error, error :language_error, child 0) instead of the operation's own.
+// silica_rt_sup_op_tag(X0 = the operation's answer, X1 = the tag or status of the operation's
+// own reply) -> X0 = X1, or this build's :error for the -2 answer. Leaf.
+	.globl	silica_rt_sup_op_tag
+	.p2align	2
+silica_rt_sup_op_tag:
+	cmn	x0, #2
+	b.ne	Lsot_own
+	adrp	x8, silica_rt_sup_error_tag
+	add	x8, x8, :lo12:silica_rt_sup_error_tag
+	ldr	x1, [x8]
+Lsot_own:
+	mov	x0, x1
+	ret
+// silica_rt_sup_op_error(X0 = the answer, X1 = the error atom of the operation's own reply,
+// :ok) -> X0 = X1, or :language_error for the -2 answer. Leaf.
+	.globl	silica_rt_sup_op_error
+	.p2align	2
+silica_rt_sup_op_error:
+	cmn	x0, #2
+	b.ne	Lsoe_own
+	adrp	x8, silica_rt_sup_self_error_atom
+	add	x8, x8, :lo12:silica_rt_sup_self_error_atom
+	ldr	x1, [x8]
+Lsoe_own:
+	mov	x0, x1
+	ret
+// silica_rt_sup_op_child(X0 = :restart_child's answer: the started child's identity, -1 for no
+// child) -> X0 = the answer, or 0 (the error reply's child) for the -2 answer. Leaf.
+	.globl	silica_rt_sup_op_child
+	.p2align	2
+silica_rt_sup_op_child:
+	cmn	x0, #2
+	b.ne	Lsoc_own
+	mov	x0, xzr
+Lsoc_own:
+	ret
 // PID registry primitive actor (spec §20.3.1).
 // State layout: one calloc block of silica_registry_slots * 16 B: occ[slots] (int64, 1 = held) at +0,
 // actor_ref words[slots] at +slots*8. The same block is read directly by the keyed forms and by
