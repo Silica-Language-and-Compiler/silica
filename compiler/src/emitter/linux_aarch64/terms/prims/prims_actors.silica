@@ -221,7 +221,7 @@ fn is_actor_prim(name: string) -> bool {
         or name == "register_failure_reporter"
         or name == "wait_for_exit" or name == "cast_exit"
         or name == "stack_policy"
-        or name == "heap_used"
+        or name == "heap_used" or name == "actor_carrier_index"
 }
 
 fn actor_prim_is_nullary(name: string) -> bool {
@@ -238,6 +238,7 @@ fn actor_prim_is_unary(name: string) -> bool {
         or name == "start_child" or name == "kill_abnormal" or name == "child_table_row_ref"
         or name == "supervisor_which_children" or name == "supervisor_count_children"
         or name == "register_failure_reporter" or name == "set_scheduler_policy" or name == "cast_exit"
+        or name == "actor_carrier_index"
 }
 
 fn asm_bl(label: string) -> string {
@@ -690,22 +691,36 @@ fn actor_message_copy_x10(term: { nodes: List[{ kind: int64, type_name: string, 
     }
 }
 
-// spawn / spawn_dangerous: X0 init, X1 beh, W2 core (0 default), X3 supervisor trampoline, X4 stack_policy.
-fn emit_spawn(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+// spawn / spawn_dangerous / spawn_device: X0 init, X1 beh, W2 core (0 default), X3 supervisor
+// trampoline, X4 stack_policy. The runtime entry is the prim's: silica_rt_actor_spawn binds the
+// actor to a carrier; silica_rt_actor_spawn_dangerous (spawn_dangerous) gives it a thread of its
+// own, since a dangerous actor's foreign call may block and its guarded-FFI recovery state is per
+// thread (actor_memory_budget_plan.md item N; spec §15.4.13.5). A device actor does no foreign
+// call (silica_device_actor_specification.md: disjoint from dangerous) and is a carrier actor.
+fn spawn_runtime_label(prim: string) -> string {
+    case prim == "spawn_dangerous" or prim == "spawn_dangerous_registered" of {
+        true -> "silica_rt_actor_spawn_dangerous";
+        false -> "silica_rt_actor_spawn"
+    }
+}
+
+fn emit_spawn(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, prim: string) -> string {
     e3b_pfx: string <- e3b_trampoline_x3_prefix(sir_term_root_node(term).value);
     case spawn_right_is_tuple(term) of {
         true -> {
             count: int64 <- spawn_right_count(term);
             loads: string <- concat("    MOV X0, X11\n    LDR X1, [X10]\n    LDR X4, [X10, #8]\n", spawn_core_from_flat(count, 2));
-            concat(concat(concat(concat(spawn_promote_init_x11(term), e3b_pfx), loads), asm_bl("silica_rt_actor_spawn")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
+            concat(concat(concat(concat(spawn_promote_init_x11(term), e3b_pfx), loads), asm_bl(spawn_runtime_label(prim))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
         };
         // No policy word (not reachable from source: the type checker requires one). X4 = 0 inherits.
-        false -> concat(concat(concat(concat(e3b_pfx, "    MOV X0, X9\n    MOV X1, X10\n    MOV W2, WZR\n    MOV X4, XZR\n"), asm_bl("silica_rt_actor_spawn")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)), "")
+        false -> concat(concat(concat(concat(e3b_pfx, "    MOV X0, X9\n    MOV X1, X10\n    MOV W2, WZR\n    MOV X4, XZR\n"), asm_bl(spawn_runtime_label(prim))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)), "")
     }
 }
 
-// spawn_registered / spawn_dangerous_registered: X10 -> [beh, name, policy(, core)], X11 = init.
-fn emit_spawn_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, register_label: string) -> string {
+// spawn_registered / spawn_dangerous_registered / spawn_device_registered: X10 -> [beh, name,
+// policy(, core)], X11 = init. The registration entry picks the registry; the spawn entry is the
+// prim's (spawn_runtime_label).
+fn emit_spawn_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, register_label: string, prim: string) -> string {
     e3b_pfx: string <- e3b_trampoline_x3_prefix(sir_term_root_node(term).value);
     count: int64 <- spawn_right_count(term);
     save_name: string <- "    SUB SP, SP, #16\n    LDR X12, [X10, #8]\n    STR X12, [SP, #8]\n";
@@ -713,7 +728,7 @@ fn emit_spawn_registered(dest: string, term: { nodes: List[{ kind: int64, type_n
     // X10/X11 (operand block, init) are caller-saved, so they are kept across the runtime call.
     check: string <- concat("    STP X10, X11, [SP, #-16]!\n    LDR X0, [X10, #8]\n    BL ", concat(registry_check_label(register_label), "\n    LDP X10, X11, [SP], #16\n"));
     loads: string <- concat("    MOV X0, X11\n    LDR X1, [X10]\n    LDR X4, [X10, #16]\n", spawn_core_from_flat(count, 3));
-    spawn_asm: string <- concat(concat(e3b_pfx, loads), asm_bl("silica_rt_actor_spawn"));
+    spawn_asm: string <- concat(concat(e3b_pfx, loads), asm_bl(spawn_runtime_label(prim)));
     save_actor: string <- "    STR X0, [SP, #0]\n";
     reg_tail: string <- concat(register_label, "\n    LDR X0, [SP, #0]\n    ADD SP, SP, #16\n");
     reg: string <- concat("    LDR X1, [SP, #8]\n    BL ", reg_tail);
@@ -764,15 +779,6 @@ fn release_algorithm_index(lexeme: string) -> int64 {
         "keep_high_water" -> 5;
         _: string -> 0
     }
-}
-
-// set_scheduler_policy(policy) -> :ok. A hosted runtime has no ready queue of its own to order
-// (actors are threads the OS schedules), so the per-core dispatch-order policy of the ESP32-S3_raw
-// runtime has nothing to select here: the call is accepted and answers :ok (index 2 of the fixed atom
-// prefix, atoms/atom_table.silica), as pin_actor_to_efficiency_core is a no-op on a board whose cores
-// are alike. The argument (X9) is not read.
-fn emit_set_scheduler_policy_noop(dest: string) -> string {
-    concat(concat("    MOV ", gpr_x_view(dest)), ", #2\n")
 }
 
 fn emit_stack_policy(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
@@ -855,6 +861,7 @@ fn runtime_label(name: string) -> string {
         "pin_actor_to_numa_node" -> "silica_rt_pin_actor_to_numa_node";
         "unpin_actor" -> "silica_rt_unpin_actor";
         "set_actor_priority" -> "silica_rt_set_actor_priority";
+        "set_scheduler_policy" -> "silica_rt_set_scheduler_policy";
         "get_actor_memory_usage" -> "silica_rt_get_actor_memory_usage";
         "migrate_actor" -> "silica_rt_migrate_actor";
         "start_child" -> "silica_rt_supervisor_start_child";
@@ -874,6 +881,7 @@ fn runtime_label(name: string) -> string {
         "wait_for_exit" -> "silica_rt_wait_for_exit";
         "cast_exit" -> "silica_rt_cast_exit";
         "heap_used" -> "silica_rt_heap_used";
+        "actor_carrier_index" -> "silica_rt_actor_carrier_index";
         _: string -> "silica_rt_actor_unknown"
     }
 }
@@ -977,6 +985,32 @@ fn emit_set_actor_priority_with_atoms(term: { nodes: List[{ kind: int64, type_na
     concat(concat(concat(to_code, call_asm), map_asm), concat(concat("    MOV ", gpr_x_view(dest)), ", X12\n"))
 }
 
+// set_scheduler_policy(policy) -> :ok | :invalid_policy: the order in which the ready actors of one
+// carrier are dispatched (actor_memory_budget_plan.md item N stage 4; the policies are the ESP32-S3_raw
+// runtime's, design_documents/ports/esp32s3_xtensa_port.md §8.10). The policy atom arrives in X9; the
+// runtime takes a code (0 :priority_fifo, 1 :round_robin, 2 :weighted_fair, 3 :lottery, anything else
+// rejected) and answers 0 :ok or 1 :invalid_policy, so this site maps the program's atom indices to
+// the codes before the call and the code back to an atom after it, as the ESP32-S3_raw emitter does.
+// An atom the program never names has index -1 and gets no compare (X9 cannot hold it); the code
+// then stays 4, rejected. Every carrier reads the policy at its next push or pop; a dangerous actor's
+// own thread is scheduled by the OS and takes no part.
+fn policy_atom_to_code(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, lexeme: string, code: int64) -> string {
+    idx: int64 <- atom_table@atom_lexeme_to_index(table, lexeme);
+    case idx < 0 of {
+        true -> "";
+        false -> select_eq("X0", imm_of_index(code), "X9", imm_of_index(idx))
+    }
+}
+
+fn emit_set_scheduler_policy_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
+    inv_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":invalid_policy");
+    to_code: string <- concat("    MOV X0, #4\n", concat(concat(policy_atom_to_code(table, ":priority_fifo", 0), policy_atom_to_code(table, ":round_robin", 1)), concat(policy_atom_to_code(table, ":weighted_fair", 2), policy_atom_to_code(table, ":lottery", 3))));
+    call_asm: string <- asm_bl(runtime_label("set_scheduler_policy"));
+    map_asm: string <- concat(concat("    MOV X12, #", concat(atom_table@int64_to_decimal_string(ok_idx), "\n")), select_eq_idx("X12", inv_idx, "X0", "#1"));
+    concat(concat(concat(to_code, call_asm), map_asm), concat(concat("    MOV ", gpr_x_view(dest)), ", X12\n"))
+}
+
 fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, outer_reg: string) -> string {
     ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
     case sir_term_root_node(term).name of {
@@ -985,9 +1019,7 @@ fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string,
         "register_failure_reporter" -> emit_register_failure_reporter(dest, term, caller_module_from_outer_reg(outer_reg));
         "migrate_actor" -> emit_migrate_actor_with_atoms(term, dest, table);
         "set_actor_priority" -> emit_set_actor_priority_with_atoms(term, dest, table);
-        // set_scheduler_policy(policy) -> :ok: a hosted runtime has no ready queue of its own to order
-        // (actors are threads the OS schedules), so the policy is accepted and :ok answered.
-        "set_scheduler_policy" -> concat(concat("    MOV ", gpr_x_view(dest)), concat(", #", concat(atom_table@int64_to_decimal_string(ok_idx), "\n")));
+        "set_scheduler_policy" -> emit_set_scheduler_policy_with_atoms(term, dest, table);
         _: string -> case always_ok_prim(sir_term_root_node(term).name) of {
             true -> concat(emit_prim_op(term, dest), concat(concat("    MOV ", gpr_x_view(dest)), concat(", #", concat(atom_table@int64_to_decimal_string(ok_idx), "\n"))));
             false -> emit_prim_op(term, dest)
@@ -997,12 +1029,12 @@ fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string,
 
 fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     case sir_term_root_node(term).name of {
-        "spawn" -> emit_spawn(dest, term);
-        "spawn_dangerous" -> emit_spawn(dest, term);
-        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named");
-        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named");
-        "spawn_device" -> emit_spawn(dest, term);
-        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named");
+        "spawn" -> emit_spawn(dest, term, "spawn");
+        "spawn_dangerous" -> emit_spawn(dest, term, "spawn_dangerous");
+        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named", "spawn_registered");
+        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named", "spawn_dangerous_registered");
+        "spawn_device" -> emit_spawn(dest, term, "spawn_device");
+        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named", "spawn_device_registered");
         "spawn_registered_supervisor" -> emit_spawn_registered_supervisor(dest, term);
         "spawn_linked" -> emit_spawn_linked(dest, term);
         "send" -> emit_send(dest, term);
@@ -1042,7 +1074,7 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "pin_actor_to_numa_node" -> emit_runtime_binary(dest, term);
         "unpin_actor" -> emit_runtime_unary(dest, term);
         "set_actor_priority" -> emit_runtime_binary(dest, term);
-        "set_scheduler_policy" -> emit_set_scheduler_policy_noop(dest);
+        "set_scheduler_policy" -> emit_runtime_unary(dest, term);
         "get_actor_memory_usage" -> emit_runtime_unary(dest, term);
         "migrate_actor" -> emit_runtime_binary(dest, term);
         "start_child" -> emit_runtime_unary(dest, term);
@@ -1067,6 +1099,9 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "wait_for_exit" -> emit_runtime_nullary(dest, term);
         "cast_exit" -> emit_runtime_unary(dest, term);
         "heap_used" -> emit_runtime_nullary(dest, term);
+        // actor_carrier_index(ref) -> int64: test-only (item N stage 3), hosted carrier runtime only
+        // (-1 for a dangerous actor, which has a thread of its own).
+        "actor_carrier_index" -> emit_runtime_unary(dest, term);
         "stack_policy" -> emit_stack_policy(dest, term);
         _: string -> concat(concat(".error \"unsupported actor prim: ", concat(sir_term_root_node(term).name, "\"\n")), "\n")
     }
