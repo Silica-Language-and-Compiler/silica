@@ -20,6 +20,7 @@ with a table of which steps a given kind of change needs. The scripts below are 
 | Find out what is really broken after changing the compiler | `rebuild_refresh_verify.sh` |
 | Re-record assembly goldens after an intended change | `update_goldens.sh` |
 | Copy this tree to the Linux build machines (and only that) | `sync_to_hosts.sh` |
+| Run one app through the platform-neutral entry point | `run_app.sh` |
 
 ## The machine file
 
@@ -152,6 +153,19 @@ Typing a host path by hand in zsh, write `"${h}:silica/..."`, never `$h:silica/.
 `$h:s...` as a substitution modifier, and that is how `trials/error_enforcement_addition/admin@pix.ca/`
 and `ca/tree@nix.localals/` were made. The script is bash and refuses to push while this tree holds
 a directory whose name contains `@` or `:`.
+
+### run_app.sh
+A platform-neutral entry point for running one app. It is a three-line wrapper: it does nothing itself
+except `exec` `run_board_app.sh` from its own directory, passing every argument through unchanged, so
+its options, exit status and output are whatever that script defines. The wrapper's own comment says
+`run_board_app.sh` is retained for compatibility.
+
+    bash programmer_tools/run_app.sh <arguments for run_board_app.sh>
+
+It reads no `.silica_build_hosts`, selects no target or host, and has no `-h` of its own. In this
+tree `run_board_app.sh` is not present in `programmer_tools/`, so until it is supplied the wrapper
+cannot run anything. The ESP32-S3 board's app runner is a separate script,
+`compiler/src/emitter/ESP32-S3_raw/board/tools/run_app.sh`, which has its own `-h`.
 
 ## Subdirectories
 
