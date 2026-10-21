@@ -47,9 +47,20 @@
 // before the next one), so the lowest page holding a nonzero word after the behavior returns is the
 // message's depth. The scan costs the untouched pages, which are exactly the ones about to be released.
 // :release_when_idle: a carrier actor is swept by its carrier (prims_actors_carrier_asm.silica,
-// silica_rt_carrier_sweep) a second after its last message; a dangerous actor, on a thread of its own,
-// waits for mail with a one-second timeout while it holds committed stack and releases on expiry
-// (silica_rt_stack_idle_check, the same check the sweep makes).
+// silica_rt_carrier_sweep) once the idle period has passed since its last message
+// (silica_rt_stack_idle_due, against one clock reading per sweep), or sooner, oldest first, while
+// the idle stacks listed on its carrier exceed the carrier's idle-stack budget
+// (silica_rt_idle_stack_budget; release_when_idle_design.md, 2026-10-20: the period is an upper bound
+// on how long an idle stack is kept, not a promise); a dangerous actor, on a thread of its own, waits
+// for mail with the period as its timeout while it holds committed stack and releases on expiry
+// (silica_rt_stack_idle_check; it is outside the budget). The period is spec §15.1.2.2's one second
+// unless SILICA_IDLE_RELEASE_MS=<milliseconds> in the environment says otherwise (read once by
+// silica_rt_stack_runtime_init: unset, 0 or not a number keeps 1000 ms; more than 3,600,000 ms is
+// clamped to that hour), kept in nanoseconds in silica_rt_idle_release_ns; a busy carrier looks at
+// its list at most every silica_rt_idle_sweep_ns = min(250 ms, the period / 4). The budget is per
+// carrier: SILICA_IDLE_STACK_BUDGET=<bytes> (the process total; unset, 0 or not a number means the
+// default, the machine's memory plus swap over 32) split evenly over the carriers, at least 16
+// platform pages each. It is a cap on the transient, never a reservation and never a per-actor limit.
 //
 // silica_rt_stack_runtime_init also reads the carrier count (SILICA_CARRIER_COUNT, else the machine's
 // logical cores) and the machine's core counts (prims_actors_carrier_asm.silica).
@@ -74,6 +85,15 @@ silica_rt_stack_default_reserve:
 	.zero	8
 silica_rt_stack_init_done:
 	.zero	8
+	.globl	silica_rt_idle_release_ns
+silica_rt_idle_release_ns:
+	.zero	8
+	.globl	silica_rt_idle_sweep_ns
+silica_rt_idle_sweep_ns:
+	.zero	8
+	.globl	silica_rt_idle_stack_budget
+silica_rt_idle_stack_budget:
+	.zero	8
 	.data
 	.p2align	3
 	.globl	silica_rt_stack_exhausted_atom
@@ -89,6 +109,10 @@ silica_rt_thread_limit_atom:
 	.quad	");
     concat(concat(p2, thread_limit_idx), "
 	.section .rodata
+L_srt_idle_release_env:
+	.asciz	\"SILICA_IDLE_RELEASE_MS\"
+L_srt_idle_budget_env:
+	.asciz	\"SILICA_IDLE_STACK_BUDGET\"
 ")
 }
 
@@ -97,10 +121,12 @@ fn stack_asm_init() -> string {
 	.globl	silica_rt_stack_runtime_init
 	.p2align	2
 silica_rt_stack_runtime_init:
-# Read the platform page and the default reservation (physical memory + swap) once.
+# Read the platform page and the default reservation (physical memory + swap) once; then the carrier
+# count, the machine's core counts, the :release_when_idle period and the idle-stack budget (header).
 # _SC_PAGESIZE = 30, _SC_PHYS_PAGES = 85; struct sysinfo (112 B): totalswap @64, mem_unit (u32) @104.
 # Frame: [rbp - 8] = &silica_rt_stack_init_done (x19), [rbp - 16] = page (x20);
-# [rsp + 32] = pages * page, [rsp + 48 .. 160) = struct sysinfo.
+# [rsp + 32] = pages * page, [rsp + 48 .. 160) = struct sysinfo. The Apple module's x21 (the value
+# being parsed) is r10 here: each parse loop and what it stores run between calls, nothing crosses one.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 240
@@ -199,6 +225,72 @@ Lsri_logical_have:
 	mov	rdi, QWORD PTR [rip + silica_rt_logical_cpu_count]
 Lsri_pcore_have:
 	mov	QWORD PTR [rip + silica_rt_pcore_count], rdi
+# The :release_when_idle period: SILICA_IDLE_RELEASE_MS=<ms> (decimal; the digits up to the first
+# other character; unset, 0 or no digits keeps spec §15.1.2.2's 1000 ms; clamped to 3,600,000 ms, an
+# hour), kept in nanoseconds; and a busy carrier's sweep cadence, min(250 ms, the period / 4).
+	lea	rdi, [rip + L_srt_idle_release_env]
+	call	getenv
+	xor	r10d, r10d
+	test	rax, rax
+	jz	Lsri_idle_parsed
+Lsri_idle_digit:
+	movzx	ecx, BYTE PTR [rax]
+	sub	ecx, 48
+	cmp	ecx, 9
+	ja	Lsri_idle_parsed
+	imul	r10, r10, 10
+	add	r10, rcx
+	inc	rax
+	cmp	r10, 3600000
+	jb	Lsri_idle_digit
+	mov	r10d, 3600000
+Lsri_idle_parsed:
+	test	r10, r10
+	jnz	Lsri_idle_have
+	mov	r10d, 1000
+Lsri_idle_have:
+	imul	r10, r10, 1000000
+	mov	QWORD PTR [rip + silica_rt_idle_release_ns], r10
+	mov	r11, r10
+	shr	r11, 2
+	mov	ecx, 250000000
+	cmp	r11, rcx
+	cmovae	r11, rcx
+	mov	QWORD PTR [rip + silica_rt_idle_sweep_ns], r11
+# The idle-stack budget per carrier: SILICA_IDLE_STACK_BUDGET=<bytes> (decimal, the process total;
+# unset, 0 or no digits means the default, the memory-plus-swap reservation over 32; the digits stop
+# counting once the value passes 2^60) over the carrier count (silica_rt_carrier_count, stored above,
+# at least 1), at least 16 platform pages ([rbp - 16]).
+	lea	rdi, [rip + L_srt_idle_budget_env]
+	call	getenv
+	xor	r10d, r10d
+	test	rax, rax
+	jz	Lsri_budget_parsed
+Lsri_budget_digit:
+	movzx	ecx, BYTE PTR [rax]
+	sub	ecx, 48
+	cmp	ecx, 9
+	ja	Lsri_budget_parsed
+	imul	r10, r10, 10
+	add	r10, rcx
+	inc	rax
+	mov	r11, r10
+	shr	r11, 60
+	jz	Lsri_budget_digit
+Lsri_budget_parsed:
+	test	r10, r10
+	jnz	Lsri_budget_have
+	mov	r10, QWORD PTR [rip + silica_rt_stack_default_reserve]
+	shr	r10, 5
+Lsri_budget_have:
+	mov	rax, r10
+	xor	edx, edx
+	div	QWORD PTR [rip + silica_rt_carrier_count]
+	mov	r10, QWORD PTR [rbp - 16]
+	shl	r10, 4
+	cmp	rax, r10
+	cmovb	rax, r10
+	mov	QWORD PTR [rip + silica_rt_idle_stack_budget], rax
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rax], 1
 Lsri_done:
@@ -717,8 +809,10 @@ Lsmr_ret:
 	.p2align	2
 silica_rt_stack_idle_check:
 # X0 = ACB -> X0 = mailbox wait timeout in microseconds (0 = wait without a timeout). Only
-# :release_when_idle actors holding committed stack wait with a timeout; once a second has passed
-# since the last message the stack is released and the wait becomes untimed.
+# :release_when_idle actors holding committed stack wait with a timeout; once the idle period
+# (silica_rt_idle_release_ns) has passed since the last message the stack is released and the wait
+# becomes untimed. A dangerous actor's thread makes this check; a carrier's sweep uses
+# silica_rt_stack_idle_due below.
 # Frame: [rbp - 8] ACB (x19).
 	push	rbp
 	mov	rbp, rsp
@@ -733,7 +827,7 @@ silica_rt_stack_idle_check:
 	mov	rcx, QWORD PTR [rax + 344]
 	mov	rdx, rdi
 	sub	rdx, rcx
-	mov	r8, 1000000000
+	mov	r8, QWORD PTR [rip + silica_rt_idle_release_ns]
 	cmp	rdx, r8
 	jb	Lsic_wait
 	mov	rdi, rax
@@ -753,6 +847,28 @@ Lsic_none:
 	xor	edi, edi
 Lsic_ret:
 	leave
+	ret
+	.globl	silica_rt_stack_idle_due
+	.p2align	2
+silica_rt_stack_idle_due:
+# X0 = ACB (a :release_when_idle actor holding committed stack, on its carrier's sweep list), X1 =
+# the time now (monotonic ns; the sweep reads the clock once for a whole batch) -> X0 = 0 when the
+# idle period (silica_rt_idle_release_ns) has passed since the actor's last message (#344), else
+# the microseconds until it will have, at least 1. Leaf; rax rcx rdx r8 (x9-x10).
+	mov	rcx, rsi
+	sub	rcx, QWORD PTR [rdi + 344]
+	mov	r8, QWORD PTR [rip + silica_rt_idle_release_ns]
+	cmp	rcx, r8
+	jae	Lsid_due
+	sub	r8, rcx
+	mov	rax, r8
+	xor	edx, edx
+	mov	ecx, 1000
+	div	rcx
+	lea	rdi, [rax + 1]
+	ret
+Lsid_due:
+	xor	edi, edi
 	ret
 	.globl	silica_rt_cv_wait_timeout
 	.p2align	2
