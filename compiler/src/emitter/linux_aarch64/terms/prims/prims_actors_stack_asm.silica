@@ -47,9 +47,22 @@
 // before the next one), so the lowest page holding a nonzero word after the behavior returns is the
 // message's depth. The scan costs the untouched pages, which are exactly the ones about to be released.
 // :release_when_idle: a carrier actor is swept by its carrier (prims_actors_carrier_asm.silica,
-// silica_rt_carrier_sweep) a second after its last message; a dangerous actor, on a thread of its own,
-// waits for mail with a one-second timeout while it holds committed stack and releases on expiry
-// (silica_rt_stack_idle_check, the same check the sweep makes).
+// silica_rt_carrier_sweep) once the idle period has passed since its last message
+// (silica_rt_stack_idle_due, against one clock reading per sweep), or sooner, oldest first, while
+// the idle stacks listed on its carrier exceed the carrier's idle-stack budget
+// (silica_rt_idle_stack_budget; release_when_idle_design.md, 2026-10-20: the period is an upper bound
+// on how long an idle stack is kept, not a promise); a dangerous actor, on a thread of its own, waits
+// for mail with the period as its timeout while it holds committed stack and releases on expiry
+// (silica_rt_stack_idle_check; it is outside the budget). The period is spec §15.1.2.2's one second
+// unless SILICA_IDLE_RELEASE_MS=<milliseconds> in the environment says otherwise (read once by
+// silica_rt_stack_runtime_init: unset, 0 or not a number keeps 1000 ms; more than 3,600,000 ms is
+// clamped to that hour), kept in nanoseconds in silica_rt_idle_release_ns; a busy carrier looks at
+// its list at most every silica_rt_idle_sweep_ns = min(250 ms, the period / 4). The budget is per
+// carrier: SILICA_IDLE_STACK_BUDGET=<bytes> (the process total; unset, 0 or not a number means the
+// default, the machine's memory plus swap over 32) split evenly over the carriers, at least 16
+// platform pages each (sysconf(_SC_PAGESIZE): 16 KB on the Pi 5, 4 KB on nix, so a byte budget covers
+// four times the one-page actors on a 4 KB host). It is a cap on the transient, never a reservation and
+// never a per-actor limit.
 //
 // silica_rt_stack_runtime_init also reads the carrier count (SILICA_CARRIER_COUNT, else the machine's
 // logical cores) and the machine's core counts (prims_actors_carrier_asm.silica).
@@ -67,6 +80,15 @@ silica_rt_stack_default_reserve:
 	.zero	8
 silica_rt_stack_init_done:
 	.zero	8
+	.globl	silica_rt_idle_release_ns
+silica_rt_idle_release_ns:
+	.zero	8
+	.globl	silica_rt_idle_sweep_ns
+silica_rt_idle_sweep_ns:
+	.zero	8
+	.globl	silica_rt_idle_stack_budget
+silica_rt_idle_stack_budget:
+	.zero	8
 	.data
 	.p2align	3
 	.globl	silica_rt_stack_exhausted_atom
@@ -82,6 +104,10 @@ silica_rt_thread_limit_atom:
 	.quad	");
     concat(concat(p2, thread_limit_idx), "
 	.section .rodata
+L_srt_idle_release_env:
+	.asciz	\"SILICA_IDLE_RELEASE_MS\"
+L_srt_idle_budget_env:
+	.asciz	\"SILICA_IDLE_STACK_BUDGET\"
 ")
 }
 
@@ -90,11 +116,14 @@ fn stack_asm_init() -> string {
 	.globl	silica_rt_stack_runtime_init
 	.p2align	2
 silica_rt_stack_runtime_init:
-// Read the platform page and the default reservation (physical memory + swap) once.
-// _SC_PAGESIZE = 30, _SC_PHYS_PAGES = 85; struct sysinfo: totalswap @64, mem_unit (u32) @104.
-	stp	x29, x30, [sp, #-160]!
+// Read the platform page and the default reservation (physical memory + swap) once; then the carrier
+// count, the machine's core counts, the :release_when_idle period and the idle-stack budget (header).
+// _SC_PAGESIZE = 30, _SC_PHYS_PAGES = 85; struct sysinfo: totalswap @64, mem_unit (u32) @104 (the
+// struct sits at SP+48 .. SP+160; X21 is kept at SP+160).
+	stp	x29, x30, [sp, #-176]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
+	str	x21, [sp, #160]
 	adrp	x19, silica_rt_stack_init_done
 	add	x19, x19, :lo12:silica_rt_stack_init_done
 	ldr	x8, [x19]
@@ -195,11 +224,86 @@ Lsri_pcore_have:
 	adrp	x8, silica_rt_pcore_count
 	add	x8, x8, :lo12:silica_rt_pcore_count
 	str	x0, [x8]
+// The :release_when_idle period: SILICA_IDLE_RELEASE_MS=<ms> (decimal; the digits up to the first
+// other character; unset, 0 or no digits keeps spec §15.1.2.2's 1000 ms; clamped to 3,600,000 ms, an
+// hour), kept in nanoseconds; and a busy carrier's sweep cadence, min(250 ms, the period / 4).
+	adrp	x0, L_srt_idle_release_env
+	add	x0, x0, :lo12:L_srt_idle_release_env
+	bl	getenv
+	mov	x21, xzr
+	cbz	x0, Lsri_idle_parsed
+Lsri_idle_digit:
+	ldrb	w9, [x0], #1
+	sub	w9, w9, #48
+	cmp	w9, #9
+	b.hi	Lsri_idle_parsed
+	mov	x10, #10
+	mul	x21, x21, x10
+	add	x21, x21, x9
+	movz	x10, #0xEE80
+	movk	x10, #0x36, lsl #16
+	cmp	x21, x10
+	b.lo	Lsri_idle_digit
+	mov	x21, x10
+Lsri_idle_parsed:
+	cbnz	x21, Lsri_idle_have
+	mov	x21, #1000
+Lsri_idle_have:
+	movz	x10, #0x4240
+	movk	x10, #0xF, lsl #16
+	mul	x21, x21, x10
+	adrp	x8, silica_rt_idle_release_ns
+	add	x8, x8, :lo12:silica_rt_idle_release_ns
+	str	x21, [x8]
+	lsr	x9, x21, #2
+	movz	x10, #0xB280
+	movk	x10, #0x0EE6, lsl #16
+	cmp	x9, x10
+	csel	x9, x9, x10, lo
+	adrp	x8, silica_rt_idle_sweep_ns
+	add	x8, x8, :lo12:silica_rt_idle_sweep_ns
+	str	x9, [x8]
+// The idle-stack budget per carrier: SILICA_IDLE_STACK_BUDGET=<bytes> (decimal, the process total;
+// unset, 0 or no digits means the default, the memory-plus-swap reservation over 32; the digits stop
+// counting once the value passes 2^60) over the carrier count (X20), at least 16 platform pages.
+	adrp	x0, L_srt_idle_budget_env
+	add	x0, x0, :lo12:L_srt_idle_budget_env
+	bl	getenv
+	mov	x21, xzr
+	cbz	x0, Lsri_budget_parsed
+Lsri_budget_digit:
+	ldrb	w9, [x0], #1
+	sub	w9, w9, #48
+	cmp	w9, #9
+	b.hi	Lsri_budget_parsed
+	mov	x10, #10
+	mul	x21, x21, x10
+	add	x21, x21, x9
+	lsr	x10, x21, #60
+	cbz	x10, Lsri_budget_digit
+Lsri_budget_parsed:
+	cbnz	x21, Lsri_budget_have
+	adrp	x8, silica_rt_stack_default_reserve
+	add	x8, x8, :lo12:silica_rt_stack_default_reserve
+	ldr	x21, [x8]
+	lsr	x21, x21, #5
+Lsri_budget_have:
+	udiv	x21, x21, x20
+	adrp	x8, silica_rt_stack_page
+	add	x8, x8, :lo12:silica_rt_stack_page
+	ldr	x9, [x8]
+	lsl	x9, x9, #4
+	cmp	x21, x9
+	csel	x21, x21, x9, hs
+	adrp	x8, silica_rt_idle_stack_budget
+	add	x8, x8, :lo12:silica_rt_idle_stack_budget
+	str	x21, [x8]
 	mov	x8, #1
 	str	x8, [x19]
 Lsri_done:
+	ldr	x21, [sp, #160]
 	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #160
+	ldp	x29, x30, [sp], #176
 	ret
 	.globl	silica_rt_stack_prefix_for
 	.p2align	2
@@ -654,8 +758,10 @@ Lsmr_ret:
 	.p2align	2
 silica_rt_stack_idle_check:
 // X0 = ACB -> X0 = mailbox wait timeout in microseconds (0 = wait without a timeout). Only
-// :release_when_idle actors holding committed stack wait with a timeout; once a second has passed
-// since the last message the stack is released and the wait becomes untimed.
+// :release_when_idle actors holding committed stack wait with a timeout; once the idle period
+// (silica_rt_idle_release_ns) has passed since the last message the stack is released and the wait
+// becomes untimed. A dangerous actor's thread makes this check; a carrier's sweep uses
+// silica_rt_stack_idle_due below.
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	str	x19, [sp, #16]
@@ -668,8 +774,9 @@ silica_rt_stack_idle_check:
 	bl	silica_rt_stack_now_ns
 	ldr	x11, [x19, #344]
 	sub	x12, x0, x11
-	movz	x13, #0xCA00
-	movk	x13, #0x3B9A, lsl #16
+	adrp	x13, silica_rt_idle_release_ns
+	add	x13, x13, :lo12:silica_rt_idle_release_ns
+	ldr	x13, [x13]
 	cmp	x12, x13
 	b.lo	Lsic_wait
 	mov	x0, x19
@@ -688,6 +795,28 @@ Lsic_none:
 Lsic_ret:
 	ldr	x19, [sp, #16]
 	ldp	x29, x30, [sp], #32
+	ret
+	.globl	silica_rt_stack_idle_due
+	.p2align	2
+silica_rt_stack_idle_due:
+// X0 = ACB (a :release_when_idle actor holding committed stack, on its carrier's sweep list), X1 =
+// the time now (monotonic ns; the sweep reads the clock once for a whole batch) -> X0 = 0 when the
+// idle period (silica_rt_idle_release_ns) has passed since the actor's last message (#344), else
+// the microseconds until it will have, at least 1. Leaf; X9-X10.
+	ldr	x9, [x0, #344]
+	sub	x9, x1, x9
+	adrp	x10, silica_rt_idle_release_ns
+	add	x10, x10, :lo12:silica_rt_idle_release_ns
+	ldr	x10, [x10]
+	cmp	x9, x10
+	b.hs	Lsid_due
+	sub	x9, x10, x9
+	mov	x10, #1000
+	udiv	x0, x9, x10
+	add	x0, x0, #1
+	ret
+Lsid_due:
+	mov	x0, xzr
 	ret
 	.globl	silica_rt_cv_wait_timeout
 	.p2align	2
