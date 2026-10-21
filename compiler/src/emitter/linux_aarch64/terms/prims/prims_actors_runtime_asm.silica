@@ -148,7 +148,7 @@ Lsp_entry:
 	mov	x21, x0
 	mov	w22, #1 // =0x1
 	mov	w0, #1 // =0x1
-	mov	w1, #528
+	mov	w1, #544
 	bl	calloc
 	mov	x19, x0
 	cbz	x0, LBB0_4
@@ -334,7 +334,7 @@ LBBsl_common:
 	mov	x20, x1
 	mov	x21, x0
 	mov	w0, #1
-	mov	w1, #528
+	mov	w1, #544
 	bl	calloc
 	mov	x19, x0
 	cbz	x0, LBBsl_4
@@ -568,7 +568,11 @@ fn actor_rt_asm_chunk_1() -> string {
 	mov	x19, x0
 // The thread of a dangerous actor (the only actor with one; prims_actors_carrier_asm.silica
 // header). This thread's record (item N stage 2): the current actor is this actor, and it is no
-// carrier's.
+// carrier's. #528 = this frame's SP on the thread's own (pthread) stack: every path that ends the
+// actor from inside its behaviour (silica_rt_thread_actor_end) comes back to it and returns from
+// here, so the thread ends by returning from its start routine, never by pthread_exit.
+	mov	x9, sp
+	str	x9, [x19, #528]
 	str	x19, [x19, #496]
 	str	xzr, [x19, #504]
 	add	x0, x19, #496
@@ -1032,6 +1036,44 @@ LBB1_thread_done:
 	ret
 	.cfi_endproc
                                         // -- End function
+	.globl	silica_rt_thread_actor_end
+	.p2align	2
+silica_rt_thread_actor_end:
+// X0 = a dangerous actor's ACB (#440 = 0), on its own thread, after the delivering phase of an
+// exit path that began inside the behaviour (silica_rt_badarith, case_clause, name_taken,
+// fail_current, a guarded foreign fault): the thread is on the actor's reservation or on its
+// signal alternate stack, never on its own pthread stack. Moves back to actor_thread_main's frame
+// (#528, on the pthread stack), unmaps the reservation and the alternate stack (nothing waits any
+// more), lets the actor's holds go and returns from the start routine as LBB1_thread_done does.
+// Never returns here.
+//
+// Not pthread_exit: glibc ends a thread by a forced unwind (_Unwind_ForcedUnwind through every
+// frame to start_thread's), and its stop function only ends the walk at a frame whose CFA has
+// reached start_thread's saved SP on the thread's stack. On any other stack that never happens,
+// and the walk cannot cross a stack switch anyway: at the first frame with no unwind rules (these
+// runtime routines carry only .cfi_startproc; a behaviour carries none) the CFA and the return
+// address stop changing, so the unwinder spins in the same frame for ever, the thread at 100% CPU
+// with the actor long reported ended (seen on a :dangerous row child that divided by zero). Its
+// reservation and alternate stack also stayed mapped, as nothing could unmap the stack it stood on.
+	mov	x19, x0
+	ldr	x9, [x19, #528]
+	cbz	x9, Ltae_no_base
+	mov	sp, x9
+	mov	x0, x19
+	mov	x1, xzr
+	bl	silica_rt_actor_stack_free
+	mov	x0, x19
+	bl	silica_rt_actor_final_release
+	b	LBB1_thread_done
+Ltae_no_base:
+// No base recorded (not reachable from a thread actor_thread_main started): the holds go and the
+// thread ends the way libc can, without its stacks.
+	mov	x0, x19
+	bl	silica_rt_actor_final_release
+Ltae_exit:
+	mov	x0, xzr
+	bl	pthread_exit
+	b	Ltae_exit
 	.p2align	2 // functional queue dequeue; caller holds queue's lock
 silica_rt_q_dequeue_locked: // X0 = &queue (pair: front, rear). Returns X0 = node or null.
 	.cfi_startproc
@@ -5891,24 +5933,23 @@ Lbadarith_no_supervisor:
 	bl	silica_rt_ffi_arena_teardown
 	mov	x0, x19
 	bl	silica_rt_actor_dealloc_region
-	cbz	x23, Lbadarith_release
-// Nothing of the actor waits any more: onto the carrier's stack, and the reservation is unmapped
-// before the block can go.
+// Nothing of the actor waits any more. A dangerous actor's thread ends through
+// silica_rt_thread_actor_end (back on its own stack: the reservation goes, the holds go, the start
+// routine returns); a carrier actor moves onto the carrier's stack, its reservation is unmapped
+// before the block can go, and the path ends in the carrier loop.
+	cbz	x23, Lbadarith_thread_end
 	ldr	x9, [x23, #48]
 	mov	sp, x9
 	mov	x0, x19
 	mov	x1, xzr
 	bl	silica_rt_actor_stack_free
-Lbadarith_release:
 	mov	x0, x19
 	bl	silica_rt_actor_final_release
-	cbz	x23, Lbadarith_thread_exit
 	mov	x0, x23
 	b	silica_rt_carrier_loop_enter
-Lbadarith_thread_exit:
-	mov	x0, #0
-	bl	pthread_exit
-	b	Lbadarith_thread_exit
+Lbadarith_thread_end:
+	mov	x0, x19
+	b	silica_rt_thread_actor_end
 Lbadarith_process:
 	mov	w0, #2
 Lbadarith_msg_a:
@@ -6001,24 +6042,22 @@ Lcaseclause_no_supervisor:
 	bl	silica_rt_ffi_arena_teardown
 	mov	x0, x19
 	bl	silica_rt_actor_dealloc_region
-	cbz	x23, Lcaseclause_release
-// Nothing of the actor waits any more: onto the carrier's stack, and the reservation is unmapped
-// before the block can go.
+// Nothing of the actor waits any more: a dangerous actor's thread ends through
+// silica_rt_thread_actor_end (as silica_rt_badarith); a carrier actor moves onto the carrier's
+// stack, its reservation is unmapped before the block can go, and the path ends in the carrier loop.
+	cbz	x23, Lcaseclause_thread_end
 	ldr	x9, [x23, #48]
 	mov	sp, x9
 	mov	x0, x19
 	mov	x1, xzr
 	bl	silica_rt_actor_stack_free
-Lcaseclause_release:
 	mov	x0, x19
 	bl	silica_rt_actor_final_release
-	cbz	x23, Lcaseclause_thread_exit
 	mov	x0, x23
 	b	silica_rt_carrier_loop_enter
-Lcaseclause_thread_exit:
-	mov	x0, #0
-	bl	pthread_exit
-	b	Lcaseclause_thread_exit
+Lcaseclause_thread_end:
+	mov	x0, x19
+	b	silica_rt_thread_actor_end
 Lcaseclause_process:
 	mov	w0, #2
 Lcaseclause_msg_a:
@@ -6310,24 +6349,22 @@ Lnametaken_no_supervisor:
 	bl	silica_rt_ffi_arena_teardown
 	mov	x0, x19
 	bl	silica_rt_actor_dealloc_region
-	cbz	x23, Lnametaken_release
-// Nothing of the actor waits any more: onto the carrier's stack, and the reservation is unmapped
-// before the block can go.
+// Nothing of the actor waits any more: a dangerous actor's thread ends through
+// silica_rt_thread_actor_end (as silica_rt_badarith); a carrier actor moves onto the carrier's
+// stack, its reservation is unmapped before the block can go, and the path ends in the carrier loop.
+	cbz	x23, Lnametaken_thread_end
 	ldr	x9, [x23, #48]
 	mov	sp, x9
 	mov	x0, x19
 	mov	x1, xzr
 	bl	silica_rt_actor_stack_free
-Lnametaken_release:
 	mov	x0, x19
 	bl	silica_rt_actor_final_release
-	cbz	x23, Lnametaken_thread_exit
 	mov	x0, x23
 	b	silica_rt_carrier_loop_enter
-Lnametaken_thread_exit:
-	mov	x0, #0
-	bl	pthread_exit
-	b	Lnametaken_thread_exit
+Lnametaken_thread_end:
+	mov	x0, x19
+	b	silica_rt_thread_actor_end
 Lnametaken_process:
 	mov	w0, #2
 Lnametaken_msg_a:

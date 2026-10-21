@@ -1,0 +1,157 @@
+// A :dangerous row child's thread must end after a division by zero in its behaviour. The child
+// runs on a thread of its own; when it fails inside its behaviour (silica_rt_badarith) the runtime
+// reports the failure, ends the thread and the supervisor restarts the row. The Linux runtime ended
+// that thread with pthread_exit while still on the actor's own stack: glibc's forced unwind then
+// spun in _Unwind_ForcedUnwind at 100% CPU for ever and the thread never ended. The driver runs 64
+// crash/restart cycles in a row (get_child, cast 0, poll get_child until the row holds another
+// child), so one leaked spinning thread per crash is visible from outside as CPU time and makes
+// the run slow. The root (one_for_one, 200 restarts in 10 seconds) holds one row:
+//   :dangerous_zzzzt_counter (dangerous, 600): a message n posts state + n on the board (a
+//   call-type actor the driver polls); 0 divides by zero.
+//
+//   64 cycles, each replacement differs from the child it replaces -> 9
+//   cast 5 to the last replacement                                   -> 605
+//
+// Expected output: 9, 605, then done, exit status 0; the 64 failure reports (the counter ended by
+// division by zero, reason_tag 1) land anywhere, so the output is compared as a multiset. Printed
+// values avoid the digits 1-4 (folded by the comparer): 9 is a check that holds, 6 one that does
+// not. On Linux the verdict also includes the process's user CPU time staying small: a spinning
+// thread per crash would burn a core each until the process exits.
+
+use Supervisor;
+use trial_wait_int64;
+
+impl ZzzzDangerousThreadRootSup for Supervisor;
+
+// The board: 0 answers the last posted value, anything else is posted and answered.
+fn board(msg: int64, state: int64) -> (:reply, int64, int64) {
+    case msg == 0 of {
+        true -> (:reply, state, state);
+        false -> (:reply, msg, msg)
+    }
+}
+
+// The cast-type counter of the row: posts state + msg; 0 divides by zero.
+fn counter(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        v: int64 <- case msg == 0 of {
+            true -> state / msg;
+            false -> state + msg
+        };
+        _: int64 <- call_registered(:zzzzt_board, v impl ActorMessage {})
+    produces
+        pure (:no_reply, v)
+    end
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 200, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :dangerous_zzzzt_counter, agent_type: :worker, initial_state: initial_state + 600, behavior: counter, restart: :permanent, shutdown: 0, flavor: :dangerous }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+// The row's current child.
+fn child_of(sup: supervisor_ref, id: atom) -> actor_ref {
+    sequence
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: id } impl SupervisorMessage {})
+    produces
+        pure got.child
+    end
+}
+
+// Polls get_child until the row holds a child other than `old` (bounded: a restart that never
+// comes ends the trial with a wrong value instead of hanging it).
+fn replacement_of(sup: supervisor_ref, id: atom, old: actor_ref, tries: int64) -> actor_ref {
+    sequence
+        now: actor_ref <- child_of(sup, id);
+        r: actor_ref <- case actor_ref_not_equal(now, old) or tries <= 0 of {
+            true -> now;
+            false -> replacement_of(sup, id, old, tries - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+// n crash/restart cycles of the row; answers how many of them saw a replacement.
+fn crash_cycles(sup: supervisor_ref, n: int64, replaced: int64) -> int64 {
+    case n <= 0 of {
+        true -> replaced;
+        false -> {
+            sequence proc[concurrency]
+                old: actor_ref <- child_of(sup, :dangerous_zzzzt_counter);
+                _: boolean <- cast(old, 0 impl ActorMessage {});
+                now: actor_ref <- replacement_of(sup, :dangerous_zzzzt_counter, old, 1000000);
+                more: int64 <- case actor_ref_not_equal(now, old) of {
+                    true -> 1;
+                    false -> 0
+                };
+                r: int64 <- crash_cycles(sup, n - 1, replaced + more)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+// Polls the board until it holds `expect` (bounded), then answers what it holds.
+fn posted(expect: int64, tries: int64) -> int64 {
+    sequence proc[concurrency]
+        v: int64 <- call_registered(:zzzzt_board, 0 impl ActorMessage {});
+        r: int64 <- case v == expect or tries <= 0 of {
+            true -> v;
+            false -> posted(expect, tries - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn show(v: int64) -> int64 {
+    sequence proc[device_io]
+        _: atom <- print_int64(v);
+        _: atom <- println("")
+    produces
+        pure v
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- spawn_registered(0, board, :zzzzt_board, stack_policy(0, :keep_last_message));
+        root: supervisor_ref <- spawn_registered_supervisor(ZzzzDangerousThreadRootSup, 0, :zzzzt_root, stack_policy(0, :keep_last_message));
+        replaced: int64 <- crash_cycles(root, 64, 0);
+        _: int64 <- show(verdict(replaced == 64));
+        last: actor_ref <- child_of(root, :dangerous_zzzzt_counter);
+        _: boolean <- cast(last, 5 impl ActorMessage {});
+        _: int64 <- show(posted(605, 1000000));
+        _: atom <- println("done")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
