@@ -7632,8 +7632,8 @@ stack_policy(reserve: int64, release: atom) -> stack_policy
 
 **Platform Notes**: Lazy page migration and NUMA-aware placement of stack pages (design document §4.3, §5.3) apply on platforms that have NUMA nodes and are not implemented on those that do not. Actor stacks as described here require demand paging; the rules for targets without it are decided per target in its port design.
 
-**Implementation status (2026-10-16).** The observable stack rules of this section hold on every target; the mechanics differ from the reservation model above.
-- **Hosted targets** (Apple silicon macOS, Linux AArch64, Linux x86-64) make the reservation, the chunked commit and the release as specified. Each actor is also backed by its own operating-system thread, on which the behavior runs on the actor's reserved stack. The hosted runtime therefore does not yet hold millions of actors: the number of threads the host allows bounds it. The statements of §15.1.2.2 and §15.1.2 that actors are not threads, and that several actors share a carrier thread, state the design that this change of runtime will reach; until ROADMAP chunk 2 (carrier threads) lands, a hosted target runs one operating-system thread per actor. On a hosted target `migrate_actor` today sets an affinity hint on the actor's thread.
+**Implementation status (2026-10-21).** The observable stack rules of this section hold on every target; the mechanics differ from the reservation model above.
+- **Hosted targets** (Apple silicon macOS, Linux AArch64, Linux x86-64) make the reservation, the chunked commit and the release as specified. Actors are not threads: hosted carriers are the only execution model, with one carrier thread per logical core by default (`SILICA_CARRIER_COUNT` overrides it; §15.1.2), and many actors share a carrier, each running on its own reserved stack. Only a dangerous actor (§15.4.13.5) is an operating-system thread of its own, so only dangerous actors are bounded by the number of threads the host allows. On a hosted target `migrate_actor` transfers the actor between carriers (§15.1.2), and `actor_carrier_index` (§22.10) reports which carrier an actor is bound to.
 - **ESP32-S3** (raw, two cores) has no address-space reservation. An actor holds no stack until its first dispatch; its machine stack and its auxiliary stack are then chains of heap chunks that grow on demand (twice the previous chunk, up to 16 KB machine and 4 KB auxiliary) and are released by the actor's release algorithm. A lowered `reserve` caps what an actor's chunks may hold together; reaching it ends the actor with `(:explicit, :stack_exhausted)`. With the default `reserve` the limit is the heap: heap exhaustion by growth is a runtime abort, status 71. `main` has two fixed stacks, sized per image from a static bound, and crossing one is a fatal fault, status 70. The target is sized for 1,000 actors and supervisors resident with heap left for the program ([actor_memory_budget_plan.md](actor_memory_budget_plan.md)).
 
 **Observing a Stack**:
@@ -14394,7 +14394,7 @@ module arch.apple.amx {
 
 This section documents all built-in functions and primitives available in Silica. These are always available without requiring imports. A builtin is always called unqualified; a module function with a builtin's name is called only as `module@name(...)` (§19.3.3).
 
-**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `stop_self`, `fail_self`, `panic`, `assert`, `unreachable` (§15.1.2.3, §22.16); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout`, `send_after`, `cancel_timer`, `monotonic_time`, `current_time` (§22.14); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations and `alloc_atomic` (§22.12); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `set_scheduler_policy`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
+**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `stop_self`, `fail_self`, `panic`, `assert`, `unreachable` (§15.1.2.3, §22.16); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout`, `send_after`, `cancel_timer`, `monotonic_time`, `current_time` (§22.14); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations and `alloc_atomic` (§22.12); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
 
 ### 22.1 Memory Management Primitives
 
@@ -14666,7 +14666,7 @@ Get CPU topology information as a JSON string.
 type numa_info = {
     id: int,
     cores: List[int64,normal],
-    memory_ranges: list<memory_range>
+    memory_ranges: List[memory_range,normal]
 }
 
 type memory_range = {
@@ -14676,7 +14676,7 @@ type memory_range = {
 }
 
 type cache_info = {
-    levels: list<cache_level>
+    levels: List[cache_level,normal]
 }
 
 type cache_level = {
@@ -14688,15 +14688,15 @@ type cache_level = {
 }
 
 type cpu_topology = {
-    cores: list<core_info>,
-    numa_nodes: list<numa_info>,
+    cores: List[core_info,normal],
+    numa_nodes: List[numa_info,normal],
     cache_hierarchy: cache_info
 }
 
 type core_info = {
     id: int,
     core_type: core_type,  // efficiency | performance
-    capabilities: list<string>,
+    capabilities: List[string,normal],
     frequency_mhz: int
 }
 
@@ -14719,7 +14719,7 @@ These built-ins are part of the actor runtime and scheduler surface. **Every fun
 get_cpu_topology() -> cpu_topology
 get_efficiency_cores() -> List[int64,normal]
 get_performance_cores() -> List[int64,normal]
-get_core_capabilities(core_id: int) -> core_info
+get_core_capabilities(core_id: int64) -> core_info
 
 // Actor placement. Every actor is pinned from spawn until it terminates (§15.1.2).
 // Each of the following moves the actor to another core; none of them unpins it.
@@ -14736,6 +14736,12 @@ remove_actor(actor: actor_ref) -> (int64, affinity_error)
 
 // Advanced scheduling hints
 set_actor_priority(actor: actor_ref, priority: priority_level) -> :ok | :actor_not_found
+
+// Scheduler policy: one policy in force for the whole program, applied by each core's (hosted: each carrier's) scheduler to its own ready actors
+set_scheduler_policy(policy: atom) -> :ok | :invalid_policy
+
+// Placement query: the index of the carrier an actor is bound to (hosted targets)
+actor_carrier_index(actor: actor_ref) -> int64
 ```
 
 **Error Handling:**
@@ -14744,6 +14750,17 @@ The `pin_actor_*` helpers and `remove_actor` return a tuple `(int64, affinity_er
 - On failure: `(0, affinity_error)` where `affinity_error` indicates the failure reason
 
 **Priority levels.** `priority_level` is a hint to the per-core scheduler (§23.1.1). Among the actors on one core that have messages waiting, the scheduler starts dispatches for `:high` actors before `:normal` ones, and `:normal` before `:low`. It must still start a dispatch for every actor with a waiting message within a bounded number of dispatches, so no priority starves another. Every actor starts at `:normal`. A priority changes which actor runs next, never how an actor's own messages are ordered, and never interrupts a dispatch.
+
+**Scheduler policy.** `set_scheduler_policy(policy)` selects how each core's scheduler orders the actors that have messages waiting. The program names one of four atoms, and the answer is `:ok`; any other atom is rejected with `:invalid_policy` and the policy in force does not change. The call names no core: one policy is in force for the whole program, and every core, on a hosted target every carrier, applies it to its own ready actors. A change takes effect at the next push or pop of each ready queue and leaves queued actors where they are. The default is `:priority_fifo`. None of the policies preempts a dispatch (§15.1.2).
+
+- `:priority_fifo`: the waiting actor of the highest `priority_level` runs next, and actors of one level run in arrival order. Strict: a program whose `:high` actors always have messages waiting starves the lower levels, and a program that cannot allow that selects `:weighted_fair` or `:lottery`.
+- `:round_robin`: priority levels are ignored and the waiting actors run in strict arrival order.
+- `:weighted_fair`: deficit round robin over the three levels with quanta of 4 dispatches for `:high`, 2 for `:normal` and 1 for `:low`; an empty level forfeits its quantum. No level starves: a `:low` actor waits at most 4 + 2 dispatches.
+- `:lottery`: a level is drawn at random in proportion to its weight (4, 2, 1) times the number of its waiting actors, and the head of that level runs. No level starves in expectation; there is no hard bound.
+
+**Carrier query.** `actor_carrier_index(actor)` returns the zero-based index of the carrier thread the actor is bound to, as an `int64`. It takes exactly one argument of type `actor_ref` (any other count or type is E2005) and requires `proc[concurrency]`. It returns `-1`, and does not fail, for a dangerous actor (which has a thread of its own and no carrier) and for a reference that names no actor. A migration that has been requested but not yet applied (§15.1.2, dispatch boundary) is not reported: the result is the carrier the actor is bound to now. On a hosted target an actor placed on core `c` is bound to carrier `c mod N`, where `N` is the carrier count.
+
+**Implementation status (2026-10-21).** The four scheduler policies are implemented on the ESP32-S3 and on the three hosted targets (on each carrier, as above). `actor_carrier_index` is implemented on the three hosted targets only; the ESP32-S3 emitter has no lowering for it.
 
 **`get_core_capabilities(core_id)` result contract:**
 
@@ -15347,7 +15364,7 @@ When register access fails:
 #### 26.2.1 Thread Management
 Runtime integrates with OS threading:
 
-- **Native Threads**: Uses OS threads for actor scheduling
+- **Native Threads**: On a hosted target the runtime's carrier threads (one per logical core by default) schedule the actors, and a dangerous actor (§15.4.13.5) is an operating-system thread of its own
 - **CPU Affinity**: Optional thread pinning to CPU cores
 - **Priority Mapping**: Maps Silica priorities to OS priorities
 - **Signal Handling**: Proper signal handling for runtime control
