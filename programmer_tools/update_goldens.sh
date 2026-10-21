@@ -38,7 +38,8 @@
 # WHAT IT NEVER TOUCHES (all of this is hand-derived, or is not a golden at all)
 #   *.scout and its variants (*.scout.multiset, *.scout.sorted, *.scout.normalized) - expected
 #     program output and exit status, derived by hand.
-#   *.<target>.scout - a reviewed, hand-recorded board-vs-host difference.
+#   *.<target>.scout - a reviewed, hand-recorded difference of that target from the Mac (the harness
+#     reads it in place of the plain .scout there: trials/silica_compiler.mk SCOUT_FOR).
 #   *.golden_fail, *.<target>.golden_fail, *.no_golden_fail - expected compiler diagnostics,
 #     derived by hand (exit codes shift when literals are added; they are not mechanical).
 #   *.sout, *.cur_fail - a run's actual output, never a golden.

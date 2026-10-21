@@ -204,7 +204,7 @@ integrate-run:
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1; \
 		elif [ -x "$$base" ]; then \
-			if [ -f "$$base.scout" ]; then \
+			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
 				if [ -f "$$base.wait_for_exit" ]; then \
 					if [ -f "$(THIS_DIR)run_integration_exit_after_marker.py" ]; then \
 						marker=$$(awk 'NF { print $$1; found=1; exit } END { if (!found) print "done" }' "$$base.wait_for_exit"); \
@@ -230,24 +230,24 @@ integrate-run:
 					fi; \
 				fi; \
 				if [ -f "$$base.scout.multiset" ]; then \
-					if [ -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset.sh" "$$base.sout" "$$base.scout"; then \
+					if [ -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)"; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout multiset-compare differs from .scout"; \
 						$(INTEGRATE_DOT_FAIL); \
 						ko=$$((ko + 1)); failed=1; \
-					elif [ ! -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! diff -Bw -q "$$base.sout" "$$base.scout" > /dev/null 2>&1; then \
+					elif [ ! -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout (missing compare_scout_multiset.sh; used diff -Bw)"; \
 						$(INTEGRATE_DOT_FAIL); \
-						diff -Bw "$$base.sout" "$$base.scout" || true; \
+						diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
 						ko=$$((ko + 1)); failed=1; \
 					else \
 						echo "✅✅ $(MSG_PREFIX)$$base output multiset-matches .scout"; \
 						$(INTEGRATE_DOT_OK); \
 						ok=$$((ok + 1)); \
 					fi; \
-				elif ! diff -Bw -q "$$base.sout" "$$base.scout" > /dev/null 2>&1; then \
+				elif ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout"; \
 					$(INTEGRATE_DOT_FAIL); \
-					diff -Bw "$$base.sout" "$$base.scout" || true; \
+					diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \

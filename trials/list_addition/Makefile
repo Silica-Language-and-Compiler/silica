@@ -162,11 +162,11 @@ integrate-run:
 				$(INTEGRATE_DOT_FAIL); \
 				ko=$$((ko + 1)); failed=1; continue; \
 			fi; \
-			if [ -f "$$base.scout" ]; then \
-				if ! bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$$base.scout" > /dev/null 2>&1; then \
+			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
+				if ! bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout (normalized compare)"; \
 					$(INTEGRATE_DOT_FAIL); \
-					bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$$base.scout" || true; \
+					bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \

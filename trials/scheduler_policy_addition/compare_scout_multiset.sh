@@ -8,9 +8,10 @@ set -euo pipefail
 # runtime owns a per-core ready queue (ESP32-S3_raw). On a hosted target the actors are threads the OS
 # schedules, so the same program prints the same lines in an order nobody defines. Hence two readings
 # of one golden:
-#   - a per-target golden (<stem>.<target>.scout, the board's reviewed expectation) is compared in
-#     order, line for line, as diff -Bw does;
-#   - the shared golden (<stem>.scout) is compared as a multiset of lines: the same lines, any order.
+#   - a raw target's golden (<stem>.ESP32-S3_raw.scout, the board's reviewed expectation) is compared
+#     in order, line for line, as diff -Bw does;
+#   - every other golden -- the shared <stem>.scout, and a hosted target's <stem>.<target>.scout
+#     (silica_compiler.mk SCOUT_FOR) -- is compared as a multiset of lines: the same lines, any order.
 # The last line of both is the exit status, compared like any other line.
 
 if [ "$#" -ne 2 ]; then
@@ -19,7 +20,7 @@ if [ "$#" -ne 2 ]; then
 fi
 actual=$1 golden=$2
 case "$(basename "$golden" .scout)" in
-  *.*)  # <stem>.<target>.scout: the target's own expectation, compared in order
+  *.*_raw)  # <stem>.<raw target>.scout: the board's own expectation, compared in order
     diff -Bw "$actual" "$golden"
     exit $? ;;
 esac

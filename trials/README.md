@@ -6,6 +6,25 @@ against its `.ascomp` golden, links and runs the program, and diffs its output
 against its `.scout` golden (error and warning suites diff compiler output against
 `.golden_fail` / `.golden_warn` instead). A bare `make` in a suite only compiles.
 
+## Goldens per target
+
+The plain golden names are the macOS (Apple Silicon) goldens. Another emit target
+(`SILICA_EMIT_TARGET`, set in `silica_compiler.mk`: `linux_aarch64`, `linux_x86_64`,
+`ESP32-S3_raw`) reads `<trial>.<target>.<kind>` beside them:
+
+| golden | macOS | other targets |
+|---|---|---|
+| assembly | `<trial>.ascomp` | `<trial>.<target>.ascomp`, always (`ASCOMP_EXT`) |
+| compiler errors | `<trial>.golden_fail` | `<trial>.<target>.golden_fail` when it exists, else the plain one (`GOLDEN_FAIL_EXT`) |
+| run output | `<trial>.scout` | `<trial>.<target>.scout` when it exists, else the plain one (`$(call SCOUT_FOR,<trial>)`) |
+
+A target scout is for output that legitimately differs on that host (for example
+`cpu_topology_runtime_queries.linux_aarch64.scout`); most trials have only the plain
+`.scout`, which every target shares. It is a golden, not a trial: trials are the
+`.silica` files, and the comparison markers (`<trial>.scout.multiset`, `.sorted`,
+`.alt`, `.normalized`) stay keyed on the plain trial name. The Mac never reads a
+target scout. The board harness (`targets/board_suite.sh`) applies the same rule.
+
 ## Running the trials
 
 ```

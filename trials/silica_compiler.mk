@@ -15,6 +15,13 @@
 # Leaf helpers that already include this file (do not re-point the compiler elsewhere):
 #   standard_data_structures_phase1/leaf.mk
 #   ffi_addition/common_app.mk
+#
+# Per-target goldens (defined below, after the emit target): assembly <stem>$(ASCOMP_EXT), errors
+# <stem>$(GOLDEN_FAIL_EXT).golden_fail, run output $(call SCOUT_FOR,<stem>). The plain names
+# (<stem>.ascomp, .golden_fail, .scout) are the macOS goldens; on any other emit target
+# <stem>.<target>.{ascomp,golden_fail,scout} is used instead -- always for .ascomp, and for
+# .golden_fail / .scout only when that file exists (else the plain one). <target> is
+# $(SILICA_EMIT_TARGET): linux_aarch64, linux_x86_64, ESP32-S3_raw.
 
 _SILICA_COMPILER_MK_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 BINARIES_DIR := $(abspath $(_SILICA_COMPILER_MK_DIR)../binaries)
@@ -69,6 +76,20 @@ ASCOMP_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),.ascomp,.$(
 # The error golden a trial is compared against: <stem>.<target>.golden_fail when it exists, else the
 # plain <stem>.golden_fail (the macOS golden). GOLDEN_FAIL_EXT is empty on the Mac.
 GOLDEN_FAIL_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,.$(SILICA_EMIT_TARGET))
+
+# The output golden a trial's run (<stem>.sout) is compared against. The plain <stem>.scout is the
+# macOS (Darwin) golden and the default for every target; a target whose run legitimately prints
+# something else (a host-specific fact, e.g. the CPU topology) keeps <stem>.<target>.scout beside it,
+# and that file wins on that target when it exists. SCOUT_EXT is empty on the Mac, so the Mac always
+# reads the plain .scout, exactly as before. A target-specific scout is a golden, never a trial: the
+# trials are the .silica files, and markers (<stem>.scout.multiset, .sorted, .alt, ...) stay keyed on
+# the plain stem.
+#   "$(call SCOUT_FOR,$$base)"  ->  the path of the golden for shell variable base, in a recipe.
+# On the Mac it expands to plain "$base.scout" (no subshell); elsewhere to a POSIX-sh
+# $( if [ -f ... ] ...) that picks "$base.<target>.scout" when that file exists, else "$base.scout".
+SCOUT_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,.$(SILICA_EMIT_TARGET))
+_SCOUT_PICK_SH = $$(if [ -f "$(1)$(SCOUT_EXT).scout" ]; then echo "$(1)$(SCOUT_EXT).scout"; else echo "$(1).scout"; fi)
+SCOUT_FOR = $(if $(SCOUT_EXT),$(_SCOUT_PICK_SH),$(1).scout)
 
 # Toolchain for the emitted target's code: trials/platform/<emit target>.mk (assembler, linker,
 # link flags, FFI fixture flags, golden suffix, skip list). Optional while the per-trial makefiles

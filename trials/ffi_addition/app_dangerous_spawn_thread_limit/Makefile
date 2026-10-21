@@ -114,28 +114,28 @@ integrate-run: fixtures
 		fi; \
 		fi; \
 		[ "$$failed" -ne 0 ] && break; \
-		if [ ! -f "$$trial.scout" ]; then \
+		if [ ! -f "$(call SCOUT_FOR,$$trial)" ]; then \
 			echo "  ❌ $(APP_LABEL)/$$trial: missing .scout"; ko=$$((ko + 1)); failed=1; \
 			$(INTEGRATE_DOT_FAIL); \
-		elif [ -f "$$trial.scout.sorted" ] && [ -f "$(FFI_TRIAL_DIR)/compare_scout_sorted.sh" ] && ! "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_sorted.sh" "$$trial.sout" "$$trial.scout" > /dev/null 2>&1; then \
+		elif [ -f "$$trial.scout.sorted" ] && [ -f "$(FFI_TRIAL_DIR)/compare_scout_sorted.sh" ] && ! "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_sorted.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout (sorted compare)"; \
 			$(INTEGRATE_DOT_FAIL); \
-			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_sorted.sh" "$$trial.sout" "$$trial.scout" || true; \
+			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_sorted.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
-		elif [ -f "$$trial.scout.sorted" ] && [ ! -f "$(FFI_TRIAL_DIR)/compare_scout_sorted.sh" ] && ! diff -Bw -q "$$trial.sout" "$$trial.scout" > /dev/null 2>&1; then \
+		elif [ -f "$$trial.scout.sorted" ] && [ ! -f "$(FFI_TRIAL_DIR)/compare_scout_sorted.sh" ] && ! diff -Bw -q "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout (missing compare_scout_sorted.sh; used diff -Bw)"; \
 			$(INTEGRATE_DOT_FAIL); \
-			diff -Bw "$$trial.sout" "$$trial.scout" || true; \
+			diff -Bw "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
-		elif [ ! -f "$$trial.scout.sorted" ] && [ -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$$trial.scout" > /dev/null 2>&1; then \
+		elif [ ! -f "$$trial.scout.sorted" ] && [ -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout (normalized compare)"; \
 			$(INTEGRATE_DOT_FAIL); \
-			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$$trial.scout" || true; \
+			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
-		elif [ ! -f "$$trial.scout.sorted" ] && [ ! -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! diff -Bw -q "$$trial.sout" "$$trial.scout" > /dev/null 2>&1; then \
+		elif [ ! -f "$$trial.scout.sorted" ] && [ ! -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! diff -Bw -q "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout"; \
 			$(INTEGRATE_DOT_FAIL); \
-			diff -Bw "$$trial.sout" "$$trial.scout" || true; \
+			diff -Bw "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
 		else \
 			echo "  ✅✅ $(APP_LABEL)/$$trial output matches .scout"; \

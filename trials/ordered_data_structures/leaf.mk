@@ -381,11 +381,11 @@ if [ "$$integrate_killed" = 1 ]; then \
 	echo "❌❌ $(MSG_PREFIX)$$b $(INTEGRATE_KILLED_MSG)"; \
 	$(INTEGRATE_DOT_FAIL); \
 	printf 'FAIL\t%s\tkilled by the watchdog; trial incomplete\n' "$$b" >> "$$res"; \
-elif [ -f "$$b.scout" ]; then \
-	if ! diff -Bw -q "$$b.sout" "$$b.scout" > /dev/null 2>&1; then \
+elif [ -f "$(call SCOUT_FOR,$$b)" ]; then \
+	if ! diff -Bw -q "$$b.sout" "$(call SCOUT_FOR,$$b)" > /dev/null 2>&1; then \
 		echo "❌❌ $(MSG_PREFIX)$$b .sout differs from .scout"; \
 		$(INTEGRATE_DOT_FAIL); \
-		diff -Bw "$$b.sout" "$$b.scout" || true; \
+		diff -Bw "$$b.sout" "$(call SCOUT_FOR,$$b)" || true; \
 		printf 'FAIL\t%s\t.sout differs from .scout\n' "$$b" >> "$$res"; \
 	else \
 		echo "✅✅ $(MSG_PREFIX)$$b output matches .scout"; \
