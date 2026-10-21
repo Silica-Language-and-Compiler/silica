@@ -100,6 +100,12 @@ stack faults before any output: on x86-64 `movaps` in `pthread_create`, reached 
 addresses. `-rdynamic`: the failure banner names behaviours through `dladdr`, which on glibc sees only
 `.dynsym`.
 
+On Linux the program ends only when it reads the line `exit` (with its newline) on a standard input that stays
+open; end-of-file alone never ends it, so do not start it under `nohup` or with `</dev/null`. Run it from a
+terminal and type `exit`, or drive it with the harness: `python3 trials/carriers_addition/run_integration_exit_after_marker.py
+<dir>/ idle_actor_capacity out.txt "100000 idle actors" 1`, or `(sleep 20; echo exit) | ./idle_actor_capacity`.
+The last line of the output is the exit status, 0 after a clean stop.
+
 The compile, assemble and link steps were checked on 2026-10-08 with `silica-999955` (an 83 KB executable).
 Since 2026-10-11 `main` registers a FailureReporter before it starts the spawner (spec §15.4.13.4, error
 E2236 otherwise); the reporter writes each failure report to stderr, as the runtime did before. That version
