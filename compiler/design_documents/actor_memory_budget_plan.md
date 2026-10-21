@@ -1361,7 +1361,10 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       of the trial tree beyond the suites listed; the idle-actor capacity measurement on pix; whether
       `pthread_setaffinity_np`'s binding (verified only as "the call is made and its result stored")
       improves anything measurable. `linux_x86_64` and the compiler on carriers are covered below.
-  - **Item N final status (2026-10-20, branch `hosted-carriers-item-n`).** Hosted carriers are the only
+  - **Item N final status (2026-10-20, branch `hosted-carriers-item-n`).** Latest: `:release_when_idle` on
+    carriers is now FIFO, budgeted and released outside the carrier lock on Apple Silicon (commit
+    `53c8ce38d6`; the idle period is an upper bound and `SILICA_IDLE_RELEASE_MS` sets it; Linux mirrors in
+    progress, not yet verified; follow-up 5 below). Hosted carriers are the only
     execution model on Apple Silicon, Linux AArch64 and Linux x86-64; the ESP32-S3 board has its own
     per-core schedulers and only the gap fixes below were mirrored to it.
     - *Linux x86-64 (nix), `ef2e778126`:* hand translation of the Apple Silicon design (carrier module,
@@ -1431,20 +1434,32 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       3. Board: row-child drain protection (acquire mode 2) not mirrored; to be done on a separate
          branch.
       4. `get_efficiency_cores` / `get_performance_cores` return wrong core-id lists.
-      5. `:release_when_idle` idle sweep costs about 8 KB per actor at peak. A design exists
-         (`release_when_idle_design.md`, scratchpad of 2026-10-20); it is **not implemented**. In brief:
-         (a) the 8 KB is a transient that scales with the spawn-and-dispatch rate, not a per-actor
-         cost: each dispatched actor holds one committed page until a sweep finds its stack idle for
-         one second; (b) the sweep walks the whole list under the carrier lock, so it stalls spawners
-         as the population grows; (c) the list becomes FIFO by idle stamp with a listed-bytes total, and
-         the sweep stops at the first entry not yet due; (d) the sweep works in incremental batches of
-         64 and releases outside the carrier lock, through a new actor status 6 (sweeping); (e) a
-         per-carrier idle-stack budget (machine memory plus swap over 32, split over the carriers,
-         `SILICA_IDLE_STACK_BUDGET` overriding) makes the sweep take the oldest first when exceeded;
-         (f) about 260 lines per port, Apple Silicon first, five new `carriers_addition` trials;
-         (g) pending Lee's decision on a spec sentence that makes the one-second idle an upper bound
-         on how long an idle stack is kept; without it the lock stall goes but the transient stays
-         bounded only by rate times one second times a page; (h) not implemented.
+      5. `:release_when_idle` idle sweep: **implemented on Apple Silicon 2026-10-20 (commit `53c8ce38d6`);
+         the Linux AArch64 and x86-64 mirrors are in progress and not yet verified.** Design:
+         `release_when_idle_design.md` (scratchpad of 2026-10-20); Lee approved the full version,
+         including the specification deviation (the idle period is now an upper bound) and made the
+         period user-definable. What it does: (a) the 8 KB per actor seen at 100,000 actors was a
+         transient that scales with the spawn-and-dispatch rate, not a per-actor cost: each dispatched
+         actor holds one committed page until a sweep finds its stack idle; (b) the old sweep walked the
+         whole list under the carrier lock and stalled spawners as the population grew; (c) the idle list
+         is now FIFO by idle stamp, with a tail and a listed-bytes total, and the sweep stops at the first
+         entry not yet due; (d) the sweep is incremental, in batches of 64, and releases under the actor's
+         lock outside the carrier lock, through a new actor status 6 (sweeping); an actor that gets mail,
+         a stop or a migration meanwhile becomes ready again and is not released; (e) a per-carrier
+         idle-stack budget (machine memory plus swap over 32, split over the carriers, floor 16 platform
+         pages) makes the sweep take the oldest first when exceeded, so the idle period is an upper
+         bound; (f) `SILICA_IDLE_RELEASE_MS=<ms>` sets the period for carriers and for the timed wait of
+         dangerous actors (default 1000; unset, 0 or non-numeric gives the default; clamped to
+         3,600,000), the sweep cadence on a busy carrier is min(250 ms, period / 4), and
+         `SILICA_IDLE_STACK_BUDGET=<bytes>` overrides the budget (process total). Trials:
+         `carriers_addition/workers_zzzzz_idle_release_{budget_bounds_burst, oldest_first,
+         keeps_recently_mailed, sweep_under_mail_stress, migrated_relists, period_env}`, with per-trial
+         `<base>.env` runtime knobs read by the suite's Makefile. Measured (idle_actor_capacity shape,
+         cast per actor, reserve 65536, 10 carriers, 16 GB Mac; wall time to the last total line, peak
+         RSS by `programmer_tools/peak_rss.sh`): 1,000,000 actors with `:release_when_idle` 5.48 s,
+         peak 1,262 MB, 654 MB at rest (before the redesign: 28.16 s, 1,240 MB peak); with
+         `:release_on_return` 5.95 s, 655 MB. The extrapolated 8.5 GB peak of §16 did not materialise:
+         the old lock-held walk had stalled the spawner, which is what held the rate down.
       6. Linux idle-actor capacity, `get_actor_memory_usage` and x86-64 timing are unmeasured (held).
       7. Stale `__silica_runtime.*.ascomp` goldens (the harness never compares them).
       8. About 30 trial comments still mention `SILICA_CARRIERS=0`; left as history.
@@ -1988,7 +2003,12 @@ stops at the per-task thread limit of 4,096 on this host (4,000 actors), so the 
 411,000 thread-backed actors in 2 s (never of this build, with no cast per actor) does not reproduce here and is unexplained.
 `:release_when_idle` commits stacks at first dispatch and the idle sweep gives them back only later: at 100,000
 the transient peak is about 8 KB per actor (about 850 MB) before settling at 68 MB, so a million under that
-policy was not run (extrapolated peak about 8.5 GB); `:release_on_return` has no transient. The
+policy was not run then (extrapolated peak about 8.5 GB); `:release_on_return` has no transient.
+**Update 2026-10-20 (Apple Silicon, after the budgeted sweep of §5 N follow-up 5):** 1,000,000 actors with
+`:release_when_idle` took 5.48 s wall with a 1,262 MB peak RSS and 654 MB at rest (before: 28.16 s, 1,240 MB
+peak); `:release_on_return` 5.95 s, 655 MB. The 8.5 GB extrapolation did not materialise, because the old
+lock-held walk had stalled the spawner. Peak RSS is `ps -o rss=` polled every 50 ms (`programmer_tools/peak_rss.sh`;
+on Linux use `/usr/bin/time -v`). Linux not yet measured. The
 `get_actor_memory_usage` probe was not taken: `whereis` is not a function in this compiler (E2007), and the
 actor ref is not otherwise reachable after the spawner returns. Zero committed stack is inferred from the
 RSS figures only (608 MB dirty at a million, about 640 B per actor).
@@ -2011,7 +2031,7 @@ Checked from the hosted runtime source on 2026-10-07 and again on 2026-10-16 (si
 | K | done | `cast_exit` / `wait_for_exit` in the hosted runtimes; trial-verified 2026-10-08 (§5 K) |
 | L | done | `compiler/src/main.silica` (§5 L) |
 | M | done | `trials/lib_trial_support`, `programmer_tools/trial_shape_m` (§5 M) |
-| N | built 2026-10-19, `apple_silicon_mac` only, unpublished branch: carriers are the only model (no gate, no opt-out; `SILICA_CARRIER_COUNT=<n>` overrides the core count) | one carrier thread per logical core for every actor but a dangerous one (workers, supervisors, the registries), bound at spawn (`core mod N`, else in turn), per-carrier idle sweep; placement (`migrate_actor`, the `pin_actor_*` family) real on carriers; the four dispatch-order policies and the three priority levels real per carrier; one thread per dangerous actor; the Linux runtimes still thread per actor; §5 N "Carriers are the only model" |
+| N | built 2026-10-19, `apple_silicon_mac` only, unpublished branch: carriers are the only model (no gate, no opt-out; `SILICA_CARRIER_COUNT=<n>` overrides the core count) | one carrier thread per logical core for every actor but a dangerous one (workers, supervisors, the registries), bound at spawn (`core mod N`, else in turn), per-carrier idle sweep (FIFO, budgeted, batches of 64, released outside the carrier lock since 2026-10-20; `SILICA_IDLE_RELEASE_MS`, `SILICA_IDLE_STACK_BUDGET`); placement (`migrate_actor`, the `pin_actor_*` family) real on carriers; the four dispatch-order policies and the three priority levels real per carrier; one thread per dangerous actor; the Linux runtimes still thread per actor; §5 N "Carriers are the only model" |
 | J | done 2026-10-09 | per-image `silica_registry_slots` (one per atom) sizes the three registries and the keyed-form discriminator; duplicates refused per §20.3.1; names removed at teardown (§5 J) |
 
 ## 18. Gate (hosted)

@@ -22,6 +22,27 @@ and Return. It is not a trial and is not run by any harness.
   machine's memory plus swap of address space, so address space runs out first, after a few thousand
   actors, and the number says little about memory. A small reserve measures what idle actors really cost.
 
+## Measured with `:release_when_idle` (2026-10-20, Apple Silicon)
+
+On a 16 GB, 10-core Mac, each actor sent one message right after spawn, reserve 65536, 1,000,000 idle actors:
+
+| Release policy | Wall time to the last total | Peak RSS | RSS at rest |
+| --- | ---: | ---: | ---: |
+| `:release_when_idle`, current runtime | 5.48 s | 1,262 MB | 654 MB |
+| `:release_when_idle`, before the budgeted sweep | 28.16 s | 1,240 MB | not recorded |
+| `:release_on_return` | 5.95 s | not recorded | 655 MB |
+
+Peak RSS comes from `ps -o rss=` polled every 50 ms, which `programmer_tools/peak_rss.sh` does (on Linux, run
+the program under `/usr/bin/time -v` and read "Maximum resident set size"). Linux figures are not measured yet.
+
+## Environment variables for `:release_when_idle`
+
+- `SILICA_IDLE_RELEASE_MS=<milliseconds>`: the idle period after which a stack is given back (default 1000;
+  unset, 0 or non-numeric gives the default; values above 3,600,000 are clamped). It is an upper bound: the
+  runtime keeps a budget for the stacks idle actors still hold and releases the oldest early when it is exceeded.
+- `SILICA_IDLE_STACK_BUDGET=<bytes>`: that budget for the whole process (default: the machine's memory plus
+  swap divided by 32, shared among the carriers, at least 16 platform pages each).
+
 ## Build (macOS on Apple silicon)
 
 From this directory, with the repository's published compiler:

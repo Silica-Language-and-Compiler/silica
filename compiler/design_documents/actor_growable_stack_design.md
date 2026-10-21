@@ -366,7 +366,7 @@ needs in the control block. `stack_policy` is a required spawn argument, so ever
 | `:release_on_return` | nothing | decommit-on-free, as in Windows heaps and musl | none |
 | `:keep_last_message` | the last message's usage | trim to the last request's working set | last usage |
 | `:track_recent_peak` | maximum over the last 32 messages | sliding-window maximum; the same idea as jemalloc's decay-based purging of dirty pages | a 32-entry ring of per-message usage, 256 bytes |
-| `:release_when_idle` | everything while busy, nothing after 1 s idle | the JVM's periodic uncommit of unused committed memory (JEP 346) and jemalloc's `dirty_decay_ms` | time of the last message; a runtime idle sweep |
+| `:release_when_idle` | everything while busy, nothing after the idle period (1 s by default, `SILICA_IDLE_RELEASE_MS`; an upper bound, since a per-carrier budget releases the oldest early) | the JVM's periodic uncommit of unused committed memory (JEP 346) and jemalloc's `dirty_decay_ms` | time of the last message; a runtime idle sweep |
 | `:keep_high_water` | the high-water mark | conventional thread stacks, and glibc's cache of freed thread stacks | none beyond the high-water mark |
 
 The idle sweep that `:release_when_idle` needs runs on the runtime's carrier threads, not on the actor,
