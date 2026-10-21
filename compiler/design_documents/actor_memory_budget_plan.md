@@ -1443,8 +1443,15 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
          The first five trials for A: `app_ffi_blocking_call_keeps_carrier_free`,
          `app_ffi_many_dangerous_actors`, `app_ffi_kill_during_foreign_call`,
          `app_ffi_thread_affinity`, and the option C trial `app_dangerous_spawn_thread_limit`.
-      3. Board: row-child drain protection (acquire mode 2) not mirrored; to be done on a separate
-         branch.
+      3. **Board gap (open).** Acquire mode 2 (row-child drain protection under a carrier-style
+         supervisor) is not on the ESP32-S3; the board has no restart token and drains in the caller's
+         context. The gap 3 pieces mirrored in `1fb0357e30` (self check, `silica_rt_sup_op_tag`,
+         `_op_error`, `_op_child`, atom words) were never built or run on the board. Gaps 4 and 7, option C
+         and the carrier thread-exit fixes do not apply to the board (no thread-local current actor, no
+         restart token, no OS threads). `binaries/silica-compiler-ESP32-S3_raw` still points at
+         `silica-999979-ESP32_S3_raw-macos-applesilicon`, built before all of it; no board compiler was
+         built in the 2026-10-21 round. To be done on a separate branch by Lee, who runs the board.
+         Recorded in ROADMAP.md, "Open item: the ESP32-S3 board gap".
       4. `get_efficiency_cores` / `get_performance_cores` returned wrong core-id lists: **fixed** in
          `7b8260a0fe` on all three trees (trial `cpu_topology_runtime_queries_portable`); the related
          `get_cpu_topology` list/string defect and the `get_core_capabilities` X27/X28 save defect are
@@ -1503,8 +1510,11 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       - Transient failures, passed on rerun, not defects: memory pressure on the 3 GB pix (`float16`,
         `case_addition`, `error_enforcement_addition` `train_effect_check_mem_*`) and a one-off nix E1009
         on `trial_wait_int64`.
-      - Still open: gen2/gen3 verification on carriers on all hosts (Lee's builds); the board gap
-        (item 3) on a separate branch; Linux `get_actor_memory_usage` and x86-64 timing measurements
+      - Still open: gen2/gen3 verification on carriers on all hosts (Lee's builds); the **board gap**
+        (item 3, ROADMAP.md "Open item: the ESP32-S3 board gap"): acquire mode 2 not on the board; the
+        gap 3 mirror (`1fb0357e30`) never built or run; no board compiler built in this round, so
+        `binaries/silica-compiler-ESP32-S3_raw` is still 999979; gaps 4 and 7, option C and the thread-exit
+        fixes do not apply to the board; separate branch, by Lee, board runs Lee's; Linux `get_actor_memory_usage` and x86-64 timing measurements
         (held by Lee).
 
 ## 6. Gate (common)
