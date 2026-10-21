@@ -25,6 +25,19 @@ clang main.o adder.o Supervisor.o __silica_runtime.o -o first_program -Wl,-e,mai
 ./first_program
 ```
 
+On Linux, compile with the platform's compiler (`binaries/silica-compiler-linux_x86_64` or
+`binaries/silica-compiler-linux_aarch64`) and link as `trials/linux_host.mk` does, without `-Wl,-e,main`:
+
+```sh
+for f in Supervisor adder main __silica_runtime; do cc -c -x assembler $f.sams -o $f.o; done
+cc main.o adder.o Supervisor.o __silica_runtime.o -o first_program -no-pie -rdynamic -lpthread
+```
+
+`-e main` is for dyld, which calls the entry point as a function; on Linux the kernel starts the process at
+the entry point with `argc` on top of the stack and no return address, so `main` would run 8 bytes off the
+System V stack alignment and fault in the first libc routine that needs it (`docs/examples/idle_actor_capacity/README.md`
+has the details), and its `ret` would have nowhere to go.
+
 The published `binaries/silica-compiler` (`silica-999949-macos-applesilicon` on 2026-10-16) compiles it and prints `5`. `main` registers the reporter before any start (error E2236 otherwise) and the reporter calls `cast_exit`, so a compiler older than those rules does not compile it.
 
 ## Expected output

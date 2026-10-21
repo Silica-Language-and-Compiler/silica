@@ -55,6 +55,31 @@ clang -c -x assembler __silica_runtime.sams -o __silica_runtime.o
 clang main.o __silica_runtime.o -o idle_actor_capacity -Wl,-e,main
 ```
 
+## Build (Linux, x86-64 or AArch64)
+
+The same compile with the platform's compiler (`binaries/silica-compiler-linux_x86_64` or
+`binaries/silica-compiler-linux_aarch64`), then assemble and link as `trials/linux_host.mk` does:
+
+```sh
+echo main.silica > silica.config
+../../../binaries/silica-compiler-linux_x86_64
+cc -c -x assembler main.sams -o main.o
+cc -c -x assembler __silica_runtime.sams -o __silica_runtime.o
+cc main.o __silica_runtime.o -o idle_actor_capacity -no-pie -rdynamic -lpthread
+```
+
+Do not pass `-Wl,-e,main` on Linux. The macOS line above works because dyld calls the entry point as a
+function and exits with its result; on Linux the entry point is where the kernel starts the process, with
+`argc` at the top of the stack and no return address. Entered that way, `main` runs on a stack that is 8
+bytes off the System V alignment its callees expect (`rsp` is 16-byte aligned at the entry point, and
+16-byte aligned plus 8 at a function's entry), so the first libc routine that keeps a 16-byte value on its
+stack faults before any output: on x86-64 `movaps` in `pthread_create`, reached from the injected
+`silica_pid_registry_init` as the registry actor takes the first carrier thread, reported as
+`[silica] fault at ... addr=0x0 actor=0x0`, exit 70. And `main`'s `ret` would have nowhere to go. With
+`crt1.o` (no `-e`), `_start` calls `main` the ordinary way. `-no-pie`: the emitted data tables hold absolute
+addresses. `-rdynamic`: the failure banner names behaviours through `dladdr`, which on glibc sees only
+`.dynsym`.
+
 The compile, assemble and link steps were checked on 2026-10-08 with `silica-999955` (an 83 KB executable).
 Since 2026-10-11 `main` registers a FailureReporter before it starts the spawner (spec §15.4.13.4, error
 E2236 otherwise); the reporter writes each failure report to stderr, as the runtime did before. That version
