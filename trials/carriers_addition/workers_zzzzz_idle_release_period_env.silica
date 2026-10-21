@@ -1,0 +1,91 @@
+// Carriers, the :release_when_idle period from the environment: SILICA_IDLE_RELEASE_MS=<ms> read
+// once at runtime start replaces spec §15.1.2.2's one second (unset, 0 or not a number keeps 1000
+// ms; more than an hour is clamped to an hour). The suite runs this trial with
+// SILICA_IDLE_RELEASE_MS=600000 (the .env file beside it: ten minutes). An actor is called once and
+// holds over 1 MB; with the default period the bounded poll (2,000 ticks, four seconds and more on
+// every host: a tick is a deep message to a :release_on_return actor, which re-faults its stack
+// every time, workers_zzzzz_idle_release_budget_bounds_burst) would see it released after a second;
+// under the ten minutes it sees no release, and the actor still holds everything when the poll gives
+// up. The budget does not bind: the default is far above one actor's stack. The matching check that
+// a SHORTER period releases sooner needs a wall clock, which no trial has: it is run by hand
+// (release_when_idle_design.md, the hand-off notes).
+//
+// Expected output: true (held), true (not released within the poll), true (still held), 0. The same
+// at every carrier count.
+
+use trial_support_int64;
+
+fn depth(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            r: int64 <- depth(n - 1);
+            r + 1
+        }
+    }
+}
+
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+fn tick(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+fn poll_released(w: actor_ref, t: actor_ref, n: int64) -> boolean {
+    sequence proc[concurrency]
+        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        r: boolean <- case u.committed == 0 of {
+            true -> true;
+            false -> tick_then_poll(w, t, n)
+        }
+    produces
+        pure r
+    end
+}
+
+fn tick_then_poll(w: actor_ref, t: actor_ref, n: int64) -> boolean {
+    case n == 0 of {
+        true -> false;
+        false -> {
+            sequence proc[concurrency]
+                _: int64 <- call(t, 200000 impl ActorMessage {});
+                r: boolean <- poll_released(w, t, n - 1)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        t: actor_ref <- spawn(0, tick, stack_policy(0, :release_on_return));
+        w: actor_ref <- spawn(0, beh, stack_policy(0, :release_when_idle));
+        _: int64 <- call(w, 200000 impl ActorMessage {});
+        busy: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        print_boolean(busy.committed > 1048576 and busy.retained == busy.committed);
+        println("");
+        released: boolean <- poll_released(w, t, 2000);
+        print_boolean(released == false);
+        println("");
+        still: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        print_boolean(still.committed == busy.committed and still.retained == busy.retained);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

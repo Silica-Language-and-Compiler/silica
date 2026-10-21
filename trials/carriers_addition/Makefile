@@ -12,7 +12,11 @@
 # The trial executables run with SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) in their environment:
 # the number of carriers, 0 (the default) meaning the machine's logical cores; the suite must pass
 # at 1, 2 and 4 (`make integrate SILICA_CARRIER_COUNT=2`). The compiler itself is not given the
-# variable: it runs with whatever the caller's environment holds.
+# variable: it runs with whatever the caller's environment holds. A trial that needs another runtime
+# knob keeps it in <base>.env beside its source, one NAME=value per line, added to the environment
+# of that run only (the workers_zzzzz_idle_release_* trials: SILICA_IDLE_STACK_BUDGET=<bytes>, the
+# :release_when_idle idle-stack budget for the process, and SILICA_IDLE_RELEASE_MS=<ms>, the idle
+# period; prims_actors_stack_asm.silica's header).
 # Uses silica-compiler to generate assembly, then assembles and links.
 #
 # silica-compiler reads silica.config in this directory and emits .sams files.
@@ -190,7 +194,7 @@ integrate-run:
 					if [ -f "$(THIS_DIR)run_integration_exit_after_marker.py" ]; then \
 						marker=$$(awk 'NF { print $$1; found=1; exit } END { if (!found) print "done" }' "$$base.wait_for_exit"); \
 						marker_count=$$(awk 'NF { print ($$2 == "" ? 1 : $$2); found=1; exit } END { if (!found) print 1 }' "$$base.wait_for_exit"); \
-						$(call INTEGRATE_EXEC_TRIAL,$(MSG_PREFIX)$$base,env SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) python3 "$(THIS_DIR)run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "$$marker" "$$marker_count"); \
+						$(call INTEGRATE_EXEC_TRIAL,$(MSG_PREFIX)$$base,env SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) $$(cat "$$base.env" 2>/dev/null) python3 "$(THIS_DIR)run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "$$marker" "$$marker_count"); \
 						if [ "$$integrate_killed" = 1 ]; then \
 							echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 							$(INTEGRATE_DOT_FAIL); \
@@ -203,7 +207,7 @@ integrate-run:
 						continue; \
 					fi; \
 				else \
-					$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,env SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) ./$$base); \
+					$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,env SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) $$(cat "$$base.env" 2>/dev/null) ./$$base); \
 					if [ "$$integrate_killed" = 1 ]; then \
 						echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 						$(INTEGRATE_DOT_FAIL); \

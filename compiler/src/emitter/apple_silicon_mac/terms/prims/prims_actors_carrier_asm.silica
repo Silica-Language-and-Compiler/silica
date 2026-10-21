@@ -44,11 +44,12 @@
 //     being run, +48 the carrier's base SP, +56 its 64 KB signal alternate stack, +64 pthread_t,
 //     +72 started, +80 created, +88/+96 the thread's record (below), +104 the sweep list head
 //     (idle :release_when_idle actors of this carrier still holding committed stack, linked
-//     through ACB #456), +112 the carrier's index, +120 the time of its last sweep; +128 the
-//     three run queues, one per priority tier, 24 B each at +128 + 24 * q (q = 0 high, 1 normal,
-//     2 low): head, tail (control blocks linked through ACB #456) and length; +200 the
+//     through ACB #456, oldest first), +112 the carrier's index, +120 the time of its last sweep;
+//     +128 the three run queues, one per priority tier, 24 B each at +128 + 24 * q (q = 0 high, 1
+//     normal, 2 low): head, tail (control blocks linked through ACB #456) and length; +200 the
 //     weighted-fair tier being served and +208 its remaining credit; +216 the lottery's xorshift64
-//     state (0 until the first draw); +224..+255 spare.
+//     state (0 until the first draw); +224 the sweep list's tail and +232 its listed bytes (the
+//     sum of ACB #288 over the listed actors); +240..+255 spare.
 //   - Dispatch order (stage 4; the board's rt_actors.S silica_rt_rq_push / _rq_pop, design in
 //     design_documents/ports/esp32s3_xtensa_port.md §8.10): set_scheduler_policy chooses how the
 //     READY actors of one carrier take turns. One policy word for the process
@@ -128,7 +129,9 @@
 //   - ACB fields (prims_actors_runtime_asm.silica layout): #440 the carrier (0 = a dangerous
 //     actor, on a thread of its own),
 //     #448 status (0 none, 1 idle, 2 ready: in a run queue, 3 running, 4 parked in a runtime
-//     wait, 5 idle on the carrier's sweep list), #456 run-queue, wait-list or sweep-list link, #464
+//     wait, 5 idle on the carrier's sweep list, 6 sweeping: taken off that list by its carrier's
+//     sweep, which is about to release its stack under the actor's lock; on no queue or list; a
+//     wake handles it like 1, a migration like 2-4), #456 run-queue, wait-list or sweep-list link, #464
 //     the SP of a parked context (0 = none), #472 the actor parked in a spawn until this actor has
 //     started, #480 the wait list the actor is parked on, #512 the pending migration target, #520
 //     the priority level.
@@ -158,14 +161,35 @@
 //     that phase, on the carrier's stack. The carrier's stack is for what never waits: the
 //     mailbox loop, the release algorithm, the re-queue, and the tail of an exit (stack_free,
 //     the arena teardown, the final release).
-//   - The idle sweep: a carrier walks its sweep list (_silica_rt_carrier_sweep) before it sleeps
-//     on an empty queue, waits with the earliest due time as its timeout, and, so that a busy
-//     carrier releases too, at a dispatch at most every quarter second while the list is not
-//     empty; an actor a second past its last message (ACB #344) is released by
-//     _silica_rt_stack_idle_check, the same check an actor thread makes in its timed wait, and
-//     leaves the list. The list changes only on the carrier's own thread (listing) or under the
-//     carrier's lock (the sweep, and _silica_rt_carrier_unlist when mail makes a listed actor
-//     ready).
+//   - The idle sweep (release_when_idle_design.md, 2026-10-20): the sweep list is FIFO by the
+//     actors' last-message stamps (ACB #344): _silica_rt_carrier_mark_idle appends at the tail
+//     (+224) in the same dispatch that stamped, and adds the actor's committed bytes (#288) to the
+//     listed total (+232). _silica_rt_carrier_sweep takes from the head only, in batches of at
+//     most 64 per call: an actor whose stamp is the idle period old (_silica_rt_stack_idle_due,
+//     against ONE clock reading per batch; the period is _silica_rt_idle_release_ns, spec
+//     §15.1.2.2's second unless SILICA_IDLE_RELEASE_MS says otherwise), or any head while the
+//     listed total exceeds the carrier's idle-stack budget (_silica_rt_idle_stack_budget: oldest
+//     first, whatever its age, so the committed stack idle actors hold on a carrier is bounded by
+//     the budget plus one actor's stack and the batch in flight, whatever the spawn rate). The
+//     walk stops at the first head not yet due, so a sweep costs O(released), never O(listed). No
+//     stack is released under the carrier's lock: per actor the sweep unlinks it and marks it 6
+//     (sweeping) under the carrier's lock, lets that lock go, takes the actor's own lock and, when
+//     its status is still 6, releases it (_silica_rt_stack_release_to, on the carrier's stack; it
+//     never waits) and marks it plainly idle (1); a status of 2 found there (mail, a stop or a
+//     migration's wake made it ready meanwhile) means no release: the actor is about to run and
+//     will stamp and relist at its next boundary. Only one of the two locks is held at a time.
+//     A carrier sweeps before it sleeps on an empty queue (batch after batch while the sweep
+//     answers 1, re-checking its queues between batches, then waits with the microseconds until
+//     the head is due as its timeout) and, while busy, at a dispatch when the listed total is over
+//     budget (checked at every pop) or when the head is due and _silica_rt_idle_sweep_ns
+//     (min(250 ms, the period / 4)) has passed since the last sweep; a busy sweep that answers 1
+//     is followed by ONE dispatch and then the next batch, so a burst of spawns never starves and
+//     the batch bounds the dispatch latency it adds. A migration relist (Lcmg_listed) appends an
+//     older stamp behind newer ones on the target: it is released when the entry before it is,
+//     at most one extra period late. The list changes only under the carrier's lock (the listing
+//     by mark_idle, the sweep's hand-off, and _silica_rt_carrier_unlist when mail or a migration
+//     takes a listed actor off); status 6 is written under the carrier's lock on the carrier's own
+//     thread and read under the actor's lock.
 //   - The carrier loop is re-entered afresh (SP reset to the base, current actor cleared) from every
 //     path that leaves an actor: a dispatch boundary with an empty mailbox, an exit path (which runs
 //     on the carrier's stack, like the board's scheduler running a faulted actor's exit), or a park.
@@ -220,9 +244,10 @@
 // path holds two carriers' locks, so a reply on carrier 2 that pushes its parked caller to
 // carrier 1, a supervisor's cascade on carrier 1 that stops siblings on carriers 2 and 3, and
 // two carriers waking each other's actors all take the locks in this order.
-// _silica_rt_carriers_lock (the table's creation, once) and the identity table's lock
-// (_silica_rt_ref_hold, taken by every reference resolution with nothing of the above held) are
-// leaves of their own. The wrapper lock sits above the actor locks on the reply path
+// The sweep's two sections (the hand-off under the carrier's lock, the release under the actor's)
+// are taken in sequence with nothing else held, never nested. _silica_rt_carriers_lock (the
+// table's creation, once) and the identity table's lock (_silica_rt_ref_hold, taken by every
+// reference resolution with nothing of the above held) are leaves of their own. The wrapper lock sits above the actor locks on the reply path
 // (LBB1_post_beh holds the wrapper while the ingress drain takes the replier's and its
 // supervisor's locks) and a dying actor's mailbox lock is held while the wrappers of calls INTO
 // it are signalled (_silica_rt_actor_signal_pending_call_deaths): those are different wrappers
@@ -619,24 +644,59 @@ Lcar_pop:
 	ldr	x10, [x19, #176]
 	orr	x9, x9, x10
 	cbz	x9, Lcar_empty
-; A busy carrier sweeps its idle :release_when_idle actors at most every quarter second.
+; A busy carrier sweeps a batch of its idle :release_when_idle actors when their listed bytes are
+; over the carrier's budget (every pop), or when the head is due and the sweep cadence has passed
+; since the last sweep; a batch that answers 1 (more to do) is followed by one dispatch and then
+; the next batch (the last-sweep time is cleared so the cadence does not delay it).
 	ldr	x9, [x19, #104]
 	cbz	x9, Lcar_have
+	ldr	x10, [x19, #232]
+	adrp	x11, _silica_rt_idle_stack_budget@PAGE
+	add	x11, x11, _silica_rt_idle_stack_budget@PAGEOFF
+	ldr	x11, [x11]
+	cmp	x10, x11
+	b.hi	Lcar_sweep_busy
 	bl	_silica_rt_stack_now_ns
-	ldr	x9, [x19, #120]
-	sub	x9, x0, x9
-	movz	x10, #0xB280
-	movk	x10, #0x0EE6, lsl #16
-	cmp	x9, x10
+	ldr	x10, [x19, #120]
+	sub	x10, x0, x10
+	adrp	x11, _silica_rt_idle_sweep_ns@PAGE
+	add	x11, x11, _silica_rt_idle_sweep_ns@PAGEOFF
+	ldr	x11, [x11]
+	cmp	x10, x11
 	b.lo	Lcar_have
+	ldr	x9, [x19, #104]
+	ldr	x10, [x9, #344]
+	sub	x10, x0, x10
+	adrp	x11, _silica_rt_idle_release_ns@PAGE
+	add	x11, x11, _silica_rt_idle_release_ns@PAGEOFF
+	ldr	x11, [x11]
+	cmp	x10, x11
+	b.lo	Lcar_have
+Lcar_sweep_busy:
 	mov	x0, x19
 	bl	_silica_rt_carrier_sweep
-	b	Lcar_pop
+	cmp	x0, #1
+	b.ne	Lcar_have
+	str	xzr, [x19, #120]
+	b	Lcar_have
 Lcar_empty:
-; Nothing to run: sweep, then sleep until mail (or a parked actor's wake) or the earliest release.
+; Nothing to run: sweep a batch; more to do (1) means back to the top, where mail that arrived
+; meanwhile is dispatched first; else, since the sweep let this lock go for each release, an actor
+; pushed meanwhile (it found the carrier awake, so it did not signal) is run before any sleep;
+; else sleep until mail (or a parked actor's wake) or the time the head of the list is due (0 =
+; the list is empty: no timeout).
 	mov	x0, x19
 	bl	_silica_rt_carrier_sweep
-	mov	x2, x0
+	cmp	x0, #1
+	b.eq	Lcar_pop
+	mov	x21, x0
+	ldr	x9, [x19, #128]
+	ldr	x10, [x19, #152]
+	orr	x9, x9, x10
+	ldr	x10, [x19, #176]
+	orr	x9, x9, x10
+	cbnz	x9, Lcar_have
+	mov	x2, x21
 	mov	x9, #1
 	str	x9, [x19, #16]
 	add	x0, x19, #8
@@ -797,8 +857,13 @@ Lcpu_unlock:
 _silica_rt_carrier_mark_idle:
 ; X0 = a carrier actor with no mail, between dispatches, its lock held: a pending migration is
 ; applied, then it is idle (1), or, when it is :release_when_idle (#312 = 4) and still holds
-; committed stack (#288), idle on its carrier's sweep list (5), linked through #456 under that
-; carrier's lock (the carrier may be the one just moved to: its list changes under its lock).
+; committed stack (#288), idle on its carrier's sweep list (5): appended at the tail (+224; the
+; list is ordered by the last-message stamps, #344, which this dispatch has just written), its
+; committed bytes added to the listed total (+232), under that carrier's lock (the carrier may be
+; the one just moved to: its list changes under its lock, and when it sleeps it is woken, as a push
+; wakes it, so that it waits with the listed actor's due time as its timeout rather than the untimed
+; or longer wait it chose when its list was shorter; a carrier listing on its own thread is awake,
+; so the signal is never sent for it).
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -812,11 +877,26 @@ _silica_rt_carrier_mark_idle:
 	ldr	x20, [x19, #440]
 	mov	x0, x20
 	bl	_os_unfair_lock_lock
-	ldr	x9, [x20, #104]
-	str	x9, [x19, #456]
+	str	xzr, [x19, #456]
+	ldr	x9, [x20, #224]
+	cbz	x9, Lcmi_first
+	str	x19, [x9, #456]
+	b	Lcmi_linked
+Lcmi_first:
 	str	x19, [x20, #104]
+Lcmi_linked:
+	str	x19, [x20, #224]
+	ldr	x9, [x20, #232]
+	ldr	x10, [x19, #288]
+	add	x9, x9, x10
+	str	x9, [x20, #232]
 	mov	x9, #5
 	str	x9, [x19, #448]
+	ldr	x9, [x20, #16]
+	cbz	x9, Lcmi_unlock
+	add	x0, x20, #8
+	bl	_silica_rt_cv_signal
+Lcmi_unlock:
 	mov	x0, x20
 	bl	_os_unfair_lock_unlock
 	b	Lcmi_ret
@@ -831,8 +911,9 @@ Lcmi_ret:
 	.p2align	2
 _silica_rt_carrier_unlist:
 ; X0 = a carrier actor its caller found on its carrier's sweep list (status 5), its lock held:
-; taken off the list under the carrier's lock. Not found is fine: the sweep released it and took
-; it off meanwhile.
+; taken off the list under the carrier's lock (the tail, +224, fixed up when it was the last entry;
+; its committed bytes taken off the listed total, +232). Not found is fine: the sweep took it off
+; meanwhile (it is 6, sweeping, or already released and 1; the caller's status write settles it).
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -841,17 +922,26 @@ _silica_rt_carrier_unlist:
 	mov	x0, x20
 	bl	_os_unfair_lock_lock
 	add	x9, x20, #104
+	mov	x11, xzr
 Lcul_find:
 	ldr	x10, [x9]
 	cbz	x10, Lcul_unlock
 	cmp	x10, x19
 	b.eq	Lcul_found
+	mov	x11, x10
 	add	x9, x10, #456
 	b	Lcul_find
 Lcul_found:
 	ldr	x10, [x19, #456]
 	str	x10, [x9]
+	cbnz	x10, Lcul_tail_kept
+	str	x11, [x20, #224]
+Lcul_tail_kept:
 	str	xzr, [x19, #456]
+	ldr	x9, [x20, #232]
+	ldr	x10, [x19, #288]
+	sub	x9, x9, x10
+	str	x9, [x20, #232]
 Lcul_unlock:
 	mov	x0, x20
 	bl	_os_unfair_lock_unlock
@@ -861,48 +951,87 @@ Lcul_unlock:
 	.globl	_silica_rt_carrier_sweep
 	.p2align	2
 _silica_rt_carrier_sweep:
-; X0 = a carrier, its lock held, on its own thread. Walks the sweep list (+104): an actor whose
-; last message is a second old is released by _silica_rt_stack_idle_check (nothing of it runs: it
-; is idle and off the run queue, and mail for it waits for this lock in _silica_rt_carrier_unlist)
-; and becomes plainly idle (1), off the list; -> X0 = the microseconds until the earliest remaining
-; one is due, 0 when the list is empty. Records the time of the sweep (+120).
-	stp	x29, x30, [sp, #-48]!
+; X0 = a carrier, its lock held, on its own thread; returns with it held. One batch of the idle
+; sweep (the module header): up to 64 actors from the head of the sweep list (+104), each taken
+; while it is due (_silica_rt_stack_idle_due against the clock read once here) or while the listed
+; bytes (+232) exceed the carrier's budget (_silica_rt_idle_stack_budget). Per actor: under the
+; carrier's lock it is unlinked (tail +224 and total +232 kept), marked 6 (sweeping) and the lock
+; let go; then under the actor's own lock alone its stack is released (_silica_rt_stack_release_to
+; 0/0, on this carrier's stack: it never waits) and it is marked plainly idle (1), unless its
+; status is no longer 6 (mail, a stop or a migration made it ready, 2: it keeps its stack and will
+; stamp and relist at its next boundary); then the carrier's lock is taken again for the next
+; head. -> X0 = 0 when the list is empty, 1 when more is to be done at once (the batch is full with
+; the list not empty), else the microseconds until the head is due. Records the time of the sweep
+; (+120). An actor marked 6 has #440 = this carrier and is on no queue or list, so a push by its
+; wake lands on this carrier's queue, popped only after this call returns.
+	stp	x29, x30, [sp, #-64]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
 	stp	x21, x22, [sp, #32]
+	str	x23, [sp, #48]
 	mov	x19, x0
 	bl	_silica_rt_stack_now_ns
-	str	x0, [x19, #120]
+	mov	x21, x0
+	str	x21, [x19, #120]
+	adrp	x23, _silica_rt_idle_stack_budget@PAGE
+	add	x23, x23, _silica_rt_idle_stack_budget@PAGEOFF
+	ldr	x23, [x23]
 	mov	x22, xzr
-	add	x21, x19, #104
-	ldr	x20, [x21]
 Lcsw_next:
-	cbz	x20, Lcsw_done
+	ldr	x20, [x19, #104]
+	cbz	x20, Lcsw_empty
+	cmp	x22, #64
+	b.hs	Lcsw_more
+	ldr	x9, [x19, #232]
+	cmp	x9, x23
+	b.hi	Lcsw_take
 	mov	x0, x20
-	bl	_silica_rt_stack_idle_check
-	cbnz	x0, Lcsw_keep
+	mov	x1, x21
+	bl	_silica_rt_stack_idle_due
+	cbnz	x0, Lcsw_ret
+Lcsw_take:
 	ldr	x9, [x20, #456]
-	str	x9, [x21]
+	str	x9, [x19, #104]
+	cbnz	x9, Lcsw_tail_kept
+	str	xzr, [x19, #224]
+Lcsw_tail_kept:
 	str	xzr, [x20, #456]
+	ldr	x9, [x19, #232]
+	ldr	x10, [x20, #288]
+	sub	x9, x9, x10
+	str	x9, [x19, #232]
+	mov	x9, #6
+	str	x9, [x20, #448]
+	add	x22, x22, #1
+	mov	x0, x19
+	bl	_os_unfair_lock_unlock
+	add	x0, x20, #16
+	bl	_os_unfair_lock_lock
+	ldr	x9, [x20, #448]
+	cmp	x9, #6
+	b.ne	Lcsw_skip
+	mov	x0, x20
+	mov	x1, xzr
+	mov	x2, xzr
+	bl	_silica_rt_stack_release_to
 	mov	x9, #1
 	str	x9, [x20, #448]
-	ldr	x20, [x21]
+Lcsw_skip:
+	add	x0, x20, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x19
+	bl	_os_unfair_lock_lock
 	b	Lcsw_next
-Lcsw_keep:
-	cbz	x22, Lcsw_set_min
-	cmp	x0, x22
-	b.hs	Lcsw_advance
-Lcsw_set_min:
-	mov	x22, x0
-Lcsw_advance:
-	add	x21, x20, #456
-	ldr	x20, [x21]
-	b	Lcsw_next
-Lcsw_done:
-	mov	x0, x22
+Lcsw_empty:
+	mov	x0, xzr
+	b	Lcsw_ret
+Lcsw_more:
+	mov	x0, #1
+Lcsw_ret:
+	ldr	x23, [sp, #48]
 	ldp	x21, x22, [sp, #32]
 	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #48
+	ldp	x29, x30, [sp], #64
 	ret
 "
 }
@@ -912,8 +1041,9 @@ fn carrier_asm_wakes() -> string {
 	.p2align	2
 _silica_rt_actor_mail_signal:
 ; X0 = ACB; the caller holds ACB+16 and has enqueued mail or ended the actor. Signals the mailbox
-; futex (an actor thread waits on it) and, for an idle carrier actor (plainly idle or on its
-; carrier's sweep list), makes it ready on its own carrier.
+; futex (an actor thread waits on it) and, for an idle carrier actor (plainly idle, 1; on its
+; carrier's sweep list, 5, taken off it first; or being swept, 6, already off the list: the sweep
+; finds 2 under this lock and keeps the stack), makes it ready on its own carrier.
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
 	str	x19, [sp, #16]
@@ -924,6 +1054,8 @@ _silica_rt_actor_mail_signal:
 	cbz	x9, Lams_ret
 	ldr	x9, [x19, #448]
 	cmp	x9, #1
+	b.eq	Lams_ready
+	cmp	x9, #6
 	b.eq	Lams_ready
 	cmp	x9, #5
 	b.ne	Lams_ret
@@ -1623,10 +1755,13 @@ _silica_rt_carrier_migrate:
 ; lock, by its status: idle (1) it is bound to the target at once (nothing of it is queued or
 ; listed, and mail for it takes this lock); idle on its carrier's sweep list (5) it is taken off
 ; that list (under the old carrier's lock), bound, and listed again on the target by
-; _silica_rt_carrier_mark_idle (under the target's lock); ready (2, queued on its carrier), running
-; (3) or parked (4, inside a dispatch) the target is left pending in #512 and applied at the
-; actor's next dispatch boundary (_silica_rt_carrier_requeue, or _silica_rt_carrier_mark_idle when
-; the dispatch finds no mail), never while it runs and never at a resume: a parked actor resumes
+; _silica_rt_carrier_mark_idle (under the target's lock; it joins the tail behind newer stamps, so
+; it is released when the entry before it is, at most one idle period late); ready (2, queued on
+; its carrier), running (3), parked (4, inside a dispatch) or being swept (6: its carrier's sweep
+; holds it off the list and will release it or find it ready under this lock; never relisted here)
+; the target is left pending in #512 and applied at the actor's next dispatch boundary
+; (_silica_rt_carrier_requeue, or _silica_rt_carrier_mark_idle when the dispatch finds no mail),
+; never while it runs and never at a resume: a parked actor resumes
 ; where it parked, inside the same dispatch. At most one carrier lock is held at any point, never
 ; with the target's and the old carrier's locks together, so the lock order of this module's
 ; header holds. The mailbox is the actor's own and moves with it; message order is unchanged.

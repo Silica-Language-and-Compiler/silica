@@ -1,0 +1,113 @@
+// Carriers, :release_when_idle (release_when_idle_design.md §3, trial 3): an actor that keeps
+// receiving messages keeps everything it has committed (spec §15.1.2.2: "everything, while messages
+// keep arriving"); only the idle period after its last message releases it. w is called once with a
+// deep message (over 1 MB committed and retained); a short while later (twenty ticks, about fifty
+// milliseconds, well inside the period) it still holds all of it; a second, shallow call inside the
+// period changes nothing (the stack is neither released nor shrunk at that boundary); another short
+// while later it still holds all of it; then, with no more mail, the bounded poll sees it released to
+// nothing, its high-water mark unchanged. The budget does not bind: the default is far above one
+// actor's stack. A tick is a deep message to a :release_on_return actor, which re-faults its stack
+// every time (workers_zzzzz_idle_release_budget_bounds_burst).
+//
+// Expected output: true, true, true, true, true, 0. The same at every carrier count.
+
+use trial_support_int64;
+
+fn depth(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            r: int64 <- depth(n - 1);
+            r + 1
+        }
+    }
+}
+
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+fn tick(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+fn ticks(t: actor_ref, n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            sequence proc[concurrency]
+                _: int64 <- call(t, 200000 impl ActorMessage {});
+                r: int64 <- ticks(t, n - 1)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+// Up to n ticks until w holds no committed stack.
+fn poll_released(w: actor_ref, t: actor_ref, n: int64) -> boolean {
+    sequence proc[concurrency]
+        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        r: boolean <- case u.committed == 0 of {
+            true -> true;
+            false -> tick_then_poll(w, t, n)
+        }
+    produces
+        pure r
+    end
+}
+
+fn tick_then_poll(w: actor_ref, t: actor_ref, n: int64) -> boolean {
+    case n == 0 of {
+        true -> false;
+        false -> {
+            sequence proc[concurrency]
+                _: int64 <- call(t, 200000 impl ActorMessage {});
+                r: boolean <- poll_released(w, t, n - 1)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        t: actor_ref <- spawn(0, tick, stack_policy(0, :release_on_return));
+        w: actor_ref <- spawn(0, beh, stack_policy(0, :release_when_idle));
+        _: int64 <- call(w, 200000 impl ActorMessage {});
+        busy: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        print_boolean(busy.committed > 1048576 and busy.retained == busy.committed);
+        println("");
+        _: int64 <- ticks(t, 20);
+        held: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        print_boolean(held.committed == busy.committed and held.retained == busy.retained);
+        println("");
+        _: int64 <- call(w, 10 impl ActorMessage {});
+        _: int64 <- ticks(t, 20);
+        again: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        print_boolean(again.committed == busy.committed and again.retained == busy.retained);
+        println("");
+        released: boolean <- poll_released(w, t, 2000);
+        print_boolean(released);
+        println("");
+        idle: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        print_boolean(idle.committed == 0 and idle.retained == 0 and idle.high_water == busy.high_water);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
