@@ -77,12 +77,11 @@ clang main.o __silica_runtime.o -o idle_actor_capacity -Wl,-e,main
 
 ## Build (Linux, x86-64 or AArch64)
 
-The same compile with the platform's compiler (`binaries/silica-compiler-linux_x86_64` or
-`binaries/silica-compiler-linux_aarch64`), then assemble and link as `trials/linux_host.mk` does:
+The same compile with the native compiler for the machine (`binaries/silica-compiler`), then assemble and link as `trials/linux_host.mk` does:
 
 ```sh
 echo main.silica > silica.config
-../../../binaries/silica-compiler-linux_x86_64
+../../../binaries/silica-compiler
 cc -c -x assembler main.sams -o main.o
 cc -c -x assembler __silica_runtime.sams -o __silica_runtime.o
 cc main.o __silica_runtime.o -o idle_actor_capacity -no-pie -rdynamic -lpthread

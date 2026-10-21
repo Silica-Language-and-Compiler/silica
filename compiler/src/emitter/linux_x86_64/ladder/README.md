@@ -26,6 +26,8 @@ table lists.
 
 ## Running a step on nix
 
+Historical note: the cross-compiler link `binaries/silica-compiler-linux_x86_64` was removed on 2026-10-21; nix now builds and runs its own native compiler (silica-999974-linux-x86_64), so the steps below are the original bring-up method.
+
 The Mac compiles (cross compiler `binaries/silica-compiler-linux_x86_64`, built with
 `make -C src build TARGET=linux_x86_64 SILICA_COMPILER=binaries/silica-compiler INSTALL_SELFHOST=0`
 after `make clean`), nix assembles, links and runs. For one app:

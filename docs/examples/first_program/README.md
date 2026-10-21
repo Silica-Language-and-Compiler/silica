@@ -25,8 +25,7 @@ clang main.o adder.o Supervisor.o __silica_runtime.o -o first_program -Wl,-e,mai
 ./first_program
 ```
 
-On Linux, compile with the platform's compiler (`binaries/silica-compiler-linux_x86_64` or
-`binaries/silica-compiler-linux_aarch64`) and link as `trials/linux_host.mk` does, without `-Wl,-e,main`:
+On Linux, compile with the native compiler for the machine (`binaries/silica-compiler`, which the platform link script points at the Linux build) and link as `trials/linux_host.mk` does, without `-Wl,-e,main`:
 
 ```sh
 for f in Supervisor adder main __silica_runtime; do cc -c -x assembler $f.sams -o $f.o; done
