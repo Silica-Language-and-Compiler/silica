@@ -554,8 +554,11 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
   When this item was written every hosted actor was its own operating-system thread, with a 128 KB thread
   stack and a 64 KB signal stack, so threads, mappings and address space bound the count long before memory
   did (§15), pinning was only a thread-affinity hint (`thread_policy_set` with an affinity tag on macOS) and
-  `set_scheduler_policy` answered `:ok` with no effect (on the Linux targets that is still what happens
-  until their runtimes are ported; on `apple_silicon_mac` carriers are the only model since 2026-10-19,
+  `set_scheduler_policy` answered `:ok` with no effect (superseded: that was also true of the Linux
+  targets until their carriers landed, in `aa8101edf2` for Linux AArch64 and `ef2e778126` for Linux
+  x86-64, whose `prims_actors_carrier_asm.silica` now each define a real
+  `silica_rt_set_scheduler_policy` with all four policies per carrier, and `scheduler_policy_addition`
+  passes on both; on `apple_silicon_mac` carriers are the only model since 2026-10-19,
   "Carriers are the only model" below, and stages 3 and 4 made placement and the policies real). N
   replaces the thread per actor with the BEAM pattern the board already uses per core:
   - one carrier thread per logical core, each running many actors from its own run queue;
@@ -1162,12 +1165,16 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       only run-time behaviour can differ); `scheduler_policy_addition` at counts 1 and 4; any
       Linux target; the compiler compiling itself on carriers (still no gen2).
     - **Not done in stage 4:** supervisors on carriers; the Linux runtimes (no carriers, no policy
-      symbol: their `set_scheduler_policy` is still the inline `:ok`); materialising the
+      symbol: their `set_scheduler_policy` is still the inline `:ok`) -- superseded: carriers and a
+      real `silica_rt_set_scheduler_policy` (all four policies per carrier) landed on Linux AArch64
+      in `aa8101edf2` and on Linux x86-64 in `ef2e778126`, and the Mac text above stays as written
+      for the Mac; materialising the
       `(int64, affinity_error)` tuple; time (`send_after`, `call_with_timeout`) and any
       preemption or reduction budget (ROADMAP chunk 11; the port design's §8.10 says why a
       budget needs a specification change first); the `scheduler_policy_addition` hosted goldens
       (above); the ROADMAP chunk 2 and port-design §8.10 sentences that call the hosted
-      `set_scheduler_policy` a no-op, to be refreshed when this branch is published.
+      `set_scheduler_policy` a no-op, to be refreshed when this branch is published (done: both now
+      say it is real per carrier on all three hosted targets).
   - **Carriers are the only model (2026-10-19, `apple_silicon_mac` only, same branch): Lee's two
     decisions, implemented.** (1) There is no thread-per-actor default and no opt-out: the
     `SILICA_CARRIERS` gate is gone (the `getenv`, `_silica_rt_carriers_enabled` and its string are

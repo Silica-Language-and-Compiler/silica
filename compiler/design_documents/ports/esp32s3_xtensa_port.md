@@ -473,9 +473,13 @@ and the runtime answers `:actor_not_found` for no actor or an ended one. Before 
 itself reached the runtime, which clamped every index above 2 to normal, so the priority queues had
 never been exercised: the new trials are the first to run them.
 
-Hosted targets have no ready queue of their own to order (their actors are threads the OS schedules),
-so `set_scheduler_policy` is a no-op there that answers `:ok` for any atom (`prims_actors.silica` of
-the three hosted emitters, the `pin_actor_to_efficiency_core` precedent). Trials:
+Hosted targets now have a ready queue per carrier thread (item N of
+`actor_memory_budget_plan.md`; carriers on `apple_silicon_mac`, and on Linux AArch64 and x86-64 in
+`aa8101edf2` and `ef2e778126`), so `set_scheduler_policy` is real there: each target's
+`prims_actors_carrier_asm.silica` defines `silica_rt_set_scheduler_policy`, which selects one of
+`:priority_fifo`, `:round_robin`, `:weighted_fair` and `:lottery`, applied by every carrier to its own
+queues as the board applies one per core. (Before the carriers, hosted actors were threads the OS
+schedules and the call was a no-op answering `:ok` for any atom.) Trials:
 `trials/scheduler_policy_addition` (its README says how the order trials are compared on a target that
 defines no order). No specification change: this is a runtime configuration choice made through an
 ordinary atom argument, not a new normative guarantee.
