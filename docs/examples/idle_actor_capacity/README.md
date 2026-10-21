@@ -32,8 +32,28 @@ On a 16 GB, 10-core Mac, each actor sent one message right after spawn, reserve 
 | `:release_when_idle`, before the budgeted sweep | 28.16 s | 1,240 MB | not recorded |
 | `:release_on_return` | 5.95 s | not recorded | 655 MB |
 
-Peak RSS comes from `ps -o rss=` polled every 50 ms, which `programmer_tools/peak_rss.sh` does (on Linux, run
-the program under `/usr/bin/time -v` and read "Maximum resident set size"). Linux figures are not measured yet.
+Peak RSS comes from polling the process's resident set size every 50 ms, which
+`programmer_tools/peak_rss.sh` does (BSD `ps -o rss=` on macOS; `/proc/<pid>/status` on Linux, no `bc` or BSD
+`ps` needed). It also reports the peak thread count on Linux and, with `RWI_RSS_CAP_MB` and
+`RWI_MIN_AVAIL_MB`, stops the program before it can exhaust the machine.
+
+## Measured on Linux (2026-10-20)
+
+Same program with the spawner changed to stop at the target (one `case new_total >= N` around the
+`cast_registered` at the end of `spawner`, otherwise the file is unchanged), reserve 65536, each actor sent
+one message, `:release_when_idle`, run through `peak_rss.sh`:
+
+| Machine | Idle actors | Wall time to the last total | Peak RSS | RSS at rest | Threads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AArch64 (pix) | 100,000 | 0.15 to 0.20 s | 109 MB | 55 MB | not recorded |
+| x86-64 (nix, 8 cores) | 100,000 | 0.30 s | 55.5 MB | 55.5 MB | 9 |
+| x86-64 (nix, 8 cores) | 1,000,000 | 2.48 s | 536 MB | 536 MB | 9 |
+
+`SILICA_CARRIER_COUNT` sets the carrier threads, and the thread count is the carriers plus one. On nix,
+100,000 actors took 0.29 to 0.31 s and 55.4 to 55.5 MB with `SILICA_CARRIER_COUNT` 1, 2 and 4 (threads 2, 3
+and 5) as with it unset (8 carriers, 9 threads). The unmodified program (no stopping point) starts and prints
+`1000 idle actors` at each of those settings; left running it reaches about 650 to 690 MB of RSS within three
+seconds, so stop it with `exit` and Return.
 
 ## Environment variables for `:release_when_idle`
 
