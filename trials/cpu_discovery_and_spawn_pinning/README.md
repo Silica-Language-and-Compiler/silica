@@ -10,6 +10,9 @@ Silica sources covering **CPU topology / affinity** from `cpu_topology_implement
 | `cpu_spawn_third_nonliteral_affinity.silica` | Third argument is a non-literal `uint64` expression (`2 + 3`). |
 | `cpu_topology_runtime_queries.silica` | `get_efficiency_cores`, `get_performance_cores`, `get_cpu_topology`, `get_core_capabilities`; walks and prints core id lists. |
 | `cpu_topology_phase_h_verify.silica` | Phase H **fixture**: five `print_int64` lines (checks a–e) plus process exit. |
+| `cpu_topology_runtime_queries_portable.silica` | The two core-id lists checked without naming a core count (one `.scout` for every host). |
+| `cpu_topology_walk_lists.silica` | Walks every list `get_cpu_topology()` answers (cores, capabilities, numa_nodes, memory_ranges, cache levels, shared_cores) with `head`/`remove_head`; 1/0 outcomes only. |
+| `cpu_topology_x28_live_across_capabilities.silica` | Ten live bindings (X19..X28) summed across `get_core_capabilities`: the runtime must save X28. |
 
 ## Note (golden `.scout` files)
 
