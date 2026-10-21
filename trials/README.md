@@ -19,11 +19,11 @@ The plain golden names are the macOS (Apple Silicon) goldens. Another emit targe
 | run output | `<trial>.scout` | `<trial>.<target>.scout` when it exists, else the plain one (`$(call SCOUT_FOR,<trial>)`) |
 
 A target scout is for output that legitimately differs on that host (for example
-`cpu_topology_runtime_queries.linux_aarch64.scout`); most trials have only the plain
+`cpu_topology_runtime_queries.linux_aarch64.scout` and `.linux_x86_64.scout`); most trials have only the plain
 `.scout`, which every target shares. It is a golden, not a trial: trials are the
 `.silica` files, and the comparison markers (`<trial>.scout.multiset`, `.sorted`,
 `.alt`, `.normalized`) stay keyed on the plain trial name. The Mac never reads a
-target scout. The board harness (`targets/board_suite.sh`) applies the same rule.
+target scout (`SCOUT_EXT` is empty there). The board harness (`targets/board_suite.sh`) applies the same rule.
 
 ## Running the trials
 

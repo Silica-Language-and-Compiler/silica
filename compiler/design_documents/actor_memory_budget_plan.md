@@ -966,13 +966,18 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       outside `proc[concurrency]` was accepted, against spec §22.10. Added to both tables of
       `effect_checker_core.silica`; trial
       `error_enforcement_addition/effect_migrate_actor_undeclared` (E3002), which the installed
-      compilers accept until one built from this tree is installed. (3) Pre-existing and NOT
-      fixed: `get_efficiency_cores()` / `get_performance_cores()` read wrongly through the list
+      compilers accept until one built from this tree is installed. (3) Pre-existing, since **fixed**
+      (2026-10-20): `get_efficiency_cores()` / `get_performance_cores()` read wrongly through the list
       builtins (`length` 4 and `head` 5 for the E list [4..9] on this Mac, from `main` and from an
-      actor, with the installed 999945 compiler as well as this tree's), so
-      `cpu_discovery_and_spawn_pinning/cpu_topology_runtime_queries` fails with either compiler
-      and that suite's four `.ascomp` are stale (a different emitter's text); the new kind-pin
-      trial counts cores through `get_core_capabilities` instead.
+      actor, with the installed 999945 compiler as well as this tree's) because they returned
+      16-byte cons cells, not `List[int64]` handles; commit `7b8260a0fe` builds real lists on all
+      three trees, with trial `cpu_discovery_and_spawn_pinning/cpu_topology_runtime_queries_portable`.
+      Two more defects found after it were fixed in `42ec5a7c76`: `get_cpu_topology()` still answered
+      its record and string lists (cores, numa_nodes, each node's memory_ranges,
+      cache_hierarchy.levels) as cons cells, and `get_core_capabilities` did not save X27/X28, so a
+      caller's X28 was clobbered across the call. Linux x86-64 was never affected by the X28 part.
+      Trials `cpu_topology_walk_lists` and `cpu_topology_x28_live_across_capabilities`. The kind-pin
+      trial still counts cores through `get_core_capabilities`.
     - *Trials* (`trials/carriers_addition`, named `workers_zpin_*`; the compile order is
       topological, so atoms of trials on `trial_support_int64` are numbered before the two
       `trial_wait_int64` trials: `workers_call_cycle_across_carriers` and
@@ -1433,7 +1438,10 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
          `app_ffi_thread_affinity`, and the option C trial `app_dangerous_spawn_thread_limit`.
       3. Board: row-child drain protection (acquire mode 2) not mirrored; to be done on a separate
          branch.
-      4. `get_efficiency_cores` / `get_performance_cores` return wrong core-id lists.
+      4. `get_efficiency_cores` / `get_performance_cores` returned wrong core-id lists: **fixed** in
+         `7b8260a0fe` on all three trees (trial `cpu_topology_runtime_queries_portable`); the related
+         `get_cpu_topology` list/string defect and the `get_core_capabilities` X27/X28 save defect are
+         fixed in `42ec5a7c76` (see the root causes under stage 2; x86-64 never had the X28 part).
       5. `:release_when_idle` idle sweep: **implemented on Apple Silicon 2026-10-20 (commit `53c8ce38d6`);
          the Linux AArch64 and x86-64 mirrors are in progress and not yet verified.** Design:
          `release_when_idle_design.md` (scratchpad of 2026-10-20); Lee approved the full version,
@@ -1467,6 +1475,30 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
          and carry a `:dangerous_` id) are enforced only for a module's `init`, not for the start
          functions of child supervisors. A call-type `:dangerous` row in a sub-supervisor compiles and
          runs.
+      10. Latent and deliberately unfixed: on Linux x86-64, `LBBsl_common` (the shared body of
+          `spawn_linked`, in `prims_actors_runtime_asm.silica`) does `push rax` before
+          `call silica_rt_beh_convention` and pops it after, so that call is made with `rsp` 8 bytes off
+          16-byte alignment (the frame is aligned after `push rbp` and `sub rsp, 80`). Read from the
+          source only; no failure has been observed and the callee's use of aligned instructions was not
+          checked. Left as is; fix it by padding with `sub rsp, 8` around the push if it ever shows.
+
+      Final status of the gap list (2026-10-21):
+      - Final full gate run on pix and nix. 148 goldens that went stale when `04fdd8ac2d` removed the
+        sret epilogue padding-word copy were refreshed on pix, nix and the Mac (`9651229e17`,
+        `d2624cd444`, `b80daba1e9`). The `cpu_discovery_and_spawn_pinning` suite is 14/14 on the Mac, pix
+        and nix after `8219f6b2bd`. `carriers_addition` is 124/124 at carrier counts 1, 2 and 4 on pix
+        and nix.
+      - Per-target `.scout` (commit `a44f396fc0`): `SCOUT_EXT` in `trials/silica_compiler.mk` is empty on
+        the Mac, so the plain `<base>.scout` applies there; on the Linux hosts `<base>.<target>.scout`
+        (`linux_aarch64`, `linux_x86_64`) wins when it exists, else the plain one. Raw targets compare
+        in order and hosted targets use the multiset compare. Host scouts now exist for
+        `cpu_topology_runtime_queries`. (`trials/README.md`, "Goldens per target".)
+      - Transient failures, passed on rerun, not defects: memory pressure on the 3 GB pix (`float16`,
+        `case_addition`, `error_enforcement_addition` `train_effect_check_mem_*`) and a one-off nix E1009
+        on `trial_wait_int64`.
+      - Still open: gen2/gen3 verification on carriers on all hosts (Lee's builds); the board gap
+        (item 3) on a separate branch; Linux `get_actor_memory_usage` and x86-64 timing measurements
+        (held by Lee).
 
 ## 6. Gate (common)
 
