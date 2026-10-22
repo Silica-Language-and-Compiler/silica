@@ -2,7 +2,9 @@
 
 This document describes what remains to be done to make Silica's region-based memory model memory-safe as specified. The specification (../silica-specification.md §12) defines comprehensive safety guarantees; the current implementation provides only partial support.
 
-**Implementation status (2026-10-16).** The plan below is the 2025-2026 gap list. The chunk-4 design
+**Implementation status (2026-10-22, from the 2026-10-16 survey).** The design (§0) withdrew the premise that the 1,152 standard-library records with a region field become linear: they hold only never-freed family arenas, and linearity applies to owned regions (`alloc_region`) and aggregates embedding them.
+
+**Earlier status (2026-10-16).** The plan below is the 2025-2026 gap list. The chunk-4 design
 ([region_memory_safety_design.md](../region_memory_safety_design.md), ROADMAP chunk 4) supersedes it for everything
 not yet built: static lifetime analysis beyond Phase A (§2.1), region isolation (§2.3), ownership-based release and
 the use-after-free hazards (§2.4), and atomic references (§2.5) are all still open, and none of the design's
@@ -181,13 +183,25 @@ The spec describes "implicit deallocation when r goes out of scope" — the impl
 
 ## 3. Implementation Order
 
-Recommended order of work:
+The 2025 ordering that stood here (bounds, isolation, lifetime analysis, allocation strategy, atomics) is replaced by the
+stage list of [region_memory_safety_design.md](../region_memory_safety_design.md) §13, with the work split in §16.
+Status as of 2026-10-22: the bounds item is done; the stages below are not started, per the design (not re-verified
+against the tree beyond the 2026-10-16 survey recorded in its status paragraph).
 
-1. **Buffer bounds checking** (§2.2) — done 2026-09-19.
-2. **Region isolation enforcement** (§2.3) — Extends existing type checker; prevents obvious misuse.
-3. **Static region lifetime analysis** (§2.1) — Core safety; blocks use-after-free. Depends on build-plan Phase 6.
-4. **Allocation strategy** (§2.4) — May follow from lifetime analysis; consider heap-based regions if stack proves insufficient.
-5. **Atomic references and `alloc_atomic`** (§2.5) — Complete the specified atomic allocation and operation lowering once region identity and bounds plumbing are stable.
+| Stage | Content | Needs |
+|-------|---------|-------|
+| 0 | Silent hazards H1 to H10 (design §1.3): atomic arena bump, `cast`/`send`/`spawn` as moving prims, let-bound aggregate promotion, null checks | no decision |
+| 1 | Lifetime polymorphism (per-call substitution, E2311); covers the Phase B/C part of §2.1 | Q10 (spelling) |
+| 2 | Structure handle type, every cell immortal | Q1, Q2 |
+| 3 | Region checker, report-only (isolation §2.3 and linearity for owned regions) | stage 2 |
+| 4 | `drop` nodes and runtime owner lists (use-after-free, §2.4) | Q5 |
+| 5 | Errors on (E2300 to E2320) | Q3, Q4, Q11 |
+| 6 | Counted structure storage; messages move across actors, biased counting (design §17, §18) | Q2 (b or c); Q6 and Q12 are decided |
+| 7 | Atomics (§2.5): builtins, lowering, shared atomic regions | Q7, Q8 |
+| 8 | Bounds outcome (actor failure, not process abort) and static checks against N (§2.2, "Not done") | Q9 |
+
+Stages 0, 1 and 8 need no open decision. Hosted carriers (ROADMAP item N) are the execution model; owner lists belong to
+the actor, so they do not change this order.
 
 ---
 
@@ -195,12 +209,12 @@ Recommended order of work:
 
 When implementation is complete, the following should hold:
 
-- [ ] No program can return a reference whose region does not outlive the call (lifetime analysis)
-- [ ] No program can use a reference after its region has been deallocated (lifetime analysis)
+- [ ] No program can return a reference whose region does not outlive the call (lifetime analysis; design stages 1, 3, 5)
+- [ ] No program can use a reference after its region has been deallocated (lifetime analysis and drop-based release; design stages 3 to 5)
 - [x] No `buf_load` or `buf_store` executes without a prior bounds check (bounds checking; 2026-09-19, against the buffer's run-time count)
-- [ ] No `ref(R1, ...)` is used with `region(R2, ...)` when R1 ≠ R2 (region isolation)
+- [ ] No `ref(R1, ...)` is used with `region(R2, ...)` when R1 ≠ R2 (region isolation; design stages 3 and 5)
 - [ ] Cross-module region usage is validated (cross-module lifetime tracking)
-- [ ] `alloc_atomic` is implemented end to end or removed from the specification until it is implemented
+- [ ] (design stage 7) `alloc_atomic` is implemented end to end or removed from the specification until it is implemented
 - [ ] Atomic-space refs use correct atomic load/store/RMW lowering and documented ordering semantics
 - [ ] Error messages reference specification sections (e.g., spec:§12.1.4)
 
@@ -214,3 +228,4 @@ When implementation is complete, the following should hold:
 | 1.1 | 2026-03-27 | Terminology: memory region vs arena; §1.2/§2.4 aligned with heap bump emitter |
 | 1.2 | 2026-05-26 | Moved into `Phase1_TODOs`; aligned atomic status with source-code audit |
 | 1.3 | 2026-10-16 | Status block: superseded by the chunk-4 design; bounds checking (§2.2) marked implemented; paths made per-target |
+| 1.4 | 2026-10-22 | §3 Implementation Order and the checklist now point to the design's stage list (§13); status block: the withdrawn linearity-of-1,152-records premise noted; carriers noted |
