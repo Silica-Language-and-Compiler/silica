@@ -1,9 +1,9 @@
 # bees_regions_open_addition (INTEGRATE_PENDING)
 
-Open region-release defects, staged as trials that state the correct behaviour. The
+Open region-release defect (one trial left), staged as a trial that state the correct behaviour. The
 `INTEGRATE_PENDING` file keeps this directory out of tree-wide runs on the host and on the board
-(both report it as `SKIPPED (INTEGRATE_PENDING)`), so the trials do not turn the gate red while the
-defects are open. Run them by hand:
+(both report it as `SKIPPED (INTEGRATE_PENDING)`), so the trial does not turn the gate red while the
+defect is open. Run them by hand:
 
 ```
 make -C bees_regions_open_addition integrate TRIAL_TARGET=host                 # from trials/
@@ -12,9 +12,12 @@ make integrate TRIAL_TARGET=host TRIAL_SUITES=bees_regions_open_addition       #
 
 | trial | shows |
 |---|---|
-| `bees_sd7_message_region_released` | project-bees SD-7, region design §18.7, the realistic burst shape: `main` casts 100,000 messages at once, each carrying a fresh two-cell region; each region should be released when the receiving behaviour returns. Output check only. |
-| `bees_sd7_message_region_released_in_flight` | the same release, measured with one message in flight: the behaviour casts the next region message to itself, 100,000 times. Carries the SD-7 peak-RSS ceiling. |
 | `region_in_returned_record_released` | hazard H9, no actors: 100,000 calls each returning a record that holds a fresh two-cell region; each region should be released when the caller is done with it. |
+
+The two project-bees SD-7 trials (`bees_sd7_message_region_released` and
+`bees_sd7_message_region_released_in_flight`) were staged here until 2026-10-22 and are now gated in
+`../bees_regions_addition` (see "SD-7: moved" below). This directory keeps the history of how they
+were measured.
 
 ## How the leak is checked: `.scout` plus a peak-RSS ceiling
 
@@ -58,7 +61,7 @@ environment; pass it on the make command line.
 Without the SD-7 fix (`binaries/silica-compiler` = 999943, the default):
 
 ```
-make -C bees_regions_open_addition integrate TRIAL_TARGET=host
+make -C bees_regions_open_addition integrate TRIAL_TARGET=host   (history, 2026-10-22, when the SD-7 trials were still here)
 ❌❌ bees_regions_open_addition/bees_sd7_message_region_released_in_flight has no .ascomp file
 ❌❌ bees_regions_open_addition/bees_sd7_message_region_released has no .ascomp file
 ❌❌ bees_regions_open_addition/region_in_returned_record_released has no .ascomp file
@@ -88,25 +91,20 @@ leak is fixed. The ceiling is host only; the board ignores the marker, so a boar
 program-visible counter (a runtime count of `alloc_region` blocks in `heap_used()`, or a builtin such
 as live region bytes; compiler work) to check the leak there.
 
-### SD-7: when to move to `../bees_regions_addition`
+### SD-7: moved
 
-With the Mac compiler that has the SD-7 fix, both SD-7 trials pass (the in-flight twin on output and
-ceiling, the burst on output); only the H9 trial still fails. They should move to the gated
-`../bees_regions_addition` together, with their `.scout`, `.wait_for_exit` and the twin's
-`.max_rss_mb`, once the fix is in a built compiler on all three hosts and checked there: the Mac
-fixed compiler promoted to `binaries/silica-compiler`, `linux_aarch64` on pix and `linux_x86_64` on
-nix each passing this suite, and a board run of the in-flight twin printing `300000` / `done` (the
-board ignores the ceiling, so there it checks only that release does not break delivery). They stay
-here until then: on any host still on 999943 the twin fails on its ceiling, and the gated suite
-must stay green. Moving needs their `.ascomp` goldens from each host's fixed compiler, and a
-re-check of the gated suite's existing `.ascomp` goldens (a new shape or atom can renumber them;
-refresh only where `.sout` matches `.scout`). The burst trial queues up to 100,000 ~4 KB regions,
-which the board's heap cannot hold, so on the board it may need a smaller count or a host-only
-marker; that is untested.
+Moved 2026-10-22, with their `.scout`, `.wait_for_exit` and (the in-flight twin) `.max_rss_mb`, to
+the gated `../bees_regions_addition`, once the SD-7 fix (dispatch-scoped release of a message
+record's owned regions) was in a built compiler: the Mac promoted `binaries/silica-compiler`
+(999942), and the `linux_aarch64` (pix) and `linux_x86_64` (nix) gen1 compilers with the same fix.
+Their `.ascomp` goldens were recorded from those compilers and the suite's existing goldens
+(`bees_sd21`, `bees_sd22`, `bees_term`) were re-recorded where the two new units renumbered atoms
+and shapes (`.sout` matched `.scout`). Not yet checked: a board run of the in-flight twin; the
+burst trial queues up to 100,000 ~4 KB regions, which the board's heap probably cannot hold.
 
-When a defect is fixed and its trial passes on every host (output and ceiling), add its `.ascomp`
+When the H9 defect is fixed and its trial passes on every host (output and ceiling), add its `.ascomp`
 goldens (Mac, then `linux_aarch64` on pix and `linux_x86_64` on nix) and move it, with its
 `.scout` and `.max_rss_mb`, to `../bees_regions_addition` (re-check that suite's other `.ascomp` goldens, which a
 new shape can renumber), then delete
 this directory once it is empty. The SD-22 trial in `../bees_regions_addition` must still pass
-after these are fixed: it is the check that the release does not come back as a scope-exit free.
+after this is fixed: it is the check that the release does not come back as a scope-exit free.

@@ -1,27 +1,36 @@
-// bees_sd7_message_region_released  (OPEN: staged in bees_regions_open_addition, see README.md)
+// bees_sd7_message_region_released_in_flight  (gated; staged in bees_regions_open_addition until 2026-10-22, failed its ceiling then, passes with the SD-7 fix, see README.md)
 //
 // Shows (the correct behaviour): a region moved into a message is released when the receiving
 // behaviour returns (§18.7: regions a message carries are moved on send and dispatch-scoped in
-// the receiver). main builds 100,000 messages { r, root }, each a fresh region holding a two-cell
-// chain (1, 2), and casts them to one cast-only actor that sums the chain and keeps only an int64;
-// a last message with sum 0 makes it print the total (300000) and done.
+// the receiver), measured with one message in flight. The actor's behaviour sums the two-cell
+// chain (1, 2) its message carries, keeps only an int64, and casts the next message, a fresh
+// region built by build_message, to itself (registered as :w); main sends the first. After
+// 100,000 messages the total is 300000 and it prints the total and done.
 // Origin: project-bees defect SD-7; chunk 4 region design §18.7 (message regions released at
-// dispatch end) and §18.6's message_region_released_at_dispatch_end; hazard H9 (a region inside a
-// record is never released).
-// This is the realistic burst shape: main casts all 100,000 messages without throttling, so many
-// are queued at once, and each queued message legitimately holds its live ~4 KB region. Peak RSS
-// here therefore includes the queue and cannot tell a leak from a full queue, so this trial has
-// no peak-RSS ceiling and checks output only (300000, done, exit 0). The release itself is
-// checked by its in-flight twin, bees_sd7_message_region_released_in_flight, which keeps one
-// message in flight and carries the ceiling.
-// Measured 2026-10-22 on the Mac (/usr/bin/time -l and the harness): the compiler without the
-// SD-7 fix (binaries/silica-compiler, 999943) peaks at ~520 MiB (~545 MB); the compiler with the
-// fix (compiler/build/apple_silicon_mac/silica-compiler) at ~382 MiB, the queue it still holds;
-// 100,000 int64 casts (no regions) peak at ~14.6 MB. Output is right with both.
-// No program output measures region memory: heap_used() counts only actor arena bumps
-// (_silica_rt_region_alloc), and alloc_region's blocks come from _silica_rt_raw_alloc, which no
-// counter sees; get_actor_memory_usage reports stacks only.
-// No .ascomp while the trial is staged in the open suite.
+// dispatch end) and §18.6's message_region_released_at_dispatch_end. This is the in-flight twin of
+// bees_sd7_message_region_released, which is the realistic burst shape (main casts all 100,000
+// at once) and whose peak RSS includes the queued messages.
+// Why this shape and not the burst: each queued message legitimately holds a live ~4 KB region,
+// so the burst's peak RSS measures queue depth as well as release and cannot tell a leak from a
+// full queue. Here at most one message (one region) exists at a time, so memory that grows with
+// the count is memory that is never released. This trial carries the peak-RSS ceiling; the burst
+// trial checks only output.
+// Measured 2026-10-22 on the Mac. Program alone (/usr/bin/time -l): the compiler without the
+// SD-7 fix (binaries/silica-compiler, 999943) peaks at ~534 MB, about 5.3 KB per message; the
+// compiler with the fix (compiler/build/apple_silicon_mac/silica-compiler) at ~6.9 MB. Under the
+// harness, whose peak includes the Python marker runner's own ~15 MB: 508.9 MiB without the fix,
+// 15.7 MiB with it. The 1,000,000-message variant: ~2.4 GB without the fix, ~57 MB with it;
+// 100,000 int64 casts (the burst control, no regions) peak at ~14.5 MB.
+// How leaking and not leaking differ: only in memory; the output (300000, done) is the same. No
+// program output can show it: heap_used() counts only actor arena bumps, and alloc_region's
+// blocks come from _silica_rt_raw_alloc, which no counter sees. So the check is the harness's
+// peak-RSS ceiling (host only; trials/README.md, "Peak memory ceiling"): the .scout holds the
+// correct output (300000, done, exit 0) and bees_sd7_message_region_released_in_flight.max_rss_mb
+// holds 40 (MiB): about 2.5 times the leak-free harness peak (15.7) and under a tenth of the leak
+// (508.9), so allocator or host variation does not flip a leak-free run, while a leak of about
+// 250 bytes a message (100,000 x 250 B = 25 MB on top of the leak-free peak) still fails.
+// Staged in bees_regions_open_addition (no .ascomp) until the SD-7 fix was built; moved to
+// bees_regions_addition with its .ascomp goldens once it passed (see README.md).
 // Run: about one second.
 fn some_term(c: ref(L, normal, (atom, int64, ref?(L, normal, rec)))) -> ref?(L, normal, rec) {
     c
@@ -44,11 +53,9 @@ fn beh(msg: { r: region(L, normal), root: ref?(L, normal, rec) }, state: int64) 
     sequence proc[device_io]
         got: int64 <- sum_chain(msg.root);
         new_total: int64 <- state + got;
-        // port change: E2237 forbids cast to a call-only actor, so beh is cast-only and the final
-        // (sum 0) message prints the total instead of replying to a call
-        _: atom <- case got == 0 of {
+        _: atom <- case new_total >= 300000 of {
             true -> { _: atom <- print_int64(new_total); println(""); println("done"); :ok };
-            false -> :ok
+            false -> { _: boolean <- send_next(); :ok }
         }
     produces pure (:no_reply, new_total) end
 }
@@ -62,24 +69,18 @@ fn build_message(a: int64, b: int64) -> { r: region(L, normal), root: ref?(L, no
     produces pure { r: r, root: some_term(n1) } end
 }
 
-fn send_n(a: actor_ref, n: int64) -> int64 {
+fn send_next() -> boolean {
     sequence proc[concurrency]
         m: { r: region(L, normal), root: ref?(L, normal, rec) } <- build_message(1, 2);
-        _: boolean <- cast(a, m impl ActorMessage {});
-        rest: int64 <- case n <= 1 of {
-            true -> 0;
-            false -> send_n(a, n - 1)
-        }
-    produces pure rest end
+        ok: boolean <- cast_registered(:w, m impl ActorMessage {})
+    produces pure ok end
 }
 
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
         _: atom <- start_reporter();
-        a: actor_ref <- spawn(0, beh, stack_policy(0, :keep_last_message));
-        _: int64 <- send_n(a, 100000);
-        last: { r: region(L, normal), root: ref?(L, normal, rec) } <- build_message(0, 0);
-        _: boolean <- cast(a, last impl ActorMessage {});
+        _: actor_ref <- spawn_registered(0, beh, :w, stack_policy(0, :keep_last_message));
+        _: boolean <- send_next();
         _: int64 <- wait_for_exit()
     produces pure 0 end
 }
