@@ -15,11 +15,11 @@ document proposes a change to the specification it says so (§1.5, §15); until 
 [runtime_failure_reporting.md](runtime_failure_reporting.md).
 
 **Implementation status (2026-10-16).** Nothing of the design is built. Checked against the tree that day: the
-compiler holds no region checker, no `drop` nodes, none of the codes E2300 to E2320, no `alloc_atomic` and no
+compiler holds no region checker, no `drop` nodes, none of the codes E2300 to E2318, no `alloc_atomic` and no
 `atomic_*` operation (§9); `alloc_region` is still called nowhere in the stdlib or the compiler (§1.4); scope
 release (`mark`/`release_to`) is still disabled in all four emitters (§1.2); and Phase A of the lifetime analysis
-(`check_sequence_return_lifetime`) is still the only lifetime rule. The open decisions of §15 are open except
-those marked decided. §1 below was measured 2026-10-09; the function names are still right, but line numbers have
+(`check_sequence_return_lifetime`) is still the only lifetime rule. Lee decided Q1, Q2, Q5, Q15, Q16 and Q17 on 2026-10-22 (and Q6 on 2026-10-09, narrowed by Q2 (a), with Q12 withdrawn as moot): never-freed family arenas spelled `arena(L, S)`, no counted storage, so there is no counted-storage stage. The other open decisions of §15 (Q3, Q4, Q7 to Q11, Q13, Q14) are
+still open. §1 below was measured 2026-10-09; the function names are still right, but line numbers have
 drifted (for example `let_owns_local_region` is now at line 816 of `term_reg_spill.silica`, `fn_destroys_region_param`
 at 2389 of `emitter_core.silica`). Re-read 2026-10-16 and still true by reading: H1 (no lock anywhere in
 `canonical_arena_runtime_asm.silica`), H2 (`fn_destroys_region_param`), H5 (`LBBra_grow_failed`), H10 (no
@@ -43,20 +43,19 @@ neither does the compiler. Making those records linear would break the structure
 reuse the old version, and `graph_wbt_core@set_entry` reads one record three times. It would also buy no safety, because
 an arena that is never freed cannot dangle.
 
-The arena is safe, but it only grows. A 1,000-key map exhausts the board's heap in about 740 updates, and a busy host
+The arena is safe, but it only grows. A 1,000-key map exhausts the ESP32-S3 heap in about 740 updates, and a busy host
 grows by tens of MB a second (§17). So the design separates the type `region(L, Space)` into an owned kind and a
-structure kind, and it compares two ways of storing structures (Q2):
+structure kind. **Decided by Lee, 2026-10-22: Q2 (a), the never-freed family arena with the atomic bump (stage 0), the handle spelled `arena(L, S)` (Q1 a).** Counted storage was considered and is not part of the plan (§17). Structures therefore still never reclaim memory until a later project:
 
 | Kind | Made by | Handle | Lifetime | Release |
 | --- | --- | --- | --- | --- |
 | **Owned region** | `alloc_region` | linear (move-only, §4.4.2); every record or tuple embedding one is linear | lexical, by ownership | at the last owner's scope end, or at its actor's end |
-| **Structure storage, recommended: counted regions** (§17) | the structure constructors | a version handle: counted, not linear; the checker places increments and decrements (Perceus-style) | while any version reaches the node | when the last reference goes |
-| Structure storage, alternative: arena | `canonical_arena_lookup` | copyable | application | never (process end) |
+| **Structure storage, decided (Q2 a, Lee 2026-10-22): the family arena** | `canonical_arena_lookup` | `arena(L, S)`: copyable, not linear (Q1 a) | application | never (process end) |
 
-The linearity rule holds in full for owned regions and the aggregates that embed them (§3). Structure versions follow
-Lee's rules (§3.14): a version has exactly one handle and is created only by a change; a change borrows its input,
-so old versions stay usable; a no-op change returns `:unchanged`. Under either storage choice the
-stdlib and compiler sources change by script (type spelling, Q1), apart from about 20 hand sites under counting. The safety properties of §12 are enforced at
+The linearity rule holds in full for owned regions and the aggregates that embed them (§3). A structure version is an
+`arena(L, S)` handle: copyable, immutable, never freed. Lee's version rules still hold (§3.14): a version is created only
+by a change, a change leaves its input valid, and a no-op change returns `:unchanged`. The
+stdlib and compiler sources change by script (type spelling, Q1: `region(L, normal)` becomes `arena(L, normal)`). The safety properties of §12 are enforced at
 compile time by a new **region checker** pass (§3–§6). Release is driven by explicit `drop` nodes that the SIR
 generator places from the checker's ownership facts (§7). Those replace the four emitters' name-independent
 heuristics. The run-time checks are the bounds checks that already exist (§8), plus the atomic arena bump that closes
@@ -149,7 +148,7 @@ Silent means the program runs on and computes with freed, shared or garbage memo
 
 | # | Where | Conflict | Proposed resolution |
 | --- | --- | --- | --- |
-| S1 | §16.3.5 "Message contents are copied between actors" vs §12.1.6 "the same move discipline applies" | copy vs move | **decided 2026-10-09 (Lee): move, with biased counting for shared nodes** (§18); §18.5 lists the spec text to change as Q6 decides; fix §16.3.5 |
+| S1 | §16.3.5 "Message contents are copied between actors" vs §12.1.6 "the same move discipline applies" | copy vs move | **decided 2026-10-09 (Lee): move**; structure versions are copyable arena handles (Q2 a, 2026-10-22) (§18); §18.5 lists the spec text to change as Q6 decides; fix §16.3.5 |
 | S2 | §4.4.2 "The function must return the handle to the caller" vs trial `region_move_pass_no_return` (a callee that consumes and releases) | must return vs may consume | Q3 |
 | S3 | §12.1.1 "atomic: regions … accessed by multiple actors concurrently" vs §12.1.6 "owned by at most one actor at a time" | sharing | Q7 |
 | S4 | §17 examples: function-level `proc[...]` (now E3009), `{ok, …}` record-tag syntax, `alloc_atomic()` with no arguments, `ref(R, atomic, ref(R, normal, …))` (a cross-actor pointer into normal memory) | stale syntax, unsound example | rewrite with §9 |
@@ -167,7 +166,7 @@ Three kinds of storage, each with one release rule:
 | Storage | Holds | Owner | Released |
 | --- | --- | --- | --- |
 | **Owned region** `region(L, S)` | what the program allocates in it explicitly (`alloc_ref`, `alloc_rec`, `alloc_buf`) | exactly one binding, in exactly one actor (or `main`) | when its owner is dropped (§7). An actor's owned regions that are still live when it ends are released by the runtime (§7.3). |
-| **Structure storage** | stdlib nodes | Q2: counted regions, one per node, owned jointly by the versions and nodes that reach them (recommended, §17); or one arena per family, owned by the application | counted: when the count reaches zero; immortal (hybrid) and arena: never |
+| **Structure storage** | stdlib nodes | one arena per family, owned by the application (Q2 a, decided 2026-10-22) | never |
 | **Actor heap** (implicit) | lists, promoted tuples and records, strings, message copies | the actor | hosted: the actor's arena, freed at the actor's end; board: per block (`silica_rt_free`); `main`: never |
 
 The frame is not storage a value may outlive. Item B and `arg_aggregate_heap_promote` move every aggregate that leaves
@@ -195,9 +194,9 @@ soundness is the runtime's (item B, H3, H4), and it is in this chunk only becaus
 A type is **linear** if it is, or contains at any depth through record fields, tuple elements and sum variants:
 `region(L, S)` (owned), `device_window(L, D)`, or `buf(L, S, T, N)` and `ref(L, S, T)` **when L is the lifetime of an
 owned region that is itself carried in the same value**. A `ref`/`buf` alone is not linear: it is a borrowed view, and
-§4 checks it by lifetime. Structure handles (Q1, Q2), scalars, strings, atoms, actor references, lists and function
-values are not linear. Under counted structure storage, structure versions form a second class, **counted** (§17.5): the
-same analysis places a count increment where a linear value would be an E2301.
+§4 checks it by lifetime. Structure handles (`arena(L, S)`, Q1, Q2), scalars, strings, atoms, actor references, lists and function
+values are not linear: an arena handle is a copyable word over immutable, never-freed nodes, so it is used, copied and
+sent freely.
 
 A list, a generic type argument and a trait's associated type may not be linear (E2307, §3.10–3.11).
 
@@ -259,10 +258,10 @@ capture that. Calling a function value with a linear argument is an ordinary mov
 
 | Construct | Rule |
 | --- | --- |
-| `spawn(state, beh, policy)` | `state` is moved (§12.1.5). Any later use of it, or of a linear or counted part of it, is E2301. This replaces the `"moved_region"` rebinding, and covers records, tuples, structure versions and any expression. |
-| supervised child spec (`init` child list, `add_child`) | the initial state may not be linear or hold a structure version (E2308): the supervisor keeps it in its row to restart the child, which would duplicate the owner or the version (§18.4). A worker that needs a region allocates it in its first message, or receives it by message. |
-| `call(a, msg)`, `cast(a, msg)`, `send`, the `_registered` forms | `msg` is moved at submission (§12.1.6; for data structures, Lee's decision of 2026-10-09, §18). Any later use of a linear or counted value in it is E2301, with no implicit `dup` across an actor boundary. The runtime transfers ownership of every owned region in it to the receiver (§7.3) and moves its structure versions (§18). |
-| behaviour `fn beh(msg: M, state: S) -> (:reply, R, S)` | `msg` and `state` are owned parameters. The reply and the new state are moved out: each linear or counted part of `msg` and `state` must be in the reply, in the new state, moved elsewhere, or dropped, and in at most one of them: one version in both the reply and the new state, or in a message and the new state, is E2303, with no escape hatch (Q12, decided). The legal way to reply from the state and keep it is two versions: keep v1 in the state and reply with, or send, v2 from a change of v1 (§18.1). The usual threading is `(:reply, x, (r2, k + 1))`. |
+| `spawn(state, beh, policy)` | `state` is moved (§12.1.5). Any later use of it, or of a linear part of it, is E2301. This replaces the `"moved_region"` rebinding, and covers records, tuples and any expression holding an owned region. Structure versions in it are arena handles and stay usable. |
+| supervised child spec (`init` child list, `add_child`) | the initial state may not be linear (E2308): the supervisor keeps it in its row to restart the child, which would duplicate the owner (§18.4). A worker that needs a region allocates it in its first message, or receives it by message. A structure version (an arena handle) is allowed; each restart reuses the same handle (Q14). |
+| `call(a, msg)`, `cast(a, msg)`, `send`, the `_registered` forms | `msg` is moved at submission (§12.1.6, §18). Any later use of a linear value in it is E2301. The runtime transfers ownership of every owned region in it to the receiver (§7.3). Structure versions in it are arena handles, passed by value; the sender keeps its own. |
+| behaviour `fn beh(msg: M, state: S) -> (:reply, R, S)` | `msg` and `state` are owned parameters. The reply and the new state are moved out: each linear part of `msg` and `state` must be in the reply, in the new state, moved elsewhere, or dropped, and in at most one of them: an owned region in both the reply and the new state, or in a message and the new state, is E2303. A structure version is an arena handle and may be in both (§18.1). The usual threading is `(:reply, x, (r2, k + 1))`. |
 | a `call`'s result | moved to and owned by the caller's binding (§12.1.6). |
 | `cast_exit`, `wait_for_exit` | no ownership effect (§12.4). |
 
@@ -389,53 +388,32 @@ fn main() -> int64 {
 Writing `alloc_ref(r, 5)` after the `spawn` is E2301 ("r was moved into spawn"). That is the case
 `enrich_env_for_actor_spawn` catches today only as a generic E2003.
 
-Structure versions are borrowed by changes and queries, and moved by everything else (§3.14; shown with the counted
-spelling of Q1):
+Structure versions are `arena(L, S)` handles, which are copyable, so a change leaves its input usable and a version may be bound again (§3.14):
 
 ```silica
-        m0: { root: ref?(L, normal, rec), …, region: counted(L, normal), … } <- wbt_map@empty(…);
-        r1: :unchanged | (:inserted, { … }) | (:replaced, { … }) <- wbt_map@insert(m0, 1, 10);   // borrows m0
-        old: int64 <- wbt_map@size(m0);                                                         // legal: m0 is still a version
-        kept: { … } <- m0;                                                                      // moves m0
-        again: int64 <- wbt_map@size(m0);                                                       // E2301: m0 was moved into kept
+        m0: { root: ref?(L, normal, rec), …, region: arena(L, normal), … } <- wbt_map@empty(…);
+        r1: :unchanged | (:inserted, { … }) | (:replaced, { … }) <- wbt_map@insert(m0, 1, 10);   // m0 is unchanged and still valid
+        old: int64 <- wbt_map@size(m0);
+        kept: { … } <- m0;                                                                      // a copy of the handle
+        again: int64 <- wbt_map@size(m0);                                                       // legal
 ```
 
-### 3.14 Structure versions: one handle each, and only a change makes one
+### 3.14 Structure versions: arena handles, and only a change makes one
 
-**Lee's rules, 2026-10-09 (option A).**
-- A new version of a data structure is created **only by a change**: insert, update, delete, meld and the like.
-  Storing or binding a version never creates another one. There is no aliasing and no implicit duplication. Binding it,
-  storing it in actor state, putting it in a record, tuple or list, passing it on, returning it and sending it all
-  move the one version.
+**Lee's version rules (2026-10-09, option A), as they stand under Q2 (a), 2026-10-22.**
+- A structure version is a record holding an `arena(L, S)` handle (Q1). It is **not linear**: binding, storing,
+  copying, passing on, returning and sending it are legal and create nothing, because the nodes are immutable and live in
+  a never-freed arena. No count, no `dup` and no ownership check applies to a version.
+- A new version is created **only by a change**: insert, update, delete, meld and the like.
 - **A change does not consume its input.** After `r <- wbt_map@insert(v1, k, x)`, v1 is still a valid version. A real
-  change yields a new version v2 that shares v1's unchanged nodes, counted by biased counting (§18.2). Persistence is
-  observable.
+  change yields a new version v2 that shares v1's unchanged nodes. Persistence is observable.
 - **A no-op change returns `:unchanged`, not a version.** Inserting an identical entry, deleting an absent key, melding
-  with an empty heap and the like produce no version at all. The program carries on with v1: no copy, no alias, no
-  run-time check.
+  with an empty heap and the like produce no version at all. The program carries on with v1: no copy and no run-time
+  check.
 
-What the checker enforces for a structure version (the counted class, §17.5):
-
-| Use of a version `v` | Kind | After it |
-| --- | --- | --- |
-| argument of a **change** (`insert`, `delete`, `meld`, `replace_*`, `add_edge`, …) | **borrow** | `v` still usable; the result is `:unchanged` or carries a new version |
-| argument of a **query** (`get`, `contains`, `size`, folds, every trait method) | borrow | still usable |
-| binding, record/tuple/list operand, return, state, reply, message, spawn state, argument of a function that stores, returns or sends it | **move** | later use is E2301 |
-| the same version in two moving positions of one expression, or kept in the new state and also replied or sent | — | E2303 (§18.1) |
-
-**Borrowed or consumed** is inferred per function from its body and recorded in the `.iface`:
-- A version parameter used only by changes, queries and prims is *borrowed*; every stdlib change and query is
-  borrowing.
-- One that the function moves anywhere is *consumed*.
-- A function that returns or stores a version, or a reference into one, that it only borrowed would create a second
-  handle: **E2320** (*VersionAliased*).
-- A change's result carries a version it **created**, not its input, so E2320 also rules out a change that returns its
-  input on a no-op path. Those paths must return `:unchanged`.
-
-**Count increments** (`dup`, §17.5) are placed only where a change stores a reference it borrowed (a child of a node of
-the old version) into a node or version handle it creates: the "shares v1's unchanged nodes" increment. The checker
-never places a `dup` because a binding is used twice. A second use is legal only if the first was a borrow; otherwise
-it is E2301.
+**Not scheduled.** Moving the stdlib's change results to the shapes below (367 updaters, about 300 caller sites in
+`trials/` and 55 in the compiler) is an API change that no stage of this plan carries; it was part of the removed
+counted-storage stage. The rules above stay as the design of the result shapes, for whenever it is scheduled.
 
 **Result shapes.** Every change returns a sum whose first alternative is `:unchanged`, and whose other alternatives are
 tagged tuples carrying the new version. The tag says *what* changed, so the stdlib's current flags fold into the tag.
@@ -478,7 +456,7 @@ return sites in 23 modules, found by grep for `{ map: old_map, … }`-style resu
 | graphs | existing vertex or identical edge, rejected add, absent edge or vertex | 16 |
 
 Callers inspect today's flags about 300 times in `trials/` and 55 times in the compiler, mostly `.inserted` through
-`compiler_maps@map_insert_or_get_index`. Each becomes a `case` on the result (§13 stage 6d).
+`compiler_maps@map_insert_or_get_index`. Each would become a `case` on the result when the reshaping is scheduled.
 
 ---
 
@@ -564,7 +542,6 @@ Emitters lower `drop_owned`:
 | `region(L, S)` | `_silica_rt_region_destroy(handle)`, X0/X1 (the scope's result) preserved, as `emit_region_destroy_reg` does today |
 | record/tuple/sum embedding owned regions | load each owned-region field and destroy it; for a sum, branch on the tag first. The field offsets come from the boxed layout (one word per field, `prims_record`). |
 | `device_window` | no code (unmapping is not specified); the checker still enforces single ownership |
-| counted structure value (§17.5) | `silica_rt_counted_release(ptr, release_fn)` per counted field; `dup_counted` is the matching inline increment |
 
 Then remove `let_owns_local_region`, `fn_destroys_region_param`, `body_has_moving_call`, `region_used_outside_borrow`, the
 dead `region_name_escapes`/`body_has_user_call`, and the disabled `mark`/`release_to` scope path with
@@ -687,21 +664,21 @@ costs one atomic RMW per stdlib node allocation, which is uncontended in the com
 
 ## 10. Error codes
 
-`E23xx` is unused (registry and sources). The block `E2300–E2319` becomes the region-safety family, next to the
+`E23xx` is unused (registry and sources). The block `E2300–E2318` becomes the region-safety family, next to the
 device family (E22xx). The type checker's "reference outlives region" moves from E2100 to E2300, which leaves E2100 with
-its one registered meaning.
+its one registered meaning. E2319 and E2320, drafted for counted storage, were removed in revision 1.9 and their numbers are not reused.
 
 | Code | Name | Raised when | Phase |
 | --- | --- | --- | --- |
 | E2300 | ReferenceOutlivesRegion | a returned, sent or spawned value holds `ref`/`ref?`/`buf` of lifetime L without `region(L)`, L not an arena lifetime (§4) | region checker (moved from type checker E2100) |
 | E2301 | UseAfterMove | a linear binding used after it was moved (names the move's line and, for case, the arm) | region checker |
 | E2302 | ReferenceAfterRegionGone | a `ref`/`buf` of lifetime L used after L's region was moved out or dropped | region checker |
-| E2303 | LinearMovedTwice | one expression moves one binding twice; or one version (or a linear value) is both kept in an actor's new state and given away as its reply or in a message (§18.1) | region checker |
+| E2303 | LinearMovedTwice | one expression moves one binding twice; or a linear value (an owned region) is both kept in an actor's new state and given away as its reply or in a message (§18.1) | region checker |
 | E2304 | PartiallyMovedValueUsed | whole use, or second move, of a record or tuple after a linear field was moved out | region checker |
 | E2305 | RegionParameterNotReturned | reserved for Q3 option "spec-strict"; unused under the recommendation | region checker |
 | E2306 | LinearCapture | a function literal captures a linear binding | region checker |
 | E2307 | LinearTypeArgument | a linear type as a list element type, generic type argument or associated type | type checker |
-| E2308 | LinearRestartableState | a supervised child spec's initial state is linear or holds a structure version (§18.4) | type checker (`type_checker_supervisor`) |
+| E2308 | LinearRestartableState | a supervised child spec's initial state is linear (§18.4) | type checker (`type_checker_supervisor`) |
 | E2309 | DuplicateLifetime | two live owned regions share a lifetime name | region checker |
 | E2310 | CrossRegionReference | `alloc_*` result L differs from the region's L, or a ref of L2 is stored in region L1 (L2 not an arena) | type checker |
 | E2311 | LifetimeConflictAtCall | one callee lifetime bound to two caller lifetimes | type checker (call checker) |
@@ -712,8 +689,6 @@ its one registered meaning.
 | E2316 | AtomicCellType | atomic cell type not a word scalar | type checker |
 | E2317 | AtomicOrderingInvalid | ordering not a literal atom, or illegal for the operation | type checker |
 | E2318 | ComparisonOnRegionType | `==`/`!=`/ordering operators on region, arena, ref, buf or device_window | type checker |
-| E2319 | WriteToSharedCell | `write_ref` on a counted cell not allocated in the same function (§17.5; counted storage only) | region checker |
-| E2320 | VersionAliased | a function returns or stores a structure version, or a borrowed reference into one, that it only borrowed, outside the increment a change makes (§3.14, §17.5) | region checker |
 
 Run-time outcomes, not codes: buffer bounds and invalid size (actor failure `(:explicit, :buf_bounds)` /
 `:buf_invalid` per Q9, abort 71 in `main`), region growth failure (abort 71), H5's null paths (abort 71).
@@ -744,11 +719,11 @@ not reach it, so its codes never duplicate E2003 noise.
 | --- | --- |
 | **Item K** (`wait_for_exit`, `cast_exit`) | no ownership effect. When `main` returns, actors are abandoned with their owned regions still linked; the process end reclaims them, and on the board `silica_rt_exit` halts. `main`'s own owned bindings are dropped at its scope end, after `wait_for_exit` returns. That is safe: anything an actor holds was moved and is not `main`'s to drop. |
 | **Growable actor stacks** (chunk 1, board item F) | stacks are released at the message boundary, so nothing may point into a stack across it. Regions are heap blocks, and a handle in a frame slot is fine. Aggregates rely on item B and H3's fix. A crash mid-behaviour leaves owned regions in frame slots, which §7.3's owner list reclaims. |
-| **Actor messages and replies** | moves (Q6, decided 2026-10-09; §18). Owned regions move by pointer plus owner transfer (§7.3). Structure versions move in O(1) with no node copied, and nodes reachable from two actors use biased counting (§18.2). Plain immutable values are copied into the receiver, which closes H4. |
+| **Actor messages and replies** | moves (Q6, decided 2026-10-09; §18). Owned regions move by pointer plus owner transfer (§7.3). Structure versions are arena handles passed by value (Q2 a). Plain immutable values are copied into the receiver; the H4 case needs the targeted stage 0 fix. |
 | **Supervised restart** | E2308 keeps owned regions out of child specs. |
 | **FFI** (dangerous actors) | E2101–E2103 stay as they are. The region checker treats `external_danger` regions as ordinary owned regions, and the taint checker's "only into actor state or an FFI result cast" is stricter, so the two compose. Chunk 13 inherits §8's length-word contract for `buf(L, S, uint8, N)`. |
 | **Device windows** | linear (§3.1). The `spawn_device` initial state moves the window. A window message is an explicit ownership transfer (device spec §5.1–§5.2). DMA buffers moved to the worker and back (device spec §5.3) are ordinary linear region moves, which this chunk finally enforces. Window lifetimes are no longer erased (H7). `peek`/`poke` borrow. |
-| **Board memory** | an owned region's first block is 4,128 B on every target (`emit_alloc_region`), 1.2% of the board's 354,816-byte heap per region. Proposal (decidable without Lee): a per-target first-block size, 512 B on `ESP32-S3_raw`, growing as now. The owner links add 16 B per region. Canonical arenas are 4,128 B each on first use and are never freed; nine families means ≤ 37 KB on the board if all are used. Worse, they only grow: a 1,000-key map updated ten times a second exhausts the heap in about 74 s (§17). Counted storage (Q2) is what lets a long-running board app keep a structure. |
+| **Board memory** | an owned region's first block is 4,128 B on every target (`emit_alloc_region`), 1.2% of the board's 354,816-byte heap per region. Proposal (decidable without Lee): a per-target first-block size, 512 B on `ESP32-S3_raw`, growing as now. The owner links add 16 B per region. Canonical arenas are 4,128 B each on first use and are never freed; nine families means ≤ 37 KB on the board if all are used. Worse, they only grow: a 1,000-key map updated ten times a second exhausts the heap in about 74 s (§17). Q2 (a) (2026-10-22) keeps the arena, so a long-running board app that updates a structure still exhausts the heap until a later project. |
 | **Chunk 9** (networking) | received bytes arrive in `buf(L, S, uint8, N)`. §8 gives the bounds check, and an overrun fails the connection's actor (Q9), not the server. |
 | **Chunk 13** | depends on §8 and on Q9's failure outcome for `recreate`'s limit checks. |
 | **Chunk 2** (carriers) | owner lists are per actor, not per thread, so carriers change nothing. H1's fix is needed either way. |
@@ -768,19 +743,17 @@ linux_aarch64 and linux_x86_64 (lock-step), and with a green ESP32 cross build a
 | --- | --- | --- | --- |
 | **0. Silent hazards** | H1 atomic arena bump and CAS arena insert (§9.4); H2 count `cast`/`send`/`spawn`/`call` prims as moving in the existing heuristics (interim, removed at stage 4); H3 promote let-bound frame aggregates passed by name (wire the staged trial); H5 null checks; renumber the region meaning of E2100 to E2300 | no | the hazard trials of §14.2 fail before and pass after; fixed points |
 | **1. Lifetime polymorphism** | §5 option A: per-call substitution, E2311 | yes, relaxing only (accepts more) | trials that spell a generic `R` pass; the `L1` workaround comments go from the trials; fixed points. Nothing in the compiler's source needs it. |
-| **2. Structure handle type** | Q1's spelling for the structure storage Q2 chooses (recommended `counted(L, S)`): type checker, interner, SIR, emitters. In this stage **every cell is immortal** (the §17.8 sentinel), so run-time behaviour is today's arena exactly and the fixed points cannot move. The constructors' `canonical_arena_lookup` result is accepted into the new type, and during the transition also into a `region` binding (a named transition rule, removed at stage 5). **Publish.** Then a script rewrites the stdlib's handle fields and allocator tuples (2,239 record types, 34 tuples, the `x.region` lets) and the 25 compiler modules' inline map types, verified with `git diff`, not the masked regex view (memory note). | yes | stdlib, `ordered_data_structures` and the compiler build; fixed points with the rewritten source |
-| **3. Region checker, report-only** | §11 checker behind a `silica.config` switch (`region_check: report`), writing `<unit>.regions` reports, no diagnostics, so no golden changes. For counted values it reports where it would place `dup` and which parameters it infers as borrows (§17.5). | no (reports only) | reports over the stdlib and the compiler show **no linear misuse**; reports over `trials/` are reviewed, and every entry is either a real misuse (it becomes an error trial in §14) or a checker defect (fixed); the dup and borrow reports for `wbt_map` are reviewed by hand against §17.3. Board trial sources are included. |
-| **4. Drops and owner lists** | §7.1 `drop_owned` in SIR and emitters for owned regions; remove the heuristics; §7.3 runtime owner lists and transfers; the per-target first-block size; **message regions (§18.7):** `drop_owned` at behaviour return for a message's owned regions unless they flow into the new state, partial move out of a message record, `copy_to`, release on a failed send, reply regions dropped for a dead or timed-out caller, and the actor-end walk covering the unprocessed mailbox | no (`copy_to` is a new builtin or trait method, Q15) | §14.2 release trials (write-every-page) on every host and the board; the message-region trials of §18.6 (`message_region_released_at_dispatch_end` and the others except the chunk-11 one); `memory_region_addition` and `actors_addition` unchanged; `.ascomp` goldens refreshed only where `.sout` = `.scout`; fixed points |
-| **5. Errors on** | `region_check` defaults to `error`; the transition rule from stage 2 is removed; E2300–E2319 error trials wired | yes | the compiler's own source passed stage 3 clean, so it builds; fixed points; the error suite is green on the three hosts |
-| **6. Counted structure storage** (Q2 c, §17) | 6a runtime, four targets: per-actor size-class allocator with remote-free lists and abandoned slabs; the biased-counting header and protocol (§18.2: owner test, plain owner count, atomic shared count, count queue with count-only dispatch, merge at actor end); `silica_rt_counted_release`; counted list chunks; the immortal sentinel kept. 6b compiler: `dup_counted` placement and `drop_owned` for counted values, borrow inference recorded in `.iface`, generated per-shape release functions, E2319. 6c moves across actors (§18): O(1) handle transfer of every version with no node copied, biased counting for shared nodes (§18.2), E2303 for keep-and-give-away (Q12), E2308 for versions in child specs, the copy of plain values into the receiver (closes H4), and crash cleanup maps at call and failure sites so a crash drops its frames' references. 6d stdlib by hand (≈ 20 sites, §17.7): constructors obtain counted storage and gain `empty_immortal`-style variants; meld's same-arena test goes. Under §3.14 (option A), also the **change-result reshaping**: every stdlib change (367 updaters, all families) returns `:unchanged | (:tag, V…) | …` instead of a flagged record; the ≈ 69 no-op return paths return `:unchanged`; the callers that inspect today's flags (≈ 300 in `trials/`, 55 in the compiler, through 18 compiler insert sites and `compiler_maps@map_insert_or_get_index`) become `case` matches. A script can rewrite the result types and the simple `r.inserted`/`r.map` caller shapes; the no-op paths and the callers that use the flag in other ways are by hand. The traits change only where a provided method calls a change (they are queries). Bootstrap: the compiler's own sources adopt the new shapes only after a published compiler compiles tagged-tuple sum results of qualified generic calls correctly. A trial of exactly that is in stage 6's gate, since the seed once rejected tagged-sum returns. Persistence trials and the 149 trial calls that reuse old versions stay valid. Supervised child specs holding versions are rejected (E2308, Q14). ⟶ Expect most of the stage-6 hand work here. | yes (constructor variants; E2319) | the §17.6 benchmarks run under (a) and (c) on all hosts and the board; `board_map_update_forever` keeps the heap free total flat; `ordered_data_structures` green unchanged; fixed points (the compiler's output must not depend on its storage choice) |
+| **2. Structure handle type** | the handle spelled `arena(L, S)` (Q1 a, Q2 a, decided 2026-10-22; not linear, accepted by the allocation prims, obtained from `canonical_arena_lookup`): type checker, interner, SIR, emitters. No cell is ever freed, so run-time behaviour is today's arena exactly and the fixed points cannot move. The constructors' `canonical_arena_lookup` result is accepted into the new type, and during the transition also into a `region` binding (a named transition rule, removed at stage 5). Specification addition S7. **Publish.** Then a script renames the stdlib's handle fields from `region(L, normal)` to `arena(L, normal)` and rewrites the allocator tuples (2,239 record types, 34 tuples, the `x.region` lets) and the 25 compiler modules' inline map types, verified with `git diff`, not the masked regex view (memory note). | yes | stdlib, `ordered_data_structures` and the compiler build; fixed points with the rewritten source |
+| **3. Region checker, report-only** | §11 checker behind a `silica.config` switch (`region_check: report`), writing `<unit>.regions` reports, no diagnostics, so no golden changes. | no (reports only) | reports over the stdlib and the compiler show **no linear misuse**; reports over `trials/` are reviewed, and every entry is either a real misuse (it becomes an error trial in §14) or a checker defect (fixed). Board trial sources are included. |
+| **4. Drops and owner lists** | §7.1 `drop_owned` in SIR and emitters for owned regions; remove the heuristics; §7.3 runtime owner lists and transfers; the per-target first-block size; **message regions (§18.7):** `drop_owned` at behaviour return for a message's owned regions unless they flow into the new state, partial move out of a message record, `copy_to`, release on a failed send, reply regions dropped for a dead or timed-out caller, and the actor-end walk covering the unprocessed mailbox | no (`copy_to` is a new compiler builtin `copy_to(region, value)` derived per type like `recreate`, Q15 decided 2026-10-22) | §14.2 release trials (write-every-page) on every host and the board; the message-region trials of §18.6 (`message_region_released_at_dispatch_end` and the others except the chunk-11 one); `memory_region_addition` and `actors_addition` unchanged; `.ascomp` goldens refreshed only where `.sout` = `.scout`; fixed points |
+| **5. Errors on** | `region_check` defaults to `error`; the transition rule from stage 2 is removed; E2300–E2318 error trials wired | yes | the compiler's own source passed stage 3 clean, so it builds; fixed points; the error suite is green on the three hosts |
 | **7. Atomics** (after stage 1, parallel to 3–6) | §9: builtins, lowering on four targets, shared atomic regions per Q7 | yes | the atomic run trials plus two-actor counter and CAS trials on the hosts and both board cores |
 | **8. Bounds outcome and static buffer checks** (any time after 0) | Q9 actor failure; E2313/E2314; use or remove `\|bounds:` | yes (E2313/E2314) | §14 trials |
 
-Stages 0, 1 and 8 do not depend on the open decisions. Stage 2 needs Q1 and Q2; stage 4 needs Q5; stage 5 needs
-Q3/Q4/Q11; stage 6 needs Q2 (c or b) (Q6 and Q12 are decided); stage 7 needs Q7/Q8. If Lee chooses (a) for Q2, stage 6 is dropped and
-stage 2 spells `arena(L, S)`. The ROADMAP gate ("enforced at compile time or halted at run time, never silent; the
-linearity rule holding for a region in a record or tuple; trials; stdlib and compiler at their fixed points under it")
-is met at the end of stage 5 plus H4's resolution (6c). Stage 6 makes the structures reclaim memory, and stage 7 closes
+Stages 0, 1 and 8 do not depend on the open decisions. Stage 2 needed Q1 and Q2 (decided 2026-10-22: `arena(L, S)`); stage 4 needed Q5 (decided 2026-10-22, with Q15 to Q17); stage 5 needs
+Q3/Q4/Q11; stage 7 needs Q7/Q8. There is no stage 6: the counted-storage stage was removed under Q2 (a) (2026-10-22), and the numbers 7 and 8 are kept so that references stay stable. The ROADMAP gate ("enforced at compile time or halted at run time, never silent;
+the linearity rule holding for a region in a record or tuple; trials; stdlib and compiler at their fixed points under it")
+is met at the end of stage 5 plus the targeted stage 0 fix for H4 named in participate.md. Structures do not reclaim memory, and stage 7 closes
 "atomic references".
 
 ---
@@ -809,10 +782,7 @@ A construct that the bootstrap compiler rejects in a batch goes into its own `co
 | E2313, E2314 | literal size mismatch; literal index 15 into N = 10; negative literal index |
 | E2315–E2317 | `atomic_fetch_add` on a normal ref; atomic cell of a record type; `atomic_load(c, :release)`; ordering passed as a variable |
 | E2318 | `r1 == r2` on regions; `c1 != c2` on refs |
-| E2301 (versions) | a version used after it was put in a record, a list or the new state; after it was returned in an `(:inserted, v)` built by the program; after `kept <- m0` |
-| E2320 (no-op) | a change written by the program whose no-op path returns its input version instead of `:unchanged` |
-| E2320 | a function that borrows a version (passes it only to queries) and returns it; one that stores a borrowed child reference into a record it returns; a "get inner set" helper returning the stored version |
-| E2301, E2303 (moves) | the message-move cases of §18.6: a version or a record holding one used after `cast`, `call`, `send`, `spawn`; sent in one arm and used after the `case`; replied and kept in the new state; `cast(a, (m, m))` |
+| E2301, E2303 (moves) | the message-move cases of §18.6: an owned region, or a record holding one, used after `cast`, `call`, `send`, `spawn`; sent in one arm and used after the `case`; replied and kept in the new state; `cast(a, (r, r))` |
 
 ### 14.2 Run trials
 
@@ -833,12 +803,11 @@ A construct that the bootstrap compiler rejects in a batch goes into its own `co
 | `buf_bounds_ends_actor` | Q9: an out-of-bounds write in a worker ends the worker, the supervisor restarts it, `main` continues |
 | atomic: `atomic_counter_two_actors`, `atomic_cas_loop`, `atomic_orderings`, on hosts and the board's two cores | §9 |
 | `device_window_moved_once` (board) | window moved into a worker, used there |
-| `no_op_change_returns_unchanged` | per family: identical insert (map, set), delete of an absent key/item, meld with an empty heap, pop of an empty heap, skew-list update out of range, tree replace with the same subtree, graph remove of an absent edge and add of an existing vertex; each returns `:unchanged`, the program carries on with v1 and its contents are intact; no node is allocated and no count changes (allocator and count probes) |
+| `no_op_change_returns_unchanged` | per family: identical insert (map, set), delete of an absent key/item, meld with an empty heap, pop of an empty heap, skew-list update out of range, tree replace with the same subtree, graph remove of an absent edge and add of an existing vertex; each returns `:unchanged`, the program carries on with v1 and its contents are intact; no node is allocated (allocator probe). Waits on the result reshaping of §3.14, which no stage carries. |
 | `change_result_variants` | every tagged alternative of §3.14's result table matched by destructuring (`(:inserted, m2: …)`, `(:replaced, …)`, `(:popped, item, h2)`, `:incompatible`, `:overflow`, `:rejected`), with the old version still used after the match |
 | `persistence_old_versions_valid` | `bt_persistence_sharing` and `bo_old_heap_valid_after_pop` shapes under the stage-5 checker: old versions stay valid after changes |
-| `no_op_change_on_moved_version` | the same no-op changes on a version received from another actor: `:unchanged`, and the sender-owned nodes' counts (owner and shared) are untouched |
-| `change_threads_version` | a version threaded through 10⁶ changes (each `(:inserted, m2)` rebinds, the old version is dropped): old paths freed as they go, heap bounded by the live version |
-| move and biased-counting trials of §18.6 | `move_unique_version_o1`, `move_shared_version_both_evolve`, `shared_drop_sender_first`, `shared_drop_receiver_first`, `shared_owner_ends_first`, `shared_owner_ends_first`, `shared_owner_crashes_with_locals`, `shared_idle_owner_reclaims`, `move_reply_version`, `move_two_versions_reply_and_keep`, `no_op_change_returns_unchanged`, `change_result_variants`, `persistence_old_versions_valid`, `no_op_change_on_moved_version`, `move_map_of_sets`, `move_immortal_version`, `supervised_child_builds_state_per_start`, `move_two_cores` and `owner_migrates_between_cores` (board) |
+| `no_op_change_on_moved_version` | the same no-op changes on a version received from another actor: `:unchanged`, and the sender's copy of the handle is untouched |
+| move trials of §18.6 | `reply_and_keep_same_version`, `move_reply_version`, `move_map_of_sets`, `supervised_child_restarts_with_version`, `move_two_cores` (board), and the owned-region trials listed there |
 
 Each existing `region_move_*` and `region_local_release` trial keeps its output through stage 4.
 
@@ -847,10 +816,10 @@ Each existing `region_move_*` and `region_local_release` trial keeps its output 
 ## 15. Open decisions for Lee
 
 **Q1. How is a structure's storage handle told apart from an owned region in the type?**
-The spelling follows Q2. (a) A new type constructor: `counted(L, Space)` under counted storage, or `arena(L, Space)`
-under the arena. It is not linear, it is accepted by the allocation prims, and the constructors obtain it. (b) A reserved
+**Decided by Lee, 2026-10-22: (a), spelled `arena(L, Space)`** (Q2 is (a)): a new non-linear type constructor, accepted by the allocation prims and obtained from `canonical_arena_lookup`; a script renames the stdlib handle fields from `region(L, normal)` to `arena(L, normal)`; the transition rule during stage 2 is removed at stage 5; specification addition S7.
+The spelling follows Q2 (a). (a) A new type constructor `arena(L, Space)`. It is not linear, it is accepted by the allocation prims, and the constructors obtain it. (b) A reserved
 lifetime name (`app`), so `region(app, normal)` is the structure handle. (c) Infer it from where the handle came from.
-*Recommend (a)*, spelled `counted(L, Space)` if Q2 is (b) or (c), and `arena(L, Space)` if Q2 is (a).
+*Recommend (a)*, spelled `arena(L, Space)`.
 - It is explicit (nothing hidden) and a script can do the rename.
 - It keeps the per-family L.
 - It names what the handle does.
@@ -859,27 +828,15 @@ lifetime name (`app`), so `region(app, normal)` is the structure handle. (c) Inf
 
 Any choice makes S7 a spec addition.
 
-**Q2. How are the standard data structures stored, and is their memory ever given back?** (Full comparison: §17.)
+**Q2. How are the standard data structures stored, and is their memory ever given back? — Decided by Lee, 2026-10-22: (a), the never-freed family arena with the atomic bump (stage 0).** Counted storage (biased counting, a size-class allocator, counted list chunks, change-result reshaping at the counted level) is not part of this plan and its design was removed from this document (§17). Consequences: stage 2 spells the handle `arena(L, S)`; structures still never reclaim memory (a 1,000-key map exhausts the ESP32-S3 heap in about 740 updates, a busy host grows by tens of MB/s) until a later project; H4 (replies in the replier's arena) now needs the targeted stage 0 fix already listed in participate.md; biased counting is not needed.
+The options considered (§17):
 - (a) **Never-freed family arena**, as today: one process-global arena per structure family, with an atomic bump
-  (stage 0). Simple and fast, with O(1) meld within a family. Nothing is ever reclaimed: a 1,000-key map updated ten
-  times a second exhausts the board's heap in about 74 seconds, and a busy host grows by tens of MB a second.
-- (b) **Counted regions.** Each node is a small region with a count of the versions and nodes that reach it. Path
-  copying is unchanged. The region checker places increments and decrements (Perceus-style, invisible in source).
-  Memory comes back the moment the last version that reaches it goes. Immutable nodes, O(1) moves and O(1) meld are kept, there is no
-  GC, and it is deterministic. Costs: 25–100% more bytes per live node (biased-counting header, §17.2), an estimated 1.3–2× on update-heavy code
-  (less with in-place reuse of unique paths), and a large compiler and runtime stage.
-- (c) **Hybrid:** (b) by default, plus an immortal constructor per family (for example `wbt_map@empty_immortal`) whose
-  versions behave as (a), for batch programs. One type serves both, and the programmer sees one choice at construction.
+  (stage 0). Simple and fast, with O(1) meld within a family. Nothing is ever reclaimed.
+- (b) **Counted regions**: each node a small region with a count; memory returns when the last version goes.
+- (c) **Hybrid:** (b) by default, plus an immortal constructor per family.
 - (d) Per-actor arenas freed at actor end: reclaims only on actor end or restart. A long-running actor still grows.
 - (e) One owned region per structure with explicit `compact`: reclamation by hand, and versions die at each compaction.
-
-*Recommend (c)*, with counted as the default and non-atomic counts; messages move (Q6, decided; §18). It is the only option
-that lets a long-running program, and any board app, keep updating a structure.
-Option (a) stays as the interim behaviour until stage 6, because stage 2 introduces the type with every cell immortal.
-
-**Decision wanted:** do standard data structures give memory back when versions go out of use, at the cost of per-node
-counts (b or c), or do they keep today's never-freed family arenas (a)? If (b) or (c): should batch programs, the
-compiler among them, be able to opt out per constructor (c)?
+Lee chose (a).
 
 **Q3. May a function consume a region parameter without returning it?**
 (a) Yes: an unreturned, unmoved parameter is dropped and released, as `region_move_pass_no_return` expects today.
@@ -887,55 +844,33 @@ compiler among them, be able to opt out per constructor (c)?
 *Recommend (a)*, rewording §4.4.2 to "must return it if the caller is to keep it". Releasing is a legitimate end of
 ownership, and locals already drop.
 
-**Q4. Should user functions be able to borrow?** (For structure versions this is now settled by Lee's rule, §3.14: changes and queries borrow their version arguments, inferred. The question remains for owned regions.)
+**Q4. Should user functions be able to borrow?** (Structure versions are copyable arena handles and need no borrowing, §3.14. The question is for owned regions.)
 (a) No. Only the region prims borrow, and a function that inspects a linear value takes it and returns it.
 (b) A parameter marker for a borrowed linear value.
 *Recommend (a)* for chunk 4. After Q1 the stdlib's 921 queries take arena records, which are copyable, so the pressure
 for borrowing is gone. Revisit if real owned-region code shows the threading to be a burden.
 
-**Q5. Who releases the owned regions of an actor that ends?**
+**Q5. Who releases the owned regions of an actor that ends? — Decided by Lee, 2026-10-22: (a), a per-actor runtime owner list, ownership transferred on message and spawn (§7.3).** It covers locals at a crash, queued mailbox messages and failed sends.
 (a) A per-actor runtime owner list, with ownership transferred on message and spawn (§7.3). (b) A compiler-generated
 destructor of the state type. (c) Nobody: they leak until process end.
 *Recommend (a).* Only it covers regions held in locals at a crash.
 
-**Q6. Messages: move or copy? — Decided by Lee, 2026-10-09: move, with biased counting for shared nodes.** A data
-structure carried by a message, reply or spawn state is moved, and the sender may not use it afterwards (E2301).
-- Every move is an O(1) handle transfer that copies no unchanged node.
-- Nodes reachable from more than one actor are counted by biased counting (§18.2): a plain owner count for the
-  creating actor and an atomic shared count for everyone else, freed when both reach zero. When the owner ends, the
-  nodes become shared-only.
-- Immortal versions move in O(1) and carry no counts (§18.3).
-- A supervised child's initial state may not hold a structure version (§18.4).
-- Plain immutable values are copied by the runtime, which closes H4.
+**Q6. Messages: move or copy? — Decided by Lee, 2026-10-09: move; narrowed by Q2 (a), 2026-10-22.** An owned region carried by a message, reply or spawn state is moved, and the sender may not use it afterwards (E2301).
+- Every move is an O(1) handle transfer (§7.3).
+- Structure versions are `arena(L, S)` handles (Q1, Q2 a): copyable words over immutable, never-freed nodes. A send passes the handle by value and the sender keeps using its own. Nothing is counted (the biased-counting design of 2026-10-09 was removed with the counted-storage stage, §17).
+- Plain immutable values are copied by the runtime. H4 (a reply in the replier's arena) needs the targeted stage 0 fix.
 
-Option (b), copying the shared part, is rejected because it copies unchanged nodes. Spec changes: §18.5.
+Spec changes: §18.5.
 
-**Q12. How does a program send a version it also keeps? — Decided by Lee, 2026-10-09: it cannot; there is no `share`
-builtin.** One version in both the new state and the reply, or in both the new state and a message, is E2303, with no
-escape hatch. The legal pattern is two versions: keep v1 in the state and reply with, or send, v2 from a change of v1
-(changes borrow their input, §3.14). Their shared nodes are counted by biased counting (§18.2) and never copied. When
-the change is a no-op there is no v2, and the reply is the atom `:unchanged` (§18.1).
 
-**Q13. Reading a version stored inside a structure** (a graph's inner adjacency set from `get`), re-evaluated under
-option A. The stored inner version is held by a node of the outer version. Handing the caller a handle to it would
-make a second handle to one version, and it is not a change, so it is E2320 under Lee's rules. Options: (a) such reads
-return a borrowed view, usable for queries inside the caller and never stored, returned or sent; (b) a change that
-yields a new outer version without the inner one, plus the inner version moved out of that new outer version as it is
-created (`take`: `:unchanged | (:taken, outer2, inner)`; the old outer version still holds its copy-free reference,
-and the inner version handed out is the one the new outer version would have held, so there is still one handle per
-version); (c) only queries over inner structures (`has_edge`, `neighbors`), never the inner version itself.
-*Recommend (c)* for the public API, which is what the graph traits already present, with (a) for the stdlib's internal
-helpers. (b) is consistent with the rules, and is worth adding only if a program needs to extract an inner structure.
+**Q12. How does a program send a version it also keeps? — Withdrawn 2026-10-22: moot under Q2 (a).** Lee decided on 2026-10-09 that there is no `share` builtin and that keeping and giving away one version is E2303. That rule existed because a counted version had exactly one handle. An arena handle is a copyable word, so there is nothing to share and nothing to forbid: a version may be kept in the new state and also replied or sent. E2303 keeps its other meanings (one expression moving a binding twice; an owned region both kept and given away), where the second use really is a second owner.
 
-**Q14. May a supervised child's initial state hold a structure version?** Re-evaluated under option A. The supervisor's
-row keeps the initial state to restart the child, so each start needs a version of its own. A restart is not a change,
-so under Lee's rules no new version may appear. Moving the row's version into the child would leave nothing for the
-next restart, and handing the child the row's handle while the row keeps it is E2303's keep-and-give-away. Options:
-(a) no: E2308, and the child builds its structure in its first dispatch or receives it by message; (b) the runtime gives
-each start a new handle to the row's version, one root count, as a named exception to "only a change makes a version",
-justified because the row's version is never visible to programs; (c) the child spec names a constructor function
-instead of a value, called at each start. *Recommend (a)*: it needs no exception and no new spec field. (c) is the
-clean extension if supervised children often need prebuilt structures.
+
+**Q13. Reading a version stored inside a structure** (a graph's inner adjacency set from `get`). *Open, narrowed by Q2 (a).* The stored inner version is an arena handle, so `get` can return it by value and nothing is aliased. (a) return the handle (a value like any other); (b) only queries over inner structures (`has_edge`, `neighbors`), never the inner version itself. *Recommend (a)* now that the aliasing worry is gone; (b) is what the graph traits already present.
+
+
+**Q14. May a supervised child's initial state hold a structure version?** *Open, narrowed by Q2 (a).* A version is an arena handle, and the arena is never freed, so the supervisor's row can keep the handle and every restart reuses it. (a) yes, with no new rule; (b) no, E2308 extends to versions. *Recommend (a).* E2308 stays for owned regions (linear, so the row would duplicate the owner).
+
 
 **Q7. May two actors share atomic memory?**
 (a) Yes: `region(L, atomic)` is application-lifetime and copyable, and holds only word-scalar atomic cells.
@@ -963,18 +898,18 @@ parameters, or bracket generics. Either way §4.4.1/§12.1.4's sentence changes.
 (a) No (E2307). (b) Yes, with a linear-aware generic checker.
 *Recommend (a)* now. No stdlib or compiler code needs it.
 
-**Q15. How is `copy_to` spelled? (§18.7, 2026-10-22)** (a) A compiler builtin `copy_to(region, value)`, derived per type
+**Q15. How is `copy_to` spelled? (§18.7) — Decided by Lee, 2026-10-22: (a), a compiler builtin `copy_to(region, value)` derived per type like `recreate`; no copy for `device_window` or atomic cells.** (a) A compiler builtin `copy_to(region, value)`, derived per type
 like `recreate`. (b) A derived trait method (a `Copyable` trait beside `Recreatable`), so a library type may refine
-it. *Open.* The builtin is the smaller change; the trait follows the FFI wrapper spec's `Recreatable` precedent and
+it. *Decided (a).* The builtin is the smaller change; the trait follows the FFI wrapper spec's `Recreatable` precedent and
 lets a type reject the copy. Either way a `device_window` and an atomic cell have none.
 
-**Q16. May a behaviour move a whole received region into its state? (§18.7)** (a) Yes: the state owns it, no drop, O(1).
+**Q16. May a behaviour move a whole received region into its state? (§18.7) — Decided by Lee, 2026-10-22: (a), yes (the state owns it, no drop, O(1)).** (a) Yes: the state owns it, no drop, O(1).
 (b) No: only `copy_to`. *Recommend (a)*: it keeps the move O(1) and is the same ownership transfer as the send. The cost
 is that state may then hold a region that grows with each message, which is the program's choice.
 
-**Q17. Who owns a region when a send fails? (§18.7)** (a) The runtime releases it on the failed send (the sender's use
+**Q17. Who owns a region when a send fails? (§18.7) — Decided by Lee, 2026-10-22: (a), the runtime releases the region on a failed send; a sender that needs the data copies first.** (a) The runtime releases it on the failed send (the sender's use
 is already E2301). (b) The sender keeps ownership on `actor_not_found`, which contradicts the static moved rule and
-would make a region both moved and not moved after the call. *Recommend (a).* Record Lee's choice here.
+would make a region both moved and not moved after the call. *Recommend (a).* Lee chose (a).
 
 ---
 
@@ -991,27 +926,23 @@ quick incremental Mac builds and minimal repros only. Everything else goes to le
 | 3 | 0–8 | every full build (Mac, pix, nix, ESP32 cross), fixed-point runs, `make integrate`, board suites, golden refresh under the rules | Sonnet / Haiku |
 | 4 | 1 | per-call lifetime substitution, E2311, removal of the binder fallback and `device_window` lifetime erasure | **Fable** |
 | 5 | 1 | remove the `L1` workaround comments from trials; `generic_lifetime_name` and E2311 trials | Opus |
-| 6 | 2 | `counted(L, S)` (or `arena` under Q2 a) through lexer/parser (if needed), interner, type checker, SIR, emitters, with every cell immortal; transition rule | **Fable** |
+| 6 | 2 | `arena(L, S)` (Q1 a, Q2 a, decided 2026-10-22) through lexer/parser (if needed), interner, type checker, SIR, emitters, no cell ever freed; transition rule | **Fable** |
 | 7 | 2 | stdlib and compiler-source rewrite script: exact-token rewrite of handle field types and allocator tuples only, verified with `git diff` per file, the count reconciled against §1.4's 2,239 | Opus (script), Sonnet (run and verify) |
-| 8 | 3 | `region_checker/` (ownership state, lifetime liveness, dup and borrow placement for counted values, report mode, `silica.config` switch) | **Fable** |
-| 9 | 3 | report collection over stdlib, compiler and `trials/`; triage into misuse vs checker defect; hand review of the `wbt_map` dup and borrow report | Sonnet |
+| 8 | 3 | `region_checker/` (ownership state, lifetime liveness, report mode, `silica.config` switch) | **Fable** |
+| 9 | 3 | report collection over stdlib, compiler and `trials/`; triage into misuse vs checker defect | Sonnet |
 | 10 | 4 | `drop_owned` placement in SIR; lowering in four emitters; removal of the heuristics and dead scope-release code; owner lists, transfer and actor-end walk in four runtimes (the walk covers the unprocessed mailbox, §18.7); per-target first-block size; dispatch-end drops for message regions, the partial-move rule, `copy_to` derivation, region release on a failed send and for a dead or timed-out caller (§18.7) | **Fable** |
 | 11 | 4 | release trials (write-every-page), `crashed_actor_regions_released`, `region_moved_between_actors`, and the message-region trials of §18.6 (§18.7; the timed-out-call trial waits on chunk 11) | Opus |
-| 12 | 5 | switch to errors; E2300–E2319 messages and metadata; `error_codes.md` and `.jsonld` entries | **Fable** (code); Sonnet (registry text) |
+| 12 | 5 | switch to errors; E2300–E2318 messages and metadata; `error_codes.md` and `.jsonld` entries | **Fable** (code); Sonnet (registry text) |
 | 13 | 5 | the §14.1 error catalogue, goldens re-derived from real output | Opus (sources), Sonnet (goldens) |
-| 14 | 6a | per-actor size-class allocator (remote-free lists, abandoned slabs); biased-counting header and protocol (owner test, count queue, count-only dispatch, merge at actor end); `silica_rt_counted_release`; counted list chunks; immortal sentinel; in four runtimes | **Fable** |
-| 15 | 6b–c | `dup_counted` and counted `drop_owned` lowering in four emitters; generated per-shape release functions; borrow inference in `.iface`; E2319; the §18 move machinery (O(1) handle transfer, owner-tested `dup`/`drop` lowering, E2303 for keep-and-give-away, crash cleanup maps at call and failure sites and the unwinding that runs them); the runtime side of biased counting is item 14 | **Fable** |
-| 16 | 6d | the ≈ 20 hand sites of §17.7 (constructors and their immortal variants, meld compatibility, cursor `write_ref` review, validators); the change-result reshaping of §3.14 (result types and simple callers by script, no-op paths and other callers by hand) across the stdlib, the trials and the compiler's map users | Opus (script and hand edits), with Fable review of anything the checker rejects |
-| 17 | 6 | the §17.6 benchmarks and `board_map_update_forever`; runs under (a) and (c) on all hosts and the board; the measurement report that sets 6e | Opus (sources), Sonnet (runs and report) |
-| 18 | 7 | atomic builtins in the checkers and SIR; lowering in four emitters; ESP32 64-bit spinlock path; removal of the function-level barriers | **Fable** |
-| 19 | 7 | atomic run and error trials, two-core board runs (console-only) | Opus / Sonnet |
-| 20 | 8 | actor-failure outcome for bounds, invalid size and list index; E2313/E2314; `\|bounds:` use or removal | **Fable** |
-| 21 | all | spec text: §4.4.1–§4.4.2, §12.1.2–§12.1.6, §12.3.3, §12.4, §16.3.5, §17 rewrite, arenas (S7), per decisions; `region_memory_safety_todo.md` closed with a pointer here; ROADMAP status | main session or Sonnet |
+| 14 | 7 | atomic builtins in the checkers and SIR; lowering in four emitters; ESP32 64-bit spinlock path; removal of the function-level barriers | **Fable** |
+| 15 | 7 | atomic run and error trials, two-core board runs (console-only) | Opus / Sonnet |
+| 16 | 8 | actor-failure outcome for bounds, invalid size and list index; E2313/E2314; `\|bounds:` use or removal | **Fable** |
+| 17 | all | spec text: §4.4.1–§4.4.2, §12.1.2–§12.1.6, §12.3.3, §12.4, §16.3.5, §17 rewrite, arenas (S7), per decisions; `region_memory_safety_todo.md` closed with a pointer here; ROADMAP status | main session or Sonnet |
 
-Fable's estimated scope, by size: the region checker (8), drops and owner lists (10) and counted storage (14, 15) are
-the large items; 2, 4, 6, 12, 18 and 20 are each a few modules across four emitters.
+Fable's estimated scope, by size: the region checker (8) and drops and owner lists (10) are
+the large items; 2, 4, 6, 12, 14 and 16 are each a few modules across four emitters.
 
-## 17. Structure storage: a never-freed arena or counted regions (Q2)
+## 17. Structure storage: record of the options (Q2)
 
 Lee's concern (2026-10-09): a never-freed arena only grows. Measured against the code:
 
@@ -1023,228 +954,25 @@ Lee's concern (2026-10-09): a never-freed arena only grows. Measured against the
 - On a host, a server doing 100,000 updates a second grows by about 48 MB/s, about 170 GB an hour.
 - Constructor sites, `canonical_arena_lookup` and the destroy path never free an arena block (§1.2).
 
-Option (a) is therefore safe but unusable for any long-running program, and on the board it fails within minutes.
-Leaks are not a §12 safety violation, so the chunk's gate could be met with (a). The board-release goal and the
-"millions of actors" goal cannot.
+The arena is safe (leaks are not a §12 safety violation) but unusable for a long-running program that keeps updating a
+structure, and on the board it fails within minutes.
 
-### 17.1 The options
+**Options considered.** (a) the never-freed family arena; (b) counted regions, one small region per node with a count of
+the versions and nodes that reach it; (c) (b) by default plus an immortal constructor per family; (d) per-actor arenas
+freed at actor end; (e) one owned region per structure with an explicit `compact`.
 
-| | Model | Reclaims | Persistence | Programmer sees |
-| --- | --- | --- | --- | --- |
-| **a** | One never-freed arena per structure family (today) | nothing, ever | full | nothing |
-| **b** | **Counted regions.** Each node is its own small region carrying a count of the nodes and version handles that refer to it. Path copying is unchanged; the new path counts its shared subtrees; dropping a version decrements its root and frees nodes reaching zero, recursively. | precisely the nodes no live version reaches, at the moment the last reference goes | full | nothing (b2 below) or an explicit `share` (b1) |
-| **c** | **Hybrid.** (b) by default. A second constructor per family makes an *immortal* version whose nodes carry a sentinel count that is never changed: (a)'s behaviour, minus the arena. | as (b) for counted versions; nothing for immortal ones | full | a constructor choice |
-| **d** | Per-actor arenas, freed when the actor ends | only at actor end or restart | full within the actor; a moved structure would have to be copied out of the sender's arena | nothing |
-| **e** | One owned (linear) region per structure instance, with an explicit `compact` that copies the live version into a fresh region and drops the old one | at each compaction | only between compactions | a `compact` call, and versions invalidated by it |
-
-(d) does not answer the concern: a long-lived actor still grows without bound. (e) puts reclamation in the
-programmer's hands, which is manual memory management by another name, and breaks the persistence contract at every
-compaction. They are listed for completeness and are not recommended.
-
-### 17.2 Granularity
-
-**Per node** keeps every algorithm as it is: weight-balanced trees, skew-binary lists, Brodal–Okasaki heaps and the
-rose and binary trees are all binary or rank-structured, and none has a "wide node" form without a rewrite.
-
-The header is biased counting's (§18.2): owner and two counts, 16 B on hosts and 12 B on the board. No allocator
-header is needed with per-actor size classes.
-
-| Node (fields) | Today, arena | Counted, hosted, 16-byte classes | Counted, hosted, 8-byte classes | Counted, board, 4-byte classes |
-| --- | --- | --- | --- | --- |
-| wbt_map (5) | 40 | 64 (+60%) | 56 (+40%) | 52 (+30%) |
-| wbt_set (4) | 32 | 48 (+50%) | 48 (+50%) | 44 (+38%) |
-| tree_binary (4) | 32 | 48 (+50%) | 48 (+50%) | 44 (+38%) |
-| tree_rose (6) | 48 | 64 (+33%) | 64 (+33%) | 60 (+25%) |
-| skew_ral (3) | 24 | 48 (+100%) | 40 (+67%) | 36 (+50%) |
-| brodal_okasaki (4) | 32 | 48 (+50%) | 48 (+50%) | 44 (+38%) |
-| graph_dense vertex (2) | 16 | 32 (+100%) | 32 (+100%) | 28 (+75%) |
-
-The node sizes come from the `alloc_rec` shapes, at one 8-byte word per field (boxed layout). The overhead is 25–100%
-per *live* node, against 100% loss of every *dead* node under (a). A single plain count word (8 B), the design before
-Lee's biased-counting decision, would have cost 17–100%; the extra 4–8 B buy safe cross-actor sharing without copying.
-The board's 4-byte classes are possible because Xtensa needs only 4-byte alignment for its 32-bit accesses; the
-emitter's 8-byte fields are two words there.
-
-**Per chunk** (B-tree-style nodes of 8–32 entries) amortizes the count word to 1–3%. It costs a hand rewrite of
-`wbt_map`/`wbt_set` into B-trees, and it costs more bytes copied per update. At 16 entries and n = 10⁶, an update copies
-about 5 levels × ~300 B ≈ 1.5 KB, against 20 × 40 B = 800 B for the binary tree. It does not apply to the heaps, the
-skew lists or the trees.
-
-**Recommendation: per node**, with a per-actor size-class allocator, so that most node allocations are a free-list pop
-and the board needs no allocator header.
-
-### 17.3 Count maintenance
-
-| Operation | Count work under (b) | Today under (a) |
-| --- | --- | --- |
-| path-copying change, binary node, depth d (the change borrows its input, §3.14) | d new path nodes; one increment per copied level for the untouched sibling it shares (≈ d), plus ≤ 2 per rebalancing rotation | d bump allocations |
-| the old version dropped afterwards (the threading case: `r <- insert(m, …)`, then `m` is no longer used) | the old path's d nodes reach zero: d frees and d decrements of their siblings, which undo the increments above | nothing freed |
-| the same, when the old path's nodes have count 1 and the old version's last use is the change | *reuse*: the change rewrites the old path in place, which no one can observe; no allocation, no count change (an optimization of stage 6 or later, §17.6) | — |
-| a no-op change | nothing: the change returns `:unchanged` (§3.14) | nothing |
-| lookup, `size`, fold (queries) | none: queries borrow (§3.14) | none |
-| Brodal–Okasaki `meld` | O(1): the new root takes both heaps' trees, so 2–4 increments. The same-arena test (`canonical_arena_same`, 4 sites; the `compatible` result) becomes unnecessary: any two heaps of one specialization meld. | O(1), only within one arena |
-| skew-list `cons` / `tail` | O(1): 1–2 increments | O(1) |
-| bulk build of n nodes | n allocations, each created with count 1 by its parent; no increments | n bump allocations |
-| graphs on `graph_wbt_core` (a map of sets) | as maps; the outer node's release drops the inner set's root, because the item type holds a counted handle (§17.5) | — |
-| CSR and dense snapshots (`buf`-backed, built once) | one counted region per snapshot buffer, one count | — |
-| dropping a whole structure of n uniquely held nodes | n frees, by a release that walks children (depth ≤ tree height; the last child is a loop, not a call, so a degenerate chain cannot exhaust the stack) | nothing |
-
-An update therefore does O(log n) count work, the same order as the path copy it accompanies.
-
-### 17.4 Across actors
-
-- **Messages move, and shared nodes use biased counting** (Q6, decided 2026-10-09; §18.2). Every move is O(1) and copies
-  no node. A node's owner changes its owner count with plain instructions; any other actor changes the node's shared
-  count atomically. The single-actor case, which is nearly all count traffic, stays non-atomic. Only nodes reachable
-  from more than one actor pay atomics, and only from the non-owner's side.
-- **Board.** An actor runs on one core at a time, and `migrate_actor` hands it over at the dispatch boundary under the
-  scheduler lock. The lock's barrier publishes its plain owner counts, and it stays the owner on the new core. Two
-  actors on different cores that share nodes meet only on those nodes' shared words (`S32C1I`).
-- **H1.** This also retires H1: each actor allocates from its own size classes, and no arena is shared, except the
-  immortal one with its atomic bump.
-- **Rejected:** a single atomic count on every node. It would put an atomic operation under every structural share,
-  including the single-actor case.
-
-### 17.5 How it fits the linearity rule
-
-Under (b), §3.1 gains a second class next to the linear one:
-
-| Class | Members | On a second use | At scope end |
-| --- | --- | --- | --- |
-| **linear** | owned regions, `device_window`, aggregates embedding them | E2301 | `drop_owned` (release) |
-| **counted** | structure versions: records holding a `counted(L, S)` handle (Q1), `ref`/`ref?` of a counted lifetime, and every record, tuple and list that embeds one | E2301, unless the earlier use was a borrow: a change or a query (§3.14) | `drop_owned` (decrement; release at zero) |
-
-A version is a linear handle that changes and queries borrow (Lee's rules, §3.14). A new version comes only from a
-change, and the change makes the only increments: one per borrowed subtree it shares into its result. This is precise
-counting, as in Koka's Perceus, but without Perceus's implicit `dup` on reuse: a reuse that is not a borrow is E2301.
-(Variants considered earlier: **b2**, implicit `dup` at every non-final use, and **b1**, an explicit `share`. Both are
-superseded by Lee's rule and by Q12's decision.)
-
-What the checker enforces and places:
-
-- **Borrows.** Prim operands, as in §3.2, and the version parameters of changes and queries. Whether a parameter is
-  borrowed or consumed is inferred from the body and recorded in the function's `.iface` entry. Callers then place no
-  count operation around a call that borrows. All ten traits' methods are queries (§1.4), so trait calls cost no count
-  work.
-- **`dup`.** A kind-6 prim `dup_counted`, lowered inline as §18.2's owner test: immortal → nothing; mine → plain
-  increment of `biased`; otherwise → atomic increment of `shared`. It is placed **only** where a function stores a
-  reference it borrowed (read out of a borrowed version or node) into a node it allocates (`alloc_rec`) or a version
-  handle it returns. Anywhere else, storing a borrowed reference is E2320.
-- **`drop_owned` on a counted type.** Lowered as `silica_rt_counted_release(ptr, release_fn)`, which runs §18.2's
-  drop protocol. `release_fn` is generated per node shape: it decrements every counted slot (the `ref?` positions, and
-  counted handles inside the item type), frees the cell, and continues with the last child as a loop. Generic modules
-  are specialized per instantiation (`trait_specialization@specialize_program`), so the item type, and with it the
-  release function, is known statically. This needs verifying for the module-level generics (`ItemType`/`KeyType`)
-  during stage 6.
-- **Records and tuples embedding counted handles** have no count word of their own (boxed layout, immutable). They move
-  as a whole. Dropping one drops each counted field, statically from the type.
-- **Lists of counted values.** 28 stdlib modules keep `List[(…, ref?(L, normal, rec))]` inside nodes: skew-list forests,
-  Brodal–Okasaki children, dense-graph rows. List chunks already carry a claim word for copy-on-write prepend. Under (b)
-  a list whose element type is counted also counts its chunks: sharing a suffix, which only a change does, increments
-  the chunk, and dropping a list decrements it and, at zero, drops its elements and the next chunk. This is runtime work
-  in the four list runtimes (`rt_list.S` and the hosted `prims_list`). It saves hand-rewriting those 28 modules, and it
-  narrows E2307 to *linear* list elements.
-- **Mutation.** The two `write_ref` sites (`wbt_map:6855`, `wbt_set:4261`, cursor cells) write cells the cursor just
-  allocated. The checker accepts `write_ref` on a counted cell only for a cell bound in the same function from its
-  `alloc_rec` (E2319 *WriteToSharedCell* otherwise), so a shared node is never mutated.
-- **Container reads of versions.** A query that returns a version stored inside another structure (a graph's inner
-  adjacency set from `get`) would hand out a second handle to the stored version: E2320 by the rule above. Q13 asks how
-  such reads are to look.
-- **Item payloads.** Boxed item values (strings, records stored as keys or values) live in the actor heap, not in the
-  node. Releasing a node does not free them. Reclamation is precise for nodes; payloads follow the actor heap's rules
-  (hosted: at actor end; board: per block). With scalar keys and values, the board's usual case, nodes are everything.
-
-### 17.6 Run-time cost against (a)
-
-Estimates, to be replaced by measurements (plan below). d = path depth.
-
-| Operation | (a) arena | (b) counted | Expected ratio (b)/(a) |
-| --- | --- | --- | --- |
-| insert, old version dropped after (threading) | d bump allocations + compares | d size-class allocations + ≈ d increments + d decrements + d frees + compares | 1.3–2× (allocation work 3–4×; compares dominate for string keys) |
-| the same with in-place reuse when the change is the old version's last use (§17.3) | — | in place: no allocation, no free, no counts | 0.6–1× |
-| lookup / contains / size | traversal | traversal (borrowed) | 1× |
-| update keeping the old version | d bump allocations | d allocations + ≈ d increments | 1.2–1.5× |
-| dropping a version | free of cost, frees nothing | O(nodes only it holds) | — (this is the point) |
-| meld (Brodal–Okasaki) | O(1), same arena only | O(1) + 2–4 increments, any two heaps | ≈1× |
-| bulk build | n bump allocations | n size-class allocations | 1.2–1.5× |
-| memory, long-running updates | grows ≈ 480 B per update (1,000 keys) | bounded by the live versions × 1.25–2 | the board runs indefinitely |
-
-**Measurement plan**, as trials under `ordered_data_structures` with timing on hosts and `get_actor_memory_usage` plus
-the heap's free total on the board:
-
-| Benchmark | What it measures |
-| --- | --- |
-| `bench_wbt_insert_thread_1m` | insert 10⁶ int64 keys, threading |
-| `bench_wbt_insert_keep_every_1000` | the same, keeping every 1,000th version |
-| `bench_wbt_lookup_1m` | 10⁶ lookups |
-| `bench_bo_meld_100k` | 10⁵ melds of small heaps |
-| `bench_skew_cons_tail_1m` | 10⁶ cons/tail on skew lists |
-| `bench_graph_wbt_edges_100k` | 10⁵ edge insertions in a wbt-backed graph |
-| `board_map_update_forever` (board) | a 1,000-key map updated 100,000 times; heap free total must stay flat |
-
-Run each under (a) and (b) on all three hosts and the board, before stage 6 is accepted.
-
-### 17.7 Migration impact
-
-| Part | (a) arena design | (b)/(c) counted |
-| --- | --- | --- |
-| 2,239 record types, 53 modules | type spelling by script (`arena(L, S)`) | type spelling by script (`counted(L, S)`); same script |
-| 34 `(region, ref?)` allocator tuples, 127 `x.region` lets | script | script (the handle stays the allocation authority for `alloc_rec`) |
-| 11 constructor sites (`canonical_arena_lookup`) | unchanged | hand: obtain the counted authority (`counted_space(normal)`), and add the immortal constructor variant under (c) |
-| meld compatibility (`canonical_arena_same`, 4 sites; `compatible` results) | unchanged | hand: always compatible within a specialization; keep the result field for API stability |
-| 28 modules with lists of refs | unchanged | unchanged, provided list chunks count (§17.5); otherwise hand rewrites |
-| 2 `write_ref` cursor sites | unchanged | hand review against E2319 |
-| validators comparing region identity | unchanged | hand review |
-| all ten traits | script (inline types in `impl fn` bodies) | script; trait calls are queries and so borrows |
-| compiler's 25 modules | script, after publication | script, after publication; constructors choose counted or immortal (c) by measurement |
-| compiler work (Fable) | type constructor only | type constructor; `dup` placement and borrow inference in the region checker; generated release functions; size-class per-actor allocator; counted list chunks; immortal sentinel; four emitters and four runtimes |
-| trials | none change | none change under b2; benchmarks added |
-
-The stdlib's source changes almost entirely by script under either option. The difference is compiler and runtime work,
-and it is large under (b).
-
-### 17.8 The hybrid
-
-(c) is (b) with one addition: a cell whose count word holds the immortal sentinel is never counted or freed. `dup` and
-`drop` test for it first, which is one compare and branch.
-
-- Each family gets a second constructor, for example `wbt_map@empty_immortal(…)` beside `wbt_map@empty(…)`. Every
-  version derived from an immortal one allocates its new nodes immortal. The types are the same, so all functions and
-  traits serve both, with no second copy of any module.
-- The programmer sees one choice at construction: counted (memory comes back as versions go out of use) or immortal
-  (never comes back, slightly faster, for batch programs that end soon).
-- Choosing by memory space instead was considered and rejected: `Space` means cache and device policy (§4.4.2), and
-  overloading it would hide a lifetime decision in a cache attribute.
-- The sentinel also makes the migration safe. Stage 2 can introduce the `counted` type with **every** cell immortal,
-  which is exactly today's behaviour, so the fixed points cannot move. The real counting is then switched on per
-  constructor in stage 6.
-
-### 17.9 Recommendation
-
-**(c), the hybrid, with counted as the default:**
-- per-node counted regions;
-- precise counts whose increments only changes make (§3.14, §17.5), with inferred borrows for queries;
-- non-atomic counts within an actor, with messages moved and shared nodes under biased counting (Q6, decided; §18.2);
-- counted list chunks;
-- an immortal constructor per family for batch use.
-
-It answers the concern exactly: memory returns when the last version that can reach it goes. It keeps immutable nodes, O(1) moves and
-O(1) meld, and it drops the same-arena restriction. It needs no garbage collector and stays deterministic. The trees
-and heaps are acyclic, so counting cannot leak through cycles. Graphs keep their cycles in vertex ids, not in
-references, so they are acyclic too. The stdlib source changes mostly by script, apart from about 20 hand sites and the hand part of §3.14's
-change-result reshaping (§13 stage 6d).
-
-The costs:
-- a large piece of compiler and runtime work (stage 6, §13);
-- an estimated 1.3–2× on update-heavy code until in-place reuse lands;
-- 25–100% more bytes per live node.
-
-The interim fix for H1 (stage 0's atomic arena bump) stays: immortal and pre-stage-6 nodes still come from a shared
-arena.
+**Chosen by Lee, 2026-10-22: Q2 (a), the never-freed family arena with the atomic bump of stage 0, handle `arena(L, S)`
+(Q1 a).** Counted storage (b, c) is not part of this plan. Its design (per-node counts, biased counting across actors,
+a per-actor size-class allocator, counted list chunks, benchmarks and migration estimates) was in revisions 1.1 to 1.8 of
+this document and was removed in 1.9; version control holds it if the project is reopened. What stays true:
+- structures never reclaim memory until a later project, and the figures above are the cost;
+- H1's atomic arena bump is permanent, not interim;
+- H4 needs its targeted stage 0 fix;
+- moves of structure versions are handle passes (§18).
 
 ## 18. Messages move: what a move means (Q6, decided)
 
-**Lee's decision, 2026-10-09:** when a message carries a data structure, it is a **move**, not a copy. The specification
+**Lee's decision, 2026-10-09:** when a message carries a data structure, it is a **move**, not a copy. Since Q2 (a) (2026-10-22) a structure version is a copyable arena handle, so the move applies to owned regions and a version handle is passed by value. The specification
 conflict S1 resolves toward §12.1.6.
 
 ### 18.1 The rule at the language level
@@ -1254,14 +982,14 @@ A value given to any actor-boundary operand is **moved**:
 - a behaviour's reply and its new state;
 - a `spawn` initial state.
 
-For the classes of §3.1 and §17.5 this means:
+For the classes of §3.1 this means:
 
 | Class of the value | After the send |
 | --- | --- |
 | linear (owned region, `device_window`, aggregates embedding them) | E2301 on any later use (already §3.8) |
-| counted (structure versions, and records, tuples and lists embedding them) | **E2301** on any later use. The checker never places an implicit `dup` across an actor boundary; within one actor a reuse would be a `dup` (§17.5), but a send is always a final use. |
-| immortal versions (hybrid) | E2301, the same rule: the language does not distinguish them |
-| plain values (scalars, atoms, strings, actor references, records/tuples/lists of those) | usable. They are immutable, so a move and a copy cannot be told apart. The runtime copies them into the receiver, which closes H4. |
+| structure versions (`arena(L, S)` handles, and records, tuples and lists holding them) | usable. A handle is a copyable word over immutable, never-freed nodes; the receiver gets a copy of it and the sender keeps its own. |
+| plain values (scalars, atoms, strings, actor references, records/tuples/lists of those) | usable. They are immutable, so a move and a copy cannot be told apart. The runtime copies them into the receiver; the copy out of the replier's arena is the targeted stage 0 fix for H4. |
+
 
 **No use after a send (Lee, 2026-10-22).** It is a compile error, **E2301**, for the sender to do any work with a region
 after it has been sent. "Work" is any use: read, write, pass to a call, return, store in state, send again. The rule
@@ -1275,207 +1003,62 @@ actor-boundary operand of this section, not only `cast`, `send` and `call`: a **
 The lifetime of a moved owned region after it arrives, and how a receiver keeps data past the dispatch, are in §18.7
 (Lee, 2026-10-22): the regions are dispatch-scoped, and keeping anything is explicit.
 
-**Only a change makes a version (Lee, 2026-10-09; §3.14).** A send, a reply, a spawn state and a new state each move
-the one version they are given; none of them creates another, and the runtime never duplicates a version on the way.
-A change borrows its input and returns either `:unchanged` or a new version (§3.14), so every version has exactly one
-handle, wherever it is.
-
-**Keep one version, give away another (Q12, decided by Lee, 2026-10-09: no `share` builtin).** One version cannot be
-both kept in an actor's state and given away: put in the new state *and* returned as the reply, or put in the new state
-*and* sent to another actor. Either is **E2303**, and there is no builtin to get around it. Two different versions are
-different. Keep v1 in the state and reply with, or send, v2 from a change of v1: they share every node off v2's changed
-path, and biased counting (§18.2) counts those nodes on both sides without copying any of them.
+**Versions (Q2 a, 2026-10-22).** A send, a reply, a spawn state and a new state pass a version's handle by value. Only a
+change makes a version (§3.14). Keeping a version in the state and also replying with it or sending it is legal, so E2303 does
+not apply to versions (Q12 is withdrawn); it applies to owned regions, whose second use would be a second owner:
 
 ```silica
-fn beh(msg: int64, state: { root: ref?(L, normal, rec), …, region: counted(L, normal), … })
+fn beh(msg: int64, state: { root: ref?(L, normal, rec), …, region: arena(L, normal), … })
     -> (:reply, :unchanged | (:inserted, { … }) | (:replaced, { … }),
-                { root: ref?(L, normal, rec), …, region: counted(L, normal), … }) {
+                { root: ref?(L, normal, rec), …, region: arena(L, normal), … }) {
     sequence proc[mem(normal)]
-        r: :unchanged | (:inserted, { … }) | (:replaced, { … }) <- wbt_map@insert(state, msg, 0);   // borrows state
+        r: :unchanged | (:inserted, { … }) | (:replaced, { … }) <- wbt_map@insert(state, msg, 0);
     produces
-        pure (:reply, r, state)          // legal: reply with the change result (v2 or :unchanged), keep v1 = state
+        pure (:reply, r, state)          // legal: reply with the change result, keep v1 = state
     end
 }
 ```
 
 ```silica
-    produces
-        pure (:reply, state, state)      // E2303: one version in both the reply and the new state
-    end
+        pure (:reply, state, state)      // legal for a version handle; E2303 if `state` held an owned region
 ```
 
-```silica
-        _: atom <- cast(peer, state);
-    produces
-        pure (:no_reply, state)          // E2303: one version sent and kept in the new state
-    end
-```
 
-In the first example `state` is borrowed by `insert` and then moved into the new state. The increments are `insert`'s
-own, one for each subtree it shares into v2. If the key was already present with the same value, `r` is `:unchanged`
-and the caller receives that atom; no version was made, so nothing is shared.
+### 18.2 Shared nodes under a move
 
-### 18.2 Shared nodes under a move: biased counting (decided)
+Nodes of a structure version live in a never-freed arena and are immutable, so any number of actors may hold versions
+that share nodes. There is nothing to count and nothing to free: no owner, no merge at actor end, no crash cleanup of
+references. The only shared mutable state is the arena's bump pointer and insert table, which stage 0 makes atomic (H1).
 
-**Lee's decision, 2026-10-09: biased counting.**
+### 18.3 Arena versions under a move
 
-The premise: these are functional data structures. Nodes are immutable, and only a change copies nodes, just the
-replaced path. Moving a version to another actor is a handle transfer that never copies an unchanged node. Sharing is
-always safe for reads, so the only shared mutable state is the count.
+A move of a version is a **handle pass, O(1)**, like every move. Two actors on different cores may derive versions from
+one lineage concurrently; both allocate from the family arena with the atomic bump.
 
-The hard case: the sender keeps v1 and moves v2, a change of v1. Every node off v2's changed path is then reachable from
-two actors. The same happens more mildly when a receiver changes a moved version whose nodes the sender created.
-
-Biased counting splits each node's count in two, so that the common case stays plain:
-
-- **Owner count** (*biased*): changed only by the node's owner (the actor that created it), with plain loads and
-  stores.
-- **Shared count**: changed by any other actor, with atomic read-modify-writes.
-- **Freeing**: a node is freed when both reach zero.
-
-This is biased reference counting (Choi, Shull and Torrellas, 2018), biased to an **actor** rather than a thread, which
-is sound because an actor never runs on two threads or cores at once.
-
-**Node header.** It precedes the node's fields; the counts live in separate words so that the owner's plain stores
-never share a word with another core's atomic updates.
-
-| Field | Hosts (AArch64, x86-64) | Board (Xtensa LX7, 32-bit) | Meaning |
-| --- | --- | --- | --- |
-| `owner` | 8 B: the owner's ACB address | 4 B: the owner's ACB address | compared with the current actor; ignored once `merged` is set |
-| `biased` | 4 B, `uint32` | 4 B, `uint32` | the owner's count; plain access, owner only |
-| `shared` | 4 B, `int32` with two flag bits: `merged` and `queued` | 4 B, the same | everyone else's count; atomic (`LDADDAL`/`CASAL`, `LOCK XADD`/`LOCK CMPXCHG`, `S32C1I` loop); it may go negative |
-| total | **16 B** | **12 B** | |
-
-The immortal sentinel is `owner` = 0 with `merged` set: `dup` and `drop` test it first and do nothing.
-
-**The protocol.** "Me" is the current actor, whose ACB address is already at hand (thread-local on hosts, `THREADPTR`
-block on the board).
-
-| Event | Action |
-| --- | --- |
-| `dup` (increment) | if immortal: nothing. Else if `owner` = me and not `merged`: `biased += 1` (plain). Otherwise: atomic `shared += 1`. |
-| `drop` by the owner | `biased -= 1` (plain). On reaching 0: atomically set `merged` and read `shared`. If `shared` = 0, the owner frees the node. Otherwise the node is now **shared-only**: whoever later takes `shared` to 0 frees it. |
-| `drop` by a non-owner | atomic `shared -= 1`, and look at the result. If `merged` and the result is 0, this actor frees the node. If not `merged` and the result is negative with `queued` clear, set `queued` (in the same CAS) and push the node onto the owner's **count queue**. |
-| owner processes its count queue | for each queued node: atomically set `merged` (clearing `queued`) and add `biased` into `shared`. If the sum is 0 the owner frees the node; otherwise it stays shared-only. |
-| move of a version | nothing. One reference changes hands, and its count does not change. If the receiver later drops it, `shared` goes to −1 and the node is queued to its owner, whose merge finds `biased` 1 + `shared` −1 = 0 and frees it. |
-| non-owner path copy over owner nodes | the new path nodes are the copier's own. Each untouched child it now references gets a `dup`: atomic `shared += 1` when the child belongs to someone else. |
-| reads, traversal, queries | no count operations (borrows, §17.5) |
-| a no-op change (§3.14) | nothing: the change returns `:unchanged` and makes no reference, so no count changes, whoever owns the nodes |
-
-A negative `shared` count is why the queue exists. When the owner's own count is still positive, a non-owner may give up
-the last *shared* reference first. Neither side alone knows the node is dead, so the non-owner hands the node to the
-only actor allowed to read `biased` without racing.
-
-**When the owner sees its queue.** The count queue is a per-actor lock-free list: one atomic push by non-owners. The owner
-drains it:
-- at every dispatch boundary;
-- **without** running its behaviour when it is idle: a push to an idle owner's empty queue makes it runnable for a
-  count-only dispatch, the way system messages are delivered;
-- at actor end (below).
-
-So an idle owner cannot hold memory hostage.
-
-**Who frees, and where the memory goes.**
-- The actor that takes the last count to zero runs the node's release function: it frees the node and drops the
-  children it referenced, each with that actor's own owner test.
-- A block freed by a non-owner goes onto its slab's atomic remote-free list (as in mimalloc). The slab's owner reclaims
-  it on its next allocation miss.
-
-**Owner ending or restarting: the nodes become shared-only.** At actor end (normal, crash, `remove_actor`, supervisor
-shutdown), before its ACB is recycled, the runtime:
-1. drops the actor's state, and the frames' pending drops on a crash (below);
-2. drains its count queue;
-3. walks its slabs' live blocks and, for every node it owns, merges as the queue step does: set `merged`, add `biased`
-   into `shared`, free at 0;
-4. hands its slabs to the shared page pool as **abandoned** slabs, reclaimed when empty.
-
-After that every surviving node is shared-only, and any actor may free it when `shared` reaches 0.
-
-Making nodes shared-only was chosen over handing ownership to another actor, for three reasons:
-- there is no natural heir: the nodes may be referenced by several actors, or by none that is related to the owner;
-- a hand-off would have to rewrite `owner` while other actors read it;
-- the ACB address can then be recycled safely, because a `merged` node never looks at `owner` again.
-
-A restarted actor is a new actor with a new ACB and identity, so it owns none of its predecessor's nodes and reaches
-them through the shared count.
-
-**A crash must drop the dispatch's live references**, or a single crash would pin, through stuck counts, every node its
-locals reached: usually the whole state structure. The emitter therefore records cleanup maps:
-- at call sites;
-- at Silica's own failure sites: bounds, invalid size, division, explicit abort.
-
-The fault path unwinds the dispatch's frames through the existing frame table (SFT) and runs each frame's pending
-drops before step 1. Only these sites need maps, because safe Silica code faults only there.
-
-**Both board cores and `migrate_actor`.** Ownership belongs to the actor, not to the core or carrier thread.
-- An actor migrated to the other core keeps its identity and its ACB, so it remains the owner. Its plain `biased`
-  writes are published by the scheduler lock's barrier at the dispatch boundary where `migrate_actor` takes effect, and
-  on its new core it keeps using plain instructions.
-- Two actors on different cores that share nodes use the atomic `shared` word (`S32C1I`) on those nodes only.
-- The hosted carriers of chunk 2 change nothing: the owner test compares the actor, not the thread.
-
-**Immortal versions.**
-- Immortal nodes carry no counts. `dup` and `drop` skip them, and they are never freed, so any number of actors may
-  hold them.
-- A counted node may reference an immortal one.
-- An immortal node that references a counted node (an immortal map whose items are counted sets) keeps that node alive
-  forever: a leak, but safe. Its count is still maintained correctly by whichever actors touch it, owner plain and others
-  atomic. So the earlier "contagious immortality" walk is unnecessary and is dropped.
-
-**Costs.**
-
-| Case | Cost per `dup`/`drop` |
-| --- | --- |
-| the node is mine (the single-actor case) | one load of `owner`, one compare, a plain add or subtract on `biased`: non-atomic, as §17.4 requires |
-| the node is someone else's, or shared-only | one atomic read-modify-write on `shared`: ~20–40 cycles uncontended on Apple cores, more when two cores touch the line; an `S32C1I` loop on the board |
-| a move | O(1): no walk, no copy, no count change |
-| a receiver that keeps updating a moved structure | atomics on the sender-owned nodes it references, falling away as its own path copies replace the hot paths |
-| an owner's merge (`biased` reaching 0 while shared, or a queued node) | one atomic flag set and add per node, once |
-| actor end | O(live nodes the actor owns), once |
-
-**The options that were not chosen:**
-
-| | Option | Why not |
-| --- | --- | --- |
-| a | the checker forbids a send while another version may share | sound only conservatively, and that rejects "reply with a change of the state, keep the state" |
-| b | **transfer the unique part, copy the shared part** | **rejected: it copies unchanged nodes**, against the premise that only a change copies, and only the replaced path |
-| c | atomic counts on every node reachable from two actors, with a marking walk | biased counting gets the same safety with no walk, and keeps the owner's own nodes non-atomic |
-| d | a may-share flag on version handles | it existed to make moves O(1); with biased counting every move is O(1), so the flag is not needed |
-| e | owner-applied counts with queued deltas (ORCA-style) | a message per remote increment; the atomic `shared` word is simpler and needs the queue only when `shared` goes negative |
-| f | make the shared part immortal on send | it leaks the shared history and walks it |
-
-### 18.3 Immortal versions under a move
-
-A move of an immortal version is **O(1)**, like every move. A version derived from an immortal one allocates its new
-nodes immortal, from the shared arena with stage 0's atomic bump. Their interaction with counted nodes is in §18.2.
 
 ### 18.4 Calls, replies, state, spawn and supervised restart
 
 | Operand | Semantics | Checker |
 | --- | --- | --- |
-| `cast(a, m)`, `send(a, m)` | `m` moved to the receiver at submission: O(1) for an unshared version; §18.2 otherwise | later use of `m` (or of a counted or linear part of it) is E2301 |
+| `cast(a, m)`, `send(a, m)` | `m` moved to the receiver at submission, O(1); version handles in it are passed by value | later use of a linear part of `m` is E2301 |
 | `call(a, m)` argument | as `cast` | as `cast` |
-| `call` reply `(:reply, r, s)` | `r` moved from the callee to the caller, by the same transfer; the caller's binding owns it | a callee that replies with a version and keeps the same version in `s` is E2303, with no escape hatch (Q12); reply with a version derived from the state instead (§18.1) |
-| behaviour new state `s` | stays in the actor: no transfer, no walk | the state's linear and counted parts must each end in exactly one of reply, new state, a send, or a drop |
-| `spawn(st, beh, policy)` | `st` moved to the new actor at spawn: O(1) for an unshared version; §18.2 otherwise | later use is E2301 (replaces `"moved_region"`) |
+| `call` reply `(:reply, r, s)` | `r` moved from the callee to the caller, by the same transfer; the caller's binding owns it | an owned region in both `r` and `s` is E2303; a version handle may be in both |
+| behaviour new state `s` | stays in the actor: no transfer, no walk | the state's linear parts must each end in exactly one of reply, new state, a send, or a drop |
+| `spawn(st, beh, policy)` | `st` moved to the new actor at spawn, O(1) | later use of a linear part is E2301 (replaces `"moved_region"`) |
 | owned regions in a `cast`/`send`/`call` message or a reply | moved on send (O(1) handle transfer); **dispatch-scoped** in the receiver: dropped at behaviour return unless moved into the new state, or the needed part is rebuilt with `copy_to`. Failure paths (dead receiver, timed-out call, dead caller, crashed receiver with queued messages) release the region in the runtime. All in §18.7 | E2301 for the sender's later use; `drop_owned` placed at behaviour return; lifetime error for a message ref stored into state without `copy_to` |
-| supervised child spec initial state | **may not hold a structure version** (E2308, extended; Q14, re-evaluated under option A). The supervisor's row keeps the initial state to restart the child, so every start would need its own version, and a restart is not a change; moving the row's version into the child leaves nothing for the next restart, and sharing the handle is E2303's keep-and-give-away. A child that needs a structure builds it in its first dispatch, or receives it by message. | E2308 for an owned region (as before) and for a structure version, or any value holding one, in a child spec's initial state. The `init` code that builds the spec moves its values into the spec, and later use is E2301. |
-
-One alternative is rejected regardless of §18.2: making the initial state immortal at registration. Each supervisor
-restart re-runs `init` and builds new specs, so immortal states would leak once per cycle, the per-cycle growth the
-board's budget plan measures (its §13).
+| supervised child spec initial state | an owned region may not be in it (E2308): the supervisor's row keeps the initial state to restart the child, which would duplicate the owner. A structure version may (Q14, open, recommended yes): the row keeps the arena handle and every restart reuses it. | E2308 for an owned region. The `init` code that builds the spec moves its owned values into the spec, and later use is E2301. |
 
 ### 18.5 Specification text to change (not edited here)
 
 | Section | Change |
 | --- | --- |
-| §16.3.5 "Isolation: Message contents are copied between actors" | "Message contents are moved: the sender may not use a moved value afterwards (E2301). Immutable plain values are indistinguishable from copies; data structures and owned regions change owner." |
-| §12.1.6 | extend from regions to data structures: versions and the aggregates that hold them move on `call`, `cast`, `send` and reply; nodes shared with a version the sender keeps are counted by biased counting and never copied; this is invisible except in cost |
-| §12.1.5, §15.1.1 "Region handles in initial state" | the same for structures in a spawn initial state |
-| §15.4 child specs (`initial_state` in rows, §15.4.12) | a supervised child's initial state may contain neither owned regions nor structure versions (E2308) |
+| §16.3.5 "Isolation: Message contents are copied between actors" | "Message contents are moved: the sender may not use a moved value afterwards (E2301). Immutable plain values are indistinguishable from copies; owned regions change owner; structure versions are arena handles passed by value." |
+| §12.1.6 | extend from regions to data structures: a version handle is copied on `call`, `cast`, `send` and reply, and the nodes it reaches are shared, immutable and never freed; owned regions move |
+| §12.1.5, §15.1.1 "Region handles in initial state" | owned regions in a spawn initial state move; structure version handles are copied |
+| §15.4 child specs (`initial_state` in rows, §15.4.12) | a supervised child's initial state may not contain an owned region (E2308) |
 | §16.3.5 "Immutability" | unchanged; add that a moved message is owned by the receiver from submission |
-| §15.1.1 "State Semantics" and §12.1.6 replies | one version may not be both kept in the new state and given away as the reply or in a message (E2303); a version derived from the state may be |
-| common_contract.md §6–§7 | a change borrows its input version and returns `:unchanged` or a tagged new version (§6's "a no-op may return the identical root" and its flags give way to the result sums of §3.14); a version moved to another actor is the receiver's; old versions kept by the sender stay valid for the sender |
+| §15.1.1 "State Semantics" and §12.1.6 replies | one owned region may not be both kept in the new state and given away as the reply or in a message (E2303); a structure version handle may |
+| common_contract.md §6–§7 | a change borrows its input version and returns `:unchanged` or a tagged new version (§6's "a no-op may return the identical root" and its flags give way to the result sums of §3.14); a version sent to another actor is a copy of the handle, and both actors may keep using it |
 
 ### 18.6 Trials for moves
 
@@ -1483,28 +1066,19 @@ board's budget plan measures (its §13).
 
 | Code | Case |
 | --- | --- |
-| E2301 | version used after `cast`; after `call` argument; after `send`; after `spawn` state; record holding a version used after `cast`; list of versions used after `cast`; version sent in one `case` arm, used after the `case`; immortal version used after `cast` |
-| E2303 | keep-and-reply: `(:reply, state, state)`; keep-and-send: `cast(peer, state)` then `(:no_reply, state)`; keep-and-send through `call`'s argument; keep-and-reply with a record holding the version; `cast(a, (m, m))` |
+| E2303 | an owned region kept in the new state and also replied; kept and sent through `cast`; kept and sent through `call`'s argument; kept and replied inside a record; `cast(a, (r, r))` |
 | E2301 (no use after a send, §18.1, **not written**) | `send_then_use_bare_region`; `send_then_use_region_in_record`; `send_then_use_region_in_tuple`; `send_then_use_region_in_list_element`; `send_then_use_region_in_structure_version`; `send_then_use_via_field_read` (a field read from the aggregate after the send); `send_then_use_via_name_alias` and `send_then_use_via_handle_copy` (a copy of the handle); `send_then_use_region_in_closure`; `send_then_use_in_later_case_branch` (sent in one arm or before the `case`, used in a later branch); `send_then_use_in_loop` and `send_then_use_in_recursion` (sent in an iteration, used in the next, or by the recursive call). Each is repeated for `cast`, `send`, `call`, a reply and a spawn state, and for each of read, write, pass to a call, return, store in state and send again |
-| E2308 | child spec whose initial state holds an owned region; one whose initial state holds a structure version |
+| E2308 | child spec whose initial state holds an owned region |
 
 **Run trials:**
 
 | Trial | Shows |
 | --- | --- |
-| `move_unique_version_o1` | a 10⁶-node map threaded then cast: the transfer does no walk and copies no node (time and the allocator's counters); the receiver inserts and validates |
-| `move_shared_version_both_evolve` | the sender keeps v1 and casts v2, a change of v1: both actors then change and validate their versions for 10⁴ rounds; no corruption; the allocator's counters show no node copied by any move, only the replaced paths of changes |
-| `shared_drop_sender_first` / `shared_drop_receiver_first` | v1 kept by the sender, v2 moved to the receiver; both dropped, in each order; every node freed exactly once (heap returns to its baseline; no double free); the receiver-first order exercises the negative shared count and the owner's queue |
-| `shared_owner_ends_first` | the sender (owner) is removed while the receiver holds v2; the receiver keeps updating and finally drops it; heap returns to baseline; nodes became shared-only at the owner's end |
-| `shared_owner_crashes_with_locals` | the owner faults (division) mid-dispatch holding a derived version in a local, 1,000 times under a supervisor; heap flat (crash cleanup maps) |
-| `shared_idle_owner_reclaims` | the receiver drops the last reference while the owner is idle; the owner's count-only dispatch frees the nodes without a message to its behaviour |
-| `move_reply_version` | `call` returning a version built in the callee; the caller keeps it after the callee ends (H4 for structures) |
-| `move_two_versions_reply_and_keep` | a server keeps v1 in its state and replies with the result of `insert(v1, …)` on every call, 10⁴ calls (some of them no-ops, replied as `:unchanged`); the caller and the server both validate their versions; no node copied by any move; heap returns to baseline when both let go |
-| `move_map_of_sets` | a `graph_wbt` adjacency moved; inner sets shared with the sender's kept copy |
-| `move_immortal_version` | immortal map moved: O(1); the receiver derives versions; an immortal map holding counted sets keeps them alive and counts stay correct on both sides |
-| `supervised_child_builds_state_per_start` | a child that builds a 1,000-entry map in its first dispatch crashes and restarts 1,000 times; heap growth flat (the crashed instance's versions are released) |
-| `move_two_cores` (board) | sender and receiver pinned to different cores, moving and updating versions derived from one lineage for 10⁵ rounds; validate both; heap returns to baseline |
-| `owner_migrates_between_cores` (board) | the owner is moved by `migrate_actor` to the other core while a receiver on the first core holds shared nodes; both keep updating and dropping; the owner stays the owner (plain counts on its nodes), heap returns to baseline |
+| `move_reply_version` | `call` returning a version built in the callee; the caller keeps using it after the callee ends (H4 for structures; the targeted stage 0 fix) |
+| `move_map_of_sets` | a `graph_wbt` adjacency version sent; the receiver and the sender both query it |
+| `supervised_child_restarts_with_version` | a child whose initial state holds a map version crashes and restarts 1,000 times (Q14 a); every start sees the same contents |
+| `reply_and_keep_same_version` | a server keeps v1 in its state and replies with the same handle on every call, 10⁴ calls; the caller and the server both validate it |
+| `move_two_cores` (board) | sender and receiver pinned to different cores, each deriving versions from one lineage for 10⁵ rounds with the atomic bump; validate both |
 | `message_region_released_at_dispatch_end` | **not written** (§18.7; write-every-page, the SD-7 shape). A receiver is cast 100,000 messages, each holding an owned region of several pages, and writes every page; it keeps nothing. RSS stays flat. Fails today (SD-7). |
 | `message_region_moved_into_state_not_dropped` | **not written** (§18.7). The behaviour moves the message's whole region into the new state; no `drop_owned` is placed on that path, the region is read intact by the next dispatch, and it is released once, at the actor's end. |
 | `copy_to_rebuilds_in_state_region` | **not written** (§18.7). The behaviour copies a part of the message value into the state region with `copy_to`; the message region is dropped at return, the copy is intact in the next dispatch, its type carries the state's lifetime, and a 100,000-message run keeps RSS bounded by the state. |
@@ -1551,8 +1125,7 @@ for it. A sender that wants to keep data calls `copy_to` before sending (a visib
 | Class of the message part | Send | Keep past the dispatch |
 | --- | --- | --- |
 | owned region, or an aggregate embedding one | move | move the whole into the state, or `copy_to` a part |
-| immortal arena structure version (Q2 a, or the hybrid's immortal constructors) | handle pass (a move in the language, §18.3) | store the handle |
-| counted structure version (Q2 b or c) | move (§18.1, §18.2) | move it into the state |
+| arena structure version (Q2 a) | handle pass by value (§18.3) | store the handle |
 | plain scalars, atoms, strings | copy (§18.1) | already a copy |
 
 **5. Partial move.** A message such as `{ r: region, root: ref? }` moves as a unit; the receiver binds `r` and `root`
@@ -1563,9 +1136,9 @@ record or tuple parameter is a partial move.** It consumes that field; the other
 is new to §3.4 (§3.4 states only the whole-aggregate case) and has to be added there when stage 3 implements it.
 
 **6. Cross-core receivers.** The receiving carrier or core must be able to free the region's blocks: on the hosts
-they come back by the remote-free lists of stage 6a (per-actor size-class allocator), or by the plain region destroy
-when the region is a whole `alloc_region` block chain; the receiver's drop does not require the sender's thread. The
-board heap is not checked by this section (it is one heap under the scheduler lock, §7.3).
+the receiver's drop is the plain region destroy of a whole `alloc_region` block chain and does not require the sender's
+thread. The board heap is not checked by this section (it is one heap under the scheduler lock, §7.3).
+
 
 **7. Failure paths.** The design had not covered the following. All of them belong to stage 4 (§13, §16 item 10) and
 have trials in §18.6.
@@ -1578,7 +1151,7 @@ have trials in §18.6.
 - **(ii) Failed send.** A `cast`, `send` or `call` to a dead actor returns `actor_not_found`. The sender cannot use the
   moved region (E2301 is static and cannot know the send failed), so **the runtime releases the region on the failed
   send**. The alternative, keeping ownership with the sender on failure, would contradict the static moved rule: the
-  checker would have to treat the region as both moved and not moved. Recorded as an open choice in Q17.
+  checker would have to treat the region as both moved and not moved. Q17 is decided (a), 2026-10-22.
 - **(iii) A timed-out call.** Under `call_with_timeout` (chunk 11, not started) the late reply is discarded; its
   regions must be released at that point. The trial is blocked on chunk 11.
 - **(iv) The caller dies awaiting a reply.** The reply's regions are dropped when the reply is delivered to a dead
@@ -1590,8 +1163,8 @@ have trials in §18.6.
 
 **8. What this changes in the plan.**
 
-- Biased counting (§18.2) is needed only if counted storage (Q2 b or c) is chosen; for owned regions and for the
-  immortal arena (Q2 a) there is no count.
+- There is no counting of any kind: Q2 (a) was decided on 2026-10-22 and structure versions are arena handles.
+
 - It **closes H4 for plain values** (they are copied, §18.1) and **SD-22 and SD-7 for owned regions** (dropped at
   dispatch end). SD-22 is H2's stage-0 fix plus the drop; SD-7 needs this section and stage 4.
 - Stage 2 (owned versus structure kind) is still needed: the rule applies to owned regions, not to structure handles.
@@ -1640,7 +1213,7 @@ whose value must outlive the frame that made it:
 On a long-lived actor these grow without bound even when the copy is dead at once (an argument a callee only
 reads) or when the structure holding it later drops it. Lee decided (2026-10-12) not to patch these case by
 case in the emitters: reclaiming them needs to know when the last reference is gone, which is this chunk's
-ownership model (biased counting, messages move, versions only by a change). The chunk-4 implementation
+ownership model (ownership of owned regions, messages move, versions only by a change). The chunk-4 implementation
 must cover every case above, with a zero-growth trial for each (the zero_heap_growth_* trials in
 actors_addition and the *_frees_heap trials in stack_budget_board_addition are the pattern).
 
@@ -1648,6 +1221,8 @@ actors_addition and the *_frees_heap trials in stack_budget_board_addition are t
 
 | Version | Date | Changes |
 | --- | --- | --- |
+| 1.9 | 2026-10-22 | Pruned the counted-storage text that Q2 (a) made contradictory. Removed: the counted class of structure versions (§3.1, §3.8, §3.13, §3.14) and its rules; the counted row of §7.1; error codes **E2319** *WriteToSharedCell* and **E2320** *VersionAliased* (the block is now E2300 to E2318; the numbers are not reused), and their trial rows in §14.1; the version-borrow/consume table, `dup` placement and count increments of §3.14 (the version rules that still hold, and the result shapes, are kept for arena handles); stage 6 of §13 (there is no stage 6; 7 and 8 keep their numbers) and §16 items 14 to 17 (old 18 to 21 are now 14 to 17); §17 reduced to the measurements, the options considered and the choice (old §17.1 to §17.9 removed); §18.2 (biased counting: header, owner test, count queue, merge at actor end, crash cleanup maps, cores) and §18.3's immortal versions, replaced by two short paragraphs; the counted and immortal rows of §18.1; the counted-version trials of §14.2 and §18.6; the stage-6a text of §18.7 item 6. Decided on the way: E2303 stays for owned regions only, because an arena handle is copyable and a second use of a version is not a second owner; Q12 is withdrawn as moot; Q6 is narrowed to owned regions; Q13 and Q14 stay open but are rewritten for arena handles (recommend: return the handle; allow a version in a child spec); E2308 now covers owned regions only. The stdlib change-result reshaping of §3.14 and the trials that need it are no longer carried by any stage. References to revisions 1.1 to 1.8 above use the old §16 numbering and the removed sections. |
+| 1.8 | 2026-10-22 | Lee's decisions of 2026-10-22: Q2 (a), the never-freed family arena with the atomic bump, so counted storage and stage 6 (items 14 to 17 of §16) are dropped, may be reopened later; Q1 (a) spelled `arena(L, S)`; Q5 (a) per-actor owner list; Q15 (a) compiler builtin `copy_to(region, value)`; Q16 (a) a received region may move into the state; Q17 (a) the runtime releases the region on a failed send. §0, §13 (stages 2, 4, 6 and the dependency paragraph), §15, §16 (items 6, 14 to 17), §17 and §17.9, §18.7 updated; H4 now needs the targeted stage 0 fix, biased counting is not needed. Still open: Q3, Q4, Q7 to Q11, Q13, Q14. |
 | 1.7 | 2026-10-22 | Lee's approach for messages that carry regions: moved on send, dispatch-scoped in the receiver (dropped at behaviour return unless moved into the new state), kept past the dispatch only by moving the whole region into the state or by a compiler-derived `copy_to`. New §18.7, with the failure paths the design had not covered (mailbox drain at actor end, failed send, timed-out call, dead caller, worker dying with the only copy); §18.1, §18.4 cross references; ten trials in §18.6, not written; stage 4 (§13) and item 10 and 11 (§16) extended; new open questions Q15 to Q17. Closes SD-7, SD-22 and H4's owned-region case without later reclamation; biased counting is needed only for counted storage (Q2 b or c). |
 | 1.6 | 2026-10-09 | Lee chose option A, replacing 1.5's "every change consumes its input" (the coordinator's wording, not Lee's): changes borrow their input, so old versions stay valid and persistence is observable; a no-op change returns `:unchanged`, not a version; result sums per family replace today's flags (§3.14). Restored: Q12's two-version reply pattern, the persistence trials and the 149 reuse sites, §17.3/§17.6 costs, §18.2's hard case and drop-order trials. Re-evaluated: supervised child specs still may not hold a version (new Q14), and Q13 (inner versions) under A. Trials, stage 6d, item 16 and the spec-change list updated. |
 | 1.5 | 2026-10-09 | Lee's version rules: only a change makes a version (no aliasing, no implicit duplication), and every change consumes its input; a no-op change returns the same version with no count change, no check and no failure (this replaced, the same day, a proposal to fail no-op changes with `(:explicit, :no_op_change)`, which was withdrawn with its static E2321 and query-first requirement). New §3.14 with the stdlib no-op inventory (≈ 69 return sites, 23 modules); E2320 *VersionAliased*; supervised child specs may not hold versions (E2308 extended); §17.3/§17.5/§17.6, §18.1 (examples), §18.2 (where cross-actor counting arises; no-op row), Q12, Q13 (container reads), §13 stage 6d, the trials and the spec-change list updated. Consequence recorded: old versions are not kept, so the Q12 "keep v1, reply v2" pattern and 149 trial reuse sites are no longer legal. |

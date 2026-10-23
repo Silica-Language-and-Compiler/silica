@@ -4,13 +4,13 @@ This document describes what remains to be done to make Silica's region-based me
 
 **Implementation status (2026-10-22, from the 2026-10-16 survey).** The design (§0) withdrew the premise that the 1,152 standard-library records with a region field become linear: they hold only never-freed family arenas, and linearity applies to owned regions (`alloc_region`) and aggregates embedding them.
 
-**Next development set (Lee, 2026-10-22; not started).** Chunk 4 work is ordered by what Project BEES needs: item 0 ports, runs and fixes the four BEES defect repros (SD-7, SD-20, SD-21, SD-22); then H1 (atomic canonical-arena bump and insert), H3 (let-bound aggregate passed by name), H4 (reply or state dangling after the replying actor ends), H5 (hosted arena grow failure and the missing null check in `emit_alloc_region`), stage 8 / Q9 (failures reach the supervisor instead of aborting), and S-15 (region release inside a living actor, stages 2 to 5 with the §18 move machinery). Items 1 to 5 need no open decision; S-15 depends on Q1, Q2 and Q5. Messages that carry regions are planned by design §18.7 (2026-10-22): moved on send, dispatch-scoped in the receiver, kept only by moving the whole region into the state or by an explicit `copy_to`, with release on the failure paths (failed send, mailbox drain at actor end, dead or timed-out caller). Full list: the "Next development set: region safety for Project BEES" section of [participate.md](../../../docs/participate.md).
+**Next development set (Lee, 2026-10-22; not started).** Chunk 4 work is ordered by what Project BEES needs: item 0 ports, runs and fixes the four BEES defect repros (SD-7, SD-20, SD-21, SD-22); then H1 (atomic canonical-arena bump and insert), H3 (let-bound aggregate passed by name), H4 (reply or state dangling after the replying actor ends), H5 (hosted arena grow failure and the missing null check in `emit_alloc_region`), stage 8 / Q9 (failures reach the supervisor instead of aborting), and S-15 (region release inside a living actor, stages 2 to 5 with the §18 move machinery). Items 1 to 5 need no open decision; S-15 rests on Q1, Q2 and Q5, decided by Lee on 2026-10-22: Q2 (a) the never-freed family arena (counted storage removed from the plan, so there is no stage 6; H4 therefore needs its targeted stage 0 fix), Q1 (a) the handle `arena(L, S)`, Q5 (a) per-actor owner lists. Q15 (a) `copy_to` builtin, Q16 (a) move a received region into state, Q17 (a) release on failed send are decided too; Q3, Q4, Q7 to Q11, Q13, Q14 remain open. Messages that carry regions are planned by design §18.7 (2026-10-22): moved on send, dispatch-scoped in the receiver, kept only by moving the whole region into the state or by an explicit `copy_to`, with release on the failure paths (failed send, mailbox drain at actor end, dead or timed-out caller). Full list: the "Next development set: region safety for Project BEES" section of [participate.md](../../../docs/participate.md).
 
 **Earlier status (2026-10-16).** The plan below is the 2025-2026 gap list. The chunk-4 design
 ([region_memory_safety_design.md](../region_memory_safety_design.md), ROADMAP chunk 4) supersedes it for everything
 not yet built: static lifetime analysis beyond Phase A (§2.1), region isolation (§2.3), ownership-based release and
 the use-after-free hazards (§2.4), and atomic references (§2.5) are all still open, and none of the design's
-error codes (E2300 to E2320) or `drop` nodes exists in the compiler. One item is done: buffer bounds checking
+error codes (E2300 to E2318) or `drop` nodes exists in the compiler. One item is done: buffer bounds checking
 (§2.2), emitted on all four targets since 2026-09-19. File paths below are relative to `compiler/src`, and the
 emitter files exist once per target, as `emitter/<target>/terms/prims/prims_memory.silica`.
 
@@ -194,15 +194,14 @@ against the tree beyond the 2026-10-16 survey recorded in its status paragraph).
 |-------|---------|-------|
 | 0 | Silent hazards H1 to H10 (design §1.3): atomic arena bump, `cast`/`send`/`spawn` as moving prims, let-bound aggregate promotion, null checks | no decision |
 | 1 | Lifetime polymorphism (per-call substitution, E2311); covers the Phase B/C part of §2.1 | Q10 (spelling) |
-| 2 | Structure handle type, every cell immortal | Q1, Q2 |
+| 2 | Structure handle type `arena(L, S)`, no cell ever freed | Q1, Q2 (decided 2026-10-22) |
 | 3 | Region checker, report-only (isolation §2.3 and linearity for owned regions) | stage 2 |
-| 4 | `drop` nodes and runtime owner lists (use-after-free, §2.4) | Q5 |
-| 5 | Errors on (E2300 to E2320) | Q3, Q4, Q11 |
-| 6 | Counted structure storage; messages move across actors, biased counting (design §17, §18) | Q2 (b or c); Q6 and Q12 are decided |
+| 4 | `drop` nodes and runtime owner lists (use-after-free, §2.4) | Q5 (decided 2026-10-22) |
+| 5 | Errors on (E2300 to E2318) | Q3, Q4, Q11 |
 | 7 | Atomics (§2.5): builtins, lowering, shared atomic regions | Q7, Q8 |
 | 8 | Bounds outcome (actor failure, not process abort) and static checks against N (§2.2, "Not done") | Q9 |
 
-Stages 0, 1 and 8 need no open decision. Hosted carriers (ROADMAP item N) are the execution model; owner lists belong to
+Stages 0, 1 and 8 need no open decision. There is no stage 6 (the counted-storage stage was removed, Q2 a, 2026-10-22). Hosted carriers (ROADMAP item N) are the execution model; owner lists belong to
 the actor, so they do not change this order.
 
 ---
