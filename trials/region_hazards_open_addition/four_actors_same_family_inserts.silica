@@ -1,0 +1,187 @@
+// four_actors_same_family_inserts  (OPEN: staged in region_hazards_open_addition, see README.md)
+//
+// Hazard H1 (region_memory_safety_design.md §1.3, fix §9.4, stage 0 in §13; §14.2 names the
+// two-actor form two_actors_same_family_inserts, widened here to four actors to raise the odds of a
+// collision): every wbt_map takes its node arena from canonical_arena_lookup(1), one process-global
+// arena per structure family, and alloc_rec bumps it with a plain load / add / store (and grows it
+// with an unlocked L_region_grow). Four actors, spawned pinned to cores 0..3 so that they run on
+// four carrier threads at once, each build their OWN wbt_map[int64, int64] of 20,000 keys
+// (key k -> id * 1000000 + k), then check it: validate is valid with 20,000 entries and every key
+// reads back its own value. Each sends its count of wrong entries to a collector actor, which
+// prints the totals after the fourth and ends main's wait_for_exit with cast_exit(0).
+// The race: two threads that load the same bump pointer before either stores it get the SAME cell;
+// the later alloc_rec's write wins and the other actor's node now holds the wrong key, value or
+// child links. Two threads growing the arena at once can also both chain a block and lose one.
+// Pass vs fail: a pass prints "actors: 4" and "wrong entries: 0" and exits 0. A fail prints a
+// nonzero wrong-entries count, or a failure report (a worker faulted following a corrupted link:
+// the reporter prints "failure report" and ends the program with status 70), or hangs (a cycle).
+// Not deterministic: the hazard needs two bumps to interleave inside a few instructions, so a run
+// can pass by luck. README.md has the failure rate measured over 20 runs on the Mac. A pass of
+// many runs is the evidence after the fix (atomic bump and CAS arena insert, §9.4), not one run.
+// No .ascomp: today's assembly is the defective codegen.
+
+use wbt_map;
+
+fn cmp_i64(a: int64, b: int64) -> :less | :equal | :greater {
+    case a < b of { true -> :less; false -> case a == b of { true -> :equal; false -> :greater } }
+}
+
+fn key_count() -> int64 {
+    20000
+}
+
+fn fill(
+    m: {
+        root: ref?(L, normal, rec),
+        compare_key: fn(int64, int64) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    id: int64,
+    k: int64
+) -> {
+    root: ref?(L, normal, rec),
+    compare_key: fn(int64, int64) -> :less | :equal | :greater,
+    compare_value: fn(int64, int64) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64,
+    compare_key_ordering_bundle: int64,
+    compare_value_ordering_bundle: int64
+} {
+    case k == key_count() of {
+        true -> m;
+        false -> {
+            r: {
+                map: {
+                    root: ref?(L, normal, rec),
+                    compare_key: fn(int64, int64) -> :less | :equal | :greater,
+                    compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                    region: region(L, normal),
+                    specialization_key: int64,
+                    compare_key_ordering_bundle: int64,
+                    compare_value_ordering_bundle: int64
+                },
+                inserted: boolean,
+                replaced: boolean
+            } <- wbt_map@insert(m, k, id * 1000000 + k);
+            fill(r.map, id, k + 1)
+        }
+    }
+}
+
+// Counts the keys 0 .. key_count()-1 that do not read back id * 1000000 + k.
+fn wrong_from(
+    m: {
+        root: ref?(L, normal, rec),
+        compare_key: fn(int64, int64) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    id: int64,
+    k: int64,
+    acc: int64
+) -> int64 {
+    case k == key_count() of {
+        true -> acc;
+        false -> {
+            g: { status: :not_found | :found, value: int64 } <- wbt_map@get(m, k, -1);
+            ok: boolean <- case g.status of { :found -> g.value == id * 1000000 + k; :not_found -> false };
+            wrong_from(m, id, k + 1, case ok of { true -> acc; false -> acc + 1 })
+        }
+    }
+}
+
+fn builder(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        e: {
+            root: ref?(L, normal, rec),
+            compare_key: fn(int64, int64) -> :less | :equal | :greater,
+            compare_value: fn(int64, int64) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64,
+            compare_key_ordering_bundle: int64,
+            compare_value_ordering_bundle: int64
+        } <- wbt_map@empty({ compare_key: cmp_i64, compare_value: cmp_i64 });
+        m: {
+            root: ref?(L, normal, rec),
+            compare_key: fn(int64, int64) -> :less | :equal | :greater,
+            compare_value: fn(int64, int64) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64,
+            compare_key_ordering_bundle: int64,
+            compare_value_ordering_bundle: int64
+        } <- fill(e, msg, 0);
+        v: { valid: boolean, error: atom, logical_count: int64 } <- wbt_map@validate(m);
+        shape_bad: int64 <- case v.valid and v.logical_count == key_count() of { true -> 0; false -> 1 };
+        wrong: int64 <- wrong_from(m, msg, 0, shape_bad);
+        _: boolean <- cast_registered(:collector, wrong impl ActorMessage {})
+    produces pure (:no_reply, state) end
+}
+
+// state = finished * 1000000000 + total wrong entries
+fn collector(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        next: int64 <- state + 1000000000 + msg;
+        finished: int64 <- next / 1000000000;
+        _: boolean <- case finished == 4 of {
+            true -> {
+                print("actors: ");
+                _: atom <- print_int64(finished);
+                println("");
+                print("wrong entries: ");
+                _: atom <- print_int64(next - finished * 1000000000);
+                println("");
+                cast_exit(0)
+            };
+            false -> true
+        }
+    produces pure (:no_reply, next) end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: actor_ref <- spawn_registered(0, collector, :collector, stack_policy(0, :keep_last_message));
+        a: actor_ref <- spawn(0, builder, stack_policy(0, :keep_last_message), 0);
+        b: actor_ref <- spawn(0, builder, stack_policy(0, :keep_last_message), 1);
+        c: actor_ref <- spawn(0, builder, stack_policy(0, :keep_last_message), 2);
+        d: actor_ref <- spawn(0, builder, stack_policy(0, :keep_last_message), 3);
+        _: boolean <- cast(a, 1 impl ActorMessage {});
+        _: boolean <- cast(b, 2 impl ActorMessage {});
+        _: boolean <- cast(c, 3 impl ActorMessage {});
+        _: boolean <- cast(d, 4 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces pure code end
+}
+
+// FailureReporter (E2236: registered before any spawn). A worker that faults on a corrupted node
+// ends the program here, with status 70, so a failing run does not wait for a collector that
+// never reaches four.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println("failure report");
+        _: atom <- println_stderr(report);
+        _: boolean <- cast_exit(70)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

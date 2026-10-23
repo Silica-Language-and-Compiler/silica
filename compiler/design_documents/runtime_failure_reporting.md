@@ -27,9 +27,11 @@ runs on macOS, Linux (AArch64 or x86-64) or bare metal on the ESP32-S3.
 | Fatal fault: a synchronous CPU exception the program cannot survive (§15.4.4 gate fails, a fault outside any actor, including exhausting `main`'s stack, a fault in trusted runtime code) | `[silica] fault at 0x<pc>` + ` in <symbol>+0x<offset>` where available + `  addr=0x<fault address>` + `  actor=0x..  sbase=0x..  ssize=0x..` on targets with actors | **70** |
 | Runtime abort: a runtime check the program cannot continue from, a resource the runtime cannot obtain (memory to commit for a growing actor stack, §15.4.10.2), a containment failure not raised by hardware | `[silica] abort: <reason> at 0x<pc>` + ` in <symbol>+0x<offset>` where available | **71** |
 | Language-level failure in `main` (`case_clause`, `badarith`) | the atom name | 1 |
-| Actor failure (a fault or stack exhaustion inside an actor that the runtime recovers, every exit reason of §15.4.11) | none: delivered through supervision (§15.4.4, §15.4.10) | not a process exit |
+| Actor failure (a fault or stack exhaustion inside an actor that the runtime recovers, every exit reason of §15.4.11, including the runtime checks of §4 that fail inside an actor, below) | none: delivered through supervision (§15.4.4, §15.4.10) | not a process exit |
 
 What the rules mean in practice:
+
+- **Main versus actor (Lee, 2026-10-22 and 2026-10-23).** The runtime checks `L_buf_bounds`, `L_buf_invalid`, the list-index check and the region allocation failure (`L_region_overflow`, the hosted arena grow failure and the raw allocation failure of design H5) are runtime aborts (status 71) only when `main` runs them. Inside an actor they end the actor, which the supervisor handles like any other failure (§7), with the exit reasons `(:explicit, :buf_bounds)`, `(:explicit, :buf_invalid)`, `(:explicit, :list_index)` and `(:explicit, :region_alloc_failed)`. The access or allocation is never performed. The abort reasons of the §4 tables are what `main` prints; the design is [region_memory_safety_design.md](region_memory_safety_design.md) §8 (Q9). Status 2026-10-23: implemented on the Mac, mirrors unbuilt.
 
 - **Nothing ends a Silica process through C `abort()` (SIGABRT, status 134) or a default signal action
   (status 139).** Every call to `abort()` the runtime and the emitted code used to make is now a runtime
@@ -237,6 +239,8 @@ to stderr. The report line is before the marker, so it is part of the `.sout`, a
 is.
 
 ## 4. The sites
+
+The abort reasons in the first three tables below are printed when `main` runs the check. Inside an actor the buffer-bounds, invalid-size, list-index and region-allocation sites end the actor instead (`(:explicit, :buf_bounds)`, `(:explicit, :buf_invalid)`, `(:explicit, :list_index)`, `(:explicit, :region_alloc_failed)`; section 1; Lee, 2026-10-23).
 
 Emitted code (host emitters `terms/prims/prims_memory.silica`, `terms/prims/prims_list.silica`; the ESP32
 emitter's `prims_memory.silica`):

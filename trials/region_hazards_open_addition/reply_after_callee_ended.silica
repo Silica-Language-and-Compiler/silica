@@ -1,0 +1,97 @@
+// reply_after_callee_ended  (OPEN: staged in region_hazards_open_addition, see README.md)
+//
+// Hazard H4 (region_memory_safety_design.md §1.3; named in §14.2; the "targeted stage 0 fix for
+// H4" of §13's closing paragraph): on hosted targets an actor's reply lives in the REPLYING
+// actor's arena (behaviour_result_move_asm copies the record shell there), and
+// _silica_rt_actor_dealloc_region munmaps that whole arena when the actor ends. A caller that
+// keeps a composite reply from an actor that has since ended reads freed memory.
+// main calls replier r once and keeps the reply, the record { a: 7, b: 14, c: 21 }. It then removes
+// r and waits until r's end has been reported (the reporter's countdown ends main's
+// wait_for_exit with cast_exit(0)), so r's arena is gone before main looks at the reply. Then a
+// second replier q is called 64 times (its arena is mapped next and can land on r's old
+// addresses), and only then main prints the three fields of r's reply, and q's last reply as the
+// control.
+// Pass vs fail: a pass prints 7, 14, 21 (r's reply, intact) and 70, 140, 210 (q's 64th reply)
+// with exit 0. A fail is a fault (status 70; the reply's page was unmapped), or numbers other than
+// 7, 14, 21 (the page was mapped again for q and holds q's data). Which of the two depends on
+// whether the address was reused, so a failing run is not always the same failure; README.md has
+// what the Mac shows today.
+// Expected output (compared as a multiset: the report and the root-exit note are asynchronous):
+//   failure report: other                         r ends through remove_actor (reason :normal)
+//   [silica] root actor exited (no supervisor)    r had no supervisor
+//   7 / 14 / 21                                   r's reply, read after r ended
+//   70 / 140 / 210                                q's 64th reply, read while q is alive
+//   0                                             exit status
+
+fn replier(msg: int64, state: int64) -> (:reply, { a: int64, b: int64, c: int64 }, int64) {
+    (:reply, { a: msg, b: msg * 2, c: msg * 3 }, state + 1)
+}
+
+fn call_n(q: actor_ref, n: int64) -> { a: int64, b: int64, c: int64 } {
+    sequence proc[concurrency]
+        rep: { a: int64, b: int64, c: int64 } <- call(q, 70 impl ActorMessage {});
+        out: { a: int64, b: int64, c: int64 } <- case n == 1 of { true -> rep; false -> call_n(q, n - 1) }
+    produces pure out end
+}
+
+fn show(rep: { a: int64, b: int64, c: int64 }) -> int64 {
+    sequence proc[device_io]
+        _: atom <- print_int64(rep.a);
+        println("");
+        _: atom <- print_int64(rep.b);
+        println("");
+        _: atom <- print_int64(rep.c);
+        println("")
+    produces pure 0 end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- start_reporter(1);
+        r: actor_ref <- spawn(0, replier, stack_policy(0, :keep_last_message));
+        kept: { a: int64, b: int64, c: int64 } <- call(r, 7 impl ActorMessage {});
+        _: atom <- remove_actor(r);
+        _: int64 <- wait_for_exit();
+        q: actor_ref <- spawn(0, replier, stack_policy(0, :keep_last_message));
+        last: { a: int64, b: int64, c: int64 } <- call_n(q, 64);
+        _: int64 <- show(kept);
+        _: int64 <- show(last)
+    produces
+        pure 0
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// One line per report; the state counts down from the number of reports main waits for, and the
+// last one ends main's wait_for_exit() with cast_exit(0) (the identity_restart pattern).
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        print(report_kind(report));
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces
+        pure (:no_reply, left)
+    end
+}
+
+fn report_kind(report: string) -> string {
+    case contains(report, "reason_tag:      4") of {
+        true -> "failure report: reason_tag 4\n";
+        false -> "failure report: other\n"
+    }
+}
+
+fn start_reporter(expected: int64) -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

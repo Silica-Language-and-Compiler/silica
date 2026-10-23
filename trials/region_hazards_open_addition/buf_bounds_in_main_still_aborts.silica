@@ -1,0 +1,106 @@
+// buf_bounds_in_main_still_aborts  (staged with the Q9 trials in region_hazards_open_addition; PASSES today)
+//
+// Q9 / stage 8 guard (region_memory_safety_design.md §8 and §15 Q9 (a): "in main it stays runtime
+// abort 71"): when the out-of-bounds index is in main itself, the process still ends with the
+// runtime abort "[silica] abort: buffer index out of bounds at <PTR>" and status 71, even while a
+// supervisor and its worker are alive. This is the part of the Q9 change that must NOT change:
+// a fix that routes every L_buf_bounds through actor failure would make main's fault an actor
+// failure of nothing (no current actor), or let main run on.
+// The program: the buf_bounds_ends_actor supervisor and worker are started and the worker answers
+// call(3) with 105; then main stores at index 4 of its own 4-element buffer.
+// Pass vs fail: a pass prints 105, the abort line and 71; "main continued" must never print.
+// Today: passes (the abort is process-wide everywhere). It stays a pass after the Q9 fix.
+// Expected output (compared as a multiset; the abort line is folded to <PTR>):
+//   105
+//   [silica] abort: buffer index out of bounds at <PTR>
+//   71
+
+use Supervisor;
+
+impl BufBoundsInMainSup for Supervisor;
+
+fn store_at(index: int64) -> int64 {
+    sequence proc[mem(normal)]
+        L1: lifetime <- fresh_lifetime();
+        r: region(L1, normal) <- alloc_region(normal);
+        buf: buf(L1, normal, int64, 4) <- alloc_buf(r, 4);
+        _: atom <- write_buf(buf, index, 5);
+        value: int64 <- read_buf(buf, index)
+    produces
+        pure value
+    end
+}
+
+fn worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, store_at(msg) + state, state + 1)
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 3600 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :bm_worker, agent_type: :worker, initial_state: initial_state, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- start_reporter(1);
+        _: supervisor_ref <- spawn_registered_supervisor(BufBoundsInMainSup, 100, :bm_sup, stack_policy(0, :keep_last_message));
+        r1: int64 <- call_registered(:bm_worker, 3 impl ActorMessage {});
+        print_int64(r1);
+        println("");
+        v: int64 <- store_at(4);
+        println("main continued");
+        print_int64(v);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// One line per report, naming the failed behaviour; the state counts down from the number of
+// reports main waits for, and the last ends main's wait_for_exit() with cast_exit(0).
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        print(report_kind(report));
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces
+        pure (:no_reply, left)
+    end
+}
+
+fn report_who(report: string) -> string {
+    case contains(report, "_worker\n") of {
+        true -> "worker";
+        false -> case contains(report, "_crasher\n") of { true -> "crasher"; false -> "other" }
+    }
+}
+
+fn report_kind(report: string) -> string {
+    case contains(report, "reason_tag:      4") of {
+        true -> concat(concat("failure report: ", report_who(report)), " reason_tag 4\n");
+        false -> concat(concat("failure report: ", report_who(report)), " other reason\n")
+    }
+}
+
+fn start_reporter(expected: int64) -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

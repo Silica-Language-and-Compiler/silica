@@ -4,7 +4,9 @@ This document describes what remains to be done to make Silica's region-based me
 
 **Implementation status (2026-10-22, from the 2026-10-16 survey).** The design (§0) withdrew the premise that the 1,152 standard-library records with a region field become linear: they hold only never-freed family arenas, and linearity applies to owned regions (`alloc_region`) and aggregates embedding them.
 
-**Next development set (Lee, 2026-10-22; not started).** Chunk 4 work is ordered by what Project BEES needs: item 0 ports, runs and fixes the four BEES defect repros (SD-7, SD-20, SD-21, SD-22); then H1 (atomic canonical-arena bump and insert), H3 (let-bound aggregate passed by name), H4 (reply or state dangling after the replying actor ends), H5 (hosted arena grow failure and the missing null check in `emit_alloc_region`), stage 8 / Q9 (failures reach the supervisor instead of aborting), and S-15 (region release inside a living actor, stages 2 to 5 with the §18 move machinery). Items 1 to 5 need no open decision; S-15 rests on Q1, Q2 and Q5, decided by Lee on 2026-10-22: Q2 (a) the never-freed family arena (counted storage removed from the plan, so there is no stage 6; H4 therefore needs its targeted stage 0 fix), Q1 (a) the handle `arena(L, S)`, Q5 (a) per-actor owner lists. Q15 (a) `copy_to` builtin, Q16 (a) move a received region into state, Q17 (a) release on failed send are decided too; Q3, Q4, Q7 to Q11, Q13, Q14 remain open. Messages that carry regions are planned by design §18.7 (2026-10-22): moved on send, dispatch-scoped in the receiver, kept only by moving the whole region into the state or by an explicit `copy_to`, with release on the failure paths (failed send, mailbox drain at actor end, dead or timed-out caller). Full list: the "Next development set: region safety for Project BEES" section of [participate.md](../../../docs/participate.md).
+**Status 2026-10-23.** Lee decided Q9 (a): inside an actor an out-of-bounds buffer index, an invalid buffer size and a list-index failure terminate the actor with `(:explicit, :buf_bounds)`, `(:explicit, :buf_invalid)`, `(:explicit, :list_index)`; only in `main` do they stay runtime abort 71. H5 (hosted region growth and raw allocation failure) likewise ends the actor with `(:explicit, :region_alloc_failed)` (Lee, 2026-10-22). H1, H3, H4, H5 and stage 8 are implemented on the Mac; the Linux and ESP32-S3 mirrors are written but unbuilt (staged hazard trials in `trials/region_hazards_open_addition`). E2313 and E2314 are registered; the `|bounds:N` metadata was removed.
+
+**Next development set (Lee, 2026-10-22; not started at that date).** Chunk 4 work is ordered by what Project BEES needs: item 0 ports, runs and fixes the four BEES defect repros (SD-7, SD-20, SD-21, SD-22); then H1 (atomic canonical-arena bump and insert), H3 (let-bound aggregate passed by name), H4 (reply or state dangling after the replying actor ends), H5 (hosted arena grow failure and the missing null check in `emit_alloc_region`), stage 8 / Q9 (failures reach the supervisor instead of aborting), and S-15 (region release inside a living actor, stages 2 to 5 with the §18 move machinery). Items 1 to 5 need no open decision; S-15 rests on Q1, Q2 and Q5, decided by Lee on 2026-10-22: Q2 (a) the never-freed family arena (counted storage removed from the plan, so there is no stage 6; H4 therefore needs its targeted stage 0 fix), Q1 (a) the handle `arena(L, S)`, Q5 (a) per-actor owner lists. Q15 (a) `copy_to` builtin, Q16 (a) move a received region into state, Q17 (a) release on failed send are decided too; Q3, Q4, Q7 to Q11, Q13, Q14 remain open. Messages that carry regions are planned by design §18.7 (2026-10-22): moved on send, dispatch-scoped in the receiver, kept only by moving the whole region into the state or by an explicit `copy_to`, with release on the failure paths (failed send, mailbox drain at actor end, dead or timed-out caller). Full list: the "Next development set: region safety for Project BEES" section of [participate.md](../../../docs/participate.md).
 
 **Earlier status (2026-10-16).** The plan below is the 2025-2026 gap list. The chunk-4 design
 ([region_memory_safety_design.md](../region_memory_safety_design.md), ROADMAP chunk 4) supersedes it for everything
@@ -106,7 +108,7 @@ Terminology: [memory region vs arena](#terminology-memory-region-vs-arena) (abov
 
 **As built**: `alloc_buf` stores the element count in the word below element 0 and rejects a negative count or a byte-size overflow (`L_buf_invalid`, runtime abort `invalid buffer size`). Every `buf_store` and `buf_load` compares the index against that count (`emit_buf_bounds_check` in `prims_memory.silica`: `LDR X17, [X1, #-8]; CMP X2, X17; B.HS L_buf_bounds`) and branches to `L_buf_bounds`, which ends the process with the runtime abort `buffer index out of bounds`, status 71 ([runtime_failure_reporting.md](../runtime_failure_reporting.md) §4). Trials: `memory_region_addition/buf_write_out_of_bounds_aborts` and `buf_read_out_of_bounds_aborts`.
 
-**Not done**: the check uses the run-time count, not the `N` of `buf(R, Space, T, N)`, so the size passed to `alloc_buf` is never compared with `N` (design §1.1). The spec says an out-of-bounds access is a trap; the process-wide abort, even inside an actor, against "crash to the supervisor" is open decision Q9 in the design (§1.5, S5).
+**Not done**: the check uses the run-time count, not the `N` of `buf(R, Space, T, N)`, so the size passed to `alloc_buf` is never compared with `N` (design §1.1). The spec says an out-of-bounds access is a trap; the process-wide abort, even inside an actor, against "crash to the supervisor" was decision Q9 in the design (§1.5, S5), **decided by Lee, 2026-10-23: (a), the actor ends (`:buf_bounds`, `:buf_invalid`, `:list_index`), abort 71 only in `main`**. The `|bounds:N` metadata was removed; the run-time check stays for every index.
 
 ---
 
@@ -192,14 +194,14 @@ against the tree beyond the 2026-10-16 survey recorded in its status paragraph).
 
 | Stage | Content | Needs |
 |-------|---------|-------|
-| 0 | Silent hazards H1 to H10 (design §1.3): atomic arena bump, `cast`/`send`/`spawn` as moving prims, let-bound aggregate promotion, null checks | no decision |
+| 0 | Silent hazards H1 to H10 (design §1.3): atomic arena bump, `cast`/`send`/`spawn` as moving prims, let-bound aggregate promotion, null checks (H5: the actor ends with `(:explicit, :region_alloc_failed)`, abort 71 in `main`). H1, H3, H4, H5 implemented on the Mac 2026-10-23, mirrors unbuilt | no decision |
 | 1 | Lifetime polymorphism (per-call substitution, E2311); covers the Phase B/C part of §2.1 | Q10 (spelling) |
 | 2 | Structure handle type `arena(L, S)`, no cell ever freed | Q1, Q2 (decided 2026-10-22) |
 | 3 | Region checker, report-only (isolation §2.3 and linearity for owned regions) | stage 2 |
 | 4 | `drop` nodes and runtime owner lists (use-after-free, §2.4) | Q5 (decided 2026-10-22) |
 | 5 | Errors on (E2300 to E2318) | Q3, Q4, Q11 |
 | 7 | Atomics (§2.5): builtins, lowering, shared atomic regions | Q7, Q8 |
-| 8 | Bounds outcome (actor failure, not process abort) and static checks against N (§2.2, "Not done") | Q9 |
+| 8 | Bounds outcome (actor failure, not process abort) and static checks against N (§2.2, "Not done"). Q9 decided 2026-10-23; outcome implemented on the Mac, mirrors unbuilt; E2313/E2314 registered | Q9 (decided) |
 
 Stages 0, 1 and 8 need no open decision. There is no stage 6 (the counted-storage stage was removed, Q2 a, 2026-10-22). Hosted carriers (ROADMAP item N) are the execution model; owner lists belong to
 the actor, so they do not change this order.
@@ -229,4 +231,5 @@ When implementation is complete, the following should hold:
 | 1.1 | 2026-03-27 | Terminology: memory region vs arena; §1.2/§2.4 aligned with heap bump emitter |
 | 1.2 | 2026-05-26 | Moved into `Phase1_TODOs`; aligned atomic status with source-code audit |
 | 1.3 | 2026-10-16 | Status block: superseded by the chunk-4 design; bounds checking (§2.2) marked implemented; paths made per-target |
+| 1.5 | 2026-10-23 | Q9 decided (a) and H5 outcome recorded; stage 0 and 8 status; E2313/E2314 registered; `\|bounds:N` removed |
 | 1.4 | 2026-10-22 | §3 Implementation Order and the checklist now point to the design's stage list (§13); status block: the withdrawn linearity-of-1,152-records premise noted; carriers noted |

@@ -1,0 +1,141 @@
+// region_alloc_failure_ends_actor  (OPEN: staged in region_hazards_open_addition, see README.md;
+// expected outcome NEEDS LEE'S DECISION, see below)
+//
+// Hazard H5 (region_memory_safety_design.md §1.3: the hosted actor arena returns 0 when it cannot
+// grow, LBBra_grow_failed in _silica_rt_region_alloc, and hosted emit_alloc_region has no null
+// check after _silica_rt_raw_alloc; stage 0 "H5 null checks" in §13). Neither unchecked path can
+// be reached deterministically from a trial: the arena path needs one arena request larger than
+// what mmap can map, and no allocation a program controls the size of goes to the actor arena
+// (records, tuples, message copies and list chunks have sizes fixed by the compiler); the
+// emit_alloc_region path needs malloc(4128) to fail, which takes exhausting the process's address
+// space, and macOS still found 290 free 64 MB holes after every large malloc had failed (measured
+// with a C probe, 2026-10-22). A ulimit cap does not help: on macOS setrlimit(RLIMIT_AS) and
+// setrlimit(RLIMIT_DATA) to 1 GB fail with EINVAL (ulimit -v too), and the harness sets no limit.
+// So this is the closest deterministic trial: the CHECKED neighbour of those paths. A worker asks
+// for a buffer of 2^56 int64 elements (2^59 bytes, no multiply overflow, so not L_buf_invalid):
+// the region grows, _silica_rt_raw_alloc (malloc) returns 0, and L_region_grow branches to
+// L_region_overflow. Today that is the process-wide runtime abort "[silica] abort: region
+// allocation failed at 0x...", status 71.
+// The .scout below records the outcome asked for when the trial was written: the allocation
+// failure ends the worker (reason_tag 4), its supervisor restarts it, and main continues. That is
+// NOT what the design says today: §10 lists "region growth failure (abort 71), H5's null paths
+// (abort 71)" as run-time outcomes, so a stage-0 fix that follows the design adds null checks that
+// abort 71 and leaves this trial failing. If Lee keeps §10, the .scout becomes
+//   105 / [silica] abort: region allocation failed at <PTR> / 71
+// and the trial passes today (it then guards that the check stays); if Lee extends Q9's "crash to
+// the supervisor" to allocation failure in an actor, it stays as written.
+// Same program shape as buf_bounds_ends_actor: main calls the worker with 1 (105), the crasher
+// calls it with 2^56, main calls the restarted worker with 1 (105).
+// Expected output (compared as a multiset: reports are asynchronous):
+//   105
+//   failure report: worker reason_tag 4    the region cannot grow: ends the worker
+//   failure report: crasher reason_tag 4   the crasher's call raises actor_not_found
+//   after restart
+//   105
+//   done
+//   0
+
+use Supervisor;
+
+impl RegionAllocFailureEndsActorSup for Supervisor;
+
+fn fill(count: int64) -> int64 {
+    sequence proc[mem(normal)]
+        L1: lifetime <- fresh_lifetime();
+        r: region(L1, normal) <- alloc_region(normal);
+        buf: buf(L1, normal, int64, count) <- alloc_buf(r, count);
+        _: atom <- write_buf(buf, 0, 5);
+        value: int64 <- read_buf(buf, 0)
+    produces
+        pure value
+    end
+}
+
+fn worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, fill(msg) + state, state + 1)
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 3600 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :ra_worker, agent_type: :worker, initial_state: initial_state, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+// Calls the worker with its message; when the worker ends before replying, the call raises
+// actor_not_found and the crasher fails with reason_tag 4 (spec §16.1.1).
+fn crasher(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: int64 <- call_registered(:ra_worker, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- start_reporter(2);
+        _: supervisor_ref <- spawn_registered_supervisor(RegionAllocFailureEndsActorSup, 100, :ra_sup, stack_policy(0, :keep_last_message));
+        r1: int64 <- call_registered(:ra_worker, 1 impl ActorMessage {});
+        print_int64(r1);
+        println("");
+        k: actor_ref <- spawn(0, crasher, stack_policy(0, :keep_last_message));
+        bad: int64 <- 72057594037927936;
+        _: boolean <- cast(k, bad impl ActorMessage {});
+        _: int64 <- wait_for_exit();
+        println("after restart");
+        r2: int64 <- call_registered(:ra_worker, 1 impl ActorMessage {});
+        print_int64(r2);
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// One line per report, naming the failed behaviour; the state counts down from the number of
+// reports main waits for, and the last ends main's wait_for_exit() with cast_exit(0).
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        print(report_kind(report));
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces
+        pure (:no_reply, left)
+    end
+}
+
+fn report_who(report: string) -> string {
+    case contains(report, "_worker\n") of {
+        true -> "worker";
+        false -> case contains(report, "_crasher\n") of { true -> "crasher"; false -> "other" }
+    }
+}
+
+fn report_kind(report: string) -> string {
+    case contains(report, "reason_tag:      4") of {
+        true -> concat(concat("failure report: ", report_who(report)), " reason_tag 4\n");
+        false -> concat(concat("failure report: ", report_who(report)), " other reason\n")
+    }
+}
+
+fn start_reporter(expected: int64) -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

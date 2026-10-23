@@ -140,6 +140,8 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E2239 BoardPackDeviceDescribed — a program describes a board-pack device: `impl fn registers(device: (:tag))` whose tag the target's board pack describes, in any module other than the pack's own description module for that tag, whatever the body says (device spec §4.9 rule 5, §4.9.1)
 - E2240 CallToSelf — `call()` whose target is `self()` or a name bound from `self()`: the actor would wait for its own reply and deadlock; use `cast(self(), ...)` (spec §16.2.6.5)
 - E2241 TerminateSelfByRemoveOrKill — `remove_actor` or `kill_abnormal` whose target is `self()` or a name bound from `self()`; an actor ends itself only with `stop_self` or `fail_self`, and a target the compiler cannot see is still a run-time `:language_error` (spec §15.1.2.3)
+- E2313 BufferLengthMismatch — `alloc_buf`'s literal element count differs from the literal N of the `buf(R, Space, T, N)` type it is bound to (spec §12.3.3); reported at the size argument
+- E2314 BufferIndexOutOfRange — a literal index of `read_buf`, `buf_load`, `write_buf` or `buf_store` is outside 0..N-1 for a `buf` type with a literal N (spec §12.3.3); reported at the index argument
 
 ### Effect checker (E3000-E3999)
 - E3000 EffectErrorDefault — effect failure with no code of its own

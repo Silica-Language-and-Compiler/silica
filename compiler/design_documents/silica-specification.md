@@ -7044,13 +7044,13 @@ write_buf(buffer, index, value) -> atom proc[mem(Space)]
 Buffer access is bounds-checked. The compiler emits bounds checks before every `buf_load` and `buf_store`:
 
 - **MTE (Memory Tagging Extensions)**: When MTE hardware is available (see §21.3), the implementation may use hardware-assisted bounds checking.
-- **Software fallback**: When MTE is not available, the compiler emits a comparison and conditional branch before each load/store: compare index against buffer size N (from `buf(L, Space, T, N)`), trap on out-of-bounds.
+- **Software fallback**: When MTE is not available, the compiler emits a comparison and conditional branch before each load/store: compare index against buffer size N (from `buf(L, Space, T, N)`). **Out-of-bounds outcome (Lee, 2026-10-23):** inside an actor an out-of-bounds index, an invalid buffer size (`alloc_buf` with a negative count or an overflowing byte size) and a list-index failure terminate the actor with `failure_reason` `(:explicit, :buf_bounds)`, `(:explicit, :buf_invalid)` and `(:explicit, :list_index)`; the supervisor handles the exit as for any other failure (§15.4.11), and the access is never performed. Only in `main`, which is not an actor, do they remain a runtime abort (status 71, §15.4.6). A literal `alloc_buf` count that differs from the literal N of its `buf` type is the compile-time error E2313, and a literal index outside 0..N-1 for a literal N is E2314; the run-time check stays for every index.
 
 ```
 buf: buf(L1, normal, int, 10) <- alloc_buf(r, 10)  // buffer of size 10
 dynamic: buf(L1, normal, int64, capacity) <- alloc_buf(r, capacity)
 x: int <- read_buf(buf, 5)           // ✓ valid index
-y: int <- read_buf(buf, 15)          // ✗ runtime bounds error (traps)
+y: int <- read_buf(buf, 15)          // ✗ E2314 (literal index outside 0..9); with a run-time index, the actor ends with (:explicit, :buf_bounds)
 ```
 
 ### 12.4 Memory Safety Guarantees
@@ -7343,7 +7343,7 @@ Array/buffer access is bounds-checked:
 
 ```
 buf: buf(R, normal, int, 10) <- alloc_buf(r, 10)
-x: int <- read_buf(buf, 15)    // Runtime error: index out of bounds
+x: int <- read_buf(buf, 15)    // E2314 for a literal index; a run-time index out of bounds ends the actor with (:explicit, :buf_bounds) (abort 71 in main)
 ```
 
 #### 14.4.2 Division by Zero
@@ -8834,7 +8834,7 @@ same on every target, hosted or OS-free; only where the report is written differ
 | Class | When | Report (one line) | Exit status |
 |-------|------|-------------------|-------------|
 | **Fatal fault** | A synchronous hardware exception that is not recovered: the containment gate fails (§15.4.4); the fault is outside any actor, including exhausting the stack of `main`, which is not an actor (§15.1.2.2); the fault is in trusted runtime code; a fault in guarded foreign code (§26) when no actor is current; a fault inside the fault handler itself; or debug mode (§15.4.15.1) | `[silica] fault at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>`, then `  addr=0x<fault address>` and, on targets with actors, `  actor=0x<actor>  sbase=0x<stack base>  ssize=0x<stack size>` | **70** |
-| **Runtime abort** | The runtime detects a condition it cannot continue from: a failed runtime check (region capacity, buffer validity or bounds, list index, an internal invariant), a resource the runtime cannot obtain (memory to commit for a growing stack, §15.4.10.2; an actor stack reservation requested by `main`, §15.1.2.2), or a containment failure that was not raised by hardware | `[silica] abort: <reason> at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>` | **71** |
+| **Runtime abort** | The runtime detects a condition it cannot continue from: a failed runtime check in `main` (region capacity, buffer validity or bounds, list index, an internal invariant; inside an actor the same failures end the actor instead, with `(:explicit, :region_alloc_failed)`, `:buf_invalid`, `:buf_bounds` or `:list_index`, and reach its supervisor), a resource the runtime cannot obtain (memory to commit for a growing stack, §15.4.10.2; an actor stack reservation requested by `main`, §15.1.2.2), or a containment failure that was not raised by hardware | `[silica] abort: <reason> at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>` | **71** |
 | **Language-level failure in `main`** | A pattern-match or arithmetic failure raised in `main`, which has no supervisor; a `call` or `cast` from `main` to an ended actor (§16.1.4); a calling-convention mismatch found at run time (§16.2.6.4) | the failure's atom name (`case_clause`, `badarith`, `actor_not_found`, `language_error`) | **1** |
 
 Rules:
@@ -9311,7 +9311,7 @@ The failure reason is an **inline sum type** — a built-in language construct, 
 | `:normal` | The actor ended normally, through `stop_self(:normal)` or `remove_actor` (§15.1.2.3) |
 | `:language_error` | Language-level failure: pattern-match exhaustion, a type mismatch, `panic` (§22.16), or similar |
 | `:memory_fault` | Hardware-detected memory fault (MTE tag mismatch, guard page violation) |
-| `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :thread_limit)` for a spawn of a dangerous actor whose thread the host refused (§15.4.13.5), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), `(:explicit, :restart_intensity_breach)` for a supervisor that ends because it breached its restart intensity (§15.4.13.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4). `:thread_limit` is a runtime atom appended after `:restart_intensity_breach`, so no program atom moves. |
+| `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :thread_limit)` for a spawn of a dangerous actor whose thread the host refused (§15.4.13.5), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), `(:explicit, :restart_intensity_breach)` for a supervisor that ends because it breached its restart intensity (§15.4.13.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4), and, for a runtime check that fails inside an actor (the same checks abort the process only in `main`), `(:explicit, :buf_bounds)` for a buffer index out of bounds, `(:explicit, :buf_invalid)` for an invalid buffer size, `(:explicit, :list_index)` for a list index out of range and `(:explicit, :region_alloc_failed)` for a region growth or raw allocation failure (Lee, 2026-10-22 and 2026-10-23; the access or allocation is never performed). These four are runtime atoms appended after the existing ones. `:thread_limit` is a runtime atom appended after `:restart_intensity_breach`, so no program atom moves. |
 | `:noproc` | Used only in a `DOWN` message: the monitored actor had already ended when `monitor` was called (§15.4.8.6) |
 | `:unknown` | Runtime could not determine the reason |
 
