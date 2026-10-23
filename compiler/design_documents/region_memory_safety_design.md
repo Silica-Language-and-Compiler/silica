@@ -14,15 +14,9 @@ document proposes a change to the specification it says so (§1.5, §15); until 
 [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md) §6.2, §7.5–§7.7,
 [runtime_failure_reporting.md](runtime_failure_reporting.md).
 
-**Implementation status (2026-10-16).** Nothing of the design is built. Checked against the tree that day: the
-compiler holds no region checker, no `drop` nodes, none of the codes E2300 to E2318, no `alloc_atomic` and no
-`atomic_*` operation (§9); `alloc_region` is still called nowhere in the stdlib or the compiler (§1.4); scope
-release (`mark`/`release_to`) is still disabled in all four emitters (§1.2); and Phase A of the lifetime analysis
-(`check_sequence_return_lifetime`) is still the only lifetime rule. Lee decided Q3, Q4, Q7, Q8, Q10, Q11, Q13 and Q14 on 2026-10-23 and Q1, Q2, Q5, Q15, Q16 and Q17 on 2026-10-22 (and Q6 on 2026-10-09, narrowed by Q2 (a), with Q12 withdrawn as moot): never-freed family arenas spelled `arena(L, S)`, no counted storage, so there is no counted-storage stage. No decision of §15 remains open (Q14 was decided 2026-10-23 too). Open details remain for Q13 (the copy's destination and spelling) and Q14 (see §15). §1 below was measured 2026-10-09; the function names are still right, but line numbers have
+**Implementation status (2026-10-23).** Stage 0 is implemented on the Mac and built on pix and nix (the ESP32-S3 mirror is not built): H1 (CAS bump loop and locked canonical-arena insert), H3 (a let-bound aggregate passed by name is promoted), H4 (a reply is copied into the caller's arena), H5 and Q9 (a region allocation or growth failure, an out-of-bounds buffer index, an invalid buffer size and a list-index failure end the actor, abort 71 only in `main`), the E2313/E2314 literal checks, and the removal of the `|bounds:N` metadata; the first form of the dispatch-end release of a message's owned regions (SD-7, §18.7 item 2) is in the emitters too. Staged hazard trials: `trials/region_hazards_open_addition`. Not built, as found by the 2026-10-16 survey and not re-read since: the region checker, `drop` nodes, the codes E2300 to E2312 and E2315 to E2318, the `atomic_*` builtins (§9; `alloc_atomic` will not be added, Q8), Phases B and C of the lifetime analysis, and ownership-based release; scope release (`mark`/`release_to`) is still disabled in all four emitters (§1.2); `alloc_region` is still called nowhere in the stdlib or the compiler (§1.4). Lee decided Q3, Q4, Q7, Q8, Q10, Q11, Q13, Q14 and Q18 on 2026-10-23 and Q1, Q2, Q5, Q15, Q16 and Q17 on 2026-10-22 (and Q6 on 2026-10-09, narrowed by Q2 (a) and its default superseded by Q18, with Q12 withdrawn as moot): never-freed family arenas spelled `arena(L, S)`, no counted storage, so there is no counted-storage stage. No decision of §15 remains open. Open details remain for Q13 (the copy's destination and spelling) and Q14 (see §15); ROADMAP chunk 15 owns them and the fate of the family arena (note at the top of §0). §1 below was measured 2026-10-09; the function names are still right, but line numbers have
 drifted (for example `let_owns_local_region` is now at line 816 of `term_reg_spill.silica`, `fn_destroys_region_param`
-at 2389 of `emitter_core.silica`). Re-read 2026-10-16 and still true by reading: H1 (no lock anywhere in
-`canonical_arena_runtime_asm.silica`), H2 (`fn_destroys_region_param`), H5 (`LBBra_grow_failed`), H10 (no
-`alloc_atomic` in `compiler/src`); H3's staged repro is not in any suite and no fix was looked for; H4 and H6 to H9 were not re-read. Two things changed after the survey: the 2026-10-12 emitter work of §19
+at 2389 of `emitter_core.silica`). The 2026-10-16 re-read found H1, H3, H4 and H5 true by reading (they are now fixed on the Mac as above), and H2 (`fn_destroys_region_param`) and H10 (no `atomic_*` in `compiler/src`) true; H6 to H9 were not re-read. Two things changed after the survey: the 2026-10-12 emitter work of §19
 (caller-provided result slot in X8, reused state tuples, case-arm tuples built in the reply buffer) and the
 board runtime's item B, J and F work in [actor_memory_budget_plan.md](actor_memory_budget_plan.md); neither alters a
 hazard above except by removing allocations in the cases §19 lists as fixed. §19 is the one part of the chunk that
@@ -34,7 +28,7 @@ chunk's ownership model.
 
 ## 0. Summary
 
-**Note (Lee, 2026-10-23).** The structure model of §3.1, §3.13 and §3.14 is being redesigned as ROADMAP chunk 15 (data structure redesign), with the decisions of §15 (Q1 to Q11, Q13 to Q17) as its requirements, not provisional. The never-freed family arena of Q2 (a) cannot stand as written once Q13 and Q14 need freeable structure copies; chunk 15 decides where a structure's memory lives and who releases it, and is a prerequisite for stage 2.
+**Note (Lee, 2026-10-23).** The structure model of §3.1, §3.13 and §3.14 is being redesigned as ROADMAP chunk 15 (data structure redesign), with the decisions of §15 (Q1 to Q11, Q13 to Q18) as its requirements, not provisional. The never-freed family arena of Q2 (a) cannot stand as written once Q13 and Q14 need freeable structure copies; chunk 15 decides where a structure's memory lives and who releases it, and is a prerequisite for stage 2. Requirements: [data_structure_redesign_requirements.md](data_structure_redesign_requirements.md).
 
 The chunk's premise was that 1,152 stdlib records embed a move-only region and must become linear. Measured, they do
 not hold owned regions at all. Every standard data structure takes its region from `canonical_arena_lookup(key)`: one
@@ -46,14 +40,14 @@ an arena that is never freed cannot dangle.
 
 The arena is safe, but it only grows. A 1,000-key map exhausts the ESP32-S3 heap in about 740 updates, and a busy host
 grows by tens of MB a second (§17). So the design separates the type `region(L, Space)` into an owned kind and a
-structure kind. **Decided by Lee, 2026-10-22: Q2 (a), the never-freed family arena with the atomic bump (stage 0), the handle spelled `arena(L, S)` (Q1 a).** Counted storage was considered and is not part of the plan (§17). Structures therefore still never reclaim memory until a later project:
+structure kind. **Decided by Lee, 2026-10-22: Q2 (a), the never-freed family arena with the atomic bump (stage 0), the handle spelled `arena(L, S)` (Q1 a).** Counted storage was considered and is not part of the plan (§17). Structures therefore still never reclaim memory under this plan, and chunk 15 (note above) decides whether that stands:
 
 | Kind | Made by | Handle | Lifetime | Release |
 | --- | --- | --- | --- | --- |
 | **Owned region** | `alloc_region` | linear (move-only, §4.4.2); every record or tuple embedding one is linear | lexical, by ownership | at the last owner's scope end, or at its actor's end |
-| **Structure storage, decided (Q2 a, Lee 2026-10-22): the family arena** | `canonical_arena_lookup` | `arena(L, S)`: copyable, not linear (Q1 a) | application | never (process end) |
+| **Structure storage, decided (Q2 a, Lee 2026-10-22); chunk 15 revisits it (note above): the family arena** | `canonical_arena_lookup` | `arena(L, S)`: copyable, not linear (Q1 a) | application | never (process end) |
 
-The linearity rule holds in full for owned regions and the aggregates that embed them (§3). A structure version is an
+The linearity rule holds in full for owned regions and the aggregates that embed them (§3). A structure version is, as decided in Q1 and Q2 (a) and until chunk 15 says otherwise, an
 `arena(L, S)` handle: copyable, immutable, never freed. Lee's version rules still hold (§3.14): a version is created only
 by a change, a change leaves its input valid, and a no-op change returns `:unchanged`. The
 stdlib and compiler sources change by script (type spelling, Q1: `region(L, normal)` becomes `arena(L, normal)`). The safety properties of §12 are enforced at
@@ -63,7 +57,7 @@ heuristics. The run-time checks are the bounds checks that already exist (§8), 
 a data race found in this survey (§1.3 H1).
 
 Ten silent hazards were found by reading the code (§1.3). Four of them are live use-after-free or race paths that need
-no new language rule, and they are stage 0 of the migration (§13).
+no new language rule, and they are stage 0 of the migration (§13), now implemented (H1, H3, H4, H5; status above).
 
 ---
 
@@ -101,8 +95,8 @@ anything.
 
 | What | Where | Behaviour |
 | --- | --- | --- |
-| **Buffer bounds**, all four emitters | `prims_memory@emit_alloc_buf` (302) stores the element count at `[buf-8]` and rejects a negative count or a multiply overflow (`L_buf_invalid`). `emit_buf_bounds_check` (345) emits `LDR X17,[X1,#-8]; CMP X2,X17; B.HS L_buf_bounds`, inline in `emit_buf_store` (414) and at `term_emit_kind_compound_part2:261` for loads. x86 uses `x86_cmp_branch`; ESP32 aborts inline into `silica_rt_abort_buf_bounds` (`rt_console.S:539`). | process-wide **runtime abort, status 71** (`_silica_rt_abort_with`), even inside an actor. **Decided 2026-10-23 (Q9 a): inside an actor this ends the actor instead (§8); abort 71 stays only in `main`.** |
-| Region full | `emit_region_bump_check` (169) calls `L_region_grow` (566), which chains a new block of max(4096, request) on `[r+16]`. ESP32 uses `silica_rt_region_grow` (`rt_heap.S:321`). | abort 71 on allocation failure (hosted `L_region_overflow`; board "heap exhausted"). **Decided 2026-10-22/23: inside an actor the actor ends with `(:explicit, :region_alloc_failed)`; abort 71 stays only in `main` (§8, H5).** |
+| **Buffer bounds**, all four emitters | `prims_memory@emit_alloc_buf` (302) stores the element count at `[buf-8]` and rejects a negative count or a multiply overflow (`L_buf_invalid`). `emit_buf_bounds_check` (345) emits `LDR X17,[X1,#-8]; CMP X2,X17; B.HS L_buf_bounds`, inline in `emit_buf_store` (414) and at `term_emit_kind_compound_part2:261` for loads. x86 uses `x86_cmp_branch`; ESP32 aborts inline into `silica_rt_abort_buf_bounds` (`rt_console.S:539`). | process-wide **runtime abort, status 71** (`_silica_rt_abort_with`), even inside an actor. **Decided 2026-10-23 (Q9 a), implemented on the Mac: inside an actor this ends the actor instead (§8); abort 71 stays only in `main`.** |
+| Region full | `emit_region_bump_check` (169) calls `L_region_grow` (566), which chains a new block of max(4096, request) on `[r+16]`. ESP32 uses `silica_rt_region_grow` (`rt_heap.S:321`). | abort 71 on allocation failure (hosted `L_region_overflow`; board "heap exhausted"). **Decided 2026-10-22/23, implemented on the Mac: inside an actor the actor ends with `(:explicit, :region_alloc_failed)`; abort 71 stays only in `main` (§8, H5).** |
 | Owned-region release: a local | `term_reg_spill@let_owns_local_region` (697; ESP32 833), used by `term_emit_kind_let_top:217` and `…_let_named_tail:223` | `_silica_rt_region_destroy` after the let body, **only** when the body contains no SIR kind-4/5 call at all (`body_has_moving_call`) and the name appears only as an `alloc_*`/`region_*`/`ref_in_region` argument (`region_used_outside_borrow`). Otherwise it leaks. |
 | Owned-region release: a parameter | `emitter_core@fn_destroys_region_param` (2376), `region_param_index` (2336), `return_type_carries_region` (2325) | destroys the **first** `region(`-typed parameter (index ≤ 7) at the epilogue when the return type's text has no "region" and the body has no kind-4/5 call. It disables TCO (`tco_eligible` 1665). |
 | Fresh let-bound composites (ESP32 only) | `ESP32-S3_raw/terms/term_reg_spill@let_owns_fresh_composite` (696), `fresh_name_moves_in` (666) | frees a `record_make`/`tuple_make` tail block, or a `get_actor_memory_usage` record, at scope end unless the name is moved, rebound or projected to an inline aggregate (budget plan §13). Not in the hosted emitters. |
@@ -113,11 +107,11 @@ anything.
 
 ### 1.3 Silent today
 
-Silent means the program runs on and computes with freed, shared or garbage memory.
+Silent means the program runs on and computes with freed, shared or garbage memory. Rows are as surveyed 2026-10-09; **H1, H3, H4 and H5 are fixed on the Mac by stage 0 (2026-10-23).**
 
 | # | Hazard | Evidence | Kind |
 | --- | --- | --- | --- |
-| H1 | **Canonical arenas are process-global and their bump allocation is unlocked.** Two actors updating any structure of the same family (two `wbt_map`s, say) bump the same arena from two threads on hosted, or two cores on the board, and can get the same cell. Arena creation in `_silica_rt_canonical_arena_lookup` is also an unlocked probe-and-insert. | by reading: `canonical_arena_runtime_asm.silica`, `emit_region_bump_check` | data race, corruption |
+| H1 | **Canonical arenas are process-global and their bump allocation is unlocked.** Two actors updating any structure of the same family (two `wbt_map`s, say) bump the same arena from two carrier threads on hosted (hosted carriers are the execution model, ROADMAP item N), or two cores on the board, and can get the same cell. Arena creation in `_silica_rt_canonical_arena_lookup` is also an unlocked probe-and-insert. | by reading: `canonical_arena_runtime_asm.silica`, `emit_region_bump_check`. **Fixed on the Mac, stage 0 (2026-10-23).** | data race, corruption |
 | H2 | **A region parameter carried away by `cast`, `send` or `spawn` is destroyed by its function.** Those are kind-6 prims, not kind-4/5 calls, so `body_has_moving_call` does not see them. `return_type_carries_region` is false for an `atom` or `actor_ref` result, so `fn_destroys_region_param` frees a region the receiver now owns. (The local-let rule catches this through `region_used_outside_borrow`; the parameter rule has no such check.) | by reading: `fn_destroys_region_param`, `sir_generator/terms/terms_actor_lowering` (cast becomes a prim) | use-after-free |
 | H3 | **A let-bound frame aggregate passed by name to a call is not promoted.** It dangles once the caller's frame is reused (memory note 2026-09-08, still true). `arg_aggregate_heap_promote` fires only on a literal `tuple_make`/`record_make` (`term_reg_spill@is_aggregate_make` 946). | by reading; staged repro `wbt_map_tuple_value_escapes_via_let` | use-after-free |
 | H4 | **Replies and states live in the replying actor's arena on hosted.** `_silica_rt_actor_dealloc_region` (2571) frees the whole arena when that actor ends, so a caller holding a composite reply from an actor that has since ended (crashed and restarted, or removed) reads freed memory. | by reading: `behaviour_result_move_asm`, `_silica_rt_region_alloc` (2714) | use-after-free, to confirm by trial |
@@ -126,7 +120,7 @@ Silent means the program runs on and computes with freed, shared or garbage memo
 | H7 | `device_window` lifetimes are erased (`device_window_types_equal_modulo_lifetime`, 793) and the window is not move-only, against spec §4.4.6 and device spec §5.1. Two workers can hold one window. | by reading | spec rule unenforced |
 | H8 | Phase A misses `ref?`, records and lists, so `fn f(r: region(L, normal)) -> ref?(L, normal, rec)` and `-> { root: ref(L, …) }` compile without the region. This is generic-module convention 5 in the memory notes ("returning `ref?` is not caught"). | `collect_lifetime_ids_from_ref_types` (601) | dangling reference accepted |
 | H9 | Owned-region **leaks** (not safety violations, listed for completeness): any region in a scope that makes any call; every region parameter after the first; a region inside a record or tuple; regions held by an actor that crashes; canonical arenas (by design); hosted strings and `main`'s implicit allocations (never freed); the board's residual 492 B per supervisor cycle (budget plan §13). | §1.2 | leak |
-| H10 | `ref(L, atomic, T)` is an ordinary cell: plain `LDR`/`STR`, plus `DMB ISH`/`memw`/`mfence` at function entry, exit and calls. `alloc_atomic` and the `atomic_*` operations of §17 exist nowhere in the compiler. Two actors cannot share an atomic cell anyway, since nothing lets them (§9). | by reading: `prims_memory:231/241`, `control/control.silica:42-85` | spec feature missing |
+| H10 | `ref(L, atomic, T)` is an ordinary cell: plain `LDR`/`STR`, plus `DMB ISH`/`memw`/`mfence` at function entry, exit and calls. The `atomic_*` builtins of §9.2 (Q8) exist nowhere in the compiler (`alloc_atomic` will not be added). Today nothing lets two actors share an atomic cell; Q7 (a) decides that `region(L, atomic)` may be shared (§9). | by reading: `prims_memory:231/241`, `control/control.silica:42-85` | spec feature missing |
 
 ### 1.4 What the code base actually holds
 
@@ -149,7 +143,7 @@ Silent means the program runs on and computes with freed, shared or garbage memo
 
 | # | Where | Conflict | Proposed resolution |
 | --- | --- | --- | --- |
-| S1 | §16.3.5 "Message contents are copied between actors" vs §12.1.6 "the same move discipline applies" | copy vs move | **decided 2026-10-09 (Lee): move**; structure versions are copyable arena handles (Q2 a, 2026-10-22) (§18); §18.5 lists the spec text to change as Q6 decides; fix §16.3.5 |
+| S1 | §16.3.5 "Message contents are copied between actors" vs §12.1.6 "the same move discipline applies" | copy vs move | **decided 2026-10-09 (Lee): move; default superseded by Q18 (2026-10-23): copy by default, move on request**; structure versions are copyable arena handles (Q2 a, 2026-10-22; chunk 15 revisits storage) (§18); §18.5 lists the spec text to change as Q6 decides; fix §16.3.5 |
 | S2 | §4.4.2 "The function must return the handle to the caller" vs trial `region_move_pass_no_return` (a callee that consumes and releases) | must return vs may consume | Q3 decided 2026-10-23: (a), may consume; spec reworded |
 | S3 | §12.1.1 "atomic: regions … accessed by multiple actors concurrently" vs §12.1.6 "owned by at most one actor at a time" | sharing | Q7 (decided 2026-10-23: (a), the one named exception) |
 | S4 | §17 examples: function-level `proc[...]` (now E3009), `{ok, …}` record-tag syntax, `alloc_atomic()` with no arguments, `ref(R, atomic, ref(R, normal, …))` (a cross-actor pointer into normal memory) | stale syntax, unsound example | rewrite with §9 |
@@ -167,7 +161,7 @@ Three kinds of storage, each with one release rule:
 | Storage | Holds | Owner | Released |
 | --- | --- | --- | --- |
 | **Owned region** `region(L, S)` | what the program allocates in it explicitly (`alloc_ref`, `alloc_rec`, `alloc_buf`) | exactly one binding, in exactly one actor (or `main`) | when its owner is dropped (§7). An actor's owned regions that are still live when it ends are released by the runtime (§7.3). |
-| **Structure storage** | stdlib nodes | one arena per family, owned by the application (Q2 a, decided 2026-10-22) | never |
+| **Structure storage** | stdlib nodes | one arena per family, owned by the application (Q2 a, decided 2026-10-22; chunk 15 may change it, see §0) | never |
 | **Actor heap** (implicit) | lists, promoted tuples and records, strings, message copies | the actor | hosted: the actor's arena, freed at the actor's end; board: per block (`silica_rt_free`); `main`: never |
 
 The frame is not storage a value may outlive. Item B and `arg_aggregate_heap_promote` move every aggregate that leaves
@@ -182,7 +176,7 @@ soundness is the runtime's (item B, H3, H4), and it is in this chunk only becaus
 - A `ref`/`buf` may not outlive its region (§12.1.4, §12.4.2), and in a returned value or a message its region travels
   with it (§12.1.4 scope exit rule, §12.1.6).
 - Ownership of an owned region transfers on `spawn` (§12.1.5) and on `call`/`cast` submission (§12.1.6); replies return
-  it (§12.1.6).
+  it (§12.1.6). Since Q18 (2026-10-23) what transfers is the copy made at the send, or the original when the send is an explicit `move`.
 - Buffer accesses stay checked at run time (§12.3.3). An out-of-bounds write corrupts data, and an out-of-bounds read
   hands a wrong value onward, so both meet Lee's first criterion.
 
@@ -209,7 +203,7 @@ Every occurrence of a binding of linear type is exactly one of:
 | --- | --- | --- |
 | **Borrow** | the region operand of a region prim: `alloc_ref`, `alloc_rec`, `alloc_buf`, `read_ref`, `write_ref`, `buf_load`/`read_buf`, `buf_store`/`write_buf`, `ref_in_region`, `canonical_arena_same`; the window operand of `peek`/`poke` | none: the value stays owned here |
 | **Read** of a non-linear field | `x.f` or a destructuring pattern position whose type is not linear | none |
-| **Move** | anything else: a user-call argument, a function-value call argument, a return or `produces pure` operand, a record/tuple/sum literal operand, the right-hand side of a binding, a `case` scrutinee, a `spawn` initial state, a `call`/`cast`/`send` message, a behaviour's reply or new state, and `x.f` with `f` linear | the binding is **moved**; any later use is E2301 |
+| **Move** | anything else: a user-call argument, a function-value call argument, a return or `produces pure` operand, a record/tuple/sum literal operand, the right-hand side of a binding, a `case` scrutinee, a `spawn` initial state, a `call`/`cast`/`send` message, a behaviour's reply or new state, and `x.f` with `f` linear (the actor-boundary operands, that is the `spawn` initial state, a message, a reply and a new state, move only when explicitly marked `move(...)`; otherwise they copy, Q18) | the binding is **moved**; any later use is E2301 |
 
 The borrow positions are exactly the prim operands the emitter heuristic already treats as borrows (`rgn_is_region_borrow_prim`).
 User functions do not borrow (Q4 a, decided 2026-10-23): a function that inspects a linear value takes it and gives it back.
@@ -259,9 +253,9 @@ capture that. Calling a function value with a linear argument is an ordinary mov
 
 | Construct | Rule |
 | --- | --- |
-| `spawn(state, beh, policy)` | `state` is moved (§12.1.5). Any later use of it, or of a linear part of it, is E2301. This replaces the `"moved_region"` rebinding, and covers records, tuples and any expression holding an owned region. Structure versions in it are arena handles and stay usable. |
+| `spawn(state, beh, policy)` | `state` is copied by default and moved only when marked `move` (Q18, 2026-10-23). After an explicit move, any later use of it, or of a linear part of it, is E2301; before Q18 this was the only mode (§12.1.5). This replaces the `"moved_region"` rebinding, and covers records, tuples and any expression holding an owned region. Structure versions in it are arena handles and stay usable. |
 | supervised child spec (`init` child list, `add_child`) | the initial state may not be linear (E2308): the supervisor keeps it in its row to restart the child, which would duplicate the owner (§18.4). A worker that needs a region allocates it in its first message, or receives it by message. A structure version is allowed (Q14, decided 2026-10-23): the child receives a copy at every start and restart, released when it dies; its destination is an open detail. |
-| `call(a, msg)`, `cast(a, msg)`, `send`, the `_registered` forms | `msg` is moved at submission (§12.1.6, §18). Any later use of a linear value in it is E2301. The runtime transfers ownership of every owned region in it to the receiver (§7.3). Structure versions in it are arena handles, passed by value; the sender keeps its own. |
+| `call(a, msg)`, `cast(a, msg)`, `send`, the `_registered` forms | `msg` is copied at submission by default (Q18, 2026-10-23); with an explicit `move` it is moved (§12.1.6, §18) and any later use of a linear value in it is E2301. The runtime transfers ownership of every owned region in it to the receiver (§7.3). Structure versions in it are arena handles, passed by value; the sender keeps its own. |
 | behaviour `fn beh(msg: M, state: S) -> (:reply, R, S)` | `msg` and `state` are owned parameters. The reply and the new state are moved out: each linear part of `msg` and `state` must be in the reply, in the new state, moved elsewhere, or dropped, and in at most one of them: an owned region in both the reply and the new state, or in a message and the new state, is E2303. A structure version is an arena handle and may be in both (§18.1). The usual threading is `(:reply, x, (r2, k + 1))`. |
 | a `call`'s result | moved to and owned by the caller's binding (§12.1.6). |
 | `cast_exit`, `wait_for_exit` | no ownership effect (§12.4). |
@@ -380,13 +374,13 @@ fn main() -> int64 {
     sequence proc[concurrency, mem(normal)]
         L: lifetime <- fresh_lifetime();
         r: region(L, normal) <- alloc_region(normal);
-        a: actor_ref <- spawn((r, 0), beh, stack_policy(0, :keep_last_message));   // (r, 0) moved
+        a: actor_ref <- spawn(move((r, 0)), beh, stack_policy(0, :keep_last_message));   // explicit move (Q18): (r, 0) moved; a plain spawn((r, 0), …) would copy
         v: int64 <- call(a, 1 impl ActorMessage {});
     produces pure v end
 }
 ```
 
-Writing `alloc_ref(r, 5)` after the `spawn` is E2301 ("r was moved into spawn"). That is the case
+Writing `alloc_ref(r, 5)` after this explicit-move `spawn` is E2301 ("r was moved into spawn"); after a plain, copying `spawn` it is legal. That is the case
 `enrich_env_for_actor_spawn` catches today only as a generic E2003.
 
 Structure versions are `arena(L, S)` handles, which are copyable, so a change leaves its input usable and a version may be bound again (§3.14):
@@ -412,9 +406,9 @@ Structure versions are `arena(L, S)` handles, which are copyable, so a change le
   with an empty heap and the like produce no version at all. The program carries on with v1: no copy and no run-time
   check.
 
-**Not scheduled.** Moving the stdlib's change results to the shapes below (367 updaters, about 300 caller sites in
+**Not scheduled in chunk 4.** Moving the stdlib's change results to the shapes below (367 updaters, about 300 caller sites in
 `trials/` and 55 in the compiler) is an API change that no stage of this plan carries; it was part of the removed
-counted-storage stage. The rules above stay as the design of the result shapes, for whenever it is scheduled.
+counted-storage stage, and ROADMAP chunk 15 takes it over. The rules above stay as the design of the result shapes, for whenever it is scheduled.
 
 **Result shapes.** Every change returns a sum whose first alternative is `:unchanged`, and whose other alternatives are
 tagged tuples carrying the new version. The tag says *what* changed, so the stdlib's current flags fold into the tag.
@@ -569,7 +563,7 @@ supervisor shutdown). Otherwise every restart leaks the crashed instance's regio
 on its owning actor's region list, rooted in two new ACB words (`main` has a static root).
 
 - `alloc_region` links the region into the current actor's list; `_silica_rt_region_destroy` unlinks it.
-- Message submission (`call`/`cast`/`send`) and `spawn` move every owned region in the payload: the compiler emits,
+- Message submission (`call`/`cast`/`send`) and `spawn` move every owned region in the payload (since Q18, the payload is the copy made into a fresh owned region, or the original on an explicit `move`): the compiler emits,
   after the payload is built, one `_silica_rt_region_transfer(handle, target)` per owned region it contains, from
   the payload's type, which unlinks it from the sender's list and links it into the receiver's. The ESP32 has two cores,
   so this runs under the scheduler lock there.
@@ -675,7 +669,7 @@ its one registered meaning. E2319 and E2320, drafted for counted storage, were r
 | Code | Name | Raised when | Phase |
 | --- | --- | --- | --- |
 | E2300 | ReferenceOutlivesRegion | a returned, sent or spawned value holds `ref`/`ref?`/`buf` of lifetime L without `region(L)`, L not an arena lifetime (§4) | region checker (moved from type checker E2100) |
-| E2301 | UseAfterMove | a linear binding used after it was moved (names the move's line and, for case, the arm) | region checker |
+| E2301 | UseAfterMove | a linear binding used after it was moved (names the move's line and, for case, the arm). For messages only an explicitly `move`d value qualifies (Q18, 2026-10-23); a plain send copies | region checker |
 | E2302 | ReferenceAfterRegionGone | a `ref`/`buf` of lifetime L used after L's region was moved out or dropped | region checker |
 | E2303 | LinearMovedTwice | one expression moves one binding twice; or a linear value (an owned region) is both kept in an actor's new state and given away as its reply or in a message (§18.1) | region checker |
 | E2304 | PartiallyMovedValueUsed | whole use, or second move, of a record or tuple after a linear field was moved out | region checker |
@@ -725,11 +719,11 @@ not reach it, so its codes never duplicate E2003 noise.
 | --- | --- |
 | **Item K** (`wait_for_exit`, `cast_exit`) | no ownership effect. When `main` returns, actors are abandoned with their owned regions still linked; the process end reclaims them, and on the board `silica_rt_exit` halts. `main`'s own owned bindings are dropped at its scope end, after `wait_for_exit` returns. That is safe: anything an actor holds was moved and is not `main`'s to drop. |
 | **Growable actor stacks** (chunk 1, board item F) | stacks are released at the message boundary, so nothing may point into a stack across it. Regions are heap blocks, and a handle in a frame slot is fine. Aggregates rely on item B and H3's fix. A crash mid-behaviour leaves owned regions in frame slots, which §7.3's owner list reclaims. |
-| **Actor messages and replies** | moves (Q6, decided 2026-10-09; §18). Owned regions move by pointer plus owner transfer (§7.3). Structure versions are arena handles passed by value (Q2 a). Plain immutable values are copied into the receiver; the H4 case needs the targeted stage 0 fix. |
+| **Actor messages and replies** | copy by default, move on request (Q18, 2026-10-23; Q6's move default is superseded; §18). The copy goes into a fresh owned region that moves by pointer plus owner transfer (§7.3), as does an explicitly moved original. Structure versions are arena handles passed by value (Q2 a). Plain immutable values are copied into the receiver; the H4 case needs the targeted stage 0 fix. |
 | **Supervised restart** | E2308 keeps owned regions out of child specs. |
 | **FFI** (dangerous actors) | E2101–E2103 stay as they are. The region checker treats `external_danger` regions as ordinary owned regions, and the taint checker's "only into actor state or an FFI result cast" is stricter, so the two compose. Chunk 13 inherits §8's length-word contract for `buf(L, S, uint8, N)`. |
 | **Device windows** | linear (§3.1). The `spawn_device` initial state moves the window. A window message is an explicit ownership transfer (device spec §5.1–§5.2). DMA buffers moved to the worker and back (device spec §5.3) are ordinary linear region moves, which this chunk finally enforces. Window lifetimes are no longer erased (H7). `peek`/`poke` borrow. |
-| **Board memory** | an owned region's first block is 4,128 B on every target (`emit_alloc_region`), 1.2% of the board's 354,816-byte heap per region. Proposal (decidable without Lee): a per-target first-block size, 512 B on `ESP32-S3_raw`, growing as now. The owner links add 16 B per region. Canonical arenas are 4,128 B each on first use and are never freed; nine families means ≤ 37 KB on the board if all are used. Worse, they only grow: a 1,000-key map updated ten times a second exhausts the heap in about 74 s (§17). Q2 (a) (2026-10-22) keeps the arena, so a long-running board app that updates a structure still exhausts the heap until a later project. |
+| **Board memory** | an owned region's first block is 4,128 B on every target (`emit_alloc_region`), 1.2% of the board's 354,816-byte heap per region. Proposal (decidable without Lee): a per-target first-block size, 512 B on `ESP32-S3_raw`, growing as now. The owner links add 16 B per region. Canonical arenas are 4,128 B each on first use and are never freed; nine families means ≤ 37 KB on the board if all are used. Worse, they only grow: a 1,000-key map updated ten times a second exhausts the heap in about 74 s (§17). Q2 (a) (2026-10-22) keeps the arena for now, so a long-running board app that updates a structure still exhausts the heap until chunk 15 decides otherwise. |
 | **Chunk 9** (networking) | received bytes arrive in `buf(L, S, uint8, N)`. §8 gives the bounds check, and an overrun fails the connection's actor (Q9), not the server. |
 | **Chunk 13** | depends on §8 and on Q9's failure outcome for `recreate`'s limit checks. |
 | **Chunk 2** (carriers) | owner lists are per actor, not per thread, so carriers change nothing. H1's fix is needed either way. |
@@ -747,19 +741,19 @@ linux_aarch64 and linux_x86_64 (lock-step), and with a green ESP32 cross build a
 
 | Stage | Content | Language change? | Gate |
 | --- | --- | --- | --- |
-| **0. Silent hazards** | H1 atomic arena bump and CAS arena insert (§9.4); H2 count `cast`/`send`/`spawn`/`call` prims as moving in the existing heuristics (interim, removed at stage 4); H3 promote let-bound frame aggregates passed by name (wire the staged trial); H5 null checks, ending the actor with `(:explicit, :region_alloc_failed)` (abort 71 in `main`; Lee, 2026-10-22); renumber the region meaning of E2100 to E2300 | no | the hazard trials of §14.2 fail before and pass after; fixed points |
+| **0. Silent hazards** | H1 atomic arena bump and CAS arena insert (§9.4); H2 count `cast`/`send`/`spawn`/`call` prims as moving in the existing heuristics (interim, removed at stage 4); H3 promote let-bound frame aggregates passed by name (wire the staged trial); H5 null checks, ending the actor with `(:explicit, :region_alloc_failed)` (abort 71 in `main`; Lee, 2026-10-22); renumber the region meaning of E2100 to E2300 | no | the hazard trials of §14.2 fail before and pass after; fixed points. **Status 2026-10-23: H1, H3, H4, H5 and Q9 implemented on the Mac and built on pix and nix; ESP32-S3 mirror not built.** |
 | **1. Lifetime polymorphism** | §5 option A: per-call substitution, E2311 | yes, relaxing only (accepts more) | trials that spell a generic `R` pass; the `L1` workaround comments go from the trials; fixed points. Nothing in the compiler's source needs it. |
-| **2. Structure handle type** | the handle spelled `arena(L, S)` (Q1 a, Q2 a, decided 2026-10-22; not linear, accepted by the allocation prims, obtained from `canonical_arena_lookup`): type checker, interner, SIR, emitters. No cell is ever freed, so run-time behaviour is today's arena exactly and the fixed points cannot move. The constructors' `canonical_arena_lookup` result is accepted into the new type, and during the transition also into a `region` binding (a named transition rule, removed at stage 5). Specification addition S7. **Publish.** Then a script renames the stdlib's handle fields from `region(L, normal)` to `arena(L, normal)` and rewrites the allocator tuples (2,239 record types, 34 tuples, the `x.region` lets) and the 25 compiler modules' inline map types, verified with `git diff`, not the masked regex view (memory note). | yes | stdlib, `ordered_data_structures` and the compiler build; fixed points with the rewritten source |
+| **2. Structure handle type** | the handle spelled `arena(L, S)` (Q1 a, Q2 a, decided 2026-10-22; not linear, accepted by the allocation prims, obtained from `canonical_arena_lookup`): type checker, interner, SIR, emitters. No cell is ever freed, so run-time behaviour is today's arena exactly and the fixed points cannot move. The constructors' `canonical_arena_lookup` result is accepted into the new type, and during the transition also into a `region` binding (a named transition rule, removed at stage 5). Specification addition S7. **Publish.** Then a script renames the stdlib's handle fields from `region(L, normal)` to `arena(L, normal)` and rewrites the allocator tuples (2,239 record types, 34 tuples, the `x.region` lets) and the 25 compiler modules' inline map types, verified with `git diff`, not the masked regex view (memory note). | yes | stdlib, `ordered_data_structures` and the compiler build; fixed points with the rewritten source. **Waits on ROADMAP chunk 15 (2026-10-23), which decides whether the handle and the family arena stand.** |
 | **3. Region checker, report-only** | §11 checker behind a `silica.config` switch (`region_check: report`), writing `<unit>.regions` reports, no diagnostics, so no golden changes. | no (reports only) | reports over the stdlib and the compiler show **no linear misuse**; reports over `trials/` are reviewed, and every entry is either a real misuse (it becomes an error trial in §14) or a checker defect (fixed). Board trial sources are included. |
 | **4. Drops and owner lists** | §7.1 `drop_owned` in SIR and emitters for owned regions; remove the heuristics; §7.3 runtime owner lists and transfers; the per-target first-block size; **message regions (§18.7):** `drop_owned` at behaviour return for a message's owned regions unless they flow into the new state, partial move out of a message record, `copy_to`, release on a failed send, reply regions dropped for a dead or timed-out caller, and the actor-end walk covering the unprocessed mailbox | no (`copy_to` is a new compiler builtin `copy_to(region, value)` derived per type like `recreate`, Q15 decided 2026-10-22) | §14.2 release trials (write-every-page) on every host and the board; the message-region trials of §18.6 (`message_region_released_at_dispatch_end` and the others except the chunk-11 one); `memory_region_addition` and `actors_addition` unchanged; `.ascomp` goldens refreshed only where `.sout` = `.scout`; fixed points |
 | **5. Errors on** | `region_check` defaults to `error`; the transition rule from stage 2 is removed; E2300–E2318 error trials wired | yes | the compiler's own source passed stage 3 clean, so it builds; fixed points; the error suite is green on the three hosts |
 | **7. Atomics** (after stage 1, parallel to 3–6) | §9: builtins, lowering on four targets, shared atomic regions per Q7 | yes | the atomic run trials plus two-actor counter and CAS trials on the hosts and both board cores |
-| **8. Bounds outcome and static buffer checks** (any time after 0) | Q9 actor failure (decided 2026-10-23: `:buf_bounds`, `:buf_invalid`, `:list_index`; abort 71 only in `main`); E2313/E2314; `\|bounds:` removed | yes (E2313/E2314) | §14 trials |
+| **8. Bounds outcome and static buffer checks** (any time after 0) | Q9 actor failure (decided 2026-10-23: `:buf_bounds`, `:buf_invalid`, `:list_index`; abort 71 only in `main`); E2313/E2314; `\|bounds:` removed | yes (E2313/E2314) | §14 trials. **Status 2026-10-23: Q9 outcome and E2313/E2314 literal checks implemented on the Mac; `\|bounds:` removed.** |
 
-Stages 0, 1 and 8 do not depend on the open decisions. Stage 2 needed Q1 and Q2 (decided 2026-10-22: `arena(L, S)`); stage 4 needed Q5 (decided 2026-10-22, with Q15 to Q17); stage 5 needed
+Stages 0, 1 and 8 do not depend on the open decisions. Stage 2 needed Q1 and Q2 (decided 2026-10-22: `arena(L, S)`) and now also waits on chunk 15; stage 4 needed Q5 (decided 2026-10-22, with Q15 to Q17); stage 5 needed
 Q11 (decided 2026-10-23, with Q3 and Q4); stage 7 needed Q7 and Q8 (both decided 2026-10-23). There is no stage 6: the counted-storage stage was removed under Q2 (a) (2026-10-22), and the numbers 7 and 8 are kept so that references stay stable. The ROADMAP gate ("enforced at compile time or halted at run time, never silent;
 the linearity rule holding for a region in a record or tuple; trials; stdlib and compiler at their fixed points under it")
-is met at the end of stage 5 plus the targeted stage 0 fix for H4 named in participate.md. Structures do not reclaim memory, and stage 7 closes
+is met at the end of stage 5 plus the targeted stage 0 fix for H4 named in participate.md. Structures do not reclaim memory unless chunk 15 changes that, and stage 7 closes
 "atomic references".
 
 ---
@@ -774,7 +768,7 @@ A construct that the bootstrap compiler rejects in a batch goes into its own `co
 
 | Code | Cases (one trial each) |
 | --- | --- |
-| E2301 | region used after move into a call; after `spawn` state; after `cast` message; after `call` message; after return in one arm, used after the `case`; record holding a region moved twice in sequence; tuple holding a region used after destructure; device_window used after `spawn_device`; parameter used after passing on; rebinding inside a `case` arm, used outside |
+| E2301 | region used after move into a call; after an explicit `move` into `spawn` state; into a `cast` message; into a `call` message (a plain, copying send leaves the sender's use legal and needs a positive trial instead, Q18); after return in one arm, used after the `case`; record holding a region moved twice in sequence; tuple holding a region used after destructure; device_window used after `spawn_device`; parameter used after passing on; rebinding inside a `case` arm, used outside |
 | E2302 | `read_ref` after the region was moved into a callee that did not return it; `buf_load` after the owning record was sent; ref used after its region was dropped by a `case` arm; ref of a parameter region used after that region was passed on |
 | E2300 | return `ref?(L…)` without the region (H8); return `{ root: ref(L…) }`; return `List[ref(L…), mem(normal)]`; cast a message holding a ref without its region; spawn state holding a ref without its region; a callee returning its borrowed `ref` parameter |
 | E2303 | `f(b, b)`; `(r, r)`; `{ a: r, b: r }` |
@@ -788,7 +782,7 @@ A construct that the bootstrap compiler rejects in a batch goes into its own `co
 | E2313, E2314 | literal size mismatch; literal index 15 into N = 10; negative literal index |
 | E2315–E2317 | `atomic_fetch_add` on a normal ref; atomic cell of a record type; `atomic_load(c, :release)`; ordering passed as a variable |
 | E2318 | `r1 == r2` on regions; `c1 != c2` on refs |
-| E2301, E2303 (moves) | the message-move cases of §18.6: an owned region, or a record holding one, used after `cast`, `call`, `send`, `spawn`; sent in one arm and used after the `case`; replied and kept in the new state; `cast(a, (r, r))` |
+| E2301, E2303 (moves) | the message-move cases of §18.6: an owned region, or a record holding one, used after an explicit `move` into `cast`, `call`, `send`, `spawn`; sent in one arm and used after the `case`; replied and kept in the new state; `cast(a, (r, r))` |
 
 ### 14.2 Run trials
 
@@ -804,12 +798,12 @@ A construct that the bootstrap compiler rejects in a batch goes into its own `co
 | `two_actors_same_family_inserts` | H1: two actors insert 100,000 keys each into their own `wbt_map`; validate both |
 | `reply_after_callee_ended` | H4: read a composite reply after the replying actor was removed |
 | `crashed_actor_regions_released` | §7.3: a worker that allocates a region and divides by zero, restarted 1,000 times; heap growth bounded |
-| `region_moved_between_actors` | an owned region in a `cast` written by the receiver; the sender's list no longer holds it (released once, at the receiver's end) |
+| `region_moved_between_actors` | an owned region in a `cast` with an explicit `move`, written by the receiver; the sender's list no longer holds it (released once, at the receiver's end) |
 | `generic_lifetime_name` | a callee spelled `region(R, normal)` called with `region(L1, normal)` (stage 1) |
 | `buf_bounds_ends_actor` | Q9: an out-of-bounds write in a worker ends the worker, the supervisor restarts it, `main` continues |
 | atomic: `atomic_counter_two_actors`, `atomic_cas_loop`, `atomic_orderings`, on hosts and the board's two cores | §9 |
 | `device_window_moved_once` (board) | window moved into a worker, used there |
-| `no_op_change_returns_unchanged` | per family: identical insert (map, set), delete of an absent key/item, meld with an empty heap, pop of an empty heap, skew-list update out of range, tree replace with the same subtree, graph remove of an absent edge and add of an existing vertex; each returns `:unchanged`, the program carries on with v1 and its contents are intact; no node is allocated (allocator probe). Waits on the result reshaping of §3.14, which no stage carries. |
+| `no_op_change_returns_unchanged` | per family: identical insert (map, set), delete of an absent key/item, meld with an empty heap, pop of an empty heap, skew-list update out of range, tree replace with the same subtree, graph remove of an absent edge and add of an existing vertex; each returns `:unchanged`, the program carries on with v1 and its contents are intact; no node is allocated (allocator probe). Waits on the result reshaping of §3.14, which no stage of chunk 4 carries (chunk 15 owns it). |
 | `change_result_variants` | every tagged alternative of §3.14's result table matched by destructuring (`(:inserted, m2: …)`, `(:replaced, …)`, `(:popped, item, h2)`, `:incompatible`, `:overflow`, `:rejected`), with the old version still used after the match |
 | `persistence_old_versions_valid` | `bt_persistence_sharing` and `bo_old_heap_valid_after_pop` shapes under the stage-5 checker: old versions stay valid after changes |
 | `no_op_change_on_moved_version` | the same no-op changes on a version received from another actor: `:unchanged`, and the sender's copy of the handle is untouched |
@@ -819,7 +813,7 @@ Each existing `region_move_*` and `region_local_release` trial keeps its output 
 
 ---
 
-## 15. Open decisions for Lee
+## 15. Decisions for Lee (all decided; Q13 and Q14 open details are owned by chunk 15)
 
 **Q1. How is a structure's storage handle told apart from an owned region in the type?**
 **Decided by Lee, 2026-10-22: (a), spelled `arena(L, Space)`** (Q2 is (a)): a new non-linear type constructor, accepted by the allocation prims and obtained from `canonical_arena_lookup`; a script renames the stdlib handle fields from `region(L, normal)` to `arena(L, normal)`; the transition rule during stage 2 is removed at stage 5; specification addition S7.
@@ -834,7 +828,7 @@ lifetime name (`app`), so `region(app, normal)` is the structure handle. (c) Inf
 
 Any choice makes S7 a spec addition.
 
-**Q2. How are the standard data structures stored, and is their memory ever given back? — Decided by Lee, 2026-10-22: (a), the never-freed family arena with the atomic bump (stage 0).** Counted storage (biased counting, a size-class allocator, counted list chunks, change-result reshaping at the counted level) is not part of this plan and its design was removed from this document (§17). Consequences: stage 2 spells the handle `arena(L, S)`; structures still never reclaim memory (a 1,000-key map exhausts the ESP32-S3 heap in about 740 updates, a busy host grows by tens of MB/s) until a later project; H4 (replies in the replier's arena) now needs the targeted stage 0 fix already listed in participate.md; biased counting is not needed.
+**Q2. How are the standard data structures stored, and is their memory ever given back? — Decided by Lee, 2026-10-22: (a), the never-freed family arena with the atomic bump (stage 0).** Counted storage (biased counting, a size-class allocator, counted list chunks, change-result reshaping at the counted level) is not part of this plan and its design was removed from this document (§17). Consequences: stage 2 spells the handle `arena(L, S)`; structures still never reclaim memory (a 1,000-key map exhausts the ESP32-S3 heap in about 740 updates, a busy host grows by tens of MB/s) until a later project; H4 (replies in the replier's arena) needed the targeted stage 0 fix listed in participate.md (implemented on the Mac, 2026-10-23); biased counting is not needed.
 The options considered (§17):
 - (a) **Never-freed family arena**, as today: one process-global arena per structure family, with an atomic bump
   (stage 0). Simple and fast, with O(1) meld within a family. Nothing is ever reclaimed.
@@ -842,7 +836,7 @@ The options considered (§17):
 - (c) **Hybrid:** (b) by default, plus an immortal constructor per family.
 - (d) Per-actor arenas freed at actor end: reclaims only on actor end or restart. A long-running actor still grows.
 - (e) One owned region per structure with explicit `compact`: reclamation by hand, and versions die at each compaction.
-Lee chose (a).
+Lee chose (a). Q13 and Q14 (2026-10-23) need structure copies that are freed, which a never-freed arena cannot hold; ROADMAP chunk 15 resolves that tension and is not resolved here.
 
 **Q3. May a function consume a region parameter without returning it? — Decided by Lee, 2026-10-23: (a).** E2305 RegionParameterNotReturned stays reserved and unused.
 (a) Yes: an unreturned, unmoved parameter is dropped and released, as `region_move_pass_no_return` expects today.
@@ -861,7 +855,7 @@ for borrowing is gone. Revisit if real owned-region code shows the threading to 
 destructor of the state type. (c) Nobody: they leak until process end.
 *Recommend (a).* Only it covers regions held in locals at a crash.
 
-**Q6. Messages: move or copy? — Decided by Lee, 2026-10-09: move; narrowed by Q2 (a), 2026-10-22.** An owned region carried by a message, reply or spawn state is moved, and the sender may not use it afterwards (E2301).
+**Q6. Messages: move or copy? — Decided by Lee, 2026-10-09: move; narrowed by Q2 (a), 2026-10-22.** An owned region carried by a message, reply or spawn state is moved, and the sender may not use it afterwards (E2301). **Default superseded by Q18 (2026-10-23): a send copies by default and moves only on request; E2301 then applies only to explicitly moved values.**
 - Every move is an O(1) handle transfer (§7.3).
 - Structure versions are `arena(L, S)` handles (Q1, Q2 a): copyable words over immutable, never-freed nodes. A send passes the handle by value and the sender keeps using its own. Nothing is counted (the biased-counting design of 2026-10-09 was removed with the counted-storage stage, §17).
 - Plain immutable values are copied by the runtime. H4 (a reply in the replier's arena) needs the targeted stage 0 fix.
@@ -879,10 +873,10 @@ Spec changes: §18.5.
 - A loop of such reads over a graph is quadratic in the worst case.
 - Queries over the inner structure (`has_edge`, `neighbors`) are unaffected and need no copy.
 
-*Open detail (not decided):* (1) which arena receives the copy, the caller's arena or the inner type's family arena; (2) the exact signature and spelling, an explicit `copy_to`-style call or `get` copying implicitly. Until Lee answers, neither is chosen.
+*Open detail (not decided; owned by chunk 15):* (1) which arena receives the copy, the caller's arena or the inner type's family arena; (2) the exact signature and spelling, an explicit `copy_to`-style call or `get` copying implicitly. Until Lee answers, neither is chosen.
 
 
-**Q14. May a supervised child's initial state hold a structure version? — Decided by Lee, 2026-10-23: a copy is sent to the child at start and cleaned up when the child dies.** The supervisor's child spec may hold the version. At every start and every restart the child receives a COPY of it, a structural copy built the way `copy_to` builds one (Q15, Q13), and that copy is released when the child dies. This is neither (a) restarts reuse the shared handle (the earlier recommendation) nor (b) E2308 forbids versions in specs. E2308 stays for owned regions (linear, so the row would duplicate the owner). Consequences and OPEN DETAILS (not decided): (1) a copy that is cleaned up at child death cannot live in the never-freed family arena of Q2 (a); it must live in a region the child owns, released by the Q5 per-actor owner list at the child's end, so the child's state then holds data in an owned region, not an `arena(L, S)` handle. How that copy's type is spelled, and how it relates to `arena(L, S)` and to Q16 (a received region may move into state), is undecided. (2) The cost is O(size of the version) per start and per restart, which matters for restart storms. (3) Which side makes the copy (the supervisor at spawn, or the runtime on spawn) and the destination of the copy are undecided. (4) Whether this shows that Q2 (a) needs a per-instance exception for structures that must be freed is for Lee.
+**Q14. May a supervised child's initial state hold a structure version? — Decided by Lee, 2026-10-23: a copy is sent to the child at start and cleaned up when the child dies.** The supervisor's child spec may hold the version. At every start and every restart the child receives a COPY of it, a structural copy built the way `copy_to` builds one (Q15, Q13), and that copy is released when the child dies. This is neither (a) restarts reuse the shared handle (the earlier recommendation) nor (b) E2308 forbids versions in specs. E2308 stays for owned regions (linear, so the row would duplicate the owner). Consequences and OPEN DETAILS (not decided; owned by chunk 15): (1) a copy that is cleaned up at child death cannot live in the never-freed family arena of Q2 (a); it must live in a region the child owns, released by the Q5 per-actor owner list at the child's end, so the child's state then holds data in an owned region, not an `arena(L, S)` handle. How that copy's type is spelled, and how it relates to `arena(L, S)` and to Q16 (a received region may move into state), is undecided. (2) The cost is O(size of the version) per start and per restart, which matters for restart storms. (3) Which side makes the copy (the supervisor at spawn, or the runtime on spawn) and the destination of the copy are undecided. (4) Whether this shows that Q2 (a) needs a per-instance exception for structures that must be freed is for Lee.
 
 
 **Q7. May two actors share atomic memory? — Decided by Lee, 2026-10-23: (a), on all targets.** `region(L, atomic)` is the one named exception to §12.1.6; hosted actors are threads sharing an address space, atomic instructions are ordinary user-mode instructions (already used by the H1 bump loop), and the ESP32-S3 cores use S32C1I. Only the chunk 14 uses (interrupt handlers, DMA, peripheral registers as the second party) are unavailable on hosted OSes and wait for chunk 14.
@@ -921,6 +915,15 @@ is that state may then hold a region that grows with each message, which is the 
 is already E2301). (b) The sender keeps ownership on `actor_not_found`, which contradicts the static moved rule and
 would make a region both moved and not moved after the call. *Recommend (a).* Lee chose (a).
 
+**Q18. Messages: copy by default, move on request. — Decided by Lee, 2026-10-23 (option C).** Supersedes Q6's default. Q6 stays above as history; the move machinery of §18 and §18.7 now serves explicit moves and the copy's own transfer.
+- A send (`cast`, `send`, `call` message, reply, spawn state) COPIES its value by default, for data structures and owned regions. The sender keeps its data. A value the code explicitly marks for moving is transferred in O(1) and the sender may not use it afterwards. E2301 therefore applies to explicitly moved values only (and to function-call moves, which are unchanged: calls still move).
+- The explicit move is spelled `move` (Lee, 2026-10-23, decided). The legacy `move` builtin (an old actor-migration alias; migration is `migrate_actor`) is being removed from the compiler, so there is no collision.
+- **How the copy works (recommended, accepted as part of C):** the sender copies the message into a fresh owned region, and that region then moves to the receiver. The decided machinery applies unchanged: the dispatch-scoped message region dropped at behaviour return unless moved into state (§18.7, SD-7 work stays valid), Q16 move into state, Q17 failed-send release, the mailbox drain. Copying is type-directed: tree-shaped parts are walked with no bookkeeping; a per-message table (source node address to copy) is kept only where the type allows sharing. A raw owned region is copied by traversal from the message's typed roots, not by memcpy, because it holds internal pointers.
+- **Sharing is preserved** across every value in one message, including two versions of a structure sent together (Lee: yes). One node in the source is one node in the copy, so the per-message table is required.
+- **Evacuation** (return from a frame, copy into state at dispatch end, candidate D of the data structure redesign): the source frame is dying, so forwarding pointers may be written into it (no table), preserving sharing. Non-tail recursion would copy a returned version once per frame (quadratic); the direction is destination-passing (build directly where the result is kept, as region passing does) when the compiler sees the value flows to the return, evacuation otherwise. Lee's cleanup-on-pop rule is unchanged.
+- **Later optimisation, only if measured to be needed:** in-place forwarding with an undo log (valid because the sender's data is private and the sender does the copy; needs a spare word or bit per node, which the boxed one-word-per-field record layout may not have; cannot write read-only constants).
+- Consequences: the spec text of §18.5 and spec §12.1.6, §15.1.1, §16.3.5 and the other places that state "messages move" must be revisited (spec not edited in this pass). The `send_then_use_*` error trials of §18.6 apply to explicit `move` sends; plain sends need positive trials that the sender still uses its data. Requirements: [data_structure_redesign_requirements.md](data_structure_redesign_requirements.md) R4.
+
 ---
 
 ## 16. Work breakdown
@@ -936,8 +939,8 @@ quick incremental Mac builds and minimal repros only. Everything else goes to le
 | 3 | 0–8 | every full build (Mac, pix, nix, ESP32 cross), fixed-point runs, `make integrate`, board suites, golden refresh under the rules | Sonnet / Haiku |
 | 4 | 1 | per-call lifetime substitution, E2311, removal of the binder fallback and `device_window` lifetime erasure | **Fable** |
 | 5 | 1 | remove the `L1` workaround comments from trials; `generic_lifetime_name` and E2311 trials | Opus |
-| 6 | 2 | `arena(L, S)` (Q1 a, Q2 a, decided 2026-10-22) through lexer/parser (if needed), interner, type checker, SIR, emitters, no cell ever freed; transition rule | **Fable** |
-| 7 | 2 | stdlib and compiler-source rewrite script: exact-token rewrite of handle field types and allocator tuples only, verified with `git diff` per file, the count reconciled against §1.4's 2,239 | Opus (script), Sonnet (run and verify) |
+| 6 | 2 | (waits on chunk 15) `arena(L, S)` (Q1 a, Q2 a, decided 2026-10-22) through lexer/parser (if needed), interner, type checker, SIR, emitters, no cell ever freed; transition rule | **Fable** |
+| 7 | 2 | (waits on chunk 15) stdlib and compiler-source rewrite script: exact-token rewrite of handle field types and allocator tuples only, verified with `git diff` per file, the count reconciled against §1.4's 2,239 | Opus (script), Sonnet (run and verify) |
 | 8 | 3 | `region_checker/` (ownership state, lifetime liveness, report mode, `silica.config` switch) | **Fable** |
 | 9 | 3 | report collection over stdlib, compiler and `trials/`; triage into misuse vs checker defect | Sonnet |
 | 10 | 4 | `drop_owned` placement in SIR; lowering in four emitters; removal of the heuristics and dead scope-release code; owner lists, transfer and actor-end walk in four runtimes (the walk covers the unprocessed mailbox, §18.7); per-target first-block size; dispatch-end drops for message regions, the partial-move rule, `copy_to` derivation, region release on a failed send and for a dead or timed-out caller (§18.7) | **Fable** |
@@ -972,22 +975,22 @@ the versions and nodes that reach it; (c) (b) by default plus an immortal constr
 freed at actor end; (e) one owned region per structure with an explicit `compact`.
 
 **Chosen by Lee, 2026-10-22: Q2 (a), the never-freed family arena with the atomic bump of stage 0, handle `arena(L, S)`
-(Q1 a).** Counted storage (b, c) is not part of this plan. Its design (per-node counts, biased counting across actors,
+(Q1 a), subject to chunk 15's redesign of structure storage (§0 note).** Counted storage (b, c) is not part of this plan. Its design (per-node counts, biased counting across actors,
 a per-actor size-class allocator, counted list chunks, benchmarks and migration estimates) was in revisions 1.1 to 1.8 of
 this document and was removed in 1.9; version control holds it if the project is reopened. What stays true:
 - structures never reclaim memory until a later project, and the figures above are the cost;
 - H1's atomic arena bump is permanent, not interim;
-- H4 needs its targeted stage 0 fix;
+- H4 needed its targeted stage 0 fix (implemented on the Mac);
 - moves of structure versions are handle passes (§18).
 
-## 18. Messages move: what a move means (Q6, decided)
+## 18. Messages move: what a move means (Q6, decided; default superseded by Q18, 2026-10-23: copy by default, move on request, so this section describes the explicit move and the transfer of the copy)
 
-**Lee's decision, 2026-10-09:** when a message carries a data structure, it is a **move**, not a copy. Since Q2 (a) (2026-10-22) a structure version is a copyable arena handle, so the move applies to owned regions and a version handle is passed by value. The specification
+**Lee's decision, 2026-10-09 (default superseded by Q18, 2026-10-23, which makes a plain send a copy):** when a message carries a data structure, it is a **move**, not a copy. Since Q2 (a) (2026-10-22) a structure version is a copyable arena handle, so the move applies to owned regions and a version handle is passed by value. The specification
 conflict S1 resolves toward §12.1.6.
 
 ### 18.1 The rule at the language level
 
-A value given to any actor-boundary operand is **moved**:
+A value given to any actor-boundary operand is **moved** (since Q18, 2026-10-23, only when explicitly marked `move`; otherwise it is copied and the sender keeps it):
 - a `cast`, `send` or `call` message, and the `_registered` and `_dangerous` forms;
 - a behaviour's reply and its new state;
 - a `spawn` initial state.
@@ -996,15 +999,15 @@ For the classes of §3.1 this means:
 
 | Class of the value | After the send |
 | --- | --- |
-| linear (owned region, `device_window`, aggregates embedding them) | E2301 on any later use (already §3.8) |
-| structure versions (`arena(L, S)` handles, and records, tuples and lists holding them) | usable. A handle is a copyable word over immutable, never-freed nodes; the receiver gets a copy of it and the sender keeps its own. |
+| linear (owned region, `device_window`, aggregates embedding them) | after an explicit `move`, E2301 on any later use (already §3.8); after a plain send the sender keeps its original and the receiver has a copy (Q18) |
+| structure versions (`arena(L, S)` handles, and records, tuples and lists holding them) | usable. A handle is a copyable word over immutable, never-freed nodes; the receiver gets a copy of it and the sender keeps its own. (Q18 says a send copies data structures by default; how that squares with passing the handle is for chunk 15.) |
 | plain values (scalars, atoms, strings, actor references, records/tuples/lists of those) | usable. They are immutable, so a move and a copy cannot be told apart. The runtime copies them into the receiver; the copy out of the replier's arena is the targeted stage 0 fix for H4. |
 
 
-**No use after a send (Lee, 2026-10-22).** It is a compile error, **E2301**, for the sender to do any work with a region
-after it has been sent. "Work" is any use: read, write, pass to a call, return, store in state, send again. The rule
-holds for a region by itself **and** for a region contained in anything else (a record, tuple, list, structure
-version, closure or any aggregate embedding one), and it holds however the region is reached afterwards: through a
+**No use after an explicit move (Lee, 2026-10-22; narrowed to explicit moves by Q18, 2026-10-23).** It is a compile error, **E2301**, for the sender to do any work with a region
+after it has been sent by an explicit `move`. "Work" is any use: read, write, pass to a call, return, store in state, send again. The rule
+holds for a region by itself **and** for a region contained in anything else (a record, tuple, list,
+closure or any aggregate embedding one; a structure version holds an `arena` handle, not an owned region, under Q2 a), and it holds however the region is reached afterwards: through a
 name bound to the aggregate, through a field read from it, or through a copy of the handle. It applies to every
 actor-boundary operand of this section, not only `cast`, `send` and `call`: a **reply** and a **spawn initial state**
 (and a behaviour's new state, once it has been moved out) are sends in the same sense. The error trials are listed in
@@ -1048,6 +1051,8 @@ one lineage concurrently; both allocate from the family arena with the atomic bu
 
 ### 18.4 Calls, replies, state, spawn and supervised restart
 
+Under Q18 (2026-10-23) "moved" in this table means the move of the copy made at the send (the default) or of the original on an explicit `move`; E2301 for the sender applies only to explicit moves.
+
 | Operand | Semantics | Checker |
 | --- | --- | --- |
 | `cast(a, m)`, `send(a, m)` | `m` moved to the receiver at submission, O(1); version handles in it are passed by value | later use of a linear part of `m` is E2301 |
@@ -1059,6 +1064,8 @@ one lineage concurrently; both allocate from the family arena with the atomic bu
 | supervised child spec initial state | an owned region may not be in it (E2308): the supervisor's row keeps the initial state to restart the child, which would duplicate the owner. A structure version may (Q14, decided 2026-10-23): the row keeps the version and each start or restart gives the child a copy (built as `copy_to` builds one), released when the child dies; copy destination and type spelling are open details. | E2308 for an owned region. The `init` code that builds the spec moves its owned values into the spec, and later use is E2301. |
 
 ### 18.5 Specification text to change (not edited here)
+
+The wording proposed in the first rows below is the Q6 wording; Q18 (2026-10-23) changes it to "copied by default, moved only by an explicit `move`" when the specification is edited.
 
 | Section | Change |
 | --- | --- |
@@ -1077,7 +1084,7 @@ one lineage concurrently; both allocate from the family arena with the atomic bu
 | Code | Case |
 | --- | --- |
 | E2303 | an owned region kept in the new state and also replied; kept and sent through `cast`; kept and sent through `call`'s argument; kept and replied inside a record; `cast(a, (r, r))` |
-| E2301 (no use after a send, §18.1, **not written**) | `send_then_use_bare_region`; `send_then_use_region_in_record`; `send_then_use_region_in_tuple`; `send_then_use_region_in_list_element`; `send_then_use_region_in_structure_version`; `send_then_use_via_field_read` (a field read from the aggregate after the send); `send_then_use_via_name_alias` and `send_then_use_via_handle_copy` (a copy of the handle); `send_then_use_region_in_closure`; `send_then_use_in_later_case_branch` (sent in one arm or before the `case`, used in a later branch); `send_then_use_in_loop` and `send_then_use_in_recursion` (sent in an iteration, used in the next, or by the recursive call). Each is repeated for `cast`, `send`, `call`, a reply and a spawn state, and for each of read, write, pass to a call, return, store in state and send again |
+| E2301 (no use after an explicit `move` send, §18.1, **not written**; plain sends need positive trials that the sender still uses its data) | `send_then_use_bare_region`; `send_then_use_region_in_record`; `send_then_use_region_in_tuple`; `send_then_use_region_in_list_element`; `send_then_use_via_field_read` (a field read from the aggregate after the send); `send_then_use_via_name_alias` and `send_then_use_via_handle_copy` (a copy of the handle); `send_then_use_region_in_closure`; `send_then_use_in_later_case_branch` (sent in one arm or before the `case`, used in a later branch); `send_then_use_in_loop` and `send_then_use_in_recursion` (sent in an iteration, used in the next, or by the recursive call). Each is repeated for `cast`, `send`, `call`, a reply and a spawn state, and for each of read, write, pass to a call, return, store in state and send again |
 | E2308 | child spec whose initial state holds an owned region |
 
 **Run trials:**
@@ -1094,20 +1101,20 @@ one lineage concurrently; both allocate from the family arena with the atomic bu
 | `copy_to_rebuilds_in_state_region` | **not written** (§18.7). The behaviour copies a part of the message value into the state region with `copy_to`; the message region is dropped at return, the copy is intact in the next dispatch, its type carries the state's lifetime, and a 100,000-message run keeps RSS bounded by the state. |
 | `partial_move_of_region_out_of_message_record` | **not written** (§18.7). A message `{ r: region, root: ref? }` is received; the behaviour moves `r` out of it into the state (partial move). The remaining fields may not be used afterwards where they borrow `r` (E2301), and `r` is released exactly once. |
 | `crashed_actor_queued_message_regions_released` | **not written** (§18.7, H9). Messages with owned regions are queued to a worker that faults on its first dispatch; the supervisor restarts it 1,000 times. The regions of the unprocessed mailbox are released with the actor; heap growth is bounded. Fails today. |
-| `send_to_dead_actor_releases_region` | **not written** (§18.7). A `cast`, a `send` and a `call` with a region to a removed actor return `actor_not_found`; the sender may not use the region (E2301) and the runtime releases it; 100,000 repetitions, RSS flat. |
+| `send_to_dead_actor_releases_region` | **not written** (§18.7). A `cast`, a `send` and a `call` with a region to a removed actor return `actor_not_found`; the runtime releases the region that moved (the copy, or the original on an explicit `move`, where the sender may not use it, E2301); 100,000 repetitions, RSS flat. |
 | `timed_out_call_late_reply_region_released` | **not written; blocked on chunk 11** (`call_with_timeout` is not started). A call times out; the callee's later reply carries a region; the runtime discards the reply and releases the region. |
 | `caller_dies_reply_region_dropped` | **not written** (§18.7). A caller is removed while awaiting a reply; the callee replies with a region; the region is dropped, not leaked, and not freed twice. |
 
-**Error trials** (added by §18.7, **not written**): `message_ref_stored_in_state_without_copy_to_is_error` (a ref carrying the message region's lifetime stored into state typed with the state's lifetime is the lifetime error, and the program with `copy_to` compiles); `copy_to_rejected_for_device_window_and_atomic` (`copy_to` of a `device_window` or an atomic cell is rejected); the sender's later use of a region after the send is E2301, also when the send fails at run time.
+**Error trials** (added by §18.7, **not written**): `message_ref_stored_in_state_without_copy_to_is_error` (a ref carrying the message region's lifetime stored into state typed with the state's lifetime is the lifetime error, and the program with `copy_to` compiles); `copy_to_rejected_for_device_window_and_atomic` (`copy_to` of a `device_window` or an atomic cell is rejected); the sender's later use of a region after an explicit `move` send is E2301, also when the send fails at run time.
 
 ### 18.7 Dispatch-scoped message regions and explicit `copy_to` (Lee, 2026-10-22)
 
-**Decision.** The regions a message carries are **moved on send** and are **dispatch-scoped** in the receiver. Keeping
+**Decision.** The regions a message carries are **moved on send** (since Q18, 2026-10-23: the sender's copy of the message is the region that moves, or the original when the send is an explicit `move`) and are **dispatch-scoped** in the receiver. Keeping
 anything past the dispatch is explicit. This is the plan for messages that carry regions; it fixes BEES's SD-7 (a
 region received in a message is never freed while the actor lives) without later reclamation.
 
 **1. Move on send.** The no-use-after-send rule of §18.1 (E2301 for any use of the region, bare or embedded, by name, field read or handle copy, on `cast`, `send`, `call`, reply and spawn state) is the static half of this section. A message's owned regions (and the aggregates embedding them) change owner in O(1): a handle
-transfer (§7.3's `_silica_rt_region_transfer`), no byte copied. The sender's later use is E2301, as §3.8 and §18.1
+transfer (§7.3's `_silica_rt_region_transfer`), no byte copied. The sender's later use of an explicitly moved region is E2301, as §3.8 and §18.1
 already decide. Replies follow the same rule: a reply's regions belong to the caller's continuation, that is, the
 binding that receives the `call` result owns them (§18.4), and are dispatch-scoped there in the same way.
 
@@ -1128,13 +1135,13 @@ message part that goes nowhere.
 
 Nothing is implicit. A `ref` that carries the message region's lifetime, stored into state typed with the state's
 lifetime, is the **existing lifetime error** (§4); it is what forces the explicit `copy_to`, and no new code is needed
-for it. A sender that wants to keep data calls `copy_to` before sending (a visible O(n)); sending never copies.
+for it. Under Q18 a plain send copies and the sender keeps its data; only an explicit `move` gives it up, and a sender that moves but still wants the data calls `copy_to` before the move (a visible O(n)).
 
 **4. By value class.**
 
 | Class of the message part | Send | Keep past the dispatch |
 | --- | --- | --- |
-| owned region, or an aggregate embedding one | move | move the whole into the state, or `copy_to` a part |
+| owned region, or an aggregate embedding one | copy into a fresh owned region that moves (Q18); an explicit `move` sends the original | move the whole into the state, or `copy_to` a part |
 | arena structure version (Q2 a) | handle pass by value (§18.3) | store the handle |
 | plain scalars, atoms, strings | copy (§18.1) | already a copy |
 
@@ -1167,9 +1174,8 @@ have trials in §18.6.
 - **(iv) The caller dies awaiting a reply.** The reply's regions are dropped when the reply is delivered to a dead
   caller, as in (ii).
 - **(v) A worker dies holding the only copy.** Nothing is recovered: a region received and not yet moved into state
-  dies with the worker, and its sender no longer has it. A sender that needs the data to survive the receiver's crash
-  must `copy_to` before sending and keep the copy. This is the pattern, as in BEAM (messages are copied, and the sender
-  keeps its own). Documented here and in the language guide, not enforced.
+  dies with the worker, and its sender no longer has it. Under Q18 a plain send already copies, so the sender keeps its own data, as in BEAM; a sender that sent with an explicit `move`
+  and needs the data to survive the receiver's crash must `copy_to` before the move and keep the copy. Documented here and in the language guide, not enforced.
 
 **8. What this changes in the plan.**
 
@@ -1197,7 +1203,6 @@ have trials in §18.6.
 - §18.1's table row for plain values says the runtime copies them into the receiver; with the drop at dispatch end,
   a plain value inside a message that also holds a region is copied with the message and remains usable in the state
   only if it does not borrow the region (see 5).
-- §14.2 lists `shared_owner_ends_first` twice in its last row.
 
 ---
 
@@ -1223,7 +1228,7 @@ whose value must outlive the frame that made it:
 On a long-lived actor these grow without bound even when the copy is dead at once (an argument a callee only
 reads) or when the structure holding it later drops it. Lee decided (2026-10-12) not to patch these case by
 case in the emitters: reclaiming them needs to know when the last reference is gone, which is this chunk's
-ownership model (ownership of owned regions, messages move, versions only by a change). The chunk-4 implementation
+ownership model (ownership of owned regions, messages copy by default and move on request (Q18), versions only by a change). The chunk-4 implementation
 must cover every case above, with a zero-growth trial for each (the zero_heap_growth_* trials in
 actors_addition and the *_frees_heap trials in stack_budget_board_addition are the pattern).
 
@@ -1231,6 +1236,8 @@ actors_addition and the *_frees_heap trials in stack_budget_board_addition are t
 
 | Version | Date | Changes |
 | --- | --- | --- |
+| 1.20 | 2026-10-23 | Consistency cleanup after Q18 and stage 0, no new decisions. Implementation-status paragraph rewritten (stage 0 implemented on the Mac and built on pix and nix; E2313/E2314 literal checks; first SD-7 release); H1 row (hosted carriers, fixed) and the §1.3 intro; H10 and S1 rows; chunk 15 noted wherever the never-freed family arena is stated as settled (§0, §2, §3.14, §12, §13 stages 2, §15 Q2/Q13/Q14, §16 items 6-7, §17, §18.1); Q18 applied to the stale "messages move / E2301 after a send" text (§2, §3.2, §3.13 spawn example now `move((r, 0))`, §7.3, §12, §14.1, §14.2, §15 heading, §18 lead, §18.1, §18.4, §18.5, §18.6, §18.7 items 1, 3, 4, 7(v), §19); `alloc_atomic` text brought to Q8; the `send_then_use_region_in_structure_version` trial dropped (a version holds an arena handle, not an owned region); the stale note about a duplicated `shared_owner_ends_first` row removed (the row went in 1.9); §15 heading no longer says decisions are open. Conflicts that need Lee are reported separately, not resolved here. Spec not edited. |
+| 1.19 | 2026-10-23 | Q18 (Lee, option C): messages copy by default, move on request (explicit move spelled `move`; the legacy `move` builtin is being removed). The copy is made into a fresh owned region that then moves to the receiver, so §18.7, Q16 and Q17 stand; sharing is preserved by a per-message table; evacuation uses forwarding pointers in the dying frame, destination-passing preferred. E2301 narrowed to explicitly moved values in §3.8, §10, §18 and §18.7; Q6 kept as history. Spec not edited. |
 | 1.18 | 2026-10-23 | Lee is not happy with the design of the standard data structures: ROADMAP chunk 15 (data structure redesign: ownership, copy and release) added, with the decisions of 2026-10-22/23 as requirements, none provisional. Note at the top of §0; stage 2 (structure handle type) waits on chunk 15, which takes over the stdlib rename, H9 and the §3.14 change-result reshaping. Q13 and Q14 open details are owned by chunk 15. |
 | 1.17 | 2026-10-23 | Lee's decision of 2026-10-23: Q14, a copy is sent to the child at start and cleaned up when the child dies. The supervisor's child spec may hold a structure version; every start and restart gives the child a structural copy (built as `copy_to` builds one, Q15, Q13), released at the child's death; neither (a) reuse of the handle nor (b) E2308 for versions; E2308 stays for owned regions. §0, §3 and §7 text, §15 Q14 and the trial row updated. Every §15 decision is now made. Open details, not decided: Q13, which arena receives the copy and the spelling; Q14, (1) the copy cannot live in the never-freed family arena (Q2 a), so it needs a child-owned region freed by the Q5 owner list, and its type spelling and relation to `arena(L, S)` and Q16 are undecided, (2) O(size) cost per start and restart (restart storms), (3) whether the supervisor or the runtime makes the copy and its destination, (4) whether Q2 (a) needs a per-instance exception for structures that must be freed (for Lee). |
 | 1.16 | 2026-10-23 | Lee's decision of 2026-10-23: Q13, a structural copy. Reading an inner structure version out of a container (a graph's adjacency set from `get`) returns a copy built the way `copy_to` builds one (Q15), not the stored arena handle; neither (a) return the handle nor (b) queries only. Recorded consequences: O(size of the inner structure) per read; arenas are never freed (Q2 a), so each read leaves a copy behind; a loop of reads over a graph is quadratic in the worst case; the stored original is untouched; queries need no copy. Open detail, not decided: which arena receives the copy (caller's or the inner type's family arena) and the spelling (explicit `copy_to`-style call or implicit in `get`). Q14 is now the only open decision of §15. |
