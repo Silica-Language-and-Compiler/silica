@@ -770,7 +770,7 @@ linux_aarch64 and linux_x86_64 (lock-step), and with a green ESP32 cross build a
 | **1. Lifetime polymorphism** | §5 option A: per-call substitution, E2311 | yes, relaxing only (accepts more) | trials that spell a generic `R` pass; the `L1` workaround comments go from the trials; fixed points. Nothing in the compiler's source needs it. |
 | **2. Structure handle type** | Q1's spelling for the structure storage Q2 chooses (recommended `counted(L, S)`): type checker, interner, SIR, emitters. In this stage **every cell is immortal** (the §17.8 sentinel), so run-time behaviour is today's arena exactly and the fixed points cannot move. The constructors' `canonical_arena_lookup` result is accepted into the new type, and during the transition also into a `region` binding (a named transition rule, removed at stage 5). **Publish.** Then a script rewrites the stdlib's handle fields and allocator tuples (2,239 record types, 34 tuples, the `x.region` lets) and the 25 compiler modules' inline map types, verified with `git diff`, not the masked regex view (memory note). | yes | stdlib, `ordered_data_structures` and the compiler build; fixed points with the rewritten source |
 | **3. Region checker, report-only** | §11 checker behind a `silica.config` switch (`region_check: report`), writing `<unit>.regions` reports, no diagnostics, so no golden changes. For counted values it reports where it would place `dup` and which parameters it infers as borrows (§17.5). | no (reports only) | reports over the stdlib and the compiler show **no linear misuse**; reports over `trials/` are reviewed, and every entry is either a real misuse (it becomes an error trial in §14) or a checker defect (fixed); the dup and borrow reports for `wbt_map` are reviewed by hand against §17.3. Board trial sources are included. |
-| **4. Drops and owner lists** | §7.1 `drop_owned` in SIR and emitters for owned regions; remove the heuristics; §7.3 runtime owner lists and transfers; the per-target first-block size | no | §14.2 release trials (write-every-page) on every host and the board; `memory_region_addition` and `actors_addition` unchanged; `.ascomp` goldens refreshed only where `.sout` = `.scout`; fixed points |
+| **4. Drops and owner lists** | §7.1 `drop_owned` in SIR and emitters for owned regions; remove the heuristics; §7.3 runtime owner lists and transfers; the per-target first-block size; **message regions (§18.7):** `drop_owned` at behaviour return for a message's owned regions unless they flow into the new state, partial move out of a message record, `copy_to`, release on a failed send, reply regions dropped for a dead or timed-out caller, and the actor-end walk covering the unprocessed mailbox | no (`copy_to` is a new builtin or trait method, Q15) | §14.2 release trials (write-every-page) on every host and the board; the message-region trials of §18.6 (`message_region_released_at_dispatch_end` and the others except the chunk-11 one); `memory_region_addition` and `actors_addition` unchanged; `.ascomp` goldens refreshed only where `.sout` = `.scout`; fixed points |
 | **5. Errors on** | `region_check` defaults to `error`; the transition rule from stage 2 is removed; E2300–E2319 error trials wired | yes | the compiler's own source passed stage 3 clean, so it builds; fixed points; the error suite is green on the three hosts |
 | **6. Counted structure storage** (Q2 c, §17) | 6a runtime, four targets: per-actor size-class allocator with remote-free lists and abandoned slabs; the biased-counting header and protocol (§18.2: owner test, plain owner count, atomic shared count, count queue with count-only dispatch, merge at actor end); `silica_rt_counted_release`; counted list chunks; the immortal sentinel kept. 6b compiler: `dup_counted` placement and `drop_owned` for counted values, borrow inference recorded in `.iface`, generated per-shape release functions, E2319. 6c moves across actors (§18): O(1) handle transfer of every version with no node copied, biased counting for shared nodes (§18.2), E2303 for keep-and-give-away (Q12), E2308 for versions in child specs, the copy of plain values into the receiver (closes H4), and crash cleanup maps at call and failure sites so a crash drops its frames' references. 6d stdlib by hand (≈ 20 sites, §17.7): constructors obtain counted storage and gain `empty_immortal`-style variants; meld's same-arena test goes. Under §3.14 (option A), also the **change-result reshaping**: every stdlib change (367 updaters, all families) returns `:unchanged | (:tag, V…) | …` instead of a flagged record; the ≈ 69 no-op return paths return `:unchanged`; the callers that inspect today's flags (≈ 300 in `trials/`, 55 in the compiler, through 18 compiler insert sites and `compiler_maps@map_insert_or_get_index`) become `case` matches. A script can rewrite the result types and the simple `r.inserted`/`r.map` caller shapes; the no-op paths and the callers that use the flag in other ways are by hand. The traits change only where a provided method calls a change (they are queries). Bootstrap: the compiler's own sources adopt the new shapes only after a published compiler compiles tagged-tuple sum results of qualified generic calls correctly. A trial of exactly that is in stage 6's gate, since the seed once rejected tagged-sum returns. Persistence trials and the 149 trial calls that reuse old versions stay valid. Supervised child specs holding versions are rejected (E2308, Q14). ⟶ Expect most of the stage-6 hand work here. | yes (constructor variants; E2319) | the §17.6 benchmarks run under (a) and (c) on all hosts and the board; `board_map_update_forever` keeps the heap free total flat; `ordered_data_structures` green unchanged; fixed points (the compiler's output must not depend on its storage choice) |
 | **7. Atomics** (after stage 1, parallel to 3–6) | §9: builtins, lowering on four targets, shared atomic regions per Q7 | yes | the atomic run trials plus two-actor counter and CAS trials on the hosts and both board cores |
@@ -963,6 +963,19 @@ parameters, or bracket generics. Either way §4.4.1/§12.1.4's sentence changes.
 (a) No (E2307). (b) Yes, with a linear-aware generic checker.
 *Recommend (a)* now. No stdlib or compiler code needs it.
 
+**Q15. How is `copy_to` spelled? (§18.7, 2026-10-22)** (a) A compiler builtin `copy_to(region, value)`, derived per type
+like `recreate`. (b) A derived trait method (a `Copyable` trait beside `Recreatable`), so a library type may refine
+it. *Open.* The builtin is the smaller change; the trait follows the FFI wrapper spec's `Recreatable` precedent and
+lets a type reject the copy. Either way a `device_window` and an atomic cell have none.
+
+**Q16. May a behaviour move a whole received region into its state? (§18.7)** (a) Yes: the state owns it, no drop, O(1).
+(b) No: only `copy_to`. *Recommend (a)*: it keeps the move O(1) and is the same ownership transfer as the send. The cost
+is that state may then hold a region that grows with each message, which is the program's choice.
+
+**Q17. Who owns a region when a send fails? (§18.7)** (a) The runtime releases it on the failed send (the sender's use
+is already E2301). (b) The sender keeps ownership on `actor_not_found`, which contradicts the static moved rule and
+would make a region both moved and not moved after the call. *Recommend (a).* Record Lee's choice here.
+
 ---
 
 ## 16. Work breakdown
@@ -982,8 +995,8 @@ quick incremental Mac builds and minimal repros only. Everything else goes to le
 | 7 | 2 | stdlib and compiler-source rewrite script: exact-token rewrite of handle field types and allocator tuples only, verified with `git diff` per file, the count reconciled against §1.4's 2,239 | Opus (script), Sonnet (run and verify) |
 | 8 | 3 | `region_checker/` (ownership state, lifetime liveness, dup and borrow placement for counted values, report mode, `silica.config` switch) | **Fable** |
 | 9 | 3 | report collection over stdlib, compiler and `trials/`; triage into misuse vs checker defect; hand review of the `wbt_map` dup and borrow report | Sonnet |
-| 10 | 4 | `drop_owned` placement in SIR; lowering in four emitters; removal of the heuristics and dead scope-release code; owner lists, transfer and actor-end walk in four runtimes; per-target first-block size | **Fable** |
-| 11 | 4 | release trials (write-every-page), `crashed_actor_regions_released`, `region_moved_between_actors` | Opus |
+| 10 | 4 | `drop_owned` placement in SIR; lowering in four emitters; removal of the heuristics and dead scope-release code; owner lists, transfer and actor-end walk in four runtimes (the walk covers the unprocessed mailbox, §18.7); per-target first-block size; dispatch-end drops for message regions, the partial-move rule, `copy_to` derivation, region release on a failed send and for a dead or timed-out caller (§18.7) | **Fable** |
+| 11 | 4 | release trials (write-every-page), `crashed_actor_regions_released`, `region_moved_between_actors`, and the message-region trials of §18.6 (§18.7; the timed-out-call trial waits on chunk 11) | Opus |
 | 12 | 5 | switch to errors; E2300–E2319 messages and metadata; `error_codes.md` and `.jsonld` entries | **Fable** (code); Sonnet (registry text) |
 | 13 | 5 | the §14.1 error catalogue, goldens re-derived from real output | Opus (sources), Sonnet (goldens) |
 | 14 | 6a | per-actor size-class allocator (remote-free lists, abandoned slabs); biased-counting header and protocol (owner test, count queue, count-only dispatch, merge at actor end); `silica_rt_counted_release`; counted list chunks; immortal sentinel; in four runtimes | **Fable** |
@@ -1250,6 +1263,18 @@ For the classes of §3.1 and §17.5 this means:
 | immortal versions (hybrid) | E2301, the same rule: the language does not distinguish them |
 | plain values (scalars, atoms, strings, actor references, records/tuples/lists of those) | usable. They are immutable, so a move and a copy cannot be told apart. The runtime copies them into the receiver, which closes H4. |
 
+**No use after a send (Lee, 2026-10-22).** It is a compile error, **E2301**, for the sender to do any work with a region
+after it has been sent. "Work" is any use: read, write, pass to a call, return, store in state, send again. The rule
+holds for a region by itself **and** for a region contained in anything else (a record, tuple, list, structure
+version, closure or any aggregate embedding one), and it holds however the region is reached afterwards: through a
+name bound to the aggregate, through a field read from it, or through a copy of the handle. It applies to every
+actor-boundary operand of this section, not only `cast`, `send` and `call`: a **reply** and a **spawn initial state**
+(and a behaviour's new state, once it has been moved out) are sends in the same sense. The error trials are listed in
+§18.6 (`send_then_use_*`).
+
+The lifetime of a moved owned region after it arrives, and how a receiver keeps data past the dispatch, are in §18.7
+(Lee, 2026-10-22): the regions are dispatch-scoped, and keeping anything is explicit.
+
 **Only a change makes a version (Lee, 2026-10-09; §3.14).** A send, a reply, a spawn state and a new state each move
 the one version they are given; none of them creates another, and the runtime never duplicates a version on the way.
 A change borrows its input and returns either `:unchanged` or a new version (§3.14), so every version has exactly one
@@ -1433,6 +1458,7 @@ nodes immortal, from the shared arena with stage 0's atomic bump. Their interact
 | `call` reply `(:reply, r, s)` | `r` moved from the callee to the caller, by the same transfer; the caller's binding owns it | a callee that replies with a version and keeps the same version in `s` is E2303, with no escape hatch (Q12); reply with a version derived from the state instead (§18.1) |
 | behaviour new state `s` | stays in the actor: no transfer, no walk | the state's linear and counted parts must each end in exactly one of reply, new state, a send, or a drop |
 | `spawn(st, beh, policy)` | `st` moved to the new actor at spawn: O(1) for an unshared version; §18.2 otherwise | later use is E2301 (replaces `"moved_region"`) |
+| owned regions in a `cast`/`send`/`call` message or a reply | moved on send (O(1) handle transfer); **dispatch-scoped** in the receiver: dropped at behaviour return unless moved into the new state, or the needed part is rebuilt with `copy_to`. Failure paths (dead receiver, timed-out call, dead caller, crashed receiver with queued messages) release the region in the runtime. All in §18.7 | E2301 for the sender's later use; `drop_owned` placed at behaviour return; lifetime error for a message ref stored into state without `copy_to` |
 | supervised child spec initial state | **may not hold a structure version** (E2308, extended; Q14, re-evaluated under option A). The supervisor's row keeps the initial state to restart the child, so every start would need its own version, and a restart is not a change; moving the row's version into the child leaves nothing for the next restart, and sharing the handle is E2303's keep-and-give-away. A child that needs a structure builds it in its first dispatch, or receives it by message. | E2308 for an owned region (as before) and for a structure version, or any value holding one, in a child spec's initial state. The `init` code that builds the spec moves its values into the spec, and later use is E2301. |
 
 One alternative is rejected regardless of §18.2: making the initial state immortal at registration. Each supervisor
@@ -1459,6 +1485,7 @@ board's budget plan measures (its §13).
 | --- | --- |
 | E2301 | version used after `cast`; after `call` argument; after `send`; after `spawn` state; record holding a version used after `cast`; list of versions used after `cast`; version sent in one `case` arm, used after the `case`; immortal version used after `cast` |
 | E2303 | keep-and-reply: `(:reply, state, state)`; keep-and-send: `cast(peer, state)` then `(:no_reply, state)`; keep-and-send through `call`'s argument; keep-and-reply with a record holding the version; `cast(a, (m, m))` |
+| E2301 (no use after a send, §18.1, **not written**) | `send_then_use_bare_region`; `send_then_use_region_in_record`; `send_then_use_region_in_tuple`; `send_then_use_region_in_list_element`; `send_then_use_region_in_structure_version`; `send_then_use_via_field_read` (a field read from the aggregate after the send); `send_then_use_via_name_alias` and `send_then_use_via_handle_copy` (a copy of the handle); `send_then_use_region_in_closure`; `send_then_use_in_later_case_branch` (sent in one arm or before the `case`, used in a later branch); `send_then_use_in_loop` and `send_then_use_in_recursion` (sent in an iteration, used in the next, or by the recursive call). Each is repeated for `cast`, `send`, `call`, a reply and a spawn state, and for each of read, write, pass to a call, return, store in state and send again |
 | E2308 | child spec whose initial state holds an owned region; one whose initial state holds a structure version |
 
 **Run trials:**
@@ -1478,6 +1505,116 @@ board's budget plan measures (its §13).
 | `supervised_child_builds_state_per_start` | a child that builds a 1,000-entry map in its first dispatch crashes and restarts 1,000 times; heap growth flat (the crashed instance's versions are released) |
 | `move_two_cores` (board) | sender and receiver pinned to different cores, moving and updating versions derived from one lineage for 10⁵ rounds; validate both; heap returns to baseline |
 | `owner_migrates_between_cores` (board) | the owner is moved by `migrate_actor` to the other core while a receiver on the first core holds shared nodes; both keep updating and dropping; the owner stays the owner (plain counts on its nodes), heap returns to baseline |
+| `message_region_released_at_dispatch_end` | **not written** (§18.7; write-every-page, the SD-7 shape). A receiver is cast 100,000 messages, each holding an owned region of several pages, and writes every page; it keeps nothing. RSS stays flat. Fails today (SD-7). |
+| `message_region_moved_into_state_not_dropped` | **not written** (§18.7). The behaviour moves the message's whole region into the new state; no `drop_owned` is placed on that path, the region is read intact by the next dispatch, and it is released once, at the actor's end. |
+| `copy_to_rebuilds_in_state_region` | **not written** (§18.7). The behaviour copies a part of the message value into the state region with `copy_to`; the message region is dropped at return, the copy is intact in the next dispatch, its type carries the state's lifetime, and a 100,000-message run keeps RSS bounded by the state. |
+| `partial_move_of_region_out_of_message_record` | **not written** (§18.7). A message `{ r: region, root: ref? }` is received; the behaviour moves `r` out of it into the state (partial move). The remaining fields may not be used afterwards where they borrow `r` (E2301), and `r` is released exactly once. |
+| `crashed_actor_queued_message_regions_released` | **not written** (§18.7, H9). Messages with owned regions are queued to a worker that faults on its first dispatch; the supervisor restarts it 1,000 times. The regions of the unprocessed mailbox are released with the actor; heap growth is bounded. Fails today. |
+| `send_to_dead_actor_releases_region` | **not written** (§18.7). A `cast`, a `send` and a `call` with a region to a removed actor return `actor_not_found`; the sender may not use the region (E2301) and the runtime releases it; 100,000 repetitions, RSS flat. |
+| `timed_out_call_late_reply_region_released` | **not written; blocked on chunk 11** (`call_with_timeout` is not started). A call times out; the callee's later reply carries a region; the runtime discards the reply and releases the region. |
+| `caller_dies_reply_region_dropped` | **not written** (§18.7). A caller is removed while awaiting a reply; the callee replies with a region; the region is dropped, not leaked, and not freed twice. |
+
+**Error trials** (added by §18.7, **not written**): `message_ref_stored_in_state_without_copy_to_is_error` (a ref carrying the message region's lifetime stored into state typed with the state's lifetime is the lifetime error, and the program with `copy_to` compiles); `copy_to_rejected_for_device_window_and_atomic` (`copy_to` of a `device_window` or an atomic cell is rejected); the sender's later use of a region after the send is E2301, also when the send fails at run time.
+
+### 18.7 Dispatch-scoped message regions and explicit `copy_to` (Lee, 2026-10-22)
+
+**Decision.** The regions a message carries are **moved on send** and are **dispatch-scoped** in the receiver. Keeping
+anything past the dispatch is explicit. This is the plan for messages that carry regions; it fixes BEES's SD-7 (a
+region received in a message is never freed while the actor lives) without later reclamation.
+
+**1. Move on send.** The no-use-after-send rule of §18.1 (E2301 for any use of the region, bare or embedded, by name, field read or handle copy, on `cast`, `send`, `call`, reply and spawn state) is the static half of this section. A message's owned regions (and the aggregates embedding them) change owner in O(1): a handle
+transfer (§7.3's `_silica_rt_region_transfer`), no byte copied. The sender's later use is E2301, as §3.8 and §18.1
+already decide. Replies follow the same rule: a reply's regions belong to the caller's continuation, that is, the
+binding that receives the `call` result owns them (§18.4), and are dispatch-scoped there in the same way.
+
+**2. Dispatch scope.** The receiver owns the message's regions for the length of that behaviour call. The checker
+places a `drop_owned` (§7.1) for each of them at behaviour return, unless the region flowed into the new state. No
+runtime test and no reference counting are involved; this is the static ownership rule of §3.8 ("each linear part of
+`msg` must be in the reply, in the new state, moved elsewhere, or dropped") with the drop made the default for a
+message part that goes nowhere.
+
+**3. Keeping data past the dispatch.** Two ways, both explicit:
+
+- (a) **Move the whole region into the new state.** The state then owns the region; there is no drop on that path. O(1).
+- (b) **`copy_to(state_region, value)`**: a compiler-derived copy that rebuilds `value` in the state's region and
+  returns it typed with the state's lifetime. It is built on the same derivation machinery as the Recreatable
+  `recreate` of the FFI wrapper specification (§7.7), the compiler walking the value's type. It is O(size of the
+  value), visibly. There is no `copy_to` for a `device_window` or an atomic cell (they are neither copyable nor
+  rebuildable); using one is a compile error.
+
+Nothing is implicit. A `ref` that carries the message region's lifetime, stored into state typed with the state's
+lifetime, is the **existing lifetime error** (§4); it is what forces the explicit `copy_to`, and no new code is needed
+for it. A sender that wants to keep data calls `copy_to` before sending (a visible O(n)); sending never copies.
+
+**4. By value class.**
+
+| Class of the message part | Send | Keep past the dispatch |
+| --- | --- | --- |
+| owned region, or an aggregate embedding one | move | move the whole into the state, or `copy_to` a part |
+| immortal arena structure version (Q2 a, or the hybrid's immortal constructors) | handle pass (a move in the language, §18.3) | store the handle |
+| counted structure version (Q2 b or c) | move (§18.1, §18.2) | move it into the state |
+| plain scalars, atoms, strings | copy (§18.1) | already a copy |
+
+**5. Partial move.** A message such as `{ r: region, root: ref? }` moves as a unit; the receiver binds `r` and `root`
+by destructuring. The checker needs a rule for pulling the region out of an aggregate: **moving a linear field out of a
+record or tuple parameter is a partial move.** It consumes that field; the other fields stay usable, except that a
+`ref` whose lifetime is the moved region's cannot be used after the region has been moved into the state or dropped
+(E2301 on the remaining fields that borrow it). The aggregate as a whole is not usable after a partial move. This rule
+is new to §3.4 (§3.4 states only the whole-aggregate case) and has to be added there when stage 3 implements it.
+
+**6. Cross-core receivers.** The receiving carrier or core must be able to free the region's blocks: on the hosts
+they come back by the remote-free lists of stage 6a (per-actor size-class allocator), or by the plain region destroy
+when the region is a whole `alloc_region` block chain; the receiver's drop does not require the sender's thread. The
+board heap is not checked by this section (it is one heap under the scheduler lock, §7.3).
+
+**7. Failure paths.** The design had not covered the following. All of them belong to stage 4 (§13, §16 item 10) and
+have trials in §18.6.
+
+- **(i) Mailbox drain at actor end.** The actor-end owner-list walk (§7.3) must include the regions in the actor's
+  **unprocessed mailbox** as well as those in its state and locals. Today a crashed actor leaks them (H9). Whether
+  they are already on the receiver's list depends on when the transfer links them (at submission, as §7.3 says, or at
+  dispatch); stage 4 must pick submission, so the walk covers them with no mailbox traversal, and must show it by
+  `crashed_actor_queued_message_regions_released`.
+- **(ii) Failed send.** A `cast`, `send` or `call` to a dead actor returns `actor_not_found`. The sender cannot use the
+  moved region (E2301 is static and cannot know the send failed), so **the runtime releases the region on the failed
+  send**. The alternative, keeping ownership with the sender on failure, would contradict the static moved rule: the
+  checker would have to treat the region as both moved and not moved. Recorded as an open choice in Q17.
+- **(iii) A timed-out call.** Under `call_with_timeout` (chunk 11, not started) the late reply is discarded; its
+  regions must be released at that point. The trial is blocked on chunk 11.
+- **(iv) The caller dies awaiting a reply.** The reply's regions are dropped when the reply is delivered to a dead
+  caller, as in (ii).
+- **(v) A worker dies holding the only copy.** Nothing is recovered: a region received and not yet moved into state
+  dies with the worker, and its sender no longer has it. A sender that needs the data to survive the receiver's crash
+  must `copy_to` before sending and keep the copy. This is the pattern, as in BEAM (messages are copied, and the sender
+  keeps its own). Documented here and in the language guide, not enforced.
+
+**8. What this changes in the plan.**
+
+- Biased counting (§18.2) is needed only if counted storage (Q2 b or c) is chosen; for owned regions and for the
+  immortal arena (Q2 a) there is no count.
+- It **closes H4 for plain values** (they are copied, §18.1) and **SD-22 and SD-7 for owned regions** (dropped at
+  dispatch end). SD-22 is H2's stage-0 fix plus the drop; SD-7 needs this section and stage 4.
+- Stage 2 (owned versus structure kind) is still needed: the rule applies to owned regions, not to structure handles.
+- Stages 2 to 5 are still required for S-15 (region release inside a living actor): the checker, the drops and the
+  errors are what places the dispatch-end drop.
+
+**9. Inconsistencies found in the earlier text (to reconcile at implementation).**
+
+- §18.4 says a behaviour's new state "stays in the actor: no transfer, no walk". The same behaviour now also drops
+  message regions at return; the sentence applies to the state alone.
+- §14.2 `region_moved_between_actors` says the region is "released once, at the receiver's end". Under this section it
+  is released at the end of the receiving dispatch unless it was moved into the state. The trial's expectation must
+  be adjusted when it is written.
+- §7.3 links a region into the receiver's list at submission, which already puts a queued message's regions on the
+  list; the "mailbox drain" of 7(i) is then a requirement on that choice and on the failed-send path, not a new walk.
+  If a stage-4 implementation transfers at dispatch instead, the walk must add the mailbox.
+- §3.8 describes the behaviour's message parameter as owned and requires each part to end in "the reply, the new
+  state, moved elsewhere, or dropped"; it does not say that the drop is placed by the checker by default. This section
+  says it is.
+- §18.1's table row for plain values says the runtime copies them into the receiver; with the drop at dispatch end,
+  a plain value inside a message that also holds a region is copied with the message and remains usable in the state
+  only if it does not borrow the region (see 5).
+- §14.2 lists `shared_owner_ends_first` twice in its last row.
 
 ---
 
@@ -1511,6 +1648,7 @@ actors_addition and the *_frees_heap trials in stack_budget_board_addition are t
 
 | Version | Date | Changes |
 | --- | --- | --- |
+| 1.7 | 2026-10-22 | Lee's approach for messages that carry regions: moved on send, dispatch-scoped in the receiver (dropped at behaviour return unless moved into the new state), kept past the dispatch only by moving the whole region into the state or by a compiler-derived `copy_to`. New §18.7, with the failure paths the design had not covered (mailbox drain at actor end, failed send, timed-out call, dead caller, worker dying with the only copy); §18.1, §18.4 cross references; ten trials in §18.6, not written; stage 4 (§13) and item 10 and 11 (§16) extended; new open questions Q15 to Q17. Closes SD-7, SD-22 and H4's owned-region case without later reclamation; biased counting is needed only for counted storage (Q2 b or c). |
 | 1.6 | 2026-10-09 | Lee chose option A, replacing 1.5's "every change consumes its input" (the coordinator's wording, not Lee's): changes borrow their input, so old versions stay valid and persistence is observable; a no-op change returns `:unchanged`, not a version; result sums per family replace today's flags (§3.14). Restored: Q12's two-version reply pattern, the persistence trials and the 149 reuse sites, §17.3/§17.6 costs, §18.2's hard case and drop-order trials. Re-evaluated: supervised child specs still may not hold a version (new Q14), and Q13 (inner versions) under A. Trials, stage 6d, item 16 and the spec-change list updated. |
 | 1.5 | 2026-10-09 | Lee's version rules: only a change makes a version (no aliasing, no implicit duplication), and every change consumes its input; a no-op change returns the same version with no count change, no check and no failure (this replaced, the same day, a proposal to fail no-op changes with `(:explicit, :no_op_change)`, which was withdrawn with its static E2321 and query-first requirement). New §3.14 with the stdlib no-op inventory (≈ 69 return sites, 23 modules); E2320 *VersionAliased*; supervised child specs may not hold versions (E2308 extended); §17.3/§17.5/§17.6, §18.1 (examples), §18.2 (where cross-actor counting arises; no-op row), Q12, Q13 (container reads), §13 stage 6d, the trials and the spec-change list updated. Consequence recorded: old versions are not kept, so the Q12 "keep v1, reply v2" pattern and 149 trial reuse sites are no longer legal. |
 | 1.4 | 2026-10-09 | Q12 decided by Lee: no `share` builtin. One version kept in state and also replied or sent is E2303 with no escape hatch; two versions (keep v1, reply or send v2 derived from it) are the legal pattern, counted by biased counting. §3.8, §10 E2303, §18.1 (examples), §18.4, §18.5, Q12, stage 6c, item 15 and the trials updated. |
