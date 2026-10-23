@@ -18,8 +18,7 @@ document proposes a change to the specification it says so (§1.5, §15); until 
 compiler holds no region checker, no `drop` nodes, none of the codes E2300 to E2318, no `alloc_atomic` and no
 `atomic_*` operation (§9); `alloc_region` is still called nowhere in the stdlib or the compiler (§1.4); scope
 release (`mark`/`release_to`) is still disabled in all four emitters (§1.2); and Phase A of the lifetime analysis
-(`check_sequence_return_lifetime`) is still the only lifetime rule. Lee decided Q1, Q2, Q5, Q15, Q16 and Q17 on 2026-10-22 (and Q6 on 2026-10-09, narrowed by Q2 (a), with Q12 withdrawn as moot): never-freed family arenas spelled `arena(L, S)`, no counted storage, so there is no counted-storage stage. The other open decisions of §15 (Q3, Q4, Q7 to Q11, Q13, Q14) are
-still open. §1 below was measured 2026-10-09; the function names are still right, but line numbers have
+(`check_sequence_return_lifetime`) is still the only lifetime rule. Lee decided Q3, Q4, Q7, Q8, Q10, Q11, Q13 and Q14 on 2026-10-23 and Q1, Q2, Q5, Q15, Q16 and Q17 on 2026-10-22 (and Q6 on 2026-10-09, narrowed by Q2 (a), with Q12 withdrawn as moot): never-freed family arenas spelled `arena(L, S)`, no counted storage, so there is no counted-storage stage. No decision of §15 remains open (Q14 was decided 2026-10-23 too). Open details remain for Q13 (the copy's destination and spelling) and Q14 (see §15). §1 below was measured 2026-10-09; the function names are still right, but line numbers have
 drifted (for example `let_owns_local_region` is now at line 816 of `term_reg_spill.silica`, `fn_destroys_region_param`
 at 2389 of `emitter_core.silica`). Re-read 2026-10-16 and still true by reading: H1 (no lock anywhere in
 `canonical_arena_runtime_asm.silica`), H2 (`fn_destroys_region_param`), H5 (`LBBra_grow_failed`), H10 (no
@@ -34,6 +33,8 @@ chunk's ownership model.
 ---
 
 ## 0. Summary
+
+**Note (Lee, 2026-10-23).** The structure model of §3.1, §3.13 and §3.14 is being redesigned as ROADMAP chunk 15 (data structure redesign), with the decisions of §15 (Q1 to Q11, Q13 to Q17) as its requirements, not provisional. The never-freed family arena of Q2 (a) cannot stand as written once Q13 and Q14 need freeable structure copies; chunk 15 decides where a structure's memory lives and who releases it, and is a prerequisite for stage 2.
 
 The chunk's premise was that 1,152 stdlib records embed a move-only region and must become linear. Measured, they do
 not hold owned regions at all. Every standard data structure takes its region from `canonical_arena_lookup(key)`: one
@@ -149,11 +150,11 @@ Silent means the program runs on and computes with freed, shared or garbage memo
 | # | Where | Conflict | Proposed resolution |
 | --- | --- | --- | --- |
 | S1 | §16.3.5 "Message contents are copied between actors" vs §12.1.6 "the same move discipline applies" | copy vs move | **decided 2026-10-09 (Lee): move**; structure versions are copyable arena handles (Q2 a, 2026-10-22) (§18); §18.5 lists the spec text to change as Q6 decides; fix §16.3.5 |
-| S2 | §4.4.2 "The function must return the handle to the caller" vs trial `region_move_pass_no_return` (a callee that consumes and releases) | must return vs may consume | Q3 |
-| S3 | §12.1.1 "atomic: regions … accessed by multiple actors concurrently" vs §12.1.6 "owned by at most one actor at a time" | sharing | Q7 |
+| S2 | §4.4.2 "The function must return the handle to the caller" vs trial `region_move_pass_no_return` (a callee that consumes and releases) | must return vs may consume | Q3 decided 2026-10-23: (a), may consume; spec reworded |
+| S3 | §12.1.1 "atomic: regions … accessed by multiple actors concurrently" vs §12.1.6 "owned by at most one actor at a time" | sharing | Q7 (decided 2026-10-23: (a), the one named exception) |
 | S4 | §17 examples: function-level `proc[...]` (now E3009), `{ok, …}` record-tag syntax, `alloc_atomic()` with no arguments, `ref(R, atomic, ref(R, normal, …))` (a cross-actor pointer into normal memory) | stale syntax, unsound example | rewrite with §9 |
 | S5 | §12.3.3 "trap on out-of-bounds" vs the supervision model ("crash to the supervisor") | process abort vs actor failure | Q9, **decided 2026-10-23 (a): actor failure; abort 71 only in `main`** |
-| S6 | §4.4.1 / §12.1.4 "functions may take `L: lifetime` as a parameter for polymorphism" vs the stdlib's implicit `L` | value parameter vs type-level | Q10 |
+| S6 | §4.4.1 / §12.1.4 "functions may take `L: lifetime` as a parameter for polymorphism" vs the stdlib's implicit `L` | value parameter vs type-level | Q10 decided 2026-10-23: (a), implicit per-signature quantification; spec reworded |
 | S7 | canonical arenas are not in the specification at all (only common_contract.md §7) | undocumented memory kind | §2; spec text after Q1/Q2 |
 | S8 | §30 "Advanced Type System" is a placeholder | — | nothing for this chunk; linearity goes into §4.4.2 and §12 |
 
@@ -211,7 +212,7 @@ Every occurrence of a binding of linear type is exactly one of:
 | **Move** | anything else: a user-call argument, a function-value call argument, a return or `produces pure` operand, a record/tuple/sum literal operand, the right-hand side of a binding, a `case` scrutinee, a `spawn` initial state, a `call`/`cast`/`send` message, a behaviour's reply or new state, and `x.f` with `f` linear | the binding is **moved**; any later use is E2301 |
 
 The borrow positions are exactly the prim operands the emitter heuristic already treats as borrows (`rgn_is_region_borrow_prim`).
-User functions do not borrow (Q4): a function that inspects a linear value takes it and gives it back.
+User functions do not borrow (Q4 a, decided 2026-10-23): a function that inspects a linear value takes it and gives it back.
 
 One expression may not move one binding twice: `f(b, b)`, `(r, r)` and `{ a: r, b: r }` are E2303.
 
@@ -224,7 +225,7 @@ One expression may not move one binding twice: `f(b, b)`, `(r, r)` and `{ a: r, 
   still owned is **dropped**: the SIR generator places a `drop` there, and dropping releases every owned region the
   value holds (§7). Dropping is not an error (spec §12.1.2, implicit release at scope exit).
 - A parameter is a binding of the whole body. If the function neither returns nor moves it, it is dropped at the end of
-  the body, which is today's `region_move_pass_no_return` behaviour. Q3 asks whether that stays legal.
+  the body, which is today's `region_move_pass_no_return` behaviour. Lee decided on 2026-10-23 (Q3 a) that this stays legal.
 
 ### 3.4 Records and tuples
 
@@ -259,7 +260,7 @@ capture that. Calling a function value with a linear argument is an ordinary mov
 | Construct | Rule |
 | --- | --- |
 | `spawn(state, beh, policy)` | `state` is moved (§12.1.5). Any later use of it, or of a linear part of it, is E2301. This replaces the `"moved_region"` rebinding, and covers records, tuples and any expression holding an owned region. Structure versions in it are arena handles and stay usable. |
-| supervised child spec (`init` child list, `add_child`) | the initial state may not be linear (E2308): the supervisor keeps it in its row to restart the child, which would duplicate the owner (§18.4). A worker that needs a region allocates it in its first message, or receives it by message. A structure version (an arena handle) is allowed; each restart reuses the same handle (Q14). |
+| supervised child spec (`init` child list, `add_child`) | the initial state may not be linear (E2308): the supervisor keeps it in its row to restart the child, which would duplicate the owner (§18.4). A worker that needs a region allocates it in its first message, or receives it by message. A structure version is allowed (Q14, decided 2026-10-23): the child receives a copy at every start and restart, released when it dies; its destination is an open detail. |
 | `call(a, msg)`, `cast(a, msg)`, `send`, the `_registered` forms | `msg` is moved at submission (§12.1.6, §18). Any later use of a linear value in it is E2301. The runtime transfers ownership of every owned region in it to the receiver (§7.3). Structure versions in it are arena handles, passed by value; the sender keeps its own. |
 | behaviour `fn beh(msg: M, state: S) -> (:reply, R, S)` | `msg` and `state` are owned parameters. The reply and the new state are moved out: each linear part of `msg` and `state` must be in the reply, in the new state, moved elsewhere, or dropped, and in at most one of them: an owned region in both the reply and the new state, or in a message and the new state, is E2303. A structure version is an arena handle and may be in both (§18.1). The usual threading is `(:reply, x, (r2, k + 1))`. |
 | a `call`'s result | moved to and owned by the caller's binding (§12.1.6). |
@@ -278,8 +279,8 @@ allocation site.
 
 A type parameter (`ItemType`, `KeyType`, `ValueType`, `PriorityType`, `AccType`, …) or a bracket argument may not be
 instantiated with a linear type (E2307). Generic code copies its items freely: `get` returns a stored value, and a fold
-passes the accumulator around. Allowing linear instantiation would need a linear-aware generic checker, which Q11
-defers. Trait methods take the trait type, which (after Q1) holds an arena, so traits are unaffected.
+passes the accumulator around. Allowing linear instantiation would need a linear-aware generic checker; that is decided (Q11, 2026-10-23: a linear type may not instantiate a
+generic type parameter, list element type or trait associated type; a linear-aware generic checker may be added later). Trait methods take the trait type, which (after Q1) holds an arena, so traits are unaffected.
 
 ### 3.11 Lists
 
@@ -501,7 +502,7 @@ Today a callee must spell the caller's lifetime name. That is why the stdlib use
 | B | Spec §12.1.4: `L: lifetime` value parameters | every polymorphic function gains a run-time argument that means nothing at run time; 9,428 stdlib sites change | contradicts "nothing hidden" only mildly, but costs a register per call |
 | C | Bracket generics `fn f[L](…)` | parser and generic machinery change; stdlib rewrite | mixes lifetime with type generics, which the module conventions already strain |
 
-**Recommendation: A (Q10).** Implementation: in the call checker (`type_checker_expressions_user_call_check_args_result`)
+**Decided (Q10, Lee, 2026-10-23): A.** Implementation: in the call checker (`type_checker_expressions_user_call_check_args_result`)
 build one substitution per call: callee lifetime name → caller lifetime. Unify every argument against it, and a
 conflict is **E2311** ("lifetime L of push is bound to both L1 and L2"). Apply the substitution to the result type.
 `types_equal_surface` keeps comparing literally *after* substitution, so the change is local to call sites,
@@ -609,7 +610,11 @@ Already done at run time on all four targets (§1.2). Remaining:
 
 An atomic cell is useful only when two actors (two threads or cores) touch it. Today nothing lets two actors hold one
 region: §12.1.6 forbids it, and §1.3 H10 notes the compiler offers nothing for it. Spec §12.1.1 and §17.2.4 assume
-sharing. Q7 settles which way the language goes.
+sharing. Lee decided Q7 on 2026-10-23: (a), model A below. `region(L, atomic)` is the one named exception to §12.1.6's
+no-cross-actor-sharing rule, on all targets: hosted actors are threads in one process and share an address space, atomic
+instructions (LDAXR/STXR on AArch64, `lock cmpxchg` on x86-64) are ordinary user-mode instructions that the H1 bump loop
+already uses, and the ESP32-S3's two cores use S32C1I. Only the chunk 14 uses (interrupt handlers, DMA and peripheral
+registers as the second party) are unavailable on hosted OSes; those wait for chunk 14.
 
 | | Model | Consequence |
 | --- | --- | --- |
@@ -617,12 +622,12 @@ sharing. Q7 settles which way the language goes.
 | B | Atomics only within an actor's owned region | sound and simple, but an atomic cell then has no second party except interrupts and DMA (chunk 14) |
 | C | Remove atomics from the language until chunk 14 | the 62 trial files and §17 go |
 
-**Recommendation: A**, created by `alloc_region(atomic)`. Allocation into a shared atomic region uses an atomic bump
+**Decided (Q7, Lee, 2026-10-23): A**, created by `alloc_region(atomic)`. Allocation into a shared atomic region uses an atomic bump
 (below), because several actors may allocate.
 
 ### 9.2 Surface (Q8)
 
-Recommended, to keep the 44 run trials and Silica's current style (atoms, tagged tuples, no conversions):
+**Decided (Q8, Lee, 2026-10-23): the recommended surface below.** It keeps the 44 run trials and Silica's current style (atoms, tagged tuples, no conversions):
 
 ```
 alloc_ref(r: region(L, atomic), initial: T) -> ref(L, atomic, T)          // alloc_atomic is not added
@@ -648,11 +653,10 @@ load takes no `:release`, a store no `:acquire`), else **E2317**. An `atomic_*` 
 | ESP32-S3_raw (LX7) | `L32AI`/`S32RI` (acquire/release), `memw` for `:seq_cst` | `S32C1I` loop with `SCOMPARE1` | `S32C1I` | `S32C1I` loop |
 
 ESP32: 64-bit atomics are not native on the LX7. `int64`/`uint64` cells there take the runtime's spinlock (the
-scheduler lock pattern) or are rejected by the ESP32 emitter. Recommend the spinlock, so one program means one thing
-on every target.
+scheduler lock pattern), so one program means one thing on every target (decided, Q8).
 
 The function-level `DMB ISH`/`memw`/`mfence` barriers that `mem(atomic)` adds today (`control/control.silica`,
-`effects/emitter_effects`) become redundant once each operation carries its own ordering, and are removed.
+`effects/emitter_effects`) become redundant once each operation carries its own ordering, and are removed (decided, Q8).
 
 ### 9.4 The same bump fixes H1
 
@@ -675,7 +679,7 @@ its one registered meaning. E2319 and E2320, drafted for counted storage, were r
 | E2302 | ReferenceAfterRegionGone | a `ref`/`buf` of lifetime L used after L's region was moved out or dropped | region checker |
 | E2303 | LinearMovedTwice | one expression moves one binding twice; or a linear value (an owned region) is both kept in an actor's new state and given away as its reply or in a message (§18.1) | region checker |
 | E2304 | PartiallyMovedValueUsed | whole use, or second move, of a record or tuple after a linear field was moved out | region checker |
-| E2305 | RegionParameterNotReturned | reserved for Q3 option "spec-strict"; unused under the recommendation | region checker |
+| E2305 | RegionParameterNotReturned | reserved and unused: Q3 was decided (a) on 2026-10-23, so an unreturned, unmoved parameter is legal; the number is not reused | region checker |
 | E2306 | LinearCapture | a function literal captures a linear binding | region checker |
 | E2307 | LinearTypeArgument | a linear type as a list element type, generic type argument or associated type | type checker |
 | E2308 | LinearRestartableState | a supervised child spec's initial state is linear (§18.4) | type checker (`type_checker_supervisor`) |
@@ -752,8 +756,8 @@ linux_aarch64 and linux_x86_64 (lock-step), and with a green ESP32 cross build a
 | **7. Atomics** (after stage 1, parallel to 3–6) | §9: builtins, lowering on four targets, shared atomic regions per Q7 | yes | the atomic run trials plus two-actor counter and CAS trials on the hosts and both board cores |
 | **8. Bounds outcome and static buffer checks** (any time after 0) | Q9 actor failure (decided 2026-10-23: `:buf_bounds`, `:buf_invalid`, `:list_index`; abort 71 only in `main`); E2313/E2314; `\|bounds:` removed | yes (E2313/E2314) | §14 trials |
 
-Stages 0, 1 and 8 do not depend on the open decisions. Stage 2 needed Q1 and Q2 (decided 2026-10-22: `arena(L, S)`); stage 4 needed Q5 (decided 2026-10-22, with Q15 to Q17); stage 5 needs
-Q3/Q4/Q11; stage 7 needs Q7/Q8. There is no stage 6: the counted-storage stage was removed under Q2 (a) (2026-10-22), and the numbers 7 and 8 are kept so that references stay stable. The ROADMAP gate ("enforced at compile time or halted at run time, never silent;
+Stages 0, 1 and 8 do not depend on the open decisions. Stage 2 needed Q1 and Q2 (decided 2026-10-22: `arena(L, S)`); stage 4 needed Q5 (decided 2026-10-22, with Q15 to Q17); stage 5 needed
+Q11 (decided 2026-10-23, with Q3 and Q4); stage 7 needed Q7 and Q8 (both decided 2026-10-23). There is no stage 6: the counted-storage stage was removed under Q2 (a) (2026-10-22), and the numbers 7 and 8 are kept so that references stay stable. The ROADMAP gate ("enforced at compile time or halted at run time, never silent;
 the linearity rule holding for a region in a record or tuple; trials; stdlib and compiler at their fixed points under it")
 is met at the end of stage 5 plus the targeted stage 0 fix for H4 named in participate.md. Structures do not reclaim memory, and stage 7 closes
 "atomic references".
@@ -840,13 +844,13 @@ The options considered (§17):
 - (e) One owned region per structure with explicit `compact`: reclamation by hand, and versions die at each compaction.
 Lee chose (a).
 
-**Q3. May a function consume a region parameter without returning it?**
+**Q3. May a function consume a region parameter without returning it? — Decided by Lee, 2026-10-23: (a).** E2305 RegionParameterNotReturned stays reserved and unused.
 (a) Yes: an unreturned, unmoved parameter is dropped and released, as `region_move_pass_no_return` expects today.
 (b) No, per §4.4.2's "must return": E2305.
 *Recommend (a)*, rewording §4.4.2 to "must return it if the caller is to keep it". Releasing is a legitimate end of
 ownership, and locals already drop.
 
-**Q4. Should user functions be able to borrow?** (Structure versions are copyable arena handles and need no borrowing, §3.14. The question is for owned regions.)
+**Q4. Should user functions be able to borrow? — Decided by Lee, 2026-10-23: (a).** Revisit (b) only if real owned-region code shows the threading to be a burden; (a) never rejects a program (b) would accept, so (b) can be added later. (Structure versions are copyable arena handles and need no borrowing, §3.14. The question is for owned regions.)
 (a) No. Only the region prims borrow, and a function that inspects a linear value takes it and returns it.
 (b) A parameter marker for a borrowed linear value.
 *Recommend (a)* for chunk 4. After Q1 the stdlib's 921 queries take arena records, which are copyable, so the pressure
@@ -868,23 +872,30 @@ Spec changes: §18.5.
 **Q12. How does a program send a version it also keeps? — Withdrawn 2026-10-22: moot under Q2 (a).** Lee decided on 2026-10-09 that there is no `share` builtin and that keeping and giving away one version is E2303. That rule existed because a counted version had exactly one handle. An arena handle is a copyable word, so there is nothing to share and nothing to forbid: a version may be kept in the new state and also replied or sent. E2303 keeps its other meanings (one expression moving a binding twice; an owned region both kept and given away), where the second use really is a second owner.
 
 
-**Q13. Reading a version stored inside a structure** (a graph's inner adjacency set from `get`). *Open, narrowed by Q2 (a).* The stored inner version is an arena handle, so `get` can return it by value and nothing is aliased. (a) return the handle (a value like any other); (b) only queries over inner structures (`has_edge`, `neighbors`), never the inner version itself. *Recommend (a)* now that the aliasing worry is gone; (b) is what the graph traits already present.
+**Q13. Reading a version stored inside a structure (a graph's inner adjacency set from `get`). — Decided by Lee, 2026-10-23: structural copy.** Reading an inner structure version out of a container returns a copy of the inner structure, built the way `copy_to` builds a copy (Q15), not the stored arena handle. The alternatives were (a) return the handle (recommended) and (b) queries only; Lee chose neither.
+- The stored original is untouched.
+- Cost: O(size of the inner structure) per read.
+- Arenas are never freed (Q2 a), so each read leaves a new copy behind for the life of the application.
+- A loop of such reads over a graph is quadratic in the worst case.
+- Queries over the inner structure (`has_edge`, `neighbors`) are unaffected and need no copy.
+
+*Open detail (not decided):* (1) which arena receives the copy, the caller's arena or the inner type's family arena; (2) the exact signature and spelling, an explicit `copy_to`-style call or `get` copying implicitly. Until Lee answers, neither is chosen.
 
 
-**Q14. May a supervised child's initial state hold a structure version?** *Open, narrowed by Q2 (a).* A version is an arena handle, and the arena is never freed, so the supervisor's row can keep the handle and every restart reuses it. (a) yes, with no new rule; (b) no, E2308 extends to versions. *Recommend (a).* E2308 stays for owned regions (linear, so the row would duplicate the owner).
+**Q14. May a supervised child's initial state hold a structure version? — Decided by Lee, 2026-10-23: a copy is sent to the child at start and cleaned up when the child dies.** The supervisor's child spec may hold the version. At every start and every restart the child receives a COPY of it, a structural copy built the way `copy_to` builds one (Q15, Q13), and that copy is released when the child dies. This is neither (a) restarts reuse the shared handle (the earlier recommendation) nor (b) E2308 forbids versions in specs. E2308 stays for owned regions (linear, so the row would duplicate the owner). Consequences and OPEN DETAILS (not decided): (1) a copy that is cleaned up at child death cannot live in the never-freed family arena of Q2 (a); it must live in a region the child owns, released by the Q5 per-actor owner list at the child's end, so the child's state then holds data in an owned region, not an `arena(L, S)` handle. How that copy's type is spelled, and how it relates to `arena(L, S)` and to Q16 (a received region may move into state), is undecided. (2) The cost is O(size of the version) per start and per restart, which matters for restart storms. (3) Which side makes the copy (the supervisor at spawn, or the runtime on spawn) and the destination of the copy are undecided. (4) Whether this shows that Q2 (a) needs a per-instance exception for structures that must be freed is for Lee.
 
 
-**Q7. May two actors share atomic memory?**
+**Q7. May two actors share atomic memory? — Decided by Lee, 2026-10-23: (a), on all targets.** `region(L, atomic)` is the one named exception to §12.1.6; hosted actors are threads sharing an address space, atomic instructions are ordinary user-mode instructions (already used by the H1 bump loop), and the ESP32-S3 cores use S32C1I. Only the chunk 14 uses (interrupt handlers, DMA, peripheral registers as the second party) are unavailable on hosted OSes and wait for chunk 14.
 (a) Yes: `region(L, atomic)` is application-lifetime and copyable, and holds only word-scalar atomic cells.
 (b) No: atomics stay within one actor's owned region. (c) Remove atomics until chunk 14.
-*Recommend (a)* (§9.1). It is the only form in which atomics do anything, it keeps pointers into normal memory out of
+*Recommended (a), chosen* (§9.1). It is the only form in which atomics do anything, it keeps pointers into normal memory out of
 shared cells, and it amends §12.1.6's "no cross-actor sharing" with one named exception.
 
-**Q8. What is the atomic surface?**
-*Recommend* §9.2: no `alloc_atomic` (`alloc_ref` into an atomic region); `read_ref`/`write_ref` on atomic refs mean
+**Q8. What is the atomic surface? — Decided by Lee, 2026-10-23: the recommended surface of §9.2.**
+Chosen:  no `alloc_atomic` (`alloc_ref` into an atomic region); `read_ref`/`write_ref` on atomic refs mean
 `:seq_cst`, which keeps the 62 trial files valid; four `atomic_*` builtins with literal atom orderings; tagged-tuple CAS
-result. The alternative is spec §17 as written, with `alloc_atomic`, bare ordering identifiers and a record-tag CAS
-result.
+result (`(:ok, T) | (:fail, T)`); 64-bit cells on the ESP32-S3 take the runtime spinlock; the function-level barriers of `mem(atomic)` are removed once each operation carries its ordering. E2317 is an illegal order, E2315 a non-atomic ref. The alternative was spec §17 as written, with `alloc_atomic`, bare ordering identifiers and a record-tag CAS
+result; spec §17 is updated.
 
 **Q9. What does an out-of-bounds buffer access do? — Decided by Lee, 2026-10-23: (a); it covers the invalid buffer size and the list-index failure too, and (2026-10-22) region growth and raw allocation failure (H5) with `(:explicit, :region_alloc_failed)`.**
 (a) End the actor (`(:explicit, :buf_bounds)`), handled by its supervisor, and abort 71 only in `main`. (b) A
@@ -892,13 +903,10 @@ process-wide abort 71, as today.
 *Recommended (a), chosen*, per "crash to the supervisor". The access is still never performed, so no data is corrupted. It
 applies to `L_buf_invalid` and to the list-index abort by the same reasoning, which is worth deciding together.
 
-**Q10. How is lifetime polymorphism spelled?**
-*Recommend* implicit per-signature quantification (§5 A). The alternatives are spec §12.1.4's `L: lifetime` value
-parameters, or bracket generics. Either way §4.4.1/§12.1.4's sentence changes.
+**Q10. How is lifetime polymorphism spelled? — Decided by Lee, 2026-10-23: (a).** Implicit per-signature quantification (§5 A): each call instantiates the callee's lifetime names consistently across the arguments and the result; a conflict is E2311; a lifetime that appears only in the result is fresh and returned with its region, else E2300. No `L: lifetime` value parameters and no bracket generics. Spec §4.4.1/§12.1.4's sentence is reworded.
 
-**Q11. May a linear type instantiate a generic type parameter?**
-(a) No (E2307). (b) Yes, with a linear-aware generic checker.
-*Recommend (a)* now. No stdlib or compiler code needs it.
+**Q11. May a linear type instantiate a generic type parameter? — Decided by Lee, 2026-10-23: (a).** A linear (owned-region) type may not instantiate a generic type parameter, a list element type or a trait associated type: E2307 (LinearTypeArgument).
+(a) No (E2307). (b) Yes, with a linear-aware generic checker. No stdlib or compiler code needs it. Reversible: (a) only rejects programs, so (b) may be added later without breaking any accepted program.
 
 **Q15. How is `copy_to` spelled? (§18.7) — Decided by Lee, 2026-10-22: (a), a compiler builtin `copy_to(region, value)` derived per type like `recreate`; no copy for `device_window` or atomic cells.** (a) A compiler builtin `copy_to(region, value)`, derived per type
 like `recreate`. (b) A derived trait method (a `Copyable` trait beside `Recreatable`), so a library type may refine
@@ -1048,7 +1056,7 @@ one lineage concurrently; both allocate from the family arena with the atomic bu
 | behaviour new state `s` | stays in the actor: no transfer, no walk | the state's linear parts must each end in exactly one of reply, new state, a send, or a drop |
 | `spawn(st, beh, policy)` | `st` moved to the new actor at spawn, O(1) | later use of a linear part is E2301 (replaces `"moved_region"`) |
 | owned regions in a `cast`/`send`/`call` message or a reply | moved on send (O(1) handle transfer); **dispatch-scoped** in the receiver: dropped at behaviour return unless moved into the new state, or the needed part is rebuilt with `copy_to`. Failure paths (dead receiver, timed-out call, dead caller, crashed receiver with queued messages) release the region in the runtime. All in §18.7 | E2301 for the sender's later use; `drop_owned` placed at behaviour return; lifetime error for a message ref stored into state without `copy_to` |
-| supervised child spec initial state | an owned region may not be in it (E2308): the supervisor's row keeps the initial state to restart the child, which would duplicate the owner. A structure version may (Q14, open, recommended yes): the row keeps the arena handle and every restart reuses it. | E2308 for an owned region. The `init` code that builds the spec moves its owned values into the spec, and later use is E2301. |
+| supervised child spec initial state | an owned region may not be in it (E2308): the supervisor's row keeps the initial state to restart the child, which would duplicate the owner. A structure version may (Q14, decided 2026-10-23): the row keeps the version and each start or restart gives the child a copy (built as `copy_to` builds one), released when the child dies; copy destination and type spelling are open details. | E2308 for an owned region. The `init` code that builds the spec moves its owned values into the spec, and later use is E2301. |
 
 ### 18.5 Specification text to change (not edited here)
 
@@ -1078,7 +1086,7 @@ one lineage concurrently; both allocate from the family arena with the atomic bu
 | --- | --- |
 | `move_reply_version` | `call` returning a version built in the callee; the caller keeps using it after the callee ends (H4 for structures; the targeted stage 0 fix) |
 | `move_map_of_sets` | a `graph_wbt` adjacency version sent; the receiver and the sender both query it |
-| `supervised_child_restarts_with_version` | a child whose initial state holds a map version crashes and restarts 1,000 times (Q14 a); every start sees the same contents |
+| `supervised_child_restarts_with_version` | a child whose initial state holds a map version crashes and restarts 1,000 times (Q14); every start receives a copy with the same contents, released when that child dies |
 | `reply_and_keep_same_version` | a server keeps v1 in its state and replies with the same handle on every call, 10⁴ calls; the caller and the server both validate it |
 | `move_two_cores` (board) | sender and receiver pinned to different cores, each deriving versions from one lineage for 10⁵ rounds with the atomic bump; validate both |
 | `message_region_released_at_dispatch_end` | **not written** (§18.7; write-every-page, the SD-7 shape). A receiver is cast 100,000 messages, each holding an owned region of several pages, and writes every page; it keeps nothing. RSS stays flat. Fails today (SD-7). |
@@ -1223,6 +1231,14 @@ actors_addition and the *_frees_heap trials in stack_budget_board_addition are t
 
 | Version | Date | Changes |
 | --- | --- | --- |
+| 1.18 | 2026-10-23 | Lee is not happy with the design of the standard data structures: ROADMAP chunk 15 (data structure redesign: ownership, copy and release) added, with the decisions of 2026-10-22/23 as requirements, none provisional. Note at the top of §0; stage 2 (structure handle type) waits on chunk 15, which takes over the stdlib rename, H9 and the §3.14 change-result reshaping. Q13 and Q14 open details are owned by chunk 15. |
+| 1.17 | 2026-10-23 | Lee's decision of 2026-10-23: Q14, a copy is sent to the child at start and cleaned up when the child dies. The supervisor's child spec may hold a structure version; every start and restart gives the child a structural copy (built as `copy_to` builds one, Q15, Q13), released at the child's death; neither (a) reuse of the handle nor (b) E2308 for versions; E2308 stays for owned regions. §0, §3 and §7 text, §15 Q14 and the trial row updated. Every §15 decision is now made. Open details, not decided: Q13, which arena receives the copy and the spelling; Q14, (1) the copy cannot live in the never-freed family arena (Q2 a), so it needs a child-owned region freed by the Q5 owner list, and its type spelling and relation to `arena(L, S)` and Q16 are undecided, (2) O(size) cost per start and restart (restart storms), (3) whether the supervisor or the runtime makes the copy and its destination, (4) whether Q2 (a) needs a per-instance exception for structures that must be freed (for Lee). |
+| 1.16 | 2026-10-23 | Lee's decision of 2026-10-23: Q13, a structural copy. Reading an inner structure version out of a container (a graph's adjacency set from `get`) returns a copy built the way `copy_to` builds one (Q15), not the stored arena handle; neither (a) return the handle nor (b) queries only. Recorded consequences: O(size of the inner structure) per read; arenas are never freed (Q2 a), so each read leaves a copy behind; a loop of reads over a graph is quadratic in the worst case; the stored original is untouched; queries need no copy. Open detail, not decided: which arena receives the copy (caller's or the inner type's family arena) and the spelling (explicit `copy_to`-style call or implicit in `get`). Q14 is now the only open decision of §15. |
+| 1.15 | 2026-10-23 | Lee's decision of 2026-10-23: Q11 (a), a linear (owned-region) type may not instantiate a generic type parameter, list element type or trait associated type (E2307 LinearTypeArgument); (b), a linear-aware generic checker, may be added later because (a) only rejects programs. §0, §3.10, §13 and §15 Q11 updated. Stage 5 is no longer blocked on an open decision. Still open: Q13, Q14. |
+| 1.14 | 2026-10-23 | Lee's decision of 2026-10-23: Q10 (a), implicit per-signature quantification of lifetimes (§5 A): each call instantiates the callee's lifetime names consistently across arguments and result, conflict is E2311, a result-only lifetime is fresh and returned with its region else E2300; no `L: lifetime` value parameters, no bracket generics. §0, S6, §5, §15 Q10 updated; spec §4.4.1/§12.1.4 reworded. Stage 1 is no longer blocked on an open decision. Still open: Q11, Q13, Q14. |
+| 1.13 | 2026-10-23 | Lee's decision of 2026-10-23: Q8, the recommended surface of §9.2: no `alloc_atomic` (`alloc_ref` into an atomic region); `read_ref`/`write_ref` on atomic refs mean `:seq_cst`; four `atomic_*` builtins (`atomic_load`, `atomic_store`, `atomic_fetch_add` integer-only, `atomic_compare_exchange`) with literal atom orderings (E2317 illegal order, E2315 non-atomic ref); compare_exchange returns `(:ok, T) \| (:fail, T)`; 64-bit cells on the ESP32-S3 take the runtime spinlock; the `mem(atomic)` function-level barriers are removed. §0, §9.2, §9.3, §13 stage 7 and §15 Q8 updated; spec §17 and its `alloc_atomic` mentions updated, the lock-free stack example removed (Q7 rejects it). Stage 7 is no longer blocked on an open decision. Still open: Q10, Q11, Q13, Q14. |
+| 1.12 | 2026-10-23 | Lee's decision of 2026-10-23: Q7 (a), `region(L, atomic)` is an application-lifetime, copyable shared region holding only word-scalar atomic cells, the one named exception to spec §12.1.6's no-cross-actor-sharing rule, on all targets (hosted threads share an address space; LDAXR/STXR, lock cmpxchg and S32C1I are ordinary instructions); interrupt, DMA and peripheral uses wait for chunk 14. §0, S3, §9.1, §13 and §15 Q7 updated; spec §12.1.6 reconciled. Still open: Q8 to Q11, Q13, Q14. |
+| 1.11 | 2026-10-23 | Lee's decision of 2026-10-23: Q3 (a), a function may consume a region parameter without returning it; an unreturned, unmoved parameter is dropped and released at the end of the body (trial `region_move_pass_no_return`). Q4 (a), user functions cannot borrow in chunk 4: only the region prims borrow, and a function that inspects an owned region takes it and returns it; (b) may be added later since (a) rejects nothing (b) would accept. E2305 stays reserved and unused (number not reused). §0, §3.3, S2, §13, §15 Q3 and Q4 and the E2305 row updated; spec §4.4.2 reworded. Still open: Q7 to Q11, Q13, Q14. |
 | 1.10 | 2026-10-23 | Lee's decisions of 2026-10-23: Q9 (a), an out-of-bounds buffer index, an invalid buffer size and a list-index failure end the actor with `(:explicit, :buf_bounds)` / `:buf_invalid` / `:list_index`, abort 71 only in `main`; H5 (region growth and raw allocation failure, chosen 2026-10-22) likewise ends the actor with `(:explicit, :region_alloc_failed)`. §1.2, H5, S5, §8, §10, §13 stages 0 and 8, §15 Q9 and §16 item 16 updated; `\|bounds:N` metadata removal recorded; E2313/E2314 registered. |
 | 1.9 | 2026-10-22 | Pruned the counted-storage text that Q2 (a) made contradictory. Removed: the counted class of structure versions (§3.1, §3.8, §3.13, §3.14) and its rules; the counted row of §7.1; error codes **E2319** *WriteToSharedCell* and **E2320** *VersionAliased* (the block is now E2300 to E2318; the numbers are not reused), and their trial rows in §14.1; the version-borrow/consume table, `dup` placement and count increments of §3.14 (the version rules that still hold, and the result shapes, are kept for arena handles); stage 6 of §13 (there is no stage 6; 7 and 8 keep their numbers) and §16 items 14 to 17 (old 18 to 21 are now 14 to 17); §17 reduced to the measurements, the options considered and the choice (old §17.1 to §17.9 removed); §18.2 (biased counting: header, owner test, count queue, merge at actor end, crash cleanup maps, cores) and §18.3's immortal versions, replaced by two short paragraphs; the counted and immortal rows of §18.1; the counted-version trials of §14.2 and §18.6; the stage-6a text of §18.7 item 6. Decided on the way: E2303 stays for owned regions only, because an arena handle is copyable and a second use of a version is not a second owner; Q12 is withdrawn as moot; Q6 is narrowed to owned regions; Q13 and Q14 stay open but are rewritten for arena handles (recommend: return the handle; allow a version in a child spec); E2308 now covers owned regions only. The stdlib change-result reshaping of §3.14 and the trials that need it are no longer carried by any stage. References to revisions 1.1 to 1.8 above use the old §16 numbering and the removed sections. |
 | 1.8 | 2026-10-22 | Lee's decisions of 2026-10-22: Q2 (a), the never-freed family arena with the atomic bump, so counted storage and stage 6 (items 14 to 17 of §16) are dropped, may be reopened later; Q1 (a) spelled `arena(L, S)`; Q5 (a) per-actor owner list; Q15 (a) compiler builtin `copy_to(region, value)`; Q16 (a) a received region may move into the state; Q17 (a) the runtime releases the region on a failed send. §0, §13 (stages 2, 4, 6 and the dependency paragraph), §15, §16 (items 6, 14 to 17), §17 and §17.9, §18.7 updated; H4 now needs the targeted stage 0 fix, biased counting is not needed. Still open: Q3, Q4, Q7 to Q11, Q13, Q14. |

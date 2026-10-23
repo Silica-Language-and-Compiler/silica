@@ -3242,7 +3242,7 @@ proc[concurrency] actor_ref          // computation spawning an actor
 
 **Lifetime Identifiers (L*):** Region types use lifetime identifiers (e.g. `L1`, `L2`) to track region scope. The first parameter of `region`, `ref`, and `buf` types is a lifetime identifier. Programmers obtain lifetime values via `fresh_lifetime()` and pass them to region-allocating functions. This ensures unique lifetimes when composing multiple regions in the same scope.
 
-**Allocation Scope:** Region allocation (`alloc_region`, `alloc_ref`, `alloc_buf`, `alloc_atomic`) is permitted only within sequence blocks (`sequence ... produces pure ... end`), not at function scope or in other expression positions outside such blocks.
+**Allocation Scope:** Region allocation (`alloc_region`, `alloc_ref`, `alloc_buf`) is permitted only within sequence blocks (`sequence ... produces pure ... end`), not at function scope or in other expression positions outside such blocks.
 
 #### 4.4.2 Region Types
 Region types represent memory regions: `region(L, Space)` where L is a lifetime identifier and Space is a memory space.
@@ -3280,7 +3280,7 @@ region(L1, device)                  // device memory (driver library only)
 
 The lifetime identifier (e.g. `L1`) is obtained from `fresh_lifetime()` and must be unique among region allocations in the same or composable scope.
 
-**Region Handle Move Semantics:** Region handles are move-only; they cannot be copied. When a region handle is passed to any function, ownership transfers (the handle is moved). The function must return the handle to the caller. This ensures exactly one handle exists per region at any time. See §12.1.5 for the special case of `spawn`, and §12.1.6 when a region (or related resources) is carried **inside an actor message** (`call`, `cast`).
+**Region Handle Move Semantics:** Region handles are move-only; they cannot be copied. When a region handle is passed to any function, ownership transfers (the handle is moved). The function must return it if the caller is to keep it; a parameter that is neither returned nor moved is dropped and released at the end of the body. This ensures exactly one handle exists per region at any time. See §12.1.5 for the special case of `spawn`, and §12.1.6 when a region (or related resources) is carried **inside an actor message** (`call`, `cast`).
 
 #### 4.4.3 Reference Types
 Reference types represent pointers to memory: `ref(L, Space, T)`.
@@ -3301,7 +3301,7 @@ Region-backed collections grow functionally: allocate a fresh region and larger 
 
 #### 4.4.5 Atomic memory space
 
-Atomic-capable cells use **`ref(L, atomic, T)`**. The **`atomic`** memory space (second parameter) selects hardware atomic-capable backing; there is no separate **`atomic_ref`** type name. **`alloc_atomic(r, initial)`** produces **`ref(R, atomic, T)`** (see §22).
+Atomic-capable cells use **`ref(L, atomic, T)`**. The **`atomic`** memory space (second parameter) selects hardware atomic-capable backing; there is no separate **`atomic_ref`** type name. **`alloc_ref(r, initial)`** produces **`ref(R, atomic, T)`** (see §22).
 
 ```
 ref(L1, atomic, int)                  // reference in atomic memory space
@@ -4962,13 +4962,13 @@ fn alloc_and_print() -> ref(R, normal, int) {
 fn alloc_normal() -> ref(R, normal, int) { ... }
 
 // Function with mem(atomic) - effects on sequence
-fn alloc_atomic() -> ref(R, atomic, int) { ... }
+fn make_atomic_cell() -> ref(R, atomic, int) { ... }
 
 // Combined: mem(normal) <: mem(atomic), effects on sequence
 fn alloc_both() -> (ref(R, normal, int), ref(R, atomic, int)) {
     sequence proc[mem(atomic)]
         ref1: ref(R, normal, int) <- alloc_normal();  // mem(normal)
-        ref2: ref(R, atomic, int) <- alloc_atomic();  // mem(atomic)
+        ref2: ref(R, atomic, int) <- make_atomic_cell();  // mem(atomic)
     produces
         pure (ref1, ref2)                             // Union: [mem(atomic)] (normal subsumed)
     end
@@ -5029,13 +5029,13 @@ When effects have subeffecting relationships, the compiler minimizes the effect 
 fn alloc_normal() -> ref(R, normal, int) { ... }
 
 // Function with mem(atomic) - effects on sequence (mem(normal) <: mem(atomic))
-fn alloc_atomic() -> ref(R, atomic, int) { ... }
+fn make_atomic_cell() -> ref(R, atomic, int) { ... }
 
 // Combined: mem(normal) is subsumed by mem(atomic)
 fn alloc_both() -> (ref(R, normal, int), ref(R, atomic, int)) {
     sequence proc[mem(atomic)]
         ref1: ref(R, normal, int) <- alloc_normal();   // mem(normal)
-        ref2: ref(R, atomic, int) <- alloc_atomic();   // mem(atomic)
+        ref2: ref(R, atomic, int) <- make_atomic_cell();   // mem(atomic)
     produces
         pure (ref1, ref2)                              // Union: [mem(atomic)] (normal subsumed)
     end
@@ -6639,7 +6639,7 @@ The compiler performs static analysis to verify region lifetimes and ensure memo
 
 **Lifetime Tracking:**
 - Regions are tracked through their lexical scope (sequence blocks)
-- Lifetime identifiers are obtained via `fresh_lifetime()`; functions may take `L: lifetime` as a parameter for polymorphism
+- Lifetime identifiers are obtained via `fresh_lifetime()`; lifetime names in a function signature are implicitly quantified per signature and instantiated at each call, consistently across the arguments and the result (no `L: lifetime` parameter)
 - Each distinct region allocation must use a distinct lifetime; duplicate lifetimes across composable scopes are a compile error
 - References cannot outlive their containing region
 - Region deallocation is verified to occur after all references are no longer accessible
@@ -6993,7 +6993,7 @@ When the **message** operand to `call()` or `cast()` (Chapter 16) **contains** a
 
 **`call()` and replies:** If the behavior returns `(:reply, reply_value, new_state)` and `reply_value` carries region-owned data back to the caller, ownership of that payload **returns** to the **caller** by the same move/return rules as a function result—the reply path is not a second, hidden copy.
 
-**No cross-actor sharing:** A region is **owned by at most one actor at a time**; actor communication transfers ownership by **message moves**, not by shared mutable heaps. See also §15.1.2.2 (actor stack architecture).
+**No cross-actor sharing:** A region is **owned by at most one actor at a time**; actor communication transfers ownership by **message moves**, not by shared mutable heaps. The one named exception is the atomic region `region(L, atomic)`: application-lifetime and copyable, it holds only word-scalar atomic cells and may be shared by actors on every target (§17.2.4). See also §15.1.2.2 (actor stack architecture).
 
 ### 12.2 Reference Semantics
 
@@ -7331,7 +7331,7 @@ cast(actor1, msg2)
 Atomic operations provide strong guarantees:
 
 ```
-atomic_compare_exchange(ref, expected, new)
+atomic_compare_exchange(ref, expected, new, :acq_rel)
 // Either succeeds completely or fails completely
 // No partial updates visible to other threads
 ```
@@ -10438,8 +10438,10 @@ ref(R, atomic, T)    // reference in atomic memory space
 Atomic operations work in designated memory spaces:
 
 ```
-alloc_atomic(r, initial_value) -> ref(R, atomic, T) proc[mem(atomic), atomic]
+alloc_ref(r: region(L, atomic), initial_value) -> ref(L, atomic, T) proc[mem(atomic), atomic]   // no alloc_atomic (Q8)
 ```
+
+Decided by Lee, 2026-10-23 (region memory safety design Q8, §9.2): `read_ref`/`write_ref` on an atomic ref mean `:seq_cst`; the four builtins are `atomic_load`, `atomic_store`, `atomic_fetch_add` (integer cells only) and `atomic_compare_exchange`; the ordering is an atom literal (E2317 if it is not legal for the operation); an `atomic_*` call on a non-atomic ref is E2315. On the ESP32-S3, 64-bit cells take the runtime spinlock, so one program means one thing on every target. The function-level barriers formerly added by `mem(atomic)` are removed once each operation carries its ordering.
 
 ### 17.2 Memory Ordering Semantics
 
@@ -10447,7 +10449,7 @@ alloc_atomic(r, initial_value) -> ref(R, atomic, T) proc[mem(atomic), atomic]
 Silica supports standard memory orderings that control how atomic operations synchronize memory accesses across actors:
 
 ```
-type order = relaxed | acquire | release | acq_rel | seq_cst
+order: atom literal, one of :relaxed | :acquire | :release | :acq_rel | :seq_cst   // a variable is not allowed
 ```
 
 **When to Use Each Ordering:**
@@ -10465,10 +10467,10 @@ type order = relaxed | acquire | release | acq_rel | seq_cst
 
 ```silica
 // Example: Simple counter (ordering doesn't matter)
-counter: ref(R, atomic, int64) <- alloc_atomic(r, 0);
+counter: ref(R, atomic, int64) <- alloc_ref(r, 0);
 
 fn increment() -> atom proc[mem(normal), atomic] {
-    atomic_fetch_add(counter, 1, relaxed)  // Fast, no ordering needed
+    atomic_fetch_add(counter, 1, :relaxed)  // Fast, no ordering needed
 }
 ```
 
@@ -10479,18 +10481,18 @@ fn increment() -> atom proc[mem(normal), atomic] {
 
 ```silica
 // Example: Reading published data
-data: ref(R, atomic, Data) <- alloc_atomic(r, initial_data);
-ready: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+data: ref(R, atomic, Data) <- alloc_ref(r, initial_data);
+ready: ref(R, atomic, boolean) <- alloc_ref(r, false);
 
 // Publisher (Actor A)
 fn publish(new_data: Data) -> atom proc[mem(normal), atomic] {
     write_ref(data, new_data);                    // Write data
-    atomic_store(ready, true, release);           // Publish with release
+    atomic_store(ready, true, :release);           // Publish with release
 }
 
 // Consumer (Actor B)
 fn consume() -> Data proc[mem(normal), atomic] {
-    ready_flag: boolean <- atomic_load(ready, acquire);
+    ready_flag: boolean <- atomic_load(ready, :acquire);
     case ready_flag of {
         true -> read_ref(data);
         false -> initial_data
@@ -10505,17 +10507,17 @@ fn consume() -> Data proc[mem(normal), atomic] {
 
 ```silica
 // Example: Publishing initialization complete
-init_complete: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+init_complete: ref(R, atomic, boolean) <- alloc_ref(r, false);
 
 // Initializer (Actor A)
 fn initialize() -> atom proc[mem(normal), atomic] {
     // ... perform initialization ...
-    atomic_store(init_complete, true, release);  // Release: all prior writes visible
+    atomic_store(init_complete, true, :release);  // Release: all prior writes visible
 }
 
 // Waiter (Actor B)
 fn wait_for_init() -> atom proc[mem(normal), atomic] {
-    complete: boolean <- atomic_load(init_complete, acquire);  // Acquire: see release
+    complete: boolean <- atomic_load(init_complete, :acquire);  // Acquire: see release
     // All initialization work is now guaranteed visible
 }
 ```
@@ -10526,11 +10528,11 @@ fn wait_for_init() -> atom proc[mem(normal), atomic] {
 
 ```silica
 // Example: Atomic counter with ordering
-shared_counter: ref(R, atomic, int64) <- alloc_atomic(r, 0);
+shared_counter: ref(R, atomic, int64) <- alloc_ref(r, 0);
 
 fn increment_with_ordering() -> int64 proc[mem(normal), atomic] {
     // acq_rel ensures this operation synchronizes both ways
-    old_value: int64 <- atomic_fetch_add(shared_counter, 1, acq_rel);
+    old_value: int64 <- atomic_fetch_add(shared_counter, 1, :acq_rel);
     // All prior increments are visible (acquire)
     // This increment is visible to future operations (release)
     old_value
@@ -10545,16 +10547,16 @@ fn increment_with_ordering() -> int64 proc[mem(normal), atomic] {
 
 ```silica
 // Example: Global flag coordination
-global_flag: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+global_flag: ref(R, atomic, boolean) <- alloc_ref(r, false);
 
 // Actor A
 fn set_flag() -> atom proc[mem(normal), atomic] {
-    atomic_store(global_flag, true, seq_cst);  // Participates in global order
+    atomic_store(global_flag, true, :seq_cst);  // Participates in global order
 }
 
 // Actor B
 fn check_flag() -> boolean proc[mem(normal), atomic] {
-    atomic_load(global_flag, seq_cst)  // Sees all seq_cst operations in order
+    atomic_load(global_flag, :seq_cst)  // Sees all seq_cst operations in order
 }
 ```
 
@@ -10568,15 +10570,15 @@ fn produce(
     buffer: { data: buf(R, normal, int64, 100), head: ref(R, atomic, int64), tail: ref(R, atomic, int64) },
     item: int64
 ) -> boolean proc[mem(normal), atomic] {
-    head: int64 <- atomic_load(buffer.head, acquire);
-    tail: int64 <- atomic_load(buffer.tail, relaxed);
+    head: int64 <- atomic_load(buffer.head, :acquire);
+    tail: int64 <- atomic_load(buffer.tail, :relaxed);
     
     next_head: int64 <- (head + 1) % 100;
     case next_head == tail of {
         true -> false;
         false -> {
             write_buf(buffer.data, head, item);
-            atomic_store(buffer.head, next_head, release);
+            atomic_store(buffer.head, next_head, :release);
             true
         }
     }
@@ -10586,15 +10588,15 @@ fn produce(
 fn consume(
     buffer: { data: buf(R, normal, int64, 100), head: ref(R, atomic, int64), tail: ref(R, atomic, int64) }
 ) -> Some(int64) | None proc[mem(normal), atomic] {
-    tail: int64 <- atomic_load(buffer.tail, acquire);  // Acquire: see producer releases
-    head: int64 <- atomic_load(buffer.head, relaxed);
+    tail: int64 <- atomic_load(buffer.tail, :acquire);  // Acquire: see producer releases
+    head: int64 <- atomic_load(buffer.head, :relaxed);
     
     case tail == head of {
         true -> None;
         false -> {
             item: int64 <- read_buf(buffer.data, tail);
             next_tail: int64 <- (tail + 1) % 100;
-            atomic_store(buffer.tail, next_tail, release);
+            atomic_store(buffer.tail, next_tail, :release);
             Some(item)
         }
     }
@@ -10604,19 +10606,19 @@ fn consume(
 **Flag-Based Coordination:**
 ```silica
 // Coordination flag between actors
-ready_flag: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+ready_flag: ref(R, atomic, boolean) <- alloc_ref(r, false);
 data: ref(R, normal, SharedData) <- alloc_ref(r, initial_data);
 
 // Actor A: Prepare and signal
 fn prepare_and_signal(new_data: SharedData) -> atom proc[mem(normal), atomic] {
     write_ref(data, new_data);                    // Prepare data
-    atomic_store(ready_flag, true, release);      // Signal with release
+    atomic_store(ready_flag, true, :release);      // Signal with release
     // All writes before release are visible to acquire loads
 }
 
 // Actor B: Wait and read
 fn wait_and_read() -> SharedData proc[mem(normal), atomic] {
-    ready: boolean <- atomic_load(ready_flag, acquire);
+    ready: boolean <- atomic_load(ready_flag, :acquire);
     case ready of {
         true -> read_ref(data);
         false -> initial_data
@@ -10624,48 +10626,22 @@ fn wait_and_read() -> SharedData proc[mem(normal), atomic] {
 }
 ```
 
-**Lock-Free Stack:**
-```silica
-// Cells: ref(R, normal, (int64, ref?(R, normal, rec))) with rec the full cell tuple (§4.2.2).
-// Stack head holds ref(R, atomic, ref(R, normal, (int64, ref?(R, normal, rec)))).
-fn push(
-    stack: { top: ref(R, atomic, ref(R, normal, (int64, ref?(R, normal, rec)))) },
-    value: int64
-) -> atom proc[mem(normal), atomic] {
-    new_cell: ref(R, normal, (int64, ref?(R, normal, rec))) <- alloc_ref(r, (value, :none));
-    try_push(stack, new_cell)
-}
-
-fn try_push(
-    stack: { top: ref(R, atomic, ref(R, normal, (int64, ref?(R, normal, rec)))) },
-    new_cell: ref(R, normal, (int64, ref?(R, normal, rec)))
-) -> atom proc[mem(normal), atomic] {
-    old_top: ref(R, normal, (int64, ref?(R, normal, rec))) <- atomic_load(stack.top, acquire);
-    result: {ok, ref(R, normal, (int64, ref?(R, normal, rec)))} | {fail, ref(R, normal, (int64, ref?(R, normal, rec)))}
-        <- atomic_compare_exchange(stack.top, old_top, new_cell, acq_rel);
-    case result of {
-        {ok, _: ref(R, normal, (int64, ref?(R, normal, rec)))} -> :ok;
-        {fail, _: ref(R, normal, (int64, ref?(R, normal, rec)))} -> try_push(stack, new_cell)
-    }
-}
-```
-
 **Actor Synchronization with Atomics:**
 ```silica
 // Shared counter accessed by multiple actors
-shared_count: ref(R, atomic, int64) <- alloc_atomic(r, 0);
+shared_count: ref(R, atomic, int64) <- alloc_ref(r, 0);
 
 // Actor behavior that increments counter
 fn counter_actor(msg: IncrementMsg, state: unit) -> atom proc[mem(normal), atomic] {
     // Use seq_cst for global ordering across all actors
-    atomic_fetch_add(shared_count, 1, seq_cst);
+    atomic_fetch_add(shared_count, 1, :seq_cst);
     ()
 }
 
 // Reader actor that reads the counter
 fn reader_actor(msg: ReadMsg, state: unit) -> int64 proc[mem(normal), atomic] {
     // seq_cst ensures we see all increments in order
-    atomic_load(shared_count, seq_cst)
+    atomic_load(shared_count, :seq_cst)
 }
 ```
 
@@ -10680,16 +10656,16 @@ Atomic operations provide synchronization between actors, complementing message 
 **Combining Both:**
 ```silica
 // Use atomics for fast shared state, messages for coordination
-shared_stats: ref(R, atomic, Stats) <- alloc_atomic(r, initial_stats);
+shared_stats: ref(R, atomic, Stats) <- alloc_ref(r, initial_stats);
 
 // Fast path: atomic update
 fn update_stats_fast(increment: int64) -> atom proc[mem(normal), atomic] {
-    atomic_fetch_add(shared_stats.count, increment, relaxed);
+    atomic_fetch_add(shared_stats.count, increment, :relaxed);
 }
 
 // Coordination path: message passing
 fn request_detailed_report(reply_to: actor_ref) -> atom proc[concurrency] {
-    current_stats: Stats <- atomic_load(shared_stats, acquire);
+    current_stats: Stats <- atomic_load(shared_stats, :acquire);
     cast(reply_to, ReportMsg {stats: current_stats});
 }
 ```
@@ -10697,7 +10673,7 @@ fn request_detailed_report(reply_to: actor_ref) -> atom proc[concurrency] {
 **Happens-Before with Actors:**
 ```silica
 // Atomic release in one actor, message cast, atomic acquire in another
-flag: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+flag: ref(R, atomic, boolean) <- alloc_ref(r, false);
 
 // Actor A
 fn actor_a_behavior(msg: StartMsg, state: unit) -> atom proc[mem(normal), atomic, concurrency] {
@@ -10705,7 +10681,7 @@ fn actor_a_behavior(msg: StartMsg, state: unit) -> atom proc[mem(normal), atomic
     prepare_data();
     
     // Release: all prior writes visible
-    atomic_store(flag, true, release);
+    atomic_store(flag, true, :release);
     
     // Cast message (happens after release)
     cast(actor_b_ref, DataReadyMsg {});
@@ -10715,7 +10691,7 @@ fn actor_a_behavior(msg: StartMsg, state: unit) -> atom proc[mem(normal), atomic
 // Actor B
 fn actor_b_behavior(msg: DataReadyMsg, state: unit) -> atom proc[mem(normal), atomic] {
     // Acquire: guaranteed to see release from Actor A
-    ready: boolean <- atomic_load(flag, acquire);
+    ready: boolean <- atomic_load(flag, :acquire);
     // All data prepared by Actor A is now visible
     process_data();
     ()
@@ -10876,19 +10852,15 @@ atomic_store(aref, value, order) -> atom proc[mem(Space), atomic]
 #### 17.3.2 Read-Modify-Write Operations
 ```
 atomic_fetch_add(aref, delta, order) -> T proc[mem(Space), atomic]
-atomic_fetch_sub(aref, delta, order) -> T proc[mem(Space), atomic]
-atomic_fetch_and(aref, mask, order) -> T proc[mem(Space), atomic]
-atomic_fetch_or(aref, mask, order) -> T proc[mem(Space), atomic]
-atomic_fetch_xor(aref, mask, order) -> T proc[mem(Space), atomic]
 ```
 
 #### 17.3.3 Compare and Exchange
 ```
 atomic_compare_exchange(aref, expected, new_val, order)
- -> {ok, T} | {fail, T} proc[mem(Space), atomic]
+ -> (:ok, T) | (:fail, T) proc[mem(Space), atomic]
 ```
 
-Returns `{ok, old_value}` if successful, `{fail, current_value}` if the value wasn't expected.
+Returns `(:ok, old_value)` if successful, `(:fail, current_value)` if the value wasn't expected.
 
 ### 17.4 Lock-Free Data Structures
 
@@ -10899,14 +10871,14 @@ fn spsc_enqueue(
     queue: { buf: buf(R, normal, int64, 1024), capacity: int, head: ref(R, atomic, int), tail: ref(R, atomic, int) },
     item: int64
 ) -> boolean proc[mem(normal), atomic] {
-    tail: int <- atomic_load(queue.tail, acquire);
-    head: int <- atomic_load(queue.head, acquire);
+    tail: int <- atomic_load(queue.tail, :acquire);
+    head: int <- atomic_load(queue.head, :acquire);
     next_tail: int <- (tail + 1) % queue.capacity;
     case next_tail == head of {
         true -> false;
         false -> {
             write_buf(queue.buf, tail, item);
-            atomic_store(queue.tail, next_tail, release);
+            atomic_store(queue.tail, next_tail, :release);
             true
         }
     }
@@ -10915,14 +10887,14 @@ fn spsc_enqueue(
 fn spsc_recv(
     queue: { buf: buf(R, normal, int64, 1024), capacity: int, head: ref(R, atomic, int), tail: ref(R, atomic, int) }
 ) -> Some(int64) | None proc[mem(normal), atomic] {
-    head: int <- atomic_load(queue.head, acquire);
-    tail: int <- atomic_load(queue.tail, acquire);
+    head: int <- atomic_load(queue.head, :acquire);
+    tail: int <- atomic_load(queue.tail, :acquire);
     case head == tail of {
         true -> None;
         false -> {
             item: int64 <- read_buf(queue.buf, head);
             next_head: int <- (head + 1) % queue.capacity;
-            atomic_store(queue.head, next_head, release);
+            atomic_store(queue.head, next_head, :release);
             Some(item)
         }
     }
@@ -10942,8 +10914,8 @@ establishes: `msg1` happens-before `msg2` in actorA
 
 #### 18.1.2 Atomic Synchronization
 ```
-atomic_store(ref, value, release)  // in actor A
-atomic_load(ref, acquire)          // in actor B
+atomic_store(ref, value, :release)  // in actor A
+atomic_load(ref, :acquire)          // in actor B
 ```
 establishes: store happens-before load
 
@@ -10970,12 +10942,12 @@ Between actors, only explicit synchronization establishes ordering:
 
 ```
 // Actor 1
-atomic_store(flag, true, release)
+atomic_store(flag, true, :release)
 cast(actor2, data)
 
 // Actor 2 behavior function
 fn process_message(msg: Data, state: unit) -> atom {
-    flag_value: boolean <- atomic_load(flag, acquire)
+    flag_value: boolean <- atomic_load(flag, :acquire)
     // flag_value is guaranteed to be true
 }
 ```
@@ -11016,18 +10988,18 @@ AArch64's weak ordering means:
    ```
    // Actor 1: Release
    write_ref(data, value)
-   atomic_store(flag, true, release)  // STLR ensures prior writes visible
+   atomic_store(flag, true, :release)  // STLR ensures prior writes visible
    
    // Actor 2: Acquire
-   ready: boolean <- atomic_load(flag, acquire)  // LDAR ensures sees release
+   ready: boolean <- atomic_load(flag, :acquire)  // LDAR ensures sees release
    value: int <- read_ref(data)  // Guaranteed to see write_ref(data, value)
    ```
 
 3. **Sequential Consistency**: Sequential consistency requires full barriers:
    ```
    // seq_cst operations use DMB ISH + LDAR/STLR
-   atomic_store(x, 1, seq_cst)  // DMB ISH + STLR
-   atomic_load(y, seq_cst)      // LDAR + DMB ISH
+   atomic_store(x, 1, :seq_cst)  // DMB ISH + STLR
+   atomic_load(y, :seq_cst)      // LDAR + DMB ISH
    ```
 
 **Cache Coherency Guarantees:**
@@ -11078,7 +11050,7 @@ fn producer_behavior(msg: unit, state: ProducerState) -> ProducerState proc[mem(
     write_ref(state.data, 42);
     
     // Release: ensures data write is visible before flag write
-    atomic_store(state.ready_flag, true, release);  // STLR instruction
+    atomic_store(state.ready_flag, true, :release);  // STLR instruction
     
     // Cast message (happens after release)
     cast(consumer_ref, DataReadyMsg {});
@@ -11088,7 +11060,7 @@ fn producer_behavior(msg: unit, state: ProducerState) -> ProducerState proc[mem(
 // Actor 2: Consumer
 fn consumer_behavior(msg: DataReadyMsg, state: ConsumerState) -> ConsumerState proc[mem(normal), atomic] {
     // Acquire: guaranteed to see release from producer
-    ready: boolean <- atomic_load(shared_flag, acquire);  // LDAR instruction
+    ready: boolean <- atomic_load(shared_flag, :acquire);  // LDAR instruction
     
     // All data prepared by producer is now visible
     // This read is guaranteed to see write_ref(state.data, 42)
@@ -11099,7 +11071,7 @@ fn consumer_behavior(msg: DataReadyMsg, state: ConsumerState) -> ConsumerState p
 ```
 
 The AArch64 hardware guarantees:
-- `STLR` in producer ensures `write_ref(state.data, 42)` is visible before `atomic_store(state.ready_flag, true, release)`
+- `STLR` in producer ensures `write_ref(state.data, 42)` is visible before `atomic_store(state.ready_flag, true, :release)`
 - `LDAR` in consumer ensures it sees the `STLR` and all prior writes
 - `read_ref(shared_data)` is guaranteed to see `write_ref(state.data, 42)`
 
@@ -11164,7 +11136,7 @@ The compiler generates AArch64 instructions based on memory ordering requirement
 **1. Relaxed Ordering (`relaxed`):**
 
 ```silica
-atomic_store(ptr, value, relaxed)
+atomic_store(ptr, value, :relaxed)
 ```
 
 Generated code:
@@ -11178,7 +11150,7 @@ CBNZ  W2, retry      // Retry if store failed
 **2. Acquire Ordering (`acquire`):**
 
 ```silica
-value: int <- atomic_load(ptr, acquire)
+value: int <- atomic_load(ptr, :acquire)
 ```
 
 Generated code:
@@ -11190,7 +11162,7 @@ LDAR  W0, [X1]      // Load-acquire: ensures subsequent operations see prior rel
 **3. Release Ordering (`release`):**
 
 ```silica
-atomic_store(ptr, value, release)
+atomic_store(ptr, value, :release)
 ```
 
 Generated code:
@@ -11202,7 +11174,7 @@ STLR  W0, [X1]      // Store-release: ensures prior operations visible before st
 **4. Acquire-Release Ordering (`acq_rel`):**
 
 ```silica
-old_value: int <- atomic_fetch_add(ptr, 1, acq_rel)
+old_value: int <- atomic_fetch_add(ptr, 1, :acq_rel)
 ```
 
 Generated code:
@@ -11217,7 +11189,7 @@ loop:
 **5. Sequential Consistency (`seq_cst`):**
 
 ```silica
-atomic_store(ptr, value, seq_cst)
+atomic_store(ptr, value, :seq_cst)
 ```
 
 Generated code:
@@ -11446,7 +11418,7 @@ The following tables provide comprehensive guidance for selecting appropriate ba
 // Producer (Actor 1)
 fn producer(msg: unit, state: ProducerState) -> ProducerState proc[mem(normal), atomic] {
     write_ref(state.data, 42);
-    atomic_store(state.ready_flag, true, release);  // STLR instruction
+    atomic_store(state.ready_flag, true, :release);  // STLR instruction
     state
 }
 ```
@@ -11456,7 +11428,7 @@ Generated code for producer:
 // write_ref(state.data, 42)
 STR   W2, [X1]      // Store data (normal store, no ordering)
 
-// atomic_store(state.ready_flag, true, release)
+// atomic_store(state.ready_flag, true, :release)
 MOV   W0, #1
 STLR  W0, [X3]      // Store-release: ensures data store visible before flag store
 ```
@@ -11464,7 +11436,7 @@ STLR  W0, [X3]      // Store-release: ensures data store visible before flag sto
 ```silica
 // Consumer (Actor 2)
 fn consumer(msg: unit, state: ConsumerState) -> ConsumerState proc[mem(normal), atomic] {
-    ready: boolean <- atomic_load(state.ready_flag, acquire);
+    ready: boolean <- atomic_load(state.ready_flag, :acquire);
     case ready of {
         true -> {
             value: int <- read_ref(state.data);
@@ -11477,7 +11449,7 @@ fn consumer(msg: unit, state: ConsumerState) -> ConsumerState proc[mem(normal), 
 
 Generated code for consumer:
 ```assembly
-// atomic_load(state.ready_flag, acquire)
+// atomic_load(state.ready_flag, :acquire)
 LDAR  W0, [X3]      // Load-acquire: ensures sees producer's release
 CBNZ  W0, read_data // Branch if ready
 
@@ -11499,11 +11471,11 @@ LDR   W1, [X1]      // Load data (guaranteed to see producer's write due to LDAR
 Atomic operations prevent data races:
 
 ```
-counter: ref(R, atomic, int) <- alloc_atomic(r, 0)
+counter: ref(R, atomic, int) <- alloc_ref(r, 0)
 
 // Multiple actors can safely increment
 fn increment_counter() {
-    atomic_fetch_add(counter, 1, seq_cst)
+    atomic_fetch_add(counter, 1, :seq_cst)
 }
 ```
 
@@ -14394,7 +14366,7 @@ module arch.apple.amx {
 
 This section documents all built-in functions and primitives available in Silica. These are always available without requiring imports. A builtin is always called unqualified; a module function with a builtin's name is called only as `module@name(...)` (§19.3.3).
 
-**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `stop_self`, `fail_self`, `panic`, `assert`, `unreachable` (§15.1.2.3, §22.16); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout`, `send_after`, `cancel_timer`, `monotonic_time`, `current_time` (§22.14); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations and `alloc_atomic` (§22.12); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
+**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `stop_self`, `fail_self`, `panic`, `assert`, `unreachable` (§15.1.2.3, §22.16); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout`, `send_after`, `cancel_timer`, `monotonic_time`, `current_time` (§22.14); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations (§22.12; `alloc_atomic` is not added, Q8); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
 
 ### 22.1 Memory Management Primitives
 
@@ -14409,7 +14381,6 @@ Returns a unique lifetime value. Each call produces a distinct lifetime. Use whe
 alloc_region(space: memory_space) -> region(L, space) proc[mem(space)]
 alloc_ref(r, initial_value) -> ref(L, space, T) proc[mem(space)]
 alloc_buf(r, capacity) -> buf(L, space, T, capacity) proc[mem(space)]
-alloc_atomic(r, initial_value) -> ref(L, space, T) proc[mem(space), atomic]
 alloc_region_on_numa_node(numa_node: int, space: memory_space) -> region(L, space) proc[mem(space)]
 ```
 The lifetime L is taken from the binding's explicit type annotation (e.g. `region(L1, Space)`). L is typically obtained from `fresh_lifetime()`. Region allocation is permitted only within sequence blocks.
@@ -14440,7 +14411,7 @@ sequence proc[mem(normal)]
     dma_buffer: buf(L3, normal_noncacheable, uint8, 4096) <- alloc_buf(dma_region, 4096);
     // Atomic memory for shared counters
     atomic_region: region(L4, atomic) <- alloc_region(atomic);
-    counter: ref(L4, atomic, int64) <- alloc_atomic(atomic_region, 0);
+    counter: ref(L4, atomic, int64) <- alloc_ref(atomic_region, 0);
 produces pure () end
 ```
 
@@ -14823,7 +14794,7 @@ atomic_load(ref, order) -> T proc[mem(space), atomic]
 atomic_store(ref, value, order) -> atom proc[mem(space), atomic]
 atomic_fetch_add(ref, delta, order) -> T proc[mem(space), atomic]
 atomic_compare_exchange(ref, expected, new_val, order)
-    -> {ok, T} | {fail, T} proc[mem(space), atomic]
+    -> (:ok, T) | (:fail, T) proc[mem(space), atomic]
 ```
 
 ### 22.13 Type Operations
@@ -15654,7 +15625,7 @@ The compiler automatically inserts memory barriers based on effect annotations. 
 ```silica
 // Source code
 fn load_shared_data(r: ref(R, atomic, Data)) -> Data proc[mem(atomic), atomic] {
-    atomic_load(r, acquire)  // acquire ordering
+    atomic_load(r, :acquire)  // acquire ordering
 }
 ```
 
@@ -15672,7 +15643,7 @@ LDAR X0, [X1]  // Load-acquire: X0 = result, X1 = address
 ```silica
 // Source code
 fn seq_cst_load(r: ref(R, atomic, int64)) -> int64 proc[mem(atomic), atomic] {
-    atomic_load(r, seq_cst)  // sequential consistency
+    atomic_load(r, :seq_cst)  // sequential consistency
 }
 ```
 
@@ -15693,7 +15664,7 @@ LDAR X0, [X1]  // Load-acquire after barrier
 // Source code
 fn publish_data(data_ref: ref(R, normal, Data), atomic_flag: ref(R, atomic, boolean)) -> atom proc[mem(normal), mem(atomic), atomic] {
     write_ref(data_ref, new_data);                    // Normal store
-    atomic_store(atomic_flag, true, release);        // Release store
+    atomic_store(atomic_flag, true, :release);        // Release store
 }
 ```
 
@@ -15716,13 +15687,13 @@ fn actor_a_behavior(msg: Message, state: State) -> State proc[mem(normal), mem(a
     // Prepare shared data
     write_ref(shared_data_ref, prepared_data);
     // Publish with release semantics
-    atomic_store(publish_flag, true, release);
+    atomic_store(publish_flag, true, :release);
     state
 }
 
 // Source code (Actor B)
 fn actor_b_behavior(msg: Message, state: State) -> State proc[mem(normal), mem(atomic), atomic, concurrency] {
-    ready: boolean <- atomic_load(publish_flag, acquire);
+    ready: boolean <- atomic_load(publish_flag, :acquire);
     case ready of {
         true -> {
             data: Data <- read_ref(shared_data_ref);
@@ -15763,10 +15734,10 @@ fn complex_atomic_operation(
     flag: ref(R, atomic, boolean)
 ) -> int64 proc[mem(atomic), atomic] {
     // Relaxed increment (no ordering needed)
-    old_count: int64 <- atomic_fetch_add(counter, 1, relaxed);
+    old_count: int64 <- atomic_fetch_add(counter, 1, :relaxed);
     
     // Sequential consistency store (needs full ordering)
-    atomic_store(flag, true, seq_cst);
+    atomic_store(flag, true, :seq_cst);
     
     old_count
 }
