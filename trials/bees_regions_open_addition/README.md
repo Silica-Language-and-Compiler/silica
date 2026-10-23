@@ -12,12 +12,9 @@ make integrate TRIAL_TARGET=host TRIAL_SUITES=bees_regions_open_addition       #
 
 | trial | shows |
 |---|---|
-| `bees_sd7_message_region_released` | project-bees SD-7, region design §18.7: 100,000 casts each carrying a fresh two-cell region; each region should be released when the receiving behaviour returns. |
+| `bees_sd7_message_region_released` | project-bees SD-7, region design §18.7, the realistic burst shape: `main` casts 100,000 messages at once, each carrying a fresh two-cell region; each region should be released when the receiving behaviour returns. Output check only. |
+| `bees_sd7_message_region_released_in_flight` | the same release, measured with one message in flight: the behaviour casts the next region message to itself, 100,000 times. Carries the SD-7 peak-RSS ceiling. |
 | `region_in_returned_record_released` | hazard H9, no actors: 100,000 calls each returning a record that holds a fresh two-cell region; each region should be released when the caller is done with it. |
-
-Status 2026-10-22 (Mac, `binaries/silica-compiler` = 999943): both leak. Their output is right
-(`300000` / `done` and `5000050000`), but peak RSS is ~545 MB and ~528 MB (519.9 and 503.4 MiB), about
-5 KB a region; the int64-cast control for SD-7 peaks at ~14.6 MB.
 
 ## How the leak is checked: `.scout` plus a peak-RSS ceiling
 
@@ -28,31 +25,60 @@ The leak shows only in memory, and no program output can tell it today:
   100,000 returned-record regions and by 56 bytes a message (the message copies) in SD-7.
 - `get_actor_memory_usage` reports actor stacks only.
 
-So each trial has a `.scout` with the correct output and a `<trial>.max_rss_mb` marker (the
+So a leak trial has a `.scout` with the correct output and a `<trial>.max_rss_mb` marker (the
 harness's peak-memory ceiling, `../README.md`, "Peak memory ceiling"). A pass needs both: matching
-output and a peak resident set size at or below the ceiling.
+output and a peak resident set size at or below the ceiling. The harness peak includes the Python
+marker runner's own ~15 MB.
 
-| trial | `.scout` | ceiling | leak-free run | today (999943) |
+### Why SD-7 has two trials
+
+In the burst trial every queued message legitimately holds its live ~4 KB region, so its peak RSS
+measures queue depth as well as release: with the SD-7 fix it still peaks at ~382 MiB, because the
+receiver falls behind and the queue holds most of the regions. It cannot tell a leak from a full
+queue, so it has no ceiling and checks output only; it stays because it is the realistic shape
+(and the shape the BEES repro had). The in-flight twin keeps at most one message, and so one region,
+alive at a time; memory that grows with the count there is memory never released, so it carries
+the ceiling.
+
+| trial | `.scout` | ceiling | without the fix (999943) | with the fix (Mac build) |
 |---|---|---|---|---|
-| `bees_sd7_message_region_released` | `300000`, `done`, `0` | 100 MB | ~15 MB (the int64-cast control; also the Python marker runner's own peak) | ~520 MiB (~545 MB; 519.9 and 521.1 in two runs) |
-| `region_in_returned_record_released` | `5000050000`, `0` | 100 MB | a few MB (about one region live) | 503.4 MiB (~528 MB) |
+| `bees_sd7_message_region_released` | `300000`, `done`, `0` | none (queue depth) | ~520 MiB (~545 MB) | ~382 MiB (the queue) |
+| `bees_sd7_message_region_released_in_flight` | `300000`, `done`, `0` | 40 MB | 508.9 MiB (~534 MB alone) | 15.7 MiB (~6.9 MB alone) |
+| `region_in_returned_record_released` | `5000050000`, `0` | 100 MB | 503.4 MiB (~528 MB) | 503.4 MiB, not fixed |
 
-100 MB is more than six times a leak-free run and a fifth of today's peak, so normal variation
-(allocator, carrier count, a slower host) does not flip a leak-free run, and a leak a fifth the
-size of today's still fails. SD-7 caveat: `main` casts all 100,000 messages without throttling, so
-if the receiver falls far behind, many messages and their regions are in flight at once even with
-correct release; the ceiling assumes the receiver keeps up (it does with int64 messages). If a fixed
-compiler still trips the ceiling with flat per-dispatch memory, throttle the sender rather than
-raise the ceiling.
+"Alone" is `/usr/bin/time -l` on the program without the harness. The in-flight ceiling of 40 MB is
+about 2.5 times its leak-free harness peak and under a tenth of the leak, so normal variation does
+not flip a leak-free run, while a leak of about 250 bytes a message still fails. The returned-record
+ceiling of 100 MB is more than six times a leak-free run (a few MB, about one region live) and a
+fifth of today's peak.
 
-Run today (Mac, 999943), the output matches and both trials fail on the ceiling; with no `.ascomp`
-each also reports `has no .ascomp file`:
+Runs on the Mac, 2026-10-22, from `trials/`. The harness ignores `SILICA_COMPILER` from the
+environment; pass it on the make command line.
+
+Without the SD-7 fix (`binaries/silica-compiler` = 999943, the default):
 
 ```
+make -C bees_regions_open_addition integrate TRIAL_TARGET=host
+❌❌ bees_regions_open_addition/bees_sd7_message_region_released_in_flight has no .ascomp file
 ❌❌ bees_regions_open_addition/bees_sd7_message_region_released has no .ascomp file
 ❌❌ bees_regions_open_addition/region_in_returned_record_released has no .ascomp file
-❌ bees_regions_open_addition/bees_sd7_message_region_released: max_rss_mb: peak resident set size 519.9 MB exceeds the ceiling of 100 MB (bees_sd7_message_region_released.max_rss_mb)
-❌❌ bees_regions_open_addition/bees_sd7_message_region_released .sout differs from .scout
+❌ bees_regions_open_addition/bees_sd7_message_region_released_in_flight: max_rss_mb: peak resident set size 508.9 MB exceeds the ceiling of 40 MB (bees_sd7_message_region_released_in_flight.max_rss_mb)
+❌❌ bees_regions_open_addition/bees_sd7_message_region_released_in_flight .sout differs from .scout
+❌ bees_regions_open_addition/region_in_returned_record_released: max_rss_mb: peak resident set size 503.4 MB exceeds the ceiling of 100 MB (region_in_returned_record_released.max_rss_mb)
+❌❌ bees_regions_open_addition/region_in_returned_record_released .sout differs from .scout
+```
+
+(The burst trial's output matched there too.) With the SD-7 fix (the Mac build at
+`compiler/build/apple_silicon_mac/silica-compiler`):
+
+```
+make -C bees_regions_open_addition integrate TRIAL_TARGET=host SILICA_COMPILER=/Volumes/2T/silica/compiler/build/apple_silicon_mac/silica-compiler
+❌❌ bees_regions_open_addition/bees_sd7_message_region_released_in_flight has no .ascomp file
+❌❌ bees_regions_open_addition/bees_sd7_message_region_released has no .ascomp file
+❌❌ bees_regions_open_addition/region_in_returned_record_released has no .ascomp file
+✅ bees_regions_open_addition/bees_sd7_message_region_released_in_flight peak resident set size 15.7 MB is within the ceiling of 40 MB
+✅✅ bees_regions_open_addition/bees_sd7_message_region_released_in_flight output matches .scout
+✅✅ bees_regions_open_addition/bees_sd7_message_region_released output matches .scout
 ❌ bees_regions_open_addition/region_in_returned_record_released: max_rss_mb: peak resident set size 503.4 MB exceeds the ceiling of 100 MB (region_in_returned_record_released.max_rss_mb)
 ❌❌ bees_regions_open_addition/region_in_returned_record_released .sout differs from .scout
 ```
@@ -61,6 +87,22 @@ There is no `.ascomp`: today's assembly is the defective codegen, so it is recor
 leak is fixed. The ceiling is host only; the board ignores the marker, so a board run would need a
 program-visible counter (a runtime count of `alloc_region` blocks in `heap_used()`, or a builtin such
 as live region bytes; compiler work) to check the leak there.
+
+### SD-7: when to move to `../bees_regions_addition`
+
+With the Mac compiler that has the SD-7 fix, both SD-7 trials pass (the in-flight twin on output and
+ceiling, the burst on output); only the H9 trial still fails. They should move to the gated
+`../bees_regions_addition` together, with their `.scout`, `.wait_for_exit` and the twin's
+`.max_rss_mb`, once the fix is in a built compiler on all three hosts and checked there: the Mac
+fixed compiler promoted to `binaries/silica-compiler`, `linux_aarch64` on pix and `linux_x86_64` on
+nix each passing this suite, and a board run of the in-flight twin printing `300000` / `done` (the
+board ignores the ceiling, so there it checks only that release does not break delivery). They stay
+here until then: on any host still on 999943 the twin fails on its ceiling, and the gated suite
+must stay green. Moving needs their `.ascomp` goldens from each host's fixed compiler, and a
+re-check of the gated suite's existing `.ascomp` goldens (a new shape or atom can renumber them;
+refresh only where `.sout` matches `.scout`). The burst trial queues up to 100,000 ~4 KB regions,
+which the board's heap cannot hold, so on the board it may need a smaller count or a host-only
+marker; that is untested.
 
 When a defect is fixed and its trial passes on every host (output and ceiling), add its `.ascomp`
 goldens (Mac, then `linux_aarch64` on pix and `linux_x86_64` on nix) and move it, with its
