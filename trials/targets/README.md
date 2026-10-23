@@ -91,6 +91,9 @@ per suite) instead of as thousands of failures.
 - A real, reviewed difference between the host and the board can be recorded as
   `<trial>.<target>.scout` (or `.golden_fail`) next to the trial; it is used instead of the shared
   golden. Such files are written by hand, never generated.
+- A `<trial>.max_rss_mb` peak-memory ceiling (see [../README.md](../README.md), "Peak memory
+  ceiling") is host only and is ignored here: the board run compares output only, so a trial
+  whose leak shows only in host RSS passes on the board when its output matches.
 - The board's own outputs are written next to each trial as `<trial>.<target>.sout` and
   `<trial>.<target>.cur_fail`. Nothing the host run writes is touched: the host's `.sams`, `.sout`,
   logs and reports stay as they were.
