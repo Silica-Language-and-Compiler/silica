@@ -165,10 +165,31 @@ fn emit_alloc_region(dest: string) -> string {
 //
 // The retry uses a numeric local label so the sites need no unique names: `1f` binds to the `1:`
 // this function emits right after the grow call, and nothing can be emitted in between.
-fn emit_region_bump_check(bump_math: string) -> string {
-    attempt: string <- concat(bump_math, xt_isa@xt_cmp_branch("LS", "X5", "X4", "1f"));
-    grow: string <- xt_isa@xt_call("silica_rt_region_grow");
-    concat(attempt, concat(grow, concat(bump_math, "1:\n")))
+// The reservation every region allocation shares. `size_math` must leave the request in bytes in
+// X7 (X7-X9 are scratch in every prim sequence: alloc_buf already computes its byte count there).
+// Afterwards X3 is the start of the reserved bytes, X4 the block's end and X5 the new bump (all
+// three in the core's register block, high words 0), and the bump is already published: the sites
+// must not store it again.
+//
+// The bump is moved with S32C1I (design region_memory_safety_design.md §9.4, H1): a canonical
+// arena is shared by both cores, and two actors allocating in the same arena from the two cores
+// used to read one bump, each write bump+size, and hand out the same cell. The compare-and-swap
+// also makes a growth safe: silica_rt_region_grow (rt_heap.S) parks a sentinel (0x80000000, above
+// every data address) in the bump before it publishes the new block, so a reservation that read
+// the old bump either sees a request that cannot fit or finds the word changed under its S32C1I
+// and starts over; the grow stores the end before the bump with memw between.
+//
+// Hand-written Xtensa: X1 is a12 (its low word, the only one an address has), a2/a3/a8/a9 are the
+// scratch registers every xt_mem access uses. Nothing is moved into place for the grow call: the
+// runtime reads the region from a4 (the caller's a12) and the request from X7 in the register
+// block. Numeric local labels, so the sites need no unique names: 2 is the retry, 3 the grow,
+// 1 the exit.
+fn emit_region_bump_check(size_math: string) -> string {
+    load_size: string <- "    rur a9, threadptr\n    l32i a8, a9, 32\n";
+    attempt: string <- "2:\n    l32i a2, a12, 0\n    l32i a3, a12, 8\n    add a9, a2, a8\n    bltu a3, a9, 3f\n    wsr a2, scompare1\n    s32c1i a9, a12, 0\n    bne a9, a2, 2b\n";
+    publish: string <- "    add a9, a2, a8\n    rur a8, threadptr\n    s32i a2, a8, 0\n    s32i a3, a8, 8\n    s32i a9, a8, 16\n    movi a9, 0\n    s32i a9, a8, 4\n    s32i a9, a8, 12\n    s32i a9, a8, 20\n    j 1f\n";
+    grow: string <- concat("3:\n", concat(xt_isa@xt_call("silica_rt_region_grow"), "    j 2b\n1:\n"));
+    concat(size_math, concat(load_size, concat(attempt, concat(publish, grow))))
 }
 
 fn memory_type_is_tuple(type_name: string) -> boolean {
@@ -195,19 +216,12 @@ fn memory_tuple_word_count(value: { nodes: List[{ kind: int64, type_name: string
 // Operands: X1 = region base, X2 = value. Region [X1]=bump, [X1+8]=end.
 // Bounds check: if bump+8 > end, grow the region and allocate from the new block.
 fn emit_alloc_ref_scalar(dest: string) -> string {
-    ldr_bump: string <- xt_mem@xt_ldr("X3", "[X1]");
-    ldr_end: string <- xt_mem@xt_ldr("X4", "[X1, #8]");
-    add_new: string <- xt_isa@xt_add("X5", "X3", "#8");
+    mov_size: string <- xt_isa@xt_mov("X7", "#8");
     mov_ref: string <- xt_isa@xt_mov("X4", "X3");
     str_val: string <- xt_mem@xt_str("X2", "[X3]");
-    add_bump: string <- xt_isa@xt_add("X3", "X3", "#8");
-    str_bump: string <- xt_mem@xt_str("X3", "[X1]");
     mov_dest: string <- xt_isa@xt_mov(dest, "X4");
-    check1: string <- concat(concat(ldr_bump, ldr_end), add_new);
-    check: string <- emit_region_bump_check(check1);
-    alloc1: string <- concat(concat(mov_ref, str_val), add_bump);
-    alloc2: string <- concat(alloc1, str_bump);
-    alloc: string <- concat(alloc2, mov_dest);
+    check: string <- emit_region_bump_check(mov_size);
+    alloc: string <- concat(concat(mov_ref, str_val), mov_dest);
     concat(check, alloc)
 }
 
@@ -301,27 +315,20 @@ fn elem_size_bytes_from_buf_type(buf_type: string) -> int64 {
 fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     elem_bytes: int64 <- elem_size_bytes_from_buf_type(sir_term_root_node(term).type_name);
     eb: string <- int64_to_str(elem_bytes);
-    neg_check: string <- emit_abort_when("LT", "X2", "#0", "silica_rt_abort_buf_invalid");
-    ldr_bump: string <- xt_mem@xt_ldr("X3", "[X1]");
-    ldr_end: string <- xt_mem@xt_ldr("X4", "[X1, #8]");
+    neg_check: string <- emit_abort_when("LT", "X2", "#0", "silica_rt_buf_invalid_failed");
     mov_elem: string <- xt_isa@xt_mov("X8", concat("#", eb));
     mul_bytes: string <- xt_isa@xt_mul("X7", "X2", "X8");
-    mul_ov: string <- concat(xt_isa@xt_sdiv("X9", "X7", "X8"), emit_abort_when("NE", "X9", "X2", "silica_rt_abort_buf_invalid"));
-    // X7 = element bytes + 8 (the length word), rounded up to a multiple of 8.
+    mul_ov: string <- concat(xt_isa@xt_sdiv("X9", "X7", "X8"), emit_abort_when("NE", "X9", "X2", "silica_rt_buf_invalid_failed"));
+    // X7 = element bytes + 8 (the length word), rounded up to a multiple of 8: the request the
+    // reservation takes.
     with_len: string <- concat(xt_isa@xt_add("X7", "X7", "#15"), concat(xt_isa@xt_lsr("X7", "X7", "#3"), xt_isa@xt_lsl("X7", "X7", "#3")));
-    add_new: string <- xt_isa@xt_add("X5", "X3", "X7");
     mov_buf: string <- xt_isa@xt_mov("X4", "X3");
-    add_bump: string <- xt_isa@xt_add("X3", "X3", "X7");
-    str_bump: string <- xt_mem@xt_str("X3", "[X1]");
     store_len: string <- concat(xt_mem@xt_str("X2", "[X4]"), xt_isa@xt_add("X4", "X4", "#8"));
     mov_dest: string <- xt_isa@xt_mov(dest, "X4");
-    // Element count validation and the byte count in X7 happen once; only the bump math repeats.
     size_calc1: string <- concat(neg_check, mov_elem);
     size_calc: string <- concat(size_calc1, concat(mul_bytes, concat(mul_ov, with_len)));
-    bump_math: string <- concat(concat(ldr_bump, ldr_end), add_new);
-    check: string <- concat(size_calc, emit_region_bump_check(bump_math));
-    alloc1: string <- concat(concat(mov_buf, add_bump), concat(str_bump, store_len));
-    alloc: string <- concat(alloc1, mov_dest);
+    check: string <- emit_region_bump_check(size_calc);
+    alloc: string <- concat(concat(mov_buf, store_len), mov_dest);
     concat(check, alloc)
 }
 
@@ -355,7 +362,7 @@ fn int64_to_str(n: int64) -> string {
 // index at or past the length and a negative index. X17 is scratch here: nothing is live in it
 // across a buffer access. The abort is inline (emit_abort_when), never a branch out of the section.
 fn emit_buf_bounds_check(_term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, _outer_reg: string, _label_sfx: string) -> string {
-    concat(xt_mem@xt_ldr("X17", "[X1, #-8]"), emit_abort_when("HS", "X2", "X17", "silica_rt_abort_buf_bounds"))
+    concat(xt_mem@xt_ldr("X17", "[X1, #-8]"), emit_abort_when("HS", "X2", "X17", "silica_rt_buf_bounds_failed"))
 }
 
 fn memory_type_contains_from(h: string, needle: string, i: int64) -> boolean {
@@ -475,18 +482,13 @@ fn emit_alloc_rec(term: { nodes: List[{ kind: int64, type_name: string, value: s
     tuple_bytes: int64 <- prims_tuple@flat_alloc_size(tuple_count);
     allocation_bytes: int64 <- tuple_bytes + 8;
     allocation_text: string <- atom_table@int64_to_decimal_string(allocation_bytes);
-    ldr_bump: string <- xt_mem@xt_ldr("X3", "[X1]");
-    ldr_end: string <- xt_mem@xt_ldr("X4", "[X1, #8]");
-    mov_size: string <- xt_isa@xt_mov("X5", concat("#", allocation_text));
-    add_new: string <- xt_isa@xt_add("X5", "X3", "X5");
-    bump_math: string <- concat(concat(concat(ldr_bump, ldr_end), mov_size), add_new);
-    bounds: string <- emit_region_bump_check(bump_math);
+    mov_size: string <- xt_isa@xt_mov("X7", concat("#", allocation_text));
+    bounds: string <- emit_region_bump_check(mov_size);
     retain_ref: string <- xt_isa@xt_mov("X4", "X3");
     payload: string <- concat(xt_isa@xt_add("X6", "X3", "#8"), xt_mem@xt_str("X6", "[X4]"));
     copy: string <- emit_alloc_rec_copy_words(0, tuple_bytes / 8);
-    publish_bump: string <- xt_mem@xt_str("X5", "[X1]");
     mov_dest: string <- xt_isa@xt_mov(dest, "X4");
-    concat(concat(concat(concat(concat(concat(bounds, retain_ref), payload), copy), publish_bump), mov_dest), "")
+    concat(concat(concat(concat(bounds, retain_ref), payload), copy), mov_dest)
 }
 
 // A buffer access aborts inline (emit_buf_bounds_check), so reading a buffer the module was passed

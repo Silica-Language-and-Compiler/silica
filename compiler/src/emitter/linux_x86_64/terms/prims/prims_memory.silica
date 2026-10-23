@@ -138,6 +138,8 @@ fn emit_canonical_arena_same(dest: string) -> string {
 fn emit_alloc_region(dest: string) -> string {
     mov_size: string <- x86_isa@x86_movi("X0", 4128);
     bl_malloc: string <- x86_isa@x86_call("silica_rt_raw_alloc");
+    // No block: the current actor ends with (:explicit, :region_alloc_failed), main aborts (H5).
+    null_check: string <- concat("    test rdi, rdi\n    jnz 1f\n", concat(x86_isa@x86_call("silica_rt_region_alloc_failed"), "1:\n"));
     add_bump: string <- x86_isa@x86_add("X4", "X0", "#32");
     str_bump: string <- x86_mem@x86_str("X4", "[X0]");
     // The AArch64 site formed 4128 in X5 because ADD takes at most #4095; kept as reg + reg.
@@ -148,29 +150,39 @@ fn emit_alloc_region(dest: string) -> string {
     str_no_ext: string <- x86_mem@x86_str("XZR", "[X0, #16]");
     str_span_end: string <- x86_mem@x86_str("X4", "[X0, #24]");
     mov_dest: string <- x86_isa@x86_mov(dest, "X0");
-    part1: string <- concat(mov_size, bl_malloc);
+    part1: string <- concat(mov_size, concat(bl_malloc, null_check));
     part2: string <- concat(part1, concat(add_bump, str_bump));
     part3: string <- concat(part2, concat(mov_arena_sz, concat(add_end, str_end)));
     part4: string <- concat(part3, concat(str_no_ext, str_span_end));
     concat(part4, mov_dest)
 }
 
-// The bounds check every region allocation shares. `bump_math` must leave the current block's bump
-// in X3, its end in X4 and bump+request in X5; it is emitted a second time after a growth because
-// the new block's bump has to be read again.
+// The reservation every region allocation shares. `size_math` must leave the request in bytes in
+// X7 = r15 (X7-X9 are scratch in every prim sequence: alloc_buf already computes its byte count
+// there). Afterwards X3 = rcx is the start of the reserved bytes, X4 = r8 the block's end and
+// X5 = r9 the new bump, and the bump is already published: the sites must not store it again.
 //
-// Nothing is moved into place for the call: L_region_grow reads the region from X1 and the size
-// from X5 - X3, all of which the check just computed and is about to recompute anyway. Setting up
-// argument registers instead would corrupt the caller on exactly the rare path that is hardest to
-// notice -- the emitter stages call arguments in X0-X7, so a `MOV X6, X1` here destroys a staged
-// argument, but only in the runs where the region happened to fill up.
+// The bump is moved with `lock cmpxchg` (design region_memory_safety_design.md §9.4, H1): a
+// canonical arena is process-shared, and two actors allocating in the same arena from two threads
+// used to read one bump, each write bump+size, and hand out the same cell. The AArch64 emitters use
+// an exclusive pair for the same reservation; here rax carries the expected bump (rax is no VR's
+// home, so it is free scratch in a prim sequence). The compare-exchange also makes a growth safe:
+// L_region_grow (below) parks a sentinel in the bump before it publishes the new block, so a
+// reservation that read the old bump either sees a request that cannot fit or finds the word
+// changed under its exchange and starts over; x86 loads and stores keep program order, so a
+// reservation that reads the new bump reads the new end (the grow stores the end first).
 //
-// The retry uses a numeric local label so the sites need no unique names: `1f` binds to the `1:`
-// this function emits right after the grow call, and nothing can be emitted in between.
-fn emit_region_bump_check(bump_math: string) -> string {
-    attempt: string <- concat(bump_math, x86_isa@x86_cmp_branch("LS", "X5", "X4", "1f"));
-    grow: string <- x86_isa@x86_call("L_region_grow");
-    concat(attempt, concat(grow, concat(bump_math, "1:\n")))
+// Nothing is moved into place for the grow call: L_region_grow reads the region from X1 and the
+// request from X7, both of which the site set up for the reservation. Setting up argument registers
+// instead would corrupt the caller on exactly the rare path that is hardest to notice -- the emitter
+// stages call arguments in X0-X7, so a `MOV X6, X1` here destroys a staged argument, but only in
+// the runs where the region happened to fill up.
+//
+// Numeric local labels, so the sites need no unique names: 2 is the retry, 3 the grow, 1 the exit.
+fn emit_region_bump_check(size_math: string) -> string {
+    reserve: string <- "2:\n    mov rax, QWORD PTR [rsi]\n    mov r8, QWORD PTR [rsi + 8]\n    lea r9, [rax + r15]\n    cmp r9, r8\n    ja 3f\n    lock cmpxchg QWORD PTR [rsi], r9\n    jne 2b\n    mov rcx, rax\n    jmp 1f\n";
+    grow: string <- concat("3:\n", concat(x86_isa@x86_call("L_region_grow"), "    jmp 2b\n1:\n"));
+    concat(size_math, concat(reserve, grow))
 }
 
 fn memory_type_is_tuple(type_name: string) -> boolean {
@@ -197,19 +209,12 @@ fn memory_tuple_word_count(value: { nodes: List[{ kind: int64, type_name: string
 // Operands: X1 = region base, X2 = value. Region [X1]=bump, [X1+8]=end.
 // Bounds check: if bump+8 > end, grow the region and allocate from the new block.
 fn emit_alloc_ref_scalar(dest: string) -> string {
-    ldr_bump: string <- x86_mem@x86_ldr("X3", "[X1]");
-    ldr_end: string <- x86_mem@x86_ldr("X4", "[X1, #8]");
-    add_new: string <- x86_isa@x86_add("X5", "X3", "#8");
+    mov_size: string <- x86_isa@x86_movi("X7", 8);
     mov_ref: string <- x86_isa@x86_mov("X4", "X3");
     str_val: string <- x86_mem@x86_str("X2", "[X3]");
-    add_bump: string <- x86_isa@x86_add("X3", "X3", "#8");
-    str_bump: string <- x86_mem@x86_str("X3", "[X1]");
     mov_dest: string <- x86_isa@x86_mov(dest, "X4");
-    check1: string <- concat(concat(ldr_bump, ldr_end), add_new);
-    check: string <- emit_region_bump_check(check1);
-    alloc1: string <- concat(concat(mov_ref, str_val), add_bump);
-    alloc2: string <- concat(alloc1, str_bump);
-    alloc: string <- concat(alloc2, mov_dest);
+    check: string <- emit_region_bump_check(mov_size);
+    alloc: string <- concat(concat(mov_ref, str_val), mov_dest);
     concat(check, alloc)
 }
 
@@ -304,28 +309,19 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
     elem_bytes: int64 <- elem_size_bytes_from_buf_type(sir_term_root_node(term).type_name);
     eb: string <- int64_to_str(elem_bytes);
     neg_check: string <- x86_isa@x86_cmp_branch("LT", "X2", "#0", "L_buf_invalid");
-    ldr_bump: string <- x86_mem@x86_ldr("X3", "[X1]");
-    ldr_end: string <- x86_mem@x86_ldr("X4", "[X1, #8]");
     mov_elem: string <- x86_isa@x86_movi_text("X8", eb);
     mul_bytes: string <- x86_isa@x86_mul("X7", "X2", "X8");
     mul_ov: string <- concat(x86_isa@x86_sdiv("X9", "X7", "X8"), x86_isa@x86_cmp_branch("NE", "X9", "X2", "L_buf_invalid"));
-    // X7 = element bytes + 8 (the length word), rounded up to a multiple of 8.
+    // X7 = element bytes + 8 (the length word), rounded up to a multiple of 8: the request the
+    // reservation takes.
     with_len: string <- concat(x86_isa@x86_add("X7", "X7", "#15"), concat(x86_isa@x86_lsr("X7", "X7", "#3"), x86_isa@x86_lsl("X7", "X7", "#3")));
-    add_new: string <- x86_isa@x86_add("X5", "X3", "X7");
     mov_buf: string <- x86_isa@x86_mov("X4", "X3");
-    // The AArch64 site wrote `ADD X3, X3, X2, LSL #3` for 8-byte elements; X7 already holds
-    // X2 * elem_bytes (validated by the overflow check above), so both widths bump by X7.
-    add_bump: string <- x86_isa@x86_add("X3", "X3", "X7");
-    str_bump: string <- x86_mem@x86_str("X3", "[X1]");
     store_len: string <- concat(x86_mem@x86_str("X2", "[X4]"), x86_isa@x86_add("X4", "X4", "#8"));
     mov_dest: string <- x86_isa@x86_mov(dest, "X4");
-    // Element count validation and the byte count in X7 happen once; only the bump math repeats.
     size_calc1: string <- concat(neg_check, mov_elem);
     size_calc: string <- concat(size_calc1, concat(mul_bytes, concat(mul_ov, with_len)));
-    bump_math: string <- concat(concat(ldr_bump, ldr_end), add_new);
-    check: string <- concat(size_calc, emit_region_bump_check(bump_math));
-    alloc1: string <- concat(concat(mov_buf, add_bump), concat(str_bump, store_len));
-    alloc: string <- concat(alloc1, mov_dest);
+    check: string <- emit_region_bump_check(size_calc);
+    alloc: string <- concat(concat(mov_buf, store_len), mov_dest);
     concat(check, alloc)
 }
 
@@ -466,18 +462,13 @@ fn emit_alloc_rec(term: { nodes: List[{ kind: int64, type_name: string, value: s
     tuple_bytes: int64 <- prims_tuple@flat_alloc_size(tuple_count);
     allocation_bytes: int64 <- tuple_bytes + 8;
     allocation_text: string <- atom_table@int64_to_decimal_string(allocation_bytes);
-    ldr_bump: string <- x86_mem@x86_ldr("X3", "[X1]");
-    ldr_end: string <- x86_mem@x86_ldr("X4", "[X1, #8]");
-    mov_size: string <- x86_isa@x86_movi_text("X5", allocation_text);
-    add_new: string <- x86_isa@x86_add("X5", "X3", "X5");
-    bump_math: string <- concat(concat(concat(ldr_bump, ldr_end), mov_size), add_new);
-    bounds: string <- emit_region_bump_check(bump_math);
+    mov_size: string <- x86_isa@x86_movi_text("X7", allocation_text);
+    bounds: string <- emit_region_bump_check(mov_size);
     retain_ref: string <- x86_isa@x86_mov("X4", "X3");
     payload: string <- concat(x86_isa@x86_add("X6", "X3", "#8"), x86_mem@x86_str("X6", "[X4]"));
     copy: string <- emit_alloc_rec_copy_words(0, tuple_bytes / 8);
-    publish_bump: string <- x86_mem@x86_str("X5", "[X1]");
     mov_dest: string <- x86_isa@x86_mov(dest, "X4");
-    concat(concat(concat(concat(concat(concat(bounds, retain_ref), payload), copy), publish_bump), mov_dest), "")
+    concat(concat(concat(concat(bounds, retain_ref), payload), copy), mov_dest)
 }
 
 // A buffer access branches to L_buf_bounds (emit_buf_bounds_check), which emit_region_helpers
@@ -547,10 +538,10 @@ fn module_uses_alloc_region(sir_module: { module_name: string, used_modules: Lis
     alloc_region_in_functions(sir_module.functions)
 }
 
-// L_region_grow(X1 = rsi = region, X5 - X3 = r9 - rcx = bytes wanted): attach a block that can hold
-// the request and point the region's bump/end at it. Hand-written x86-64. Preserves every general
+// L_region_grow(X1 = rsi = region, X7 = r15 = bytes wanted): attach a block that can hold the
+// request and point the region's bump/end at it. Hand-written x86-64. Preserves every general
 // register (all fourteen are pushed), because it is called from the middle of an allocation sequence
-// that still holds the value being stored: the caller only reloads bump and end afterwards. The
+// that still holds the value being stored: the caller only retries its reservation afterwards. The
 // region and the rounded size (X19/X20 on AArch64) live in two frame slots across
 // silica_rt_raw_alloc (internal convention: rdi -> rdi, may clobber anything but rbp/rsp).
 //
@@ -558,6 +549,17 @@ fn module_uses_alloc_region(sir_module: { module_name: string, used_modules: Lis
 // exactly the (16-byte rounded) request when that is larger, which is what makes a buffer bigger
 // than a block work at all. L_region_overflow remains for the one failure that is still fatal:
 // the allocator handing back nothing.
+//
+// Growth is serialized by silica_rt_region_lock (one process-wide word in the runtime module,
+// canonical_arena_runtime_asm; an xchg spin). Under the lock the request is checked again, because
+// the grower that got there first may already have attached a block this request fits; then a
+// sentinel (2^62, above every user address, and bump + request cannot wrap) is parked in the bump
+// so no concurrent reservation can land in the old block while the new one is being published, the
+// block is chained and its end stored, and the bump is stored last (x86 stores are not reordered
+// with other stores, so a reservation that reads the new bump reads the new end). The lock is
+// released before the overflow branch so an allocation failure that ends only the current actor
+// leaves the lock free; the sentinel stays, and the next reservation in that region tries to grow
+// again.
 // Region release (silica-specification 12.1.2): free a region and every extension
 // block chained off [base+16]. Hand-written x86-64: rdi = region; free is a SysV call, and
 // rbx/r12 hold the region and the walk pointer across it. A region is a discrete malloc'd pool, so releasing
@@ -569,7 +571,15 @@ fn emit_region_free_helper() -> string {
 }
 
 fn emit_region_grow_helper() -> string {
-    "L_region_grow:\n    push rbp\n    mov rbp, rsp\n    push rdi\n    push rsi\n    push rdx\n    push rcx\n    push r8\n    push r9\n    push r10\n    push r11\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    push rax\n    sub rsp, 16\n    mov QWORD PTR [rsp], rsi\n    mov r12, r9\n    sub r12, rcx\n    add r12, 15\n    and r12, -16\n    mov r10d, 4096\n    cmp r12, r10\n    jae 1f\n    mov r12, r10\n1:\n    mov QWORD PTR [rsp + 8], r12\n    lea rdi, [r12 + 32]\n    call silica_rt_raw_alloc\n    test rdi, rdi\n    jz L_region_overflow\n    mov rbx, QWORD PTR [rsp]\n    mov r12, QWORD PTR [rsp + 8]\n    lea rsi, [rdi + 32]\n    lea rdx, [rsi + r12]\n    mov QWORD PTR [rdi + 24], rdx\n    mov rcx, QWORD PTR [rbx + 16]\n    mov QWORD PTR [rdi + 16], rcx\n    mov QWORD PTR [rbx + 16], rdi\n    mov QWORD PTR [rbx], rsi\n    mov QWORD PTR [rbx + 8], rdx\n    add rsp, 16\n    pop rax\n    pop r15\n    pop r14\n    pop r13\n    pop r12\n    pop rbx\n    pop r11\n    pop r10\n    pop r9\n    pop r8\n    pop rcx\n    pop rdx\n    pop rsi\n    pop rdi\n    pop rbp\n    ret\n"
+    saves: string <- "L_region_grow:\n    push rbp\n    mov rbp, rsp\n    push rdi\n    push rsi\n    push rdx\n    push rcx\n    push r8\n    push r9\n    push r10\n    push r11\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    push rax\n    sub rsp, 16\n    mov QWORD PTR [rsp], rsi\n";
+    size: string <- "    mov r12, r15\n    add r12, 15\n    and r12, -16\n    mov r10d, 4096\n    cmp r12, r10\n    jae 1f\n    mov r12, r10\n1:\n    mov QWORD PTR [rsp + 8], r12\n";
+    lock: string <- "2:\n    mov eax, 1\n    xchg eax, DWORD PTR [rip + silica_rt_region_lock]\n    test eax, eax\n    jnz 2b\n";
+    recheck: string <- "    mov rbx, QWORD PTR [rsp]\n    mov rcx, QWORD PTR [rbx]\n    mov rdx, QWORD PTR [rbx + 8]\n    lea r9, [rcx + r15]\n    cmp r9, rdx\n    jbe 4f\n    movabs rax, 4611686018427387904\n    mov QWORD PTR [rbx], rax\n";
+    alloc: string <- "    lea rdi, [r12 + 32]\n    call silica_rt_raw_alloc\n    test rdi, rdi\n    jz 5f\n    mov rbx, QWORD PTR [rsp]\n    mov r12, QWORD PTR [rsp + 8]\n";
+    publish: string <- "    lea rsi, [rdi + 32]\n    lea rdx, [rsi + r12]\n    mov QWORD PTR [rdi + 24], rdx\n    mov rcx, QWORD PTR [rbx + 16]\n    mov QWORD PTR [rdi + 16], rcx\n    mov QWORD PTR [rbx + 16], rdi\n    mov QWORD PTR [rbx + 8], rdx\n    mov QWORD PTR [rbx], rsi\n4:\n    mov DWORD PTR [rip + silica_rt_region_lock], 0\n";
+    restores: string <- "    add rsp, 16\n    pop rax\n    pop r15\n    pop r14\n    pop r13\n    pop r12\n    pop rbx\n    pop r11\n    pop r10\n    pop r9\n    pop r8\n    pop rcx\n    pop rdx\n    pop rsi\n    pop rdi\n    pop rbp\n    ret\n";
+    failed: string <- "5:\n    mov DWORD PTR [rip + silica_rt_region_lock], 0\n    jmp L_region_overflow\n";
+    concat(saves, concat(size, concat(lock, concat(recheck, concat(alloc, concat(publish, concat(restores, failed)))))))
 }
 
 // L_region_contains(X1 = rsi = ref, X2 = rdx = region) -> X5 = r9 = 0 or 1: is the ref one this
@@ -584,8 +594,11 @@ fn emit_region_contains_helper() -> string {
     "L_region_contains:\n    push r14\n    push r15\n    lea r14, [rdx + 32]\n    mov r15, QWORD PTR [rdx + 24]\n    cmp rsi, r14\n    jb 2f\n    cmp rsi, r15\n    jb 3f\n2:\n    mov r14, QWORD PTR [rdx + 16]\n1:\n    test r14, r14\n    jz 4f\n    lea r15, [r14 + 32]\n    cmp rsi, r15\n    jb 5f\n    mov r15, QWORD PTR [r14 + 24]\n    cmp rsi, r15\n    jb 3f\n5:\n    mov r14, QWORD PTR [r14 + 16]\n    jmp 1b\n3:\n    mov r9d, 1\n    pop r15\n    pop r14\n    ret\n4:\n    xor r9d, r9d\n    pop r15\n    pop r14\n    ret\n"
 }
 
+// The three failure labels end the current actor with (:explicit, :region_alloc_failed / :buf_invalid /
+// :buf_bounds) and abort the process (71) in main (design region_memory_safety_design.md H5 and Q9 (a),
+// runtime entries in prims_actors_stack_asm); the access or allocation was never performed.
 fn emit_region_helpers() -> string {
-    aborts: string <- "L_region_overflow:\n    call silica_rt_abort_region_overflow\nL_buf_invalid:\n    call silica_rt_abort_buf_invalid\nL_buf_bounds:\n    call silica_rt_abort_buf_bounds\n";
+    aborts: string <- "L_region_overflow:\n    call silica_rt_region_alloc_failed\nL_buf_invalid:\n    call silica_rt_buf_invalid_failed\nL_buf_bounds:\n    call silica_rt_buf_bounds_failed\n";
     concat(aborts, concat(emit_region_grow_helper(), emit_region_contains_helper()))
 }
 

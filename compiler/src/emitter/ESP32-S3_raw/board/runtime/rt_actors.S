@@ -381,6 +381,15 @@ silica_registry_atom_shutdown:
     .weak   silica_registry_atom_restart_breach
 silica_registry_atom_restart_breach:
     .word   -1
+    .weak   silica_registry_atom_buf_bounds
+silica_registry_atom_buf_bounds:
+    .word   -1
+    .weak   silica_registry_atom_buf_invalid
+silica_registry_atom_buf_invalid:
+    .word   -1
+    .weak   silica_registry_atom_list_index
+silica_registry_atom_list_index:
+    .word   -1
     .weak   silica_rt_reply_tag
 silica_rt_reply_tag:
     .word   -1

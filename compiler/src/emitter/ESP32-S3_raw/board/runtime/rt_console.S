@@ -555,6 +555,33 @@ silica_rt_abort_with:
     ABORT_ENTRY silica_rt_abort_heap_exhausted, silica_rt_reason_heap_exhausted
     ABORT_ENTRY silica_rt_abort_ingress_full, silica_rt_reason_ingress_full
 
+// Bounds failures (region_memory_safety_design.md §8, Q9 (a)): inside an actor an out-of-bounds buffer
+// index, an invalid buffer size and a list index out of range end the ACTOR with (:explicit, atom),
+// delivered and supervised like any failure (silica_rt_actor_trap_explicit); in main (no current
+// actor) they are the runtime abort of the same site, status 71, reported at the site's CALL8: a0
+// of this window is still that return address after the call8 below. The atom words are emitted
+// into the image by the compiler (emitter_core xt_runtime_registry_words; weak -1 defaults in
+// rt_actors.S for hand-written apps). The access was never performed.
+.macro FAILURE_ENTRY name, atomword, reason
+    .align  4
+    .global \name
+    .type   \name, @function
+\name:
+    entry   a1, 32
+    call8   silica_rt_current_actor
+    beqz    a10, 1f
+    movi    a8, \atomword
+    l32i    a10, a8, 0
+    call8   silica_rt_actor_trap_explicit
+1:  movi    a2, \reason
+    j       silica_rt_abort_body
+    .size   \name, . - \name
+.endm
+
+    FAILURE_ENTRY silica_rt_buf_bounds_failed, silica_registry_atom_buf_bounds, silica_rt_reason_buf_bounds
+    FAILURE_ENTRY silica_rt_buf_invalid_failed, silica_registry_atom_buf_invalid, silica_rt_reason_buf_invalid
+    FAILURE_ENTRY silica_rt_list_index_failed, silica_registry_atom_list_index, silica_rt_reason_list_index
+
 // a2 = reason, a0 = return address of the CALL8 into the entry. Never returns.
     .align  4
 silica_rt_abort_body:

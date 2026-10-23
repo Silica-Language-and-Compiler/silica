@@ -157,7 +157,10 @@ fn check_region_builtin_call(expr: { nodes: List[{ kind: int64, value: string, n
                                     (r1, _) <- check_surface(type_checker_expressions_helpers@expr_child_inner(expr), region_type, context, world);
                                     case r1.is_ok of { false -> r1; true -> {
                         (r, _) <- check_surface(type_checker_expressions_helpers@call_second_arg_expr(expr), "int64", context, world);
-                        r
+                        case r.is_ok of {
+                            false -> r;
+                            true -> check_alloc_buf_literal_size(type_checker_expressions_helpers@call_second_arg_expr(expr), type_checker_expressions_helpers@expect_surf(context, expected_type))
+                        }
                     }}
                                 }
                             }
@@ -174,7 +177,10 @@ fn check_region_builtin_call(expr: { nodes: List[{ kind: int64, value: string, n
                                             (r1, _) <- check_surface(type_checker_expressions_helpers@expr_child_inner(expr), buf_type, context, world);
                                             case r1.is_ok of { false -> r1; true -> {
                         (r, _) <- check_surface(type_checker_expressions_helpers@call_second_arg_expr(expr), "int64", context, world);
-                        r
+                        case r.is_ok of {
+                            false -> r;
+                            true -> check_buf_literal_index(type_checker_expressions_helpers@call_second_arg_expr(expr), buf_type)
+                        }
                     }}
                                         }
                                     }
@@ -194,8 +200,12 @@ fn check_region_builtin_call(expr: { nodes: List[{ kind: int64, value: string, n
                                                     false -> r1;
                                                     true -> {
                                                         (r2, _) <- check_surface(type_checker_expressions_helpers@expr_child_inner(type_checker_expressions_helpers@expr_child_right(expr)), "int64", context, world);
-                                                        case r2.is_ok of {
+                                                        r2b: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- case r2.is_ok of {
                                                             false -> r2;
+                                                            true -> check_buf_literal_index(type_checker_expressions_helpers@expr_child_inner(type_checker_expressions_helpers@expr_child_right(expr)), buf_type)
+                                                        };
+                                                        case r2b.is_ok of {
+                                                            false -> r2b;
                                                             true -> {
                                                                 (r3, _) <- check_surface(type_checker_expressions_helpers@call_third_arg_expr(expr), elem_type, context, world);
                                                                 case r3.is_ok of {
@@ -322,3 +332,68 @@ fn check_region_builtin_call(expr: { nodes: List[{ kind: int64, value: string, n
 
 // Built-in: print_int64/32/16/8, print_uint64/32/16/8 - arg matches type, returns atom
 // Built-in: print_atom(atom:x) - arg atom, returns atom (:ok on success, :fail on failure)
+
+// Static buffer checks (design region_memory_safety_design.md §8, stage 8; error codes E2313 and E2314).
+// A buf(R, Space, T, N) with a literal N is checked against a literal size or index at compile time;
+// a name for N or a computed size or index is left to the run-time check (spec §12.3.3).
+
+fn digits_only_from(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> true;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9" of {
+                true -> digits_only_from(s, i + 1);
+                false -> false
+            }
+        }
+    }
+}
+
+// The literal length N of a buf type, or -1 when N is a name or the type is not a buf.
+fn buf_literal_length(buf_type: string) -> int64 {
+    n: string <- type_checker_memory_regions@extract_length_from_buf(buf_type);
+    case length_bytes(n) > 0 and digits_only_from(n, 0) of {
+        true -> string_parse@string_to_int64(n);
+        false -> -1
+    }
+}
+
+// The value of an integer literal expression (parser kind 0), or -1 for anything else.
+fn int_literal_value(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> int64 {
+    v: string <- type_checker_expressions_helpers@expr_value(expr);
+    case type_checker_expressions_helpers@expr_kind(expr) == 0 and length_bytes(v) > 0 and digits_only_from(v, 0) of {
+        true -> string_parse@string_to_int64(v);
+        false -> -1
+    }
+}
+
+// E2313: alloc_buf(r, k) bound to buf(R, Space, T, N) with literal k and N, k != N.
+fn check_alloc_buf_literal_size(size_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, buf_type: string) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    k: int64 <- int_literal_value(size_expr);
+    n: int64 <- buf_literal_length(buf_type);
+    case k >= 0 and n >= 0 and k != n of {
+        true -> type_checker_core@type_check_err("E2313", type_checker_expressions_helpers@expr_loc(size_expr), concat(concat(concat(concat("buffer length mismatch: alloc_buf allocates ", type_checker_expressions_helpers@expr_value(size_expr)), " elements but the buffer type "), buf_type), concat(" has length ", type_checker_memory_regions@extract_length_from_buf(buf_type))), "sect12.3.3");
+        false -> type_checker_core@type_check_ok()
+    }
+}
+
+// E2314: a literal index at or past a literal N (indices run 0 to N-1).
+fn check_buf_literal_index(index_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, buf_type: string) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    i: int64 <- int_literal_value(index_expr);
+    n: int64 <- buf_literal_length(buf_type);
+    case i >= 0 and n >= 0 and i >= n of {
+        true -> type_checker_core@type_check_err("E2314", type_checker_expressions_helpers@expr_loc(index_expr), concat(concat(concat(concat("buffer index out of range: literal index ", type_checker_expressions_helpers@expr_value(index_expr)), " is outside "), buf_type), concat(concat(" (indices 0 to ", int64_to_decimal_text(n - 1)), ")")), "sect12.3.3");
+        false -> type_checker_core@type_check_ok()
+    }
+}
+
+fn int64_to_decimal_text(n: int64) -> string {
+    case n < 0 of {
+        true -> concat("-", int64_to_decimal_text(0 - n));
+        false -> case n < 10 of {
+            true -> substring("0123456789", n, n + 1);
+            false -> concat(int64_to_decimal_text(n / 10), substring("0123456789", n % 10, n % 10 + 1))
+        }
+    }
+}
