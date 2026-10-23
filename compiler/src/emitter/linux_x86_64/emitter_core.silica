@@ -27,6 +27,7 @@
 use sir_ast;
 use term_emitter;
 use term_reg_spill;
+use term_message_regions;
 use term_record_layout;
 use term_aggregate_helpers;
 use control;
@@ -1677,13 +1678,16 @@ fn fpb_count_from(s: string, i: int64, n: int64, pat: string, m: int64, acc: int
 // branches to the body. Kind 5 (a whole-body tail call) keeps its own path.
 // Same design as emitter/apple_silicon_mac (which restores SP from X29 and the prologue size).
 // See trials/recursive_function_addition/tail_recursion_runs_in_constant_stack.
-fn tco_eligible(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, arena_ok: boolean, region_ok: boolean) -> boolean {
+// msg_drop: the frame destroys its message record's regions at return (term_message_regions); a
+// jump back to the body would skip that, as it would skip a destroyed region parameter.
+fn tco_eligible(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, arena_ok: boolean, region_ok: boolean, msg_drop: boolean) -> boolean {
     scoped: boolean <- (arena_ok or region_ok) and emitter_effects@is_pure(fn_val.effects) and arena_scope_ret_ok(fn_val.return_type) and body_creates_region(fn_val.body);
     fs_is_program_main_name(fn_val.name) == false
         and sir_term_root_node(fn_val.body).kind != 5
         and use_actor_reply_sret_buffer(fn_val) == false
         and reg_conventions@is_aggregate_struct_or_tuple_return_type(fn_val.return_type) == false
         and fn_destroys_region_param(fn_val) == false
+        and msg_drop == false
         and tco_body_allocates_region(fn_val.body) == false
         and scoped == false
         and fs_count_params(fn_val.param_names) <= 8
@@ -2312,6 +2316,31 @@ fn rgn_addr_x16(off: int64) -> string {
     x86_isa@x86_sub("X16", "X29", concat("#", atom_table@int64_to_decimal_string(off)))
 }
 
+// One destroy per owned region field of the message record parked in the region slot: `ld` loads
+// the record pointer into X0 (re-emitted before every field), the field offset comes from
+// term_message_regions as ",8,24,". The caller preserves X0/X1 around it.
+fn msg_region_destroy_list(offs: string, ld: string) -> string {
+    case length_bytes(offs) <= 1 of {
+        true -> "";
+        false -> {
+            rest: string <- substring(offs, 1, length_bytes(offs));
+            c: int64 <- msg_region_comma_at(rest, 0);
+            one: string <- concat(ld, concat(x86_mem@x86_ldr("X0", concat("[X0, #", concat(substring(rest, 0, c), "]"))), x86_isa@x86_call("silica_rt_region_destroy")));
+            concat(one, msg_region_destroy_list(substring(rest, c, length_bytes(rest)), ld))
+        }
+    }
+}
+
+fn msg_region_comma_at(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> case substring(s, i, i + 1) == "," of {
+            true -> i;
+            false -> msg_region_comma_at(s, i + 1)
+        }
+    }
+}
+
 fn region_param_index(param_types: string, idx: int64) -> int64 {
     // param_type_at_index returns the LAST type once the index overruns, never an
     // empty string, so this must be bounded explicitly -- recursing on emptiness
@@ -2398,7 +2427,7 @@ fn case_bind_slots(term: { nodes: List[{ kind: int64, type_name: string, value: 
     }
 }
 
-fn frame_spill_slot_count(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> int64 {
+fn frame_spill_slot_count(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, msg_drop: boolean) -> int64 {
     pressure: int64 <- count_callee_saved_spill_pressure(fn_val.body) + full_shadow_pressure_bump(fn_val);
     lets: int64 <- count_spill_eligible_lets_in_term(fn_val.body);
     // next_frame_spill_slot never reuses |name=[X29,#-n*16] bindings. Wide
@@ -2419,9 +2448,9 @@ fn frame_spill_slot_count(fn_val: { name: string, return_type: string, effects: 
         true -> demand_base - 10;
         false -> 0
     };
-    // +1 slot holds the owned region handle from entry to the epilogue: the
-    // parameter register is not stable across the body.
-    rgn: int64 <- case fn_destroys_region_param(fn_val) of { true -> 1; false -> 0 };
+    // +1 slot holds the owned region handle (or, for msg_drop, the message record pointer) from
+    // entry to the epilogue: the parameter register is not stable across the body.
+    rgn: int64 <- case fn_destroys_region_param(fn_val) or msg_drop of { true -> 1; false -> 0 };
     // +1 slot holds the caller's result buffer (X8) of an sret tuple function from entry to the epilogue.
     sret_slot: int64 <- case fn_returns_sret_tuple(fn_val) of { true -> 1; false -> 0 };
     reg_backed + sc_depth(fn_val.body) + (agg_region_bytes(fn_val.body) + 15) / 16 + rgn + sret_slot + case_bind_slots(fn_val.body)
@@ -2429,8 +2458,8 @@ fn frame_spill_slot_count(fn_val: { name: string, return_type: string, effects: 
 fn agg_region_bytes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
     term_reg_spill@agg_subtree_bytes(term, term.root)
 }
-fn frame_spill_bytes(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> int64 {
-    frame_spill_slot_count(fn_val) * 16
+fn frame_spill_bytes(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, msg_drop: boolean) -> int64 {
+    frame_spill_slot_count(fn_val, msg_drop) * 16
 }
 
 // SUB/ADD SP, SP, #nbytes (x86_isa moves rsp with lea, so the flags survive).
@@ -2639,10 +2668,10 @@ fn fn_returns_sret_tuple(fn_val: { name: string, return_type: string, effects: s
 
 // [X29, #-N] of the X8 slot: the deepest slot, or the one above it when the owned region handle
 // (rgn_save) has the deepest.
-fn sret_slot_offset(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> int64 {
-    case fn_destroys_region_param(fn_val) of {
-        true -> frame_spill_bytes(fn_val) - 16;
-        false -> frame_spill_bytes(fn_val)
+fn sret_slot_offset(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, msg_drop: boolean) -> int64 {
+    case fn_destroys_region_param(fn_val) or msg_drop of {
+        true -> frame_spill_bytes(fn_val, msg_drop) - 16;
+        false -> frame_spill_bytes(fn_val, msg_drop)
     }
 }
 
@@ -2722,10 +2751,10 @@ fn sret_spine_arms(term: { nodes: List[{ kind: int64, type_name: string, value: 
 }
 
 // Markers for the body: where X8 was parked, and the return spine.
-fn sret_outer_markers(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+fn sret_outer_markers(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, msg_drop: boolean) -> string {
     case fn_returns_sret_tuple(fn_val) of {
         false -> "";
-        true -> concat(concat("|_rsret=", atom_table@int64_to_decimal_string(sret_slot_offset(fn_val))), concat("|_rsp=", sret_spine_nodes(fn_val.body, fn_val.body.root, ",")))
+        true -> concat(concat("|_rsret=", atom_table@int64_to_decimal_string(sret_slot_offset(fn_val, msg_drop))), concat("|_rsp=", sret_spine_nodes(fn_val.body, fn_val.body.root, ",")))
     }
 }
 
@@ -2936,6 +2965,15 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
     // 256 MB main-stack trampoline this emitter once wrapped it in is gone, because a program
     // whose work needs a deep stack spawns an actor for it.
     entry_label: string <- module_linkage@asm_symbol_for_definition(ctx.module_name, fn_val.name);
+        // Dispatch-scoped message regions (term_message_regions, region design §18.7): the boxed
+        // offsets of the owned regions in this behaviour's message record that the frame destroys
+        // at its return, "" when there is nothing proved. The bare region-parameter rule keeps its
+        // slot when both could apply.
+        msg_offs: string <- case fn_destroys_region_param(fn_val) of {
+            true -> "";
+            false -> term_message_regions@fn_message_region_offsets(fn_val, all_functions)
+        };
+        msg_drop: boolean <- length_bytes(msg_offs) > 0;
         eff_comment: string <- emitter_effects@fn_effect_annotation(fn_val.effects);
         // Program main is called by the C runtime: it preserves rbx/r12-r15 and returns in rax (control).
         is_c_main: boolean <- fn_val.name == "main" or fn_val.name == "main.main" or fn_val.name == "main.m";
@@ -3019,8 +3057,8 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             true -> concat(param_outer_emit_lm, concat("|_ffi=", ffi_enc));
             false -> param_outer_emit_lm
         };
-        param_outer_emit_fnret: string <- concat(concat(concat(param_outer_emit_ffi, concat("|_fnret=", fn_val.return_type)), sret_outer_markers(fn_val)), reply_buffer_outer_markers(fn_val));
-        frame_spill_nbytes: int64 <- frame_spill_bytes(fn_val);
+        param_outer_emit_fnret: string <- concat(concat(concat(param_outer_emit_ffi, concat("|_fnret=", fn_val.return_type)), sret_outer_markers(fn_val, msg_drop)), reply_buffer_outer_markers(fn_val));
+        frame_spill_nbytes: int64 <- frame_spill_bytes(fn_val, msg_drop);
         frame_spill_alloc: string <- emit_sp_add_sub_imm("SUB", frame_spill_nbytes);
         frame_spill_dealloc: string <- emit_sp_add_sub_imm("ADD", frame_spill_nbytes);
         shadow_prologue: string <- case string_shadow of {
@@ -3102,7 +3140,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
         // Giving up the BR costs one frame on a path that was already going to build one. Preserving the
         // tail transfer instead would mean teaching function_tail_frame_release the whole callee-saved set,
         // duplicating the epilogue's ordering in a second place for no benefit.
-        kind5_frame_blocks_tail: boolean <- sir_term_root_node(fn_val.body).kind == 5 and (function_needs_callee_saved_x19_x20_frame(fn_val) or needs_actor_ref_x21_x22_frame(fn_val) or needs_callee_x23_x24_frame(fn_val) or needs_callee_x25_x26_frame(fn_val) or needs_callee_x27_x28_frame(fn_val) or frame_spill_bytes(fn_val) > 0);
+        kind5_frame_blocks_tail: boolean <- sir_term_root_node(fn_val.body).kind == 5 and (function_needs_callee_saved_x19_x20_frame(fn_val) or needs_actor_ref_x21_x22_frame(fn_val) or needs_callee_x23_x24_frame(fn_val) or needs_callee_x25_x26_frame(fn_val) or needs_callee_x27_x28_frame(fn_val) or frame_spill_bytes(fn_val, msg_drop) > 0);
         kind5_no_tail: boolean <- main_kind5_no_tail or kind5_frame_blocks_tail or is_c_main;
         kind5_tail_returns_directly: boolean <- sir_term_root_node(fn_val.body).kind == 5 and kind5_no_tail == false;
         // Inject silica_pid_registry_init at the start of every program entry-point. The routine
@@ -3136,7 +3174,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
         // _aggb: size of the aggregate REGION area, the shallow end of the frame
         // spill allocation. Regions are indexed by SIR node within [0, _aggb);
         // register spill slots start below it, so the two never overlap.
-        tco_nodes: string <- case tco_eligible(fn_val, arena_ok, region_ok) of {
+        tco_nodes: string <- case tco_eligible(fn_val, arena_ok, region_ok, msg_drop) of {
             true -> tco_tail_self_calls(fn_val.body, fn_val.name);
             false -> ""
         };
@@ -3183,7 +3221,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             }
         };
         fn_sret: boolean <- fn_returns_sret_tuple(fn_val);
-        sret_off: int64 <- case fn_sret of { true -> sret_slot_offset(fn_val); false -> 0 };
+        sret_off: int64 <- case fn_sret of { true -> sret_slot_offset(fn_val, msg_drop); false -> 0 };
         tuple_ret_promote: string <- case fn_sret of {
             true -> case kind5_tail_returns_directly of {
                 true -> "";
@@ -3209,11 +3247,13 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
 
         // Owned region handle: park it at the deepest frame slot on entry, while the
         // argument register still holds it, and destroy from there in the epilogue.
-        rgn_owned: boolean <- fn_destroys_region_param(fn_val);
+        // A message record whose regions are dispatch-scoped (msg_drop) parks the record pointer
+        // (parameter 0, still in X0 here) in the same slot and destroys each region field from it.
+        rgn_owned: boolean <- fn_destroys_region_param(fn_val) or msg_drop;
         rgn_slot_off: int64 <- frame_spill_nbytes;
         rgn_save: string <- case rgn_owned of {
             true -> {
-                pidx: int64 <- region_param_index(fn_val.param_types, 0);
+                pidx: int64 <- case msg_drop of { true -> 0; false -> region_param_index(fn_val.param_types, 0) };
                 // The unscaled immediate stops at 255; deeper frames stage the address
                 // in X16, which is free at entry (no call has run yet).
                 x86_mem@x86_str(concat("X", atom_table@int64_to_decimal_string(pidx)), concat("[X29, #-", concat(atom_table@int64_to_decimal_string(rgn_slot_off), "]")))
@@ -3224,7 +3264,10 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
         rgn_destroy: string <- case rgn_owned of {
             true -> {
                 ld: string <- x86_mem@x86_ldr("X0", concat("[X29, #-", concat(atom_table@int64_to_decimal_string(rgn_slot_off), "]")));
-                concat(x86_mem@x86_stp("X0", "X1", "[SP, #-16]!"), concat(ld, concat(x86_isa@x86_call("silica_rt_region_destroy"), x86_mem@x86_ldp("X0", "X1", "[SP], #16"))))
+                case msg_drop of {
+                    true -> concat(x86_mem@x86_stp("X0", "X1", "[SP, #-16]!"), concat(msg_region_destroy_list(msg_offs, ld), x86_mem@x86_ldp("X0", "X1", "[SP], #16")));
+                    false -> concat(x86_mem@x86_stp("X0", "X1", "[SP, #-16]!"), concat(ld, concat(x86_isa@x86_call("silica_rt_region_destroy"), x86_mem@x86_ldp("X0", "X1", "[SP], #16"))))
+                }
             };
             false -> ""
         };
