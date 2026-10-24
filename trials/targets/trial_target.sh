@@ -35,6 +35,20 @@ trials_root=$(cd "$here/.." && pwd)
 repo_root=$(cd "$trials_root/.." && pwd)
 lock_dir="$trials_root/.integrate.lock"
 
+# Name of the machine running the trials, for the menu and notices.
+host_label() {
+    case "$(uname -s):$(uname -m)" in
+        Darwin:arm64)           echo "this Mac (Apple Silicon)" ;;
+        Darwin:*)               echo "this Mac" ;;
+        Linux:x86_64)           echo "this machine (Linux x86-64)" ;;
+        Linux:aarch64|Linux:arm64) echo "this machine (Linux AArch64)" ;;
+        *)                      echo "this machine" ;;
+    esac
+}
+
+# Seconds since the file or directory was modified; 0 if it cannot be read (GNU stat, then BSD).
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+
 die() {
     printf '❌❌ %s\n' "$*" >&2
     exit 1
@@ -88,7 +102,7 @@ cmd_lock() {
         # No live holder. A lock directory whose owner file is not written yet may belong to a run
         # that is starting this very moment: give it a few seconds before calling it stale.
         if [ ! -f "$lock_dir/owner" ]; then
-            age=$(( $(date +%s) - $(stat -f %m "$lock_dir" 2>/dev/null || echo 0) ))
+            age=$(( $(date +%s) - $(mtime_of "$lock_dir") ))
             if [ "$age" -lt 5 ]; then sleep 2; continue; fi
         fi
         rm -rf "$lock_dir"
@@ -121,7 +135,7 @@ cmd_choose() {
     while :; do
         {
             printf 'Select the trial target (make integrate):\n'
-            printf '  1) host  [default]   this Mac, binaries/silica-compiler\n'
+            printf '  1) host  [default]   %s, binaries/silica-compiler\n' "$(host_label)"
             i=1
             for t in "${targets[@]}"; do
                 i=$((i + 1))
@@ -288,7 +302,7 @@ $(head -5 "$mirror/.rt.log")"
     printf '  suites:   %d to run, %d skipped (%s)\n' "${#run_suites[@]}" "${#skipped_suites[@]}" "targets/$target.skip"
     printf '  outputs:  <suite>/<trial>.%s.sout next to each trial; report: trials/.integrate_report.%s\n' "$target" "$target"
     if [ "${#run_suites[@]}" -gt 1 ]; then
-        printf '  A board run of the whole tree takes hours; the Mac is kept awake while it runs.\n'
+        printf '  A board run of the whole tree takes hours; the host is kept awake while it runs (where caffeinate or systemd-inhibit exists).\n'
     fi
 
     export TRIAL_TARGET="$target" BOARD_PORT="$port" BOARD_SILICA_COMPILER="$compiler" BOARD_PYTHON="$py" \
@@ -298,6 +312,8 @@ $(head -5 "$mirror/.rt.log")"
     local st
     if command -v caffeinate > /dev/null 2>&1; then
         caffeinate -i "$make" --no-print-directory -C "$mirror" integrate TRIAL_TARGET="$target"
+    elif command -v systemd-inhibit > /dev/null 2>&1; then
+        systemd-inhibit --what=idle:sleep --why="silica trials" "$make" --no-print-directory -C "$mirror" integrate TRIAL_TARGET="$target"
     else
         "$make" --no-print-directory -C "$mirror" integrate TRIAL_TARGET="$target"
     fi

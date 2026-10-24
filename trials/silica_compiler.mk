@@ -98,6 +98,11 @@ SCOUT_FOR = $(if $(SCOUT_EXT),$(_SCOUT_PICK_SH),$(1).scout)
 
 # If silica-compiler is missing, run update_silica_compiler_link.bash and re-check.
 define ENSURE_SILICA_COMPILER
+	if [ "$(SILICA_COMPILER)" = "$(_SILICA_COMPILER_SEED)" ] && [ -L "$(SILICA_COMPILER)" ] && [ -n "$(SILICA_HOST_PLATFORM)" ] \
+		&& case "$$(readlink "$(SILICA_COMPILER)")" in *-$(SILICA_HOST_PLATFORM)) false;; *) true;; esac; then \
+		echo "$(SILICA_COMPILER) -> $$(readlink "$(SILICA_COMPILER)") is not a $(SILICA_HOST_PLATFORM) build; relinking for this host..."; \
+		"$(UPDATE_SILICA_COMPILER_LINK)" "$(SILICA_HOST_PLATFORM)" || exit 1; \
+	fi; \
 	if [ ! -x "$(SILICA_COMPILER)" ]; then \
 		echo "Missing $(SILICA_COMPILER); running update_silica_compiler_link.bash..."; \
 		"$(UPDATE_SILICA_COMPILER_LINK)" || exit 1; \
@@ -373,7 +378,7 @@ INTEGRATE_KILLED_MSG = killed by the watchdog after $$SILICA_INTEGRATE_WATCHDOG_
 #
 # Trial targets (targets/README.md). The outermost `integrate` -- the one the user typed, in
 # trials/ or in a suite -- first decides where the trials run:
-#   TRIAL_TARGET=host              this Mac, binaries/silica-compiler (what integrate always did)
+#   TRIAL_TARGET=host              this host (macOS, Linux x86-64 or AArch64), binaries/silica-compiler (what integrate always did)
 #   TRIAL_TARGET=<board target>    e.g. ESP32-S3_raw: compiled by binaries/silica-compiler-<target>,
 #                                  run on the board (targets/trial_target.sh does the whole run)
 #   TRIAL_TARGET=both              host, then every board target, one after the other
