@@ -31,7 +31,7 @@
 // the wait-list word of the restart protocol, +16 for the thread record, item N stage 2, and +16 for the
 // pending migration target, stage 3): #0..#215 the
 // actor runtime's, #216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
-// _silica_rt_sb_require), #224 started flag, #232 pending exit reason_tag, #240 active call wrapper,
+// _silica_rt_sb_require), #224 started flag, #232 pending exit reason_tag (#384 its atom, or a language error's detail code), #240 active call wrapper,
 // #248/#256/#264 FFI arena base/end/bump (Phase 12), #272..#391 the runtime-managed stack fields
 // (prims_actors_stack_asm.silica). A worker carries no supervision field.
 // #392 holders of the block (_silica_rt_acb_release), #400 a row child's parked exit notice (0 not yet
@@ -92,7 +92,9 @@
 use prims_actors_child_table_asm;
 use prims_actors_stack_asm;
 use prims_actors_carrier_asm;
+use prims_actors_timer_asm;
 use atom_table;
+use atom_rodata;
 use ffi_arena_runtime_asm;
 use ffi_guarded_runtime_asm;
 use ffi_fault_runtime_asm;
@@ -389,6 +391,13 @@ Lslid_no_pos:
 	mov	x0, x19
 	bl	_silica_rt_sb_require
 	str	x22, [x0, #48]
+; A child supervisor inherits its supervisor's report sink (spec §15.4.10.5; block #96, X5 = the
+; supervisor, held in X25) until it names its own with :set_report_sink.
+	cbz	x25, Lsp1_no_sb
+	ldr	x9, [x25, #216]
+	cbz	x9, Lsp1_no_sb
+	ldr	x9, [x9, #96]
+	str	x9, [x0, #96]
 Lsp1_no_sb:
 	cbz	x0, Lslp_skip_list
 	sub	sp, sp, #16
@@ -725,9 +734,18 @@ LBB1_ingress_reply_result:
 	cbnz	w22, LBB1_ingress_check_kind
 	ldr	w9, [x20, #32]
 	cbz	w9, LBB1_payload_not_owned
+	cmp	w9, #2
+	b.eq	LBB1_owned_record
 	ldr	x0, [x20, #8]
 	mov	x1, x19
 	bl	_silica_rt_report_begin
+	b	LBB1_payload_not_owned
+LBB1_owned_record:
+; An exit report record (§15.4.10.5; node +32 = 2): the arena position at the start of the
+; dispatch is noted in the node for _silica_rt_owned_record_release.
+	mov	x0, x20
+	mov	x1, x19
+	bl	_silica_rt_owned_record_begin
 LBB1_payload_not_owned:
 	ldr	x0, [x20, #8]
 	ldp	x1, x8, [x19]
@@ -780,9 +798,8 @@ LBB1_ingress_no_beh:
 	ldr	x25, [x20, #8]
 	cbz	x25, LBB1_post_beh
 	ldr	x24, [x19, #440]
-	ldr	x0, [x25]
-	mov	x1, x19
-	ldr	x2, [x25, #8]
+	mov	x0, x19
+	mov	x1, x25
 	cbz	x24, LBB1_ingress_restart_call
 	ldr	x9, [x19, #272]
 	cbz	x9, LBB1_ingress_restart_call
@@ -791,14 +808,14 @@ LBB1_ingress_no_beh:
 	mov	x10, sp
 	str	x10, [x19, #368]
 	mov	sp, x9
-	bl	_silica_rt_supervisor_maybe_restart
+	bl	_silica_rt_supervisor_restart_and_report
 	ldr	x9, [x24, #48]
 	sub	x9, x9, #48
 	mov	sp, x9
 	str	xzr, [x19, #368]
 	b	LBB1_ingress_restart_done
 LBB1_ingress_restart_call:
-	bl	_silica_rt_supervisor_maybe_restart
+	bl	_silica_rt_supervisor_restart_and_report
 LBB1_ingress_restart_done:
 	mov	x0, x25
 	bl	_silica_rt_exit_payload_free
@@ -918,9 +935,16 @@ LBB1_free_skip_restart:
 ; behaviour has returned, unless the behaviour kept it (_silica_rt_report_release).
 	ldr	w9, [x20, #32]
 	cbz	w9, LBB1_free_node
+	cmp	w9, #2
+	b.eq	LBB1_free_owned_record
 	ldr	x0, [x20, #8]
 	mov	x1, x19
 	bl	_silica_rt_report_release
+	b	LBB1_free_node
+LBB1_free_owned_record:
+	mov	x0, x20
+	mov	x1, x19
+	bl	_silica_rt_owned_record_release
 LBB1_free_node:
 	mov	x0, x20
 	bl	_free
@@ -1281,9 +1305,16 @@ _silica_rt_actor_signal_pending_call_deaths:
 LBBsigpend_active_cast:
 	ldr	w8, [x20, #32]
 	cbz	w8, LBBsigpend_active_free
+	cmp	w8, #2
+	b.eq	LBBsigpend_owned_record
 	ldr	x0, [x20, #8]
 	mov	x1, x19
 	bl	_silica_rt_report_release
+	b	LBBsigpend_active_free
+LBBsigpend_owned_record:
+	mov	x0, x20
+	mov	x1, x19
+	bl	_silica_rt_owned_record_release
 LBBsigpend_active_free:
 	mov	x0, x20
 	bl	_free
@@ -2469,7 +2500,7 @@ Lkabn_none:
 _silica_rt_actor_kill_abnormal:
 ; X0 = reference (held while the kill runs; an ended actor is :ok). Spec §15.1.2.3: kill_abnormal
 ; must not name the calling actor; the caller fails with :language_error and nothing is changed on
-; it (a call it is serving gets no reply). The target is ended with reason tag 1
+; it (a call it is serving gets no reply). The target is ended with reason tag 4, (:explicit, :killed)
 ; (_silica_rt_actor_stop). When it is a row child the caller waits for its row's exit_done to
 ; carry the target's identity (its last act), then for the restart to settle
 ; (_silica_rt_supervisor_drain_ingress: the caller drains the supervisor's ingress itself unless
@@ -2525,8 +2556,10 @@ Lkab_unlock:
 	bl	_os_unfair_lock_unlock
 	ldr	x25, [x19, #408]
 	mov	x0, x19
-	mov	x1, #1
-	mov	x2, xzr
+	mov	x1, #4
+	adrp	x8, _silica_rt_killed_atom@PAGE
+	add	x8, x8, _silica_rt_killed_atom@PAGEOFF
+	ldr	x2, [x8]
 	bl	_silica_rt_actor_stop
 	cbz	x23, Lkab_done
 	mov	x2, x0
@@ -4312,10 +4345,9 @@ Lswd_try:
 	cbz	x21, Lswd_free_wrap
 	ldr	x8, [x21]
 	cbz	x8, Lswd_free_wrap
-	mov	x0, x8
-	mov	x1, x19
-	ldr	x2, [x21, #8]
-	bl	_silica_rt_supervisor_maybe_restart
+	mov	x0, x19
+	mov	x1, x21
+	bl	_silica_rt_supervisor_restart_and_report
 	ldr	x0, [x21]
 	bl	_silica_rt_acb_release
 Lswd_free_wrap:
@@ -4825,7 +4857,7 @@ Ldup_oom_msg:
 	.asciz	\"[silica] unwind report: malloc failed\\n\"
 	.p2align	2
 L_phase_f_unwind_fmt:
-	.asciz	\"\\n=== Silica Actor Failure ===\\nactor_id:        %llu\\nagent_type_atom: %lld\\nreason_tag:      %lld\\nsupervisor_acb:  %p\\n\"
+	.asciz	\"\\n=== Silica Actor Failure ===\\nactor_id:        %llu\\nagent_type_atom: %lld\\nreason:          %s\\nreason_tag:      %lld\\nsupervisor_acb:  %p\\n\"
 	.p2align	2
 L_phase_f_cs_hdr:
 	.asciz	\"call_stack:\\n\"
@@ -4939,6 +4971,13 @@ _silica_rt_actor_deliver_unwind_report:
 	ldr	x23, [x21, #200]
 	ldr	x24, [x21, #232]
 	ldr	x25, [x21, #192]
+; The reason line's text (spec §15.4.13: the failure_reason variant and, when the failing site
+; recorded one, its detail), composed into a 256-byte stack buffer the header's snprintf reads by %s.
+	sub	sp, sp, #256
+	mov	x0, x21
+	mov	x1, sp
+	mov	x2, #256
+	bl	_silica_rt_failure_reason_text
 	mov	x0, x19
 	mov	x1, x27
 	Ldup_fmt_a:
@@ -4947,15 +4986,18 @@ Ldup_fmt_b:
 	add	x2, x2, L_phase_f_unwind_fmt@PAGEOFF
 	ldr	x3, [x21, #408]
 	mov	x4, x23
-	mov	x5, x24
-	mov	x6, x25
+	mov	x5, sp
+	mov	x6, x24
+	mov	x7, x25
 ; arm64 Darwin: variadic callers must spill register-passed unnamed args onto the stack
 ; so libc snprintf/vfprintf reads coherent values from the va_list backing.
-	sub	sp, sp, #32
+	sub	sp, sp, #48
 	stp	x3, x4, [sp]
 	stp	x5, x6, [sp, #16]
+	str	x7, [sp, #32]
 	bl	_snprintf
-	add	sp, sp, #32
+	add	sp, sp, #48
+	add	sp, sp, #256
 	mov	w26, w0
 	cmp	w26, #0
 	csel	w26, wzr, w26, lt
@@ -6025,7 +6067,190 @@ Lce_lost:
 }
 
 fn actor_rt_emit_runtime_tail(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
-    concat(concat(actor_rt_asm_phase_i_chunk(table), actor_rt_asm_phase_c_chunk(table)), actor_rt_asm_phase_f_chunk())
+    concat(concat(concat(actor_rt_asm_phase_i_chunk(table), actor_rt_asm_phase_c_chunk(table)), actor_rt_asm_phase_f_chunk()), actor_rt_asm_reason_text_chunk(table))
+}
+
+// The runtime's copy of the program's atom names, one NUL-terminated name per atom index in
+// first-added order behind a pointer table, for the failure report's reason line
+// (_silica_rt_failure_reason_text prints (:explicit, <name>) from it). Every module carries the same
+// names for print_atom (L_pa_table), module-local; the runtime object is linked once per executable
+// with the executable-wide atom table, so the indices agree with every module's.
+fn reason_text_atom_name_strings(lexemes: List[string, mem(normal)], index: int64) -> string {
+    sequence
+        result: string <- case lexemes of {
+            []: List[string, mem(normal)] -> "";
+            [head: string, tail: List[string, mem(normal)]] -> {
+                idx_s: string <- atom_table@int64_to_decimal_string(index);
+                label_line: string <- concat(concat("silica_rt_atom_name_", idx_s), ":\n");
+                one: string <- concat(label_line, concat(atom_rodata@atom_name_directives("\t", "\t.byte ", head), "\n"));
+                concat(one, reason_text_atom_name_strings(tail, index + 1))
+            };
+            _: List[string, mem(normal)] -> ""
+        }
+    produces
+        pure result
+    end
+}
+
+fn reason_text_atom_name_pointers(lexemes: List[string, mem(normal)], index: int64) -> string {
+    sequence
+        result: string <- case lexemes of {
+            []: List[string, mem(normal)] -> "";
+            [head: string, tail: List[string, mem(normal)]] -> {
+                _unused_head: string <- head;
+                one: string <- concat(concat("\t.quad\tsilica_rt_atom_name_", atom_table@int64_to_decimal_string(index)), "\n");
+                concat(one, reason_text_atom_name_pointers(tail, index + 1))
+            };
+            _: List[string, mem(normal)] -> ""
+        }
+    produces
+        pure result
+    end
+}
+
+fn reason_text_atom_name_count(lexemes: List[string, mem(normal)]) -> int64 {
+    sequence
+        result: int64 <- case lexemes of {
+            []: List[string, mem(normal)] -> 0;
+            [head: string, tail: List[string, mem(normal)]] -> {
+                _unused_head: string <- head;
+                1 + reason_text_atom_name_count(tail)
+            };
+            _: List[string, mem(normal)] -> 0
+        }
+    produces
+        pure result
+    end
+}
+
+fn actor_rt_asm_reason_text_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    sequence
+        in_order: List[string, mem(normal)] <- atom_table@atom_table_lexemes_in_order(table);
+        names: string <- reason_text_atom_name_strings(in_order, 0);
+        pointers: string <- reason_text_atom_name_pointers(in_order, 0);
+        count_s: string <- atom_table@int64_to_decimal_string(reason_text_atom_name_count(in_order));
+        code: string <- "
+	.section	__TEXT,__text,regular,pure_instructions
+	.globl	_silica_rt_failure_reason_text
+	.p2align	2
+_silica_rt_failure_reason_text:
+; X0 = a dying actor's control block, X1 = a buffer, X2 = its size. Writes the text of the failure
+; report's reason line (spec §15.4.13, §15.4.6.4): the failure_reason variant of §15.4.11.2 that the
+; exit reason tag at #232 names, spelled as a program spells it (:normal, :language_error,
+; :memory_fault, (:explicit, :atom) with the atom's name from _silica_rt_atom_names, :foreign_fault),
+; or :unknown for a tag the runtime does not give. A language error whose cause the failing site
+; recorded at #384 (1 a division by zero, 2 a case with no matching arm) adds an em dash and the
+; detail after the variant; one that recorded nothing prints the variant alone: nothing is invented.
+	.cfi_startproc
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	ldr	x8, [x0, #232]
+	ldr	x9, [x0, #384]
+	mov	x0, x1
+	mov	x1, x2
+	mov	x3, xzr
+	cbz	x8, Lrtx_normal
+	cmp	x8, #2
+	b.eq	Lrtx_language_error
+	cmp	x8, #3
+	b.eq	Lrtx_memory_fault
+	cmp	x8, #4
+	b.eq	Lrtx_explicit
+	cmp	x8, #5
+	b.eq	Lrtx_foreign_fault
+Lrtx_unknown:
+	adrp	x2, L_rtx_unknown@PAGE
+	add	x2, x2, L_rtx_unknown@PAGEOFF
+	b	Lrtx_print
+Lrtx_normal:
+	adrp	x2, L_rtx_normal@PAGE
+	add	x2, x2, L_rtx_normal@PAGEOFF
+	b	Lrtx_print
+Lrtx_memory_fault:
+	adrp	x2, L_rtx_memory_fault@PAGE
+	add	x2, x2, L_rtx_memory_fault@PAGEOFF
+	b	Lrtx_print
+Lrtx_foreign_fault:
+	adrp	x2, L_rtx_foreign_fault@PAGE
+	add	x2, x2, L_rtx_foreign_fault@PAGEOFF
+	b	Lrtx_print
+Lrtx_language_error:
+	cmp	x9, #1
+	b.eq	Lrtx_div_zero
+	cmp	x9, #2
+	b.eq	Lrtx_case_clause
+	adrp	x2, L_rtx_language_error@PAGE
+	add	x2, x2, L_rtx_language_error@PAGEOFF
+	b	Lrtx_print
+Lrtx_div_zero:
+	adrp	x3, L_rtx_detail_div_zero@PAGE
+	add	x3, x3, L_rtx_detail_div_zero@PAGEOFF
+	b	Lrtx_language_error_detail
+Lrtx_case_clause:
+	adrp	x3, L_rtx_detail_case_clause@PAGE
+	add	x3, x3, L_rtx_detail_case_clause@PAGEOFF
+Lrtx_language_error_detail:
+	adrp	x2, L_rtx_language_error_detail@PAGE
+	add	x2, x2, L_rtx_language_error_detail@PAGEOFF
+	b	Lrtx_print
+Lrtx_explicit:
+; the atom's name; an index the table does not hold (a runtime defect) prints :unknown
+	adrp	x10, _silica_rt_atom_name_count@PAGE
+	ldr	x10, [x10, _silica_rt_atom_name_count@PAGEOFF]
+	cmp	x9, x10
+	b.hs	Lrtx_unknown
+	adrp	x10, _silica_rt_atom_names@PAGE
+	add	x10, x10, _silica_rt_atom_names@PAGEOFF
+	ldr	x3, [x10, x9, lsl #3]
+	adrp	x2, L_rtx_explicit@PAGE
+	add	x2, x2, L_rtx_explicit@PAGEOFF
+Lrtx_print:
+; arm64 Darwin: the variadic argument is passed on the stack
+	sub	sp, sp, #16
+	str	x3, [sp]
+	bl	_snprintf
+	add	sp, sp, #16
+	ldp	x29, x30, [sp], #16
+	ret
+	.cfi_endproc
+	.section	__TEXT,__cstring,cstring_literals
+L_rtx_normal:
+	.asciz	\":normal\"
+L_rtx_language_error:
+	.asciz	\":language_error\"
+L_rtx_language_error_detail:
+	.asciz	\":language_error \\342\\200\\224 %s\"
+L_rtx_detail_div_zero:
+	.asciz	\"integer division by zero\"
+L_rtx_detail_case_clause:
+	.asciz	\"no case arm matched\"
+L_rtx_memory_fault:
+	.asciz	\":memory_fault\"
+L_rtx_explicit:
+	.asciz	\"(:explicit, %s)\"
+L_rtx_foreign_fault:
+	.asciz	\":foreign_fault\"
+L_rtx_unknown:
+	.asciz	\":unknown\"
+	.section	__TEXT,__const
+	.p2align	2
+";
+        // The pointer table lives in a fixup-permitted data section (as L_pa_table): dyld chained
+        // fixups fault when rebasing .quad symbol addresses in __TEXT.
+        table_head: string <- "	.section	__DATA_CONST,__const
+	.p2align	3
+	.globl	_silica_rt_atom_names
+_silica_rt_atom_names:
+";
+        count_head: string <- "	.globl	_silica_rt_atom_name_count
+_silica_rt_atom_name_count:
+	.quad	";
+        result: string <- concat(concat(concat(concat(concat(code, names), table_head), pointers), count_head), concat(count_s, "
+	.section	__TEXT,__text,regular,pure_instructions
+"))
+    produces
+        pure result
+    end
 }
 
 fn actor_rt_asm_badarith_chunk() -> string {
@@ -6048,8 +6273,12 @@ _silica_rt_badarith:
 	ldr	x23, [x19, #440]
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
-	mov	x8, #1
+; a division by zero is a language-level failure: reason tag 2, :language_error (§15.4.11.2); the
+; detail code 1 at #384 names the cause on the report's reason line (_silica_rt_failure_reason_text)
+	mov	x8, #2
 	str	x8, [x19, #232]
+	mov	x8, #1
+	str	x8, [x19, #384]
 	str	wzr, [x19, #152]
 	mov	x0, x19
 	bl	_silica_rt_actor_mail_signal
@@ -6159,8 +6388,11 @@ _silica_rt_case_clause:
 	ldr	x23, [x19, #440]
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
+; a case with no matching arm: tag 2, :language_error, detail code 2 at #384 for the reason line
 	mov	x8, #2
 	str	x8, [x19, #232]
+	mov	x8, #2
+	str	x8, [x19, #384]
 	str	wzr, [x19, #152]
 	mov	x0, x19
 	bl	_silica_rt_actor_mail_signal
@@ -7028,5 +7260,5 @@ fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref
     ordering_identity_asm: string <- ordering_identity_runtime_asm@emit_ordering_identity_runtime_asm();
     checked_int64_asm: string <- checked_int64_runtime_asm@emit_checked_int64_runtime_asm();
     stack_asm: string <- concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
-    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), actor_rt_asm_chunk_9()), actor_rt_asm_chunk_10()), actor_rt_asm_chunk_11()), actor_rt_asm_chunk_12()), actor_rt_asm_chunk_13()), actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), actor_rt_asm_badarith_chunk()), concat(actor_rt_asm_case_clause_chunk(), concat(actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, checked_int64_asm))))))))), stack_asm)
+    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), actor_rt_asm_chunk_9()), actor_rt_asm_chunk_10()), actor_rt_asm_chunk_11()), actor_rt_asm_chunk_12()), actor_rt_asm_chunk_13()), actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), actor_rt_asm_badarith_chunk()), concat(actor_rt_asm_case_clause_chunk(), concat(actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, checked_int64_asm))))))))), concat(stack_asm, prims_actors_timer_asm@emit_actor_timer_runtime_asm()))
 }

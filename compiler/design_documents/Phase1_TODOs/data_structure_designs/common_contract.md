@@ -148,7 +148,7 @@ Each non-empty recursive representation is rooted in a collection arena:
 ```text
 {
     r: region(R, SpaceType),
-    root: ref?(R, SpaceType, RecursiveNodeShape),
+    root: ref?(R, SpaceType, RecursiveNodeShape),   // spelled as the family's full inline node tuple; a bare ref?(R, SpaceType, rec) is E2010
     ...
 }
 ```

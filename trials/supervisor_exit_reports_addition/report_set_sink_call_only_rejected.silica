@@ -1,0 +1,86 @@
+// Spec §15.4.10.5: the sink is "an ordinary cast-only actor" (reports are casts, §16.2.6.4). Naming
+// a call-only actor (its behaviour returns (:reply, ...)) is refused: the :set_report_sink reply is
+// the error shape of §15.4.8.3 (tag :error), no sink is recorded, and a later exit is reported to
+// no one. main's count_children syncs with the worker's restart.
+//
+// Expected output:
+//   set_report_sink with a call-only sink: error
+//   children after the failure: 1
+//   0
+
+use Supervisor;
+
+impl ReportCallOnlySinkSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 3, restarts_time_frame: 10000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :w, agent_type: :worker, initial_state: 10, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+// Cast-only worker: 0 ends it at once with (:explicit, :boom) (§15.1.2.3).
+fn worker(msg: int64, state: int64) -> (:no_reply, int64) {
+    case msg of {
+        0 -> {
+            sequence proc[concurrency]
+                _: atom <- fail_self(:boom)
+            produces pure (:no_reply, state) end
+        };
+        _: int64 -> (:no_reply, state + msg)
+    }
+}
+
+// A call-only actor: not a valid report sink.
+fn echo(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg + state, state)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter(0);
+        e: actor_ref <- spawn(0, echo, stack_policy(0, :keep_last_message));
+        rt: supervisor_ref <- spawn_registered_supervisor(ReportCallOnlySinkSup, 0, :root, stack_policy(0, :keep_last_message));
+        set: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :set_report_sink, sink: e } impl SupervisorMessage {});
+        _: atom <- case set.tag of {
+            :error -> println("set_report_sink with a call-only sink: error");
+            :ok -> println("set_report_sink with a call-only sink: ok");
+            _: atom -> println("set_report_sink with a call-only sink: other")
+        };
+        _: boolean <- cast_registered(:w, 0 impl ActorMessage {});
+        n: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :count_children } impl SupervisorMessage {});
+        print("children after the failure: ");
+        print_int64(n.count);
+        println("");
+        _: atom <- println("")
+    produces pure 0 end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// A FailureReporter (spec §15.4.13.4) that keeps every report to itself, so the output holds only
+// main's and the sink's lines; without one the reports would go to standard error. Started with a
+// positive count, it ends main's wait_for_exit() with cast_exit(0) after that many reports.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces pure (:no_reply, left) end
+}
+
+fn start_reporter(expected: int64) -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces pure registered end
+}

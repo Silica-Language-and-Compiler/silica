@@ -1,0 +1,92 @@
+// The receive-after shape (spec §22.14.2: "an actor that must wait ends its dispatch and continues
+// when a timer's message arrives"; project BEES). A requester asks a worker and waits with a
+// timeout by ending its dispatch: it arms a timeout timer and keeps its reference in its state.
+// Round 1: the worker answers after 20 ms (its own timer) and the requester's timeout is 2 s, so the
+// reply comes first and the requester cancels the timeout (:cancelled). Round 2: the worker is asked
+// to stay silent and the timeout is 40 ms, so the timeout message comes first; no reply ever comes.
+// Expected (by hand):
+//   round 1: reply first, timeout cancel: :cancelled
+//   round 2: timeout first
+// exit status 0
+fn worker(msg: { from: actor_ref, answer: boolean }, state: int64) -> (:no_reply, int64) {
+    case msg.answer of {
+        true -> {
+            sequence proc[concurrency]
+                _: timer_ref <- send_after(20, msg.from, :reply impl ActorMessage {})
+            produces pure (:no_reply, state) end
+        };
+        false -> (:no_reply, state)
+    }
+}
+
+fn requester(msg: atom, state: { worker: actor_ref, timeout: timer_ref, round: int64 }) -> (:no_reply, { worker: actor_ref, timeout: timer_ref, round: int64 }) {
+    case msg of {
+        :start -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.worker, { from: self(), answer: true } impl ActorMessage {});
+                t: timer_ref <- send_after(2000, self(), :timeout impl ActorMessage {})
+            produces pure (:no_reply, { worker: state.worker, timeout: t, round: 1 }) end
+        };
+        :reply -> {
+            sequence proc[concurrency, device_io]
+                c: atom <- cancel_timer(state.timeout);
+                print("round ");
+                print_int64(state.round);
+                print(": reply first, timeout cancel: ");
+                print_atom(c);
+                println("");
+                _: boolean <- cast(state.worker, { from: self(), answer: false } impl ActorMessage {});
+                t: timer_ref <- send_after(40, self(), :timeout impl ActorMessage {})
+            produces pure (:no_reply, { worker: state.worker, timeout: t, round: 2 }) end
+        };
+        _: atom -> {
+            sequence proc[concurrency, device_io]
+                print("round ");
+                print_int64(state.round);
+                println(": timeout first");
+                _: boolean <- cast_exit(0)
+            produces pure (:no_reply, state) end
+        }
+    }
+}
+
+fn idle(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state)
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        d: actor_ref <- spawn(0, idle, stack_policy(0, :keep_last_message));
+        t0: timer_ref <- send_after(0, d, 0 impl ActorMessage {});
+        w: actor_ref <- spawn(0, worker, stack_policy(0, :keep_last_message));
+        r: actor_ref <- spawn({ worker: w, timeout: t0, round: 0 }, requester, stack_policy(0, :keep_last_message));
+        _: boolean <- cast(r, :start impl ActorMessage {});
+        _: int64 <- wait_for_exit()
+    produces pure 0 end
+}
+
+// FailureReporter (spec §15.4.13.4), registered before anything is spawned. Every report goes to
+// standard error; an abnormal one (reason_tag other than 0) ends the program with status 70, so a
+// failure can never pass as a timing miss. A normal end (reason_tag 0: an actor that stopped itself)
+// is only written.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case contains(report, "reason_tag:      0") of {
+            true -> true;
+            false -> cast_exit(70)
+        }
+    produces pure (:no_reply, state) end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces pure registered end
+}

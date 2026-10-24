@@ -142,8 +142,8 @@ Lct_free_none:
 // silica_rt_sup_shutdown_children(X0 = a supervisor that has ended: alive (#152) is 0): the
 // coordinated shutdown of its live children (spec §15.4.8.4, §15.4.12.2), last row first, one at a
 // time. Each row is tombstoned before its child is told (maybe_restart no longer finds it, and a
-// child waiting for its replacement stops waiting); a child with shutdown 0 is killed (reason tag 1,
-// as kill_abnormal), one with shutdown > 0 ends with (:explicit, :shutdown). On the hosts a child
+// child waiting for its replacement stops waiting); a child with shutdown 0 is killed (reason tag 4,
+// (:explicit, :killed), as kill_abnormal), one with shutdown > 0 ends with (:explicit, :shutdown). On the hosts a child
 // ends at its next dispatch boundary in both cases: a dispatch in progress runs to completion, and
 // the shutdown time is not enforced. The wait is for the row's exit_done, the child's last act, so
 // its registered name (§20.3.1) is gone before this returns and a restarted supervisor can register
@@ -214,8 +214,11 @@ Lssc_at:
 	ldr	x2, [x8]
 	b	Lssc_stop
 Lssc_kill:
-	mov	x1, #1
-	mov	x2, xzr
+// shutdown 0: killed as by kill_abnormal, failure_reason (:explicit, :killed) (§15.4.11.2, §15.4.12.2)
+	mov	x1, #4
+	adrp	x8, silica_rt_killed_atom
+	add	x8, x8, :lo12:silica_rt_killed_atom
+	ldr	x2, [x8]
 Lssc_stop:
 	mov	x0, x24
 	bl	silica_rt_actor_stop
@@ -761,10 +764,9 @@ silica_rt_supervisor_handle_notice:
 	mov	x24, x0
 	mov	x22, x1
 	mov	x21, x2
-	ldr	x0, [x21]
-	mov	x1, x24
-	ldr	x2, [x21, #8]
-	bl	silica_rt_supervisor_maybe_restart
+	mov	x0, x24
+	mov	x1, x21
+	bl	silica_rt_supervisor_restart_and_report
 	mov	x0, x21
 	bl	silica_rt_exit_payload_free
 	mov	x0, x22
@@ -1022,6 +1024,9 @@ Ladd_child_duplicate_main:
 
 // Phase E e3d+e3e+e4b: silica_rt_supervisor_maybe_restart
 // X0 = dead child_ref, X1 = supervisor ACB, X2 = reason_tag (0=:normal default; !=0 abnormal — e4b).
+// Returns X0 = the row the notice was matched to (0: no row, or the supervisor has ended) and X1 = 1
+// when that row's child was restarted (the exit report of §15.4.10.5 is built from these by
+// silica_rt_supervisor_handle_notice).
 // Scans linked child row list for matching child_ref. child_ref==0 is an e3f tombstone. If found, dispatches by
 // row.restart policy (e4b): :permanent always restarts; :transient restarts iff reason_tag != 0; anything else
 // tombstones. On restart, checks restart-frequency cap (ACB#304 max_restarts, #312 time_frame, #320 count,
@@ -1233,7 +1238,7 @@ Lmr_freq_escalate:
 	bl	silica_rt_sup_shutdown_children
 	mov	x0, x20
 	bl	silica_rt_root_report_and_note
-	b	Lmr_done
+	b	Lmr_found_kept
 Lmr_freq_escalate_mark_dead:
 	add	x0, x20, #16
 	bl	silica_rt_lock_lock
@@ -1242,7 +1247,7 @@ Lmr_freq_escalate_mark_dead:
 	bl	silica_rt_actor_mail_signal
 	add	x0, x20, #16
 	bl	silica_rt_lock_unlock
-	b	Lmr_done
+	b	Lmr_found_kept
 Lmr_freq_ok:
 	ldr	x0, [x27, #56]
 ";
@@ -1258,7 +1263,8 @@ Lmr_freq_ok:
 	mov	x0, x24
 	mov	x1, x20
 	bl	silica_rt_supervisor_respawn_row
-	b	Lmr_done
+	cbnz	x0, Lmr_found_kept
+	b	Lmr_found_restarted
 Lmr_ofa_kill:
 	mov	x25, #0
 Lmr_ofa_kill_loop:
@@ -1303,7 +1309,7 @@ Lmr_ofa_spawn_loop:
 // thread has finished its TLS init / first-schedule. Children come up in list order,
 // one at a time, after every cascaded stop has retired.
 	cmp	x25, x22
-	b.hs	Lmr_done
+	b.hs	Lmr_found_restarted
 	mov	x26, x21
 	mov	x10, x25
 Lmr_ofa_spawn_walk_idx:
@@ -1317,7 +1323,7 @@ Lmr_ofa_spawn_at_idx:
 	mov	x0, x26
 	mov	x1, x20
 	bl	silica_rt_supervisor_respawn_row
-	cbnz	x0, Lmr_done
+	cbnz	x0, Lmr_found_kept
 Lmr_ofa_spawn_next:
 	add	x25, x25, #1
 	b	Lmr_ofa_spawn_loop
@@ -1364,7 +1370,7 @@ Lmr_rfo_spawn_loop:
 // at a time. spawn_linked blocks on each new child's ACB[+288] (set in actor_thread_main
 // right after TLS init / trampoline) so iteration k+1 can never run alongside iteration k.
 	cmp	x25, x22
-	b.hs	Lmr_done
+	b.hs	Lmr_found_restarted
 	mov	x26, x21
 	mov	x10, x25
 Lmr_rfo_spawn_walk_idx:
@@ -1376,7 +1382,7 @@ Lmr_rfo_spawn_at_idx:
 	mov	x0, x26
 	mov	x1, x20
 	bl	silica_rt_supervisor_respawn_row
-	cbnz	x0, Lmr_done
+	cbnz	x0, Lmr_found_kept
 Lmr_rfo_spawn_next:
 	add	x25, x25, #1
 	b	Lmr_rfo_spawn_loop
@@ -1385,8 +1391,20 @@ Lmr_next:
 	b	Lmr_scan
 Lmr_tombstone_done:
 	str	xzr, [x24]
-	b	Lmr_done
+// The decision is made: X0 = the row, X1 = restarted (the escalation paths and a failed respawn
+// arrive at Lmr_found_kept: the child was not restarted).
+Lmr_found_kept:
+	mov	x0, x24
+	mov	x1, xzr
+	b	Lmr_ret
+Lmr_found_restarted:
+	mov	x0, x24
+	mov	x1, #1
+	b	Lmr_ret
 Lmr_done:
+	mov	x0, xzr
+	mov	x1, xzr
+Lmr_ret:
 	ldp	x29, x30, [sp, #80]
 	ldp	x20, x19, [sp, #64]
 	ldp	x22, x21, [sp, #48]
@@ -2188,12 +2206,15 @@ silica_rt_restart_breach_atom:
 ")
 }
 
-fn child_table_rt_duplicate_child_id_chunk(dup_idx: int64, shutdown_idx: int64) -> string {
-    concat(concat(concat(concat("	.data
+fn child_table_rt_duplicate_child_id_chunk(dup_idx: int64, shutdown_idx: int64, killed_idx: int64) -> string {
+    concat(concat(concat(concat(concat(concat("	.data
 	.p2align	3
 	.globl	silica_rt_shutdown_atom
 silica_rt_shutdown_atom:
 	.quad	", atom_table@int64_to_decimal_string(shutdown_idx)), "
+	.globl	silica_rt_killed_atom
+silica_rt_killed_atom:
+	.quad	"), atom_table@int64_to_decimal_string(killed_idx)), "
 	.globl	silica_rt_duplicate_child_id_atom
 silica_rt_duplicate_child_id_atom:
 	.quad	"), atom_table@int64_to_decimal_string(dup_idx)), "
@@ -2287,6 +2308,263 @@ Lrsr_done:
 ")
 }
 
+// Exit reports to a report sink (spec §15.4.10.5). The supervision block's #96 holds the sink's
+// identity (0: none), set by call_supervisor { op: :set_report_sink, sink: ref } and inherited by a
+// child supervisor from its supervisor when it is spawned (prims_actors_runtime_asm.silica, the
+// Lsp1_no_sb site of spawn_linked_row) until it names its own. After every exit notice the holder of
+// the restart token handles (supervisor_handle_notice), the report record below is cast to the sink.
+// The words: +0 the exit_report shape ({child,child_id,failure_reason,restarted,new_child} as the
+// program spells it, 0 when no unit of the build has the record), then the failure_reason atoms
+// :normal, :language_error, :memory_fault, :explicit, :unknown, :foreign_fault.
+fn child_table_rt_exit_report_chunk(shape_idx: int64, normal_idx: int64, lang_idx: int64, mem_idx: int64, explicit_idx: int64, unknown_idx: int64, foreign_idx: int64) -> string {
+    words: string <- concat("	.data
+	.p2align	3
+	.globl	silica_rt_exit_report_words
+silica_rt_exit_report_words:
+	.quad	", concat(atom_table@int64_to_decimal_string(shape_idx), concat("
+	.quad	", concat(atom_table@int64_to_decimal_string(normal_idx), concat("
+	.quad	", concat(atom_table@int64_to_decimal_string(lang_idx), concat("
+	.quad	", concat(atom_table@int64_to_decimal_string(mem_idx), concat("
+	.quad	", concat(atom_table@int64_to_decimal_string(explicit_idx), concat("
+	.quad	", concat(atom_table@int64_to_decimal_string(unknown_idx), concat("
+	.quad	", concat(atom_table@int64_to_decimal_string(foreign_idx), "
+"))))))))))))));
+    concat(words, "	.text
+// silica_rt_sup_exit_report_send(X0 = the row, X1 = 1 when its child was restarted, X2 = the exit
+// notice payload, X3 = the ended child's identity, X4 = the sink's identity): builds the exit_report
+// of §15.4.10.5 -- shape word, child, child_id, failure_reason, restarted, new_child, one word each,
+// the layout the emitter gives { child: actor_ref, child_id: atom, failure_reason: ..., restarted:
+// boolean, new_child: actor_ref } -- and casts it to the sink (silica_rt_actor_cast_flagged through
+// silica_rt_ref_call: a sink that has ended, or is call-only, gets nothing and the report is
+// dropped). failure_reason is the one-word sum of §15.4.11.2: the atom for tags 0, 2, 3 and 5, a
+// pointer to the tagged pair (:explicit, atom) for tag 4 (the notice's atom; the pair sits in the
+// record's own block at +48). Since 2026-10-23 no exit carries tag 1 (a division by zero is 2,
+// :language_error; a kill is 4 with :killed): a tag 1 is :unknown. new_child is the row's current
+// child (+112) when restarted, else the ended child. The record is the receiver's once enqueued
+// (node +32 = 2: silica_rt_owned_record_release frees it after the sink's dispatch). The record is the receiver's once enqueued; a dropped report goes back here.
+	.globl	silica_rt_supervisor_restart_and_report
+	.p2align	2
+silica_rt_supervisor_restart_and_report:
+// X0 = the supervisor, X1 = an exit notice payload (child at +0, held; reason tag at +8): the restart
+// decision (maybe_restart) and then, when the notice was matched to a row and a sink is named for
+// the supervisor (block #96, inherited or its own), the exit report of §15.4.10.5, cast after the
+// decision and never waited for. Every handler of a notice comes through here: the supervisor's own
+// dispatch (LBB1_ingress_no_beh), the drainers (supervisor_handle_notice) and the trial hook
+// supervision_wait_and_drain_one. Exits handled before a sink was named are not reported.
+	.cfi_startproc
+	stp	x22, x21, [sp, #-48]!
+	stp	x20, x19, [sp, #16]
+	stp	x29, x30, [sp, #32]
+	add	x29, sp, #32
+	mov	x19, x0
+	mov	x20, x1
+// The ended child's identity (ACB #408), read before the decision, which may give the row a new child.
+	ldr	x21, [x20]
+	ldr	x21, [x21, #408]
+	ldr	x0, [x20]
+	mov	x1, x19
+	ldr	x2, [x20, #8]
+	bl	silica_rt_supervisor_maybe_restart
+	cbz	x0, Lrar_done
+	ldr	x8, [x19, #216]
+	cbz	x8, Lrar_done
+	ldr	x4, [x8, #96]
+	cbz	x4, Lrar_done
+	mov	x2, x20
+	mov	x3, x21
+	bl	silica_rt_sup_exit_report_send
+Lrar_done:
+	ldp	x29, x30, [sp, #32]
+	ldp	x20, x19, [sp, #16]
+	ldp	x22, x21, [sp], #48
+	ret
+	.cfi_endproc
+	.globl	silica_rt_sup_exit_report_send
+	.p2align	2
+silica_rt_sup_exit_report_send:
+	.cfi_startproc
+	stp	x24, x23, [sp, #-64]!
+	stp	x22, x21, [sp, #16]
+	stp	x20, x19, [sp, #32]
+	stp	x29, x30, [sp, #48]
+	add	x29, sp, #48
+	mov	x19, x0
+	mov	x20, x1
+	mov	x21, x2
+	mov	x22, x3
+	mov	x23, x4
+// One 64-byte block: the record (48 B) and, at +48, the pair (:explicit, atom) when the reason is
+// one, so the receiver's release frees one block (silica_rt_owned_record_release; the cast is
+// made with flag 2, node +32).
+	mov	x0, #64
+	bl	malloc
+	cbz	x0, Lers_done
+	adrp	x24, silica_rt_exit_report_words
+	add	x24, x24, :lo12:silica_rt_exit_report_words
+	ldr	x8, [x21, #8]
+	cbz	x8, Lers_normal
+	cmp	x8, #2
+	b.eq	Lers_language_error
+	cmp	x8, #3
+	b.eq	Lers_memory_fault
+	cmp	x8, #5
+	b.eq	Lers_foreign_fault
+	cmp	x8, #4
+	b.eq	Lers_explicit
+	ldr	x9, [x24, #40]
+	b	Lers_reason_done
+Lers_normal:
+	ldr	x9, [x24, #8]
+	b	Lers_reason_done
+Lers_language_error:
+	ldr	x9, [x24, #16]
+	b	Lers_reason_done
+Lers_memory_fault:
+	ldr	x9, [x24, #24]
+	b	Lers_reason_done
+Lers_foreign_fault:
+	ldr	x9, [x24, #48]
+	b	Lers_reason_done
+Lers_explicit:
+	ldr	x9, [x24, #32]
+	ldr	x10, [x21, #16]
+	stp	x9, x10, [x0, #48]
+	add	x9, x0, #48
+Lers_reason_done:
+	ldr	x8, [x24]
+	str	x8, [x0]
+	str	x22, [x0, #8]
+	ldr	x8, [x19, #8]
+	str	x8, [x0, #16]
+	str	x9, [x0, #24]
+	str	x20, [x0, #32]
+	mov	x8, x22
+	cbz	x20, Lers_new_child
+	ldr	x8, [x19, #112]
+Lers_new_child:
+	str	x8, [x0, #40]
+	mov	x19, x0
+	mov	x1, x0
+	mov	x0, x23
+	mov	x2, #2
+	adrp	x9, silica_rt_actor_cast_flagged
+	add	x9, x9, :lo12:silica_rt_actor_cast_flagged
+	bl	silica_rt_ref_call
+	cmp	x0, #1
+	b.eq	Lers_done
+// Dropped (no sink, an ended or call-only sink, no memory): the block goes back here.
+	mov	x0, x19
+	bl	free
+Lers_done:
+	ldp	x29, x30, [sp, #48]
+	ldp	x20, x19, [sp, #32]
+	ldp	x22, x21, [sp, #16]
+	ldp	x24, x23, [sp], #64
+	ret
+	.cfi_endproc
+// silica_rt_owned_record_begin(X0 = the node, X1 = the receiving ACB): the arena position when the
+// dispatch of an owned record (node +32 = 2: an exit report) begins, noted in the node (+40 the
+// arena block, +48 its bump) for the release below. Leaf.
+	.globl	silica_rt_owned_record_begin
+	.p2align	2
+silica_rt_owned_record_begin:
+	ldr	x9, [x1, #160]
+	str	x9, [x0, #40]
+	ldr	x9, [x1, #176]
+	str	x9, [x0, #48]
+	ret
+// silica_rt_owned_record_release(X0 = the node, X1 = the ACB whose behaviour just returned): the
+// record (node +8; the pair (:explicit, atom) it may hold is inside it, at +48) goes back unless
+// the behaviour kept it: it is the new state (ACB word 0) or a word of what the behaviour
+// allocated in its arena since the dispatch began names the record or the pair (a state or a cell
+// holding r.failure_reason). The rule of silica_rt_report_release: anything uncertain keeps it, a
+// missed free leaks one record, a wrong one corrupts. A behaviour that sends the record on sends a
+// copy (copy-on-send, term_message_copy: a parameter is never moved), so no escape is tracked.
+// Leaf apart from the tail call to free.
+	.globl	silica_rt_owned_record_release
+	.p2align	2
+silica_rt_owned_record_release:
+	ldr	x8, [x0, #8]
+	cbz	x8, Lorr_ret
+	add	x15, x8, #48
+	ldr	x10, [x1]
+	cmp	x10, x8
+	b.eq	Lorr_ret
+	cmp	x10, x15
+	b.eq	Lorr_ret
+	ldr	x11, [x0, #40]
+	ldr	x12, [x1, #160]
+	ldr	x13, [x0, #48]
+	ldr	x14, [x1, #176]
+	cmp	x11, x12
+	b.eq	Lorr_scan
+	cbnz	x11, Lorr_ret
+	cbz	x12, Lorr_free
+	add	x13, x12, #16
+Lorr_scan:
+	cmp	x13, x14
+	b.hs	Lorr_free
+	ldr	x10, [x13], #8
+	cmp	x10, x8
+	b.eq	Lorr_ret
+	cmp	x10, x15
+	b.eq	Lorr_ret
+	b	Lorr_scan
+Lorr_free:
+	mov	x0, x8
+	b	free
+Lorr_ret:
+	ret
+	.globl	silica_rt_supervisor_set_report_sink
+	.p2align	2
+silica_rt_supervisor_set_report_sink:
+// X0 = the supervisor's reference (resolved and held by silica_rt_sup_ref_call; an ended supervisor
+// raises actor_not_found), X1 = the sink's reference -> 0, or -2 (the error reply) when the sink
+// names no live actor or a call-only one (§15.4.10.5: the sink is a cast-only actor).
+	adrp	x9, silica_rt_supervisor_set_report_sink_acb
+	add	x9, x9, :lo12:silica_rt_supervisor_set_report_sink_acb
+	b	silica_rt_sup_ref_call
+	.globl	silica_rt_supervisor_set_report_sink_acb
+	.p2align	2
+silica_rt_supervisor_set_report_sink_acb:
+	.cfi_startproc
+	stp	x22, x21, [sp, #-48]!
+	stp	x20, x19, [sp, #16]
+	stp	x29, x30, [sp, #32]
+	add	x29, sp, #32
+	mov	x19, x0
+	mov	x20, x1
+// Exits already in the ingress are handled first (§15.4.9.4), before the sink is named, so they are
+// not reported (§15.4.10.5).
+	bl	silica_rt_tls_current_actor_get
+	mov	x1, x0
+	mov	x0, x19
+	bl	silica_rt_supervisor_drain_ingress
+	mov	x0, x20
+	bl	silica_rt_ref_hold
+	cbz	x0, Lsrs_bad
+	ldr	w21, [x0, #152]
+	ldr	x22, [x0, #432]
+	bl	silica_rt_acb_release
+	cbz	w21, Lsrs_bad
+	cmp	x22, #1
+	b.eq	Lsrs_bad
+	mov	x0, x19
+	bl	silica_rt_sb_require
+	str	x20, [x0, #96]
+	mov	x0, #0
+	b	Lsrs_ret
+Lsrs_bad:
+	mov	x0, #-2
+Lsrs_ret:
+	ldp	x29, x30, [sp, #32]
+	ldp	x20, x19, [sp, #16]
+	ldp	x22, x21, [sp], #48
+	ret
+	.cfi_endproc
+")
+}
+
 fn emit_child_table_runtime_asm(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
         // Match const_atoms.silica / rodata: first-added order, not bst_lookup_string alone.
         p: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":permanent");
@@ -2297,9 +2575,22 @@ fn emit_child_table_runtime_asm(table: { is_empty: boolean, index_map: { root: r
         dup: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":duplicate_child_id");
         // (:explicit, :shutdown): a child ended by its supervisor's orderly shutdown (§15.4.12.2).
         sd: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":shutdown");
+        // (:explicit, :killed): a child ended by kill_abnormal or by a shutdown-0 stop (§15.4.11.2, §15.4.12.2).
+        kd: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":killed");
         // The restart-intensity breach reason (§15.4.13.2). The ONE place the atom is chosen: a dedicated
         // runtime atom is this lexeme plus an add_atom in atom_table.silica build_runtime_atom_table.
         brk: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":restart_intensity_breach");
         list_chunk: int64 <- child_spec_init_list_chunk_data_bytes();
-        concat(concat(concat(concat(concat(concat(concat(concat(concat(child_table_rt_asm_chunk_0(), child_table_rt_spawn_child_row_by_flavor_asm(d)), child_table_rt_asm_chunk_1(d, list_chunk)), child_table_rt_asm_chunk_2(d)), child_table_rt_asm_chunk_2b()), concat(child_table_rt_restart_breach_atom_chunk(brk), child_table_rt_duplicate_child_id_chunk(dup, sd))), child_table_rt_asm_chunk_3(p, t, o, r)), child_table_rt_asm_chunk_4()), child_table_rt_asm_chunk_5()), child_table_rt_asm_chunk_6(o))
+        // The exit report of §15.4.10.5: its record shape (as the program spells the record; 0 when none
+        // does) and the failure_reason atoms it may carry (child_table_rt_exit_report_chunk).
+        er_shape_raw: int64 <- atom_table@lexeme_to_index_first_added_order(table, "{child,child_id,failure_reason,restarted,new_child}");
+        er_shape: int64 <- case er_shape_raw < 0 of { true -> 0; false -> er_shape_raw };
+        er_normal: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":normal");
+        er_lang: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":language_error");
+        er_mem: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":memory_fault");
+        er_explicit: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":explicit");
+        er_unknown: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":unknown");
+        er_foreign: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":foreign_fault");
+        er_chunk: string <- child_table_rt_exit_report_chunk(er_shape, er_normal, er_lang, er_mem, er_explicit, er_unknown, er_foreign);
+        concat(concat(concat(concat(concat(concat(concat(concat(concat(child_table_rt_asm_chunk_0(), child_table_rt_spawn_child_row_by_flavor_asm(d)), child_table_rt_asm_chunk_1(d, list_chunk)), child_table_rt_asm_chunk_2(d)), child_table_rt_asm_chunk_2b()), concat(child_table_rt_restart_breach_atom_chunk(brk), child_table_rt_duplicate_child_id_chunk(dup, sd, kd))), child_table_rt_asm_chunk_3(p, t, o, r)), child_table_rt_asm_chunk_4()), child_table_rt_asm_chunk_5()), concat(child_table_rt_asm_chunk_6(o), er_chunk))
 }

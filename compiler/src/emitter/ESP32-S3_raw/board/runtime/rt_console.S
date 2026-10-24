@@ -625,7 +625,8 @@ silica_rt_badarith:
     entry   a1, 32
     call8   silica_rt_current_actor        // inside an actor: the actor fails, the program goes on
     beqz    a10, 1f
-    movi    a10, 1
+    movi    a10, 2                         // reason tag 2 (:language_error, §15.4.11.2), as the host's
+    movi    a11, 1                         // detail 1: integer division by zero (the report's reason line)
     call8   silica_rt_actor_trap
 1:  movi    a10, silica_rt_badarith_msg
     call8   silica_rt_main_fail_exit      // rt_actors.S: the name, the pending reports, status 1
@@ -640,6 +641,7 @@ silica_rt_case_clause:
     call8   silica_rt_current_actor
     beqz    a10, 1f
     movi    a10, 2                         // reason tag 2 (:language_error), as the host's
+    movi    a11, 2                         // detail 2: no case arm matched (the report's reason line)
     call8   silica_rt_actor_trap
 1:  movi    a10, silica_rt_case_clause_msg
     call8   silica_rt_main_fail_exit      // rt_actors.S: the name, the pending reports, status 1

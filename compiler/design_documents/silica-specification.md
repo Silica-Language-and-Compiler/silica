@@ -3164,7 +3164,7 @@ Examples:
 
 **Recursive Tuple Types (Extension):**
 
-Tuple types may contain the keyword `rec` in type positions. `rec` refers to the enclosing tuple type. Recursive positions are represented as `ref(R, Space, rec) | :none` (optional region reference). The shorthand `ref?(R, Space, T)` denotes `ref(R, Space, T) | :none`.
+Tuple types may contain the keyword `rec` in type positions. `rec` refers to the innermost enclosing tuple type, in every position. Recursive positions are represented as `ref(R, Space, rec) | :none` (optional region reference). The shorthand `ref?(R, Space, T)` denotes `ref(R, Space, T) | :none`.
 
 Examples:
 ```
@@ -3172,10 +3172,31 @@ Examples:
 (int64, ref?(R, normal, (int64, rec)))                                            // linked list node
 ```
 
+`rec` binds to the innermost tuple type that encloses it. A `rec` with no enclosing tuple type (an unbound `rec`) is a compile error, E2010. This holds in every position: a binding annotation, a record field, a parameter type and a return type. A structure root, parameter or return is therefore spelled with its node shape, not with a bare `rec`:
+
+```
+root: ref?(L, normal, (KeyType, ValueType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))   // correct
+root: ref?(L, normal, rec)                                                                       // E2010, no enclosing tuple
+```
+
+In a nested tuple, `rec` binds to the inner tuple, not the outer one:
+
+```
+(int64, (int64, ref?(R, normal, rec)))   // rec is the inner pair (int64, ref?(R, normal, rec)), not the whole tuple
+```
+
+A node whose recursive slots sit inside an inner tuple cannot name the node with `rec`. Restructure it so the recursive slots are direct elements of the node tuple. A node that held children as `List[(int64, ref?(L, normal, rec))]`, where `rec` would bind to the pair, instead holds `List[ref?(L, normal, rec)]`; a `List` is not a tuple, so `rec` binds to the node, and the per-child datum (for example a rank) moves into the child node:
+
+```
+(ItemType, int64, List[ref?(L, normal, rec), normal])   // node: item, rank, children
+```
+
+The reason is type-directed copying of messages (Q18): the copier follows only references whose layout the type names, using descriptors built at compile time from the type, with no per-cell layout header at run time.
+
 - **Base case:** The atom `:none` denotes an empty recursive position.
 - **Construction:** `alloc_rec(r, (value, ...))` allocates a recursive tuple in a region; returns `ref(R, Space, tuple_type)`. Effect: `mem(Space)`.
-- **Decomposition:** Use `read_ref(ref)` to obtain the tuple value, then decompose with `(pattern) <- expr`. Pattern match on `ref?` slots: `case slot of { :none -> ...; ref_var: ref(R, rec) -> ... }`.
-- **Type checking:** Structural equality with `rec`-scoped occurs check. `rec` is valid only inside a tuple type.
+- **Decomposition:** Use `read_ref(ref)` to obtain the tuple value, then decompose with `(pattern) <- expr`. Pattern match on `ref?` slots: `case slot of { :none -> ...; ref_var: ref(R, normal, <node tuple type>) -> ... }`.
+- **Type checking:** Structural equality with `rec`-scoped occurs check. `rec` is valid only inside a tuple type and binds to the innermost one; otherwise E2010.
 
 See [recursive_tuple_specification.md](recursive_tuple_specification.md) for full design.
 
@@ -6948,7 +6969,7 @@ For recursive data structures containing references, lifetime analysis tracks re
 
 ```
 // Singly linked list via recursive tuple and ref? (§4.2.2): a cell is
-// ref(R, normal, (int64, ref?(R, normal, rec))) with rec = (int64, ref?(R, normal, rec)).
+// ref(R, normal, (int64, ref?(R, normal, rec))) with rec = (int64, ref?(R, normal, rec)) (the innermost enclosing tuple).
 // End of list uses :none in the ref? slot instead of Some(next).
 ```
 
@@ -7698,7 +7719,7 @@ An actor ends in one of these ways:
 - **Being shut down by its supervisor** (§15.4.12.2).
 - **Failing:** a runtime trap, `panic` (§22.16) or a contained fault (§15.4).
 
-**Implementation status (2026-10-16).** `stop_self` and `fail_self` are not implemented: the compilers have no signature or lowering for them, so a program cannot yet end its own actor, nor produce an `(:explicit, atom)` reason of its own. An actor ends today by `remove_actor` or `kill_abnormal` from another actor, by its supervisor, or by a failure. The same holds for `panic` (§22.16) and for the `stop_self` and `fail_self` uses in §15.4.11.2, §15.5 and §16.1.4. The compile-time rejection of `remove_actor` and `kill_abnormal` whose target is `self()` or an alias bound from `self()` is implemented (E2241). A target the compiler cannot see, such as one hidden behind a function parameter, still fails the caller with `:language_error` at run time on every target (trials `actors_addition/remove_actor_self_language_error`, `kill_abnormal_self_language_error`).
+**Implementation status (2026-10-23).** `stop_self` and `fail_self` are implemented on all four targets (type checker, SIR lowering, the emitters and their runtimes; trials `actor_self_stop_addition`, and `error_enforcement_addition/stop_self_in_main`, `fail_self_in_plain_function`, `stop_self_reason_not_normal_or_explicit`): both are admitted only in a behaviour (E2091 elsewhere, as `kill_abnormal`), `stop_self` takes the literal `:normal` or a `(:explicit, atom)` tuple (E2003 for any other reason), and `fail_self` has the type its context expects, since it never returns. `panic` (§22.16) and the `:stop` of §15.5 are not implemented. The compile-time rejection of `remove_actor` and `kill_abnormal` whose target is `self()` or an alias bound from `self()` is implemented (E2241). A target the compiler cannot see, such as one hidden behind a function parameter, still fails the caller with `:language_error` at run time on every target (trials `actors_addition/remove_actor_self_language_error`, `kill_abnormal_self_language_error`).
 
 When an actor ends, the runtime:
 - Stops the actor’s message loop
@@ -8960,17 +8981,18 @@ Rules:
 - Every labeled field appears on its own line with a fixed-width label followed by `:` and two spaces.
 - Each stack frame occupies two lines: the `[N]  module@fn/arity` line and an indented `at file:line` line.
 - The `[runtime dispatch frame]` sentinel marks the boundary between user frames and runtime internals; the runtime frames themselves are not shown.
-- `reason` is one of the variants of the inline sum type defined in §15.4.11.2: `:normal | :language_error | :memory_fault | (:explicit, atom) | :unknown`. A dash-separated detail string may follow for additional context (e.g. `memory_fault — MTE tag mismatch at 0x0000_7fff_dead_beef`).
+- `reason` is one of the variants of the inline sum type defined in §15.4.11.2: `:normal | :language_error | :memory_fault | (:explicit, atom) | :foreign_fault | :noproc | :unknown` (`:noproc` appears only in a `DOWN` message, never in a failure report). A dash-separated detail string may follow for additional context (e.g. `memory_fault — MTE tag mismatch at 0x0000_7fff_dead_beef`).
 - `fault_addr` is present only on the trap path; it is omitted (not shown as zero) on the orderly path.
 - `region_dumps` appears only when `FailureReporter.region_dump_limit()` returns a value greater than zero (§15.4.13.4). One entry per region handle the actor held at time of death. Each entry shows up to `region_dump_limit()` bytes. On AArch64 with MTE, the tag for each 16-byte granule is appended as `[tags: N N N ...]` (one nibble per granule, decimal). On x86-64 the tag annotation is absent.
 - The delimiters `=== Silica Actor Failure ===` and `=== End Silica Actor Failure ===` are literal strings, enabling reliable extraction from log streams.
 
-**Implementation status (2026-10-16).** The runtimes write a shorter report than the format above, the same on every target apart from the pointer spelling:
+**Implementation status (2026-10-16, updated 2026-10-24).** The runtimes write a shorter report than the format above, the same on every target apart from the pointer spelling:
 
 ```
 === Silica Actor Failure ===
 actor_id:        <decimal identity>
 agent_type_atom: <atom index of the agent type; 0 for a root actor>
+reason:          <failure reason, e.g. :language_error — integer division by zero, (:explicit, :killed)>
 reason_tag:      <number of the failure reason>
 supervisor_acb:  <pointer; 0x0, (nil) or 0x00000000 when the actor has no supervisor>
 call_stack:
@@ -8979,7 +9001,7 @@ call_stack:
 === End Silica Actor Failure ===
 ```
 
-`actor_id` is the actor's 64-bit identity (§15.1.4) printed in decimal. `reason_tag` is the runtime's code for the failure reason; the codes used by the specification are 1 for `(:explicit, :killed)`, 2 for `:language_error` and 4 for the other `(:explicit, atom)` reasons, which includes `(:explicit, :shutdown)` and `(:explicit, :actor_not_found)`. The report has no source file or line, no `behavior` or `message_seq` field, and no `supervisor:` line. The root supervisor's own report is recognised by a null `supervisor_acb` and the frame `#0  <unknown behavior>`. The hosted runtimes append a `=== Region Dump ===` block per held region when the reporter's `region_dump_limit()` is above zero. The fault line of a process-fatal report (§15.4.5.5) prints the current actor's control-block address in `actor=0x…`, not its identity. The format above, with source file and line, `behavior`, `message_seq`, a `supervisor:` line and the MTE tags, remains the design and is what a conforming report will carry; the short form printed today is described, with the runtime symbols that print it, in [runtime_failure_reporting.md](runtime_failure_reporting.md) §7.
+`actor_id` is the actor's 64-bit identity (§15.1.4) printed in decimal. `reason` (added 2026-10-24) is the failure reason in readable form; the dash is U+2014 and the detail text after it appears only where the runtime knows the cause (`integer division by zero`, `no case arm matched`); an atom that the runtime's copy of the atom table does not hold prints `:unknown`. Implemented on all four targets (trial `failure_reason_line_addition`); verified on the Mac, Linux verification in progress, ESP32-S3 board run pending. `reason_tag` is the runtime's code for the failure reason; the codes are 0 for `:normal`, 2 for `:language_error` (division by zero, no case arm matched, and the convention-mismatch, name-taken and misuse sites), 3 for `:memory_fault` (a board CPU exception in an actor), 4 for every `(:explicit, atom)` reason (including `(:explicit, :killed)` from `kill_abnormal` and from a `shutdown` of 0, `(:explicit, :shutdown)` from a `shutdown` above 0, and `(:explicit, :actor_not_found)`) and 5 for `:foreign_fault`. Tag 1 is no longer written; before 2026-10-23 it meant `(:explicit, :killed)`. The report has no source file or line, no `behavior` or `message_seq` field, and no `supervisor:` line. The root supervisor's own report is recognised by a null `supervisor_acb` and the frame `#0  <unknown behavior>`. The hosted runtimes append a `=== Region Dump ===` block per held region when the reporter's `region_dump_limit()` is above zero. The fault line of a process-fatal report (§15.4.5.5) prints the current actor's control-block address in `actor=0x…`, not its identity. The format above, with source file and line, `behavior`, `message_seq`, a `supervisor:` line and the MTE tags, remains the design and is what a conforming report will carry; the short form printed today is described, with the runtime symbols that print it, in [runtime_failure_reporting.md](runtime_failure_reporting.md) §7.
 
 **Example**
 
@@ -9126,7 +9148,7 @@ Any operation can return `{ tag: :error, error: reason_atom, ... }`.
 
 **`:set_report_sink`** names the actor that receives this supervisor's exit reports (§15.4.10.5).
 
-**Implementation status (2026-10-16).** `:terminate_actor` and `:set_report_sink`, with the report sink of §15.4.10.5, are not implemented. The other operations are, and `:get_child` finds a child by its `id` (trials `supervisors_addition/phase_d_protocol_restart_and_lookup`).
+**Implementation status (2026-10-23).** `:terminate_actor` is not implemented. `:set_report_sink`, with the report sink of §15.4.10.5, is implemented on all four targets (trials `supervisor_exit_reports_addition`): it answers `{ tag: :error, ... }` when `sink` names no live actor or a call-only one. The other operations are, and `:get_child` finds a child by its `id` (trials `supervisors_addition/phase_d_protocol_restart_and_lookup`).
 
 There is no `cast_supervisor`, and `cast(supervisor_ref, ...)` is invalid. `call(supervisor_ref, ...)` is invalid; ordinary actor `call()` accepts `actor_ref`, not `supervisor_ref`.
 
@@ -9284,6 +9306,8 @@ exit_report ::= {
 - Exits handled before any sink is named are not reported. If the sink has ended, reports are dropped.
 - A report is the only way an actor other than the supervisor learns of a child's exit through supervision. It does not replace the supervision ingress, which stays runtime-internal (§15.4.9).
 
+**Implementation status (2026-10-23).** Implemented on all four targets (trials `supervisor_exit_reports_addition`). The report is cast right after the restart decision by whichever party handles the notice (the supervisor's own dispatch or a draining caller), through the sink's identity, so an ended sink gets nothing; a call-only sink is refused by `:set_report_sink`. A child supervisor copies its supervisor's sink when it is spawned (an `init` child, an `:add_child` child, a restart), and `:set_report_sink` on it replaces the copy. A sibling stopped and restarted by a `:one_for_all` or `:rest_for_one` cascade is not reported: its own exit notice is dropped by the cascade, and only notices the supervisor matches to a row produce a report. Since 2026-10-23 a division by zero ends an actor with `:language_error` (reason tag 2) and `kill_abnormal` or a shutdown-0 stop with `(:explicit, :killed)` (tag 4, `:killed` a runtime atom), on every target, so a report carries those reasons; before, all three shared tag 1 and the FailureReporter's banner printed `reason_tag: 1` for them. The record the sink receives is freed after the sink's dispatch unless the behaviour kept it (its new state, or a word it allocated, names the record or its pair). The record is spelled by the program in the field order above (the sink's behaviour reads it by offset).
+
 ---
 
 #### 15.4.11 Failure Payload
@@ -9303,7 +9327,7 @@ Every failure notification delivered to a supervisor's supervision ingress carri
 The failure reason is an **inline sum type** — a built-in language construct, not defined in any module. It is written inline wherever it appears in a type signature:
 
 ```
-:normal | :language_error | :memory_fault | (:explicit, atom) | :noproc | :unknown
+:normal | :language_error | :memory_fault | (:explicit, atom) | :foreign_fault | :noproc | :unknown
 ```
 
 | Variant | Meaning |
@@ -9311,6 +9335,7 @@ The failure reason is an **inline sum type** — a built-in language construct, 
 | `:normal` | The actor ended normally, through `stop_self(:normal)` or `remove_actor` (§15.1.2.3) |
 | `:language_error` | Language-level failure: pattern-match exhaustion, a type mismatch, `panic` (§22.16), or similar |
 | `:memory_fault` | Hardware-detected memory fault (MTE tag mismatch, guard page violation) |
+| `:foreign_fault` | A guarded foreign call faulted inside a dangerous actor (§15.4.13.5); the runtime ends that actor with this reason (reason tag 5) and sends the atom in the exit-report record (Lee, 2026-10-24) |
 | `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :thread_limit)` for a spawn of a dangerous actor whose thread the host refused (§15.4.13.5), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), `(:explicit, :restart_intensity_breach)` for a supervisor that ends because it breached its restart intensity (§15.4.13.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4), and, for a runtime check that fails inside an actor (the same checks abort the process only in `main`), `(:explicit, :buf_bounds)` for a buffer index out of bounds, `(:explicit, :buf_invalid)` for an invalid buffer size, `(:explicit, :list_index)` for a list index out of range and `(:explicit, :region_alloc_failed)` for a region growth or raw allocation failure (Lee, 2026-10-22 and 2026-10-23; the access or allocation is never performed). These four are runtime atoms appended after the existing ones. `:thread_limit` is a runtime atom appended after `:restart_intensity_breach`, so no program atom moves. |
 | `:noproc` | Used only in a `DOWN` message: the monitored actor had already ended when `monitor` was called (§15.4.8.6) |
 | `:unknown` | Runtime could not determine the reason |
@@ -9346,7 +9371,7 @@ A supervisor tears down its children when it restarts them (§15.4.12.1) and whe
 
 1. The children are stopped **one at a time, last child-table row first**, and the supervisor waits for each to finish before it stops the next. A child supervisor stops its own children first, by this same procedure.
 2. For each live child whose `actor_ref` is held in the supervisor child table, the runtime-owned supervisor behavior applies the child row's `shutdown` policy.
-3. If `shutdown` is `0`, the child is killed as by `kill_abnormal` (§22.4), with reason tag 1.
+3. If `shutdown` is `0`, the child is killed as by `kill_abnormal` (§22.4): `failure_reason` `(:explicit, :killed)` (reason tag 4; before 2026-10-23 the runtimes gave it tag 1 and no atom; tag 1 is no longer written).
 4. If `shutdown` is greater than `0`, the runtime performs an **orderly shutdown**:
    - It stops dispatching further messages to the child.
    - It lets the dispatch in progress, if any, run to completion; a call in progress still receives its reply.
@@ -9429,7 +9454,7 @@ child_spec ::= {
 `ChildReturn` is the child behavior's return form: `(:reply, Reply, ActorState)` for a call-only child, or `(:no_reply, ActorState)` for a cast-only child. Each behavior uses exactly one form (§15.1.2). A state-machine child gives `behavior: state_machine_behavior(ImplType)`, the runtime-provided cast-only behavior for that `StateMachine` implementation, and its `initial_state` is the value passed to `init` (§15.5.6).
 
 `shutdown` controls how the runtime stops a live child before replacing it:
-- `0` — kill without waiting for further messages; the child ends with reason tag 1, as for `kill_abnormal` (§15.4.12.2).
+- `0` — kill without waiting for further messages; the child ends with `(:explicit, :killed)`, as for `kill_abnormal` (§15.4.12.2).
 - `> 0` — orderly shutdown (§15.4.12.2): no further messages are dispatched, the dispatch in progress may finish for up to that many milliseconds, and the child ends with `failure_reason` `(:explicit, :shutdown)`. The time limit is not yet enforced (implementation status, §15.4.12.2).
 
 The same policy applies when the supervisor itself ends: it shuts down every live child before it ends (§15.4.8.4, §15.4.12.2).
@@ -9879,7 +9904,7 @@ call_with_timeout(actor: actor_ref, message: ActorMessage, timeout_ms: uint64)
 - A `timeout_ms` of `0` enqueues the message and returns `:timeout` without waiting.
 - Time is measured on the monotonic clock (§22.14).
 
-**Implementation status (2026-10-16).** `call_with_timeout` is not implemented, and neither are the monotonic clock and timers of §22.14. A caller cannot yet stop waiting for a reply.
+**Implementation status (2026-10-23).** `call_with_timeout` is not implemented: a caller cannot yet stop waiting for a reply. The monotonic clock and the timers of §22.14 (`monotonic_time`, `current_time`, `send_after`, `cancel_timer`, `timer_ref`) exist on all four targets since 2026-10-23, so a behaviour that must wait with a timeout arms a timer and continues when its message arrives (trials/timers_addition/receive_after_pattern).
 
 #### 16.1.2 Asynchronous Cast
 Messages can be sent asynchronously without blocking, with success/failure indication:
@@ -14366,7 +14391,7 @@ module arch.apple.amx {
 
 This section documents all built-in functions and primitives available in Silica. These are always available without requiring imports. A builtin is always called unqualified; a module function with a builtin's name is called only as `module@name(...)` (§19.3.3).
 
-**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `stop_self`, `fail_self`, `panic`, `assert`, `unreachable` (§15.1.2.3, §22.16); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout`, `send_after`, `cancel_timer`, `monotonic_time`, `current_time` (§22.14); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations (§22.12; `alloc_atomic` is not added, Q8); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
+**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `panic`, `assert`, `unreachable` (§22.16; `stop_self` and `fail_self` of §15.1.2.3 exist since 2026-10-23); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout` (§22.14; `monotonic_time`, `current_time`, `send_after`, `cancel_timer` and the `timer_ref` type exist since 2026-10-23); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations (§22.12; `alloc_atomic` is not added, Q8); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
 
 ### 22.1 Memory Management Primitives
 

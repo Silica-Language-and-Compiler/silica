@@ -98,7 +98,9 @@
 //                    started by spawn_device, silica_rt_actor_mark_device)  23 state owned (b; the
 //                    state block is the actor's, freed at its end)
 //                 24 exit reason tag(b)  25 fault EXCCAUSE+1 (b; 0: no CPU exception captured)
-//                 26 exit reason atom(h)  28 agent_type atom(h)  30 registered name+1 (h; 0 none)
+//                 26 exit reason atom(h; under tag 2 a language error's detail code for the report's
+//                    reason line: 0 none, 1 division by zero, 2 no case arm matched)
+//                 28 agent_type atom(h)  30 registered name+1 (h; 0 none)
 //                 32/36 mailbox head/tail  40 ready link (the free-list link once the ACB is freed)
 //                 44/48 machine chunk chain: first chunk / current chunk  52/56 the same, auxiliary
 //                 60/64/68 saved a0/a1/vsp (a1 0: no context, the next dispatch enters the loop afresh)
@@ -131,7 +133,8 @@
 //   core block (64 B)  0/4/8 ready heads (high, normal, low)  12/16/20 tails  24 current context
 //                 28 scheduler pseudo-ACB  32 busy  36 id  40/44/48 queued actors per ready queue
 //                 52/56 weighted-fair tier being served and its remaining credit
-//   failure payload (32 B, heap)  0 child  8 reason tag  16 reason atom  24 agent type (8-byte slots)
+//   failure payload (48 B, heap)  0 child  8 reason tag  16 reason atom  24 agent type (8-byte slots)
+//     32 holds-its-actor word  40 the ended child's identity (8 B; the exit report, spec §15.4.10.5)
 //
 // Result and status conventions follow the reference: spawn -> the actor's identity (the
 // actor_ref), cast -> 1, send -> 0, call -> the reply (an ended or unknown target raises
@@ -226,7 +229,8 @@
 #define SB_CT_LEN        52
 #define SB_CT_USERS      56
 #define SB_CT_PENDING    60
-#define SB_SIZE          64
+#define SB_SINK          64     // the report sink's identity (8 B; spec §15.4.10.5), 0 none
+#define SB_SIZE          72
 #define RING_SIZE        32
 
 // \rd = the actor's lowered reservation (0 default): the policy word without its algorithm nibble.
@@ -378,6 +382,14 @@ silica_registry_atom_identity_exhausted:
     .weak   silica_registry_atom_shutdown
 silica_registry_atom_shutdown:
     .word   -1
+    .weak   silica_registry_atom_killed
+silica_registry_atom_killed:
+    .word   -1
+    // (:explicit, :stack_exhausted) for a stack-guard hit (silica_rt_actor_fault_hook); -1 in a
+    // hand-written image, so the report's reason line prints :unknown there
+    .weak   silica_registry_atom_stack_exhausted
+silica_registry_atom_stack_exhausted:
+    .word   -1
     .weak   silica_registry_atom_restart_breach
 silica_registry_atom_restart_breach:
     .word   -1
@@ -405,6 +417,14 @@ silica_rt_sup_error_tag:
     .weak   silica_rt_sup_self_error_atom
 silica_rt_sup_self_error_atom:
     .word   4
+    // the program's atom names for the failure report's reason line (emitter_core
+    // xt_runtime_registry_words): none in a hand-written image, so (:explicit, atom) prints :unknown
+    .weak   silica_rt_atom_name_count
+silica_rt_atom_name_count:
+    .word   0
+    .weak   silica_rt_atom_names
+silica_rt_atom_names:
+    .word   0
     .text
 #define INGRESS_LIMIT         1024
 
@@ -624,8 +644,21 @@ silica_rt_banner_head:
     .asciz  "\n=== Silica Actor Failure ===\nactor_id:        "
 silica_rt_banner_agent:
     .asciz  "\nagent_type_atom: "
+silica_rt_banner_reason_text:
+    .asciz  "\nreason:          "
 silica_rt_banner_reason:
     .asciz  "\nreason_tag:      "
+// The reason line's words (spec §15.4.13, §15.4.11.2): the failure_reason variants as a program
+// spells them, the em dash (U+2014) before a detail, and the details the failing sites record.
+silica_rt_rline_normal:          .asciz ":normal"
+silica_rt_rline_language_error:  .asciz ":language_error"
+silica_rt_rline_memory_fault:    .asciz ":memory_fault"
+silica_rt_rline_explicit_open:   .asciz "(:explicit, "
+silica_rt_rline_foreign_fault:   .asciz ":foreign_fault"
+silica_rt_rline_unknown:         .asciz ":unknown"
+silica_rt_rline_detail_sep:      .asciz " \342\200\224 "
+silica_rt_rline_detail_div_zero: .asciz "integer division by zero"
+silica_rt_rline_detail_case:     .asciz "no case arm matched"
 silica_rt_banner_exc:
     .asciz  "\nexccause:        "
 silica_rt_banner_epc:
@@ -2262,7 +2295,10 @@ silica_rt_sched_loop:
     movi    a10, 0
     movi    a11, 0
     call8   silica_rt_exit_request_record
-12: // :release_when_idle actors of this core, a second after their last message (at most every
+12: // timers whose deadline has passed (spec §22.14.2; silica_rt_timers_fire below): a dispatch
+    // boundary or an idle pass, never inside a dispatch; a lock-free peek keeps the idle loop cheap
+    call8   silica_rt_timers_fire
+    // :release_when_idle actors of this core, a second after their last message (at most every
     // quarter second: a core busy with one actor's calls still frees another's)
     mov     a10, a3
     call8   silica_rt_actor_idle_scan
@@ -2483,6 +2519,11 @@ silica_rt_actor_main:
     mov     a11, a2
     l32i    a12, a5, 8
     call8   silica_rt_supervisor_maybe_restart
+    mov     a12, a10                    // the row the notice was matched to (0: none)
+    mov     a13, a11                    // 1 when its child was restarted
+    mov     a10, a2
+    mov     a11, a5
+    call8   silica_rt_sup_exit_report   // to the sink, if one is named (spec §15.4.10.5)
     l32i    a10, a1, 24
     l32i    a10, a10, MSG_PAYLOAD
     call8   silica_rt_exit_payload_free
@@ -2855,20 +2896,24 @@ silica_rt_complete_death_locked:
 1:  retw
     .size   silica_rt_complete_death_locked, . - silica_rt_complete_death_locked
 
-// silica_rt_actor_trap(reason tag): a language-level failure (badarith, case_clause) inside the
-// running actor. Ends the actor where it stands (spec §15.1.2: ending is the exception to the
+// silica_rt_actor_trap(reason tag, detail): a language-level failure (badarith, case_clause) inside
+// the running actor. Ends the actor where it stands (spec §15.1.2: ending is the exception to the
 // no-preemption rule): the exit path runs on this stack, then the core's scheduler continues.
-// Never returns. Called by rt_console.S when the trap happens in an actor.
+// The detail code (1 division by zero, 2 no case arm matched, 0 none) goes into ACB_REASON_ATOM
+// for the report's reason line (silica_rt_report_reason). Never returns. Called by rt_console.S
+// when the trap happens in an actor.
     .align  4
     .global silica_rt_actor_trap
     .type   silica_rt_actor_trap, @function
 silica_rt_actor_trap:
     entry   a1, 32
+    mov     a5, a3
     mov     a3, a2
     call8   silica_rt_current_actor
     mov     a2, a10
     beqz    a2, 9f
     s8i     a3, a2, ACB_REASON_TAG
+    s16i    a5, a2, ACB_REASON_ATOM
     movi    a4, 0
     s8i     a4, a2, ACB_ALIVE
     mov     a10, a2
@@ -2951,6 +2996,13 @@ silica_rt_actor_fault_hook:
     movi    a8, 3
     bne     a5, a7, 1f
     movi    a8, 4
+    // the stack-guard hit's reason atom, (:explicit, :stack_exhausted): the word emitter_core
+    // xt_runtime_registry_words publishes for this build (-1 in a hand-written image: :unknown).
+    // Without it the tag said explicit but ACB_REASON_ATOM kept whatever the slot held, so the
+    // report's reason line and a supervisor's failure_reason carried an atom nobody chose.
+    movi    a7, silica_registry_atom_stack_exhausted
+    l32i    a7, a7, 0
+    s16i    a7, a6, ACB_REASON_ATOM
 1:  s8i     a8, a6, ACB_REASON_TAG
     // the exception registers go into the ACB for the device-actor report (EXCCAUSE+1 in a byte, so
     // 0 means none: cause 0 is IllegalInstruction); cause codes from 1001 up are the runtime's own
@@ -3207,7 +3259,16 @@ silica_rt_spawn_common:
     mov     a10, a2
     call8   silica_rt_sb_require
     mov     a6, a10                     // a6 = the supervision block
-    s32i    a3, a6, SB_TRAMP
+    // a child supervisor inherits its supervisor's report sink (spec §15.4.10.5) until it names its own
+    l32i    a4, a7, 16                  // X5 = the supervisor (0: a root supervisor)
+    beqz    a4, 41f
+    l32i    a4, a4, ACB_SB
+    beqz    a4, 41f
+    l32i    a5, a4, SB_SINK
+    s32i    a5, a6, SB_SINK
+    l32i    a5, a4, SB_SINK + 4
+    s32i    a5, a6, SB_SINK + 4
+41: s32i    a3, a6, SB_TRAMP
     movi    a5, TR_SPAWNER
     s32i    a5, a6, SB_TRAMP_RAN
     call8   silica_rt_current
@@ -4058,8 +4119,11 @@ silica_rt_actor_kill_abnormal:
 1:  l8ui    a4, a2, ACB_ALIVE
     beqz    a4, 9f
     l32i    a6, a2, ACB_SUP
+    movi    a4, silica_registry_atom_killed   // failure_reason (:explicit, :killed), tag 4 (§15.4.11.2)
+    l32i    a4, a4, 0
+    s16i    a4, a2, ACB_REASON_ATOM
     mov     a10, a2
-    movi    a11, 1
+    movi    a11, 4
     call8   silica_rt_end_actor
     // a supervised victim: its supervisor's pending exit notices are handled before returning
     mov     a4, a6
@@ -4072,6 +4136,69 @@ silica_rt_actor_kill_abnormal:
 8:  call8   silica_rt_language_error_current   // never returns
     j       8b
     .size   silica_rt_actor_kill_abnormal, . - silica_rt_actor_kill_abnormal
+
+// ---------------------------------------------------------------------------------------------
+// Ending the calling actor (spec §15.1.2.3)
+
+// silica_rt_fail_self(X0 reason atom): fail_self(reason). The running actor fails at once with
+// failure_reason (:explicit, reason) through silica_rt_actor_trap_explicit, as the runtime's own
+// checks end it: the dispatch is abandoned, a call it is serving gets the actor-death result, queued
+// casts are dropped. Never returns. The type checker admits the call only in a behaviour (E2091);
+// with no current actor it is the language-level failure of §15.4.5.5.
+    .align  4
+    .global silica_rt_fail_self
+    .type   silica_rt_fail_self, @function
+silica_rt_fail_self:
+    entry   a1, 32
+    mov     a3, a2
+    call8   silica_rt_current_actor
+    beqz    a10, 1f
+    mov     a10, a3
+    call8   silica_rt_actor_trap_explicit   // never returns
+1:  call8   silica_rt_language_error_current   // never returns
+    j       1b
+    .size   silica_rt_fail_self, . - silica_rt_fail_self
+
+// silica_rt_stop_self_normal() -> 0: stop_self(:normal). The running actor ends at its next dispatch
+// boundary with failure_reason :normal, as remove_actor ends another actor (silica_rt_end_actor on a
+// running actor only clears ACB_ALIVE): the current dispatch runs to completion and a call it is
+// serving still gets its reply. The emitter answers :ok.
+    .align  4
+    .global silica_rt_stop_self_normal
+    .type   silica_rt_stop_self_normal, @function
+silica_rt_stop_self_normal:
+    entry   a1, 32
+    call8   silica_rt_current_actor
+    beqz    a10, 1f
+    movi    a11, 0
+    call8   silica_rt_end_actor
+    movi    a2, 0
+    movi    a3, 0
+    retw
+1:  call8   silica_rt_language_error_current   // never returns
+    j       1b
+    .size   silica_rt_stop_self_normal, . - silica_rt_stop_self_normal
+
+// silica_rt_stop_self_explicit(X0 reason atom) -> 0: stop_self((:explicit, reason)). As
+// silica_rt_stop_self_normal, with failure_reason (:explicit, reason): the atom in ACB_REASON_ATOM and
+// reason tag 4 (silica_rt_end_actor stores the tag of a live actor).
+    .align  4
+    .global silica_rt_stop_self_explicit
+    .type   silica_rt_stop_self_explicit, @function
+silica_rt_stop_self_explicit:
+    entry   a1, 32
+    mov     a3, a2
+    call8   silica_rt_current_actor
+    beqz    a10, 1f
+    s16i    a3, a10, ACB_REASON_ATOM
+    movi    a11, 4
+    call8   silica_rt_end_actor
+    movi    a2, 0
+    movi    a3, 0
+    retw
+1:  call8   silica_rt_language_error_current   // never returns
+    j       1b
+    .size   silica_rt_stop_self_explicit, . - silica_rt_stop_self_explicit
 
 // silica_rt_end_actor(acb, reason tag): request the end. The running actor (a self-kill) ends after
 // its behaviour returns, as the reference does. An actor that is not running -- parked, suspended
@@ -5130,7 +5257,7 @@ silica_rt_actor_deliver_exit:
     entry   a1, 32
     l32i    a6, a2, ACB_SUP
     beqz    a6, 19f                     // (SCHED_LOCK below defines a local 9: of its own)
-    movi    a10, 40
+    movi    a10, 48
     call8   silica_rt_alloc
     mov     a7, a10
     s32i    a2, a7, 0
@@ -5144,6 +5271,12 @@ silica_rt_actor_deliver_exit:
     // has handled it (word 32; silica_rt_exit_payload_free), since the row is matched by it
     movi    a8, 0
     s32i    a8, a7, 32
+    // the ended child's identity, for the exit report (spec §15.4.10.5): the row holds a new one
+    // once the child is restarted, and the ACB may be recycled by then
+    l32i    a8, a2, ACB_ID
+    s32i    a8, a7, 40
+    l32i    a8, a2, ACB_ID + 4
+    s32i    a8, a7, 44
     l32i    a4, a2, ACB_SB
     beqz    a4, 1f
     SCHED_LOCK a8, a9
@@ -5241,6 +5374,11 @@ silica_rt_actor_supervision_wait_and_drain_one:
     mov     a11, a2
     l32i    a12, a6, 8
     call8   silica_rt_supervisor_maybe_restart
+    mov     a12, a10                    // the row the notice was matched to (0: none)
+    mov     a13, a11                    // 1 when its child was restarted
+    mov     a10, a2
+    mov     a11, a6
+    call8   silica_rt_sup_exit_report   // to the sink, if one is named (spec §15.4.10.5)
     l32i    a5, a6, 32                  // the program gets the payload; its hold on the actor ends
     beqz    a5, 4f
     movi    a5, 0
@@ -5385,12 +5523,12 @@ silica_rt_behaviour_name:
     retw
     .size   silica_rt_behaviour_name, . - silica_rt_behaviour_name
 
-// The report is composed into a buffer (silica_rt_report_buf, 512 B) by the emit helpers below,
-// then printed or cast.
+// The report is composed into a buffer (silica_rt_report_buf, 768 B) by the emit helpers below,
+// then printed or cast. puts stops at 740 so the numeric helpers after it always have room.
     .section .bss.silica_rt_report, "aw", @nobits
     .balign 8
 silica_rt_report_buf:
-    .space  512
+    .space  768
 silica_rt_report_len:
     .space  4
     .section .text.silica_rt_actors, "ax"
@@ -5404,7 +5542,7 @@ silica_rt_report_puts:
     l32i    a4, a3, 0
     movi    a5, silica_rt_report_buf
     add     a5, a5, a4
-    movi    a7, 500
+    movi    a7, 740
 1:  l8ui    a6, a2, 0
     beqz    a6, 2f
     bgeu    a4, a7, 2f
@@ -5560,6 +5698,63 @@ silica_rt_report_device_fault:
     call8   silica_rt_report_hex
 9:  retw
     .size   silica_rt_report_device_fault, . - silica_rt_report_device_fault
+
+// append the reason line's text (spec §15.4.13, §15.4.6.4): the failure_reason variant of §15.4.11.2
+// that the exit reason tag names, spelled as a program spells it (:normal, :language_error,
+// :memory_fault, (:explicit, :atom) with the atom's name from the image's silica_rt_atom_names,
+// :foreign_fault), or :unknown for a tag the runtime does not give. A language error whose cause the
+// failing site recorded in ACB_REASON_ATOM (1 a division by zero, 2 a case with no matching arm) adds
+// an em dash and the detail after the variant; one that recorded nothing prints the variant alone:
+// nothing is invented. a2 = the dying actor's ACB.
+    .align  4
+silica_rt_report_reason:
+    entry   a1, 32
+    l8ui    a4, a2, ACB_REASON_TAG
+    l16ui   a5, a2, ACB_REASON_ATOM
+    beqz    a4, 10f
+    beqi    a4, 2, 20f
+    beqi    a4, 3, 30f
+    beqi    a4, 4, 40f
+    beqi    a4, 5, 50f
+9:  movi    a10, silica_rt_rline_unknown
+    call8   silica_rt_report_puts
+    retw
+10: movi    a10, silica_rt_rline_normal
+    call8   silica_rt_report_puts
+    retw
+20: movi    a10, silica_rt_rline_language_error
+    call8   silica_rt_report_puts
+    beqi    a5, 1, 21f
+    beqi    a5, 2, 22f
+    retw
+21: movi    a6, silica_rt_rline_detail_div_zero
+    j       23f
+22: movi    a6, silica_rt_rline_detail_case
+23: movi    a10, silica_rt_rline_detail_sep
+    call8   silica_rt_report_puts
+    mov     a10, a6
+    call8   silica_rt_report_puts
+    retw
+30: movi    a10, silica_rt_rline_memory_fault
+    call8   silica_rt_report_puts
+    retw
+40: movi    a6, silica_rt_atom_name_count    // an index the table does not hold prints :unknown
+    l32i    a6, a6, 0
+    bgeu    a5, a6, 9b
+    movi    a6, silica_rt_atom_names
+    addx4   a6, a5, a6
+    l32i    a6, a6, 0
+    movi    a10, silica_rt_rline_explicit_open
+    call8   silica_rt_report_puts
+    mov     a10, a6
+    call8   silica_rt_report_puts
+    movi    a10, silica_rt_banner_rp
+    call8   silica_rt_report_puts
+    retw
+50: movi    a10, silica_rt_rline_foreign_fault
+    call8   silica_rt_report_puts
+    retw
+    .size   silica_rt_report_reason, . - silica_rt_report_reason
 
 // The FailureReporter's report is a heap string the message owns (MSG_PAYLOAD_OWNED 2): the
 // reporter's dispatch frees it once handle_report has returned, as it frees a record message copy
@@ -5798,6 +5993,10 @@ silica_rt_actor_deliver_unwind_report:
     call8   silica_rt_report_puts
     l16ui    a10, a2, ACB_AGENT
     call8   silica_rt_report_dec
+    movi    a10, silica_rt_banner_reason_text
+    call8   silica_rt_report_puts
+    mov     a10, a2
+    call8   silica_rt_report_reason
     movi    a10, silica_rt_banner_reason
     call8   silica_rt_report_puts
     l8ui    a10, a2, ACB_REASON_TAG
@@ -6002,3 +6201,361 @@ silica_rt_get_actor_memory_usage:
 // ---------------------------------------------------------------------------------------------
 // Supervisors: the child table runtime lives in rt_supervisors.S. Until it does, the entry points
 // the emitter and this file reach are defined there or here as the reference's benign values.
+
+// ---------------------------------------------------------------------------------------------
+// Clocks and timers (spec §22.14, §4.5.2; ports/esp32s3_xtensa_port.md §8.11). The pending timers
+// are one list ordered by deadline, in ticks of the 16 MHz system timer (64-bit), under
+// silica_rt_timer_lock; every core's scheduler loop fires the due ones at its label 12 (a dispatch
+// boundary or an idle pass: never inside a dispatch, §15.1.2), so a timer fires no earlier than its
+// deadline and at most one dispatch later than a core's loop could see it. Numbers are never
+// reused (a 64-bit counter), so a stale reference is :not_found and never cancels another timer.
+// Record (TMR_SIZE bytes, silica_rt_alloc):
+//   +0 next   +4/+8 number   +12/+16 deadline   +20/+24 target identity   +28/+32 message
+//   +36 owned payload flag (a cast's MSG_PAYLOAD_OWNED)   +40 release thunk (0 none)
+// A timer that will not deliver (cancelled, or its target ended, or dropped when due) runs the
+// emitter's release thunk (the message record's owned regions, as the receiver's dispatch would
+// have destroyed them), frees an owned payload copy, and frees the record (silica_rt_timer_release).
+// current_time answers milliseconds since the system timer started: the board has no wall clock.
+#define TMR_NEXT        0
+#define TMR_ID          4
+#define TMR_DL          12
+#define TMR_TGT         20
+#define TMR_MSG         28
+#define TMR_OWNED       36
+#define TMR_THUNK       40
+#define TMR_SIZE        48
+#define TMR_SYSTIMER_CONF  0x60023000
+#define TMR_SYSTIMER_OP    0x60023004
+#define TMR_SYSTIMER_HI    0x60023040
+#define TMR_SYSTIMER_LO    0x60023044
+
+// The timer list's lock: FREE_LOCK's shape. A leaf: nothing is called while it is held.
+.macro TIMER_LOCK ra, rb
+    movi    \ra, silica_rt_timer_lock
+9:  movi    \rb, 0
+    wsr     \rb, scompare1
+    movi    \rb, 1
+    s32c1i  \rb, \ra, 0
+    bnez    \rb, 9b
+.endm
+
+.macro TIMER_UNLOCK ra, rb
+    memw
+    movi    \ra, silica_rt_timer_lock
+    movi    \rb, 0
+    s32i    \rb, \ra, 0
+    memw
+.endm
+
+    .section .bss.silica_rt_actors, "aw", @nobits
+    .balign 8
+silica_rt_timer_lock:
+    .space  4
+silica_rt_timer_head:                   // the earliest pending timer, 0 none
+    .space  4
+silica_rt_timer_next:                   // the next number, low word first (0: 1 not yet handed out)
+    .space  8
+
+    .section .text.silica_rt_actors, "ax"
+    .literal_position
+
+// silica_rt_timer_now_ticks() -> X0 = the 64-bit system timer count (a2 low, a3 high). The unit is
+// started on first use, as silica_rt_now_seconds does; HI is read before and after LO and the read
+// repeated when it changed (the other core may latch a new value between the two loads).
+    .align  4
+    .global silica_rt_timer_now_ticks
+    .type   silica_rt_timer_now_ticks, @function
+silica_rt_timer_now_ticks:
+    entry   a1, 32
+    movi    a3, TMR_SYSTIMER_CONF
+    l32i    a4, a3, 0
+    movi    a5, 0xC0000000              // CLK_EN | UNIT0_WORK_EN
+    or      a4, a4, a5
+    s32i    a4, a3, 0
+1:  movi    a3, TMR_SYSTIMER_OP
+    movi    a4, 0x40000000              // UNIT0_UPDATE
+    s32i    a4, a3, 0
+    movi    a5, 0x20000000              // UNIT0_VALUE_VALID
+2:  l32i    a4, a3, 0
+    and     a4, a4, a5
+    beqz    a4, 2b
+    movi    a3, TMR_SYSTIMER_HI
+    l32i    a6, a3, 0
+    movi    a3, TMR_SYSTIMER_LO
+    l32i    a2, a3, 0
+    movi    a3, TMR_SYSTIMER_HI
+    l32i    a7, a3, 0
+    bne     a6, a7, 1b
+    mov     a3, a7
+    retw
+    .size   silica_rt_timer_now_ticks, . - silica_rt_timer_now_ticks
+
+// monotonic_time() -> X0 = nanoseconds since the system timer started: ticks * 125 / 2 (62.5 ns a
+// tick), the 64-bit product through libgcc.
+    .align  4
+    .global silica_rt_monotonic_time
+    .type   silica_rt_monotonic_time, @function
+silica_rt_monotonic_time:
+    entry   a1, 32
+    call8   silica_rt_timer_now_ticks
+    movi    a12, 125
+    movi    a13, 0
+    call8   __muldi3
+    slli    a2, a11, 31
+    srli    a3, a10, 1
+    or      a2, a2, a3
+    srli    a3, a11, 1
+    retw
+    .size   silica_rt_monotonic_time, . - silica_rt_monotonic_time
+
+// current_time() -> X0 = milliseconds since the system timer started (ticks / 16000): the board
+// has no wall clock; the epoch milliseconds of §22.14.1 are a host's answer.
+    .align  4
+    .global silica_rt_current_time
+    .type   silica_rt_current_time, @function
+silica_rt_current_time:
+    entry   a1, 32
+    call8   silica_rt_timer_now_ticks
+    movi    a12, 16000
+    movi    a13, 0
+    call8   __udivdi3
+    mov     a2, a10
+    mov     a3, a11
+    retw
+    .size   silica_rt_current_time, . - silica_rt_current_time
+
+// silica_rt_timer_prepare(X0 target identity, X1 message, X2: a6 = owned payload flag, a7 = release
+// thunk or 0) -> X0 = the record. The inner half of send_after (emitter timer_cast).
+    .align  4
+    .global silica_rt_timer_prepare
+    .type   silica_rt_timer_prepare, @function
+silica_rt_timer_prepare:
+    entry   a1, 32
+    movi    a10, TMR_SIZE
+    call8   silica_rt_alloc
+    mov     a8, a10
+    movi    a9, 0
+    s32i    a9, a8, TMR_NEXT
+    s32i    a9, a8, TMR_ID
+    s32i    a9, a8, TMR_ID + 4
+    s32i    a2, a8, TMR_TGT
+    s32i    a3, a8, TMR_TGT + 4
+    s32i    a4, a8, TMR_MSG
+    s32i    a5, a8, TMR_MSG + 4
+    s32i    a6, a8, TMR_OWNED
+    s32i    a7, a8, TMR_THUNK
+    mov     a2, a8
+    movi    a3, 0
+    retw
+    .size   silica_rt_timer_prepare, . - silica_rt_timer_prepare
+
+// silica_rt_timer_release(rec): a timer that will not deliver gives its message back and frees
+// its record.
+    .align  4
+    .type   silica_rt_timer_release, @function
+silica_rt_timer_release:
+    entry   a1, 32
+    l32i    a3, a2, TMR_THUNK
+    beqz    a3, 1f
+    l32i    a10, a2, TMR_MSG
+    l32i    a11, a2, TMR_MSG + 4
+    callx8  a3
+1:  l32i    a3, a2, TMR_OWNED
+    beqz    a3, 2f
+    l32i    a10, a2, TMR_MSG
+    call8   silica_rt_free
+2:  mov     a10, a2
+    call8   silica_rt_free
+    retw
+    .size   silica_rt_timer_release, . - silica_rt_timer_release
+
+// silica_rt_timer_fire(rec): the cast, as silica_rt_cast_try does it (a mailbox node, enqueued by
+// identity); an ended or call-only target drops the message silently (§22.14.2). The record goes back.
+    .align  4
+    .type   silica_rt_timer_fire, @function
+silica_rt_timer_fire:
+    entry   a1, 32
+    l32i    a10, a2, TMR_MSG
+    call8   silica_rt_report_escape_check
+    call8   silica_rt_alloc_node
+    mov     a6, a10
+    l32i    a4, a2, TMR_MSG
+    l32i    a5, a2, TMR_MSG + 4
+    s32i    a4, a6, MSG_PAYLOAD
+    s32i    a5, a6, MSG_PAYLOAD + 4
+    l32i    a7, a2, TMR_OWNED
+    s32i    a7, a6, MSG_PAYLOAD_OWNED
+    l32i    a10, a2, TMR_TGT
+    l32i    a11, a2, TMR_TGT + 4
+    mov     a12, a6
+    call8   silica_rt_enqueue_by_id
+    bnez    a10, 1f
+    mov     a10, a2
+    call8   silica_rt_free
+    retw
+1:  mov     a10, a6
+    call8   silica_rt_free_node
+    mov     a10, a2
+    call8   silica_rt_timer_release
+    retw
+    .size   silica_rt_timer_fire, . - silica_rt_timer_fire
+
+// silica_rt_send_after(X0 delay_ms, X1 record) -> X0 = the timer number. A delay of 0 casts at once
+// from the caller (§22.14.2), so the message is ordered before anything the caller sends next; its
+// number is already fired. A target that has ended means a timer cancelled already: released, never
+// found. Otherwise the record is linked in deadline order (after equal deadlines: first armed, first
+// delivered). Frame: +0/+4 delay, +8 record, +12/+16 number, +20/+24 now.
+    .align  4
+    .global silica_rt_send_after
+    .type   silica_rt_send_after, @function
+silica_rt_send_after:
+    entry   a1, 48
+    s32i    a2, a1, 0
+    s32i    a3, a1, 4
+    s32i    a4, a1, 8
+    TIMER_LOCK a8, a9
+    movi    a6, silica_rt_timer_next
+    l32i    a10, a6, 0
+    l32i    a11, a6, 4
+    or      a7, a10, a11
+    bnez    a7, 1f
+    movi    a10, 1
+1:  addi    a12, a10, 1
+    mov     a13, a11
+    bgeu    a12, a10, 2f
+    addi    a13, a13, 1
+2:  s32i    a12, a6, 0
+    s32i    a13, a6, 4
+    TIMER_UNLOCK a8, a9
+    s32i    a10, a1, 12
+    s32i    a11, a1, 16
+    s32i    a10, a4, TMR_ID
+    s32i    a11, a4, TMR_ID + 4
+    l32i    a2, a1, 0
+    l32i    a3, a1, 4
+    or      a7, a2, a3
+    bnez    a7, 3f
+    mov     a10, a4
+    call8   silica_rt_timer_fire
+    j       9f
+3:  call8   silica_rt_timer_now_ticks
+    s32i    a10, a1, 20
+    s32i    a11, a1, 24
+    l32i    a10, a1, 0
+    l32i    a11, a1, 4
+    movi    a12, 16000
+    movi    a13, 0
+    call8   __muldi3
+    l32i    a12, a1, 20
+    l32i    a13, a1, 24
+    add     a10, a10, a12
+    bgeu    a10, a12, 4f
+    addi    a11, a11, 1
+4:  add     a11, a11, a13
+    l32i    a4, a1, 8
+    s32i    a10, a4, TMR_DL
+    s32i    a11, a4, TMR_DL + 4
+    l32i    a10, a4, TMR_TGT
+    l32i    a11, a4, TMR_TGT + 4
+    call8   silica_rt_ref_alive
+    bnez    a10, 5f
+    l32i    a10, a1, 8
+    call8   silica_rt_timer_release
+    j       9f
+5:  l32i    a4, a1, 8
+    l32i    a5, a4, TMR_DL
+    l32i    a6, a4, TMR_DL + 4
+    TIMER_LOCK a8, a9
+    movi    a7, silica_rt_timer_head
+6:  l32i    a2, a7, 0
+    beqz    a2, 7f
+    l32i    a12, a2, TMR_DL + 4
+    bltu    a6, a12, 7f
+    bne     a6, a12, 61f
+    l32i    a12, a2, TMR_DL
+    bltu    a5, a12, 7f
+61: mov     a7, a2
+    j       6b
+7:  s32i    a2, a4, TMR_NEXT
+    s32i    a4, a7, 0
+    TIMER_UNLOCK a8, a9
+9:  l32i    a2, a1, 12
+    l32i    a3, a1, 16
+    retw
+    .size   silica_rt_send_after, . - silica_rt_send_after
+
+// silica_rt_cancel_timer(X0 number) -> X0 = 0 :cancelled (pending: unlinked and released, never
+// delivered), 1 :not_found (fired, cancelled, or its target has ended: cancelled automatically).
+// The unlink and the pop both happen under the lock, so a cancel racing a firing timer yields
+// exactly one of delivered / :cancelled.
+    .align  4
+    .global silica_rt_cancel_timer
+    .type   silica_rt_cancel_timer, @function
+silica_rt_cancel_timer:
+    entry   a1, 48
+    TIMER_LOCK a8, a9
+    movi    a7, silica_rt_timer_head
+1:  l32i    a4, a7, 0
+    beqz    a4, 8f
+    l32i    a5, a4, TMR_ID
+    bne     a5, a2, 2f
+    l32i    a5, a4, TMR_ID + 4
+    beq     a5, a3, 3f
+2:  mov     a7, a4
+    j       1b
+3:  l32i    a5, a4, TMR_NEXT
+    s32i    a5, a7, 0
+    TIMER_UNLOCK a8, a9
+    s32i    a4, a1, 8
+    l32i    a10, a4, TMR_TGT
+    l32i    a11, a4, TMR_TGT + 4
+    call8   silica_rt_ref_alive
+    s32i    a10, a1, 12
+    l32i    a10, a1, 8
+    call8   silica_rt_timer_release
+    l32i    a2, a1, 12
+    movi    a3, 0
+    beqz    a2, 4f
+    movi    a2, 0
+    retw
+4:  movi    a2, 1
+    retw
+8:  TIMER_UNLOCK a8, a9
+    movi    a2, 1
+    movi    a3, 0
+    retw
+    .size   silica_rt_cancel_timer, . - silica_rt_cancel_timer
+
+// silica_rt_timers_fire(): every timer whose deadline has passed is taken off the list (under the
+// lock) and cast (with the lock released). Called by every core's scheduler loop.
+    .align  4
+    .global silica_rt_timers_fire
+    .type   silica_rt_timers_fire, @function
+silica_rt_timers_fire:
+    entry   a1, 48
+    movi    a7, silica_rt_timer_head
+    l32i    a2, a7, 0
+    beqz    a2, 9f
+    call8   silica_rt_timer_now_ticks
+    s32i    a10, a1, 0
+    s32i    a11, a1, 4
+1:  TIMER_LOCK a8, a9
+    movi    a7, silica_rt_timer_head
+    l32i    a2, a7, 0
+    beqz    a2, 8f
+    l32i    a5, a2, TMR_DL + 4
+    l32i    a6, a1, 4
+    bltu    a6, a5, 8f
+    bne     a6, a5, 2f
+    l32i    a5, a2, TMR_DL
+    l32i    a6, a1, 0
+    bltu    a6, a5, 8f
+2:  l32i    a5, a2, TMR_NEXT
+    s32i    a5, a7, 0
+    TIMER_UNLOCK a8, a9
+    mov     a10, a2
+    call8   silica_rt_timer_fire
+    j       1b
+8:  TIMER_UNLOCK a8, a9
+9:  retw
+    .size   silica_rt_timers_fire, . - silica_rt_timers_fire

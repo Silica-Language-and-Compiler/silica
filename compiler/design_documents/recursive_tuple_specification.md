@@ -60,10 +60,10 @@ alloc_rec(r, (value, ...))
 
 ### 2.4 Decomposition
 
-1. Bind ref: `node_ref: ref(R, (int64, ref?(R, rec), ref?(R, rec))) <- expr`
-2. Read: `node: (int64, ref?(R, rec), ref?(R, rec)) <- read_ref(node_ref)`
-3. Decompose: `(key: int64, left: ref?(R, rec), right: ref?(R, rec)) <- node`
-4. Pattern match: `case left of { :none -> ...; left_ref: ref(R, rec) -> ... }`
+1. Bind ref: `node_ref: ref(R, normal, (int64, ref?(R, normal, rec), ref?(R, normal, rec))) <- expr`
+2. Read: `node: (int64, ref?(R, normal, rec), ref?(R, normal, rec)) <- read_ref(node_ref)`
+3. Decompose: `(key: int64, left: ref?(R, normal, (int64, rec, rec)), right: ref?(R, normal, (int64, rec, rec))) <- node`
+4. Pattern match: `case left of { :none -> ...; left_ref: ref(R, normal, (int64, rec, rec)) -> ... }`
 
 ---
 

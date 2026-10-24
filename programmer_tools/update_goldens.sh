@@ -296,11 +296,13 @@ golden_ext() {  # trials/silica_compiler.mk: ASCOMP_EXT
 #   linux_x86_64      .intel_syntax noprefix
 #   ESP32-S3_raw      the XADDR macro / a literal pool (Xtensa)
 #   apple_silicon_mac Mach-O section directive, or underscore-prefixed globals
-#   linux_aarch64     everything else that is AArch64 (plain .text, .arch armv8..., no underscores)
+#   linux_aarch64     a leading .arch armv8 line (checked first: a module named 02_x has ELF
+#                     globals like _02_x_f), else everything else that is AArch64
 sams_arch() {
     awk '
         /\.intel_syntax/                          { a = "x86_64";      exit }
         /\.macro XADDR|\.literal_position|\.literal[ \t]/ { a = "xtensa"; exit }
+        /^\.arch[ \t]+armv8/                      { a = "elf_arm64";   exit }
         /__TEXT,__text/                           { a = "macho_arm64"; exit }
         /^[ \t]*\.(extern|globl|global)[ \t]+_/   { a = "macho_arm64"; exit }
         NR > 200                                  { exit }

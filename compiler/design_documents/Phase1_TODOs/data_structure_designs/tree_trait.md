@@ -57,7 +57,7 @@ Negative components are invalid.
 
 ## 4. Node representation
 
-Logical node:
+Logical node. One tuple type plays two roles, the rose node and the cell of a skew-binary list over the node's child slots:
 
 ```text
 (
@@ -65,20 +65,28 @@ Logical node:
     subtree_node_count: int64,
     live_child_count: int64,
     slot_count: int64,
-    child_slots: SkewRAL[
-        :vacant
-        | (:occupied, ref(R, SpaceType, rec))
-    ]
+    weight: int64,
+    slot: :none | ref?(L, normal, rec),
+    left: ref?(L, normal, rec),
+    right: ref?(L, normal, rec),
+    spine: List[ref?(L, normal, rec), mem(normal)]
 )
 ```
 
-`child_slots` uses reverse physical orientation:
+- **Rose node**: uses `item`, the three counts and `spine`. Its `weight` is 0, and `slot`, `left` and `right` are `:none`.
+- **Cell**: uses `weight` (the size of the subtree the cell roots), `slot` (`:none` is a vacant slot, a ref is an occupied child) and `left`/`right`. Its counts are 0 and its `spine` is empty. Its `item` is a filler copied from the owning node and never read.
+
+Binding of `rec`: `rec` binds to the innermost enclosing tuple type. A skew-RAL spine is built from tuples, so a `SkewRAL[ref?(R, SpaceType, rec)]` child store would make the cell and the rose node recurse through each other, with `rec` bound to the wrong tuple. The design therefore merges the two into the single node tuple above, and every `rec` binds to that one tuple. Roots, parameters and returns are spelled with the full inline node tuple; a bare `rec` outside a tuple type is E2010.
+
+tree_rose implements the skew-list operations itself (lookup, path-copying update, O(1) prepend, preorder walk, validation); it no longer uses skew_ral. The list over child slots uses reverse physical orientation:
 
 ```text
 physical_index = slot_count - 1 - logical_slot
 ```
 
-Appending a child prepends one occupied physical slot in `O(1)`. Existing logical slots continue to address the same entries.
+Appending a child prepends one occupied physical slot in `O(1)`. Existing logical slots continue to address the same entries. Lookup walks the spine by root weight, then halves the weight per level, so slot access is `O(log b)` for `b` slots.
+
+Validation keeps its error precedence: a count mismatch is slot_count_mismatch, a foreign cell is wrong_arena, and anything else is rank_violation.
 
 ## 5. Trait contract
 

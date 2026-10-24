@@ -22,6 +22,7 @@ use sir_ast;
 use term_emitter;
 use term_reg_spill;
 use term_message_regions;
+use term_message_copy;
 use term_record_layout;
 use term_aggregate_helpers;
 use control;
@@ -230,10 +231,17 @@ fn emit_module_with_atom_and_debug(sir_module: { module_name: string, used_modul
         // mis-gated. body_creates_region and the sharpened gate below are retained for
         // the ownership-based release that replaces this.
         funcs: string <- emit_functions(sir_module.functions, sir_module.functions, ctx, false, false);
-        needs_region_helpers: boolean <- prims_memory@module_uses_region_allocation(sir_module);
-        region_helpers: string <- case needs_region_helpers of {
+        // Copy on send (region design Q18, term_message_copy): the copier reserves cells in the fresh
+        // region through L_region_grow, so a module that copies gets the region helpers too.
+        needs_message_copy: boolean <- term_message_copy@module_uses_message_copy(sir_module);
+        needs_region_helpers: boolean <- prims_memory@module_uses_region_allocation(sir_module) or needs_message_copy;
+        region_helpers0: string <- case needs_region_helpers of {
             true -> concat("\n", prims_memory@emit_region_helpers());
             false -> ""
+        };
+        region_helpers: string <- case needs_message_copy of {
+            true -> concat(region_helpers0, concat("\n", term_message_copy@emit_message_copy_helper()));
+            false -> region_helpers0
         };
         needs_pi_helper: boolean <- int_rodata@module_uses_signed_print_var(sir_module);
         needs_pu_helper: boolean <- case int_rodata@module_uses_uint64_print_var(sir_module) of {
@@ -3098,7 +3106,10 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             true -> concat(param_outer_emit_lm, concat("|_ffi=", ffi_enc));
             false -> param_outer_emit_lm
         };
-        param_outer_emit_fnret: string <- concat(concat(concat(param_outer_emit_ffi, concat("|_fnret=", fn_val.return_type)), sret_outer_markers(fn_val, msg_drop)), reply_buffer_outer_markers(fn_val));
+        // Copy on send (term_message_copy): the function's label (site-unique descriptor labels) and
+        // the sends, spawns and reply that transfer instead of copying.
+        copy_markers: string <- concat(term_message_copy@md_fn_label_marker(entry_label), term_message_copy@fn_copy_markers(fn_val));
+        param_outer_emit_fnret: string <- concat(concat(concat(concat(param_outer_emit_ffi, concat("|_fnret=", fn_val.return_type)), sret_outer_markers(fn_val, msg_drop)), reply_buffer_outer_markers(fn_val)), copy_markers);
         frame_spill_nbytes: int64 <- frame_spill_bytes(fn_val, msg_drop);
         frame_spill_alloc: string <- emit_sp_add_sub_imm("SUB", frame_spill_nbytes);
         frame_spill_dealloc: string <- emit_sp_add_sub_imm("ADD", frame_spill_nbytes);
@@ -3277,7 +3288,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
         };
         // A kind-5 body's callee has this return type too and runs the move itself.
         behaviour_move: string <- case kind5_tail_returns_directly == false and sir_term_root_node(fn_val.body).kind != 5 and behavior_return_uses_actor_sret_tuple(fn_val.return_type) of {
-            true -> prims_actors@behaviour_result_move_asm(fn_val.return_type, entry_label, behaviour_state_reusable(fn_val));
+            true -> prims_actors@behaviour_result_move_asm(fn_val.return_type, entry_label, behaviour_state_reusable(fn_val), term_message_copy@md_reply_copy_asm(fn_val, entry_label, copy_markers, ctx.table));
             false -> ""
         };
 

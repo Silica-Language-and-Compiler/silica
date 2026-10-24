@@ -1,0 +1,86 @@
+// The reason lines of a supervisor's coordinated child shutdown (spec §15.4.12.2, §15.4.11.2). The
+// root supervisor holds one child, the supervisor of ReasonInnerSup.silica, whose two workers never
+// fail on their own: :rk with shutdown 0 and :rs with shutdown 50. main terminates the inner supervisor
+// (:terminate_child); ending, it shuts its workers down first: :rk is killed at once and :rs is asked to
+// stop, and then it ends itself with the default reason. Three reports:
+//   :rk     reason:          (:explicit, :killed)      reason_tag 4
+//   :rs     reason:          (:explicit, :shutdown)    reason_tag 4
+//   inner   reason:          :normal                   reason_tag 0
+// :killed and :shutdown are runtime atoms the program never spells; their names come from the
+// runtime's copy of the atom table.
+//
+// Expected output (as a multiset):
+//   terminated
+//   three failure reports: two with frame #0 ReasonInnerSup_inner_worker ((:explicit, :killed) and
+//     (:explicit, :shutdown)), one with frame #0 ReasonInnerSup_ReasonInnerSup_child_start (:normal)
+//   0
+
+use Supervisor;
+use ReasonInnerSup;
+
+impl ReasonRootSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 3, restarts_time_frame: 10000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :inner, agent_type: :supervisor, initial_state: 1, behavior: ReasonInnerSup@ReasonInnerSup_child_start, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter(3);
+        rt: supervisor_ref <- spawn_registered_supervisor(ReasonRootSup, 0, :reason_root, stack_policy(0, :keep_last_message));
+        _t: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :terminate_child, id: :inner } impl SupervisorMessage {});
+        println("terminated");
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236). region_dump_limit
+// is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on Darwin,
+// (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// The reporter writes every report to standard error. Its state counts down the reports main waits
+// for; the last of them ends main's wait_for_exit() with cast_exit(0). The root supervisor's own
+// report ends the program with status 70 instead.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        left: int64 <- state - 1;
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> case left == 0 of {
+                true -> cast_exit(0);
+                false -> true
+            }
+        }
+    produces
+        pure (:no_reply, left)
+    end
+}
+
+fn start_reporter(expected: int64) -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

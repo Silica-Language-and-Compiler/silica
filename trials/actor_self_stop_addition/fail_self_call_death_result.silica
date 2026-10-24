@@ -1,0 +1,126 @@
+// Spec §15.1.2.3: fail_self(reason) is an immediate abnormal stop: it never returns, the dispatch
+// is abandoned, and a call being served gets the actor-death result (§16.1.1: actor_not_found in
+// the caller). A call-only worker under a :permanent supervisor calls fail_self(:badarg) while
+// serving a call from the relay actor; the println after fail_self never runs. The relay's call
+// raises actor_not_found, so the relay (unsupervised) fails with (:explicit, :actor_not_found),
+// reason_tag 4 (as actors_addition/identity_dead_ref_raises). The worker's report shows
+// reason_tag 4 too, and the supervisor restarts it: after the two exits have been handled
+// (the call_supervisor syncs with it) the name :w answers again with the initial state.
+//
+// Expected output (order checked as a multiset: the reports are written by the FailureReporter):
+//   reply: 15
+//   two failure reports: reason_tag 4, frame #0 ..._worker; reason_tag 4, frame #0 ..._relay
+//   children after the failure: 1
+//   restarted worker replied: 11
+// exit status 0; "not reached" never appears
+
+use Supervisor;
+
+impl FailSelfCallSup for Supervisor;
+
+// The root supervisor: one child, :w, the worker, under restart policy :permanent; three restarts
+// allowed in ten seconds.
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 3, restarts_time_frame: 10000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :w, agent_type: :worker, initial_state: 10, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+// Call-only worker. 0 fails it with (:explicit, :badarg); nothing after fail_self runs.
+fn worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    case msg of {
+        0 -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- fail_self(:badarg);
+                _: atom <- println("not reached: after fail_self")
+            produces
+                pure (:reply, state, state)
+            end
+        };
+        _: int64 -> (:reply, state + msg, state + msg)
+    }
+}
+
+// The relay calls :w with its message; the worker ends before replying, so the call raises
+// actor_not_found here and the relay fails with reason_tag 4.
+fn relay(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        v: int64 <- call_registered(:w, msg impl ActorMessage {});
+        _: atom <- println("not reached: the relay got a reply")
+    produces
+        pure (:no_reply, v)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter(2);
+        rt: supervisor_ref <- spawn_registered_supervisor(FailSelfCallSup, 0, :root, stack_policy(0, :keep_last_message));
+        r1: int64 <- call_registered(:w, 5 impl ActorMessage {});
+        print("reply: ");
+        print_int64(r1);
+        println("");
+        q: actor_ref <- spawn(0, relay, stack_policy(0, :keep_last_message));
+        _: boolean <- cast(q, 0 impl ActorMessage {});
+        _: int64 <- wait_for_exit();
+        // call_supervisor's reply drains the supervisor's ingress before it is sent: once it returns the
+        // supervisor has handled every exit delivered so far and any restart has settled.
+        n: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :count_children } impl SupervisorMessage {});
+        print("children after the failure: ");
+        print_int64(n.count);
+        println("");
+        r3: int64 <- call_registered(:w, 1 impl ActorMessage {});
+        print("restarted worker replied: ");
+        print_int64(r3);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started. region_dump_limit is
+// called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// The reporter writes every report to standard error. Its state counts down the reports main waits
+// for; the last of them ends main's wait_for_exit() with cast_exit(0). The root supervisor's own
+// report ends the program with status 70 instead.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        left: int64 <- state - 1;
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> case left == 0 of {
+                true -> cast_exit(0);
+                false -> true
+            }
+        }
+    produces
+        pure (:no_reply, left)
+    end
+}
+
+fn start_reporter(expected: int64) -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

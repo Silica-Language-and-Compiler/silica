@@ -83,14 +83,17 @@ fn top_level_param_count(inner: string) -> int64 {
     top_level_param_count_from(inner, 0, 0, 0)
 }
 
+// Top-level means outside every pair of (), [] and {}: a `List[E, mem(S)]` or a record `{ a: T, b: U }`
+// inside a tuple holds commas of its own (before 2026-10-23 only parentheses nested, so a tuple
+// `(int64, List[ref?(L, S, rec), mem(normal)])` counted three fields and never compared equal).
 fn top_level_param_count_from(s: string, i: int64, depth: int64, count: int64) -> int64 {
     case i >= length_bytes(s) of {
         true -> case count == 0 of { true -> 0; false -> count + 1 };
         false -> {
             ch: string <- substring(s, i, i + 1);
-            case ch == "(" of {
+            case ch == "(" or ch == "[" or ch == "{" of {
                 true -> top_level_param_count_from(s, i + 1, depth + 1, count);
-                false -> case ch == ")" of {
+                false -> case ch == ")" or ch == "]" or ch == "}" of {
                     true -> case depth == 0 of {
                         true -> case count == 0 of { true -> 0; false -> count + 1 };
                         false -> top_level_param_count_from(s, i + 1, depth - 1, count)
@@ -117,9 +120,9 @@ fn nth_top_level_param_from(s: string, i: int64, target: int64, depth: int64, id
         true -> case idx == target of { true -> trim_type(acc); false -> "" };
         false -> {
             ch: string <- substring(s, i, i + 1);
-            case ch == "(" of {
+            case ch == "(" or ch == "[" or ch == "{" of {
                 true -> nth_top_level_param_from(s, i + 1, target, depth + 1, idx, concat(acc, ch));
-                false -> case ch == ")" of {
+                false -> case ch == ")" or ch == "]" or ch == "}" of {
                     true -> case depth == 0 of {
                         true -> case idx == target of { true -> trim_type(acc); false -> "" };
                         false -> nth_top_level_param_from(s, i + 1, target, depth - 1, idx, concat(acc, ch))
@@ -200,9 +203,19 @@ fn type_contains_rec(type_str: string) -> boolean {
         true -> true;
         false -> case is_tuple_type(t) of {
             true -> tuple_fields_contain_rec(tuple_inner(t));
-            false -> type_contains_rec_in_ref_params(t)
+            // A list's element may hold the `rec` (a node's children as List[ref?(L, S, rec), ...]).
+            false -> case is_list_type(t) of {
+                true -> type_contains_rec(list_elem_type(t));
+                false -> type_contains_rec_in_ref_params(t)
+            }
         }
     }
+}
+
+// The element type of `List[E, mem(S)]`: the text before the top-level comma.
+fn list_elem_type(t: string) -> string {
+    inner: string <- substring(t, 5, length_bytes(t) - 1);
+    trim_type(substring(inner, 0, rt_top_sep(inner, 0, 0, ",")))
 }
 
 fn tuple_fields_contain_rec(inner: string) -> boolean {
@@ -228,8 +241,12 @@ fn tuple_type_contains_rec(type_str: string) -> boolean {
     }
 }
 
+// A record holding a `rec` or `ref?` field (a structure's `{ root: ref?(L, S, rec), ... }`) needs
+// the recursive compare as much as a tuple or a ref does: type_contains_rec does not look into
+// records, so the text is scanned as well.
 fn needs_recursive_compare(a: string, b: string) -> boolean {
     type_contains_rec(a) or type_contains_rec(b) or is_ref_optional_type(a) or is_ref_optional_type(b) or substring(trim_type(a), 0, 4) == "ref?" or substring(trim_type(b), 0, 4) == "ref?"
+        or contains(a, "rec") or contains(b, "rec") or contains(a, "ref?") or contains(b, "ref?") or contains(a, "ref ?") or contains(b, "ref ?")
 }
 
 fn is_ref_optional_type(type_str: string) -> boolean {
@@ -320,27 +337,55 @@ fn is_recursive_tuple_type(t: string) -> boolean {
     is_tuple_type(t) and type_contains_rec(t)
 }
 
+// Equality of recursive tuple types is COINDUCTIVE (equi-recursive types): `stack` holds the pairs
+// of tuple types under comparison ("~a~~b~" entries), and a pair that recurs is equal by assumption.
+// A raw `rec` on both sides names the enclosing tuples, which are under comparison, and is equal
+// at once; only a `rec` on one side is unfolded (expand_rec_token) and compared with the other side's
+// tuple, which puts that pair on the stack. So each pair of tuple texts is entered at most once per
+// comparison and the work is linear in the two surfaces. Before 2026-10-23 both sides were unfolded
+// at every `rec` slot until the depth cut, which cost k^16 tuple comparisons for a shape with k `rec`
+// slots (13 s for a two-slot node; the wbt_map node spelled out never finished). The depth cut is
+// kept only as a safety net.
 fn recursive_types_equal(a: string, b: string) -> boolean {
-    ta: string <- trim_type(a);
-    tb: string <- trim_type(b);
+    // An interner surface spells its tokens apart (`ref ? ( L , normal , rec )`); the parsers here
+    // read the compact spelling, so both sides are compacted first.
+    ta: string <- rt_strip_spaces(trim_type(a), 0, "");
+    tb: string <- rt_strip_spaces(trim_type(b), 0, "");
     root_a: string <- recursive_root_for(ta);
     root_b: string <- recursive_root_for(tb);
-    equal_core(ta, tb, root_a, root_b, 0)
+    equal_core(ta, tb, root_a, root_b, 0, "")
 }
 
-fn equal_core(a: string, b: string, root_a: string, root_b: string, depth: int64) -> boolean {
-    case depth > 32 of {
+fn rt_strip_spaces(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == " " or c == "\t" or c == "\n" of {
+                true -> rt_strip_spaces(s, i + 1, acc);
+                false -> rt_strip_spaces(s, i + 1, concat(acc, c))
+            }
+        }
+    }
+}
+
+fn equal_core(a: string, b: string, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
+    case depth > 64 of {
         true -> true;
         false -> {
-            ea: string <- expand_rec_token(trim_type(a), root_a);
-            eb: string <- expand_rec_token(trim_type(b), root_b);
-            case ea == "rec" and eb == "rec" of {
+            ta: string <- trim_type(a);
+            tb: string <- trim_type(b);
+            case ta == "rec" and tb == "rec" of {
                 true -> true;
-                false -> case (ea == "rec" and is_recursive_tuple_type(eb)) or (eb == "rec" and is_recursive_tuple_type(ea)) of {
-                    true -> true;
-                    false -> case is_ref_optional_type(ea) or is_ref_optional_type(eb) of {
-                        true -> equal_ref_optional(ea, eb, root_a, root_b, depth);
-                        false -> equal_non_optional_types(ea, eb, root_a, root_b, depth)
+                false -> {
+                    ea: string <- expand_rec_token(ta, root_a);
+                    eb: string <- expand_rec_token(tb, root_b);
+                    case (ea == "rec" and is_recursive_tuple_type(eb)) or (eb == "rec" and is_recursive_tuple_type(ea)) of {
+                        true -> true;
+                        false -> case is_ref_optional_type(ea) or is_ref_optional_type(eb) of {
+                            true -> equal_ref_optional(ea, eb, root_a, root_b, depth, stack);
+                            false -> equal_non_optional_types(ea, eb, root_a, root_b, depth, stack)
+                        }
                     }
                 }
             }
@@ -348,66 +393,203 @@ fn equal_core(a: string, b: string, root_a: string, root_b: string, depth: int64
     }
 }
 
-fn equal_non_optional_types(ea: string, eb: string, root_a: string, root_b: string, depth: int64) -> boolean {
+fn equal_non_optional_types(ea: string, eb: string, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
     (ok_a: boolean, params_a: string) <- parse_ref_type(ea);
     case ok_a of {
         true -> {
             (ok_b: boolean, params_b: string) <- parse_ref_type(eb);
             case ok_b of {
-                true -> equal_ref_params(params_a, params_b, root_a, root_b, depth);
+                true -> equal_ref_params(params_a, params_b, root_a, root_b, depth, stack);
                 false -> false
             }
         };
-        false -> case is_tuple_type(ea) and is_tuple_type(eb) of {
-            true -> equal_tuple_types(ea, eb, root_a, root_b, depth);
-            false -> ea == eb
+        // A function type is spelled `fn(A) -> R` by a declaration and `(A) -> R` by an interner
+        // surface; the two spellings are one type.
+        false -> case is_fn_type(ea) and is_fn_type(eb) of {
+            true -> rt_drop_fn_prefix(ea) == rt_drop_fn_prefix(eb);
+            // A list inside a node compares by its element type, under the same `rec` binder:
+            // `List[ref?(L, S, rec), mem(normal)]` inside node N is `List[ref?(L, S, N), mem(normal)]`
+            // (a List is not a tuple, so `rec` still names the innermost enclosing tuple).
+            false -> case is_list_type(ea) and is_list_type(eb) of {
+            true -> equal_list_types(ea, eb, root_a, root_b, depth, stack);
+            false -> case is_tuple_type(ea) and is_tuple_type(eb) of {
+            true -> equal_tuple_types(ea, eb, root_a, root_b, depth, stack);
+            // Two records are compared field by field, so a field spelled `ref?(L, S, rec)` on one
+            // side and `ref?(L, S, (..., ref?(L, S, rec)))` on the other (a bound caller against the
+            // stdlib's unbound root, or the reverse) is one type (§4.2.2). Names and order must agree.
+            false -> case is_record_type(ea) and is_record_type(eb) of {
+                true -> equal_record_types(ea, eb, root_a, root_b, depth, stack);
+                false -> ea == eb
+            }
+        }
+        }
         }
     }
 }
 
-fn equal_ref_optional(a: string, b: string, root_a: string, root_b: string, depth: int64) -> boolean {
+// `List[E, S]`: the element through equal_core, the space textually.
+fn is_list_type(t: string) -> boolean {
+    length_bytes(t) >= 6 and substring(t, 0, 5) == "List[" and substring(t, length_bytes(t) - 1, length_bytes(t)) == "]"
+}
+
+fn equal_list_types(ea: string, eb: string, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
+    ia: string <- substring(ea, 5, length_bytes(ea) - 1);
+    ib: string <- substring(eb, 5, length_bytes(eb) - 1);
+    ca: int64 <- rt_top_sep(ia, 0, 0, ",");
+    cb: int64 <- rt_top_sep(ib, 0, 0, ",");
+    case trim_type(substring(ia, ca, length_bytes(ia))) == trim_type(substring(ib, cb, length_bytes(ib))) of {
+        false -> false;
+        true -> equal_core(substring(ia, 0, ca), substring(ib, 0, cb), root_a, root_b, depth + 1, stack)
+    }
+}
+
+// `fn(A) -> R`, or `(A) -> R` with the arrow at nesting depth zero after the parameter list.
+fn is_fn_type(t: string) -> boolean {
+    case length_bytes(t) >= 3 and substring(t, 0, 3) == "fn(" of {
+        true -> true;
+        false -> case length_bytes(t) >= 1 and substring(t, 0, 1) == "(" of {
+            true -> {
+                close: int64 <- rt_matching_close(t, 1, 1);
+                close + 3 <= length_bytes(t) and substring(t, close + 1, close + 3) == "->"
+            };
+            false -> false
+        }
+    }
+}
+
+// Index of the `)` that closes the paren before i (depth counts the parens open at i).
+fn rt_matching_close(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" of {
+                true -> rt_matching_close(s, i + 1, depth + 1);
+                false -> case c == ")" of {
+                    true -> case depth == 1 of {
+                        true -> i;
+                        false -> rt_matching_close(s, i + 1, depth - 1)
+                    };
+                    false -> rt_matching_close(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+fn rt_drop_fn_prefix(t: string) -> string {
+    case length_bytes(t) >= 3 and substring(t, 0, 3) == "fn(" of {
+        true -> substring(t, 2, length_bytes(t));
+        false -> t
+    }
+}
+
+fn equal_ref_optional(a: string, b: string, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
     case is_ref_optional_type(a) and is_ref_optional_type(b) of {
         true -> {
             (ok_a: boolean, inner_a: string) <- parse_ref_q_type(a);
             (ok_b: boolean, inner_b: string) <- parse_ref_q_type(b);
             case ok_a and ok_b of {
                 false -> false;
-                true -> equal_ref_params(inner_a, inner_b, root_a, root_b, depth)
+                true -> equal_ref_params(inner_a, inner_b, root_a, root_b, depth, stack)
             }
         };
         false -> false
     }
 }
 
-fn equal_ref_params(inner_a: string, inner_b: string, root_a: string, root_b: string, depth: int64) -> boolean {
+fn equal_ref_params(inner_a: string, inner_b: string, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
     case nth_top_level_param(inner_a, 0) == nth_top_level_param(inner_b, 0) of {
         false -> false;
         true -> case nth_top_level_param(inner_a, 1) == nth_top_level_param(inner_b, 1) of {
             false -> false;
-            true -> equal_core(nth_top_level_param(inner_a, 2), nth_top_level_param(inner_b, 2), root_a, root_b, depth + 1)
+            true -> equal_core(nth_top_level_param(inner_a, 2), nth_top_level_param(inner_b, 2), root_a, root_b, depth + 1, stack)
         }
     }
 }
 
-fn equal_tuple_types(a: string, b: string, root_a: string, root_b: string, depth: int64) -> boolean {
-    new_root_a: string <- case type_contains_rec(a) of { true -> a; false -> root_a };
-    new_root_b: string <- case type_contains_rec(b) of { true -> b; false -> root_b };
-    inner_a: string <- tuple_inner(a);
-    inner_b: string <- tuple_inner(b);
-    n_a: int64 <- top_level_param_count(inner_a);
-    n_b: int64 <- top_level_param_count(inner_b);
-    case n_a == n_b of {
-        false -> false;
-        true -> equal_tuple_fields_idx(inner_a, inner_b, 0, n_a, new_root_a, new_root_b, depth + 1)
+fn equal_tuple_types(a: string, b: string, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
+    key: string <- concat("~", concat(trim_type(a), concat("~~", concat(trim_type(b), "~"))));
+    case contains(stack, key) of {
+        true -> true;
+        false -> {
+            new_root_a: string <- case type_contains_rec(a) of { true -> a; false -> root_a };
+            new_root_b: string <- case type_contains_rec(b) of { true -> b; false -> root_b };
+            inner_a: string <- tuple_inner(a);
+            inner_b: string <- tuple_inner(b);
+            n_a: int64 <- top_level_param_count(inner_a);
+            n_b: int64 <- top_level_param_count(inner_b);
+            case n_a == n_b of {
+                false -> false;
+                true -> equal_tuple_fields_idx(inner_a, inner_b, 0, n_a, new_root_a, new_root_b, depth + 1, concat(stack, key))
+            }
+        }
     }
 }
 
-fn equal_tuple_fields_idx(inner_a: string, inner_b: string, idx: int64, n: int64, root_a: string, root_b: string, depth: int64) -> boolean {
+fn equal_tuple_fields_idx(inner_a: string, inner_b: string, idx: int64, n: int64, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
     case idx >= n of {
         true -> true;
-        false -> case equal_core(nth_top_level_param(inner_a, idx), nth_top_level_param(inner_b, idx), root_a, root_b, depth) of {
+        false -> case equal_core(nth_top_level_param(inner_a, idx), nth_top_level_param(inner_b, idx), root_a, root_b, depth, stack) of {
             false -> false;
-            true -> equal_tuple_fields_idx(inner_a, inner_b, idx + 1, n, root_a, root_b, depth)
+            true -> equal_tuple_fields_idx(inner_a, inner_b, idx + 1, n, root_a, root_b, depth, stack)
+        }
+    }
+}
+
+// ---- records, field by field ---------------------------------------------------------------------
+
+fn is_record_type(type_str: string) -> boolean {
+    t: string <- trim_type(type_str);
+    length_bytes(t) >= 2 and substring(t, 0, 1) == "{" and substring(t, length_bytes(t) - 1, length_bytes(t)) == "}"
+}
+
+// Index of the first `sep` at nesting depth zero (over (), [], {}) at or after i, or the length.
+fn rt_top_sep(s: string, i: int64, depth: int64, sep: string) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> rt_top_sep(s, i + 1, depth + 1, sep);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> rt_top_sep(s, i + 1, depth - 1, sep);
+                    false -> case c == sep and depth == 0 of {
+                        true -> i;
+                        false -> rt_top_sep(s, i + 1, depth, sep)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn equal_record_types(ea: string, eb: string, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
+    ta: string <- trim_type(ea);
+    tb: string <- trim_type(eb);
+    equal_record_fields(substring(ta, 1, length_bytes(ta) - 1), 0, substring(tb, 1, length_bytes(tb) - 1), 0, root_a, root_b, depth + 1, stack)
+}
+
+fn equal_record_fields(ca: string, ia: int64, cb: string, ib: int64, root_a: string, root_b: string, depth: int64, stack: string) -> boolean {
+    case ia >= length_bytes(ca) or ib >= length_bytes(cb) of {
+        true -> ia >= length_bytes(ca) and ib >= length_bytes(cb);
+        false -> {
+            ea_end: int64 <- rt_top_sep(ca, ia, 0, ",");
+            eb_end: int64 <- rt_top_sep(cb, ib, 0, ",");
+            seg_a: string <- substring(ca, ia, ea_end);
+            seg_b: string <- substring(cb, ib, eb_end);
+            colon_a: int64 <- rt_top_sep(seg_a, 0, 0, ":");
+            colon_b: int64 <- rt_top_sep(seg_b, 0, 0, ":");
+            case colon_a >= length_bytes(seg_a) or colon_b >= length_bytes(seg_b) of {
+                true -> trim_type(seg_a) == trim_type(seg_b);
+                false -> case trim_type(substring(seg_a, 0, colon_a)) == trim_type(substring(seg_b, 0, colon_b)) of {
+                    false -> false;
+                    true -> case equal_core(substring(seg_a, colon_a + 1, length_bytes(seg_a)), substring(seg_b, colon_b + 1, length_bytes(seg_b)), root_a, root_b, depth, stack) of {
+                        false -> false;
+                        true -> equal_record_fields(ca, ea_end + 1, cb, eb_end + 1, root_a, root_b, depth, stack)
+                    }
+                }
+            }
         }
     }
 }
@@ -465,7 +647,12 @@ fn recursive_type_subject(type_str: string) -> string {
             (ok_q: boolean, q_params: string) <- parse_ref_q_type(t);
             case ok_q and trim_type(nth_top_level_param(q_params, 2)) != "rec" of {
                 true -> nth_top_level_param(q_params, 2);
-                false -> t
+                // A list binding is checked on its element the same way: `List[ref?(L, S, (..., rec)),
+                // mem(S)]` names the element's tuple, while `List[rec, mem(S)]` has no tuple to name.
+                false -> case is_list_type(t) and trim_type(list_elem_type(t)) != "rec" of {
+                    true -> recursive_type_subject(list_elem_type(t));
+                    false -> t
+                }
             }
         }
     }

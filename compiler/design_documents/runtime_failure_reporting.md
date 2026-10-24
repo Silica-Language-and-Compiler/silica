@@ -345,7 +345,7 @@ Where it is applied:
 - Process-fatal paths write only the report line; unwind reports belong to actor failures (spec §15.4.5.5).
 - **Supervisor shutdown (2026-10-15, spec §15.4.12.2).** When a supervisor ends, it first shuts down its live children, one at
   a time, last child-table row first. Each shut-down child produces a failure report like any other death: a child with
-  `shutdown: 0` ends with reason tag 1 (as `kill_abnormal`), a child with `shutdown > 0` ends with
+  `shutdown: 0` ends with `(:explicit, :killed)` (reason tag 4, as `kill_abnormal`; tag 1 is no longer written since 2026-10-23), a child with `shutdown > 0` ends with
   `(:explicit, :shutdown)` (reason tag 4). A child whose supervisor is already dead does not print the root-actor note.
   The `shutdown` time limit is not enforced on any target, because nothing preempts a running message.
 - `remove_actor(self())` and `kill_abnormal(self())` fail the caller with `:language_error` at run time (spec §15.1.2.3);
@@ -371,13 +371,37 @@ process-fatal reports of §1 to §5. Checked against the hosted and board runtim
 - **The banner.** Hosted (`L_phase_f_unwind_fmt`) and board (`rt_actors.S`) print the same shape:
   `=== Silica Actor Failure ===`, `actor_id:` (the actor's 64-bit identity of spec §15.1.4, position in the
   high word and child number in the low word, printed as one unsigned integer; before 2026-10-12 it was the
-  control-block pointer), `agent_type_atom:`, `reason_tag:`, `supervisor_acb:` (a pointer; null prints `0x0`
+  control-block pointer), `agent_type_atom:`, `reason:` (readable reason, 2026-10-24, below), `reason_tag:`, `supervisor_acb:` (a pointer; null prints `0x0`
   on Darwin, `(nil)` on glibc, `0x00000000` on the board), `call_stack:` with `#0` the behaviour's symbol
   (`<unknown behavior>` when the slot is empty) and `#1  _actor_thread_main`, and
   `=== End Silica Actor Failure ===`. A region dump section follows only when the reporter's
   `region_dump_limit()` is above zero. The fields differ from the specification's example (`agent_type:`,
   `behavior:`, `supervisor:` lines); the table of §15.4.6.4 describes the intended report. The comparison
   tools fold `actor_id`, `supervisor_acb`, `epc` and `agent_type_atom` (§5).
+- **The `reason:` line (2026-10-24).** A readable line sits directly above `reason_tag:`:
+
+  ```
+  === Silica Actor Failure ===
+  actor_id:        <decimal identity>
+  agent_type_atom: <atom index of the agent type; 0 for a root actor>
+  reason:          <failure reason, e.g. :language_error — integer division by zero, (:explicit, :killed)>
+  reason_tag:      <number of the failure reason>
+  supervisor_acb:  <pointer; 0x0, (nil) or 0x00000000 when the actor has no supervisor>
+  call_stack:
+    #0  <behavior symbol, or <unknown behavior>>
+    #1  _actor_thread_main
+  === End Silica Actor Failure ===
+  ```
+
+  The dash is U+2014. Detail text follows only where the runtime knows the cause (`integer division by zero`,
+  `no case arm matched`); an atom that the runtime's copy of the atom table does not hold prints `:unknown`.
+  Covered by `trials/failure_reason_line_addition`. Implemented on all four targets; verified on the Mac, Linux
+  verification in progress, ESP32-S3 board run pending.
+- **Reason tags (2026-10-23, `:foreign_fault` 2026-10-24).** 0 `:normal`; 2 `:language_error` (division by zero,
+  no case arm matched, convention mismatch, name taken, misuse sites); 3 `:memory_fault` (board CPU exception
+  in an actor); 4 every `(:explicit, atom)`, including `(:explicit, :killed)` from `kill_abnormal` and from
+  shutdown 0, and `(:explicit, :shutdown)` from shutdown above 0; 5 `:foreign_fault` (a guarded foreign call
+  faulted inside a dangerous actor). Tag 1 is no longer written.
 - **Handler before any start (E2236).** `main` must register the reporter before it starts any actor or
   supervisor, so a death during start-up, the root supervisor's own included, always has a destination. The
   reporter must be cast-only: `register_failure_reporter` of a reply-form (call-only) behaviour is rejected

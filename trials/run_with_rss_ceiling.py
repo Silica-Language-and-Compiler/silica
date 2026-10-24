@@ -28,9 +28,11 @@
 import os
 import signal
 import sys
+import time
 
 MIB = 1024 * 1024
 KILL_GRACE_SEC = 5.0
+HWM_POLL_SEC = 0.002
 
 
 def append(path: str, line: str) -> None:
@@ -57,8 +59,49 @@ def read_ceiling(path: str):
 
 
 def peak_bytes(ru_maxrss: int) -> int:
-    # macOS: bytes. Linux and the BSDs: kilobytes. (Linux path untested; see trials/README.md.)
+    # macOS: bytes. Linux and the BSDs: kilobytes.
     return ru_maxrss if sys.platform == "darwin" else ru_maxrss * 1024
+
+
+def fork_exec(argv) -> int:
+    # Returns once the child has exec'd (or failed to): the pipe's write end is close-on-exec, so
+    # its EOF marks the exec. Until then the child's memory is a copy of this process's, and a
+    # VmHWM sample would read this process's mark, not the trial's.
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as exc:
+            os.write(2, f"run_with_rss_ceiling.py: cannot run {argv[0]}: {exc}\n".encode("utf-8"))
+        os._exit(127)
+    os.close(w)
+    while os.read(r, 1):
+        pass
+    os.close(r)
+    return pid
+
+
+def vm_hwm_bytes(pid: int) -> int:
+    # The child's own high-water mark (Linux /proc). It only rises, so the last sample before the
+    # child exits is its peak up to that moment. 0 once the child has gone.
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def inherited_floor_bytes() -> int:
+    # Linux charges a forked child with the parent's high-water mark (this Python process, 6-8 MB),
+    # so ru_maxrss never falls below what /bin/true reports when started the same way.
+    pid = fork_exec(["true"])
+    _pid, _status, rusage = os.wait4(pid, 0)
+    return peak_bytes(rusage.ru_maxrss)
 
 
 def main() -> int:
@@ -81,13 +124,9 @@ def main() -> int:
 
     timeout_sec = float(os.environ.get("SILICA_RSS_TRIAL_TIMEOUT_SEC", "600"))
 
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.execvp(command[0], command)
-        except OSError as exc:
-            os.write(2, f"run_with_rss_ceiling.py: cannot run {command[0]}: {exc}\n".encode("utf-8"))
-        os._exit(127)
+    linux = sys.platform.startswith("linux")
+    floor = inherited_floor_bytes() if linux else 0
+    pid = fork_exec(command)
 
     timed_out = [False]
 
@@ -108,7 +147,17 @@ def main() -> int:
     signal.signal(signal.SIGALRM, on_alarm)
     signal.setitimer(signal.ITIMER_REAL, timeout_sec)
     # wait4 is retried after the handler runs (PEP 475), so the alarm only sends signals.
-    _pid, status, rusage = os.wait4(pid, 0)
+    # On Linux the child is polled for its own VmHWM (see inherited_floor_bytes).
+    hwm = 0
+    if linux:
+        while True:
+            hwm = max(hwm, vm_hwm_bytes(pid))
+            _pid, status, rusage = os.wait4(pid, os.WNOHANG)
+            if _pid == pid:
+                break
+            time.sleep(HWM_POLL_SEC)
+    else:
+        _pid, status, rusage = os.wait4(pid, 0)
     signal.setitimer(signal.ITIMER_REAL, 0)
 
     if os.WIFEXITED(status):
@@ -119,6 +168,8 @@ def main() -> int:
         code = 1
 
     peak = peak_bytes(rusage.ru_maxrss)
+    if linux and peak <= floor and hwm > 0:
+        peak = hwm  # ru_maxrss is only the inherited floor; the child's own mark is the answer
     peak_mb = peak / MIB
     if timed_out[0]:
         msg = f"max_rss_mb: hard timeout: the run was stopped after {timeout_sec:g} s (peak resident set size {peak_mb:.1f} MB so far)"

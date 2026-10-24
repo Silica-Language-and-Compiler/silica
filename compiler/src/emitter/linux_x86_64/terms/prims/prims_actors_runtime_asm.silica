@@ -42,7 +42,7 @@
 // the wait-list word of the restart protocol, +16 for the thread record, item N stage 2, and +16 for the
 // pending migration target, stage 3): +0..+215 the
 // actor runtime's, +216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
-// silica_rt_sb_require in prims_actors_runtime_asm_b), +224 started flag, +232 pending exit reason_tag,
+// silica_rt_sb_require in prims_actors_runtime_asm_b), +224 started flag, +232 pending exit reason_tag (+384 its atom, or a language error's detail code),
 // +240 active call wrapper, +248/+256/+264 FFI arena base/end/bump (Phase 12), +272..+391 the
 // runtime-managed stack fields (prims_actors_stack_asm.silica). A worker carries no supervision field.
 // +392 holders of the block (_silica_rt_acb_release), +400 a row child's parked exit notice (0 not yet
@@ -104,6 +104,7 @@
 use prims_actors_child_table_asm;
 use prims_actors_stack_asm;
 use prims_actors_carrier_asm;
+use prims_actors_timer_asm;
 use atom_table;
 use ffi_arena_runtime_asm;
 use ffi_guarded_runtime_asm;
@@ -406,6 +407,17 @@ Lslid_no_pos:
 	call	silica_rt_sb_require
 	mov	rcx, QWORD PTR [rbp - 32]
 	mov	QWORD PTR [rdi + 48], rcx
+# A child supervisor inherits its supervisor's report sink (spec §15.4.10.5; block #96, X5 = the
+# supervisor, [rbp-56]) until it names its own with :set_report_sink.
+	mov	rax, QWORD PTR [rbp - 56]
+	test	rax, rax
+	jz	Lsp1_no_inherit
+	mov	rax, QWORD PTR [rax + 216]
+	test	rax, rax
+	jz	Lsp1_no_inherit
+	mov	rax, QWORD PTR [rax + 96]
+	mov	QWORD PTR [rdi + 96], rax
+Lsp1_no_inherit:
 	mov	rax, QWORD PTR [rbp - 8]
 	xor	edi, edi
 Lsp1_no_sb:
@@ -766,9 +778,18 @@ LBB1_ingress_reply_result:
 	mov	rax, QWORD PTR [rbp - 16]
 	cmp	DWORD PTR [rax + 32], 0
 	je	LBB1_payload_not_owned
+	cmp	DWORD PTR [rax + 32], 2
+	je	LBB1_owned_record
 	mov	rdi, QWORD PTR [rax + 8]
 	mov	rsi, QWORD PTR [rbp - 8]
 	call	silica_rt_report_begin
+	jmp	LBB1_payload_not_owned
+LBB1_owned_record:
+# An exit report record (§15.4.10.5; node +32 = 2): the arena position at the start of the
+# dispatch is noted in the node for silica_rt_owned_record_release.
+	mov	rdi, rax
+	mov	rsi, QWORD PTR [rbp - 8]
+	call	silica_rt_owned_record_begin
 LBB1_payload_not_owned:
 	mov	rax, QWORD PTR [rbp - 16]
 	mov	rdi, QWORD PTR [rax + 8]
@@ -838,9 +859,8 @@ LBB1_ingress_no_beh:
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	r11, QWORD PTR [rax + 440]
 	mov	QWORD PTR [rbp - 64], r11
-	mov	rdi, QWORD PTR [rcx]
-	mov	rsi, rax
-	mov	rdx, QWORD PTR [rcx + 8]
+	mov	rdi, rax
+	mov	rsi, rcx
 	test	r11, r11
 	jz	LBB1_ingress_restart_call
 	mov	r10, QWORD PTR [rax + 272]
@@ -849,13 +869,13 @@ LBB1_ingress_no_beh:
 	add	r10, QWORD PTR [rax + 280]
 	mov	QWORD PTR [rax + 368], rsp
 	mov	rsp, r10
-	call	silica_rt_supervisor_maybe_restart
+	call	silica_rt_supervisor_restart_and_report
 	lea	rsp, [rbp - 176]
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rax + 368], 0
 	jmp	LBB1_ingress_restart_done
 LBB1_ingress_restart_call:
-	call	silica_rt_supervisor_maybe_restart
+	call	silica_rt_supervisor_restart_and_report
 LBB1_ingress_restart_done:
 	mov	rdi, QWORD PTR [rbp - 56]
 	call	silica_rt_exit_payload_free
@@ -1000,9 +1020,16 @@ LBB1_free_skip_restart:
 	mov	rax, QWORD PTR [rbp - 16]
 	cmp	DWORD PTR [rax + 32], 0
 	je	LBB1_free_node
+	cmp	DWORD PTR [rax + 32], 2
+	je	LBB1_free_owned_record
 	mov	rdi, QWORD PTR [rax + 8]
 	mov	rsi, QWORD PTR [rbp - 8]
 	call	silica_rt_report_release
+	jmp	LBB1_free_node
+LBB1_free_owned_record:
+	mov	rdi, rax
+	mov	rsi, QWORD PTR [rbp - 8]
+	call	silica_rt_owned_record_release
 LBB1_free_node:
 	mov	rdi, QWORD PTR [rbp - 16]
 	call	free
@@ -1414,9 +1441,16 @@ silica_rt_actor_signal_pending_call_deaths:
 LBBsigpend_active_cast:
 	cmp	DWORD PTR [rax + 32], 0
 	je	LBBsigpend_active_free
+	cmp	DWORD PTR [rax + 32], 2
+	je	LBBsigpend_owned_record
 	mov	rdi, QWORD PTR [rax + 8]
 	mov	rsi, QWORD PTR [rbp - 8]
 	call	silica_rt_report_release
+	jmp	LBBsigpend_active_free
+LBBsigpend_owned_record:
+	mov	rdi, rax
+	mov	rsi, QWORD PTR [rbp - 8]
+	call	silica_rt_owned_record_release
 LBBsigpend_active_free:
 	mov	rdi, QWORD PTR [rbp - 16]
 	call	free
@@ -2576,8 +2610,8 @@ Lkab_unlock:
 	mov	rax, QWORD PTR [rax + 408]
 	mov	QWORD PTR [rbp - 56], rax
 	mov	rdi, QWORD PTR [rbp - 8]
-	mov	esi, 1
-	xor	edx, edx
+	mov	esi, 4
+	mov	rdx, QWORD PTR [rip + silica_rt_killed_atom]
 	call	silica_rt_actor_stop
 	cmp	QWORD PTR [rbp - 32], 0
 	je	Lkab_done
@@ -2693,7 +2727,7 @@ fn actor_rt_asm_chunk_8() -> string {
 }
 
 fn actor_rt_emit_runtime_tail(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
-    concat(concat(prims_actors_runtime_asm_c@actor_rt_asm_phase_i_chunk(table), prims_actors_runtime_asm_c@actor_rt_asm_phase_c_chunk(table)), prims_actors_runtime_asm_c@actor_rt_asm_phase_f_chunk())
+    concat(concat(concat(prims_actors_runtime_asm_c@actor_rt_asm_phase_i_chunk(table), prims_actors_runtime_asm_c@actor_rt_asm_phase_c_chunk(table)), prims_actors_runtime_asm_c@actor_rt_asm_phase_f_chunk()), prims_actors_runtime_asm_c@actor_rt_asm_reason_text_chunk(table))
 }
 
 fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
@@ -2705,5 +2739,5 @@ fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref
     checked_int64_asm: string <- checked_int64_runtime_asm@emit_checked_int64_runtime_asm();
     stack_asm: string <- concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
     linux_shims_asm: string <- linux_rt_shims_asm@emit_linux_rt_shims_asm();
-    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_9()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_10()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_11()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_12()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_13()), prims_actors_runtime_asm_c@actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), prims_actors_runtime_asm_c@actor_rt_asm_badarith_chunk()), concat(prims_actors_runtime_asm_c@actor_rt_asm_case_clause_chunk(), concat(prims_actors_runtime_asm_c@actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(prims_actors_runtime_asm_c@actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, concat(checked_int64_asm, linux_shims_asm)))))))))), stack_asm)
+    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_9()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_10()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_11()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_12()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_13()), prims_actors_runtime_asm_c@actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), prims_actors_runtime_asm_c@actor_rt_asm_badarith_chunk()), concat(prims_actors_runtime_asm_c@actor_rt_asm_case_clause_chunk(), concat(prims_actors_runtime_asm_c@actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(prims_actors_runtime_asm_c@actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, concat(checked_int64_asm, linux_shims_asm)))))))))), concat(stack_asm, prims_actors_timer_asm@emit_actor_timer_runtime_asm()))
 }

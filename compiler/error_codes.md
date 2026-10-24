@@ -81,7 +81,7 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E2007 UnknownFunction — unknown function, or an unqualified call to a function defined only in another module (imported functions are called module-qualified); also unknown behavior function in spawn builtins
 - E2008 CaseMissingCatchAllArm — a case over an integer type or string must end with a typed catch-all arm `_: T ->` (a bare `_ ->` does not count); also a catch-all arm that is not last
 - E2009 SumRecordVariantFieldTypeConflict — record variants in one sum type share a field name with different types
-- E2010 InvalidMemoryRegionType — invalid memory region type or declaration: buf/ref parameter count, empty region or element type, invalid memory space, runtime length identifier, read_ref/read_buf operand types, alloc_region space
+- E2010 InvalidMemoryRegionType — invalid memory region type or declaration: buf/ref parameter count, empty region or element type, invalid memory space, runtime length identifier, read_ref/read_buf operand types, alloc_region space, rec outside any tuple type (binding annotation today; record field, parameter type and return type to follow: rec binds to the innermost enclosing tuple type and an unbound rec is an error)
 - E2011 IntegerLiteralOutOfRange — integer literal is out of range for its type
 - E2012 TupleDecomposeBindingOverflow — tuple decomposition pattern has more elements than the register file supports
 - E2013 UnaryMinusNotAllowed — unary minus is not allowed; use negate_<type>(...)
@@ -93,7 +93,7 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E2019 MainReturnTypeInvalid — main must return an integer, float or atom
 - E2020 AmbiguousBuiltinCallName — an unqualified call names both a builtin and a function of the calling module; the module's function is called as module@name (also from inside that module), a builtin is always called unqualified
 - E2090 SupervisorTraitShape — Supervisor or FailureReporter trait/impl shape error: required methods (init; region_dump_limit, handle_report), parameter and return types (spec 15.4.13)
-- E2091 ActorOperationPlacement — spawn_linked, link, monitor, demonitor and child_table_first_ref calls only inside an actor behavior; wait_for_exit only inside main/0; spawn_linked is no longer public; add_child parent must be a Supervisor actor_ref
+- E2091 ActorOperationPlacement — spawn_linked, link, monitor, demonitor, child_table_first_ref, kill_abnormal, stop_self and fail_self calls only inside an actor behavior; wait_for_exit only inside main/0; spawn_linked is no longer public; add_child parent must be a Supervisor actor_ref
 - E2092 SupervisorInitSignature — Supervisor impl must declare init/1 with one ActorState parameter (spec 15.4.13.1)
 - E2093 InvalidChildSpecAgentType — child_spec agent_type must be a literal :worker or :supervisor
 - E2094 InvalidChildSpecFlavor — child_spec flavor must be a literal :plain or :dangerous; :dangerous requires an id starting with :dangerous_

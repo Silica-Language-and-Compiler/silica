@@ -36,8 +36,10 @@ use reg_conventions;
 use atom_table;
 use prims_record;
 use prims_tuple;
+use term_message_copy;
 use var;
 use module_linkage;
+use term_message_regions;
 
 export is_actor_prim/1;
 export actor_prim_is_nullary/1;
@@ -49,7 +51,7 @@ export module_uses_link_monitor_prims/1;
 export gpr_x_view/1;
 export composite_move_bytes/1;
 export composite_move_has_scalar_alt/1;
-export behaviour_result_move_asm/3;
+export behaviour_result_move_asm/4;
 export behaviour_convention_prefix/1;
 
 
@@ -205,9 +207,12 @@ fn is_actor_prim(name: string) -> bool {
         or name == "supervision_wait_and_drain_one" or name == "child_table_first_ref"
         or name == "child_table_row_ref"
         or name == "kill_abnormal"
+        or name == "stop_self_normal" or name == "stop_self_explicit" or name == "fail_self"
+        or name == "monotonic_time" or name == "current_time" or name == "send_after" or name == "timer_cast" or name == "cancel_timer"
         or name == "failure_reason_tag" or name == "failure_reason_atom"
         or name == "failure_agent_type" or name == "failure_release" or name == "start_child" or name == "supervisor_add_child"
         or name == "supervisor_remove_child" or name == "supervisor_restart_child" or name == "supervisor_terminate_child"
+        or name == "supervisor_set_report_sink"
         or name == "supervisor_op_tag" or name == "supervisor_op_error" or name == "supervisor_op_child"
         or name == "supervisor_which_children" or name == "supervisor_count_children" or name == "supervisor_get_child"
         or name == "supervisor_get_child_info"
@@ -229,6 +234,8 @@ fn actor_prim_is_nullary(name: string) -> bool {
     name == "self" or name == "recv" or name == "get_cpu_topology" or name == "get_efficiency_cores" or name == "get_performance_cores"
         or name == "supervision_wait_and_drain_one" or name == "wait_for_exit" or name == "child_table_first_ref"
         or name == "get_registry_actor" or name == "get_pid_registry" or name == "heap_used"
+        or name == "stop_self_normal"
+        or name == "monotonic_time" or name == "current_time"
 }
 
 fn actor_prim_is_unary(name: string) -> bool {
@@ -237,6 +244,8 @@ fn actor_prim_is_unary(name: string) -> bool {
         or name == "unpin_actor" or name == "remove_actor" or name == "register_actor" or name == "get_actor_memory_usage"
         or name == "failure_reason_tag" or name == "failure_reason_atom" or name == "failure_agent_type" or name == "failure_release"
         or name == "start_child" or name == "kill_abnormal" or name == "child_table_row_ref"
+        or name == "stop_self_explicit" or name == "fail_self"
+        or name == "cancel_timer"
         or name == "supervisor_which_children" or name == "supervisor_count_children"
         or name == "supervisor_op_child"
         or name == "register_failure_reporter" or name == "set_scheduler_policy" or name == "cast_exit"
@@ -556,7 +565,9 @@ fn heap_promote_reply_x0(nbytes: int64) -> string {
     }
 }
 
-fn bmv_reply_asm(rbytes: int64, r_scalar: bool, skip_label: string) -> string {
+// reply_copy: "" for the one-level promote; else the deep copy of the reply into a fresh owned
+// region whose shell goes to the caller's arena (term_message_copy; the descriptor rodata follows).
+fn bmv_reply_asm(rbytes: int64, r_scalar: bool, skip_label: string, reply_copy: string) -> string {
     case rbytes <= 0 of {
         true -> "";
         false -> {
@@ -570,7 +581,11 @@ fn bmv_reply_asm(rbytes: int64, r_scalar: bool, skip_label: string) -> string {
             // #240 the node being served, the node's +56 the caller (0 in main: the fallback list) and its
             // +16 the needs-reply word: a cast that reached a call-style behaviour gets no copy at all.
             cast_skip: string <- concat("    LDR X10, [SP]\n    LDR X10, [X10, #240]\n    LDR W11, [X10, #16]\n    CBZ W11, ", concat(skip_label, "\n"));
-            copy: string <- concat("    MOV X0, X9\n", concat(heap_promote_reply_x0(rbytes), "    MOV X9, X0\n    LDR X0, [SP, #8]\n    STR X9, [X0, #8]\n"));
+            promote: string <- case length_bytes(reply_copy) > 0 of {
+                true -> reply_copy;
+                false -> heap_promote_reply_x0(rbytes)
+            };
+            copy: string <- concat("    MOV X0, X9\n", concat(promote, "    MOV X9, X0\n    LDR X0, [SP, #8]\n    STR X9, [X0, #8]\n"));
             concat(concat("    LDR X9, [X0, #8]\n", concat(guard, cast_skip)), concat(copy, concat(skip_label, ":\n")))
         }
     }
@@ -640,7 +655,7 @@ fn behaviour_convention_prefix(return_type: string) -> string {
     }
 }
 
-fn behaviour_result_move_asm(return_type: string, entry_label: string, reuse_state: bool) -> string {
+fn behaviour_result_move_asm(return_type: string, entry_label: string, reuse_state: bool, reply_copy: string) -> string {
     t: string <- prims_record@strip_spaces_rt(return_type);
     reply_form: bool <- length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,";
     rtype: string <- case reply_form of {
@@ -663,7 +678,7 @@ fn behaviour_result_move_asm(return_type: string, entry_label: string, reuse_sta
             lbl: string <- concat("L_bmv_", entry_label);
             l_end: string <- concat(lbl, "_end");
             head: string <- concat("    STR X0, [SP, #-16]!\n    BL silica_rt_tls_current_actor_get\n    MOV X10, X0\n    LDR X0, [SP]\n    CBZ X10, ", concat(l_end, "\n    STP X10, X0, [SP, #-16]!\n"));
-            reply: string <- bmv_reply_asm(rbytes, composite_move_has_scalar_alt(rtype), concat(lbl, "_rs"));
+            reply: string <- bmv_reply_asm(rbytes, composite_move_has_scalar_alt(rtype), concat(lbl, "_rs"), reply_copy);
             state: string <- case sbytes > 0 of {
                 true -> case reuse_state and composite_move_has_scalar_alt(stype) == false of {
                     true -> bmv_state_reuse_asm(sbytes, soff, lbl);
@@ -705,11 +720,47 @@ fn actor_message_copy_bytes(msg: { nodes: List[{ kind: int64, type_name: string,
 
 // The message is in X10 and the target (actor ref or registry atom) in X11. The copy clobbers
 // X0..X4 and X9..X17, so X11 is parked on the stack around it.
-fn actor_message_copy_x10(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+//
+// Copy on send (region design Q18, term_message_copy): a message whose type reaches a region, a
+// ref or a buffer is deep-copied into a fresh owned region by L_mc_root (its shell in this
+// actor's arena) instead of the one-level promote, unless the SIR tagged the send "|mv"
+// (`move(x)`) or emit_sir_function found the send to be the operand's last use ("|_mvs="). The
+// descriptor the copy interprets follows the call in the constant section.
+fn send_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
+    t: string <- sir_term_root_node(sir_term_at(term, n.right_expr)).type_name;
+    case term_message_copy@md_prim_value_is_move(n.value) or term_message_copy@md_site_elided(outer_reg, term.root) or term_message_copy@md_type_needs_copy(t) == false of {
+        true -> "";
+        false -> {
+            label: string <- term_message_copy@md_site_label(term_message_copy@md_fn_label_of(outer_reg), term.root);
+            call: string <- concat("    STR X11, [SP, #-16]!\n    MOV X0, X10\n", concat(term_message_copy@md_copy_call_asm(label, ""), "    MOV X10, X0\n    LDR X11, [SP], #16\n"));
+            concat(call, term_message_copy@md_rodata_block(term_message_copy@md_descriptor_rodata(t, label, table)))
+        }
+    }
+}
+
+// The initial state is in X11 and the flat argument words in X10 (parked around the copy).
+fn spawn_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
+    t: string <- sir_term_root_node(sir_term_at(term, n.inner)).type_name;
+    case term_message_copy@md_prim_value_is_move(n.value) or term_message_copy@md_site_elided(outer_reg, term.root) or term_message_copy@md_type_needs_copy(t) == false of {
+        true -> "";
+        false -> {
+            label: string <- term_message_copy@md_site_label(term_message_copy@md_fn_label_of(outer_reg), term.root);
+            call: string <- concat("    STR X10, [SP, #-16]!\n    MOV X0, X11\n", concat(term_message_copy@md_copy_call_asm(label, ""), "    MOV X11, X0\n    LDR X10, [SP], #16\n"));
+            concat(call, term_message_copy@md_rodata_block(term_message_copy@md_descriptor_rodata(t, label, table)))
+        }
+    }
+}
+
+fn actor_message_copy_x10(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
     nb: int64 <- actor_message_copy_bytes(sir_term_at(term, sir_term_root_node(term).right_expr));
-    case nb > 0 of {
-        true -> concat(concat("    STR X11, [SP, #-16]!\n    MOV X0, X10\n", heap_promote_stack_aggregate_x0(nb)), "    MOV X10, X0\n    LDR X11, [SP], #16\n");
-        false -> ""
+    case length_bytes(deep) > 0 of {
+        true -> deep;
+        false -> case nb > 0 of {
+            true -> concat(concat("    STR X11, [SP, #-16]!\n    MOV X0, X10\n", heap_promote_stack_aggregate_x0(nb)), "    MOV X10, X0\n    LDR X11, [SP], #16\n");
+            false -> ""
+        }
     }
 }
 
@@ -726,13 +777,13 @@ fn spawn_runtime_label(prim: string) -> string {
     }
 }
 
-fn emit_spawn(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, prim: string) -> string {
+fn emit_spawn(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, prim: string, init_copy: string) -> string {
     e3b_pfx: string <- e3b_trampoline_x3_prefix(sir_term_root_node(term).value);
     case spawn_right_is_tuple(term) of {
         true -> {
             count: int64 <- spawn_right_count(term);
             loads: string <- concat("    MOV X0, X11\n    LDR X1, [X10]\n    LDR X4, [X10, #8]\n", spawn_core_from_flat(count, 2));
-            concat(concat(concat(concat(spawn_promote_init_x11(term), e3b_pfx), loads), asm_bl(spawn_runtime_label(prim))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
+            concat(concat(concat(concat(concat(spawn_promote_init_x11(term), init_copy), e3b_pfx), loads), asm_bl(spawn_runtime_label(prim))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
         };
         // No policy word (not reachable from source: the type checker requires one). X4 = 0 inherits.
         false -> concat(concat(concat(concat(e3b_pfx, "    MOV X0, X9\n    MOV X1, X10\n    MOV W2, WZR\n    MOV X4, XZR\n"), asm_bl(spawn_runtime_label(prim))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)), "")
@@ -742,7 +793,7 @@ fn emit_spawn(dest: string, term: { nodes: List[{ kind: int64, type_name: string
 // spawn_registered / spawn_dangerous_registered / spawn_device_registered: X10 -> [beh, name,
 // policy(, core)], X11 = init. The registration entry picks the registry; the spawn entry is the
 // prim's (spawn_runtime_label).
-fn emit_spawn_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, register_label: string, prim: string) -> string {
+fn emit_spawn_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, register_label: string, prim: string, init_copy: string) -> string {
     e3b_pfx: string <- e3b_trampoline_x3_prefix(sir_term_root_node(term).value);
     count: int64 <- spawn_right_count(term);
     save_name: string <- "    SUB SP, SP, #16\n    LDR X12, [X10, #8]\n    STR X12, [SP, #8]\n";
@@ -754,7 +805,7 @@ fn emit_spawn_registered(dest: string, term: { nodes: List[{ kind: int64, type_n
     save_actor: string <- "    STR X0, [SP, #0]\n";
     reg_tail: string <- concat(register_label, "\n    LDR X0, [SP, #0]\n    ADD SP, SP, #16\n");
     reg: string <- concat("    LDR X1, [SP, #8]\n    BL ", reg_tail);
-    concat(concat(concat(concat(concat(concat(spawn_promote_init_x11(term), check), save_name), spawn_asm), save_actor), reg), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
+    concat(concat(concat(concat(concat(concat(concat(spawn_promote_init_x11(term), init_copy), check), save_name), spawn_asm), save_actor), reg), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
 }
 
 // The pre-spawn registry check that goes with a registration entry: the same table, probed before
@@ -812,33 +863,33 @@ fn emit_stack_policy(dest: string, term: { nodes: List[{ kind: int64, type_name:
     }
 }
 
-fn emit_send(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    concat(actor_message_copy_x10(term), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_send")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
+fn emit_send(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
+    concat(actor_message_copy_x10(term, deep), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_send")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
 }
 
-fn emit_actor_call(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    concat(actor_message_copy_x10(term), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_call")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
+fn emit_actor_call(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
+    concat(actor_message_copy_x10(term, deep), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_call")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
 }
 
-fn emit_actor_call_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    concat(actor_message_copy_x10(term), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_call_registered")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
+fn emit_actor_call_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
+    concat(actor_message_copy_x10(term, deep), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_call_registered")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
 }
 
-fn emit_actor_cast(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+fn emit_actor_cast(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
     // bool in W0 per AAPCS; widen to X for dest
-    concat(actor_message_copy_x10(term), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_cast")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
+    concat(actor_message_copy_x10(term, deep), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_cast")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
 }
 
-fn emit_actor_cast_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    concat(actor_message_copy_x10(term), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_cast_registered")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
+fn emit_actor_cast_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
+    concat(actor_message_copy_x10(term, deep), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_cast_registered")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
 }
 
-fn emit_actor_cast_dangerous_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    concat(actor_message_copy_x10(term), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_cast_dangerous_registered")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
+fn emit_actor_cast_dangerous_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
+    concat(actor_message_copy_x10(term, deep), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_cast_dangerous_registered")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
 }
 
-fn emit_actor_cast_device_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    concat(actor_message_copy_x10(term), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_cast_device_registered")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
+fn emit_actor_cast_device_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
+    concat(actor_message_copy_x10(term, deep), concat(concat("    MOV X0, X11\n    MOV X1, X10\n", asm_bl("silica_rt_actor_cast_device_registered")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))
 }
 
 fn emit_supervisor_add_child(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
@@ -891,6 +942,7 @@ fn runtime_label(name: string) -> string {
         "supervisor_remove_child" -> "silica_rt_supervisor_remove_child";
         "supervisor_restart_child" -> "silica_rt_supervisor_restart_child";
         "supervisor_terminate_child" -> "silica_rt_supervisor_terminate_child";
+        "supervisor_set_report_sink" -> "silica_rt_supervisor_set_report_sink";
         // The reply fields of the three operations above, chosen from the operation's answer
         // (terms_actor_lowering build_call_supervisor_op_reply; -2 = the error reply).
         "supervisor_op_tag" -> "silica_rt_sup_op_tag";
@@ -904,11 +956,20 @@ fn runtime_label(name: string) -> string {
         "supervisor_get_child_agent_type" -> "silica_rt_supervisor_get_child_agent_type";
         "supervisor_get_child_restart" -> "silica_rt_supervisor_get_child_restart";
         "kill_abnormal" -> "silica_rt_actor_kill_abnormal";
+        "stop_self_normal" -> "silica_rt_stop_self_normal";
+        "stop_self_explicit" -> "silica_rt_stop_self_explicit";
+        "fail_self" -> "silica_rt_fail_self";
         "register_failure_reporter" -> "silica_rt_failure_reporter_register";
         "wait_for_exit" -> "silica_rt_wait_for_exit";
         "cast_exit" -> "silica_rt_cast_exit";
         "heap_used" -> "silica_rt_heap_used";
         "actor_carrier_index" -> "silica_rt_actor_carrier_index";
+        // Clocks and timers (spec §22.14; prims_actors_timer_asm).
+        "monotonic_time" -> "silica_rt_monotonic_time";
+        "current_time" -> "silica_rt_current_time";
+        "send_after" -> "silica_rt_send_after";
+        "timer_cast" -> "silica_rt_timer_prepare";
+        "cancel_timer" -> "silica_rt_cancel_timer";
         _: string -> "silica_rt_actor_unknown"
     }
 }
@@ -952,13 +1013,79 @@ fn emit_runtime_binary(dest: string, term: { nodes: List[{ kind: int64, type_nam
     concat(concat("    MOV X0, X9\n    MOV X1, X10\n", asm_bl(runtime_label(sir_term_root_node(term).name))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
 }
 
+// ---- Clocks and timers (spec §22.14) ----------------------------------------------------------
+// timer_cast(target, message) is the inner half of send_after: the target is in X11 and the
+// message in X10, copied by the cast rules (actor_message_copy_x10 / send_deep_copy_asm, exactly
+// as emit_actor_cast). The runtime gets X0 = the target's identity, X1 = the message, X2 = the
+// release thunk (0 when the message type carries no owned region) and answers the prepared timer
+// record, an int64 word the outer send_after prim hands on together with the delay.
+//
+// The release thunk is what a cancelled or dropped timer runs instead of the receiver's dispatch:
+// the behaviour would have destroyed the message record's top-level region fields at its return
+// (term_message_regions, region design §18.7), so the thunk destroys the same fields. It is emitted
+// in line, jumped over, and named per site.
+fn timer_release_thunk_label(outer_reg: string, root: int64) -> string {
+    concat("L_tr_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(root))))
+}
+
+fn tr_find_comma(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> case substring(s, i, i + 1) == "," of {
+            true -> i;
+            false -> tr_find_comma(s, i + 1)
+        }
+    }
+}
+
+// offs is ",8,24,": one load and one region destroy per boxed field offset.
+fn timer_thunk_destroy_lines(offs: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(offs) of {
+        true -> acc;
+        false -> case substring(offs, i, i + 1) == "," of {
+            true -> timer_thunk_destroy_lines(offs, i + 1, acc);
+            false -> {
+                e: int64 <- tr_find_comma(offs, i);
+                timer_thunk_destroy_lines(offs, e, concat(acc, concat("    LDR X0, [X19, #", concat(substring(offs, i, e), "]\n    BL silica_rt_region_destroy\n"))))
+            }
+        }
+    }
+}
+
+fn timer_release_thunk_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> string {
+    t: string <- sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name;
+    offs: string <- term_message_regions@tmr_message_record_offsets(t);
+    case length_bytes(offs) == 0 of {
+        true -> "    MOV X2, #0\n";
+        false -> {
+            lbl: string <- timer_release_thunk_label(outer_reg, term.root);
+            head: string <- concat("    B ", concat(lbl, concat("_skip\n", concat(lbl, ":\n    STP X29, X30, [SP, #-32]!\n    MOV X29, SP\n    STR X19, [SP, #16]\n    MOV X19, X0\n"))));
+            tail: string <- concat("    LDR X19, [SP, #16]\n    LDP X29, X30, [SP], #32\n    RET\n", concat(lbl, concat("_skip:\n    ADR X2, ", concat(lbl, "\n"))));
+            concat(head, concat(timer_thunk_destroy_lines(offs, 0, ""), tail))
+        }
+    }
+}
+
+fn emit_timer_cast(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string, thunk: string) -> string {
+    concat(actor_message_copy_x10(term, deep), concat(thunk, concat("    MOV X0, X11\n    MOV X1, X10\n", concat(asm_bl("silica_rt_timer_prepare"), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)))))
+}
+
+// cancel_timer(timer) -> :cancelled | :not_found (spec §22.14.2): the runtime answers 0 or 1.
+fn emit_cancel_timer_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    c_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":cancelled");
+    nf_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":not_found");
+    call_asm: string <- concat("    MOV X0, X9\n", asm_bl(runtime_label("cancel_timer")));
+    map_asm: string <- concat(concat("    MOV X12, #", concat(atom_table@int64_to_decimal_string(c_idx), "\n")), select_eq_idx("X12", nf_idx, "X0", "#1"));
+    concat(concat(call_asm, map_asm), concat(concat("    MOV ", gpr_x_view(dest)), ", X12\n"))
+}
+
 // The builtins whose spec result is only ever :ok (spec §15.4.8, §20.3, §22.4): link, demonitor,
 // add_child, kill_abnormal, register_failure_reporter, unpin_actor, register_actor, and the trial
 // hooks failure_release and supervision_ingress_enqueue. The runtime returns 0 from each; the atom
 // is answered here. Before 2026-10-09 the program received that 0, which is :efficiency, the first
 // atom of the fixed prefix (atoms/atom_table.silica seed_actor_runtime_atoms).
 fn always_ok_prim(name: string) -> boolean {
-    name == "link" or name == "demonitor" or name == "add_child" or name == "kill_abnormal" or name == "register_failure_reporter" or name == "unpin_actor" or name == "register_actor" or name == "failure_release" or name == "supervision_ingress_enqueue"
+    name == "link" or name == "demonitor" or name == "add_child" or name == "kill_abnormal" or name == "stop_self_normal" or name == "stop_self_explicit" or name == "register_failure_reporter" or name == "unpin_actor" or name == "register_actor" or name == "failure_release" or name == "supervision_ingress_enqueue"
 }
 
 // Builtins whose spec result is an atom answer the program's own atom indices (spec §15.1.2, §22.10).
@@ -1044,7 +1171,25 @@ fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string,
         // register_failure_reporter calls the caller unit's region_dump_limit, so its label needs the
         // caller's module: outer_reg carries |_lm=module (emitter_core), as for any unqualified local call.
         "register_failure_reporter" -> emit_register_failure_reporter(dest, term, caller_module_from_outer_reg(outer_reg));
+        // The actor-boundary operands (region design Q18): the copy decisions need the function's
+        // markers (outer_reg) and the atom table (sum tags and record shapes in the descriptors).
+        "send" -> emit_send(dest, term, send_deep_copy_asm(term, outer_reg, table));
+        "actor_call" -> emit_actor_call(dest, term, send_deep_copy_asm(term, outer_reg, table));
+        "actor_call_registered" -> emit_actor_call_registered(dest, term, send_deep_copy_asm(term, outer_reg, table));
+        "actor_cast" -> emit_actor_cast(dest, term, send_deep_copy_asm(term, outer_reg, table));
+        "timer_cast" -> emit_timer_cast(dest, term, send_deep_copy_asm(term, outer_reg, table), timer_release_thunk_asm(term, outer_reg));
+        "actor_cast_device" -> emit_actor_cast(dest, term, send_deep_copy_asm(term, outer_reg, table));
+        "actor_cast_registered" -> emit_actor_cast_registered(dest, term, send_deep_copy_asm(term, outer_reg, table));
+        "actor_cast_dangerous_registered" -> emit_actor_cast_dangerous_registered(dest, term, send_deep_copy_asm(term, outer_reg, table));
+        "actor_cast_device_registered" -> emit_actor_cast_device_registered(dest, term, send_deep_copy_asm(term, outer_reg, table));
+        "spawn" -> emit_spawn(dest, term, "spawn", spawn_deep_copy_asm(term, outer_reg, table));
+        "spawn_dangerous" -> emit_spawn(dest, term, "spawn_dangerous", spawn_deep_copy_asm(term, outer_reg, table));
+        "spawn_device" -> emit_spawn(dest, term, "spawn_device", spawn_deep_copy_asm(term, outer_reg, table));
+        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named", "spawn_registered", spawn_deep_copy_asm(term, outer_reg, table));
+        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named", "spawn_dangerous_registered", spawn_deep_copy_asm(term, outer_reg, table));
+        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named", "spawn_device_registered", spawn_deep_copy_asm(term, outer_reg, table));
         "migrate_actor" -> emit_migrate_actor_with_atoms(term, dest, table);
+        "cancel_timer" -> emit_cancel_timer_with_atoms(term, dest, table);
         "set_actor_priority" -> emit_set_actor_priority_with_atoms(term, dest, table);
         "set_scheduler_policy" -> emit_set_scheduler_policy_with_atoms(term, dest, table);
         _: string -> case always_ok_prim(sir_term_root_node(term).name) of {
@@ -1056,22 +1201,22 @@ fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string,
 
 fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     case sir_term_root_node(term).name of {
-        "spawn" -> emit_spawn(dest, term, "spawn");
-        "spawn_dangerous" -> emit_spawn(dest, term, "spawn_dangerous");
-        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named", "spawn_registered");
-        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named", "spawn_dangerous_registered");
-        "spawn_device" -> emit_spawn(dest, term, "spawn_device");
-        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named", "spawn_device_registered");
+        "spawn" -> emit_spawn(dest, term, "spawn", "");
+        "spawn_dangerous" -> emit_spawn(dest, term, "spawn_dangerous", "");
+        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named", "spawn_registered", "");
+        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named", "spawn_dangerous_registered", "");
+        "spawn_device" -> emit_spawn(dest, term, "spawn_device", "");
+        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named", "spawn_device_registered", "");
         "spawn_registered_supervisor" -> emit_spawn_registered_supervisor(dest, term);
         "spawn_linked" -> emit_spawn_linked(dest, term);
-        "send" -> emit_send(dest, term);
-        "actor_call" -> emit_actor_call(dest, term);
-        "actor_call_registered" -> emit_actor_call_registered(dest, term);
-        "actor_cast" -> emit_actor_cast(dest, term);
-        "actor_cast_device" -> emit_actor_cast(dest, term);
-        "actor_cast_registered" -> emit_actor_cast_registered(dest, term);
-        "actor_cast_dangerous_registered" -> emit_actor_cast_dangerous_registered(dest, term);
-        "actor_cast_device_registered" -> emit_actor_cast_device_registered(dest, term);
+        "send" -> emit_send(dest, term, "");
+        "actor_call" -> emit_actor_call(dest, term, "");
+        "actor_call_registered" -> emit_actor_call_registered(dest, term, "");
+        "actor_cast" -> emit_actor_cast(dest, term, "");
+        "actor_cast_device" -> emit_actor_cast(dest, term, "");
+        "actor_cast_registered" -> emit_actor_cast_registered(dest, term, "");
+        "actor_cast_dangerous_registered" -> emit_actor_cast_dangerous_registered(dest, term, "");
+        "actor_cast_device_registered" -> emit_actor_cast_device_registered(dest, term, "");
         "self" -> emit_self(dest, term);
         "recv" -> emit_recv(dest, term);
         "link" -> emit_runtime_unary(dest, term);
@@ -1109,6 +1254,7 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "supervisor_remove_child" -> emit_runtime_binary(dest, term);
         "supervisor_restart_child" -> emit_runtime_binary(dest, term);
         "supervisor_terminate_child" -> emit_runtime_binary(dest, term);
+        "supervisor_set_report_sink" -> emit_runtime_binary(dest, term);
         "supervisor_op_tag" -> emit_runtime_binary(dest, term);
         "supervisor_op_error" -> emit_runtime_binary(dest, term);
         "supervisor_op_child" -> emit_runtime_unary(dest, term);
@@ -1125,6 +1271,11 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
             true -> emit_runtime_unary(dest, term);
             false -> emit_kill_abnormal_named(dest, term)
         };
+        // §15.1.2.3: stop_self ends the calling actor at its next dispatch boundary (the runtime answers 0,
+        // the atom :ok is answered above); fail_self never returns, so nothing after its call matters.
+        "stop_self_normal" -> emit_runtime_nullary(dest, term);
+        "stop_self_explicit" -> emit_runtime_unary(dest, term);
+        "fail_self" -> emit_runtime_unary(dest, term);
         "register_failure_reporter" -> emit_register_failure_reporter(dest, term, "main");
         "wait_for_exit" -> emit_runtime_nullary(dest, term);
         "cast_exit" -> emit_runtime_unary(dest, term);
@@ -1132,6 +1283,14 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         // actor_carrier_index(ref) -> int64: test-only (item N stage 3), hosted carrier runtime only
         // (-1 for a dangerous actor, which has a thread of its own).
         "actor_carrier_index" -> emit_runtime_unary(dest, term);
+        // Clocks and timers (spec §22.14): the clocks are nullary, send_after takes the delay (X9) and
+        // the prepared timer record (X10), timer_cast is a message prim (its atom-free form here),
+        // cancel_timer is answered with atoms above.
+        "monotonic_time" -> emit_runtime_nullary(dest, term);
+        "current_time" -> emit_runtime_nullary(dest, term);
+        "send_after" -> emit_runtime_binary(dest, term);
+        "timer_cast" -> emit_timer_cast(dest, term, "", "    MOV X2, #0\n");
+        "cancel_timer" -> emit_runtime_unary(dest, term);
         "stack_policy" -> emit_stack_policy(dest, term);
         _: string -> concat(concat(".error \"unsupported actor prim: ", concat(sir_term_root_node(term).name, "\"\n")), "\n")
     }

@@ -1,0 +1,101 @@
+// monitor_down_delivered  (OPEN: staged in bees_gaps_open_addition, see README.md)
+//
+// Spec §15.4.8.6: when a monitored actor dies, the runtime delivers
+// (:down, monitor_ref, actor_ref, failure_reason) to the monitoring actor's standard mailbox.
+// Found in project BEES triage (S1 question 2, repros bees_triage/s1q2_info and s1q2_info2).
+//
+// The program: :watcher takes a sum message type (its own (:watch, peer) cast, the DOWN tuple, and
+// a (:timeout, n) from a ticker). On :watch it monitors the peer, then casts it 0, so the peer
+// divides by zero and fails. The failure reporter prints one line for the peer's report and starts
+// :ticker, which casts itself 200,000 times (about 0.4 s on the Mac) and then sends the watcher a
+// (:timeout, n), so the program ends even when no DOWN ever comes. On DOWN the watcher prints "down" and ends main's
+// wait_for_exit with cast_exit(0); on the timeout it prints "no down message" and cast_exit(1).
+// Today (the stable compiler used for the BEES triage, Mac, 2026-10-23): the peer fails and is reported, but no DOWN reaches the
+// watcher, so it prints "no down message" and the status is 1.
+// Expected output (compared as a multiset: the peer's report and the DOWN race):
+//   watching
+//   failure report: peer
+//   down
+//   0
+
+fn peer(msg: int64, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state / msg)
+}
+
+fn watcher(msg: (:watch, actor_ref) | (:down, monitor_ref, actor_ref, failure_reason) | (:timeout, int64), state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        r: int64 <- case msg of {
+            (:watch, p: actor_ref) -> {
+                _: monitor_ref <- monitor(p);
+                _: atom <- println("watching");
+                _: boolean <- cast(p, 0 impl ActorMessage {});
+                1
+            };
+            (:down, _: monitor_ref, _: actor_ref, _: failure_reason) -> {
+                _: atom <- println("down");
+                _: boolean <- cast_exit(0);
+                2
+            };
+            (:timeout, _: int64) -> {
+                _: atom <- println("no down message");
+                _: boolean <- cast_exit(1);
+                3
+            }
+        }
+    produces pure (:no_reply, state + r) end
+}
+
+// Counts down by casting itself; at 0 it tells the watcher that the DOWN did not come in time.
+// It casts to itself by name: cast(ref, ...) as a case arm body did not compile when this was
+// written (fixed 2026-10-23; trial actors_addition/cast_in_case_arm).
+fn ticker(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        remaining: int64 <- msg - 1;
+        expired: (:timeout, int64) <- (:timeout, remaining);
+        _: boolean <- case msg == 0 of {
+            true -> cast_registered(:watcher, expired impl ActorMessage {});
+            false -> cast_registered(:ticker, remaining impl ActorMessage {})
+        }
+    produces pure (:no_reply, state) end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- start_reporter();
+        _: actor_ref <- spawn_registered(0, ticker, :ticker, stack_policy(0, :keep_last_message));
+        p: actor_ref <- spawn(10, peer, stack_policy(0, :keep_last_message));
+        w: actor_ref <- spawn_registered(0, watcher, :watcher, stack_policy(0, :keep_last_message));
+        _: boolean <- cast(w, (:watch, p) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces pure code end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// One line per report, naming the failed behaviour; the peer's report starts the ticker.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println(concat("failure report: ", report_who(report)));
+        _: boolean <- cast_registered(:ticker, 200000 impl ActorMessage {})
+    produces
+        pure (:no_reply, state + 1)
+    end
+}
+
+fn report_who(report: string) -> string {
+    case contains(report, "_peer\n") of {
+        true -> "peer";
+        false -> "other"
+    }
+}
+
+fn start_reporter() -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

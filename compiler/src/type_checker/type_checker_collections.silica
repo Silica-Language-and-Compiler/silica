@@ -31,6 +31,7 @@ export resolve_trait_formal_type/3;
 export resolve_trait_formal_with_contexts/4;
 export resolve_constructor_call_formal/2;
 export resolve_accumulator_call_formal/2;
+export resolve_call_formal/4;
 export witness_matches_ordered_set_declaration/3;
 export witness_matches_ordered_map_declaration/4;
 export witness_matches_heap_declaration/3;
@@ -1348,31 +1349,157 @@ fn constructor_witness_type_for_placeholder(bind_type: string, placeholder: stri
     }
 }
 
-fn resolve_constructor_call_formal(bind_type: string, formal: string) -> string {
-    case length_bytes(formal) == 0 of {
-        true -> formal;
-        false -> {
-            item_t: string <- constructor_witness_type_for_placeholder(bind_type, "ItemType");
-            key_t: string <- constructor_witness_type_for_placeholder(bind_type, "KeyType");
-            val_t: string <- constructor_witness_type_for_placeholder(bind_type, "ValueType");
-            pri_t: string <- constructor_witness_type_for_placeholder(bind_type, "PriorityType");
-            s0: string <- replace_assoc_token_in_type(formal, "PriorityType", pri_t);
-            s1: string <- replace_assoc_token_in_type(s0, "ItemType", item_t);
-            s2: string <- replace_assoc_token_in_type(s1, "KeyType", key_t);
-            replace_assoc_token_in_type(s2, "ValueType", val_t)
+// ---- call-site placeholder substitution ---------------------------------------------------------
+//
+// A callee's formal (a parameter or result type) spells the callee's placeholders. A call site knows
+// what they stand for: ItemType/KeyType/ValueType/PriorityType from the receiver argument (a
+// collection type, or a record whose comparator fields witness them), from the expected type where
+// the receiver leaves one open, and AccType from the expected result. The witnesses are gathered
+// first and put into the callee's ORIGINAL formal in ONE pass (replace_call_placeholders): each
+// placeholder token of the formal is replaced once and the text of a witness is never scanned
+// again. That keeps the caller's placeholders apart from the callee's. A witness may itself spell
+// the caller's own placeholders -- a generic module calling another has ValueType witnessed by
+// `ref?(L, S, (KeyType, ValueType, ...))`, or ItemType by `{ p: KeyType, v: ValueType, ... }` -- and
+// those names belong to the caller (silica-specification §3.4.12). Before 2026-10-23 the tokens were
+// substituted in sequence (PriorityType, ItemType, KeyType, ValueType, then AccType, and at a call's
+// result a second round from the expected type), every pass rescanning the previous pass's output,
+// so a witness holding ValueType had that ValueType replaced again: a node type nested inside its
+// own ValueType slot, rejected as E2003 against the declared type.
+
+// AccType is witnessed by the call's expected result; a discarded, absent or still-placeholder
+// expectation leaves it open (AccType ~ AccType inside trait impl bodies that forward to a fold).
+fn acc_witness_of(expected_type: string) -> string {
+    e: string <- strip_spaces_col(expected_type);
+    case length_bytes(e) == 0 or e == "discard" or e == "AccType" of {
+        true -> "";
+        false -> expected_type
+    }
+}
+
+// The placeholder token starting at i: 0 none, 1 ItemType, 2 KeyType, 3 ValueType, 4 PriorityType,
+// 5 AccType. One character read decides for every position that starts no token.
+fn ph_token_at(s: string, i: int64, n: int64) -> int64 {
+    case substring(s, i, i + 1) of {
+        "I" -> case i + 8 <= n and substring(s, i, i + 8) == "ItemType" of { true -> 1; false -> 0 };
+        "K" -> case i + 7 <= n and substring(s, i, i + 7) == "KeyType" of { true -> 2; false -> 0 };
+        "V" -> case i + 9 <= n and substring(s, i, i + 9) == "ValueType" of { true -> 3; false -> 0 };
+        "P" -> case i + 12 <= n and substring(s, i, i + 12) == "PriorityType" of { true -> 4; false -> 0 };
+        "A" -> case i + 7 <= n and substring(s, i, i + 7) == "AccType" of { true -> 5; false -> 0 };
+        _: string -> 0
+    }
+}
+
+fn ph_token_len(code: int64) -> int64 {
+    case code of {
+        1 -> 8;
+        2 -> 7;
+        3 -> 9;
+        4 -> 12;
+        5 -> 7;
+        _: int64 -> 0
+    }
+}
+
+fn ph_token_witness(code: int64, w: { item: string, key: string, val: string, pri: string, acc: string }) -> string {
+    case code of {
+        1 -> w.item;
+        2 -> w.key;
+        3 -> w.val;
+        4 -> w.pri;
+        5 -> w.acc;
+        _: int64 -> ""
+    }
+}
+
+// Index of the next placeholder token at or after i, or n.
+fn ph_run_end(s: string, i: int64, n: int64) -> int64 {
+    case i >= n of {
+        true -> n;
+        false -> case ph_token_at(s, i, n) > 0 of {
+            true -> i;
+            false -> ph_run_end(s, i + 1, n)
         }
     }
 }
 
-// AccType is not witnessed by a collection receiver.  It is bound by the
-// expected result of fold-like calls, so keep this substitution separate from
-// constructor witness resolution (which may receive a function or record type
-// as its bind_type for unrelated reasons).
+fn replace_call_placeholders_scan(s: string, w: { item: string, key: string, val: string, pri: string, acc: string }, i: int64, n: int64, acc: string) -> string {
+    case i >= n of {
+        true -> acc;
+        false -> {
+            e: int64 <- ph_run_end(s, i, n);
+            case e > i of {
+                true -> replace_call_placeholders_scan(s, w, e, n, concat(acc, substring(s, i, e)));
+                false -> {
+                    code: int64 <- ph_token_at(s, i, n);
+                    len: int64 <- ph_token_len(code);
+                    witness: string <- ph_token_witness(code, w);
+                    // A token without a witness stays the callee's placeholder.
+                    piece: string <- case length_bytes(witness) == 0 of {
+                        true -> substring(s, i, i + len);
+                        false -> witness
+                    };
+                    replace_call_placeholders_scan(s, w, i + len, n, concat(acc, piece))
+                }
+            }
+        }
+    }
+}
+
+// One simultaneous pass over `formal`. Every placeholder name ends in "Type", so a formal without
+// that text is returned as is without gathering anything.
+fn replace_call_placeholders(formal: string, w: { item: string, key: string, val: string, pri: string, acc: string }) -> string {
+    case contains(formal, "Type") of {
+        false -> formal;
+        true -> replace_call_placeholders_scan(formal, w, 0, length_bytes(formal), "")
+    }
+}
+
+// The receiver's witnesses, with `exp_bind` (the expected type at a call's result, "" elsewhere)
+// filling only what the receiver leaves open: the first binding of each placeholder wins.
+fn call_witnesses(recv_bind: string, exp_bind: string, acc_expected: string) -> { item: string, key: string, val: string, pri: string, acc: string } {
+    item_r: string <- constructor_witness_type_for_placeholder(recv_bind, "ItemType");
+    key_r: string <- constructor_witness_type_for_placeholder(recv_bind, "KeyType");
+    val_r: string <- constructor_witness_type_for_placeholder(recv_bind, "ValueType");
+    pri_r: string <- constructor_witness_type_for_placeholder(recv_bind, "PriorityType");
+    item_w: string <- case length_bytes(item_r) > 0 or length_bytes(exp_bind) == 0 of {
+        true -> item_r;
+        false -> constructor_witness_type_for_placeholder(exp_bind, "ItemType")
+    };
+    key_w: string <- case length_bytes(key_r) > 0 or length_bytes(exp_bind) == 0 of {
+        true -> key_r;
+        false -> constructor_witness_type_for_placeholder(exp_bind, "KeyType")
+    };
+    val_w: string <- case length_bytes(val_r) > 0 or length_bytes(exp_bind) == 0 of {
+        true -> val_r;
+        false -> constructor_witness_type_for_placeholder(exp_bind, "ValueType")
+    };
+    pri_w: string <- case length_bytes(pri_r) > 0 or length_bytes(exp_bind) == 0 of {
+        true -> pri_r;
+        false -> constructor_witness_type_for_placeholder(exp_bind, "PriorityType")
+    };
+    acc_w: string <- acc_witness_of(acc_expected);
+    { item: item_w, key: key_w, val: val_w, pri: pri_w, acc: acc_w }
+}
+
+// The callee's formal instantiated for one call site: receiver witnesses, then the expected
+// type's for what the receiver leaves open, and AccType from `acc_expected`, in one pass.
+fn resolve_call_formal(recv_bind: string, exp_bind: string, acc_expected: string, formal: string) -> string {
+    case contains(formal, "Type") of {
+        false -> formal;
+        true -> replace_call_placeholders(formal, call_witnesses(recv_bind, exp_bind, acc_expected))
+    }
+}
+
+fn resolve_constructor_call_formal(bind_type: string, formal: string) -> string {
+    resolve_call_formal(bind_type, "", "", formal)
+}
+
+// AccType alone, for callers that have no receiver witnesses to place in the same pass.
 fn resolve_accumulator_call_formal(expected_type: string, formal: string) -> string {
-    e: string <- strip_spaces_col(expected_type);
-    case length_bytes(e) == 0 or e == "discard" or e == "AccType" of {
+    acc_w: string <- acc_witness_of(expected_type);
+    case length_bytes(acc_w) == 0 of {
         true -> formal;
-        false -> replace_assoc_token_in_type(formal, "AccType", expected_type)
+        false -> replace_call_placeholders(formal, { item: "", key: "", val: "", pri: "", acc: acc_w })
     }
 }
 

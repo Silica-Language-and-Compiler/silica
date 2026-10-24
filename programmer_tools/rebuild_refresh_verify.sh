@@ -4,6 +4,9 @@
 #   bash programmer_tools/rebuild_refresh_verify.sh                    # every machine it knows
 #   bash programmer_tools/rebuild_refresh_verify.sh --targets apple_silicon_mac
 #   bash programmer_tools/rebuild_refresh_verify.sh --skip-build       # sources unchanged since the last build
+#   bash programmer_tools/rebuild_refresh_verify.sh --skip-build --use-build
+#        # trials use each machine's compiler/build/<target>/silica-compiler instead of
+#        # binaries/silica-compiler (for builds made with INSTALL_SELFHOST=0, which install nothing)
 #   bash programmer_tools/rebuild_refresh_verify.sh --list
 #
 # On each OS-hosted platform, in order:
@@ -42,7 +45,7 @@ PLATFORM_MK="$REPO/project_makefiles/platform/platforms.mk"
 HOSTS_FILE="${SILICA_BUILD_HOSTS:-$REPO/.silica_build_hosts}"
 STAMP="$(date '+%Y%m%d-%H%M%S')"
 LOG_DIR="${LOG_DIR:-$REPO/../silica_refresh/$STAMP}"
-DO_BUILD=1; LIST_ONLY=0; SELECTED=""; ASK=1; DO_SYNC=1
+DO_BUILD=1; USE_BUILD=0; LIST_ONLY=0; SELECTED=""; ASK=1; DO_SYNC=1
 declare -a REMOTE_SPECS=()
 
 usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$0"; exit "${1:-0}"; }
@@ -51,6 +54,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --skip-build) DO_BUILD=0 ;;
         --skip-sync)  DO_SYNC=0 ;;
+        --use-build)  USE_BUILD=1 ;;
         --list)       LIST_ONLY=1 ;;
         --targets)    SELECTED="$SELECTED $(echo "$2" | tr ',' ' ')"; ASK=0; shift ;;
         --no-ask)     ASK=0 ;;
@@ -244,13 +248,13 @@ do_host() {
             >"$LOG_DIR/$t-build.log" 2>&1 || { echo "  BUILD FAILED, see $LOG_DIR/$t-build.log"; note "$t" "BUILD FAILED" - - here; return 1; }
     fi
     echo "  first run"
-    ( cd "$REPO/trials" && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host ) >"$LOG_DIR/$t-run1.log" 2>&1
+    ( cd "$REPO/trials" && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host ${USE_BUILD:+$( [ "$USE_BUILD" = 1 ] && echo "SILICA_COMPILER=$REPO/compiler/build/$t/silica-compiler")} ) >"$LOG_DIR/$t-run1.log" 2>&1
     echo "  before: $(counts "$REPO/trials/.integrate_report")"
     echo "  recording goldens"
     bash "$REPO/programmer_tools/update_goldens.sh" --targets "$t" --local-only --apply >"$LOG_DIR/$t-goldens.log" 2>&1
     grep -E 'golden\(s\) were WRITTEN|WOULD change' "$LOG_DIR/$t-goldens.log" | tail -1 | sed 's/^/  /'
     echo "  second run"
-    ( cd "$REPO/trials" && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host ) >"$LOG_DIR/$t-run2.log" 2>&1
+    ( cd "$REPO/trials" && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host ${USE_BUILD:+$( [ "$USE_BUILD" = 1 ] && echo "SILICA_COMPILER=$REPO/compiler/build/$t/silica-compiler")} ) >"$LOG_DIR/$t-run2.log" 2>&1
     rc=$?
     echo "  after:  $(counts "$REPO/trials/.integrate_report")"
     strays=$(grep '❌❌ ' "$REPO/trials/.integrate_report" 2>/dev/null | grep -c '\[[A-Za-z0-9_-]*\] ')
@@ -326,14 +330,16 @@ do_remote() {
             fi
         fi
     fi
+    local use_build_arg=""
+    [ "$USE_BUILD" = 1 ] && use_build_arg=' SILICA_COMPILER=$PWD/../compiler/build/'"$t"'/silica-compiler'
     echo "  first run on $conn"
-    ssh -o BatchMode=yes "$conn" "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host" >"$LOG_DIR/$t-run1.log" 2>&1
+    ssh -o BatchMode=yes "$conn" "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host$use_build_arg" >"$LOG_DIR/$t-run1.log" 2>&1
     echo "  before: $(ssh -o BatchMode=yes "$conn" "grep -m1 'success:' $rpath/trials/.integrate_report; grep -m1 'fail:' $rpath/trials/.integrate_report" 2>/dev/null | tr -dc '0-9/' )"
     echo "  recording goldens on $conn"
     ssh -o BatchMode=yes "$conn" "cd $rpath && bash programmer_tools/update_goldens.sh --targets $t --local-only --apply" >"$LOG_DIR/$t-goldens.log" 2>&1
     grep -E 'golden\(s\) were WRITTEN|WOULD change' "$LOG_DIR/$t-goldens.log" | tail -1 | sed 's/^/  /'
     echo "  second run on $conn"
-    ssh -o BatchMode=yes "$conn" "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host" >"$LOG_DIR/$t-run2.log" 2>&1
+    ssh -o BatchMode=yes "$conn" "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host$use_build_arg" >"$LOG_DIR/$t-run2.log" 2>&1
     rc=$?
     ssh -o BatchMode=yes "$conn" "grep -E 'success:|fail:' $rpath/trials/.integrate_report; grep '❌❌ ' $rpath/trials/.integrate_report | grep -v '^fail:' | head -20" 2>/dev/null | tee "$LOG_DIR/$t-after.txt" | sed 's/^/    /'
     set -- $(split_counts "$LOG_DIR/$t-after.txt")

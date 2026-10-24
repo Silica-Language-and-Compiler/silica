@@ -445,7 +445,7 @@ Each trait impl is a thin forwarder. `OrderedMap@get`, for example, is the whole
 ```silica
 impl fn get(
     map: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (KeyType, ValueType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
         compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater,
         compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater,
         region: region(L, normal),
@@ -543,14 +543,14 @@ fn count(bag: OrderedMap[string, int64, mem(normal)], word: string) -> int64 {
 
 ```silica
 fn store(bag: OrderedMap[string, int64, mem(normal)], word: string, n: int64) -> OrderedMap[string, int64, mem(normal)] {
-    updated: { map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, inserted: boolean, replaced: boolean } <- wbt_map@insert(bag, word, n);
+    updated: { map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, inserted: boolean, replaced: boolean } <- wbt_map@insert(bag, word, n);
     updated.map
 }
 ```
 
 ```silica
 fn drop(bag: OrderedMap[string, int64, mem(normal)], word: string) -> OrderedMap[string, int64, mem(normal)] {
-    updated: { map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, removed: boolean } <- wbt_map@delete(bag, word);
+    updated: { map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, removed: boolean } <- wbt_map@delete(bag, word);
     updated.map
 }
 ```
@@ -899,7 +899,7 @@ Compiled with the standard-library `Supervisor.silica`, it prints `1: service st
 
 The FailureReporter above is the usual caller: the report of the root supervisor means nothing is supervising the program any more, so by convention the reporter calls `cast_exit(70)`, the fault status (§15.4.5.5, §15.4.13.4).
 
-A supervisor that ends takes its children with it. It stops them one at a time, last row of its child table first, waiting for each (a child supervisor stops its own children first), then it goes. A child whose `shutdown` is `0` is killed at once, with reason tag 1; a child with `shutdown` above `0` is allowed to finish the message it is handling and ends with `(:explicit, :shutdown)`, reason tag 4. The time limit that a positive `shutdown` names is not enforced yet: nothing preempts a running message. Each stopped child produces a failure report like any other death, and its registered names are freed. A `:temporary` child’s row is removed when it ends; `:permanent` and `:transient` rows stay (trial `supervisors_addition/child_shut_down_with_supervisor`).
+A supervisor that ends takes its children with it. It stops them one at a time, last row of its child table first, waiting for each (a child supervisor stops its own children first), then it goes. A child whose `shutdown` is `0` is killed at once and ends with `(:explicit, :killed)`, reason tag 4; a child with `shutdown` above `0` is allowed to finish the message it is handling and ends with `(:explicit, :shutdown)`, reason tag 4. The time limit that a positive `shutdown` names is not enforced yet: nothing preempts a running message. Each stopped child produces a failure report like any other death, and its registered names are freed. A `:temporary` child’s row is removed when it ends; `:permanent` and `:transient` rows stay (trial `supervisors_addition/child_shut_down_with_supervisor`).
 
 A supervisor answers questions about its table through `call_supervisor(sup, { op: :get_child, id: :log } impl SupervisorMessage {})`: the reply is the child that has that id (its `child` reference and a `child_info` record), not the first live child. The trial `supervisors_addition/supervisor_get_child_by_id` shows the reply type.
 

@@ -1277,7 +1277,8 @@ The first message prints `20`. Dividing by zero is not something a calf can do, 
 === Silica Actor Failure ===
 actor_id:        4294967296
 agent_type_atom: 24
-reason_tag:      1
+reason:          :language_error — integer division by zero
+reason_tag:      2
 supervisor_acb:  0x104a4ef20
 call_stack:
   #0  main_divider

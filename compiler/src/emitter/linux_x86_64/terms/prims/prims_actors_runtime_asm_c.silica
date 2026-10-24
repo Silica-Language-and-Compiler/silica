@@ -42,10 +42,12 @@
 // variadic snprintf needs no register-argument spill, the 7th argument goes on the stack.
 
 use atom_table;
+use atom_rodata;
 
 export actor_rt_asm_phase_c_chunk/1;
 export actor_rt_asm_cv_chunk/0;
 export actor_rt_asm_phase_f_chunk/0;
+export actor_rt_asm_reason_text_chunk/1;
 export actor_rt_pid_registry_chunk/1;
 export actor_rt_asm_phase_i_chunk/1;
 export actor_rt_asm_badarith_chunk/0;
@@ -240,10 +242,9 @@ Lswd_try:
 	mov	rax, QWORD PTR [r11]
 	test	rax, rax
 	jz	Lswd_free_wrap
-	mov	rdi, rax
-	mov	rsi, QWORD PTR [rbp - 8]
-	mov	rdx, QWORD PTR [r11 + 8]
-	call	silica_rt_supervisor_maybe_restart
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, r11
+	call	silica_rt_supervisor_restart_and_report
 	mov	r11, QWORD PTR [rbp - 24]
 	mov	rdi, QWORD PTR [r11]
 	call	silica_rt_acb_release
@@ -683,7 +684,7 @@ Ldup_oom_msg:
 	.asciz	\"[silica] unwind report: malloc failed\\n\"
 	.p2align	2
 L_phase_f_unwind_fmt:
-	.asciz	\"\\n=== Silica Actor Failure ===\\nactor_id:        %llu\\nagent_type_atom: %lld\\nreason_tag:      %lld\\nsupervisor_acb:  %p\\n\"
+	.asciz	\"\\n=== Silica Actor Failure ===\\nactor_id:        %llu\\nagent_type_atom: %lld\\nreason:          %s\\nreason_tag:      %lld\\nsupervisor_acb:  %p\\n\"
 	.p2align	2
 L_phase_f_cs_hdr:
 	.asciz	\"call_stack:\\n\"
@@ -781,18 +782,31 @@ silica_rt_actor_deliver_unwind_report:
 	mov	QWORD PTR [rbp - 48], r11
 	mov	r11, QWORD PTR [r10 + 192]
 	mov	QWORD PTR [rbp - 56], r11
-# snprintf(buf, 0x800, fmt, actor, agent_type, reason_tag, supervisor): 7th argument on the stack, al = 0.
-	mov	rdi, rax
+# The reason line's text (spec §15.4.13: the failure_reason variant and, when the failing site
+# recorded one, its detail), composed into a 256-byte stack buffer the header's snprintf reads by %s.
+	sub	rsp, 256
+	mov	rdi, QWORD PTR [rbp - 24]
+	mov	rsi, rsp
+	mov	edx, 256
+	call	silica_rt_failure_reason_text
+# snprintf(buf, 0x800, fmt, actor, agent_type, reason, reason_tag, supervisor): the 7th and 8th
+# arguments on the stack, al = 0.
+	mov	rdi, QWORD PTR [rbp - 8]
 	mov	rsi, QWORD PTR [rbp - 72]
 	lea	rdx, [rip + L_phase_f_unwind_fmt]
+	mov	r10, QWORD PTR [rbp - 24]
 	mov	rcx, QWORD PTR [r10 + 408]
 	mov	r8, QWORD PTR [rbp - 40]
-	mov	r9, QWORD PTR [rbp - 48]
+	mov	r9, rsp
 	sub	rsp, 16
+	mov	r11, QWORD PTR [rbp - 48]
 	mov	QWORD PTR [rsp], r11
+	mov	r11, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 8], r11
 	xor	eax, eax
 	call	snprintf
 	add	rsp, 16
+	add	rsp, 256
 	test	eax, eax
 	jns	Ldup_len_ok
 	xor	eax, eax
@@ -1851,7 +1865,10 @@ silica_rt_badarith:
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	r10, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [r10 + 232], 1
+# a division by zero is a language-level failure: reason tag 2, :language_error (§15.4.11.2); the
+# detail code 1 at +384 names the cause on the report's reason line (silica_rt_failure_reason_text)
+	mov	QWORD PTR [r10 + 232], 2
+	mov	QWORD PTR [r10 + 384], 1
 	mov	DWORD PTR [r10 + 152], 0
 	mov	rdi, r10
 	call	silica_rt_actor_mail_signal
@@ -1971,7 +1988,9 @@ silica_rt_case_clause:
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	r10, QWORD PTR [rbp - 8]
+# a case with no matching arm: tag 2, :language_error, detail code 2 at +384 for the reason line
 	mov	QWORD PTR [r10 + 232], 2
+	mov	QWORD PTR [r10 + 384], 2
 	mov	DWORD PTR [r10 + 152], 0
 	mov	rdi, r10
 	call	silica_rt_actor_mail_signal
@@ -2831,4 +2850,170 @@ Lie_main:
 	call	exit
 	jmp	Lie_main
 ")
+}
+
+// The runtime's copy of the program's atom names, one NUL-terminated name per atom index in
+// first-added order behind a pointer table, for the failure report's reason line
+// (silica_rt_failure_reason_text prints (:explicit, <name>) from it). Every module carries the same
+// names for print_atom (L_pa_table), module-local; the runtime object is linked once per executable
+// with the executable-wide atom table, so the indices agree with every module's.
+fn reason_text_atom_name_strings(lexemes: List[string, mem(normal)], index: int64) -> string {
+    sequence
+        result: string <- case lexemes of {
+            []: List[string, mem(normal)] -> "";
+            [head: string, tail: List[string, mem(normal)]] -> {
+                idx_s: string <- atom_table@int64_to_decimal_string(index);
+                label_line: string <- concat(concat("silica_rt_atom_name_", idx_s), ":\n");
+                one: string <- concat(label_line, concat(atom_rodata@atom_name_directives("\t", "\t.byte ", head), "\n"));
+                concat(one, reason_text_atom_name_strings(tail, index + 1))
+            };
+            _: List[string, mem(normal)] -> ""
+        }
+    produces
+        pure result
+    end
+}
+
+fn reason_text_atom_name_pointers(lexemes: List[string, mem(normal)], index: int64) -> string {
+    sequence
+        result: string <- case lexemes of {
+            []: List[string, mem(normal)] -> "";
+            [head: string, tail: List[string, mem(normal)]] -> {
+                _unused_head: string <- head;
+                one: string <- concat(concat("\t.quad\tsilica_rt_atom_name_", atom_table@int64_to_decimal_string(index)), "\n");
+                concat(one, reason_text_atom_name_pointers(tail, index + 1))
+            };
+            _: List[string, mem(normal)] -> ""
+        }
+    produces
+        pure result
+    end
+}
+
+fn reason_text_atom_name_count(lexemes: List[string, mem(normal)]) -> int64 {
+    sequence
+        result: int64 <- case lexemes of {
+            []: List[string, mem(normal)] -> 0;
+            [head: string, tail: List[string, mem(normal)]] -> {
+                _unused_head: string <- head;
+                1 + reason_text_atom_name_count(tail)
+            };
+            _: List[string, mem(normal)] -> 0
+        }
+    produces
+        pure result
+    end
+}
+
+fn actor_rt_asm_reason_text_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    sequence
+        in_order: List[string, mem(normal)] <- atom_table@atom_table_lexemes_in_order(table);
+        names: string <- reason_text_atom_name_strings(in_order, 0);
+        pointers: string <- reason_text_atom_name_pointers(in_order, 0);
+        count_s: string <- atom_table@int64_to_decimal_string(reason_text_atom_name_count(in_order));
+        code: string <- "
+	.text
+	.globl	silica_rt_failure_reason_text
+	.p2align	2
+# rdi = a dying actor's control block, rsi = a buffer, rdx = its size. Writes the text of the failure
+# report's reason line (spec §15.4.13, §15.4.6.4): the failure_reason variant of §15.4.11.2 that the
+# exit reason tag at +232 names, spelled as a program spells it (:normal, :language_error,
+# :memory_fault, (:explicit, :atom) with the atom's name from silica_rt_atom_names, :foreign_fault),
+# or :unknown for a tag the runtime does not give. A language error whose cause the failing site
+# recorded at +384 (1 a division by zero, 2 a case with no matching arm) adds an em dash and the
+# detail after the variant; one that recorded nothing prints the variant alone: nothing is invented.
+silica_rt_failure_reason_text:
+	push	rbp
+	mov	rbp, rsp
+	mov	r8, QWORD PTR [rdi + 232]
+	mov	r9, QWORD PTR [rdi + 384]
+	mov	rdi, rsi
+	mov	rsi, rdx
+	xor	ecx, ecx
+	test	r8, r8
+	jz	Lrtx_normal
+	cmp	r8, 2
+	je	Lrtx_language_error
+	cmp	r8, 3
+	je	Lrtx_memory_fault
+	cmp	r8, 4
+	je	Lrtx_explicit
+	cmp	r8, 5
+	je	Lrtx_foreign_fault
+Lrtx_unknown:
+	lea	rdx, [rip + L_rtx_unknown]
+	jmp	Lrtx_print
+Lrtx_normal:
+	lea	rdx, [rip + L_rtx_normal]
+	jmp	Lrtx_print
+Lrtx_memory_fault:
+	lea	rdx, [rip + L_rtx_memory_fault]
+	jmp	Lrtx_print
+Lrtx_foreign_fault:
+	lea	rdx, [rip + L_rtx_foreign_fault]
+	jmp	Lrtx_print
+Lrtx_language_error:
+	cmp	r9, 1
+	je	Lrtx_div_zero
+	cmp	r9, 2
+	je	Lrtx_case_clause
+	lea	rdx, [rip + L_rtx_language_error]
+	jmp	Lrtx_print
+Lrtx_div_zero:
+	lea	rcx, [rip + L_rtx_detail_div_zero]
+	jmp	Lrtx_language_error_detail
+Lrtx_case_clause:
+	lea	rcx, [rip + L_rtx_detail_case_clause]
+Lrtx_language_error_detail:
+	lea	rdx, [rip + L_rtx_language_error_detail]
+	jmp	Lrtx_print
+Lrtx_explicit:
+# the atom's name; an index the table does not hold (a runtime defect) prints :unknown
+	mov	r10, QWORD PTR [rip + silica_rt_atom_name_count]
+	cmp	r9, r10
+	jae	Lrtx_unknown
+	lea	r10, [rip + silica_rt_atom_names]
+	mov	rcx, QWORD PTR [r10 + r9*8]
+	lea	rdx, [rip + L_rtx_explicit]
+Lrtx_print:
+	xor	eax, eax
+	call	snprintf
+	pop	rbp
+	ret
+	.section .rodata
+L_rtx_normal:
+	.asciz	\":normal\"
+L_rtx_language_error:
+	.asciz	\":language_error\"
+L_rtx_language_error_detail:
+	.asciz	\":language_error \\342\\200\\224 %s\"
+L_rtx_detail_div_zero:
+	.asciz	\"integer division by zero\"
+L_rtx_detail_case_clause:
+	.asciz	\"no case arm matched\"
+L_rtx_memory_fault:
+	.asciz	\":memory_fault\"
+L_rtx_explicit:
+	.asciz	\"(:explicit, %s)\"
+L_rtx_foreign_fault:
+	.asciz	\":foreign_fault\"
+L_rtx_unknown:
+	.asciz	\":unknown\"
+	.p2align	2
+";
+        // The pointer table lives in .data.rel.ro (as L_pa_table).
+        table_head: string <- "	.section .data.rel.ro,\"aw\",@progbits
+	.p2align	3
+	.globl	silica_rt_atom_names
+silica_rt_atom_names:
+";
+        count_head: string <- "	.globl	silica_rt_atom_name_count
+silica_rt_atom_name_count:
+	.quad	";
+        result: string <- concat(concat(concat(concat(concat(code, names), table_head), pointers), count_head), concat(count_s, "
+	.text
+"))
+    produces
+        pure result
+    end
 }
