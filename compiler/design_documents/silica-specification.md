@@ -3164,7 +3164,7 @@ Examples:
 
 **Recursive Tuple Types (Extension):**
 
-Tuple types may contain the keyword `rec` in type positions. `rec` refers to the enclosing tuple type. Recursive positions are represented as `ref(R, Space, rec) | :none` (optional region reference). The shorthand `ref?(R, Space, T)` denotes `ref(R, Space, T) | :none`.
+Tuple types may contain the keyword `rec` in type positions. `rec` refers to the innermost enclosing tuple type, in every position. Recursive positions are represented as `ref(R, Space, rec) | :none` (optional region reference). The shorthand `ref?(R, Space, T)` denotes `ref(R, Space, T) | :none`.
 
 Examples:
 ```
@@ -3172,10 +3172,31 @@ Examples:
 (int64, ref?(R, normal, (int64, rec)))                                            // linked list node
 ```
 
+`rec` binds to the innermost tuple type that encloses it. A `rec` with no enclosing tuple type (an unbound `rec`) is a compile error, E2010. This holds in every position: a binding annotation, a record field, a parameter type and a return type. A structure root, parameter or return is therefore spelled with its node shape, not with a bare `rec`:
+
+```
+root: ref?(L, normal, (KeyType, ValueType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))   // correct
+root: ref?(L, normal, rec)                                                                       // E2010, no enclosing tuple
+```
+
+In a nested tuple, `rec` binds to the inner tuple, not the outer one:
+
+```
+(int64, (int64, ref?(R, normal, rec)))   // rec is the inner pair (int64, ref?(R, normal, rec)), not the whole tuple
+```
+
+A node whose recursive slots sit inside an inner tuple cannot name the node with `rec`. Restructure it so the recursive slots are direct elements of the node tuple. A node that held children as `List[(int64, ref?(L, normal, rec))]`, where `rec` would bind to the pair, instead holds `List[ref?(L, normal, rec)]`; a `List` is not a tuple, so `rec` binds to the node, and the per-child datum (for example a rank) moves into the child node:
+
+```
+(ItemType, int64, List[ref?(L, normal, rec), normal])   // node: item, rank, children
+```
+
+The reason is type-directed copying of messages (Q18): the copier follows only references whose layout the type names, using descriptors built at compile time from the type, with no per-cell layout header at run time.
+
 - **Base case:** The atom `:none` denotes an empty recursive position.
 - **Construction:** `alloc_rec(r, (value, ...))` allocates a recursive tuple in a region; returns `ref(R, Space, tuple_type)`. Effect: `mem(Space)`.
-- **Decomposition:** Use `read_ref(ref)` to obtain the tuple value, then decompose with `(pattern) <- expr`. Pattern match on `ref?` slots: `case slot of { :none -> ...; ref_var: ref(R, rec) -> ... }`.
-- **Type checking:** Structural equality with `rec`-scoped occurs check. `rec` is valid only inside a tuple type.
+- **Decomposition:** Use `read_ref(ref)` to obtain the tuple value, then decompose with `(pattern) <- expr`. Pattern match on `ref?` slots: `case slot of { :none -> ...; ref_var: ref(R, normal, <node tuple type>) -> ... }`.
+- **Type checking:** Structural equality with `rec`-scoped occurs check. `rec` is valid only inside a tuple type and binds to the innermost one; otherwise E2010.
 
 See [recursive_tuple_specification.md](recursive_tuple_specification.md) for full design.
 
@@ -3242,7 +3263,7 @@ proc[concurrency] actor_ref          // computation spawning an actor
 
 **Lifetime Identifiers (L*):** Region types use lifetime identifiers (e.g. `L1`, `L2`) to track region scope. The first parameter of `region`, `ref`, and `buf` types is a lifetime identifier. Programmers obtain lifetime values via `fresh_lifetime()` and pass them to region-allocating functions. This ensures unique lifetimes when composing multiple regions in the same scope.
 
-**Allocation Scope:** Region allocation (`alloc_region`, `alloc_ref`, `alloc_buf`, `alloc_atomic`) is permitted only within sequence blocks (`sequence ... produces pure ... end`), not at function scope or in other expression positions outside such blocks.
+**Allocation Scope:** Region allocation (`alloc_region`, `alloc_ref`, `alloc_buf`) is permitted only within sequence blocks (`sequence ... produces pure ... end`), not at function scope or in other expression positions outside such blocks.
 
 #### 4.4.2 Region Types
 Region types represent memory regions: `region(L, Space)` where L is a lifetime identifier and Space is a memory space.
@@ -3280,7 +3301,7 @@ region(L1, device)                  // device memory (driver library only)
 
 The lifetime identifier (e.g. `L1`) is obtained from `fresh_lifetime()` and must be unique among region allocations in the same or composable scope.
 
-**Region Handle Move Semantics:** Region handles are move-only; they cannot be copied. When a region handle is passed to any function, ownership transfers (the handle is moved). The function must return the handle to the caller. This ensures exactly one handle exists per region at any time. See §12.1.5 for the special case of `spawn`, and §12.1.6 when a region (or related resources) is carried **inside an actor message** (`call`, `cast`).
+**Region Handle Move Semantics:** Region handles are move-only; they cannot be copied. When a region handle is passed to any function, ownership transfers (the handle is moved). The function must return it if the caller is to keep it; a parameter that is neither returned nor moved is dropped and released at the end of the body. This ensures exactly one handle exists per region at any time. See §12.1.5 for the special case of `spawn`, and §12.1.6 when a region (or related resources) is carried **inside an actor message** (`call`, `cast`).
 
 #### 4.4.3 Reference Types
 Reference types represent pointers to memory: `ref(L, Space, T)`.
@@ -3301,7 +3322,7 @@ Region-backed collections grow functionally: allocate a fresh region and larger 
 
 #### 4.4.5 Atomic memory space
 
-Atomic-capable cells use **`ref(L, atomic, T)`**. The **`atomic`** memory space (second parameter) selects hardware atomic-capable backing; there is no separate **`atomic_ref`** type name. **`alloc_atomic(r, initial)`** produces **`ref(R, atomic, T)`** (see §22).
+Atomic-capable cells use **`ref(L, atomic, T)`**. The **`atomic`** memory space (second parameter) selects hardware atomic-capable backing; there is no separate **`atomic_ref`** type name. **`alloc_ref(r, initial)`** produces **`ref(R, atomic, T)`** (see §22).
 
 ```
 ref(L1, atomic, int)                  // reference in atomic memory space
@@ -4962,13 +4983,13 @@ fn alloc_and_print() -> ref(R, normal, int) {
 fn alloc_normal() -> ref(R, normal, int) { ... }
 
 // Function with mem(atomic) - effects on sequence
-fn alloc_atomic() -> ref(R, atomic, int) { ... }
+fn make_atomic_cell() -> ref(R, atomic, int) { ... }
 
 // Combined: mem(normal) <: mem(atomic), effects on sequence
 fn alloc_both() -> (ref(R, normal, int), ref(R, atomic, int)) {
     sequence proc[mem(atomic)]
         ref1: ref(R, normal, int) <- alloc_normal();  // mem(normal)
-        ref2: ref(R, atomic, int) <- alloc_atomic();  // mem(atomic)
+        ref2: ref(R, atomic, int) <- make_atomic_cell();  // mem(atomic)
     produces
         pure (ref1, ref2)                             // Union: [mem(atomic)] (normal subsumed)
     end
@@ -5029,13 +5050,13 @@ When effects have subeffecting relationships, the compiler minimizes the effect 
 fn alloc_normal() -> ref(R, normal, int) { ... }
 
 // Function with mem(atomic) - effects on sequence (mem(normal) <: mem(atomic))
-fn alloc_atomic() -> ref(R, atomic, int) { ... }
+fn make_atomic_cell() -> ref(R, atomic, int) { ... }
 
 // Combined: mem(normal) is subsumed by mem(atomic)
 fn alloc_both() -> (ref(R, normal, int), ref(R, atomic, int)) {
     sequence proc[mem(atomic)]
         ref1: ref(R, normal, int) <- alloc_normal();   // mem(normal)
-        ref2: ref(R, atomic, int) <- alloc_atomic();   // mem(atomic)
+        ref2: ref(R, atomic, int) <- make_atomic_cell();   // mem(atomic)
     produces
         pure (ref1, ref2)                              // Union: [mem(atomic)] (normal subsumed)
     end
@@ -6639,7 +6660,7 @@ The compiler performs static analysis to verify region lifetimes and ensure memo
 
 **Lifetime Tracking:**
 - Regions are tracked through their lexical scope (sequence blocks)
-- Lifetime identifiers are obtained via `fresh_lifetime()`; functions may take `L: lifetime` as a parameter for polymorphism
+- Lifetime identifiers are obtained via `fresh_lifetime()`; lifetime names in a function signature are implicitly quantified per signature and instantiated at each call, consistently across the arguments and the result (no `L: lifetime` parameter)
 - Each distinct region allocation must use a distinct lifetime; duplicate lifetimes across composable scopes are a compile error
 - References cannot outlive their containing region
 - Region deallocation is verified to occur after all references are no longer accessible
@@ -6948,7 +6969,7 @@ For recursive data structures containing references, lifetime analysis tracks re
 
 ```
 // Singly linked list via recursive tuple and ref? (§4.2.2): a cell is
-// ref(R, normal, (int64, ref?(R, normal, rec))) with rec = (int64, ref?(R, normal, rec)).
+// ref(R, normal, (int64, ref?(R, normal, rec))) with rec = (int64, ref?(R, normal, rec)) (the innermost enclosing tuple).
 // End of list uses :none in the ref? slot instead of Some(next).
 ```
 
@@ -6993,7 +7014,7 @@ When the **message** operand to `call()` or `cast()` (Chapter 16) **contains** a
 
 **`call()` and replies:** If the behavior returns `(:reply, reply_value, new_state)` and `reply_value` carries region-owned data back to the caller, ownership of that payload **returns** to the **caller** by the same move/return rules as a function result—the reply path is not a second, hidden copy.
 
-**No cross-actor sharing:** A region is **owned by at most one actor at a time**; actor communication transfers ownership by **message moves**, not by shared mutable heaps. See also §15.1.2.2 (actor stack architecture).
+**No cross-actor sharing:** A region is **owned by at most one actor at a time**; actor communication transfers ownership by **message moves**, not by shared mutable heaps. The one named exception is the atomic region `region(L, atomic)`: application-lifetime and copyable, it holds only word-scalar atomic cells and may be shared by actors on every target (§17.2.4). See also §15.1.2.2 (actor stack architecture).
 
 ### 12.2 Reference Semantics
 
@@ -7044,13 +7065,13 @@ write_buf(buffer, index, value) -> atom proc[mem(Space)]
 Buffer access is bounds-checked. The compiler emits bounds checks before every `buf_load` and `buf_store`:
 
 - **MTE (Memory Tagging Extensions)**: When MTE hardware is available (see §21.3), the implementation may use hardware-assisted bounds checking.
-- **Software fallback**: When MTE is not available, the compiler emits a comparison and conditional branch before each load/store: compare index against buffer size N (from `buf(L, Space, T, N)`), trap on out-of-bounds.
+- **Software fallback**: When MTE is not available, the compiler emits a comparison and conditional branch before each load/store: compare index against buffer size N (from `buf(L, Space, T, N)`). **Out-of-bounds outcome (Lee, 2026-10-23):** inside an actor an out-of-bounds index, an invalid buffer size (`alloc_buf` with a negative count or an overflowing byte size) and a list-index failure terminate the actor with `failure_reason` `(:explicit, :buf_bounds)`, `(:explicit, :buf_invalid)` and `(:explicit, :list_index)`; the supervisor handles the exit as for any other failure (§15.4.11), and the access is never performed. Only in `main`, which is not an actor, do they remain a runtime abort (status 71, §15.4.6). A literal `alloc_buf` count that differs from the literal N of its `buf` type is the compile-time error E2313, and a literal index outside 0..N-1 for a literal N is E2314; the run-time check stays for every index.
 
 ```
 buf: buf(L1, normal, int, 10) <- alloc_buf(r, 10)  // buffer of size 10
 dynamic: buf(L1, normal, int64, capacity) <- alloc_buf(r, capacity)
 x: int <- read_buf(buf, 5)           // ✓ valid index
-y: int <- read_buf(buf, 15)          // ✗ runtime bounds error (traps)
+y: int <- read_buf(buf, 15)          // ✗ E2314 (literal index outside 0..9); with a run-time index, the actor ends with (:explicit, :buf_bounds)
 ```
 
 ### 12.4 Memory Safety Guarantees
@@ -7331,7 +7352,7 @@ cast(actor1, msg2)
 Atomic operations provide strong guarantees:
 
 ```
-atomic_compare_exchange(ref, expected, new)
+atomic_compare_exchange(ref, expected, new, :acq_rel)
 // Either succeeds completely or fails completely
 // No partial updates visible to other threads
 ```
@@ -7343,7 +7364,7 @@ Array/buffer access is bounds-checked:
 
 ```
 buf: buf(R, normal, int, 10) <- alloc_buf(r, 10)
-x: int <- read_buf(buf, 15)    // Runtime error: index out of bounds
+x: int <- read_buf(buf, 15)    // E2314 for a literal index; a run-time index out of bounds ends the actor with (:explicit, :buf_bounds) (abort 71 in main)
 ```
 
 #### 14.4.2 Division by Zero
@@ -7698,7 +7719,7 @@ An actor ends in one of these ways:
 - **Being shut down by its supervisor** (§15.4.12.2).
 - **Failing:** a runtime trap, `panic` (§22.16) or a contained fault (§15.4).
 
-**Implementation status (2026-10-16).** `stop_self` and `fail_self` are not implemented: the compilers have no signature or lowering for them, so a program cannot yet end its own actor, nor produce an `(:explicit, atom)` reason of its own. An actor ends today by `remove_actor` or `kill_abnormal` from another actor, by its supervisor, or by a failure. The same holds for `panic` (§22.16) and for the `stop_self` and `fail_self` uses in §15.4.11.2, §15.5 and §16.1.4. The compile-time rejection of `remove_actor` and `kill_abnormal` whose target is `self()` or an alias bound from `self()` is implemented (E2241). A target the compiler cannot see, such as one hidden behind a function parameter, still fails the caller with `:language_error` at run time on every target (trials `actors_addition/remove_actor_self_language_error`, `kill_abnormal_self_language_error`).
+**Implementation status (2026-10-23).** `stop_self` and `fail_self` are implemented on all four targets (type checker, SIR lowering, the emitters and their runtimes; trials `actor_self_stop_addition`, and `error_enforcement_addition/stop_self_in_main`, `fail_self_in_plain_function`, `stop_self_reason_not_normal_or_explicit`): both are admitted only in a behaviour (E2091 elsewhere, as `kill_abnormal`), `stop_self` takes the literal `:normal` or a `(:explicit, atom)` tuple (E2003 for any other reason), and `fail_self` has the type its context expects, since it never returns. `panic` (§22.16) and the `:stop` of §15.5 are not implemented. The compile-time rejection of `remove_actor` and `kill_abnormal` whose target is `self()` or an alias bound from `self()` is implemented (E2241). A target the compiler cannot see, such as one hidden behind a function parameter, still fails the caller with `:language_error` at run time on every target (trials `actors_addition/remove_actor_self_language_error`, `kill_abnormal_self_language_error`).
 
 When an actor ends, the runtime:
 - Stops the actor’s message loop
@@ -8834,7 +8855,7 @@ same on every target, hosted or OS-free; only where the report is written differ
 | Class | When | Report (one line) | Exit status |
 |-------|------|-------------------|-------------|
 | **Fatal fault** | A synchronous hardware exception that is not recovered: the containment gate fails (§15.4.4); the fault is outside any actor, including exhausting the stack of `main`, which is not an actor (§15.1.2.2); the fault is in trusted runtime code; a fault in guarded foreign code (§26) when no actor is current; a fault inside the fault handler itself; or debug mode (§15.4.15.1) | `[silica] fault at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>`, then `  addr=0x<fault address>` and, on targets with actors, `  actor=0x<actor>  sbase=0x<stack base>  ssize=0x<stack size>` | **70** |
-| **Runtime abort** | The runtime detects a condition it cannot continue from: a failed runtime check (region capacity, buffer validity or bounds, list index, an internal invariant), a resource the runtime cannot obtain (memory to commit for a growing stack, §15.4.10.2; an actor stack reservation requested by `main`, §15.1.2.2), or a containment failure that was not raised by hardware | `[silica] abort: <reason> at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>` | **71** |
+| **Runtime abort** | The runtime detects a condition it cannot continue from: a failed runtime check in `main` (region capacity, buffer validity or bounds, list index, an internal invariant; inside an actor the same failures end the actor instead, with `(:explicit, :region_alloc_failed)`, `:buf_invalid`, `:buf_bounds` or `:list_index`, and reach its supervisor), a resource the runtime cannot obtain (memory to commit for a growing stack, §15.4.10.2; an actor stack reservation requested by `main`, §15.1.2.2), or a containment failure that was not raised by hardware | `[silica] abort: <reason> at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>` | **71** |
 | **Language-level failure in `main`** | A pattern-match or arithmetic failure raised in `main`, which has no supervisor; a `call` or `cast` from `main` to an ended actor (§16.1.4); a calling-convention mismatch found at run time (§16.2.6.4) | the failure's atom name (`case_clause`, `badarith`, `actor_not_found`, `language_error`) | **1** |
 
 Rules:
@@ -8960,17 +8981,18 @@ Rules:
 - Every labeled field appears on its own line with a fixed-width label followed by `:` and two spaces.
 - Each stack frame occupies two lines: the `[N]  module@fn/arity` line and an indented `at file:line` line.
 - The `[runtime dispatch frame]` sentinel marks the boundary between user frames and runtime internals; the runtime frames themselves are not shown.
-- `reason` is one of the variants of the inline sum type defined in §15.4.11.2: `:normal | :language_error | :memory_fault | (:explicit, atom) | :unknown`. A dash-separated detail string may follow for additional context (e.g. `memory_fault — MTE tag mismatch at 0x0000_7fff_dead_beef`).
+- `reason` is one of the variants of the inline sum type defined in §15.4.11.2: `:normal | :language_error | :memory_fault | (:explicit, atom) | :foreign_fault | :noproc | :unknown` (`:noproc` appears only in a `DOWN` message, never in a failure report). A dash-separated detail string may follow for additional context (e.g. `memory_fault — MTE tag mismatch at 0x0000_7fff_dead_beef`).
 - `fault_addr` is present only on the trap path; it is omitted (not shown as zero) on the orderly path.
 - `region_dumps` appears only when `FailureReporter.region_dump_limit()` returns a value greater than zero (§15.4.13.4). One entry per region handle the actor held at time of death. Each entry shows up to `region_dump_limit()` bytes. On AArch64 with MTE, the tag for each 16-byte granule is appended as `[tags: N N N ...]` (one nibble per granule, decimal). On x86-64 the tag annotation is absent.
 - The delimiters `=== Silica Actor Failure ===` and `=== End Silica Actor Failure ===` are literal strings, enabling reliable extraction from log streams.
 
-**Implementation status (2026-10-16).** The runtimes write a shorter report than the format above, the same on every target apart from the pointer spelling:
+**Implementation status (2026-10-16, updated 2026-10-24).** The runtimes write a shorter report than the format above, the same on every target apart from the pointer spelling:
 
 ```
 === Silica Actor Failure ===
 actor_id:        <decimal identity>
 agent_type_atom: <atom index of the agent type; 0 for a root actor>
+reason:          <failure reason, e.g. :language_error — integer division by zero, (:explicit, :killed)>
 reason_tag:      <number of the failure reason>
 supervisor_acb:  <pointer; 0x0, (nil) or 0x00000000 when the actor has no supervisor>
 call_stack:
@@ -8979,7 +9001,7 @@ call_stack:
 === End Silica Actor Failure ===
 ```
 
-`actor_id` is the actor's 64-bit identity (§15.1.4) printed in decimal. `reason_tag` is the runtime's code for the failure reason; the codes used by the specification are 1 for `(:explicit, :killed)`, 2 for `:language_error` and 4 for the other `(:explicit, atom)` reasons, which includes `(:explicit, :shutdown)` and `(:explicit, :actor_not_found)`. The report has no source file or line, no `behavior` or `message_seq` field, and no `supervisor:` line. The root supervisor's own report is recognised by a null `supervisor_acb` and the frame `#0  <unknown behavior>`. The hosted runtimes append a `=== Region Dump ===` block per held region when the reporter's `region_dump_limit()` is above zero. The fault line of a process-fatal report (§15.4.5.5) prints the current actor's control-block address in `actor=0x…`, not its identity. The format above, with source file and line, `behavior`, `message_seq`, a `supervisor:` line and the MTE tags, remains the design and is what a conforming report will carry; the short form printed today is described, with the runtime symbols that print it, in [runtime_failure_reporting.md](runtime_failure_reporting.md) §7.
+`actor_id` is the actor's 64-bit identity (§15.1.4) printed in decimal. `reason` (added 2026-10-24) is the failure reason in readable form; the dash is U+2014 and the detail text after it appears only where the runtime knows the cause (`integer division by zero`, `no case arm matched`); an atom that the runtime's copy of the atom table does not hold prints `:unknown`. Implemented on all four targets (trial `failure_reason_line_addition`); verified on the Mac, Linux verification in progress, ESP32-S3 board run pending. `reason_tag` is the runtime's code for the failure reason; the codes are 0 for `:normal`, 2 for `:language_error` (division by zero, no case arm matched, and the convention-mismatch, name-taken and misuse sites), 3 for `:memory_fault` (a board CPU exception in an actor), 4 for every `(:explicit, atom)` reason (including `(:explicit, :killed)` from `kill_abnormal` and from a `shutdown` of 0, `(:explicit, :shutdown)` from a `shutdown` above 0, and `(:explicit, :actor_not_found)`) and 5 for `:foreign_fault`. Tag 1 is no longer written; before 2026-10-23 it meant `(:explicit, :killed)`. The report has no source file or line, no `behavior` or `message_seq` field, and no `supervisor:` line. The root supervisor's own report is recognised by a null `supervisor_acb` and the frame `#0  <unknown behavior>`. The hosted runtimes append a `=== Region Dump ===` block per held region when the reporter's `region_dump_limit()` is above zero. The fault line of a process-fatal report (§15.4.5.5) prints the current actor's control-block address in `actor=0x…`, not its identity. The format above, with source file and line, `behavior`, `message_seq`, a `supervisor:` line and the MTE tags, remains the design and is what a conforming report will carry; the short form printed today is described, with the runtime symbols that print it, in [runtime_failure_reporting.md](runtime_failure_reporting.md) §7.
 
 **Example**
 
@@ -9126,7 +9148,7 @@ Any operation can return `{ tag: :error, error: reason_atom, ... }`.
 
 **`:set_report_sink`** names the actor that receives this supervisor's exit reports (§15.4.10.5).
 
-**Implementation status (2026-10-16).** `:terminate_actor` and `:set_report_sink`, with the report sink of §15.4.10.5, are not implemented. The other operations are, and `:get_child` finds a child by its `id` (trials `supervisors_addition/phase_d_protocol_restart_and_lookup`).
+**Implementation status (2026-10-23).** `:terminate_actor` is not implemented. `:set_report_sink`, with the report sink of §15.4.10.5, is implemented on all four targets (trials `supervisor_exit_reports_addition`): it answers `{ tag: :error, ... }` when `sink` names no live actor or a call-only one. The other operations are, and `:get_child` finds a child by its `id` (trials `supervisors_addition/phase_d_protocol_restart_and_lookup`).
 
 There is no `cast_supervisor`, and `cast(supervisor_ref, ...)` is invalid. `call(supervisor_ref, ...)` is invalid; ordinary actor `call()` accepts `actor_ref`, not `supervisor_ref`.
 
@@ -9284,6 +9306,8 @@ exit_report ::= {
 - Exits handled before any sink is named are not reported. If the sink has ended, reports are dropped.
 - A report is the only way an actor other than the supervisor learns of a child's exit through supervision. It does not replace the supervision ingress, which stays runtime-internal (§15.4.9).
 
+**Implementation status (2026-10-23).** Implemented on all four targets (trials `supervisor_exit_reports_addition`). The report is cast right after the restart decision by whichever party handles the notice (the supervisor's own dispatch or a draining caller), through the sink's identity, so an ended sink gets nothing; a call-only sink is refused by `:set_report_sink`. A child supervisor copies its supervisor's sink when it is spawned (an `init` child, an `:add_child` child, a restart), and `:set_report_sink` on it replaces the copy. A sibling stopped and restarted by a `:one_for_all` or `:rest_for_one` cascade is not reported: its own exit notice is dropped by the cascade, and only notices the supervisor matches to a row produce a report. Since 2026-10-23 a division by zero ends an actor with `:language_error` (reason tag 2) and `kill_abnormal` or a shutdown-0 stop with `(:explicit, :killed)` (tag 4, `:killed` a runtime atom), on every target, so a report carries those reasons; before, all three shared tag 1 and the FailureReporter's banner printed `reason_tag: 1` for them. The record the sink receives is freed after the sink's dispatch unless the behaviour kept it (its new state, or a word it allocated, names the record or its pair). The record is spelled by the program in the field order above (the sink's behaviour reads it by offset).
+
 ---
 
 #### 15.4.11 Failure Payload
@@ -9303,7 +9327,7 @@ Every failure notification delivered to a supervisor's supervision ingress carri
 The failure reason is an **inline sum type** — a built-in language construct, not defined in any module. It is written inline wherever it appears in a type signature:
 
 ```
-:normal | :language_error | :memory_fault | (:explicit, atom) | :noproc | :unknown
+:normal | :language_error | :memory_fault | (:explicit, atom) | :foreign_fault | :noproc | :unknown
 ```
 
 | Variant | Meaning |
@@ -9311,7 +9335,8 @@ The failure reason is an **inline sum type** — a built-in language construct, 
 | `:normal` | The actor ended normally, through `stop_self(:normal)` or `remove_actor` (§15.1.2.3) |
 | `:language_error` | Language-level failure: pattern-match exhaustion, a type mismatch, `panic` (§22.16), or similar |
 | `:memory_fault` | Hardware-detected memory fault (MTE tag mismatch, guard page violation) |
-| `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :thread_limit)` for a spawn of a dangerous actor whose thread the host refused (§15.4.13.5), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), `(:explicit, :restart_intensity_breach)` for a supervisor that ends because it breached its restart intensity (§15.4.13.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4). `:thread_limit` is a runtime atom appended after `:restart_intensity_breach`, so no program atom moves. |
+| `:foreign_fault` | A guarded foreign call faulted inside a dangerous actor (§15.4.13.5); the runtime ends that actor with this reason (reason tag 5) and sends the atom in the exit-report record (Lee, 2026-10-24) |
+| `(:explicit, atom)` | Termination with a reason atom: `fail_self(reason)` or `stop_self((:explicit, reason))` (§15.1.2.3). The runtime uses `(:explicit, :killed)` for `kill_abnormal`, `(:explicit, :stack_exhausted)` for a stack that reached the end of a reservation the program lowered and `(:explicit, :stack_reserve_failed)` for a spawn whose reservation could not be made (§15.1.2.2), `(:explicit, :thread_limit)` for a spawn of a dangerous actor whose thread the host refused (§15.4.13.5), `(:explicit, :shutdown)` for a supervisor's orderly shutdown (§15.4.12.2), `(:explicit, :restart_intensity_breach)` for a supervisor that ends because it breached its restart intensity (§15.4.13.2), and `(:explicit, :identity_exhausted)` for exhausted identities (§15.1.4), and, for a runtime check that fails inside an actor (the same checks abort the process only in `main`), `(:explicit, :buf_bounds)` for a buffer index out of bounds, `(:explicit, :buf_invalid)` for an invalid buffer size, `(:explicit, :list_index)` for a list index out of range and `(:explicit, :region_alloc_failed)` for a region growth or raw allocation failure (Lee, 2026-10-22 and 2026-10-23; the access or allocation is never performed). These four are runtime atoms appended after the existing ones. `:thread_limit` is a runtime atom appended after `:restart_intensity_breach`, so no program atom moves. |
 | `:noproc` | Used only in a `DOWN` message: the monitored actor had already ended when `monitor` was called (§15.4.8.6) |
 | `:unknown` | Runtime could not determine the reason |
 
@@ -9346,7 +9371,7 @@ A supervisor tears down its children when it restarts them (§15.4.12.1) and whe
 
 1. The children are stopped **one at a time, last child-table row first**, and the supervisor waits for each to finish before it stops the next. A child supervisor stops its own children first, by this same procedure.
 2. For each live child whose `actor_ref` is held in the supervisor child table, the runtime-owned supervisor behavior applies the child row's `shutdown` policy.
-3. If `shutdown` is `0`, the child is killed as by `kill_abnormal` (§22.4), with reason tag 1.
+3. If `shutdown` is `0`, the child is killed as by `kill_abnormal` (§22.4): `failure_reason` `(:explicit, :killed)` (reason tag 4; before 2026-10-23 the runtimes gave it tag 1 and no atom; tag 1 is no longer written).
 4. If `shutdown` is greater than `0`, the runtime performs an **orderly shutdown**:
    - It stops dispatching further messages to the child.
    - It lets the dispatch in progress, if any, run to completion; a call in progress still receives its reply.
@@ -9429,7 +9454,7 @@ child_spec ::= {
 `ChildReturn` is the child behavior's return form: `(:reply, Reply, ActorState)` for a call-only child, or `(:no_reply, ActorState)` for a cast-only child. Each behavior uses exactly one form (§15.1.2). A state-machine child gives `behavior: state_machine_behavior(ImplType)`, the runtime-provided cast-only behavior for that `StateMachine` implementation, and its `initial_state` is the value passed to `init` (§15.5.6).
 
 `shutdown` controls how the runtime stops a live child before replacing it:
-- `0` — kill without waiting for further messages; the child ends with reason tag 1, as for `kill_abnormal` (§15.4.12.2).
+- `0` — kill without waiting for further messages; the child ends with `(:explicit, :killed)`, as for `kill_abnormal` (§15.4.12.2).
 - `> 0` — orderly shutdown (§15.4.12.2): no further messages are dispatched, the dispatch in progress may finish for up to that many milliseconds, and the child ends with `failure_reason` `(:explicit, :shutdown)`. The time limit is not yet enforced (implementation status, §15.4.12.2).
 
 The same policy applies when the supervisor itself ends: it shuts down every live child before it ends (§15.4.8.4, §15.4.12.2).
@@ -9879,7 +9904,7 @@ call_with_timeout(actor: actor_ref, message: ActorMessage, timeout_ms: uint64)
 - A `timeout_ms` of `0` enqueues the message and returns `:timeout` without waiting.
 - Time is measured on the monotonic clock (§22.14).
 
-**Implementation status (2026-10-16).** `call_with_timeout` is not implemented, and neither are the monotonic clock and timers of §22.14. A caller cannot yet stop waiting for a reply.
+**Implementation status (2026-10-23).** `call_with_timeout` is not implemented: a caller cannot yet stop waiting for a reply. The monotonic clock and the timers of §22.14 (`monotonic_time`, `current_time`, `send_after`, `cancel_timer`, `timer_ref`) exist on all four targets since 2026-10-23, so a behaviour that must wait with a timeout arms a timer and continues when its message arrives (trials/timers_addition/receive_after_pattern).
 
 #### 16.1.2 Asynchronous Cast
 Messages can be sent asynchronously without blocking, with success/failure indication:
@@ -10438,8 +10463,10 @@ ref(R, atomic, T)    // reference in atomic memory space
 Atomic operations work in designated memory spaces:
 
 ```
-alloc_atomic(r, initial_value) -> ref(R, atomic, T) proc[mem(atomic), atomic]
+alloc_ref(r: region(L, atomic), initial_value) -> ref(L, atomic, T) proc[mem(atomic), atomic]   // no alloc_atomic (Q8)
 ```
+
+Decided by Lee, 2026-10-23 (region memory safety design Q8, §9.2): `read_ref`/`write_ref` on an atomic ref mean `:seq_cst`; the four builtins are `atomic_load`, `atomic_store`, `atomic_fetch_add` (integer cells only) and `atomic_compare_exchange`; the ordering is an atom literal (E2317 if it is not legal for the operation); an `atomic_*` call on a non-atomic ref is E2315. On the ESP32-S3, 64-bit cells take the runtime spinlock, so one program means one thing on every target. The function-level barriers formerly added by `mem(atomic)` are removed once each operation carries its ordering.
 
 ### 17.2 Memory Ordering Semantics
 
@@ -10447,7 +10474,7 @@ alloc_atomic(r, initial_value) -> ref(R, atomic, T) proc[mem(atomic), atomic]
 Silica supports standard memory orderings that control how atomic operations synchronize memory accesses across actors:
 
 ```
-type order = relaxed | acquire | release | acq_rel | seq_cst
+order: atom literal, one of :relaxed | :acquire | :release | :acq_rel | :seq_cst   // a variable is not allowed
 ```
 
 **When to Use Each Ordering:**
@@ -10465,10 +10492,10 @@ type order = relaxed | acquire | release | acq_rel | seq_cst
 
 ```silica
 // Example: Simple counter (ordering doesn't matter)
-counter: ref(R, atomic, int64) <- alloc_atomic(r, 0);
+counter: ref(R, atomic, int64) <- alloc_ref(r, 0);
 
 fn increment() -> atom proc[mem(normal), atomic] {
-    atomic_fetch_add(counter, 1, relaxed)  // Fast, no ordering needed
+    atomic_fetch_add(counter, 1, :relaxed)  // Fast, no ordering needed
 }
 ```
 
@@ -10479,18 +10506,18 @@ fn increment() -> atom proc[mem(normal), atomic] {
 
 ```silica
 // Example: Reading published data
-data: ref(R, atomic, Data) <- alloc_atomic(r, initial_data);
-ready: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+data: ref(R, atomic, Data) <- alloc_ref(r, initial_data);
+ready: ref(R, atomic, boolean) <- alloc_ref(r, false);
 
 // Publisher (Actor A)
 fn publish(new_data: Data) -> atom proc[mem(normal), atomic] {
     write_ref(data, new_data);                    // Write data
-    atomic_store(ready, true, release);           // Publish with release
+    atomic_store(ready, true, :release);           // Publish with release
 }
 
 // Consumer (Actor B)
 fn consume() -> Data proc[mem(normal), atomic] {
-    ready_flag: boolean <- atomic_load(ready, acquire);
+    ready_flag: boolean <- atomic_load(ready, :acquire);
     case ready_flag of {
         true -> read_ref(data);
         false -> initial_data
@@ -10505,17 +10532,17 @@ fn consume() -> Data proc[mem(normal), atomic] {
 
 ```silica
 // Example: Publishing initialization complete
-init_complete: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+init_complete: ref(R, atomic, boolean) <- alloc_ref(r, false);
 
 // Initializer (Actor A)
 fn initialize() -> atom proc[mem(normal), atomic] {
     // ... perform initialization ...
-    atomic_store(init_complete, true, release);  // Release: all prior writes visible
+    atomic_store(init_complete, true, :release);  // Release: all prior writes visible
 }
 
 // Waiter (Actor B)
 fn wait_for_init() -> atom proc[mem(normal), atomic] {
-    complete: boolean <- atomic_load(init_complete, acquire);  // Acquire: see release
+    complete: boolean <- atomic_load(init_complete, :acquire);  // Acquire: see release
     // All initialization work is now guaranteed visible
 }
 ```
@@ -10526,11 +10553,11 @@ fn wait_for_init() -> atom proc[mem(normal), atomic] {
 
 ```silica
 // Example: Atomic counter with ordering
-shared_counter: ref(R, atomic, int64) <- alloc_atomic(r, 0);
+shared_counter: ref(R, atomic, int64) <- alloc_ref(r, 0);
 
 fn increment_with_ordering() -> int64 proc[mem(normal), atomic] {
     // acq_rel ensures this operation synchronizes both ways
-    old_value: int64 <- atomic_fetch_add(shared_counter, 1, acq_rel);
+    old_value: int64 <- atomic_fetch_add(shared_counter, 1, :acq_rel);
     // All prior increments are visible (acquire)
     // This increment is visible to future operations (release)
     old_value
@@ -10545,16 +10572,16 @@ fn increment_with_ordering() -> int64 proc[mem(normal), atomic] {
 
 ```silica
 // Example: Global flag coordination
-global_flag: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+global_flag: ref(R, atomic, boolean) <- alloc_ref(r, false);
 
 // Actor A
 fn set_flag() -> atom proc[mem(normal), atomic] {
-    atomic_store(global_flag, true, seq_cst);  // Participates in global order
+    atomic_store(global_flag, true, :seq_cst);  // Participates in global order
 }
 
 // Actor B
 fn check_flag() -> boolean proc[mem(normal), atomic] {
-    atomic_load(global_flag, seq_cst)  // Sees all seq_cst operations in order
+    atomic_load(global_flag, :seq_cst)  // Sees all seq_cst operations in order
 }
 ```
 
@@ -10568,15 +10595,15 @@ fn produce(
     buffer: { data: buf(R, normal, int64, 100), head: ref(R, atomic, int64), tail: ref(R, atomic, int64) },
     item: int64
 ) -> boolean proc[mem(normal), atomic] {
-    head: int64 <- atomic_load(buffer.head, acquire);
-    tail: int64 <- atomic_load(buffer.tail, relaxed);
+    head: int64 <- atomic_load(buffer.head, :acquire);
+    tail: int64 <- atomic_load(buffer.tail, :relaxed);
     
     next_head: int64 <- (head + 1) % 100;
     case next_head == tail of {
         true -> false;
         false -> {
             write_buf(buffer.data, head, item);
-            atomic_store(buffer.head, next_head, release);
+            atomic_store(buffer.head, next_head, :release);
             true
         }
     }
@@ -10586,15 +10613,15 @@ fn produce(
 fn consume(
     buffer: { data: buf(R, normal, int64, 100), head: ref(R, atomic, int64), tail: ref(R, atomic, int64) }
 ) -> Some(int64) | None proc[mem(normal), atomic] {
-    tail: int64 <- atomic_load(buffer.tail, acquire);  // Acquire: see producer releases
-    head: int64 <- atomic_load(buffer.head, relaxed);
+    tail: int64 <- atomic_load(buffer.tail, :acquire);  // Acquire: see producer releases
+    head: int64 <- atomic_load(buffer.head, :relaxed);
     
     case tail == head of {
         true -> None;
         false -> {
             item: int64 <- read_buf(buffer.data, tail);
             next_tail: int64 <- (tail + 1) % 100;
-            atomic_store(buffer.tail, next_tail, release);
+            atomic_store(buffer.tail, next_tail, :release);
             Some(item)
         }
     }
@@ -10604,19 +10631,19 @@ fn consume(
 **Flag-Based Coordination:**
 ```silica
 // Coordination flag between actors
-ready_flag: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+ready_flag: ref(R, atomic, boolean) <- alloc_ref(r, false);
 data: ref(R, normal, SharedData) <- alloc_ref(r, initial_data);
 
 // Actor A: Prepare and signal
 fn prepare_and_signal(new_data: SharedData) -> atom proc[mem(normal), atomic] {
     write_ref(data, new_data);                    // Prepare data
-    atomic_store(ready_flag, true, release);      // Signal with release
+    atomic_store(ready_flag, true, :release);      // Signal with release
     // All writes before release are visible to acquire loads
 }
 
 // Actor B: Wait and read
 fn wait_and_read() -> SharedData proc[mem(normal), atomic] {
-    ready: boolean <- atomic_load(ready_flag, acquire);
+    ready: boolean <- atomic_load(ready_flag, :acquire);
     case ready of {
         true -> read_ref(data);
         false -> initial_data
@@ -10624,48 +10651,22 @@ fn wait_and_read() -> SharedData proc[mem(normal), atomic] {
 }
 ```
 
-**Lock-Free Stack:**
-```silica
-// Cells: ref(R, normal, (int64, ref?(R, normal, rec))) with rec the full cell tuple (§4.2.2).
-// Stack head holds ref(R, atomic, ref(R, normal, (int64, ref?(R, normal, rec)))).
-fn push(
-    stack: { top: ref(R, atomic, ref(R, normal, (int64, ref?(R, normal, rec)))) },
-    value: int64
-) -> atom proc[mem(normal), atomic] {
-    new_cell: ref(R, normal, (int64, ref?(R, normal, rec))) <- alloc_ref(r, (value, :none));
-    try_push(stack, new_cell)
-}
-
-fn try_push(
-    stack: { top: ref(R, atomic, ref(R, normal, (int64, ref?(R, normal, rec)))) },
-    new_cell: ref(R, normal, (int64, ref?(R, normal, rec)))
-) -> atom proc[mem(normal), atomic] {
-    old_top: ref(R, normal, (int64, ref?(R, normal, rec))) <- atomic_load(stack.top, acquire);
-    result: {ok, ref(R, normal, (int64, ref?(R, normal, rec)))} | {fail, ref(R, normal, (int64, ref?(R, normal, rec)))}
-        <- atomic_compare_exchange(stack.top, old_top, new_cell, acq_rel);
-    case result of {
-        {ok, _: ref(R, normal, (int64, ref?(R, normal, rec)))} -> :ok;
-        {fail, _: ref(R, normal, (int64, ref?(R, normal, rec)))} -> try_push(stack, new_cell)
-    }
-}
-```
-
 **Actor Synchronization with Atomics:**
 ```silica
 // Shared counter accessed by multiple actors
-shared_count: ref(R, atomic, int64) <- alloc_atomic(r, 0);
+shared_count: ref(R, atomic, int64) <- alloc_ref(r, 0);
 
 // Actor behavior that increments counter
 fn counter_actor(msg: IncrementMsg, state: unit) -> atom proc[mem(normal), atomic] {
     // Use seq_cst for global ordering across all actors
-    atomic_fetch_add(shared_count, 1, seq_cst);
+    atomic_fetch_add(shared_count, 1, :seq_cst);
     ()
 }
 
 // Reader actor that reads the counter
 fn reader_actor(msg: ReadMsg, state: unit) -> int64 proc[mem(normal), atomic] {
     // seq_cst ensures we see all increments in order
-    atomic_load(shared_count, seq_cst)
+    atomic_load(shared_count, :seq_cst)
 }
 ```
 
@@ -10680,16 +10681,16 @@ Atomic operations provide synchronization between actors, complementing message 
 **Combining Both:**
 ```silica
 // Use atomics for fast shared state, messages for coordination
-shared_stats: ref(R, atomic, Stats) <- alloc_atomic(r, initial_stats);
+shared_stats: ref(R, atomic, Stats) <- alloc_ref(r, initial_stats);
 
 // Fast path: atomic update
 fn update_stats_fast(increment: int64) -> atom proc[mem(normal), atomic] {
-    atomic_fetch_add(shared_stats.count, increment, relaxed);
+    atomic_fetch_add(shared_stats.count, increment, :relaxed);
 }
 
 // Coordination path: message passing
 fn request_detailed_report(reply_to: actor_ref) -> atom proc[concurrency] {
-    current_stats: Stats <- atomic_load(shared_stats, acquire);
+    current_stats: Stats <- atomic_load(shared_stats, :acquire);
     cast(reply_to, ReportMsg {stats: current_stats});
 }
 ```
@@ -10697,7 +10698,7 @@ fn request_detailed_report(reply_to: actor_ref) -> atom proc[concurrency] {
 **Happens-Before with Actors:**
 ```silica
 // Atomic release in one actor, message cast, atomic acquire in another
-flag: ref(R, atomic, boolean) <- alloc_atomic(r, false);
+flag: ref(R, atomic, boolean) <- alloc_ref(r, false);
 
 // Actor A
 fn actor_a_behavior(msg: StartMsg, state: unit) -> atom proc[mem(normal), atomic, concurrency] {
@@ -10705,7 +10706,7 @@ fn actor_a_behavior(msg: StartMsg, state: unit) -> atom proc[mem(normal), atomic
     prepare_data();
     
     // Release: all prior writes visible
-    atomic_store(flag, true, release);
+    atomic_store(flag, true, :release);
     
     // Cast message (happens after release)
     cast(actor_b_ref, DataReadyMsg {});
@@ -10715,7 +10716,7 @@ fn actor_a_behavior(msg: StartMsg, state: unit) -> atom proc[mem(normal), atomic
 // Actor B
 fn actor_b_behavior(msg: DataReadyMsg, state: unit) -> atom proc[mem(normal), atomic] {
     // Acquire: guaranteed to see release from Actor A
-    ready: boolean <- atomic_load(flag, acquire);
+    ready: boolean <- atomic_load(flag, :acquire);
     // All data prepared by Actor A is now visible
     process_data();
     ()
@@ -10876,19 +10877,15 @@ atomic_store(aref, value, order) -> atom proc[mem(Space), atomic]
 #### 17.3.2 Read-Modify-Write Operations
 ```
 atomic_fetch_add(aref, delta, order) -> T proc[mem(Space), atomic]
-atomic_fetch_sub(aref, delta, order) -> T proc[mem(Space), atomic]
-atomic_fetch_and(aref, mask, order) -> T proc[mem(Space), atomic]
-atomic_fetch_or(aref, mask, order) -> T proc[mem(Space), atomic]
-atomic_fetch_xor(aref, mask, order) -> T proc[mem(Space), atomic]
 ```
 
 #### 17.3.3 Compare and Exchange
 ```
 atomic_compare_exchange(aref, expected, new_val, order)
- -> {ok, T} | {fail, T} proc[mem(Space), atomic]
+ -> (:ok, T) | (:fail, T) proc[mem(Space), atomic]
 ```
 
-Returns `{ok, old_value}` if successful, `{fail, current_value}` if the value wasn't expected.
+Returns `(:ok, old_value)` if successful, `(:fail, current_value)` if the value wasn't expected.
 
 ### 17.4 Lock-Free Data Structures
 
@@ -10899,14 +10896,14 @@ fn spsc_enqueue(
     queue: { buf: buf(R, normal, int64, 1024), capacity: int, head: ref(R, atomic, int), tail: ref(R, atomic, int) },
     item: int64
 ) -> boolean proc[mem(normal), atomic] {
-    tail: int <- atomic_load(queue.tail, acquire);
-    head: int <- atomic_load(queue.head, acquire);
+    tail: int <- atomic_load(queue.tail, :acquire);
+    head: int <- atomic_load(queue.head, :acquire);
     next_tail: int <- (tail + 1) % queue.capacity;
     case next_tail == head of {
         true -> false;
         false -> {
             write_buf(queue.buf, tail, item);
-            atomic_store(queue.tail, next_tail, release);
+            atomic_store(queue.tail, next_tail, :release);
             true
         }
     }
@@ -10915,14 +10912,14 @@ fn spsc_enqueue(
 fn spsc_recv(
     queue: { buf: buf(R, normal, int64, 1024), capacity: int, head: ref(R, atomic, int), tail: ref(R, atomic, int) }
 ) -> Some(int64) | None proc[mem(normal), atomic] {
-    head: int <- atomic_load(queue.head, acquire);
-    tail: int <- atomic_load(queue.tail, acquire);
+    head: int <- atomic_load(queue.head, :acquire);
+    tail: int <- atomic_load(queue.tail, :acquire);
     case head == tail of {
         true -> None;
         false -> {
             item: int64 <- read_buf(queue.buf, head);
             next_head: int <- (head + 1) % queue.capacity;
-            atomic_store(queue.head, next_head, release);
+            atomic_store(queue.head, next_head, :release);
             Some(item)
         }
     }
@@ -10942,8 +10939,8 @@ establishes: `msg1` happens-before `msg2` in actorA
 
 #### 18.1.2 Atomic Synchronization
 ```
-atomic_store(ref, value, release)  // in actor A
-atomic_load(ref, acquire)          // in actor B
+atomic_store(ref, value, :release)  // in actor A
+atomic_load(ref, :acquire)          // in actor B
 ```
 establishes: store happens-before load
 
@@ -10970,12 +10967,12 @@ Between actors, only explicit synchronization establishes ordering:
 
 ```
 // Actor 1
-atomic_store(flag, true, release)
+atomic_store(flag, true, :release)
 cast(actor2, data)
 
 // Actor 2 behavior function
 fn process_message(msg: Data, state: unit) -> atom {
-    flag_value: boolean <- atomic_load(flag, acquire)
+    flag_value: boolean <- atomic_load(flag, :acquire)
     // flag_value is guaranteed to be true
 }
 ```
@@ -11016,18 +11013,18 @@ AArch64's weak ordering means:
    ```
    // Actor 1: Release
    write_ref(data, value)
-   atomic_store(flag, true, release)  // STLR ensures prior writes visible
+   atomic_store(flag, true, :release)  // STLR ensures prior writes visible
    
    // Actor 2: Acquire
-   ready: boolean <- atomic_load(flag, acquire)  // LDAR ensures sees release
+   ready: boolean <- atomic_load(flag, :acquire)  // LDAR ensures sees release
    value: int <- read_ref(data)  // Guaranteed to see write_ref(data, value)
    ```
 
 3. **Sequential Consistency**: Sequential consistency requires full barriers:
    ```
    // seq_cst operations use DMB ISH + LDAR/STLR
-   atomic_store(x, 1, seq_cst)  // DMB ISH + STLR
-   atomic_load(y, seq_cst)      // LDAR + DMB ISH
+   atomic_store(x, 1, :seq_cst)  // DMB ISH + STLR
+   atomic_load(y, :seq_cst)      // LDAR + DMB ISH
    ```
 
 **Cache Coherency Guarantees:**
@@ -11078,7 +11075,7 @@ fn producer_behavior(msg: unit, state: ProducerState) -> ProducerState proc[mem(
     write_ref(state.data, 42);
     
     // Release: ensures data write is visible before flag write
-    atomic_store(state.ready_flag, true, release);  // STLR instruction
+    atomic_store(state.ready_flag, true, :release);  // STLR instruction
     
     // Cast message (happens after release)
     cast(consumer_ref, DataReadyMsg {});
@@ -11088,7 +11085,7 @@ fn producer_behavior(msg: unit, state: ProducerState) -> ProducerState proc[mem(
 // Actor 2: Consumer
 fn consumer_behavior(msg: DataReadyMsg, state: ConsumerState) -> ConsumerState proc[mem(normal), atomic] {
     // Acquire: guaranteed to see release from producer
-    ready: boolean <- atomic_load(shared_flag, acquire);  // LDAR instruction
+    ready: boolean <- atomic_load(shared_flag, :acquire);  // LDAR instruction
     
     // All data prepared by producer is now visible
     // This read is guaranteed to see write_ref(state.data, 42)
@@ -11099,7 +11096,7 @@ fn consumer_behavior(msg: DataReadyMsg, state: ConsumerState) -> ConsumerState p
 ```
 
 The AArch64 hardware guarantees:
-- `STLR` in producer ensures `write_ref(state.data, 42)` is visible before `atomic_store(state.ready_flag, true, release)`
+- `STLR` in producer ensures `write_ref(state.data, 42)` is visible before `atomic_store(state.ready_flag, true, :release)`
 - `LDAR` in consumer ensures it sees the `STLR` and all prior writes
 - `read_ref(shared_data)` is guaranteed to see `write_ref(state.data, 42)`
 
@@ -11164,7 +11161,7 @@ The compiler generates AArch64 instructions based on memory ordering requirement
 **1. Relaxed Ordering (`relaxed`):**
 
 ```silica
-atomic_store(ptr, value, relaxed)
+atomic_store(ptr, value, :relaxed)
 ```
 
 Generated code:
@@ -11178,7 +11175,7 @@ CBNZ  W2, retry      // Retry if store failed
 **2. Acquire Ordering (`acquire`):**
 
 ```silica
-value: int <- atomic_load(ptr, acquire)
+value: int <- atomic_load(ptr, :acquire)
 ```
 
 Generated code:
@@ -11190,7 +11187,7 @@ LDAR  W0, [X1]      // Load-acquire: ensures subsequent operations see prior rel
 **3. Release Ordering (`release`):**
 
 ```silica
-atomic_store(ptr, value, release)
+atomic_store(ptr, value, :release)
 ```
 
 Generated code:
@@ -11202,7 +11199,7 @@ STLR  W0, [X1]      // Store-release: ensures prior operations visible before st
 **4. Acquire-Release Ordering (`acq_rel`):**
 
 ```silica
-old_value: int <- atomic_fetch_add(ptr, 1, acq_rel)
+old_value: int <- atomic_fetch_add(ptr, 1, :acq_rel)
 ```
 
 Generated code:
@@ -11217,7 +11214,7 @@ loop:
 **5. Sequential Consistency (`seq_cst`):**
 
 ```silica
-atomic_store(ptr, value, seq_cst)
+atomic_store(ptr, value, :seq_cst)
 ```
 
 Generated code:
@@ -11446,7 +11443,7 @@ The following tables provide comprehensive guidance for selecting appropriate ba
 // Producer (Actor 1)
 fn producer(msg: unit, state: ProducerState) -> ProducerState proc[mem(normal), atomic] {
     write_ref(state.data, 42);
-    atomic_store(state.ready_flag, true, release);  // STLR instruction
+    atomic_store(state.ready_flag, true, :release);  // STLR instruction
     state
 }
 ```
@@ -11456,7 +11453,7 @@ Generated code for producer:
 // write_ref(state.data, 42)
 STR   W2, [X1]      // Store data (normal store, no ordering)
 
-// atomic_store(state.ready_flag, true, release)
+// atomic_store(state.ready_flag, true, :release)
 MOV   W0, #1
 STLR  W0, [X3]      // Store-release: ensures data store visible before flag store
 ```
@@ -11464,7 +11461,7 @@ STLR  W0, [X3]      // Store-release: ensures data store visible before flag sto
 ```silica
 // Consumer (Actor 2)
 fn consumer(msg: unit, state: ConsumerState) -> ConsumerState proc[mem(normal), atomic] {
-    ready: boolean <- atomic_load(state.ready_flag, acquire);
+    ready: boolean <- atomic_load(state.ready_flag, :acquire);
     case ready of {
         true -> {
             value: int <- read_ref(state.data);
@@ -11477,7 +11474,7 @@ fn consumer(msg: unit, state: ConsumerState) -> ConsumerState proc[mem(normal), 
 
 Generated code for consumer:
 ```assembly
-// atomic_load(state.ready_flag, acquire)
+// atomic_load(state.ready_flag, :acquire)
 LDAR  W0, [X3]      // Load-acquire: ensures sees producer's release
 CBNZ  W0, read_data // Branch if ready
 
@@ -11499,11 +11496,11 @@ LDR   W1, [X1]      // Load data (guaranteed to see producer's write due to LDAR
 Atomic operations prevent data races:
 
 ```
-counter: ref(R, atomic, int) <- alloc_atomic(r, 0)
+counter: ref(R, atomic, int) <- alloc_ref(r, 0)
 
 // Multiple actors can safely increment
 fn increment_counter() {
-    atomic_fetch_add(counter, 1, seq_cst)
+    atomic_fetch_add(counter, 1, :seq_cst)
 }
 ```
 
@@ -14394,7 +14391,7 @@ module arch.apple.amx {
 
 This section documents all built-in functions and primitives available in Silica. These are always available without requiring imports. A builtin is always called unqualified; a module function with a builtin's name is called only as `module@name(...)` (§19.3.3).
 
-**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `stop_self`, `fail_self`, `panic`, `assert`, `unreachable` (§15.1.2.3, §22.16); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout`, `send_after`, `cancel_timer`, `monotonic_time`, `current_time` (§22.14); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations and `alloc_atomic` (§22.12); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
+**Implementation status (2026-10-16).** Not every function in this section exists in the compilers. Checked against the type checker, the SIR generator and the emitters, these are absent: `panic`, `assert`, `unreachable` (§22.16; `stop_self` and `fail_self` of §15.1.2.3 exist since 2026-10-23); `register`, `whereis`, `unregister` (§20.3.1); `call_with_timeout` (§22.14; `monotonic_time`, `current_time`, `send_after`, `cancel_timer` and the `timer_ref` type exist since 2026-10-23); `random_int` and `hash` (§22.14); `read_file`, `write_file`, `get_file_size` and the directory operations (§22.6); `exec_command` (§22.8); `get_cpu_topology_info` (§22.9); `get_sve_vector_length` (§22.11); the atomic operations (§22.12; `alloc_atomic` is not added, Q8); `size_of`, `align_of`, `buffer_length`, `buffer_capacity`; `string_slice`; and `int_to_string` and `string_to_int`. The compilers also provide functions this section does not list, among them `println_stderr`, `heap_used`, `get_actor_memory_usage`, `peek`, `poke`, `map_device`, `actor_ref_bits`, `atom_bits` and `supervisor_get_child`. A name listed here is part of the language design; only the entries named above are known to be missing.
 
 ### 22.1 Memory Management Primitives
 
@@ -14409,7 +14406,6 @@ Returns a unique lifetime value. Each call produces a distinct lifetime. Use whe
 alloc_region(space: memory_space) -> region(L, space) proc[mem(space)]
 alloc_ref(r, initial_value) -> ref(L, space, T) proc[mem(space)]
 alloc_buf(r, capacity) -> buf(L, space, T, capacity) proc[mem(space)]
-alloc_atomic(r, initial_value) -> ref(L, space, T) proc[mem(space), atomic]
 alloc_region_on_numa_node(numa_node: int, space: memory_space) -> region(L, space) proc[mem(space)]
 ```
 The lifetime L is taken from the binding's explicit type annotation (e.g. `region(L1, Space)`). L is typically obtained from `fresh_lifetime()`. Region allocation is permitted only within sequence blocks.
@@ -14440,7 +14436,7 @@ sequence proc[mem(normal)]
     dma_buffer: buf(L3, normal_noncacheable, uint8, 4096) <- alloc_buf(dma_region, 4096);
     // Atomic memory for shared counters
     atomic_region: region(L4, atomic) <- alloc_region(atomic);
-    counter: ref(L4, atomic, int64) <- alloc_atomic(atomic_region, 0);
+    counter: ref(L4, atomic, int64) <- alloc_ref(atomic_region, 0);
 produces pure () end
 ```
 
@@ -14823,7 +14819,7 @@ atomic_load(ref, order) -> T proc[mem(space), atomic]
 atomic_store(ref, value, order) -> atom proc[mem(space), atomic]
 atomic_fetch_add(ref, delta, order) -> T proc[mem(space), atomic]
 atomic_compare_exchange(ref, expected, new_val, order)
-    -> {ok, T} | {fail, T} proc[mem(space), atomic]
+    -> (:ok, T) | (:fail, T) proc[mem(space), atomic]
 ```
 
 ### 22.13 Type Operations
@@ -15654,7 +15650,7 @@ The compiler automatically inserts memory barriers based on effect annotations. 
 ```silica
 // Source code
 fn load_shared_data(r: ref(R, atomic, Data)) -> Data proc[mem(atomic), atomic] {
-    atomic_load(r, acquire)  // acquire ordering
+    atomic_load(r, :acquire)  // acquire ordering
 }
 ```
 
@@ -15672,7 +15668,7 @@ LDAR X0, [X1]  // Load-acquire: X0 = result, X1 = address
 ```silica
 // Source code
 fn seq_cst_load(r: ref(R, atomic, int64)) -> int64 proc[mem(atomic), atomic] {
-    atomic_load(r, seq_cst)  // sequential consistency
+    atomic_load(r, :seq_cst)  // sequential consistency
 }
 ```
 
@@ -15693,7 +15689,7 @@ LDAR X0, [X1]  // Load-acquire after barrier
 // Source code
 fn publish_data(data_ref: ref(R, normal, Data), atomic_flag: ref(R, atomic, boolean)) -> atom proc[mem(normal), mem(atomic), atomic] {
     write_ref(data_ref, new_data);                    // Normal store
-    atomic_store(atomic_flag, true, release);        // Release store
+    atomic_store(atomic_flag, true, :release);        // Release store
 }
 ```
 
@@ -15716,13 +15712,13 @@ fn actor_a_behavior(msg: Message, state: State) -> State proc[mem(normal), mem(a
     // Prepare shared data
     write_ref(shared_data_ref, prepared_data);
     // Publish with release semantics
-    atomic_store(publish_flag, true, release);
+    atomic_store(publish_flag, true, :release);
     state
 }
 
 // Source code (Actor B)
 fn actor_b_behavior(msg: Message, state: State) -> State proc[mem(normal), mem(atomic), atomic, concurrency] {
-    ready: boolean <- atomic_load(publish_flag, acquire);
+    ready: boolean <- atomic_load(publish_flag, :acquire);
     case ready of {
         true -> {
             data: Data <- read_ref(shared_data_ref);
@@ -15763,10 +15759,10 @@ fn complex_atomic_operation(
     flag: ref(R, atomic, boolean)
 ) -> int64 proc[mem(atomic), atomic] {
     // Relaxed increment (no ordering needed)
-    old_count: int64 <- atomic_fetch_add(counter, 1, relaxed);
+    old_count: int64 <- atomic_fetch_add(counter, 1, :relaxed);
     
     // Sequential consistency store (needs full ordering)
-    atomic_store(flag, true, seq_cst);
+    atomic_store(flag, true, :seq_cst);
     
     old_count
 }

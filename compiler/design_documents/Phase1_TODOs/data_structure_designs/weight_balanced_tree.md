@@ -81,6 +81,8 @@ Map node:
 )
 ```
 
+`rec` binds to the innermost enclosing tuple type, which here is the node tuple. The collection record's `root`, and every parameter and return, spell the full inline node tuple; a bare `ref?(R, SpaceType, rec)` outside a tuple type is E2010.
+
 The owning collection record carries `region`, optional `root`, comparator bundle, and ordering identity. These are expository layouts; emitted Silica repeats the inline recursive tuple.
 
 ## 5. Smart construction

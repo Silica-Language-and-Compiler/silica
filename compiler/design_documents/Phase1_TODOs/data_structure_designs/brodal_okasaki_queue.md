@@ -29,11 +29,15 @@ A primitive tree has:
 
 ```text
 (
-    entry: EntryType,
+    ItemType,
     rank: int64,
-    children_and_deferred: List[TreeReference, SpaceType]
+    child_count: int64,
+    anchor,
+    List[ref?(L, normal, rec), mem(normal)]
 )
 ```
+
+Children and the deferred forest are `List[ref?(R, SpaceType, rec)]`, not a list of `(rank, ref)` pairs: `rec` binds to its innermost enclosing tuple type, so a pair in the list would bind `rec` to the pair, and an unbound `rec` is a compile error (E2010). The rank of a child lives in the child node itself, as the node's own `rank` field. A digit is just the tree ref. The rank is stored in the node at allocation: 0 for roots, r+1 for linked nodes. Every reference the Q18 copier follows then names its layout in the type. Intent only; the algorithms below keep their behaviour but read the rank from the node (`digit_rank` reads the node, `digit_tree` is the identity, and `cons_digit` ignores its rank argument).
 
 A rank-0 tree is a singleton. A simple link combines equal-rank trees by making the larger root a child of the smaller and increasing rank by one.
 

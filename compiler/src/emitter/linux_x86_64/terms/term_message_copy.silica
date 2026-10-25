@@ -1,0 +1,1201 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Copy-on-send (region memory safety design Q18, 2026-10-23; data_structure_redesign_requirements
+// R4, R4.1, R4.2): a cast / send / call message, a reply and a spawn initial state are COPIED by
+// default. The sender copies the value into a FRESH owned region and that region is what the
+// receiver gets, so the dispatch-scoped release of term_message_regions (the behaviour destroys
+// its message record's region fields at return) applies to the copy unchanged, and the sender
+// keeps its original. `move(x)` (the SIR tags the send prim's value "|mv", or wraps a reply
+// element in a kind-6 prim "move") transfers the original in O(1), as every send did before Q18.
+//
+// The copy is TYPE-DIRECTED and runs in one module-local helper, L_mc_root, interpreting a
+// DESCRIPTOR this module emits from the message's type string (md_descriptor_rodata):
+//
+//   desc:  .quad N            words in the aggregate (a record: its shape word plus one per field,
+//                             a tuple: one per element)
+//          .quad RIDX         index of the first word of kind REGION, or -1
+//          .quad KIND, AUX    one entry per word
+//
+//   KIND 0 WORD    scalars, atoms, strings, actor references, function values, lists (slice-1
+//                  limit: a List is shared with the sender as before), type parameters: copied as is
+//   KIND 1 REGION  an owned region handle: replaced by the fresh region it maps to
+//   KIND 2 REF1    ref / ref? to a one-word cell; AUX = a one-entry descriptor for the cell's word
+//   KIND 3 REFTUP  ref / ref? to an alloc_rec cell (one word pointing at the tuple payload); AUX =
+//                  the payload tuple's descriptor, built statically from the type: `rec` is bound
+//                  to its innermost enclosing tuple type (spec 4, recursive tuple types), so the
+//                  entry of a `ref?(L, S, rec)` points back at that tuple's own descriptor. An
+//                  UNBOUND `rec` (no enclosing tuple: a record field, a parameter or return type
+//                  such as a structure's `root: ref?(L, normal, rec)`) names no layout; that ref is
+//                  a WORD, shared with the sender as before (Lee decides its handling)
+//   KIND 4 AGG     pointer to a record or tuple; AUX = its descriptor (a value below 65536 is an
+//                  atom or nil and is copied as is)
+//   KIND 5 SUM     a sum value; AUX = a table `.quad -1-M; .quad TAG, DESC ...` matched against the
+//                  value's first word (a tuple alternative's tag atom, a record alternative's
+//                  shape number); an atom alternative (< 65536) is copied as is
+//   KIND 6 BUF     a buffer (length word before the elements); AUX = element byte size
+//   KIND 7 LIST    a list handle (chunk15_stack_memory_design.md §3.6, decision 30); AUX = a one-entry
+//                  descriptor `.quad 1, SLOT` whose entry describes one element word (SLOT = the
+//                  chunk slot bytes; a slot above 8 holds an inline aggregate). Phase 0 (2026-10-24):
+//                  described and measured, copied as a WORD (the sender's list is shared) until the
+//                  mailbox buffer of phase 4 copies the handle and the spine
+//   KIND 8 STRING  a string (decision 29): 24-byte header {marker, bytes, length} and the bytes; a
+//                  run-time string's marker is -1, a literal's -2 (string_literal_pool), so the walk
+//                  never copies a literal. Phase 0: described and measured, copied as a WORD
+//   KIND 9 CLOSURE a function value (§3.6): copied as a WORD until closure environments are described
+//                  records (phase 2 rejects a captured closure at a send or return, E2300)
+//
+// Measuring mode (§5.1): L_mc_measure(value, descriptor) walks exactly as the copy does, with the
+// same per-message table, and returns the byte total of the copy; phase 0 emits it with the helper
+// and nothing calls it yet (the exact-size mailbox buffer of phase 4 does).
+//
+// Per-type descriptor labels (§3.6 "Descriptor emission"): besides the per-site descriptors below,
+// md_type_descriptors_block emits one descriptor body per DISTINCT pointer-carrying type a module's
+// functions return (L_td_<module>_<k>_0 and children) and aliases L_td_<fn label> (the result type),
+// L_td_<fn label>_s (a behaviour's state type) and L_td_<fn label>_r (its reply type) to the bodies.
+// Phase 0 emits them; the evacuation of phase 2 and the state and reply copies of phases 3 and 4 read
+// them.
+//
+// Tree-shaped parts (records, tuples, sums, buffers) are walked with no bookkeeping. Where the
+// type allows one value to be reached twice -- refs, and the region handles themselves -- ONE
+// per-message table (source address -> copy, open addressing, malloc'd for the length of the
+// copy) makes one source node one copy node across every value in the message, so two versions
+// of a structure sent together still share their nodes (R4.2). A ref whose cell can hold a ref
+// to itself (write_ref) is entered in the table before its content is copied.
+//
+// Regions: before the copy walk a pre-map pass maps every REGION word reachable through
+// AGG / SUM entries to a fresh region (alloc_region's shape: a 4128-byte raw block). A handle the
+// canonical arena table holds (a standard structure's family arena, _silica_rt_region_destroy's
+// own test) is NOT mapped, and an aggregate whose region word maps to nothing is copied
+// shallowly: the interim limit of this slice is that structure handles pass as today, their
+// nodes are not copied (chunk 15, candidate D, slice 2). Copied cells go into the most recently
+// mapped fresh region; a ref met when no fresh region exists is shared, as before.
+//
+// Elision: with no `drop` in the language yet (stage 4), a copying send would leave the sender's
+// original to leak at every send that was written for move semantics. fn_copy_markers therefore
+// finds the sends and spawns whose operand is a LAST USE -- nothing the function evaluates after
+// the send mentions the operand's data or an alias of it (a taint closure over the lets in both
+// directions), and none of it is a parameter -- and marks them "|_mvs=<node>,"; those transfer
+// the original exactly as a `move` would, which is unobservable to the sender. A behaviour's reply
+// is likewise copied only when a reply site needs it ("|_mvr=1" marks the elided function):
+// its data is a parameter's, or is also in the new state.
+
+use sir_ast;
+use term_sir_helpers;
+use term_message_regions;
+use prims_record;
+use prims_tuple;
+use prims_list;
+use atom_table;
+use record_shape;
+use module_linkage;
+use var;
+use x86_isa;
+use x86_mem;
+
+export md_type_needs_copy/1;
+export md_descriptor_rodata/3;
+export md_site_label/2;
+export md_rodata_block/1;
+export md_copy_call_asm/2;
+export md_prim_value_is_move/1;
+export md_prim_is_move_wrapper/1;
+export fn_copy_markers/1;
+export md_site_elided/2;
+export md_reply_elided/1;
+export md_reply_copy_asm/4;
+export md_fn_label_marker/1;
+export md_fn_label_of/1;
+export module_uses_message_copy/1;
+export emit_message_copy_helper/0;
+export md_type_label/2;
+export md_type_descriptors_block/3;
+
+// ---- strings ----------------------------------------------------------------------------------
+
+fn mc_starts_with(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+fn mc_ends_with(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, length_bytes(s) - length_bytes(p), length_bytes(s)) == p
+}
+
+fn mc_find_from(s: string, sub: string, i: int64) -> int64 {
+    case i + length_bytes(sub) > length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + length_bytes(sub)) == sub of {
+            true -> i;
+            false -> mc_find_from(s, sub, i + 1)
+        }
+    }
+}
+
+fn mc_has(s: string, sub: string) -> boolean {
+    mc_find_from(s, sub, 0) >= 0
+}
+
+// Index of the first `sep` at nesting depth zero (over (), [], {}) at or after i, or the length.
+fn mc_top_sep(s: string, i: int64, depth: int64, sep: string) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> mc_top_sep(s, i + 1, depth + 1, sep);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> mc_top_sep(s, i + 1, depth - 1, sep);
+                    false -> case c == sep and depth == 0 of {
+                        true -> i;
+                        false -> mc_top_sep(s, i + 1, depth, sep)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mc_itos(n: int64) -> string {
+    atom_table@int64_to_decimal_string(n)
+}
+
+// Name sets: ",%a,%b,".
+fn mc_in_set(set: string, name: string) -> boolean {
+    length_bytes(name) > 0 and mc_has(set, concat(",", concat(name, ",")))
+}
+
+fn mc_add(set: string, name: string) -> string {
+    case length_bytes(name) == 0 or mc_in_set(set, name) of {
+        true -> set;
+        false -> concat(set, concat(name, ","))
+    }
+}
+
+// Every ",name," of `other` added to `set`.
+fn mc_union(set: string, other: string) -> string {
+    case length_bytes(other) <= 1 of {
+        true -> set;
+        false -> {
+            rest: string <- substring(other, 1, length_bytes(other));
+            c: int64 <- mc_top_sep(rest, 0, 0, ",");
+            mc_union(mc_add(set, substring(rest, 0, c)), substring(rest, c, length_bytes(rest)))
+        }
+    }
+}
+
+fn mc_intersects(a: string, b: string) -> boolean {
+    case length_bytes(b) <= 1 of {
+        true -> false;
+        false -> {
+            rest: string <- substring(b, 1, length_bytes(b));
+            c: int64 <- mc_top_sep(rest, 0, 0, ",");
+            case mc_in_set(a, substring(rest, 0, c)) of {
+                true -> true;
+                false -> mc_intersects(a, substring(rest, c, length_bytes(rest)))
+            }
+        }
+    }
+}
+
+// ---- type classification -----------------------------------------------------------------------
+
+// The inside of `ref(L, S, T)` / `ref?(L, S, T)`: T, or "" when the spelling has no third parameter.
+fn mc_ref_elem_type(t: string) -> string {
+    open: int64 <- mc_find_from(t, "(", 0);
+    inner: string <- substring(t, open + 1, length_bytes(t) - 1);
+    c1: int64 <- mc_top_sep(inner, 0, 0, ",");
+    case c1 >= length_bytes(inner) of {
+        true -> "";
+        false -> {
+            c2: int64 <- mc_top_sep(inner, c1 + 1, 0, ",");
+            case c2 >= length_bytes(inner) of {
+                true -> "";
+                false -> substring(inner, c2 + 1, length_bytes(inner))
+            }
+        }
+    }
+}
+
+fn mc_is_record(t: string) -> boolean {
+    mc_starts_with(t, "{") and mc_ends_with(t, "}")
+}
+
+fn mc_is_tuple(t: string) -> boolean {
+    mc_starts_with(t, "(") and mc_ends_with(t, ")") and mc_top_sep(t, 0, 0, "|") >= length_bytes(t)
+}
+
+fn mc_is_sum(t: string) -> boolean {
+    mc_top_sep(t, 0, 0, "|") < length_bytes(t)
+}
+
+// 0 WORD, 1 REGION, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST, 8 STRING, 9 CLOSURE for a
+// (space-stripped) type; `bound` is true when an enclosing tuple type binds `rec` (a bare `rec`, or
+// `ref?(L, S, rec)`, is a WORD otherwise). A function type is tested before the sum test: its result
+// may be a sum (`fn(a, b) -> :less | :equal | :greater`) whose `|` sits at depth zero.
+fn mc_kind_of(t: string, bound: boolean) -> int64 {
+    case length_bytes(t) == 0 of {
+        true -> 0;
+        false -> case mc_starts_with(t, "fn(") of {
+            true -> 9;
+            false -> case mc_starts_with(t, "List[") of {
+                true -> 7;
+                false -> case t == "string" of {
+                    true -> 8;
+                    false -> mc_kind_of_rest(t, bound)
+                }
+            }
+        }
+    }
+}
+
+fn mc_kind_of_rest(t: string, bound: boolean) -> int64 {
+    case length_bytes(t) == 0 of {
+        true -> 0;
+        false -> case mc_is_sum(t) of {
+            true -> 5;
+            false -> case mc_starts_with(t, "region(") of {
+                true -> 1;
+                false -> case mc_starts_with(t, "ref(") or mc_starts_with(t, "ref?(") of {
+                    true -> {
+                        e: string <- mc_ref_elem_type(t);
+                        case e == "rec" of {
+                            true -> case bound of { true -> 3; false -> 0 };
+                            false -> case mc_starts_with(e, "(") of {
+                                true -> 3;
+                                false -> case length_bytes(e) == 0 of { true -> 0; false -> 2 }
+                            }
+                        }
+                    };
+                    false -> case mc_starts_with(t, "buf(") of {
+                        true -> 6;
+                        false -> case mc_is_record(t) or mc_is_tuple(t) of {
+                            true -> 4;
+                            false -> 0
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Does a value of this type hold anything the copy must rebuild (a region, a ref, a buffer),
+// reachable through records, tuples and sums?
+// `bound`: an enclosing tuple binds `rec` here. A ref to a tuple counts without looking inside it
+// (its payload is a described cell).
+fn mc_needs_copy_at(t: string, depth: int64, bound: boolean) -> boolean {
+    case depth > 12 of {
+        true -> false;
+        false -> case mc_kind_of(t, bound) of {
+            0 -> false;
+            1 -> true;
+            2 -> true;
+            3 -> true;
+            6 -> true;
+            // Lists, strings and closures are described but not copied in phase 0 (header): a
+            // message made only of them still passes as a word. Phase 4 turns 7 and 8 to true.
+            7 -> false;
+            8 -> false;
+            9 -> false;
+            5 -> mc_alts_need_copy(t, 0, depth, bound);
+            _: int64 -> case mc_is_record(t) of {
+                true -> mc_fields_need_copy(substring(t, 1, length_bytes(t) - 1), 0, depth, bound);
+                false -> mc_elems_need_copy(substring(t, 1, length_bytes(t) - 1), 0, depth)
+            }
+        }
+    }
+}
+
+fn mc_alts_need_copy(t: string, i: int64, depth: int64, bound: boolean) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> false;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, "|");
+            case mc_needs_copy_at(substring(t, i, e), depth + 1, bound) of {
+                true -> true;
+                false -> mc_alts_need_copy(t, e + 1, depth, bound)
+            }
+        }
+    }
+}
+
+// Tuple elements: the tuple itself binds `rec`.
+fn mc_elems_need_copy(t: string, i: int64, depth: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> false;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, ",");
+            case mc_needs_copy_at(substring(t, i, e), depth + 1, true) of {
+                true -> true;
+                false -> mc_elems_need_copy(t, e + 1, depth)
+            }
+        }
+    }
+}
+
+fn mc_fields_need_copy(t: string, i: int64, depth: int64, bound: boolean) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> false;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, ",");
+            seg: string <- substring(t, i, e);
+            colon: int64 <- mc_top_sep(seg, 0, 0, ":");
+            fty: string <- case colon >= length_bytes(seg) of { true -> ""; false -> substring(seg, colon + 1, length_bytes(seg)) };
+            case mc_needs_copy_at(fty, depth + 1, bound) of {
+                true -> true;
+                false -> mc_fields_need_copy(t, e + 1, depth, bound)
+            }
+        }
+    }
+}
+
+// A message, reply or initial state of this type is deep-copied: it is a record, tuple or sum
+// (the copier's root is an aggregate) that reaches a region, a ref or a buffer.
+fn md_type_needs_copy(t0: string) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    k: int64 <- mc_kind_of(t, false);
+    (k == 4 or k == 5) and mc_needs_copy_at(t, 0, false)
+}
+
+// ---- descriptors --------------------------------------------------------------------------------
+
+fn md_site_label(fnl: string, node: int64) -> string {
+    concat("L_md_", concat(fnl, concat("_", mc_itos(node))))
+}
+
+fn mc_lbl(base: string, k: int64) -> string {
+    concat(base, concat("_", mc_itos(k)))
+}
+
+// One entry line and the rodata of the descriptors it points at; `encl` is the label of the
+// innermost enclosing tuple's descriptor ("" when none), which is what `rec` names.
+fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
+    kind: int64 <- case depth > 12 of { true -> 0; false -> mc_kind_of(t, length_bytes(encl) > 0) };
+    case kind of {
+        0 -> { line: "    .quad 0, 0\n", child: "", k: k };
+        1 -> { line: "    .quad 1, 0\n", child: "", k: k };
+        3 -> case mc_ref_elem_type(t) == "rec" of {
+            true -> { line: mc_label_entry(3, encl), child: "", k: k };
+            false -> {
+                d: { text: string, k: int64 } <- mc_agg_desc(mc_ref_elem_type(t), base, k, table, depth + 1, encl);
+                { line: mc_label_entry(3, mc_lbl(base, k)), child: d.text, k: d.k }
+            }
+        };
+        6 -> { line: concat("    .quad 6, ", concat(mc_itos(mc_buf_elem_bytes(t)), "\n")), child: "", k: k };
+        2 -> {
+            // A one-word descriptor for the cell's content.
+            c: { line: string, child: string, k: int64 } <- mc_entry(mc_ref_elem_type(t), base, k + 1, table, depth + 1, encl);
+            own: string <- concat(mc_lbl(base, k), concat(":\n    .quad 1, -1\n", c.line));
+            { line: mc_label_entry(2, mc_lbl(base, k)), child: concat(own, c.child), k: c.k }
+        };
+        4 -> {
+            d: { text: string, k: int64 } <- mc_agg_desc(t, base, k, table, depth + 1, encl);
+            { line: mc_label_entry(4, mc_lbl(base, k)), child: d.text, k: d.k }
+        };
+        7 -> {
+            // A one-entry descriptor for the element word, headed by the chunk slot bytes.
+            c: { line: string, child: string, k: int64 } <- mc_entry(prims_list@list_elem_type_from_list_t(t), base, k + 1, table, depth + 1, encl);
+            own: string <- concat(mc_lbl(base, k), concat(":\n    .quad 1, ", concat(mc_itos(prims_list@chunk_elem_slot_bytes_from_list_t(t)), concat("\n", c.line))));
+            { line: mc_label_entry(7, mc_lbl(base, k)), child: concat(own, c.child), k: c.k }
+        };
+        8 -> { line: "    .quad 8, 0\n", child: "", k: k };
+        9 -> { line: "    .quad 9, 0\n", child: "", k: k };
+        _: int64 -> {
+            d: { text: string, k: int64 } <- mc_sum_table(t, base, k, table, depth + 1, encl);
+            { line: mc_label_entry(5, mc_lbl(base, k)), child: d.text, k: d.k }
+        }
+    }
+}
+
+// An entry whose AUX is a label.
+fn mc_label_entry(kind: int64, label: string) -> string {
+    concat("    .quad ", concat(mc_itos(kind), concat(", ", concat(label, "\n"))))
+}
+
+fn mc_buf_elem_bytes(t: string) -> int64 {
+    case mc_has(t, "int8") or mc_has(t, "uint8") or mc_has(t, "boolean") of {
+        true -> 1;
+        false -> case mc_has(t, "int16") or mc_has(t, "uint16") or mc_has(t, "float16") of {
+            true -> 2;
+            false -> case mc_has(t, "int32") or mc_has(t, "uint32") or mc_has(t, "float32") of {
+                true -> 4;
+                false -> 8
+            }
+        }
+    }
+}
+
+// The descriptor of a record or tuple type at label base_k: (rodata, next_k).
+fn mc_agg_desc(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
+    inner: string <- substring(t, 1, length_bytes(t) - 1);
+    case mc_is_record(t) of {
+        true -> {
+            a: { entries: string, children: string, n: int64, ridx: int64, k: int64 } <- mc_field_entries(inner, 0, base, k + 1, table, depth, encl, { entries: "", children: "", n: 1, ridx: 0 - 1, k: k + 1 });
+            head: string <- concat(mc_lbl(base, k), concat(":\n    .quad ", concat(mc_itos(a.n), concat(", ", concat(mc_itos(a.ridx), "\n    .quad 0, 0\n")))));
+            { text: concat(head, concat(a.entries, a.children)), k: a.k }
+        };
+        false -> {
+            a: { entries: string, children: string, n: int64, ridx: int64, k: int64 } <- mc_elem_entries(inner, 0, base, k + 1, table, depth, mc_lbl(base, k), { entries: "", children: "", n: 0, ridx: 0 - 1, k: k + 1 });
+            head: string <- concat(mc_lbl(base, k), concat(":\n    .quad ", concat(mc_itos(a.n), concat(", ", concat(mc_itos(a.ridx), "\n")))));
+            { text: concat(head, concat(a.entries, a.children)), k: a.k }
+        }
+    }
+}
+
+// Entries for the fields of record content "a:T,b:U,..." (n starts at 1 for the shape word).
+fn mc_field_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+    case i >= length_bytes(content) of {
+        true -> acc;
+        false -> {
+            e: int64 <- mc_top_sep(content, i, 0, ",");
+            seg: string <- substring(content, i, e);
+            colon: int64 <- mc_top_sep(seg, 0, 0, ":");
+            fty: string <- case colon >= length_bytes(seg) of { true -> ""; false -> substring(seg, colon + 1, length_bytes(seg)) };
+            en: { line: string, child: string, k: int64 } <- mc_entry(fty, base, acc.k, table, depth, encl);
+            ridx2: int64 <- case acc.ridx < 0 and mc_kind_of(fty, false) == 1 of { true -> acc.n; false -> acc.ridx };
+            mc_field_entries(content, e + 1, base, k0, table, depth, encl, { entries: concat(acc.entries, en.line), children: concat(acc.children, en.child), n: acc.n + 1, ridx: ridx2, k: en.k })
+        }
+    }
+}
+
+// Entries for the elements of tuple content "T,U,...".
+fn mc_elem_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+    case i >= length_bytes(content) of {
+        true -> acc;
+        false -> {
+            e: int64 <- mc_top_sep(content, i, 0, ",");
+            ety: string <- substring(content, i, e);
+            en: { line: string, child: string, k: int64 } <- mc_entry(ety, base, acc.k, table, depth, encl);
+            ridx2: int64 <- case acc.ridx < 0 and mc_kind_of(ety, false) == 1 of { true -> acc.n; false -> acc.ridx };
+            mc_elem_entries(content, e + 1, base, k0, table, depth, encl, { entries: concat(acc.entries, en.line), children: concat(acc.children, en.child), n: acc.n + 1, ridx: ridx2, k: en.k })
+        }
+    }
+}
+
+// The alternative table of a sum type at label base_k: (rodata, next_k). An alternative with a
+// payload is a tuple led by its tag atom, or a record matched by its shape number; atoms and
+// alternatives whose tag this program's atom table does not hold are left out (copied as is).
+fn mc_sum_table(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
+    a: { entries: string, children: string, n: int64, ridx: int64, k: int64 } <- mc_sum_alts(t, 0, base, table, depth, encl, { entries: "", children: "", n: 0, ridx: 0 - 1, k: k + 1 });
+    // The header is -1 - M: negative, so L_mc_root tells a sum table apart from an aggregate
+    // descriptor (whose first word is a count) when the message type itself is a sum.
+    head: string <- concat(mc_lbl(base, k), concat(":\n    .quad ", concat(mc_itos(0 - 1 - a.n), "\n")));
+    { text: concat(head, concat(a.entries, a.children)), k: a.k }
+}
+
+fn mc_sum_alts(t: string, i: int64, base: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+    case i >= length_bytes(t) of {
+        true -> acc;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, "|");
+            alt: string <- substring(t, i, e);
+            tag: int64 <- mc_alt_tag(alt, table);
+            case tag < 0 of {
+                true -> mc_sum_alts(t, e + 1, base, table, depth, encl, acc);
+                false -> {
+                    d: { text: string, k: int64 } <- mc_agg_desc(alt, base, acc.k, table, depth, encl);
+                    row: string <- concat("    .quad ", concat(mc_itos(tag), concat(", ", concat(mc_lbl(base, acc.k), "\n"))));
+                    mc_sum_alts(t, e + 1, base, table, depth, encl, { entries: concat(acc.entries, row), children: concat(acc.children, d.text), n: acc.n + 1, ridx: acc.ridx, k: d.k })
+                }
+            }
+        }
+    }
+}
+
+// The word that identifies a payload alternative: a tuple's leading atom index, a record's shape
+// number; -1 when the alternative carries no payload or its tag is unknown here.
+fn mc_alt_tag(alt: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> int64 {
+    case mc_is_record(alt) of {
+        true -> atom_table@atom_lexeme_to_index(table, record_shape@record_shape_lexeme(alt));
+        false -> case mc_is_tuple(alt) of {
+            false -> 0 - 1;
+            true -> {
+                inner: string <- substring(alt, 1, length_bytes(alt) - 1);
+                first: string <- substring(inner, 0, mc_top_sep(inner, 0, 0, ","));
+                case mc_starts_with(first, ":") of {
+                    true -> atom_table@atom_lexeme_to_index(table, first);
+                    false -> 0 - 1
+                }
+            }
+        }
+    }
+}
+
+// The descriptor rodata of a message type rooted at md_site_label(fnl, node): the root descriptor
+// is `<label>_0`. "" when the type is not copied.
+fn md_descriptor_rodata(t0: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    case mc_kind_of(t, false) of {
+        4 -> mc_agg_desc(t, label, 0, table, 0, "").text;
+        5 -> mc_sum_table(t, label, 0, table, 0, "").text;
+        _: int64 -> ""
+    }
+}
+
+// A descriptor block placed in the function's text: it switches to the pointer-bearing constant
+// section and back.
+fn md_rodata_block(rodata: string) -> string {
+    case length_bytes(rodata) == 0 of {
+        true -> "";
+        false -> concat(".section .data.rel.ro,\"aw\",@progbits\n.p2align 3\n", concat(rodata, ".text\n"))
+    }
+}
+
+// The call: X0 = the value, X1 = its root descriptor, X2 = the ACB whose arena takes the copy's
+// shell (acb_asm leaves it in X2; "" means XZR, the current actor). Result in X0 (rdi). Clobbers
+// the caller-saved registers.
+fn md_copy_call_asm(label: string, acb_asm: string) -> string {
+    root: string <- concat(label, "_0");
+    x2: string <- case length_bytes(acb_asm) == 0 of { true -> x86_isa@x86_mov("X2", "XZR"); false -> acb_asm };
+    concat(x86_isa@x86_adr("X1", root), concat(x2, x86_isa@x86_call("L_mc_root")))
+}
+
+// The SIR marks: a send / spawn prim whose value ends "|mv" moves its operand; a kind-6 "move"
+// prim wraps a moved reply element.
+fn md_prim_value_is_move(value: string) -> boolean {
+    mc_ends_with(value, "|mv")
+}
+
+fn md_prim_is_move_wrapper(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+    n.kind == 6 and n.name == "move"
+}
+
+// ---- the function label marker (for site-unique descriptor labels) --------------------------------
+
+fn md_fn_label_marker(entry_label: string) -> string {
+    concat("|_fnl=", entry_label)
+}
+
+fn md_fn_label_of(outer_reg: string) -> string {
+    l: string <- var@find_sp_binding(outer_reg, "_fnl");
+    case length_bytes(l) == 0 of { true -> "f"; false -> l }
+}
+
+// ---- elision: last-use sends and spawns, replies whose data stays private ---------------------------
+
+fn mc_is_send_prim(name: string) -> boolean {
+    name == "send" or name == "actor_call" or name == "actor_call_registered" or name == "actor_cast" or name == "timer_cast"
+        or name == "actor_cast_registered" or name == "actor_cast_dangerous_registered"
+        or name == "actor_cast_device" or name == "actor_cast_device_registered"
+}
+
+fn mc_is_spawn_prim(name: string) -> boolean {
+    name == "spawn" or name == "spawn_dangerous" or name == "spawn_device" or name == "spawn_registered"
+        or name == "spawn_dangerous_registered" or name == "spawn_device_registered" or name == "spawn_linked"
+}
+
+// Every variable the term mentions whose type can carry a pointer (an unknown type counts), as a
+// set. A call through a bound function value mentions that name too.
+fn mc_vars(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, acc: string) -> string {
+    case term.root < 0 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            acc1: string <- case n.kind == 1 of {
+                true -> case length_bytes(n.type_name) > 0 and term_message_regions@type_is_pointer_free(n.type_name) of {
+                    true -> acc;
+                    false -> mc_add(acc, n.name)
+                };
+                false -> case (n.kind == 4 or n.kind == 5) and mc_starts_with(n.name, "%") of {
+                    true -> mc_add(acc, n.name);
+                    false -> acc
+                }
+            };
+            acc2: string <- mc_vars(term_sir_helpers@sir_term_at(term, n.inner), acc1);
+            mc_vars(term_sir_helpers@sir_term_at(term, n.right_expr), acc2)
+        }
+    }
+}
+
+// Does the term mention a name of the set (a variable, or a call through one)?
+fn mc_mentions(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case (n.kind == 1 or n.kind == 4 or n.kind == 5) and mc_in_set(set, n.name) of {
+                true -> true;
+                false -> case mc_mentions(term_sir_helpers@sir_term_at(term, n.inner), set) of {
+                    true -> true;
+                    false -> mc_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), set)
+                }
+            }
+        }
+    }
+}
+
+// One closure step over the function body: a let whose right-hand side mentions the set binds a
+// tainted name (when its type can carry a pointer); a let binding a tainted name taints the
+// pointer-carrying variables its right-hand side mentions (aliases of parts of the same data);
+// a case over a tainted scrutinee taints its bind arms' names and the other way round; a pattern
+// arm over a tainted scrutinee is not tracked and poisons the set ("!").
+fn mc_closure_step(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> string {
+    case term.root < 0 of {
+        true -> set;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            rhs: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, n.inner);
+            set1: string <- case n.kind == 2 of {
+                true -> {
+                    fwd: string <- case mc_mentions(rhs, set) and (length_bytes(n.type_name) == 0 or term_message_regions@type_is_pointer_free(n.type_name) == false) of {
+                        true -> mc_add(set, n.name);
+                        false -> set
+                    };
+                    case mc_in_set(fwd, n.name) of {
+                        true -> mc_union(fwd, mc_vars(rhs, ","));
+                        false -> fwd
+                    }
+                };
+                false -> case n.kind == 3 of {
+                    true -> mc_case_arms_step(term_sir_helpers@sir_term_at(term, n.right_expr), rhs, set);
+                    false -> set
+                }
+            };
+            set2: string <- mc_closure_step(rhs, set1);
+            mc_closure_step(term_sir_helpers@sir_term_at(term, n.right_expr), set2)
+        }
+    }
+}
+
+fn mc_case_arms_step(arms: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, scrut: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> string {
+    case arms.root < 0 of {
+        true -> set;
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(arms);
+            case a.kind == 7 of {
+                true -> mc_case_arms_step(term_sir_helpers@sir_term_at(arms, a.right_expr), scrut, mc_case_arms_step(term_sir_helpers@sir_term_at(arms, a.inner), scrut, set));
+                false -> case a.kind == 8 of {
+                    false -> set;
+                    true -> case a.value == "bind" of {
+                        true -> {
+                            s1: string <- case mc_mentions(scrut, set) and (length_bytes(a.type_name) == 0 or term_message_regions@type_is_pointer_free(a.type_name) == false) of {
+                                true -> mc_add(set, a.name);
+                                false -> set
+                            };
+                            case mc_in_set(s1, a.name) of {
+                                true -> mc_union(s1, mc_vars(scrut, ","));
+                                false -> s1
+                            }
+                        };
+                        false -> case (a.value == "record" or a.value == "tuple" or a.value == "list_cons") and mc_mentions(scrut, set) of {
+                            true -> mc_add(set, "!");
+                            false -> set
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The closure, iterated to a fixed point (bounded).
+fn mc_closure(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string, rounds: int64) -> string {
+    next: string <- mc_closure_step(body, set);
+    case rounds <= 0 or length_bytes(next) == length_bytes(set) of {
+        true -> next;
+        false -> mc_closure(body, next, rounds - 1)
+    }
+}
+
+// ",%a,%b," of the function's parameters.
+fn mc_param_set(names: string, acc: string) -> string {
+    case length_bytes(names) == 0 of {
+        true -> acc;
+        false -> {
+            p: int64 <- mc_top_sep(names, 0, 0, "|");
+            nm: string <- substring(names, 0, p);
+            rest: string <- case p >= length_bytes(names) of { true -> ""; false -> substring(names, p + 1, length_bytes(names)) };
+            mc_param_set(rest, mc_add(acc, concat("%", nm)))
+        }
+    }
+}
+
+// 0: the target is not in this subtree; 1: it is, and nothing evaluated after it in this subtree
+// mentions the set; 2: it is, and something after it does. Evaluation order: a let's right-hand
+// side, then its body; a case's scrutinee, then one arm; a call's or prim's inner operand, then
+// its right operand.
+fn mc_after(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string, target: int64) -> int64 {
+    case term.root < 0 of {
+        true -> 0;
+        false -> case term.root == target of {
+            true -> 1;
+            false -> {
+                n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+                a: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, n.inner);
+                b: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, n.right_expr);
+                ra: int64 <- mc_after(a, set, target);
+                case ra == 0 of {
+                    true -> mc_after(b, set, target);
+                    false -> case n.kind == 7 of {
+                        true -> ra;
+                        false -> case ra == 2 or mc_mentions(b, set) of {
+                            true -> 2;
+                            false -> 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The operand a send or spawn transfers: a send's message is its right operand, a spawn's initial
+// state its inner one.
+fn mc_site_operand(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+    case mc_is_send_prim(n.name) of {
+        true -> term_sir_helpers@sir_term_at(term, n.right_expr);
+        false -> term_sir_helpers@sir_term_at(term, n.inner)
+    }
+}
+
+fn mc_operand_type(operand: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+    term_sir_helpers@sir_term_root_node(operand).type_name
+}
+
+// A site transfers its operand when the operand's data (its taint closure) is no parameter's,
+// is not poisoned, and nothing after the site mentions it.
+fn mc_site_is_last_use(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, site: int64, params: string) -> boolean {
+    operand: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- mc_site_operand(term_sir_helpers@sir_term_at(body, site));
+    roots: string <- mc_vars(operand, ",");
+    case length_bytes(roots) <= 1 of {
+        true -> true;
+        false -> {
+            set: string <- mc_closure(body, roots, 64);
+            case mc_in_set(set, "!") or mc_intersects(params, set) of {
+                true -> false;
+                false -> mc_after(body, set, site) == 1
+            }
+        }
+    }
+}
+
+// ",12,45," of the send and spawn nodes whose operand would be copied and is a last use.
+fn mc_elided_sites(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, params: string, acc: string) -> string {
+    case term.root < 0 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            acc1: string <- case n.kind == 6 and (mc_is_send_prim(n.name) or mc_is_spawn_prim(n.name)) and md_prim_value_is_move(n.value) == false and md_type_needs_copy(mc_operand_type(mc_site_operand(term))) of {
+                true -> case mc_site_is_last_use(body, term.root, params) of {
+                    true -> concat(acc, concat(mc_itos(term.root), ","));
+                    false -> acc
+                };
+                false -> acc
+            };
+            acc2: string <- mc_elided_sites(body, term_sir_helpers@sir_term_at(term, n.inner), params, acc1);
+            mc_elided_sites(body, term_sir_helpers@sir_term_at(term, n.right_expr), params, acc2)
+        }
+    }
+}
+
+// Replies. The result positions of the body (through lets and case arms); a result that is a
+// three-element tuple_make led by an atom is a behaviour result (:reply, r, s): r is the second
+// element, s the third (tuple_make(inner = e1, right = tuple_make(inner = e2, right = e3))).
+fn mc_reply_needs_copy(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, params: string) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind of {
+                2 -> mc_reply_needs_copy(body, term_sir_helpers@sir_term_at(term, n.right_expr), params);
+                3 -> mc_reply_arms_need_copy(body, term_sir_helpers@sir_term_at(term, n.right_expr), params);
+                6 -> case n.name == "tuple_make" of {
+                    false -> false;
+                    true -> {
+                        rest: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, n.right_expr);
+                        rn: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(rest);
+                        case rn.kind == 6 and rn.name == "tuple_make" of {
+                            false -> false;
+                            true -> {
+                                r: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(rest, rn.inner);
+                                s: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(rest, rn.right_expr);
+                                case md_prim_is_move_wrapper(r) of {
+                                    true -> false;
+                                    false -> {
+                                        roots: string <- mc_vars(r, ",");
+                                        case length_bytes(roots) <= 1 of {
+                                            true -> false;
+                                            false -> {
+                                                set: string <- mc_closure(body, roots, 64);
+                                                mc_in_set(set, "!") or mc_intersects(params, set) or mc_mentions(s, set)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+fn mc_reply_arms_need_copy(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, arms: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, params: string) -> boolean {
+    case arms.root < 0 of {
+        true -> false;
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(arms);
+            case a.kind of {
+                7 -> case mc_reply_arms_need_copy(body, term_sir_helpers@sir_term_at(arms, a.inner), params) of {
+                    true -> true;
+                    false -> mc_reply_arms_need_copy(body, term_sir_helpers@sir_term_at(arms, a.right_expr), params)
+                };
+                8 -> mc_reply_needs_copy(body, term_sir_helpers@sir_term_at(arms, a.right_expr), params);
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+fn mc_reply_type(return_type: string) -> string {
+    t: string <- prims_record@strip_spaces_rt(return_type);
+    case mc_starts_with(t, "(:reply,") of {
+        true -> prims_tuple@tuple_type_nth_element(t, 1);
+        false -> ""
+    }
+}
+
+// The markers emit_sir_function adds to the body's binding string: "|_mvs=<node>,..." (sends and
+// spawns that transfer their operand) and "|_mvr=1" (the reply is not copied).
+fn fn_copy_markers(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    params: string <- mc_param_set(fn_val.param_names, ",");
+    sites: string <- mc_elided_sites(fn_val.body, fn_val.body, params, ",");
+    mvs: string <- case length_bytes(sites) <= 1 of {
+        true -> "";
+        false -> concat("|_mvs=", sites)
+    };
+    rt: string <- mc_reply_type(fn_val.return_type);
+    mvr: string <- case length_bytes(rt) > 0 and md_type_needs_copy(rt) and mc_reply_needs_copy(fn_val.body, fn_val.body, params) == false of {
+        true -> "|_mvr=1";
+        false -> ""
+    };
+    concat(mvs, mvr)
+}
+
+fn md_site_elided(outer_reg: string, node: int64) -> boolean {
+    m: string <- var@find_sp_binding(outer_reg, "_mvs");
+    length_bytes(m) > 1 and mc_has(m, concat(",", concat(mc_itos(node), ",")))
+}
+
+fn md_reply_elided(outer_reg: string) -> boolean {
+    var@find_sp_binding(outer_reg, "_mvr") == "1"
+}
+
+// The deep copy of a behaviour's reply for prims_actors@behaviour_result_move_asm: "" when the
+// reply type is not copied or every reply site transfers (markers "|_mvr=1"); else the copy call
+// with the shell in the CALLER's arena ([SP] is this ACB, its #240 the node served, the node's +56
+// the caller, as bmv_reply_asm reads them) followed by the descriptor rodata.
+fn md_reply_copy_asm(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, entry_label: string, markers: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    rt: string <- mc_reply_type(fn_val.return_type);
+    case length_bytes(rt) == 0 or md_type_needs_copy(rt) == false or md_reply_elided(markers) of {
+        true -> "";
+        false -> {
+            label: string <- concat("L_md_", concat(entry_label, "_r"));
+            acb: string <- concat(x86_mem@x86_ldr("X2", "[SP, #0]"), concat(x86_mem@x86_ldr("X2", "[X2, #240]"), x86_mem@x86_ldr("X2", "[X2, #56]")));
+            concat(md_copy_call_asm(label, acb), md_rodata_block(md_descriptor_rodata(rt, label, table)))
+        }
+    }
+}
+
+// ---- module gate ----------------------------------------------------------------------------------
+
+fn mc_term_has_copy_site(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind == 6 and (mc_is_send_prim(n.name) or mc_is_spawn_prim(n.name)) and md_type_needs_copy(mc_operand_type(mc_site_operand(term))) of {
+                true -> true;
+                false -> case mc_term_has_copy_site(term_sir_helpers@sir_term_at(term, n.inner)) of {
+                    true -> true;
+                    false -> mc_term_has_copy_site(term_sir_helpers@sir_term_at(term, n.right_expr))
+                }
+            }
+        }
+    }
+}
+
+fn mc_functions_copy(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> boolean {
+    case fns.is_nil of {
+        true -> false;
+        false -> {
+            rt: string <- mc_reply_type(fns.head.return_type);
+            case (length_bytes(rt) > 0 and md_type_needs_copy(rt)) or mc_term_has_copy_site(fns.head.body) of {
+                true -> true;
+                false -> mc_functions_copy(fns.tail)
+            }
+        }
+    }
+}
+
+// True when some send, spawn or reply of the module copies: the helper and the region helpers
+// (L_region_grow) are then appended.
+fn module_uses_message_copy(sir_module: { module_name: string, used_modules: List[string, mem(normal)], exports: List[{ fn_name: string, arity: string }, mem(normal)], export_trait_names: List[string, mem(normal)], marker_impl_types: List[string, mem(normal)], supervisor_impl_types: List[string, mem(normal)], supervisor_phase_e: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], failure_reporter_impl_types: List[string, mem(normal)], required_method_sigs: List[{ name: string, param_names: string, param_types: string, return_type: string, effects: string }, mem(normal)], runtime_dependencies: List[string, mem(normal)], is_dangerous_module: boolean, wrapper_meta_paths: List[string, mem(normal)], foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], link_libraries: List[string, mem(normal)], functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] }) -> boolean {
+    mc_functions_copy(sir_module.functions)
+}
+
+// ---- the helper (System V AMD64, Intel syntax) ------------------------------------------------
+//
+// L_mc_root(rdi = value, rsi = descriptor, rdx = shell ACB or 0) -> rdi = the copy (the emitter's
+// X0). Callee-saved registers hold the copy's state: rbx value, r12 descriptor, r13 shell ACB,
+// r14 table entries, r15 table capacity (a power of two); rbp is L_mc_root's frame and stays put
+// through every nested routine, which read the table count at [rbp-48] and the current fresh
+// region at [rbp-56]. Routines pass arguments in rdi, rsi, rdx and answer in rdi (L_mc_reserve
+// takes rdx and answers in rax); each keeps its locals in its own rsp frame, sized so rsp is
+// 16-byte aligned at every call. L_mc_lookup and L_mc_sum_desc clobber only rax, rcx, r8, r9
+// (and rdi / rsi for their answers). L_region_grow (prims_memory) reads the region from rsi and
+// the request from r15 and preserves everything, so L_mc_reserve parks r15 around it.
+
+fn mc_h_root() -> string {
+    concat(
+        "L_mc_root:\n    push rbp\n    mov rbp, rsp\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    sub rsp, 24\n    mov rbx, rdi\n    mov r12, rsi\n    mov r13, rdx\n    mov edi, 64\n    mov esi, 16\n    call calloc\n    mov r14, rax\n    mov r15, 64\n    mov QWORD PTR [rbp - 48], 0\n    mov QWORD PTR [rbp - 56], 0\n    test r14, r14\n    jz L_mc_root_done\n    mov rax, QWORD PTR [r12]\n    test rax, rax\n    jns L_mc_root_agg\n    mov rdi, rbx\n    mov rsi, r12\n    call L_mc_sum_desc\n    test rsi, rsi\n    jz L_mc_root_free\n    mov r12, rsi\nL_mc_root_agg:\n",
+        "    mov rdi, rbx\n    mov rsi, r12\n    call L_mc_premap\n    mov rdi, rbx\n    mov rsi, r12\n    mov edx, 1\n    call L_mc_agg\n    mov rbx, rdi\nL_mc_root_free:\n    mov rdi, r14\n    call free\nL_mc_root_done:\n    mov rdi, rbx\n    add rsp, 24\n    pop r15\n    pop r14\n    pop r13\n    pop r12\n    pop rbx\n    pop rbp\n    ret\n")
+}
+
+// The pre-map walk: every REGION word reachable through AGG and SUM entries gets its fresh region.
+fn mc_h_premap() -> string {
+    concat(
+        "L_mc_premap:\n    cmp rdi, 65536\n    jb L_mc_pm_ret\n    sub rsp, 40\n    mov QWORD PTR [rsp], rdi\n    mov QWORD PTR [rsp + 8], rsi\n    mov QWORD PTR [rsp + 16], 0\nL_mc_pm_loop:\n    mov rcx, QWORD PTR [rsp + 16]\n    mov rsi, QWORD PTR [rsp + 8]\n    cmp rcx, QWORD PTR [rsi]\n    jae L_mc_pm_done\n    lea r8, [rsi + 16]\n    shl rcx, 4\n    add r8, rcx\n    mov r9, QWORD PTR [r8]\n    mov rdx, QWORD PTR [r8 + 8]\n    mov rcx, QWORD PTR [rsp + 16]\n    mov rax, QWORD PTR [rsp]\n    mov rdi, QWORD PTR [rax + rcx*8]\n    cmp r9, 1\n    je L_mc_pm_region\n    cmp r9, 4\n    je L_mc_pm_agg\n    cmp r9, 5\n    je L_mc_pm_sum\n    jmp L_mc_pm_next\n",
+        "L_mc_pm_region:\n    call L_mc_map_region\n    jmp L_mc_pm_next\nL_mc_pm_agg:\n    mov rsi, rdx\n    call L_mc_premap\n    jmp L_mc_pm_next\nL_mc_pm_sum:\n    mov rsi, rdx\n    call L_mc_sum_desc\n    test rsi, rsi\n    jz L_mc_pm_next\n    call L_mc_premap\nL_mc_pm_next:\n    inc QWORD PTR [rsp + 16]\n    jmp L_mc_pm_loop\nL_mc_pm_done:\n    add rsp, 40\nL_mc_pm_ret:\n    ret\n")
+}
+
+// rdi = a region handle: mapped to a fresh region unless null, already mapped, or canonical.
+fn mc_h_map_region() -> string {
+    concat(
+        "L_mc_map_region:\n    sub rsp, 24\n    mov QWORD PTR [rsp], rdi\n    test rdi, rdi\n    jz L_mc_mr_done\n    call L_mc_lookup\n    test rdi, rdi\n    jnz L_mc_mr_done\n    mov rdi, QWORD PTR [rsp]\n    call L_mc_is_canonical\n    test rdi, rdi\n    jnz L_mc_mr_done\n    call L_mc_new_region\n    mov QWORD PTR [rbp - 56], rdi\n    mov rsi, rdi\n    mov rdi, QWORD PTR [rsp]\n    call L_mc_insert\nL_mc_mr_done:\n    add rsp, 24\n    ret\n",
+        "L_mc_is_canonical:\n    lea rax, [rip + silica_rt_canonical_arena_table]\n    mov ecx, 512\nL_mc_ic_loop:\n    cmp QWORD PTR [rax + 8], rdi\n    je L_mc_ic_yes\n    add rax, 16\n    dec ecx\n    jnz L_mc_ic_loop\n    xor edi, edi\n    ret\nL_mc_ic_yes:\n    mov edi, 1\n    ret\n")
+}
+
+// A fresh owned region, as alloc_region makes one (prims_memory@emit_alloc_region).
+fn mc_h_new_region() -> string {
+    "L_mc_new_region:\n    sub rsp, 8\n    mov edi, 4128\n    call silica_rt_raw_alloc\n    test rdi, rdi\n    jnz L_mc_nr_ok\n    call silica_rt_region_alloc_failed\nL_mc_nr_ok:\n    lea rax, [rdi + 32]\n    mov QWORD PTR [rdi], rax\n    lea rax, [rdi + 4128]\n    mov QWORD PTR [rdi + 8], rax\n    mov QWORD PTR [rdi + 16], 0\n    mov QWORD PTR [rdi + 24], rax\n    add rsp, 8\n    ret\n"
+}
+
+// rdx = bytes -> rax = their start in the current fresh region (the reservation of
+// prims_memory@emit_region_bump_check). rdx = bytes -> rdi = the shell's block: the ACB's arena
+// when r13 names one, else this actor's.
+fn mc_h_reserve() -> string {
+    concat(
+        "L_mc_reserve:\n    push r15\n    mov r15, rdx\n    mov rsi, QWORD PTR [rbp - 56]\nL_mc_rs_try:\n    mov rax, QWORD PTR [rsi]\n    mov r8, QWORD PTR [rsi + 8]\n    lea r9, [rax + r15]\n    cmp r9, r8\n    ja L_mc_rs_grow\n    lock cmpxchg QWORD PTR [rsi], r9\n    jne L_mc_rs_try\n    pop r15\n    ret\nL_mc_rs_grow:\n    call L_region_grow\n    jmp L_mc_rs_try\n",
+        "L_mc_alloc_shell:\n    sub rsp, 8\n    test r13, r13\n    jz L_mc_as_here\n    mov rdi, r13\n    mov rsi, rdx\n    call silica_rt_region_alloc_in\n    add rsp, 8\n    ret\nL_mc_as_here:\n    mov rdi, rdx\n    call silica_rt_region_alloc\n    add rsp, 8\n    ret\n")
+}
+
+// L_mc_agg(rdi = aggregate, rsi = descriptor, rdx = 1 for the message's shell) -> rdi = the copy.
+// Frame: [rsp] source, +8 descriptor, +16 word index, +24 destination, +32 shallow, +40 shell.
+fn mc_h_agg() -> string {
+    concat(concat(
+        "L_mc_agg:\n    cmp rdi, 65536\n    jb L_mc_agg_asis\n    sub rsp, 56\n    mov QWORD PTR [rsp], rdi\n    mov QWORD PTR [rsp + 8], rsi\n    mov QWORD PTR [rsp + 40], rdx\n    mov QWORD PTR [rsp + 32], 0\n    mov rax, QWORD PTR [rsi + 8]\n    test rax, rax\n    js L_mc_agg_deep\n    mov rdi, QWORD PTR [rdi + rax*8]\n    test rdi, rdi\n    jz L_mc_agg_shallow\n    call L_mc_lookup\n    test rdi, rdi\n    jnz L_mc_agg_deep\nL_mc_agg_shallow:\n    mov QWORD PTR [rsp + 32], 1\nL_mc_agg_deep:\n",
+        "    mov rsi, QWORD PTR [rsp + 8]\n    mov rdx, QWORD PTR [rsi]\n    shl rdx, 3\n    cmp QWORD PTR [rsp + 40], 0\n    jne L_mc_agg_shell\n    cmp QWORD PTR [rbp - 56], 0\n    je L_mc_agg_shell\n    call L_mc_reserve\n    mov QWORD PTR [rsp + 24], rax\n    jmp L_mc_agg_have\nL_mc_agg_shell:\n    call L_mc_alloc_shell\n    mov QWORD PTR [rsp + 24], rdi\nL_mc_agg_have:\n    mov QWORD PTR [rsp + 16], 0\nL_mc_agg_loop:\n    mov rcx, QWORD PTR [rsp + 16]\n    mov rsi, QWORD PTR [rsp + 8]\n    cmp rcx, QWORD PTR [rsi]\n    jae L_mc_agg_done\n    mov rax, QWORD PTR [rsp]\n    mov rdi, QWORD PTR [rax + rcx*8]\n    cmp QWORD PTR [rsp + 32], 0\n    jne L_mc_agg_store\n    lea r8, [rsi + 16]\n    shl rcx, 4\n    add r8, rcx\n    mov rsi, QWORD PTR [r8]\n    mov rdx, QWORD PTR [r8 + 8]\n    call L_mc_word\n"),
+        "L_mc_agg_store:\n    mov rcx, QWORD PTR [rsp + 16]\n    mov rax, QWORD PTR [rsp + 24]\n    mov QWORD PTR [rax + rcx*8], rdi\n    inc QWORD PTR [rsp + 16]\n    jmp L_mc_agg_loop\nL_mc_agg_done:\n    mov rdi, QWORD PTR [rsp + 24]\n    add rsp, 56\nL_mc_agg_asis:\n    ret\n")
+}
+
+// L_mc_word(rdi = word, rsi = kind, rdx = aux) -> rdi = the copied word. Kinds 7, 8 and 9 (list,
+// string, closure) are answered as they are in phase 0 (header).
+// L_mc_sum_desc(rdi = value, rsi = table) -> rsi = the alternative's descriptor or 0; rdi kept.
+fn mc_h_word() -> string {
+    concat(concat(
+        "L_mc_word:\n    test rsi, rsi\n    jz L_mc_w_ret\n    cmp rsi, 6\n    ja L_mc_w_ret\n    cmp rsi, 1\n    je L_mc_w_region\n    cmp rsi, 4\n    je L_mc_w_agg\n    cmp rsi, 5\n    je L_mc_w_sum\n    jmp L_mc_ref\nL_mc_w_region:\n    sub rsp, 24\n    mov QWORD PTR [rsp], rdi\n    call L_mc_lookup\n    test rdi, rdi\n    jnz L_mc_w_region_done\n    mov rdi, QWORD PTR [rsp]\nL_mc_w_region_done:\n    add rsp, 24\n    ret\nL_mc_w_agg:\n    mov rsi, rdx\n    xor edx, edx\n    jmp L_mc_agg\n",
+        "L_mc_w_sum:\n    sub rsp, 8\n    mov rsi, rdx\n    call L_mc_sum_desc\n    test rsi, rsi\n    jz L_mc_w_sum_done\n    xor edx, edx\n    call L_mc_agg\nL_mc_w_sum_done:\n    add rsp, 8\nL_mc_w_ret:\n    ret\n"),
+        "L_mc_sum_desc:\n    cmp rdi, 65536\n    jb L_mc_sd_none\n    mov rax, QWORD PTR [rdi]\n    mov rcx, QWORD PTR [rsi]\n    not rcx\n    lea r8, [rsi + 8]\nL_mc_sd_loop:\n    test rcx, rcx\n    jz L_mc_sd_none\n    cmp QWORD PTR [r8], rax\n    je L_mc_sd_hit\n    add r8, 16\n    dec rcx\n    jmp L_mc_sd_loop\nL_mc_sd_hit:\n    mov rsi, QWORD PTR [r8 + 8]\n    ret\nL_mc_sd_none:\n    xor esi, esi\n    ret\n")
+}
+
+// L_mc_ref(rdi = ref / buf word, rsi = kind 2 | 3 | 6, rdx = aux) -> rdi = the copy. An atom
+// (:none) is answered as is, as is any ref while no fresh region exists.
+// Frame: [rsp] source, +8 kind, +16 aux (REFTUP: the payload tuple's descriptor), +24 destination, +32 index.
+fn mc_h_ref() -> string {
+    concat(concat(concat(
+        "L_mc_ref:\n    cmp rdi, 65536\n    jb L_mc_ref_asis\n    cmp QWORD PTR [rbp - 56], 0\n    je L_mc_ref_asis\n    sub rsp, 40\n    mov QWORD PTR [rsp], rdi\n    mov QWORD PTR [rsp + 8], rsi\n    mov QWORD PTR [rsp + 16], rdx\n    call L_mc_lookup\n    test rdi, rdi\n    jnz L_mc_ref_done\n    cmp QWORD PTR [rsp + 8], 2\n    je L_mc_ref1\n    cmp QWORD PTR [rsp + 8], 3\n    je L_mc_refrec\n",
+        "    mov rax, QWORD PTR [rsp]\n    mov rdx, QWORD PTR [rax - 8]\n    imul rdx, QWORD PTR [rsp + 16]\n    add rdx, 15\n    and rdx, -8\n    call L_mc_reserve\n    mov QWORD PTR [rsp + 24], rax\n    mov rcx, QWORD PTR [rsp]\n    mov r8, QWORD PTR [rcx - 8]\n    mov QWORD PTR [rax], r8\n    imul r8, QWORD PTR [rsp + 16]\n    add r8, 7\n    shr r8, 3\n    xor r9d, r9d\nL_mc_buf_loop:\n    cmp r9, r8\n    jae L_mc_buf_copied\n    mov r10, QWORD PTR [rcx + r9*8]\n    mov QWORD PTR [rax + 8 + r9*8], r10\n    inc r9\n    jmp L_mc_buf_loop\nL_mc_buf_copied:\n    add rax, 8\n    mov QWORD PTR [rsp + 24], rax\n    mov rdi, QWORD PTR [rsp]\n    mov rsi, rax\n    call L_mc_insert\n    mov rdi, QWORD PTR [rsp + 24]\n    jmp L_mc_ref_done\n"),
+        "L_mc_ref1:\n    mov edx, 8\n    call L_mc_reserve\n    mov QWORD PTR [rsp + 24], rax\n    mov rdi, QWORD PTR [rsp]\n    mov rsi, rax\n    call L_mc_insert\n    mov rax, QWORD PTR [rsp]\n    mov rdi, QWORD PTR [rax]\n    mov r8, QWORD PTR [rsp + 16]\n    mov rsi, QWORD PTR [r8 + 16]\n    mov rdx, QWORD PTR [r8 + 24]\n    call L_mc_word\n    mov rax, QWORD PTR [rsp + 24]\n    mov QWORD PTR [rax], rdi\n    mov rdi, rax\n    jmp L_mc_ref_done\nL_mc_refrec:\n    mov r8, QWORD PTR [rsp + 16]\n    mov rdx, QWORD PTR [r8]\n    shl rdx, 3\n    add rdx, 15\n    and rdx, -16\n    add rdx, 8\n    call L_mc_reserve\n    mov QWORD PTR [rsp + 24], rax\n    lea rcx, [rax + 8]\n    mov QWORD PTR [rax], rcx\n    mov rdi, QWORD PTR [rsp]\n    mov rsi, rax\n    call L_mc_insert\n    mov QWORD PTR [rsp + 32], 0\n"),
+        "L_mc_rr_loop:\n    mov rcx, QWORD PTR [rsp + 32]\n    mov r8, QWORD PTR [rsp + 16]\n    cmp rcx, QWORD PTR [r8]\n    jae L_mc_rr_done\n    mov rax, QWORD PTR [rsp]\n    mov rax, QWORD PTR [rax]\n    mov rdi, QWORD PTR [rax + rcx*8]\n    lea r9, [r8 + 16]\n    shl rcx, 4\n    add r9, rcx\n    mov rsi, QWORD PTR [r9]\n    mov rdx, QWORD PTR [r9 + 8]\n    call L_mc_word\n    mov rcx, QWORD PTR [rsp + 32]\n    mov rax, QWORD PTR [rsp + 24]\n    mov QWORD PTR [rax + 8 + rcx*8], rdi\n    inc QWORD PTR [rsp + 32]\n    jmp L_mc_rr_loop\nL_mc_rr_done:\n    mov rdi, QWORD PTR [rsp + 24]\nL_mc_ref_done:\n    add rsp, 40\nL_mc_ref_asis:\n    ret\n")
+}
+
+// The per-message table: open addressing over (key, value) pairs, grown at half load.
+// L_mc_lookup(rdi = key) -> rdi = value or 0. L_mc_insert(rdi = key, rsi = value).
+fn mc_h_table() -> string {
+    concat(concat(
+        "L_mc_lookup:\n    lea rcx, [r15 - 1]\n    mov r8, rdi\n    shr r8, 3\n    and r8, rcx\nL_mc_lk_probe:\n    mov r9, r8\n    shl r9, 4\n    add r9, r14\n    mov rax, QWORD PTR [r9]\n    test rax, rax\n    jz L_mc_lk_miss\n    cmp rax, rdi\n    je L_mc_lk_hit\n    inc r8\n    and r8, rcx\n    jmp L_mc_lk_probe\nL_mc_lk_miss:\n    xor edi, edi\n    ret\nL_mc_lk_hit:\n    mov rdi, QWORD PTR [r9 + 8]\n    ret\n",
+        "L_mc_insert:\n    sub rsp, 24\n    mov QWORD PTR [rsp], rdi\n    mov QWORD PTR [rsp + 8], rsi\n    mov rax, QWORD PTR [rbp - 48]\n    shl rax, 1\n    cmp rax, r15\n    jb L_mc_in_room\n    call L_mc_grow\nL_mc_in_room:\n    mov rdi, QWORD PTR [rsp]\n    mov rsi, QWORD PTR [rsp + 8]\n    lea rcx, [r15 - 1]\n    mov r8, rdi\n    shr r8, 3\n    and r8, rcx\nL_mc_in_probe:\n    mov r9, r8\n    shl r9, 4\n    add r9, r14\n    cmp QWORD PTR [r9], 0\n    je L_mc_in_put\n    inc r8\n    and r8, rcx\n    jmp L_mc_in_probe\nL_mc_in_put:\n    mov QWORD PTR [r9], rdi\n    mov QWORD PTR [r9 + 8], rsi\n    inc QWORD PTR [rbp - 48]\n    add rsp, 24\n    ret\n"),
+        "L_mc_grow:\n    sub rsp, 24\n    mov QWORD PTR [rsp], r14\n    mov QWORD PTR [rsp + 8], r15\n    mov rdi, r15\n    shl rdi, 1\n    mov esi, 16\n    call calloc\n    test rax, rax\n    jz L_mc_gr_done\n    mov r14, rax\n    shl r15, 1\n    mov QWORD PTR [rbp - 48], 0\n    mov QWORD PTR [rsp + 16], 0\nL_mc_gr_loop:\n    mov rcx, QWORD PTR [rsp + 16]\n    cmp rcx, QWORD PTR [rsp + 8]\n    jae L_mc_gr_free\n    shl rcx, 4\n    add rcx, QWORD PTR [rsp]\n    mov rdi, QWORD PTR [rcx]\n    test rdi, rdi\n    jz L_mc_gr_next\n    mov rsi, QWORD PTR [rcx + 8]\n    call L_mc_insert\nL_mc_gr_next:\n    inc QWORD PTR [rsp + 16]\n    jmp L_mc_gr_loop\nL_mc_gr_free:\n    mov rdi, QWORD PTR [rsp]\n    call free\nL_mc_gr_done:\n    add rsp, 24\n    ret\n")
+}
+
+// ---- measuring mode (design §5.1) --------------------------------------------------------------------
+//
+// L_mc_measure(rdi = value, rsi = descriptor) -> rdi = the bytes a copy of the value occupies: every node
+// at the size L_mc_root reserves for it (an aggregate N*8; a REF1 cell 8; a REFTUP cell its payload
+// rounded to 16 plus the 8-byte cell word; a buffer (count * elem + 15) & ~7), plus the kinds the copy
+// does not build yet (a list handle 24 and CDATA + 16 per chunk of its spine; a run-time string
+// 24 + bytes + 1 rounded to 8; a literal string 0). A node reached twice is counted once (the copy's
+// table, value 1). No region is mapped and nothing is shallow: every described node counts. The frame
+// is L_mc_root's (rbx value, r12 descriptor, r14/r15 the table, [rbp-48] its count, [rbp-56] the fresh
+// region, always 0 here) with r13 the running total; the walkers keep their locals in rsp frames.
+fn mc_h_measure_root() -> string {
+    concat(
+        "L_mc_measure:\n    push rbp\n    mov rbp, rsp\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    sub rsp, 24\n    mov rbx, rdi\n    mov r12, rsi\n    xor r13d, r13d\n    mov edi, 64\n    mov esi, 16\n    call calloc\n    mov r14, rax\n    mov r15, 64\n    mov QWORD PTR [rbp - 48], 0\n    mov QWORD PTR [rbp - 56], 0\n    test r14, r14\n    jz L_mc_ms_done\n    mov rax, QWORD PTR [r12]\n    test rax, rax\n    jns L_mc_ms_agg\n    mov rdi, rbx\n    mov rsi, r12\n    call L_mc_sum_desc\n    test rsi, rsi\n    jz L_mc_ms_free\n    mov r12, rsi\nL_mc_ms_agg:\n",
+        "    mov rdi, rbx\n    mov rsi, r12\n    call L_mc_m_agg\nL_mc_ms_free:\n    mov rdi, r14\n    call free\nL_mc_ms_done:\n    mov rdi, r13\n    add rsp, 24\n    pop r15\n    pop r14\n    pop r13\n    pop r12\n    pop rbx\n    pop rbp\n    ret\n")
+}
+
+// L_mc_m_agg(rdi = aggregate, rsi = descriptor): N*8, then every word through L_mc_m_word.
+// Frame: [rsp] source, +8 descriptor, +16 word index.
+// L_mc_m_word(rdi = word, rsi = kind, rdx = aux): dispatch; 0, 1 and 9 count nothing.
+fn mc_h_measure_agg_word() -> string {
+    concat(
+        "L_mc_m_agg:\n    cmp rdi, 65536\n    jb L_mc_m_agg_ret\n    sub rsp, 40\n    mov QWORD PTR [rsp], rdi\n    mov QWORD PTR [rsp + 8], rsi\n    mov QWORD PTR [rsp + 16], 0\n    mov rax, QWORD PTR [rsi]\n    shl rax, 3\n    add r13, rax\nL_mc_m_agg_loop:\n    mov rcx, QWORD PTR [rsp + 16]\n    mov rsi, QWORD PTR [rsp + 8]\n    cmp rcx, QWORD PTR [rsi]\n    jae L_mc_m_agg_done\n    lea r8, [rsi + 16]\n    shl rcx, 4\n    add r8, rcx\n    mov rcx, QWORD PTR [rsp + 16]\n    mov rax, QWORD PTR [rsp]\n    mov rdi, QWORD PTR [rax + rcx*8]\n    mov rsi, QWORD PTR [r8]\n    mov rdx, QWORD PTR [r8 + 8]\n    call L_mc_m_word\n    inc QWORD PTR [rsp + 16]\n    jmp L_mc_m_agg_loop\nL_mc_m_agg_done:\n    add rsp, 40\nL_mc_m_agg_ret:\n    ret\n",
+        "L_mc_m_word:\n    test rsi, rsi\n    jz L_mc_mw_ret\n    cmp rsi, 1\n    je L_mc_mw_ret\n    cmp rsi, 9\n    je L_mc_mw_ret\n    cmp rsi, 4\n    je L_mc_mw_agg\n    cmp rsi, 5\n    je L_mc_mw_sum\n    cmp rsi, 7\n    je L_mc_m_list\n    cmp rsi, 8\n    je L_mc_m_str\n    jmp L_mc_m_ref\nL_mc_mw_agg:\n    mov rsi, rdx\n    jmp L_mc_m_agg\nL_mc_mw_sum:\n    sub rsp, 8\n    mov rsi, rdx\n    call L_mc_sum_desc\n    test rsi, rsi\n    jz L_mc_mw_sum_done\n    call L_mc_m_agg\nL_mc_mw_sum_done:\n    add rsp, 8\nL_mc_mw_ret:\n    ret\n")
+}
+
+// L_mc_m_ref(rdi = ref / buf word, rsi = kind 2 | 3 | 6, rdx = aux): the copy's sizes (L_mc_ref), each
+// node once. Frame: [rsp] source, +8 kind, +16 aux, +24 the REFTUP payload word index.
+fn mc_h_measure_ref() -> string {
+    concat(concat(
+        "L_mc_m_ref:\n    cmp rdi, 65536\n    jb L_mc_mref_asis\n    sub rsp, 40\n    mov QWORD PTR [rsp], rdi\n    mov QWORD PTR [rsp + 8], rsi\n    mov QWORD PTR [rsp + 16], rdx\n    call L_mc_lookup\n    test rdi, rdi\n    jnz L_mc_mref_done\n    mov rdi, QWORD PTR [rsp]\n    mov esi, 1\n    call L_mc_insert\n    cmp QWORD PTR [rsp + 8], 2\n    je L_mc_mref_ref1\n    cmp QWORD PTR [rsp + 8], 3\n    je L_mc_mref_rec\n    mov rax, QWORD PTR [rsp]\n    mov rdx, QWORD PTR [rax - 8]\n    imul rdx, QWORD PTR [rsp + 16]\n    add rdx, 15\n    and rdx, -8\n    add r13, rdx\n    jmp L_mc_mref_done\n",
+        "L_mc_mref_ref1:\n    add r13, 8\n    mov rax, QWORD PTR [rsp]\n    mov rdi, QWORD PTR [rax]\n    mov r8, QWORD PTR [rsp + 16]\n    mov rsi, QWORD PTR [r8 + 16]\n    mov rdx, QWORD PTR [r8 + 24]\n    call L_mc_m_word\n    jmp L_mc_mref_done\nL_mc_mref_rec:\n    mov r8, QWORD PTR [rsp + 16]\n    mov rdx, QWORD PTR [r8]\n    shl rdx, 3\n    add rdx, 15\n    and rdx, -16\n    add rdx, 8\n    add r13, rdx\n    mov QWORD PTR [rsp + 24], 0\n"),
+        "L_mc_mref_loop:\n    mov rcx, QWORD PTR [rsp + 24]\n    mov r8, QWORD PTR [rsp + 16]\n    cmp rcx, QWORD PTR [r8]\n    jae L_mc_mref_done\n    mov rax, QWORD PTR [rsp]\n    mov rax, QWORD PTR [rax]\n    mov rdi, QWORD PTR [rax + rcx*8]\n    lea r9, [r8 + 16]\n    shl rcx, 4\n    add r9, rcx\n    mov rsi, QWORD PTR [r9]\n    mov rdx, QWORD PTR [r9 + 8]\n    call L_mc_m_word\n    inc QWORD PTR [rsp + 24]\n    jmp L_mc_mref_loop\nL_mc_mref_done:\n    add rsp, 40\nL_mc_mref_asis:\n    ret\n")
+}
+
+// L_mc_m_list(rdi = handle, rdx = aux): 24 for the handle and CDATA + 16 per chunk of the spine
+// (CDATA = max(16, slot bytes), the slot bytes from the aux header); the element words of a
+// pointer-carrying element type with 8-byte slots are walked, the first chunk from the handle's
+// cursor and every later chunk from its claim word (the lowest offset handed out), at most the
+// handle's length of them. Inline aggregate slots are counted with their chunk and not walked
+// (phase 4 settles their copy). Frame: [rsp] handle, +8 aux, +16 elements left, +24 slot offset,
+// +32 CDATA, +40 chunk.
+// L_mc_m_str(rdi = string): a literal (marker -2) counts nothing; a run-time string (marker -1)
+// counts 24 + length + 1 rounded to 8, once.
+fn mc_h_measure_list_str() -> string {
+    concat(concat(
+        "L_mc_m_list:\n    test rdi, rdi\n    jz L_mc_ml_ret\n    sub rsp, 56\n    mov QWORD PTR [rsp], rdi\n    mov QWORD PTR [rsp + 8], rdx\n    call L_mc_lookup\n    test rdi, rdi\n    jnz L_mc_ml_done\n    mov rdi, QWORD PTR [rsp]\n    mov esi, 1\n    call L_mc_insert\n    add r13, 24\n    mov rax, QWORD PTR [rsp]\n    mov rcx, QWORD PTR [rax]\n    mov QWORD PTR [rsp + 16], rcx\n    mov r8, QWORD PTR [rsp + 8]\n    mov rcx, QWORD PTR [r8 + 8]\n    cmp rcx, 16\n    jae L_mc_ml_cdata\n    mov ecx, 16\nL_mc_ml_cdata:\n    mov QWORD PTR [rsp + 32], rcx\n    mov rcx, QWORD PTR [rax + 8]\n    mov QWORD PTR [rsp + 40], rcx\n    mov rcx, QWORD PTR [rax + 16]\n    mov QWORD PTR [rsp + 24], rcx\n",
+        "L_mc_ml_chunk:\n    cmp QWORD PTR [rsp + 40], 0\n    je L_mc_ml_done\n    mov rcx, QWORD PTR [rsp + 32]\n    add rcx, 16\n    add r13, rcx\n    mov r8, QWORD PTR [rsp + 8]\n    mov rcx, QWORD PTR [r8 + 16]\n    test rcx, rcx\n    jz L_mc_ml_next\n    cmp rcx, 9\n    je L_mc_ml_next\n    cmp QWORD PTR [r8 + 8], 8\n    jne L_mc_ml_next\nL_mc_ml_slot:\n    cmp QWORD PTR [rsp + 16], 0\n    je L_mc_ml_done\n    mov rcx, QWORD PTR [rsp + 24]\n    cmp rcx, QWORD PTR [rsp + 32]\n    jae L_mc_ml_next\n    mov rax, QWORD PTR [rsp + 40]\n    mov rdi, QWORD PTR [rax + rcx]\n    add rcx, 8\n    mov QWORD PTR [rsp + 24], rcx\n    dec QWORD PTR [rsp + 16]\n    mov r8, QWORD PTR [rsp + 8]\n    mov rsi, QWORD PTR [r8 + 16]\n    mov rdx, QWORD PTR [r8 + 24]\n    call L_mc_m_word\n    jmp L_mc_ml_slot\nL_mc_ml_next:\n    mov rax, QWORD PTR [rsp + 40]\n    mov rcx, QWORD PTR [rsp + 32]\n    mov rax, QWORD PTR [rax + rcx]\n    mov QWORD PTR [rsp + 40], rax\n    test rax, rax\n    jz L_mc_ml_done\n    mov rcx, QWORD PTR [rax + rcx + 8]\n    mov QWORD PTR [rsp + 24], rcx\n    jmp L_mc_ml_chunk\nL_mc_ml_done:\n    add rsp, 56\nL_mc_ml_ret:\n    ret\n"),
+        "L_mc_m_str:\n    cmp rdi, 65536\n    jb L_mc_mstr_ret\n    cmp QWORD PTR [rdi], -2\n    je L_mc_mstr_ret\n    sub rsp, 24\n    mov QWORD PTR [rsp], rdi\n    call L_mc_lookup\n    test rdi, rdi\n    jnz L_mc_mstr_done\n    mov rdi, QWORD PTR [rsp]\n    mov esi, 1\n    call L_mc_insert\n    mov rax, QWORD PTR [rsp]\n    mov rcx, QWORD PTR [rax + 16]\n    add rcx, 32\n    and rcx, -8\n    add r13, rcx\nL_mc_mstr_done:\n    add rsp, 24\nL_mc_mstr_ret:\n    ret\n")
+}
+
+fn emit_message_copy_helper() -> string {
+    concat(concat(concat(concat(mc_h_root(), mc_h_premap()), concat(mc_h_map_region(), mc_h_new_region())), concat(concat(mc_h_reserve(), mc_h_agg()), concat(concat(mc_h_word(), mc_h_ref()), mc_h_table()))), concat(concat(mc_h_measure_root(), mc_h_measure_agg_word()), concat(mc_h_measure_ref(), mc_h_measure_list_str())))
+}
+
+// ---- per-type descriptor labels (design §3.6 "Descriptor emission") ---------------------------------
+//
+// L_td_<fn label> names the descriptor of a function's result type, L_td_<fn label>_s a behaviour's
+// state type and L_td_<fn label>_r its reply type. Bodies are emitted once per distinct type per module
+// (L_td_<module>_<k>_0 and children) and every function label is a `.set` alias of its body.
+
+fn md_type_label(fnl: string, suffix: string) -> string {
+    concat("L_td_", concat(fnl, suffix))
+}
+
+// A result type that is a pointer at its root, or a record / tuple / sum (itself a node): kinds
+// 2 to 8. Scalars, regions and closures get no descriptor.
+fn md_root_needs_descriptor(t: string) -> boolean {
+    k: int64 <- mc_kind_of(t, false);
+    k >= 2 and k <= 8
+}
+
+// The descriptor rodata of a type rooted at <label>_0: an aggregate or sum as md_descriptor_rodata
+// emits it; any other pointer kind as a one-entry descriptor `.quad 1, -1` over the root word.
+fn md_root_descriptor_rodata(t: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    case mc_kind_of(t, false) of {
+        4 -> mc_agg_desc(t, label, 0, table, 0, "").text;
+        5 -> mc_sum_table(t, label, 0, table, 0, "").text;
+        _: int64 -> {
+            e: { line: string, child: string, k: int64 } <- mc_entry(t, label, 1, table, 0, "");
+            concat(mc_lbl(label, 0), concat(":\n    .quad 1, -1\n", concat(e.line, e.child)))
+        }
+    }
+}
+
+// The state type of a behaviour's return type: the last element of `(:reply, R, S)` or `(:no_reply, S)`,
+// "" otherwise.
+fn mc_state_type(return_type: string) -> string {
+    t: string <- prims_record@strip_spaces_rt(return_type);
+    case mc_starts_with(t, "(:reply,") and mc_tuple_arity(t) == 3 of {
+        true -> prims_tuple@tuple_type_nth_element(t, 2);
+        false -> case mc_starts_with(t, "(:no_reply,") and mc_tuple_arity(t) == 2 of {
+            true -> prims_tuple@tuple_type_nth_element(t, 1);
+            false -> ""
+        }
+    }
+}
+
+fn mc_tuple_arity(t: string) -> int64 {
+    mc_count_elems(substring(t, 1, length_bytes(t) - 1), 0, 0)
+}
+
+fn mc_count_elems(inner: string, i: int64, n: int64) -> int64 {
+    case i >= length_bytes(inner) of {
+        true -> n;
+        false -> mc_count_elems(inner, mc_top_sep(inner, i, 0, ",") + 1, n + 1)
+    }
+}
+
+// The distinct types seen so far, one per line ("<type>\n"); the index of a type is its line number.
+fn mc_type_line_index(seen: string, t: string, i: int64, k: int64) -> int64 {
+    case i >= length_bytes(seen) of {
+        true -> 0 - 1;
+        false -> {
+            e: int64 <- mc_find_from(seen, "\n", i);
+            case substring(seen, i, e) == t of {
+                true -> k;
+                false -> mc_type_line_index(seen, t, e + 1, k + 1)
+            }
+        }
+    }
+}
+
+// One label: the body (when the type is new) and the alias line.
+fn md_td_one(t0: string, label: string, module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, acc: { seen: string, n: int64, bodies: string, aliases: string }) -> { seen: string, n: int64, bodies: string, aliases: string } {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    case length_bytes(t) == 0 or md_root_needs_descriptor(t) == false of {
+        true -> acc;
+        false -> {
+            k0: int64 <- mc_type_line_index(acc.seen, t, 0, 0);
+            body_label: string <- concat("L_td_", concat(module_name, concat("_", mc_itos(case k0 < 0 of { true -> acc.n; false -> k0 }))));
+            alias: string <- concat(".set ", concat(label, concat(", ", concat(mc_lbl(body_label, 0), "\n"))));
+            case k0 < 0 of {
+                true -> { seen: concat(acc.seen, concat(t, "\n")), n: acc.n + 1, bodies: concat(acc.bodies, md_root_descriptor_rodata(t, body_label, table)), aliases: concat(acc.aliases, alias) };
+                false -> { seen: acc.seen, n: acc.n, bodies: acc.bodies, aliases: concat(acc.aliases, alias) }
+            }
+        }
+    }
+}
+
+fn md_td_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, acc: { seen: string, n: int64, bodies: string, aliases: string }) -> { seen: string, n: int64, bodies: string, aliases: string } {
+    case fns.is_nil of {
+        true -> acc;
+        false -> {
+            fnl: string <- module_linkage@asm_symbol_for_definition(module_name, fns.head.name);
+            rt: string <- fns.head.return_type;
+            a1: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_one(rt, md_type_label(fnl, ""), module_name, table, acc);
+            a2: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_one(mc_state_type(rt), md_type_label(fnl, "_s"), module_name, table, a1);
+            a3: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_one(mc_reply_type(rt), md_type_label(fnl, "_r"), module_name, table, a2);
+            md_td_functions(fns.tail, module_name, table, a3)
+        }
+    }
+}
+
+// The module's block: the bodies in the pointer-bearing constant section, then the aliases.
+fn md_type_descriptors_block(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    r: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_functions(fns, module_name, table, { seen: "", n: 0, bodies: "", aliases: "" });
+    case length_bytes(r.bodies) == 0 of {
+        true -> "";
+        false -> concat("\n", concat(md_rodata_block(r.bodies), r.aliases))
+    }
+}
+

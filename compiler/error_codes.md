@@ -81,7 +81,7 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E2007 UnknownFunction — unknown function, or an unqualified call to a function defined only in another module (imported functions are called module-qualified); also unknown behavior function in spawn builtins
 - E2008 CaseMissingCatchAllArm — a case over an integer type or string must end with a typed catch-all arm `_: T ->` (a bare `_ ->` does not count); also a catch-all arm that is not last
 - E2009 SumRecordVariantFieldTypeConflict — record variants in one sum type share a field name with different types
-- E2010 InvalidMemoryRegionType — invalid memory region type or declaration: buf/ref parameter count, empty region or element type, invalid memory space, runtime length identifier, read_ref/read_buf operand types, alloc_region space
+- E2010 InvalidMemoryRegionType — invalid memory region type or declaration: buf/ref parameter count, empty region or element type, invalid memory space, runtime length identifier, read_ref/read_buf operand types, alloc_region space, rec outside any tuple type (binding annotation today; record field, parameter type and return type to follow: rec binds to the innermost enclosing tuple type and an unbound rec is an error)
 - E2011 IntegerLiteralOutOfRange — integer literal is out of range for its type
 - E2012 TupleDecomposeBindingOverflow — tuple decomposition pattern has more elements than the register file supports
 - E2013 UnaryMinusNotAllowed — unary minus is not allowed; use negate_<type>(...)
@@ -93,7 +93,7 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E2019 MainReturnTypeInvalid — main must return an integer, float or atom
 - E2020 AmbiguousBuiltinCallName — an unqualified call names both a builtin and a function of the calling module; the module's function is called as module@name (also from inside that module), a builtin is always called unqualified
 - E2090 SupervisorTraitShape — Supervisor or FailureReporter trait/impl shape error: required methods (init; region_dump_limit, handle_report), parameter and return types (spec 15.4.13)
-- E2091 ActorOperationPlacement — spawn_linked, link, monitor, demonitor and child_table_first_ref calls only inside an actor behavior; wait_for_exit only inside main/0; spawn_linked is no longer public; add_child parent must be a Supervisor actor_ref
+- E2091 ActorOperationPlacement — spawn_linked, link, monitor, demonitor, child_table_first_ref, kill_abnormal, stop_self and fail_self calls only inside an actor behavior; wait_for_exit only inside main/0; spawn_linked is no longer public; add_child parent must be a Supervisor actor_ref
 - E2092 SupervisorInitSignature — Supervisor impl must declare init/1 with one ActorState parameter (spec 15.4.13.1)
 - E2093 InvalidChildSpecAgentType — child_spec agent_type must be a literal :worker or :supervisor
 - E2094 InvalidChildSpecFlavor — child_spec flavor must be a literal :plain or :dangerous; :dangerous requires an id starting with :dangerous_
@@ -140,6 +140,8 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E2239 BoardPackDeviceDescribed — a program describes a board-pack device: `impl fn registers(device: (:tag))` whose tag the target's board pack describes, in any module other than the pack's own description module for that tag, whatever the body says (device spec §4.9 rule 5, §4.9.1)
 - E2240 CallToSelf — `call()` whose target is `self()` or a name bound from `self()`: the actor would wait for its own reply and deadlock; use `cast(self(), ...)` (spec §16.2.6.5)
 - E2241 TerminateSelfByRemoveOrKill — `remove_actor` or `kill_abnormal` whose target is `self()` or a name bound from `self()`; an actor ends itself only with `stop_self` or `fail_self`, and a target the compiler cannot see is still a run-time `:language_error` (spec §15.1.2.3)
+- E2313 BufferLengthMismatch — `alloc_buf`'s literal element count differs from the literal N of the `buf(R, Space, T, N)` type it is bound to (spec §12.3.3); reported at the size argument
+- E2314 BufferIndexOutOfRange — a literal index of `read_buf`, `buf_load`, `write_buf` or `buf_store` is outside 0..N-1 for a `buf` type with a literal N (spec §12.3.3); reported at the index argument
 
 ### Effect checker (E3000-E3999)
 - E3000 EffectErrorDefault — effect failure with no code of its own

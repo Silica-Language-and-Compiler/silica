@@ -67,6 +67,7 @@
 #define ACB_REASON_TAG   24     // byte
 #define ACB_REASON_ATOM  26     // halfword
 #define ACB_AGENT        28     // halfword
+#define ACB_CONV         12     // rt_actors.S: the behaviour's calling convention (1 call-only, 2 cast-only)
 #define ACB_SUP          72
 #define ACB_ROW          76
 #define ACB_SB           80     // the supervision block (rt_actors.S), 0 for a plain actor
@@ -85,6 +86,7 @@
 #define SB_CT_LEN        52
 #define SB_CT_USERS      56
 #define SB_CT_PENDING    60
+#define SB_SINK          64     // the report sink's identity (8 B; spec §15.4.10.5), 0 none
 
 #define ST_DEAD          4
 
@@ -131,6 +133,10 @@
 // atom_table.silica seed_actor_runtime_atoms): the word every record starts with.
 #define SHAPE_CHILD_INFO 65536
 
+#define ATOM_NORMAL      3
+#define ATOM_LANGUAGE_ERROR 4
+#define ATOM_MEMORY_FAULT 5
+#define ATOM_EXPLICIT    6
 #define ATOM_UNKNOWN     7
 #define ATOM_PERMANENT   9
 #define ATOM_TRANSIENT   10
@@ -1007,6 +1013,11 @@ silica_rt_supervisor_drain_ingress:
     mov     a11, a6
     l32i    a12, a5, 8
     call8   silica_rt_supervisor_maybe_restart
+    mov     a12, a10                    // the row the notice was matched to (0: none)
+    mov     a13, a11                    // 1 when its child was restarted
+    mov     a10, a6
+    mov     a11, a5
+    call8   silica_rt_sup_exit_report   // to the sink, if one is named (spec §15.4.10.5)
     mov     a10, a5
     call8   silica_rt_exit_payload_free
 4:  mov     a10, a7
@@ -1146,12 +1157,12 @@ silica_rt_sup_shutdown_children:
     beqz    a5, 22f
     l8ui    a8, a5, ACB_KIND
     bnez    a8, 23f
-    movi    a7, 1                       // shutdown 0 (or negative): killed
+    movi    a7, 4                       // shutdown 0 (or negative): killed, (:explicit, :killed)
     l32i    a8, a6, ROW_SHUTDOWN + 4
-    bltz    a8, 21f
+    bltz    a8, 213f
     bnez    a8, 211f
     l32i    a8, a6, ROW_SHUTDOWN
-    beqz    a8, 21f
+    beqz    a8, 213f
 211: SCHED_LOCK a8, a9                  // shutdown > 0: (:explicit, :shutdown) unless it has a reason
     l8ui    a3, a5, ACB_ALIVE
     beqz    a3, 212f
@@ -1162,6 +1173,16 @@ silica_rt_sup_shutdown_children:
     s16i    a3, a5, ACB_REASON_ATOM
 212: SCHED_UNLOCK a8, a9
     movi    a7, 4
+    j       21f
+213: SCHED_LOCK a8, a9                  // shutdown 0: (:explicit, :killed) unless it has a reason
+    l8ui    a3, a5, ACB_ALIVE
+    beqz    a3, 214f
+    l8ui    a3, a5, ACB_REASON_TAG
+    bnez    a3, 214f
+    movi    a3, silica_registry_atom_killed
+    l32i    a3, a3, 0
+    s16i    a3, a5, ACB_REASON_ATOM
+214: SCHED_UNLOCK a8, a9
 21: mov     a10, a5
     mov     a11, a7
     call8   silica_rt_end_actor_leaf
@@ -1220,6 +1241,9 @@ silica_rt_supervisor_stop_child:
 // ends the supervisor (a root supervisor reports first). Strategy: :one_for_one respawns the row,
 // :one_for_all stops the other live children then respawns every row, :rest_for_one stops the
 // children after the dead one then respawns from it on.
+// Returns X0 = the row the notice was matched to (0: no row, or the supervisor has ended) and X1 = 1
+// when that row's child was restarted: what the exit report of §15.4.10.5 is built from
+// (silica_rt_sup_exit_report, called by every handler of a notice right after this).
     .align  4
     .global silica_rt_supervisor_maybe_restart
     .type   silica_rt_supervisor_maybe_restart, @function
@@ -1287,7 +1311,8 @@ silica_rt_supervisor_maybe_restart:
     mov     a10, a7
     mov     a11, a6
     call8   silica_rt_supervisor_respawn_row
-    j       9f
+    bnez    a10, 90f
+    j       91f
 5:  // one_for_all: stop every other live child, then respawn every row that has a child
     l32i    a3, a1, 4
     l32i    a3, a3, SB_CT_HEAD
@@ -1302,13 +1327,13 @@ silica_rt_supervisor_maybe_restart:
     j       51b
 52: l32i    a3, a1, 4
     l32i    a3, a3, SB_CT_HEAD
-53: beqz    a3, 9f
+53: beqz    a3, 91f
     l32i    a4, a3, ROW_CHILD
     beqz    a4, 531f
     mov     a10, a3
     mov     a11, a6
     call8   silica_rt_supervisor_respawn_row
-    bnez    a10, 9f
+    bnez    a10, 90f
 531: l32i   a3, a3, ROW_NEXT
     j       53b
 6:  // rest_for_one: stop and tombstone the rows after the dead one, then respawn from it on
@@ -1324,11 +1349,11 @@ silica_rt_supervisor_maybe_restart:
 611: l32i   a3, a3, ROW_NEXT
     j       61b
 62: mov     a3, a7
-63: beqz    a3, 9f
+63: beqz    a3, 91f
     mov     a10, a3
     mov     a11, a6
     call8   silica_rt_supervisor_respawn_row
-    bnez    a10, 9f
+    bnez    a10, 90f
     l32i    a3, a3, ROW_NEXT
     j       63b
 7:  // cap breached: the supervisor ends abnormally (§15.4.13.2: it terminates, propagating the
@@ -1347,7 +1372,7 @@ silica_rt_supervisor_maybe_restart:
     beq     a10, a6, 70f
     mov     a10, a6
     call8   silica_rt_sup_end_elsewhere
-    j       9f
+    j       90f
 70: l32i    a8, a6, ACB_SUP
     bnez    a8, 71f
     l32i    a9, a1, 4
@@ -1366,18 +1391,151 @@ silica_rt_supervisor_maybe_restart:
     // ACB_ALIVE is already 0 (cleared above so the shutdown restarts nothing): the running supervisor
     // takes its exit path at its dispatch boundary (rt_actors.S silica_rt_sched_loop); calling
     // silica_rt_end_actor here would only return at its "already ended" test.
-    j       9f
+    j       90f
 71: mov     a10, a6
     movi    a11, 4
     call8   silica_rt_end_actor
-    j       9f
+    j       90f
 8:  // no restart: tombstone
     mov     a10, a7
     call8   silica_rt_row_release_child
+    j       90f
+9:  movi    a2, 0                       // no row (not found, a row being stopped by a caller, an ended supervisor)
+    movi    a3, 0
+    retw
+90: mov     a2, a7                      // the row: its child was not restarted (tombstoned, a breach, a failed respawn)
+    movi    a3, 0
+    retw
+91: mov     a2, a7                      // the row: its child was restarted
+    movi    a3, 1
+    retw
+    .size   silica_rt_supervisor_maybe_restart, . - silica_rt_supervisor_maybe_restart
+
+// silica_rt_sup_exit_report(sup, payload, row, restarted): the exit report of spec §15.4.10.5, cast
+// to the supervisor's report sink (SB_SINK: named by :set_report_sink, or inherited from the
+// supervisor's own supervisor when it was spawned, rt_actors.S silica_rt_spawn_common) after every
+// exit notice the restart logic has handled; nothing when the notice was matched to no row or no
+// sink is named. The record is laid out as the emitter lays out
+// { child: actor_ref, child_id: atom, failure_reason: ..., restarted: boolean, new_child: actor_ref }:
+// a shape word (silica_registry_shape_exit_report, the image's number for that record; 0 when no unit
+// spells it) and one 8-byte slot per field. failure_reason is the one-word sum of §15.4.11.2: the
+// fixed atom for tags 0, 2 and 3, a pointer to the pair (:explicit, atom) for tag 4 (the pair sits
+// in the record's own 64-byte block, at +48), and :unknown otherwise (since 2026-10-23 no exit carries
+// tag 1: a division by zero is 2, a kill is 4 with :killed). child is the identity the notice
+// carries (payload+40); new_child is the row's current child (ROW_CID) when restarted, else child.
+// The cast owns the block (silica_rt_cast_try's X2 = 1): the receiver's dispatch frees it, as it
+// frees any record copy a cast made, and a sink that has ended or is call-only gets nothing (the
+// block goes back there). The supervisor never waits.
+    .align  4
+    .global silica_rt_sup_exit_report
+    .type   silica_rt_sup_exit_report, @function
+silica_rt_sup_exit_report:
+    entry   a1, 48
+    beqz    a4, 9f                      // no row: the notice was not handled as a child exit
+    l32i    a6, a2, ACB_SB
+    beqz    a6, 9f
+    l32i    a7, a6, SB_SINK             // the sink's identity (0: none)
+    l32i    a6, a6, SB_SINK + 4
+    or      a8, a7, a6
+    beqz    a8, 9f
+    s32i    a7, a1, 0                   // [0]/[4] the sink
+    s32i    a6, a1, 4
+    s32i    a3, a1, 8                   // [8] the payload
+    s32i    a4, a1, 12                  // [12] the row
+    s32i    a5, a1, 16                  // [16] restarted
+    movi    a10, 64                     // one block: the record (48 B) and, at +48, the pair
+    call8   silica_rt_alloc             // (:explicit, atom) when the reason is one; zeroed
+    mov     a6, a10                     // a6 = the record
+    // the failure_reason word (§15.4.11.2)
+    l32i    a3, a1, 8
+    l32i    a8, a3, 8                   // the reason tag
+    movi    a7, ATOM_NORMAL
+    beqz    a8, 2f
+    movi    a7, ATOM_LANGUAGE_ERROR
+    beqi    a8, 2, 2f
+    movi    a7, ATOM_MEMORY_FAULT
+    beqi    a8, 3, 2f
+    movi    a7, ATOM_UNKNOWN
+    bnei    a8, 4, 2f
+    movi    a8, ATOM_EXPLICIT           // (:explicit, atom): the pair at +48, one 8-byte slot each
+    s32i    a8, a6, 48
+    l32i    a8, a3, 16                  // the notice's atom
+    s32i    a8, a6, 56
+    addi    a7, a6, 48
+2:  movi    a8, silica_registry_shape_exit_report
+    l32i    a8, a8, 0
+    s32i    a8, a6, 0                   // shape
+    l32i    a8, a3, 40                  // child: the ended child's identity
+    s32i    a8, a6, 8
+    l32i    a8, a3, 44
+    s32i    a8, a6, 12
+    l32i    a4, a1, 12
+    l32i    a8, a4, ROW_ID              // child_id
+    s32i    a8, a6, 16
+    s32i    a7, a6, 24                  // failure_reason
+    l32i    a5, a1, 16                  // restarted
+    s32i    a5, a6, 32
+    l32i    a8, a3, 40                  // new_child: the ended child, or the row's current child
+    l32i    a9, a3, 44
+    beqz    a5, 3f
+    l32i    a8, a4, ROW_CID
+    l32i    a9, a4, ROW_CID + 4
+3:  s32i    a8, a6, 40
+    s32i    a9, a6, 44
+    l32i    a10, a1, 0                  // cast to the sink, owned: the receiver's dispatch frees the
+    l32i    a11, a1, 4                  // block (1 enqueued; else it went back in silica_rt_cast_try)
+    mov     a12, a6
+    movi    a13, 0
+    movi    a14, 1
+    call8   silica_rt_cast_try
 9:  movi    a2, 0
     movi    a3, 0
     retw
-    .size   silica_rt_supervisor_maybe_restart, . - silica_rt_supervisor_maybe_restart
+    .size   silica_rt_sup_exit_report, . - silica_rt_sup_exit_report
+
+// silica_rt_supervisor_set_report_sink(X0 the supervisor's reference, X1 the sink's reference) -> 0,
+// or -2 (the error reply of the lowering, as for :terminate_child aimed at the caller's own row) when
+// the sink names no live actor or a call-only one (spec §15.4.10.5: the sink is a cast-only actor;
+// reports are casts). Exits already in the ingress are handled first (§15.4.9.4), before the sink is
+// named, so they are not reported.
+    .align  4
+    .global silica_rt_supervisor_set_report_sink
+    .type   silica_rt_supervisor_set_report_sink, @function
+silica_rt_supervisor_set_report_sink:
+    entry   a1, 48
+    s32i    a4, a1, 0                   // [0]/[4] the sink's reference (§15.1.4)
+    s32i    a5, a1, 4
+    mov     a10, a2                     // X0 = the supervisor's reference (§15.1.4)
+    mov     a11, a3
+    call8   silica_rt_sup_acb
+    mov     a6, a10                     // a6 = the supervisor
+    mov     a10, a6
+    call8   silica_rt_child_table_enter
+    mov     a10, a6
+    call8   silica_rt_supervisor_drain_ingress
+    l32i    a10, a1, 0
+    l32i    a11, a1, 4
+    call8   silica_rt_ref_acb
+    beqz    a10, 8f                     // no such actor
+    l8ui    a4, a10, ACB_ALIVE
+    beqz    a4, 8f                      // ended
+    l32i    a4, a10, ACB_CONV
+    beqi    a4, 1, 8f                   // call-only (§16.2.6.4)
+    mov     a10, a6
+    call8   silica_rt_sb_require
+    l32i    a4, a1, 0
+    s32i    a4, a10, SB_SINK
+    l32i    a4, a1, 4
+    s32i    a4, a10, SB_SINK + 4
+    movi    a2, 0
+    movi    a3, 0
+    j       9f
+8:  movi    a2, -2
+    movi    a3, -1
+9:  mov     a10, a6
+    call8   silica_rt_child_table_leave
+    retw
+    .size   silica_rt_supervisor_set_report_sink, . - silica_rt_supervisor_set_report_sink
 
 // ---------------------------------------------------------------------------------------------
 // Behaviour-only accessors (trials)

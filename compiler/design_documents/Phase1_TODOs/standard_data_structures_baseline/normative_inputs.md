@@ -78,7 +78,7 @@ These documents govern compiler/runtime features required before representation 
 | [`recursive_tuple_specification.md`](../../recursive_tuple_specification.md) | `rec`, `ref?(R, Space, T)`, `:none`, `alloc_rec`, occurs check |
 | [`silica-specification.md`](../../silica-specification.md) §4.2.2 (recursive tuples), §22 (region/buffer ops) | Authoritative language definition |
 
-**Normative encoding for collection nodes:** recursive inline tuples with optional `ref?(R, Space, rec)` child slots; construction via `alloc_rec(region, (…))` in the collection's canonical arena; empty child position is `:none`.
+**Normative encoding for collection nodes:** recursive inline tuples with optional `ref?(R, Space, rec)` child slots; construction via `alloc_rec(region, (…))` in the collection's canonical arena; empty child position is `:none`. `rec` binds to the innermost enclosing tuple type; a root, parameter or return is spelled with the full node tuple, and an unbound `rec` is E2010 (Q19, data_structure_redesign_requirements.md).
 
 ### 3.2 Runtime-sized immutable buffers
 

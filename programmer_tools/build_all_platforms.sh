@@ -343,7 +343,7 @@ local_build() {  # $1 = emit target
     ( cd "$SRC" && make clean TARGET="$t" SILICA_TARGET_PROMPT=0 && \
       make build TARGET="$t" SILICA_TARGET_PROMPT=0 ${JOBS:+JOBS=$JOBS} ) >>"$log" 2>&1 || {
         echo "  FAILED (see $log)"; return 1; }
-    grep -hE "Installed (selfhost|target).*compiler:" "$log" | tail -1 | sed 's/^/  /'
+    grep -hE "Installed (selfhost|target).*compiler:" "$log" | tail -1 | sed 's/^/  /' || true
 }
 
 local_fixpoint() {

@@ -1,0 +1,131 @@
+// Spec §15.4.10.5: "A supervisor started as a child of a supervisor that has a sink inherits that
+// sink". The root starts :inner1 from its init list; main names the root's sink and then adds a second
+// supervisor, :inner2, with call_supervisor { op: :add_child, child: { ..., agent_type: :supervisor,
+// behavior: ReportInnerSup@ReportInnerSup_child_start, ... } } (§15.4.8.3, §15.4.13.3 dynamic
+// supervised children): inner2 is started as a child of a supervisor that has a sink, and inherits
+// it. Its worker :gw2 fails (fail_self(:boom)); inner2 restarts it and the report reaches the root's
+// sink with child_id :gw2 (inner1, started before the sink, reports nothing: its worker is left alone).
+// The inner supervisor comes from ReportInnerSup.silica: one :permanent cast-only worker, :gw1 for
+// initial state 1 and :gw2 otherwise (initial state 3 here: three restarts allowed).
+//
+// Expected output:
+//   sink set
+//   inner2 added
+//   report: child=gw2 restarted=true same_ref=false reason=explicit boom
+//   done
+//   0
+
+use Supervisor;
+use ReportInnerSup;
+
+impl ReportAddedInheritRootSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 3, restarts_time_frame: 10000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :inner1, agent_type: :supervisor, initial_state: 1, behavior: ReportInnerSup@ReportInnerSup_child_start, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+// The failure_reason of a report, spelled out (spec §15.4.11.2: an inline sum type).
+fn reason_text(fr: :normal | :language_error | :memory_fault | (:explicit, atom) | :noproc | :unknown) -> string {
+    case fr of {
+        :normal -> "normal";
+        :language_error -> "language_error";
+        :memory_fault -> "memory_fault";
+        :noproc -> "noproc";
+        :unknown -> "unknown";
+        (:explicit, a: atom) -> case a of {
+            :boom -> "explicit boom";
+            :bang -> "explicit bang";
+            :done -> "explicit done";
+            :restart_intensity_breach -> "explicit restart_intensity_breach";
+            _: atom -> "explicit other"
+        }
+    }
+}
+
+fn child_text(id: atom) -> string {
+    case id of {
+        :w -> "w";
+        :w1 -> "w1";
+        :w2 -> "w2";
+        :gw1 -> "gw1";
+        :gw2 -> "gw2";
+        :inner1 -> "inner1";
+        :inner2 -> "inner2";
+        _: atom -> "?"
+    }
+}
+
+// The report sink (spec §15.4.10.5): a cast-only actor whose message is the exit_report record,
+// spelled as the spec gives it. One line per report; its state counts down the reports main waits
+// for, and the last ends main's wait_for_exit() with cast_exit(0).
+fn sink(r: { child: actor_ref, child_id: atom, failure_reason: :normal | :language_error | :memory_fault | (:explicit, atom) | :noproc | :unknown, restarted: boolean, new_child: actor_ref }, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        same: boolean <- r.new_child == r.child;
+        print("report: child=");
+        print(child_text(r.child_id));
+        print(" restarted=");
+        print_boolean(r.restarted);
+        print(" same_ref=");
+        print_boolean(same);
+        print(" reason=");
+        println(reason_text(r.failure_reason));
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces pure (:no_reply, left) end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter(0);
+        s: actor_ref <- spawn(1, sink, stack_policy(0, :keep_last_message));
+        rt: supervisor_ref <- spawn_registered_supervisor(ReportAddedInheritRootSup, 0, :root, stack_policy(0, :keep_last_message));
+        set: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :set_report_sink, sink: s } impl SupervisorMessage {});
+        _: atom <- case set.status of {
+            :sink_set -> println("sink set");
+            _: atom -> println("sink NOT set")
+        };
+        added: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :add_child, child: { id: :inner2, agent_type: :supervisor, initial_state: 3, behavior: ReportInnerSup@ReportInnerSup_child_start, restart: :permanent, shutdown: 0, flavor: :plain } } impl SupervisorMessage {});
+        _: atom <- case added.tag of {
+            :child_started -> println("inner2 added");
+            _: atom -> println("inner2 NOT added")
+        };
+        _: boolean <- cast_registered(:gw2, 0 impl ActorMessage {});
+        _: int64 <- wait_for_exit();
+        _: atom <- println("done")
+    produces pure 0 end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// A FailureReporter (spec §15.4.13.4) that keeps every report to itself, so the output holds only
+// main's and the sink's lines; without one the reports would go to standard error. Started with a
+// positive count, it ends main's wait_for_exit() with cast_exit(0) after that many reports.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces pure (:no_reply, left) end
+}
+
+fn start_reporter(expected: int64) -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces pure registered end
+}

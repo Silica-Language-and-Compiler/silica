@@ -1,0 +1,528 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Dispatch-scoped release of the owned regions a message carries (region memory safety design
+// §18.7, decided 2026-10-22; project-bees SD-7).
+//
+// A behaviour `fn beh(msg: { r: region(L, S), ... }, state: S0) -> (:no_reply, S0)` owns the regions
+// its message record carries for the length of the dispatch. They are destroyed at the behaviour's
+// return (emitter_core: the epilogue's region destroy, through the same frame slot the bare
+// region-parameter rule uses) when this module PROVES that nothing derived from the message can
+// outlive the call. Anything short of a proof leaves the region alone, which is today's leak and
+// never a free of live memory.
+//
+// The proof is a taint walk over the function's SIR:
+//   * the message parameter is tainted; a let whose right-hand side mentions a tainted name is
+//     tainted unless its declared type cannot carry a pointer (scalars, atoms, strings, and tuples,
+//     records and sums made only of those); a `bind` case arm over a tainted scrutinee taints its
+//     name the same way; the other binding patterns (record, tuple, list cons) over a tainted
+//     scrutinee are not tracked and count as an escape;
+//   * a tainted value escapes when it reaches a sink: any prim outside the pure list below (every
+//     actor-boundary prim, every store into a region or buffer, every allocation into a region,
+//     and every prim this module does not know), a call whose callee is not proved harmless, a call
+//     through a tainted function value, or the function's own result when its return type can
+//     carry a pointer;
+//   * a callee is harmless when it is in this unit, its return type cannot carry a pointer, no
+//     parameter type names a region (such a callee may destroy or keep the region itself), and its
+//     body, with every pointer-carrying parameter tainted, has no sink. Recursion is admitted
+//     coinductively (a callee already under examination is harmless for the purpose of the walk,
+//     because every sink in it is found on the same walk) with a depth bound. A callee in another
+//     unit is never proved harmless: its body is not available.
+//
+// Only a parameter at index 0 whose type is a record is examined, and only the record's top-level
+// fields of type `region(...)` are released. Nested regions, tuple messages and sum messages are
+// left for the full stage-4 drops. A canonical arena handle in such a field is skipped by
+// _silica_rt_region_destroy itself (the canonical table is consulted before any free).
+//
+// Soundness is conditional on the sender obeying the no-use-after-send rule of §18.1 (E2301,
+// enforced by the stage-3/5 checker, not yet implemented): a sender that keeps a pointer into a
+// region it sent dangles once the receiver drops it. The bare region-parameter release of
+// fn_destroys_region_param lives under the same condition.
+
+use sir_ast;
+use term_sir_helpers;
+use prims_record;
+use atom_table;
+
+export fn_message_region_offsets/2;
+export type_is_pointer_free/1;
+export tmr_message_record_offsets/1;
+
+// ---- small string helpers -----------------------------------------------------------------
+
+fn tmr_starts_with(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+fn tmr_ends_with(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, length_bytes(s) - length_bytes(p), length_bytes(s)) == p
+}
+
+fn tmr_find_sub_from(s: string, sub: string, i: int64) -> int64 {
+    case i + length_bytes(sub) > length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + length_bytes(sub)) == sub of {
+            true -> i;
+            false -> tmr_find_sub_from(s, sub, i + 1)
+        }
+    }
+}
+
+fn tmr_has_sub(s: string, sub: string) -> boolean {
+    tmr_find_sub_from(s, sub, 0) >= 0
+}
+
+// Index of the first `sep` at nesting depth zero (over (), [], {}) at or after i, or the length.
+fn tmr_top_sep(s: string, i: int64, depth: int64, sep: string) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> tmr_top_sep(s, i + 1, depth + 1, sep);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> tmr_top_sep(s, i + 1, depth - 1, sep);
+                    false -> case c == sep and depth == 0 of {
+                        true -> i;
+                        false -> tmr_top_sep(s, i + 1, depth, sep)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- name sets: ",%a,%b," ------------------------------------------------------------------
+
+fn tmr_in_set(set: string, name: string) -> boolean {
+    length_bytes(name) > 0 and tmr_has_sub(set, concat(",", concat(name, ",")))
+}
+
+fn tmr_add(set: string, name: string) -> string {
+    case tmr_in_set(set, name) of {
+        true -> set;
+        false -> concat(set, concat(name, ","))
+    }
+}
+
+// ---- types ----------------------------------------------------------------------------------
+
+fn tmr_scalar_type(t: string) -> boolean {
+    t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16"
+        or t == "int8" or t == "uint8" or t == "float64" or t == "float32" or t == "float16"
+        or t == "boolean" or t == "bool" or t == "atom" or t == "string" or t == "unit" or t == "lifetime"
+        or t == "timer_ref"
+}
+
+// True when a value of this type cannot hold a pointer into a region: scalars, atoms, strings
+// (string bytes live in the string arenas and literal sections, never in a region), and tuples,
+// records and sums built only from those. Unknown spellings (List[...], ref, region, buf,
+// function types, type parameters, device windows, actor references) answer false.
+fn type_is_pointer_free(t0: string) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    n: int64 <- length_bytes(t);
+    case n == 0 of {
+        true -> false;
+        false -> case tmr_scalar_type(t) of {
+            true -> true;
+            false -> case tmr_top_sep(t, 0, 0, "|") < n of {
+                true -> tmr_alternatives_pointer_free(t, 0);
+                false -> case tmr_starts_with(t, ":") of {
+                    true -> tmr_has_sub(t, "(") == false and tmr_has_sub(t, "{") == false and tmr_has_sub(t, "[") == false;
+                    false -> case tmr_starts_with(t, "(") and tmr_ends_with(t, ")") of {
+                        true -> tmr_elements_pointer_free(substring(t, 1, n - 1), 0);
+                        false -> case tmr_starts_with(t, "{") and tmr_ends_with(t, "}") of {
+                            true -> tmr_fields_pointer_free(substring(t, 1, n - 1), 0);
+                            false -> false
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn tmr_alternatives_pointer_free(t: string, i: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- tmr_top_sep(t, i, 0, "|");
+            case type_is_pointer_free(substring(t, i, e)) of {
+                false -> false;
+                true -> tmr_alternatives_pointer_free(t, e + 1)
+            }
+        }
+    }
+}
+
+fn tmr_elements_pointer_free(t: string, i: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- tmr_top_sep(t, i, 0, ",");
+            case type_is_pointer_free(substring(t, i, e)) of {
+                false -> false;
+                true -> tmr_elements_pointer_free(t, e + 1)
+            }
+        }
+    }
+}
+
+fn tmr_fields_pointer_free(t: string, i: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- tmr_top_sep(t, i, 0, ",");
+            seg: string <- substring(t, i, e);
+            colon: int64 <- tmr_top_sep(seg, 0, 0, ":");
+            case colon >= length_bytes(seg) of {
+                true -> false;
+                false -> case type_is_pointer_free(substring(seg, colon + 1, length_bytes(seg))) of {
+                    false -> false;
+                    true -> tmr_fields_pointer_free(t, e + 1)
+                }
+            }
+        }
+    }
+}
+
+// ---- parameters ------------------------------------------------------------------------------
+
+fn tmr_pipe_at(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> case substring(s, i, i + 1) == "|" of {
+            true -> i;
+            false -> tmr_pipe_at(s, i + 1)
+        }
+    }
+}
+
+// The taint set of a callee's parameters: every parameter whose type can carry a pointer.
+// param_names and param_types are pipe-separated and SIR variables are "%name".
+fn tmr_param_taint(names: string, types: string, acc: string) -> string {
+    case length_bytes(names) == 0 of {
+        true -> acc;
+        false -> {
+            np: int64 <- tmr_pipe_at(names, 0);
+            tp: int64 <- tmr_pipe_at(types, 0);
+            nm: string <- substring(names, 0, np);
+            ty: string <- substring(types, 0, tp);
+            acc2: string <- case type_is_pointer_free(ty) of {
+                true -> acc;
+                false -> tmr_add(acc, concat("%", nm))
+            };
+            rest_n: string <- case np >= length_bytes(names) of { true -> ""; false -> substring(names, np + 1, length_bytes(names)) };
+            rest_t: string <- case tp >= length_bytes(types) of { true -> ""; false -> substring(types, tp + 1, length_bytes(types)) };
+            tmr_param_taint(rest_n, rest_t, acc2)
+        }
+    }
+}
+
+// ---- SIR walks ------------------------------------------------------------------------------
+
+// Does any variable in the subtree name a tainted binding? A call whose callee name is a tainted
+// binding (a function value that captured a tainted name) counts as a mention too.
+fn tmr_mentions(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case (n.kind == 1 or n.kind == 4 or n.kind == 5) and tmr_in_set(set, n.name) of {
+                true -> true;
+                false -> case tmr_mentions(term_sir_helpers@sir_term_at(term, n.inner), set) of {
+                    true -> true;
+                    false -> tmr_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), set)
+                }
+            }
+        }
+    }
+}
+
+// Prims whose result is a function of their operands and that keep nothing: a tainted operand
+// taints the result (by its type) and nothing else. Every prim not listed is a sink.
+fn tmr_pure_prim(name: string) -> boolean {
+    name == "record_proj" or name == "tuple_proj" or name == "tuple_make" or name == "record_make"
+        or name == "user_call_rest"
+        or name == "read_ref" or name == "buf_load" or name == "ref_eq" or name == "ref_in_region"
+        or name == "canonical_arena_same" or name == "fresh_lifetime"
+        or name == "add" or name == "sub" or name == "mul" or name == "div" or name == "rem" or name == "neg"
+        or name == "shl" or name == "shr" or name == "band" or name == "bor" or name == "bnot" or name == "bxor"
+        or name == "eq" or name == "nq" or name == "lt" or name == "gt" or name == "le" or name == "ge"
+        or name == "and" or name == "or" or name == "not"
+        or name == "is_nan" or name == "is_inf" or name == "is_finite"
+        or name == "string_length_bytes" or name == "string_length_chars"
+        or name == "string_starts_with" or name == "string_ends_with" or name == "string_contains"
+        or name == "list_nil" or name == "list_cons" or name == "list_length" or name == "list_head"
+        or name == "list_remove_head" or name == "list_at"
+}
+
+// The taint set after `let name = rhs`: the name joins when the right-hand side mentions a
+// tainted binding and the declared type can carry a pointer.
+fn tmr_let_set(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> string {
+    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+    case tmr_mentions(term_sir_helpers@sir_term_at(term, n.inner), set) and type_is_pointer_free(n.type_name) == false of {
+        true -> tmr_add(set, n.name);
+        false -> set
+    }
+}
+
+// The taint set inside a case arm: a `bind` arm over a tainted scrutinee binds a tainted name
+// unless the arm's type cannot carry a pointer.
+fn tmr_branch_set(n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, set: string, scrut_tainted: boolean) -> string {
+    case scrut_tainted and n.value == "bind" and type_is_pointer_free(n.type_name) == false of {
+        true -> tmr_add(set, n.name);
+        false -> set
+    }
+}
+
+// Arms whose pattern binds names this module does not track.
+fn tmr_branch_untracked(n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, scrut_tainted: boolean) -> boolean {
+    scrut_tainted and (n.value == "record" or n.value == "tuple" or n.value == "list_cons")
+}
+
+// True when a tainted value may outlive the function: it reaches a sink anywhere in the term.
+fn tmr_escapes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], visiting: string, depth: int64) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind of {
+                0 -> false;
+                1 -> false;
+                2 -> case tmr_escapes(term_sir_helpers@sir_term_at(term, n.inner), set, fns, visiting, depth) of {
+                    true -> true;
+                    false -> tmr_escapes(term_sir_helpers@sir_term_at(term, n.right_expr), tmr_let_set(term, set), fns, visiting, depth)
+                };
+                3 -> case tmr_escapes(term_sir_helpers@sir_term_at(term, n.inner), set, fns, visiting, depth) of {
+                    true -> true;
+                    false -> tmr_branches_escape(term_sir_helpers@sir_term_at(term, n.right_expr), set, tmr_mentions(term_sir_helpers@sir_term_at(term, n.inner), set), fns, visiting, depth)
+                };
+                4 -> tmr_call_escapes(term, n, set, fns, visiting, depth);
+                5 -> tmr_call_escapes(term, n, set, fns, visiting, depth);
+                6 -> case tmr_mentions(term_sir_helpers@sir_term_at(term, n.inner), set) or tmr_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), set) of {
+                    false -> false;
+                    true -> case tmr_pure_prim(n.name) of {
+                        false -> true;
+                        true -> case tmr_escapes(term_sir_helpers@sir_term_at(term, n.inner), set, fns, visiting, depth) of {
+                            true -> true;
+                            false -> tmr_escapes(term_sir_helpers@sir_term_at(term, n.right_expr), set, fns, visiting, depth)
+                        }
+                    }
+                };
+                _: int64 -> true
+            }
+        }
+    }
+}
+
+// A call: a tainted argument needs a harmless callee; a call through a tainted function value is
+// a sink; the arguments are then walked for sinks of their own.
+fn tmr_call_escapes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, set: string, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], visiting: string, depth: int64) -> boolean {
+    case tmr_in_set(set, n.name) of {
+        true -> true;
+        false -> {
+            tainted_args: boolean <- tmr_mentions(term_sir_helpers@sir_term_at(term, n.inner), set) or tmr_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), set);
+            case tainted_args of {
+                false -> false;
+                true -> case tmr_callee_harmless(n.name, fns, visiting, depth) of {
+                    false -> true;
+                    true -> case tmr_escapes(term_sir_helpers@sir_term_at(term, n.inner), set, fns, visiting, depth) of {
+                        true -> true;
+                        false -> tmr_escapes(term_sir_helpers@sir_term_at(term, n.right_expr), set, fns, visiting, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn tmr_branches_escape(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string, scrut_tainted: boolean, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], visiting: string, depth: int64) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind of {
+                7 -> case tmr_branches_escape(term_sir_helpers@sir_term_at(term, n.inner), set, scrut_tainted, fns, visiting, depth) of {
+                    true -> true;
+                    false -> tmr_branches_escape(term_sir_helpers@sir_term_at(term, n.right_expr), set, scrut_tainted, fns, visiting, depth)
+                };
+                8 -> case tmr_branch_untracked(n, scrut_tainted) of {
+                    true -> true;
+                    false -> {
+                        set_b: string <- tmr_branch_set(n, set, scrut_tainted);
+                        case tmr_escapes(term_sir_helpers@sir_term_at(term, n.inner), set_b, fns, visiting, depth) of {
+                            true -> true;
+                            false -> tmr_escapes(term_sir_helpers@sir_term_at(term, n.right_expr), set_b, fns, visiting, depth)
+                        }
+                    }
+                };
+                _: int64 -> true
+            }
+        }
+    }
+}
+
+// Does the value the term produces mention a tainted binding? Lets extend the set on the way to
+// their bodies; a case produces one of its arms' values.
+fn tmr_result_mentions(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind of {
+                2 -> tmr_result_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), tmr_let_set(term, set));
+                3 -> tmr_branches_result_mention(term_sir_helpers@sir_term_at(term, n.right_expr), set, tmr_mentions(term_sir_helpers@sir_term_at(term, n.inner), set));
+                _: int64 -> tmr_mentions(term, set)
+            }
+        }
+    }
+}
+
+fn tmr_branches_result_mention(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string, scrut_tainted: boolean) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind of {
+                7 -> case tmr_branches_result_mention(term_sir_helpers@sir_term_at(term, n.inner), set, scrut_tainted) of {
+                    true -> true;
+                    false -> tmr_branches_result_mention(term_sir_helpers@sir_term_at(term, n.right_expr), set, scrut_tainted)
+                };
+                8 -> case tmr_branch_untracked(n, scrut_tainted) of {
+                    true -> true;
+                    false -> tmr_result_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), tmr_branch_set(n, set, scrut_tainted))
+                };
+                _: int64 -> true
+            }
+        }
+    }
+}
+
+// ---- callees --------------------------------------------------------------------------------
+
+fn tmr_find_function(name: string, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string } {
+    case fns.is_nil of {
+        true -> sir_ast@dummy_sir_function();
+        false -> case fns.head.name == name or fns.head.name == concat("main.", name) of {
+            true -> fns.head;
+            false -> tmr_find_function(name, fns.tail)
+        }
+    }
+}
+
+// A callee that cannot keep or hand on a pointer it is given: in this unit, pointer-free result,
+// no region parameter, and no sink in its body with its pointer-carrying parameters tainted.
+fn tmr_callee_harmless(name: string, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], visiting: string, depth: int64) -> boolean {
+    case tmr_in_set(visiting, name) of {
+        true -> true;
+        false -> case depth > 8 or length_bytes(name) == 0 of {
+            true -> false;
+            false -> {
+                f: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string } <- tmr_find_function(name, fns);
+                case length_bytes(f.name) == 0 of {
+                    true -> false;
+                    false -> case type_is_pointer_free(f.return_type) == false or tmr_has_sub(f.param_types, "region") of {
+                        true -> false;
+                        false -> tmr_escapes(f.body, tmr_param_taint(f.param_names, f.param_types, ","), fns, tmr_add(visiting, name), depth + 1) == false
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- the message parameter ------------------------------------------------------------------
+
+// ",8,24," : the boxed offsets of the top-level fields of type region(...) in record type R, in
+// field order; "" when R is not a record or has none. Offsets come from the same
+// offset_bytes_before_field the record_proj emission uses (shape word first, one word per field).
+fn tmr_region_field_offsets(R: string, content: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(content) of {
+        true -> acc;
+        false -> {
+            e: int64 <- tmr_top_sep(content, i, 0, ",");
+            seg: string <- substring(content, i, e);
+            colon: int64 <- tmr_top_sep(seg, 0, 0, ":");
+            case colon >= length_bytes(seg) of {
+                true -> "";
+                false -> {
+                    fname: string <- substring(seg, 0, colon);
+                    fty: string <- substring(seg, colon + 1, length_bytes(seg));
+                    case tmr_starts_with(fty, "region(") of {
+                        false -> tmr_region_field_offsets(R, content, e + 1, acc);
+                        true -> {
+                            off: int64 <- prims_record@offset_bytes_before_field(R, fname);
+                            case off < 0 of {
+                                true -> "";
+                                false -> tmr_region_field_offsets(R, content, e + 1, concat(acc, concat(atom_table@int64_to_decimal_string(off), ",")))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn tmr_first_param_type(param_types: string) -> string {
+    substring(param_types, 0, tmr_pipe_at(param_types, 0))
+}
+
+fn tmr_message_record_offsets(ptype0: string) -> string {
+    t: string <- prims_record@strip_spaces_rt(ptype0);
+    n: int64 <- length_bytes(t);
+    case n >= 2 and tmr_starts_with(t, "{") and tmr_ends_with(t, "}") and prims_record@record_type_braces_balanced(t) of {
+        false -> "";
+        true -> {
+            offs: string <- tmr_region_field_offsets(t, substring(t, 1, n - 1), 0, ",");
+            case offs == "," of {
+                true -> "";
+                false -> offs
+            }
+        }
+    }
+}
+
+fn tmr_behaviour_return_type(t0: string) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    tmr_starts_with(t, "(:no_reply,") or tmr_starts_with(t, "(:reply,")
+}
+
+// ",8," style boxed offsets of the message record's owned regions that the function must
+// destroy at its return; "" when there is nothing to destroy or no proof.
+fn fn_message_region_offsets(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> string {
+    case tmr_behaviour_return_type(fn_val.return_type) and length_bytes(fn_val.param_names) > 0 of {
+        false -> "";
+        true -> {
+            offs: string <- tmr_message_record_offsets(tmr_first_param_type(fn_val.param_types));
+            case length_bytes(offs) == 0 of {
+                true -> "";
+                false -> {
+                    set0: string <- concat(",%", concat(substring(fn_val.param_names, 0, tmr_pipe_at(fn_val.param_names, 0)), ","));
+                    case tmr_escapes(fn_val.body, set0, fns, ",", 0) of {
+                        true -> "";
+                        false -> case type_is_pointer_free(fn_val.return_type) == false and tmr_result_mentions(fn_val.body, set0) of {
+                            true -> "";
+                            false -> offs
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

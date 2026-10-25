@@ -321,10 +321,30 @@ endef
 # its exit status and $$integrate_killed is 1 when the watchdog killed it, in which case
 # the recipe reports the trial as incomplete instead of comparing its output.
 #
+#
+# Peak memory ceiling (trials/README.md, "Peak memory ceiling"): when the directory the suite runs in
+# holds <trial>.max_rss_mb, where <trial> is the label's last /-separated word (every suite labels a
+# run $(MSG_PREFIX)<trial> or <app label>/<trial>), the command runs under run_with_rss_ceiling.py,
+# which appends a failure line to the trial's .sout when the peak resident set size is above the
+# ceiling, so the normal .sout/.scout comparison fails. Host runs only (SILICA_TARGET_IS_HOST=1); a
+# board run never reaches these macros (targets/board_suite.sh runs the board). With no marker the
+# command line is exactly the one used before the ceiling existed.
+INTEGRATE_RSS_RUNNER := $(_SILICA_COMPILER_MK_DIR)run_with_rss_ceiling.py
+# Sets integrate_rss_mark to the marker path when the ceiling applies to this run, else to "".
+define INTEGRATE_RSS_MARK
+integrate_rss_mark="$(1)"; integrate_rss_mark="$${integrate_rss_mark##*/}.max_rss_mb"; \
+if [ "$(SILICA_TARGET_IS_HOST)" != 1 ] || [ ! -f "$$integrate_rss_mark" ]; then integrate_rss_mark=""; fi
+endef
+#
 # $(call INTEGRATE_RUN_TRIAL,<label>,<sout path>,<command>): output then exit status into <sout path>.
 define INTEGRATE_RUN_TRIAL
 integrate_killed=0; \
+$(call INTEGRATE_RSS_MARK,$(1)); \
+if [ -n "$$integrate_rss_mark" ]; then \
+perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' python3 "$(INTEGRATE_RSS_RUNNER)" "$(1)" "$$integrate_rss_mark" "$(2)" -- $(3) 7>&1 > "$(2)" 2>&1 & integrate_pid=$$!; \
+else \
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $(3) > "$(2)" 2>&1 & integrate_pid=$$!; \
+fi; \
 integrate_reg="$${SILICA_INTEGRATE_ROOT:-.}/.integrate_running/$$integrate_pid"; \
 { printf '%s %s\n' "$$integrate_pid" "$(1)" > "$$integrate_reg"; } 2>/dev/null; \
 wait $$integrate_pid; integrate_rc=$$?; \
@@ -332,10 +352,16 @@ printf '%s\n' "$$integrate_rc" >> "$(2)"; \
 if [ -f "$$integrate_reg.killed" ]; then integrate_killed=1; fi; \
 rm -f "$$integrate_reg" "$$integrate_reg.killed" 2>/dev/null
 endef
-# $(call INTEGRATE_EXEC_TRIAL,<label>,<command>): the command manages its own output.
+# $(call INTEGRATE_EXEC_TRIAL,<label>,<command>): the command manages its own output. With a ceiling
+# marker the command must write <trial>.sout in the current directory (every caller does).
 define INTEGRATE_EXEC_TRIAL
 integrate_killed=0; \
+$(call INTEGRATE_RSS_MARK,$(1)); \
+if [ -n "$$integrate_rss_mark" ]; then \
+perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' python3 "$(INTEGRATE_RSS_RUNNER)" "$(1)" "$$integrate_rss_mark" "$${integrate_rss_mark%.max_rss_mb}.sout" -- $(2) 7>&1 & integrate_pid=$$!; \
+else \
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $(2) & integrate_pid=$$!; \
+fi; \
 integrate_reg="$${SILICA_INTEGRATE_ROOT:-.}/.integrate_running/$$integrate_pid"; \
 { printf '%s %s\n' "$$integrate_pid" "$(1)" > "$$integrate_reg"; } 2>/dev/null; \
 wait $$integrate_pid; integrate_rc=$$?; \

@@ -128,6 +128,51 @@ section list each one as
 `make integrate INTEGRATE_WATCHDOG_MINUTES=2` shortens the limit. Compiles keep their
 own limit (`SILICA_COMPILE_TIMEOUT`, 300 s).
 
+### Peak memory ceiling: `<trial>.max_rss_mb`
+
+A trial whose defect shows only in memory (a leak with correct output) gets a marker file
+`<trial>.max_rss_mb` beside its `.silica`, holding one positive integer: the ceiling in megabytes
+(MiB, 2^20 bytes). On a host run the trial then runs under `run_with_rss_ceiling.py`, and it passes
+only when its output matches its `.scout` **and** its peak resident set size is at or below the
+ceiling. Above it, the runner appends one line to the trial's `.sout`, so the usual comparison
+fails and the report shows the peak and the ceiling:
+
+```
+❌ <suite>/<trial>: max_rss_mb: peak resident set size 519.9 MB exceeds the ceiling of 100 MB (<trial>.max_rss_mb)
+❌❌ <suite>/<trial> .sout differs from .scout
+4d3
+< max_rss_mb: peak resident set size 519.9 MB exceeds the ceiling of 100 MB (<trial>.max_rss_mb)
+```
+
+Within the ceiling the log gets `✅ <suite>/<trial> peak resident set size 15.6 MB is within the
+ceiling of 200 MB` and the trial's check is the normal output comparison.
+
+- **Where:** the shared trial-run macros `INTEGRATE_RUN_TRIAL` and `INTEGRATE_EXEC_TRIAL` in
+  `silica_compiler.mk`, so every suite that runs its programs through them honours the marker
+  with no change to its Makefile. The trial name is the last `/`-separated word of the macro's
+  label (every suite labels a run `<suite>/<trial>`), and the marker is looked up in the directory
+  the suite runs its programs in. Suites that start their programs directly instead
+  (`actor_registration_addition`, the `cast_*registered_unheld_name*` suites, the
+  `error_enforcement_addition` leaves) do not see it. With no marker the command line is the
+  one used before the marker existed.
+- **How it is measured:** the runner forks the command (the trial, or
+  `run_integration_exit_after_marker.py` for a `.wait_for_exit` trial) and reaps it with
+  `wait4()`. Its `ru_maxrss` is the peak of the child and of every descendant the child reaped,
+  the same number `/usr/bin/time -l` (macOS) and `/usr/bin/time -v` (Linux) print, without parsing
+  `time`'s stderr out of the `.sout`. macOS reports bytes, Linux kilobytes; the runner converts.
+  For a `.wait_for_exit` trial the peak is the larger of the trial and the Python marker runner
+  (about 15 MB), so a ceiling below ~20 MB is meaningless there.
+- **Choosing a ceiling:** well above a leak-free run and well below the leaking one; say in the
+  trial's header comment which numbers it sits between.
+- **Hard timeout:** `SILICA_RSS_TRIAL_TIMEOUT_SEC` (default 600). On expiry the command gets
+  SIGTERM, then SIGKILL 5 s later, and a timeout line in the `.sout` fails the trial. The
+  watchdog still applies on top.
+- **Host only.** The marker is ignored when the emit target is not this host
+  (`SILICA_TARGET_IS_HOST=0`, compile-only runs) and on the board: `targets/board_suite.sh` runs
+  board trials without these macros and never reads it. A memory check that must hold on the
+  board needs a program-visible counter and a `.scout` instead.
+- **Linux:** the kilobyte path is written but has not been run yet (pix, nix).
+
 ## Files left behind
 
 Each directory that ran `integrate` keeps a few bookkeeping files (all ignored by the
@@ -159,7 +204,8 @@ so that each check prints one `✅✅ <suite>/<trial> ...` or `❌❌ <suite>/<t
 line followed by `$(INTEGRATE_DOT_OK)` or `$(INTEGRATE_DOT_FAIL)`, which append the
 check to the live counters (diff after the ❌❌ line), runs every trial program through `$(call INTEGRATE_RUN_TRIAL,<label>,<sout>,<cmd>)`
 or `$(call INTEGRATE_EXEC_TRIAL,<label>,<cmd>)` so the watchdog can kill it (then
-check `$$integrate_killed`), and finishes by writing `.integrate_counts`; the wrapper
+check `$$integrate_killed`; both macros also apply a `<trial>.max_rss_mb` ceiling, see
+above), and finishes by writing `.integrate_counts`; the wrapper
 and the parent do the rest.
 
 Because everything runs under `-j`, a rule must never list `clean` and

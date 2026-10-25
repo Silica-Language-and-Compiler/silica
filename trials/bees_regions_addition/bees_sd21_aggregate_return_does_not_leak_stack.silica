@@ -1,0 +1,98 @@
+// bees_sd21_aggregate_return_does_not_leak_stack
+//
+// Shows: calling a function that returns an aggregate (here a three-field record) inside an
+// actor does not leak actor stack. main casts 100000, 99999, ..., 0, then -1; each
+// dispatch makes 10 record-returning calls (sum_k -> mk). The state is (total, early): the
+// behaviour records its own stack high_water (get_actor_memory_usage(self())) at message 99000,
+// the 1,001st dispatch, and the last dispatch prints the total and whether high_water grew since.
+// How it tells leaking from not leaking: every dispatch has the same call depth, so with no leak
+// high_water at the end equals high_water at message 99000 and the trial prints
+// `false`. The SD-21 leak (~32 bytes of stack per aggregate-returning call, never given back
+// between dispatches) adds ~31 MB over the 99,001 later dispatches, so high_water grows and the
+// trial prints `true` (or faults in mk at the stack guard, as it did on 2026-09-17).
+// Origin: project-bees defect SD-21. actors_addition/aggregate_return_in_actor_keeps_stack is the
+// same workload without the high_water check (it detects only the fault).
+// Observed 2026-10-22 on the Mac compiler (999943): flat memory over 55 million record-returning
+// calls with self-cast; correct sum 7700154 at 100,000 messages (fixed). This trial: 7700154,
+// false, done, about one second.
+// Expected output: 7700154, false, done, then exit 0 (the harness sends `exit` after `done`).
+fn mk(n: int64) -> { a: int64, b: int64, c: int64 } { { a: n, b: n + 1, c: n + 2 } }
+fn sum_k(k: int64, acc: int64) -> int64 {
+    sequence
+        r: { a: int64, b: int64, c: int64 } <- mk(k);
+        v: int64 <- case k == 0 of { true -> acc + r.c; false -> sum_k(k - 1, acc + r.c) }
+    produces pure v end
+}
+fn stack_high_water() -> int64 {
+    sequence proc[concurrency]
+        me: actor_ref <- self();
+        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(me)
+    produces pure u.high_water end
+}
+fn report(total: int64, grew: boolean) -> atom {
+    sequence proc[device_io]
+        _: atom <- print_int64(total);
+        println("");
+        print_boolean(grew);
+        println("");
+        println("done")
+    produces pure :ok end
+}
+fn beh(msg: int64, state: (int64, int64)) -> (:no_reply, (int64, int64)) {
+    sequence
+        (total: int64, early: int64) <- state;
+        v: int64 <- sum_k(10, 0);
+        hw: int64 <- stack_high_water();
+        early2: int64 <- case msg == 99000 of { true -> hw; false -> early };
+        _: atom <- case msg == 0 - 1 of {
+            true -> report(total + v, hw > early2);
+            false -> :ok
+        }
+    produces pure (:no_reply, (total + v, early2)) end
+}
+fn send_n(a: actor_ref, i: int64) -> atom {
+    sequence proc[concurrency]
+        _: boolean <- cast(a, i impl ActorMessage {});
+        r: atom <- case i == 0 of { true -> :ok; false -> send_n(a, i - 1) }
+    produces pure r end
+}
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        a: actor_ref <- spawn((0, 0), beh, stack_policy(0, :keep_last_message));
+        _: atom <- send_n(a, 100000);
+        _: boolean <- cast(a, 0 - 1 impl ActorMessage {});
+        _: int64 <- wait_for_exit()
+    produces pure 0 end
+}
+// ---- port addition: FailureReporter (E2236 requires one before any spawn), copied from
+// ---- docs/examples/idle_actor_capacity/main.silica
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

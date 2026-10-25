@@ -1,0 +1,124 @@
+// Spec §15.4.10.5 under load: 100,000 exit reports. The :permanent worker :w fails with
+// fail_self(:boom) on every message; the sink, on each report, makes the replacement fail again,
+// and ends main's wait after the 100,000th report. Every report is a 64-byte block the runtime
+// hands to the sink (the record and its (:explicit, :boom) pair), freed after the sink's dispatch
+// (_silica_rt_owned_record_release); a leak of them adds 6.4 MB to the peak resident set. The
+// ceiling, 5 MB in report_hundred_thousand_reports_rss.max_rss_mb (trials/README.md "Peak memory
+// ceiling"), sits between the leak-free run (2.1 MB peak, Mac, 2026-10-23, 4.9 s) and the same
+// program with the release disabled (8.6 MB).
+//
+// Expected output:
+//   sink set
+//   reports: 100000
+//   0
+
+use Supervisor;
+
+impl ReportLoadSup for Supervisor;
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 1000000, restarts_time_frame: 10000000000 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :w, agent_type: :worker, initial_state: 10, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+// Cast-only worker: 0 ends it at once with (:explicit, :boom) (§15.1.2.3).
+fn worker(msg: int64, state: int64) -> (:no_reply, int64) {
+    case msg of {
+        0 -> {
+            sequence proc[concurrency]
+                _: atom <- fail_self(:boom)
+            produces pure (:no_reply, state) end
+        };
+        _: int64 -> (:no_reply, state + msg)
+    }
+}
+
+// The failure_reason of a report, spelled out (spec §15.4.11.2: an inline sum type).
+fn reason_text(fr: :normal | :language_error | :memory_fault | (:explicit, atom) | :noproc | :unknown) -> string {
+    case fr of {
+        :normal -> "normal";
+        :language_error -> "language_error";
+        :memory_fault -> "memory_fault";
+        :noproc -> "noproc";
+        :unknown -> "unknown";
+        (:explicit, a: atom) -> case a of {
+            :boom -> "explicit boom";
+            :bang -> "explicit bang";
+            :done -> "explicit done";
+            :restart_intensity_breach -> "explicit restart_intensity_breach";
+            _: atom -> "explicit other"
+        }
+    }
+}
+
+fn child_text(id: atom) -> string {
+    case id of {
+        :w -> "w";
+        :w1 -> "w1";
+        :w2 -> "w2";
+        :gw1 -> "gw1";
+        :gw2 -> "gw2";
+        :inner1 -> "inner1";
+        :inner2 -> "inner2";
+        _: atom -> "?"
+    }
+}
+
+// The report sink (spec §15.4.10.5): counts the reports down silently; each one makes the worker's
+// replacement fail again, and the last ends main's wait_for_exit() with cast_exit(0).
+fn sink(r: { child: actor_ref, child_id: atom, failure_reason: :normal | :language_error | :memory_fault | (:explicit, atom) | :noproc | :unknown, restarted: boolean, new_child: actor_ref }, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> cast_registered(:w, 0 impl ActorMessage {})
+        }
+    produces pure (:no_reply, left) end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter(0);
+        s: actor_ref <- spawn(100000, sink, stack_policy(0, :keep_last_message));
+        rt: supervisor_ref <- spawn_registered_supervisor(ReportLoadSup, 0, :root, stack_policy(0, :keep_last_message));
+        set: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(rt, { op: :set_report_sink, sink: s } impl SupervisorMessage {});
+        _: atom <- case set.status of {
+            :sink_set -> println("sink set");
+            _: atom -> println("sink NOT set")
+        };
+        _: boolean <- cast_registered(:w, 0 impl ActorMessage {});
+        _: int64 <- wait_for_exit();
+        _: atom <- println("reports: 100000")
+    produces pure 0 end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// A FailureReporter (spec §15.4.13.4) that keeps every report to itself, so the output holds only
+// main's and the sink's lines; without one the reports would go to standard error. Started with a
+// positive count, it ends main's wait_for_exit() with cast_exit(0) after that many reports.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces pure (:no_reply, left) end
+}
+
+fn start_reporter(expected: int64) -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces pure registered end
+}

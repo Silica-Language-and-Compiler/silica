@@ -1,0 +1,166 @@
+// Spec §15.4.8.3 (:add_child) with a child spec whose initial_state is a record literal, the shape
+// of a dynamically supervised process whose state is a record (Project BEES). The static child
+// list of init holds an int64-state child, which always worked; the added child's state is
+// { a: 10, b: 20 } and its behaviour replies a + b + msg.
+//
+// Before the fix the message prims held the supervisor reference in X11 while the message was
+// evaluated, and X11 is a scratch register: the nested record literal { a: 10, b: 20 } is promoted
+// to the heap through _silica_rt_region_alloc, which left the address of _silica_rt_heap_in_use in
+// X11, so _silica_rt_supervisor_add_child looked up a reference that names no supervisor and main
+// ended with actor_not_found on standard error and exit status 1 (the same happened with a tuple
+// initial_state and with a record holding a region). The left operand of a message prim is now
+// parked across any computed right operand (emitter term_emit_kind_compound_part3).
+//
+// The ids :s1_tuple_worker and :s1_rec_worker and the supervisor name :s1_rec_sup are atoms that
+// supervisor_child_tuple_state and supervisor_child_record_state, compiled before this unit, already
+// put in this suite's table, so adding the trial renumbers no other trial's atoms; { a, b } is
+// likewise an existing record shape.
+//
+// Expected output:
+//   1          call_registered(:s1_tuple_worker, 1) through the init child (state 0)
+//   added
+//   35         call(added.child, 5): 10 + 20 + 5
+//   done
+// exit status 0
+
+use Supervisor;
+
+impl AddRecordChildSup for Supervisor;
+
+fn plain(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state)
+}
+
+fn rec_worker(msg: int64, state: { a: int64, b: int64 }) -> (:reply, int64, { a: int64, b: int64 }) {
+    (:reply, state.a + state.b + msg, state)
+}
+
+fn init(initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+            strategy: :one_for_one | :one_for_all | :rest_for_one,
+            allowed_restart_count: int64,
+            restarts_time_frame: int64
+        } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: int64,
+                behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous
+            },
+            mem(normal)
+        ] <- [
+            { id: :s1_tuple_worker, agent_type: :worker, initial_state: initial_state, behavior: plain, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        sup: supervisor_ref <- spawn_registered_supervisor(AddRecordChildSup, 0, :s1_rec_sup, stack_policy(0, :keep_last_message));
+        _: atom <- print_int64(call_registered(:s1_tuple_worker, 1 impl ActorMessage {}));
+        println("");
+        added: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, {
+            op: :add_child,
+            child: {
+                id: :s1_rec_worker,
+                agent_type: :worker,
+                initial_state: { a: 10, b: 20 },
+                behavior: rec_worker,
+                restart: :permanent,
+                shutdown: 0,
+                flavor: :plain
+            }
+        } impl SupervisorMessage {});
+        _: atom <- println("added");
+        _: atom <- print_int64(call(added.child, 5 impl ActorMessage {}));
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

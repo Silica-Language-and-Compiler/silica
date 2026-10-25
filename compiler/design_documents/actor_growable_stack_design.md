@@ -272,7 +272,7 @@ ref1: ref(R1, normal, int64) <- alloc_ref(r, 42);
 buf1: buf(R1, normal, int64, 100) <- alloc_buf(r, 100);
 
 // Atomic reference
-atomic1: ref(R1, atomic, int64) <- alloc_atomic(r, 99);
+atomic1: ref(R1, atomic, int64) <- alloc_ref(r, 99);
 
 // All live on the actor's stack
 // All become inaccessible when actor terminates

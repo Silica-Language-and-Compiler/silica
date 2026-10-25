@@ -27,9 +27,11 @@ runs on macOS, Linux (AArch64 or x86-64) or bare metal on the ESP32-S3.
 | Fatal fault: a synchronous CPU exception the program cannot survive (§15.4.4 gate fails, a fault outside any actor, including exhausting `main`'s stack, a fault in trusted runtime code) | `[silica] fault at 0x<pc>` + ` in <symbol>+0x<offset>` where available + `  addr=0x<fault address>` + `  actor=0x..  sbase=0x..  ssize=0x..` on targets with actors | **70** |
 | Runtime abort: a runtime check the program cannot continue from, a resource the runtime cannot obtain (memory to commit for a growing actor stack, §15.4.10.2), a containment failure not raised by hardware | `[silica] abort: <reason> at 0x<pc>` + ` in <symbol>+0x<offset>` where available | **71** |
 | Language-level failure in `main` (`case_clause`, `badarith`) | the atom name | 1 |
-| Actor failure (a fault or stack exhaustion inside an actor that the runtime recovers, every exit reason of §15.4.11) | none: delivered through supervision (§15.4.4, §15.4.10) | not a process exit |
+| Actor failure (a fault or stack exhaustion inside an actor that the runtime recovers, every exit reason of §15.4.11, including the runtime checks of §4 that fail inside an actor, below) | none: delivered through supervision (§15.4.4, §15.4.10) | not a process exit |
 
 What the rules mean in practice:
+
+- **Main versus actor (Lee, 2026-10-22 and 2026-10-23).** The runtime checks `L_buf_bounds`, `L_buf_invalid`, the list-index check and the region allocation failure (`L_region_overflow`, the hosted arena grow failure and the raw allocation failure of design H5) are runtime aborts (status 71) only when `main` runs them. Inside an actor they end the actor, which the supervisor handles like any other failure (§7), with the exit reasons `(:explicit, :buf_bounds)`, `(:explicit, :buf_invalid)`, `(:explicit, :list_index)` and `(:explicit, :region_alloc_failed)`. The access or allocation is never performed. The abort reasons of the §4 tables are what `main` prints; the design is [region_memory_safety_design.md](region_memory_safety_design.md) §8 (Q9). Status 2026-10-23: implemented on the Mac, mirrors unbuilt.
 
 - **Nothing ends a Silica process through C `abort()` (SIGABRT, status 134) or a default signal action
   (status 139).** Every call to `abort()` the runtime and the emitted code used to make is now a runtime
@@ -238,6 +240,8 @@ is.
 
 ## 4. The sites
 
+The abort reasons in the first three tables below are printed when `main` runs the check. Inside an actor the buffer-bounds, invalid-size, list-index and region-allocation sites end the actor instead (`(:explicit, :buf_bounds)`, `(:explicit, :buf_invalid)`, `(:explicit, :list_index)`, `(:explicit, :region_alloc_failed)`; section 1; Lee, 2026-10-23).
+
 Emitted code (host emitters `terms/prims/prims_memory.silica`, `terms/prims/prims_list.silica`; the ESP32
 emitter's `prims_memory.silica`):
 
@@ -341,7 +345,7 @@ Where it is applied:
 - Process-fatal paths write only the report line; unwind reports belong to actor failures (spec §15.4.5.5).
 - **Supervisor shutdown (2026-10-15, spec §15.4.12.2).** When a supervisor ends, it first shuts down its live children, one at
   a time, last child-table row first. Each shut-down child produces a failure report like any other death: a child with
-  `shutdown: 0` ends with reason tag 1 (as `kill_abnormal`), a child with `shutdown > 0` ends with
+  `shutdown: 0` ends with `(:explicit, :killed)` (reason tag 4, as `kill_abnormal`; tag 1 is no longer written since 2026-10-23), a child with `shutdown > 0` ends with
   `(:explicit, :shutdown)` (reason tag 4). A child whose supervisor is already dead does not print the root-actor note.
   The `shutdown` time limit is not enforced on any target, because nothing preempts a running message.
 - `remove_actor(self())` and `kill_abnormal(self())` fail the caller with `:language_error` at run time (spec §15.1.2.3);
@@ -367,13 +371,37 @@ process-fatal reports of §1 to §5. Checked against the hosted and board runtim
 - **The banner.** Hosted (`L_phase_f_unwind_fmt`) and board (`rt_actors.S`) print the same shape:
   `=== Silica Actor Failure ===`, `actor_id:` (the actor's 64-bit identity of spec §15.1.4, position in the
   high word and child number in the low word, printed as one unsigned integer; before 2026-10-12 it was the
-  control-block pointer), `agent_type_atom:`, `reason_tag:`, `supervisor_acb:` (a pointer; null prints `0x0`
+  control-block pointer), `agent_type_atom:`, `reason:` (readable reason, 2026-10-24, below), `reason_tag:`, `supervisor_acb:` (a pointer; null prints `0x0`
   on Darwin, `(nil)` on glibc, `0x00000000` on the board), `call_stack:` with `#0` the behaviour's symbol
   (`<unknown behavior>` when the slot is empty) and `#1  _actor_thread_main`, and
   `=== End Silica Actor Failure ===`. A region dump section follows only when the reporter's
   `region_dump_limit()` is above zero. The fields differ from the specification's example (`agent_type:`,
   `behavior:`, `supervisor:` lines); the table of §15.4.6.4 describes the intended report. The comparison
   tools fold `actor_id`, `supervisor_acb`, `epc` and `agent_type_atom` (§5).
+- **The `reason:` line (2026-10-24).** A readable line sits directly above `reason_tag:`:
+
+  ```
+  === Silica Actor Failure ===
+  actor_id:        <decimal identity>
+  agent_type_atom: <atom index of the agent type; 0 for a root actor>
+  reason:          <failure reason, e.g. :language_error — integer division by zero, (:explicit, :killed)>
+  reason_tag:      <number of the failure reason>
+  supervisor_acb:  <pointer; 0x0, (nil) or 0x00000000 when the actor has no supervisor>
+  call_stack:
+    #0  <behavior symbol, or <unknown behavior>>
+    #1  _actor_thread_main
+  === End Silica Actor Failure ===
+  ```
+
+  The dash is U+2014. Detail text follows only where the runtime knows the cause (`integer division by zero`,
+  `no case arm matched`); an atom that the runtime's copy of the atom table does not hold prints `:unknown`.
+  Covered by `trials/failure_reason_line_addition`. Implemented on all four targets; verified on the Mac, Linux
+  verification in progress, ESP32-S3 board run pending.
+- **Reason tags (2026-10-23, `:foreign_fault` 2026-10-24).** 0 `:normal`; 2 `:language_error` (division by zero,
+  no case arm matched, convention mismatch, name taken, misuse sites); 3 `:memory_fault` (board CPU exception
+  in an actor); 4 every `(:explicit, atom)`, including `(:explicit, :killed)` from `kill_abnormal` and from
+  shutdown 0, and `(:explicit, :shutdown)` from shutdown above 0; 5 `:foreign_fault` (a guarded foreign call
+  faulted inside a dangerous actor). Tag 1 is no longer written.
 - **Handler before any start (E2236).** `main` must register the reporter before it starts any actor or
   supervisor, so a death during start-up, the root supervisor's own included, always has a destination. The
   reporter must be cast-only: `register_failure_reporter` of a reply-form (call-only) behaviour is rejected

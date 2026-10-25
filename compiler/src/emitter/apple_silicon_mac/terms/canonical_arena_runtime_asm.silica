@@ -20,6 +20,13 @@
 // Arena layout matches prims_memory alloc_region: [0:8]=bump, [8:16]=end, [16:24]=extension chain
 // (empty here; L_region_grow fills it if one of these arenas ever fills up), [24:32]=own data end,
 // data from offset 32.
+//
+// The table is process-shared and read from every thread (design region_memory_safety_design.md
+// §9.4, H1). A probe reads each key with an acquire load; an insert happens under
+// _silica_rt_region_lock (the word L_region_grow also takes), which stores the arena pointer first
+// and the key last with a release store, so a probe that sees the key sees the arena. A thread
+// that found an empty slot takes the lock and probes again from the start: another insert of the
+// same key may have landed in between, and the table changes only under the lock.
 
 export emit_canonical_arena_runtime_asm/0;
 
@@ -33,21 +40,28 @@ _silica_rt_canonical_arena_table:
 	.globl	_silica_rt_canonical_arena_count
 _silica_rt_canonical_arena_count:
 	.space	8
+	.globl	_silica_rt_region_lock
+_silica_rt_region_lock:
+	.space	8
 	.section	__TEXT,__text,regular,pure_instructions
 	.globl	_silica_rt_canonical_arena_lookup
 	.p2align	2
 _silica_rt_canonical_arena_lookup:
 	.cfi_startproc
 ; X0 = stable specialization key (non-zero) -> X0 = region base pointer
+; X22 = 1 once this call holds _silica_rt_region_lock.
 	stp	x21, x20, [sp, #-48]!
 	stp	x19, x30, [sp, #16]
-	.cfi_offset w30, -8
-	.cfi_offset w19, -16
-	.cfi_offset w20, -24
-	.cfi_offset w21, -32
+	str	x22, [sp, #32]
+	.cfi_offset w30, -24
+	.cfi_offset w19, -32
+	.cfi_offset w20, -40
+	.cfi_offset w21, -48
 	mov	x19, x0
 	cbz	x19, Lcal_abort_key
 	mov	w20, #512
+	mov	x22, xzr
+Lcal_restart:
 	mov	w9, w20
 	udiv	w10, w19, w9
 	msub	w8, w10, w9, w19
@@ -59,8 +73,8 @@ Lcal_probe:
 	adrp	x12, _silica_rt_canonical_arena_table@PAGE
 	add	x12, x12, _silica_rt_canonical_arena_table@PAGEOFF
 	add	x12, x12, x11
-	ldr	x13, [x12]
-	cbz	x13, Lcal_insert
+	ldar	x13, [x12]
+	cbz	x13, Lcal_empty
 	cmp	x13, x19
 	b.eq	Lcal_found
 	add	w8, w8, #1
@@ -70,14 +84,32 @@ Lcal_probe:
 	b	Lcal_probe
 Lcal_found:
 	ldr	x0, [x12, #8]
+	cbz	x22, Lcal_return
+	adrp	x9, _silica_rt_region_lock@PAGE
+	add	x9, x9, _silica_rt_region_lock@PAGEOFF
+	stlr	wzr, [x9]
+Lcal_return:
+	ldr	x22, [sp, #32]
 	ldp	x19, x30, [sp, #16]
 	ldp	x21, x20, [sp], #48
 	ret
+Lcal_empty:
+	cbnz	x22, Lcal_insert
+	adrp	x9, _silica_rt_region_lock@PAGE
+	add	x9, x9, _silica_rt_region_lock@PAGEOFF
+	mov	w11, #1
+Lcal_lock:
+	ldaxr	w10, [x9]
+	cbnz	w10, Lcal_lock
+	stxr	w13, w11, [x9]
+	cbnz	w13, Lcal_lock
+	mov	x22, #1
+	b	Lcal_restart
 Lcal_insert:
-	stp	x12, x13, [sp, #-16]!
+	mov	x21, x12
 	mov	x0, #4128
 	bl	_malloc
-	ldp	x12, x13, [sp], #16
+	mov	x12, x21
 	cbz	x0, Lcal_abort_nomem
 	add	x14, x0, #32
 	str	x14, [x0]
@@ -86,13 +118,17 @@ Lcal_insert:
 	str	x14, [x0, #8]
 	str	xzr, [x0, #16]
 	str	x14, [x0, #24]
-	str	x19, [x12]
 	str	x0, [x12, #8]
+	stlr	x19, [x12]
 	adrp	x13, _silica_rt_canonical_arena_count@PAGE
 	add	x13, x13, _silica_rt_canonical_arena_count@PAGEOFF
 	ldr	x14, [x13]
 	add	x14, x14, #1
 	str	x14, [x13]
+	adrp	x9, _silica_rt_region_lock@PAGE
+	add	x9, x9, _silica_rt_region_lock@PAGEOFF
+	stlr	wzr, [x9]
+	ldr	x22, [sp, #32]
 	ldp	x19, x30, [sp, #16]
 	ldp	x21, x20, [sp], #48
 	ret

@@ -10,6 +10,17 @@ directory. This directory holds only this README (it has no Makefile, so it is n
 
 Open:
 
+- `compile_defects_sum_binding_type_addition` (a sequence binding typed with an inline sum that has a tuple variant,
+  `kept: :none | (:some, int64) <- v;`, is E1000 at the parser; spec §3.3.4, §3.5 `identifier_pattern ::= identifier ":" type`,
+  §3.4.2; topic `case_addition`). Found 2026-10-23 writing `supervisor_exit_reports_addition`.
+- From the project BEES triage (2026-10-23, open, staged with `INTEGRATE_PENDING`; the set is described in
+  `../bees_gaps_open_addition/README.md`): `compile_defects_ffi_same_unit_adapter_addition` (a worker's
+  `external_danger` sequence calling a same-unit `dangerous_*` adapter is E3010, FFI spec §4.5; topic `ffi_addition`),
+  `compile_defects_case_512_arms_addition` (a case with 512+ literal arms is E1069; topic `case_addition`),
+  `compile_defects_migrate_actor_uint64_core_addition` (a uint64 core for `migrate_actor` is E2003, spec §15.1.2;
+  topic `actors_addition`), and `compile_defects_lifetime_in_referent_type_addition` (SD-6: a lifetime inside the
+  referent type is compared by name, E2003, spec §12.1.4; topic `memory_region_addition`).
+
 - From the ESP32-S3 device description (2026-10-05, open): `compile_defects_large_list_literal_frame_addition` (a
   function whose body is a ~400-element list literal of records builds the whole list in its stack frame, about
   76 KB; the ESP32-S3 assembler rejects it, `entry` allows 32,760 bytes, and the Mac assembler rejects it too,

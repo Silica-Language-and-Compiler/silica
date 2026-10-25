@@ -1,0 +1,129 @@
+// buf_invalid_size_ends_actor  (OPEN: staged in region_hazards_open_addition, see README.md)
+//
+// Q9 / stage 8 (region_memory_safety_design.md §8: "Same for L_buf_invalid"; §10 run-time outcomes
+// "(:explicit, :buf_bounds) / :buf_invalid per Q9, abort 71 in main"; §13 stage 8; §15 Q9 (a)):
+// an invalid buffer size (a negative count, or a byte size that overflows) inside an actor ends
+// THAT actor with failure reason (:explicit, :buf_invalid), handled by its supervisor; the rest of
+// the program keeps running. In main it stays runtime abort 71.
+// Today (all hosted targets): emit_alloc_buf branches to L_buf_invalid, which calls
+// _silica_rt_abort_buf_invalid: "[silica] abort: invalid buffer size at 0x..." and status 71 for
+// the whole process. Q9 is open; this .scout records recommendation (a).
+// Same program as buf_bounds_ends_actor, with the worker allocating a buffer of msg elements
+// (memory_region_addition/alloc_buf_negative_count_aborts's fill) instead of indexing a 4-element
+// one: main calls it with 1 (5 + state 100 = 105), the crasher calls it with -1, main calls the
+// restarted worker with 1 (105 again: the restart begins from state 100).
+// Pass vs fail: a pass prints the lines below and exits 0. Today: 105, the abort line, 71.
+// The banner shows reason_tag 4; the reason atom :buf_invalid is not printed, so it is not checked.
+// Expected output (compared as a multiset: reports are asynchronous):
+//   105
+//   failure report: worker reason_tag 4    alloc_buf(r, -1) ends the worker
+//   failure report: crasher reason_tag 4   the crasher's call raises actor_not_found
+//   after restart
+//   105
+//   done
+//   0
+
+use Supervisor;
+
+impl BufInvalidSizeEndsActorSup for Supervisor;
+
+fn fill(count: int64) -> int64 {
+    sequence proc[mem(normal)]
+        L1: lifetime <- fresh_lifetime();
+        r: region(L1, normal) <- alloc_region(normal);
+        buf: buf(L1, normal, int64, count) <- alloc_buf(r, count);
+        _: atom <- write_buf(buf, 0, 5);
+        value: int64 <- read_buf(buf, 0)
+    produces
+        pure value
+    end
+}
+
+fn worker(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, fill(msg) + state, state + 1)
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 3600 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :bi_worker, agent_type: :worker, initial_state: initial_state, behavior: worker, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces pure (flags, children) end
+}
+
+// Calls the worker with its message; when the worker ends before replying, the call raises
+// actor_not_found and the crasher fails with reason_tag 4 (spec §16.1.1).
+fn crasher(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: int64 <- call_registered(:bi_worker, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- start_reporter(2);
+        _: supervisor_ref <- spawn_registered_supervisor(BufInvalidSizeEndsActorSup, 100, :bi_sup, stack_policy(0, :keep_last_message));
+        r1: int64 <- call_registered(:bi_worker, 1 impl ActorMessage {});
+        print_int64(r1);
+        println("");
+        k: actor_ref <- spawn(0, crasher, stack_policy(0, :keep_last_message));
+        bad: int64 <- 0 - 1;
+        _: boolean <- cast(k, bad impl ActorMessage {});
+        _: int64 <- wait_for_exit();
+        println("after restart");
+        r2: int64 <- call_registered(:bi_worker, 1 impl ActorMessage {});
+        print_int64(r2);
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// One line per report, naming the failed behaviour; the state counts down from the number of
+// reports main waits for, and the last ends main's wait_for_exit() with cast_exit(0).
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        print(report_kind(report));
+        left: int64 <- state - 1;
+        _: boolean <- case left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces
+        pure (:no_reply, left)
+    end
+}
+
+fn report_who(report: string) -> string {
+    case contains(report, "_worker\n") of {
+        true -> "worker";
+        false -> case contains(report, "_crasher\n") of { true -> "crasher"; false -> "other" }
+    }
+}
+
+fn report_kind(report: string) -> string {
+    case contains(report, "reason_tag:      4") of {
+        true -> concat(concat("failure report: ", report_who(report)), " reason_tag 4\n");
+        false -> concat(concat("failure report: ", report_who(report)), " other reason\n")
+    }
+}
+
+fn start_reporter(expected: int64) -> actor_ref {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(expected, reporter, stack_policy(0, :keep_last_message));
+        _: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure reporter_ref
+    end
+}

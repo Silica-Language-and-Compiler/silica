@@ -62,6 +62,9 @@ silica_rt_heap_free_head:
     .space  4
 silica_rt_heap_lock:
     .space  4
+    .global silica_rt_region_lock             // taken by silica_rt_region_grow (below) and by
+silica_rt_region_lock:                        // rt_ordering.S's canonical arena insert
+    .space  4
 
 // The heap lock, the shape of rt_actors.S's FREE_LOCK. The macro's own local label is 9, so the
 // routines below never use 9 for theirs.
@@ -97,6 +100,8 @@ silica_rt_heap_init:
     movi    a4, 0
     s32i    a4, a3, 0
     movi    a3, silica_rt_heap_lock
+    s32i    a4, a3, 0
+    movi    a3, silica_rt_region_lock
     s32i    a4, a3, 0
     retw
     .size   silica_rt_heap_init, . - silica_rt_heap_init
@@ -312,18 +317,25 @@ silica_rt_region_destroy:
 
 // silica_rt_region_grow: called from the middle of an emitted allocation sequence when the current
 // block is full. Convention inherited from the AArch64 helper: the region is X1 (here a4), the
-// request is X5 - X3 (both live in this core's register block, THREADPTR + 16 and + 0); every register the
-// caller holds is preserved (a2-a7 untouched, a8-a15 are the caller's own scratch). A block holds at
-// least 4096 data bytes, or the 16-byte-rounded request when that is larger.
+// request is X7 (in this core's register block, THREADPTR + 32); every register the caller holds
+// is preserved (a2-a7 untouched, a8-a15 are the caller's own scratch). A block holds at least 4096
+// data bytes, or the 16-byte-rounded request when that is larger.
+//
+// Both cores may grow one canonical arena, so growth is serialized by silica_rt_region_lock (the
+// shape of HEAP_LOCK; silica_rt_alloc's own heap lock nests inside it as a leaf). Under the lock
+// the request is checked again, because the other core may already have attached a block this
+// request fits; then the sentinel 0x80000000 (above every data address, and bump + request cannot
+// wrap) is parked in the bump so no concurrent reservation (the emitted S32C1I loop,
+// prims_memory@emit_region_bump_check) can land in the old block while the new one is being
+// published, the block is chained, its end stored, and the bump last, with memw between so a
+// reservation that reads the new bump reads the new end.
     .align  4
     .global silica_rt_region_grow
     .type   silica_rt_region_grow, @function
 silica_rt_region_grow:
     entry   a1, 48
     rur     a8, threadptr
-    l32i    a9, a8, 16            // X5 = bump + request
-    l32i    a8, a8, 0             // X3 = bump
-    sub     a9, a9, a8
+    l32i    a9, a8, 32            // X7 = the request
     addi    a9, a9, 15
     movi    a8, -16
     and     a9, a9, a8            // data bytes, rounded up to 16
@@ -331,6 +343,21 @@ silica_rt_region_grow:
     bgeu    a9, a8, 1f
     mov     a9, a8
 1:  s32i    a9, a1, 0             // keep the size across the call
+    movi    a8, silica_rt_region_lock
+2:  movi    a10, 0
+    wsr     a10, scompare1
+    movi    a10, 1
+    s32c1i  a10, a8, 0
+    bnez    a10, 2b
+    rur     a8, threadptr         // under the lock: does the request fit now?
+    l32i    a10, a8, 32
+    l32i    a11, a4, 0            // bump
+    l32i    a12, a4, 8            // end
+    add     a10, a11, a10
+    bgeu    a12, a10, 5f          // end >= bump + request: the other core grew it; retry
+    movi    a10, 0x80000000       // sentinel: nothing reserves in the old block from here
+    s32i    a10, a4, 0
+    memw
     addi    a10, a9, 32
     call8   silica_rt_alloc       // never returns 0 (exhaustion aborts)
     l32i    a9, a1, 0
@@ -339,9 +366,16 @@ silica_rt_region_grow:
     s32i    a9, a10, 24           // block's own span end
     l32i    a11, a4, 16           // chain the block in front of the region's extensions
     s32i    a11, a10, 16
+    memw
     s32i    a10, a4, 16
-    s32i    a8, a4, 0             // the region now bumps in the new block
-    s32i    a9, a4, 8
+    s32i    a9, a4, 8             // the end first
+    memw
+    s32i    a8, a4, 0             // then the bump: the region now reserves in the new block
+5:  memw
+    movi    a8, silica_rt_region_lock
+    movi    a9, 0
+    s32i    a9, a8, 0
+    memw
     retw
     .size   silica_rt_region_grow, . - silica_rt_region_grow
 
