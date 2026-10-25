@@ -48,6 +48,27 @@
 //                  value's first word (a tuple alternative's tag atom, a record alternative's
 //                  shape number); an atom alternative (< 65536) is copied as is
 //   KIND 6 BUF     a buffer (length word before the elements); AUX = element byte size
+//   KIND 7 LIST    a list handle (chunk15_stack_memory_design.md §3.6, decision 30); AUX = a one-entry
+//                  descriptor `.quad 1, SLOT` whose entry describes one element word (SLOT = the
+//                  chunk slot bytes; a slot above 8 holds an inline aggregate). Phase 0 (2026-10-24):
+//                  described and measured, copied as a WORD (the sender's list is shared) until the
+//                  mailbox buffer of phase 4 copies the handle and the spine
+//   KIND 8 STRING  a string (decision 29): 24-byte header {marker, bytes, length} and the bytes; a
+//                  run-time string's marker is -1, a literal's -2 (string_literal_pool), so the walk
+//                  never copies a literal. Phase 0: described and measured, copied as a WORD
+//   KIND 9 CLOSURE a function value (§3.6): copied as a WORD until closure environments are described
+//                  records (phase 2 rejects a captured closure at a send or return, E2300)
+//
+// Measuring mode (§5.1): L_mc_measure(value, descriptor) walks exactly as the copy does, with the
+// same per-message table, and returns the byte total of the copy; phase 0 emits it with the helper
+// and nothing calls it yet (the exact-size mailbox buffer of phase 4 does).
+//
+// Per-type descriptor labels (§3.6 "Descriptor emission"): besides the per-site descriptors below,
+// md_type_descriptors_block emits one descriptor body per DISTINCT pointer-carrying type a module's
+// functions return (L_td_<module>_<k>_0 and children) and aliases L_td_<fn label> (the result type),
+// L_td_<fn label>_s (a behaviour's state type) and L_td_<fn label>_r (its reply type) to the bodies.
+// Phase 0 emits them; the evacuation of phase 2 and the state and reply copies of phases 3 and 4 read
+// them.
 //
 // Tree-shaped parts (records, tuples, sums, buffers) are walked with no bookkeeping. Where the
 // type allows one value to be reached twice -- refs, and the region handles themselves -- ONE
@@ -78,8 +99,10 @@ use term_sir_helpers;
 use term_message_regions;
 use prims_record;
 use prims_tuple;
+use prims_list;
 use atom_table;
 use record_shape;
+use module_linkage;
 use var;
 
 export md_type_needs_copy/1;
@@ -97,6 +120,8 @@ export md_fn_label_marker/1;
 export md_fn_label_of/1;
 export module_uses_message_copy/1;
 export emit_message_copy_helper/0;
+export md_type_label/2;
+export md_type_descriptors_block/3;
 
 // ---- strings ----------------------------------------------------------------------------------
 
@@ -215,10 +240,27 @@ fn mc_is_sum(t: string) -> boolean {
     mc_top_sep(t, 0, 0, "|") < length_bytes(t)
 }
 
-// 0 WORD, 1 REGION, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF for a (space-stripped) type; `bound` is
-// true when an enclosing tuple type binds `rec` (a bare `rec`, or `ref?(L, S, rec)`, is a WORD
-// otherwise).
+// 0 WORD, 1 REGION, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST, 8 STRING, 9 CLOSURE for a
+// (space-stripped) type; `bound` is true when an enclosing tuple type binds `rec` (a bare `rec`, or
+// `ref?(L, S, rec)`, is a WORD otherwise). A function type is tested before the sum test: its result
+// may be a sum (`fn(a, b) -> :less | :equal | :greater`) whose `|` sits at depth zero.
 fn mc_kind_of(t: string, bound: boolean) -> int64 {
+    case length_bytes(t) == 0 of {
+        true -> 0;
+        false -> case mc_starts_with(t, "fn(") of {
+            true -> 9;
+            false -> case mc_starts_with(t, "List[") of {
+                true -> 7;
+                false -> case t == "string" of {
+                    true -> 8;
+                    false -> mc_kind_of_rest(t, bound)
+                }
+            }
+        }
+    }
+}
+
+fn mc_kind_of_rest(t: string, bound: boolean) -> int64 {
     case length_bytes(t) == 0 of {
         true -> 0;
         false -> case mc_is_sum(t) of {
@@ -262,6 +304,11 @@ fn mc_needs_copy_at(t: string, depth: int64, bound: boolean) -> boolean {
             2 -> true;
             3 -> true;
             6 -> true;
+            // Lists, strings and closures are described but not copied in phase 0 (header): a
+            // message made only of them still passes as a word. Phase 4 turns 7 and 8 to true.
+            7 -> false;
+            8 -> false;
+            9 -> false;
             5 -> mc_alts_need_copy(t, 0, depth, bound);
             _: int64 -> case mc_is_record(t) of {
                 true -> mc_fields_need_copy(substring(t, 1, length_bytes(t) - 1), 0, depth, bound);
@@ -334,7 +381,7 @@ fn mc_lbl(base: string, k: int64) -> string {
 
 // One entry line and the rodata of the descriptors it points at; `encl` is the label of the
 // innermost enclosing tuple's descriptor ("" when none), which is what `rec` names.
-fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
+fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
     kind: int64 <- case depth > 12 of { true -> 0; false -> mc_kind_of(t, length_bytes(encl) > 0) };
     case kind of {
         0 -> { line: "    .quad 0, 0\n", child: "", k: k };
@@ -357,6 +404,14 @@ fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index
             d: { text: string, k: int64 } <- mc_agg_desc(t, base, k, table, depth + 1, encl);
             { line: mc_label_entry(4, mc_lbl(base, k)), child: d.text, k: d.k }
         };
+        7 -> {
+            // A one-entry descriptor for the element word, headed by the chunk slot bytes.
+            c: { line: string, child: string, k: int64 } <- mc_entry(prims_list@list_elem_type_from_list_t(t), base, k + 1, table, depth + 1, encl);
+            own: string <- concat(mc_lbl(base, k), concat(":\n    .quad 1, ", concat(mc_itos(prims_list@chunk_elem_slot_bytes_from_list_t(t)), concat("\n", c.line))));
+            { line: mc_label_entry(7, mc_lbl(base, k)), child: concat(own, c.child), k: c.k }
+        };
+        8 -> { line: "    .quad 8, 0\n", child: "", k: k };
+        9 -> { line: "    .quad 9, 0\n", child: "", k: k };
         _: int64 -> {
             d: { text: string, k: int64 } <- mc_sum_table(t, base, k, table, depth + 1, encl);
             { line: mc_label_entry(5, mc_lbl(base, k)), child: d.text, k: d.k }
@@ -383,7 +438,7 @@ fn mc_buf_elem_bytes(t: string) -> int64 {
 }
 
 // The descriptor of a record or tuple type at label base_k: (rodata, next_k).
-fn mc_agg_desc(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
+fn mc_agg_desc(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
     inner: string <- substring(t, 1, length_bytes(t) - 1);
     case mc_is_record(t) of {
         true -> {
@@ -400,7 +455,7 @@ fn mc_agg_desc(t: string, base: string, k: int64, table: { is_empty: boolean, in
 }
 
 // Entries for the fields of record content "a:T,b:U,..." (n starts at 1 for the shape word).
-fn mc_field_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+fn mc_field_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
     case i >= length_bytes(content) of {
         true -> acc;
         false -> {
@@ -416,7 +471,7 @@ fn mc_field_entries(content: string, i: int64, base: string, k0: int64, table: {
 }
 
 // Entries for the elements of tuple content "T,U,...".
-fn mc_elem_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+fn mc_elem_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
     case i >= length_bytes(content) of {
         true -> acc;
         false -> {
@@ -432,7 +487,7 @@ fn mc_elem_entries(content: string, i: int64, base: string, k0: int64, table: { 
 // The alternative table of a sum type at label base_k: (rodata, next_k). An alternative with a
 // payload is a tuple led by its tag atom, or a record matched by its shape number; atoms and
 // alternatives whose tag this program's atom table does not hold are left out (copied as is).
-fn mc_sum_table(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
+fn mc_sum_table(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
     a: { entries: string, children: string, n: int64, ridx: int64, k: int64 } <- mc_sum_alts(t, 0, base, table, depth, encl, { entries: "", children: "", n: 0, ridx: 0 - 1, k: k + 1 });
     // The header is -1 - M: negative, so L_mc_root tells a sum table apart from an aggregate
     // descriptor (whose first word is a count) when the message type itself is a sum.
@@ -440,7 +495,7 @@ fn mc_sum_table(t: string, base: string, k: int64, table: { is_empty: boolean, i
     { text: concat(head, concat(a.entries, a.children)), k: a.k }
 }
 
-fn mc_sum_alts(t: string, i: int64, base: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+fn mc_sum_alts(t: string, i: int64, base: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
     case i >= length_bytes(t) of {
         true -> acc;
         false -> {
@@ -461,7 +516,7 @@ fn mc_sum_alts(t: string, i: int64, base: string, table: { is_empty: boolean, in
 
 // The word that identifies a payload alternative: a tuple's leading atom index, a record's shape
 // number; -1 when the alternative carries no payload or its tag is unknown here.
-fn mc_alt_tag(alt: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> int64 {
+fn mc_alt_tag(alt: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> int64 {
     case mc_is_record(alt) of {
         true -> atom_table@atom_lexeme_to_index(table, record_shape@record_shape_lexeme(alt));
         false -> case mc_is_tuple(alt) of {
@@ -480,7 +535,7 @@ fn mc_alt_tag(alt: string, table: { is_empty: boolean, index_map: { root: ref?(L
 
 // The descriptor rodata of a message type rooted at md_site_label(fnl, node): the root descriptor
 // is `<label>_0`. "" when the type is not copied.
-fn md_descriptor_rodata(t0: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn md_descriptor_rodata(t0: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     t: string <- prims_record@strip_spaces_rt(t0);
     case mc_kind_of(t, false) of {
         4 -> mc_agg_desc(t, label, 0, table, 0, "").text;
@@ -845,7 +900,7 @@ fn md_reply_elided(outer_reg: string) -> boolean {
 // reply type is not copied or every reply site transfers (markers "|_mvr=1"); else the copy call
 // with the shell in the CALLER's arena ([SP] is this ACB, its #240 the node served, the node's +56
 // the caller, as bmv_reply_asm reads them) followed by the descriptor rodata.
-fn md_reply_copy_asm(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, entry_label: string, markers: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn md_reply_copy_asm(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, entry_label: string, markers: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     rt: string <- mc_reply_type(fn_val.return_type);
     case length_bytes(rt) == 0 or md_type_needs_copy(rt) == false or md_reply_elided(markers) of {
         true -> "";
@@ -948,11 +1003,12 @@ fn mc_h_agg() -> string {
         "L_mc_agg_store:\n    LDR X11, [SP]\n    STR X0, [X11, X28, LSL #3]\n    ADD X28, X28, #1\n    B L_mc_agg_loop\nL_mc_agg_done:\n    LDR X0, [SP]\n    ADD SP, SP, #32\n    LDR X28, [SP], #16\n    LDP X26, X27, [SP], #16\n    LDP X29, X30, [SP], #16\nL_mc_agg_asis:\n    RET\n")
 }
 
-// L_mc_word(X0 = word, X1 = kind, X2 = aux) -> X0 = the copied word.
+// L_mc_word(X0 = word, X1 = kind, X2 = aux) -> X0 = the copied word. Kinds 7, 8 and 9 (list, string,
+// closure) are answered as they are in phase 0 (header).
 // L_mc_sum_desc(X0 = value, X1 = table) -> X1 = the alternative's descriptor or 0; X0 kept.
 fn mc_h_word() -> string {
     concat(concat(
-        "L_mc_word:\n    CBZ X1, L_mc_w_ret\n    CMP X1, #1\n    B.EQ L_mc_w_region\n    CMP X1, #4\n    B.EQ L_mc_w_agg\n    CMP X1, #5\n    B.EQ L_mc_w_sum\n    B L_mc_ref\nL_mc_w_region:\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STR X26, [SP, #-16]!\n    MOV X26, X0\n    BL L_mc_lookup\n    CBNZ X0, L_mc_w_region_done\n    MOV X0, X26\nL_mc_w_region_done:\n    LDR X26, [SP], #16\n    LDP X29, X30, [SP], #16\n    RET\nL_mc_w_agg:\n    MOV X1, X2\n    MOV X2, #0\n    B L_mc_agg\n",
+        "L_mc_word:\n    CBZ X1, L_mc_w_ret\n    CMP X1, #6\n    B.HI L_mc_w_ret\n    CMP X1, #1\n    B.EQ L_mc_w_region\n    CMP X1, #4\n    B.EQ L_mc_w_agg\n    CMP X1, #5\n    B.EQ L_mc_w_sum\n    B L_mc_ref\nL_mc_w_region:\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STR X26, [SP, #-16]!\n    MOV X26, X0\n    BL L_mc_lookup\n    CBNZ X0, L_mc_w_region_done\n    MOV X0, X26\nL_mc_w_region_done:\n    LDR X26, [SP], #16\n    LDP X29, X30, [SP], #16\n    RET\nL_mc_w_agg:\n    MOV X1, X2\n    MOV X2, #0\n    B L_mc_agg\n",
         "L_mc_w_sum:\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    MOV X1, X2\n    BL L_mc_sum_desc\n    CBZ X1, L_mc_w_sum_done\n    MOV X2, #0\n    BL L_mc_agg\nL_mc_w_sum_done:\n    LDP X29, X30, [SP], #16\nL_mc_w_ret:\n    RET\n"),
         "L_mc_sum_desc:\n    CMP X0, #65536\n    B.LO L_mc_sd_none\n    LDR X9, [X0]\n    LDR X11, [X1]\n    MVN X11, X11\n    ADD X12, X1, #8\nL_mc_sd_loop:\n    CBZ X11, L_mc_sd_none\n    LDR X10, [X12]\n    CMP X10, X9\n    B.EQ L_mc_sd_hit\n    ADD X12, X12, #16\n    SUB X11, X11, #1\n    B L_mc_sd_loop\nL_mc_sd_hit:\n    LDR X1, [X12, #8]\n    RET\nL_mc_sd_none:\n    MOV X1, #0\n    RET\n")
 }
@@ -977,6 +1033,162 @@ fn mc_h_table() -> string {
         "L_mc_grow:\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STP X26, X27, [SP, #-16]!\n    STR X28, [SP, #-16]!\n    MOV X26, X22\n    MOV X27, X23\n    LSL X0, X23, #1\n    MOV X1, #16\n    BL _calloc\n    CBZ X0, L_mc_gr_done\n    MOV X22, X0\n    LSL X23, X23, #1\n    MOV X24, #0\n    MOV X28, #0\nL_mc_gr_loop:\n    CMP X28, X27\n    B.HS L_mc_gr_free\n    ADD X11, X26, X28, LSL #4\n    LDR X0, [X11]\n    CBZ X0, L_mc_gr_next\n    LDR X1, [X11, #8]\n    BL L_mc_insert\nL_mc_gr_next:\n    ADD X28, X28, #1\n    B L_mc_gr_loop\nL_mc_gr_free:\n    MOV X0, X26\n    BL _free\nL_mc_gr_done:\n    LDR X28, [SP], #16\n    LDP X26, X27, [SP], #16\n    LDP X29, X30, [SP], #16\n    RET\n")
 }
 
+// ---- measuring mode (design §5.1) --------------------------------------------------------------------
+//
+// L_mc_measure(X0 = value, X1 = descriptor) -> X0 = the bytes a copy of the value occupies: every node
+// at the size L_mc_root reserves for it (an aggregate N*8; a REF1 cell 8; a REFTUP cell its payload
+// rounded to 16 plus the 8-byte cell word; a buffer (count * elem + 15) & ~7), plus the kinds the copy
+// does not build yet (a list handle 24 and CDATA + 16 per chunk of its spine; a run-time string
+// 24 + bytes + 1 rounded to 8; a literal string 0). A node reached twice is counted once (the copy's
+// table, value 1). No region is mapped and nothing is shallow: every described node counts. The
+// callee-saved registers are the copy's (X19 value, X20 descriptor, X22-X24 the table) with X25 the
+// running total; X26-X28 are the walkers' per-frame scratch.
+fn mc_h_measure_root() -> string {
+    concat(
+        "L_mc_measure:\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STP X19, X20, [SP, #-16]!\n    STP X21, X22, [SP, #-16]!\n    STP X23, X24, [SP, #-16]!\n    STP X25, X26, [SP, #-16]!\n    STP X27, X28, [SP, #-16]!\n    MOV X19, X0\n    MOV X20, X1\n    MOV X25, #0\n    MOV X0, #64\n    MOV X1, #16\n    BL _calloc\n    MOV X22, X0\n    MOV X23, #64\n    MOV X24, #0\n    CBZ X22, L_mc_ms_done\n    LDR X9, [X20]\n    TBZ X9, #63, L_mc_ms_agg\n    MOV X0, X19\n    MOV X1, X20\n    BL L_mc_sum_desc\n    CBZ X1, L_mc_ms_free\n    MOV X20, X1\nL_mc_ms_agg:\n",
+        "    MOV X0, X19\n    MOV X1, X20\n    BL L_mc_m_agg\nL_mc_ms_free:\n    MOV X0, X22\n    BL _free\nL_mc_ms_done:\n    MOV X0, X25\n    LDP X27, X28, [SP], #16\n    LDP X25, X26, [SP], #16\n    LDP X23, X24, [SP], #16\n    LDP X21, X22, [SP], #16\n    LDP X19, X20, [SP], #16\n    LDP X29, X30, [SP], #16\n    RET\n")
+}
+
+// L_mc_m_agg(X0 = aggregate, X1 = descriptor): N*8, then every word through L_mc_m_word.
+// L_mc_m_word(X0 = word, X1 = kind, X2 = aux): dispatch; 0, 1 and 9 count nothing.
+fn mc_h_measure_agg_word() -> string {
+    concat(
+        "L_mc_m_agg:\n    CMP X0, #65536\n    B.LO L_mc_m_agg_ret\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STP X26, X27, [SP, #-16]!\n    STR X28, [SP, #-16]!\n    MOV X26, X0\n    MOV X27, X1\n    LDR X9, [X27]\n    ADD X25, X25, X9, LSL #3\n    MOV X28, #0\nL_mc_m_agg_loop:\n    LDR X9, [X27]\n    CMP X28, X9\n    B.HS L_mc_m_agg_done\n    LDR X0, [X26, X28, LSL #3]\n    ADD X10, X27, #16\n    ADD X10, X10, X28, LSL #4\n    LDR X1, [X10]\n    LDR X2, [X10, #8]\n    BL L_mc_m_word\n    ADD X28, X28, #1\n    B L_mc_m_agg_loop\nL_mc_m_agg_done:\n    LDR X28, [SP], #16\n    LDP X26, X27, [SP], #16\n    LDP X29, X30, [SP], #16\nL_mc_m_agg_ret:\n    RET\n",
+        "L_mc_m_word:\n    CBZ X1, L_mc_mw_ret\n    CMP X1, #1\n    B.EQ L_mc_mw_ret\n    CMP X1, #9\n    B.EQ L_mc_mw_ret\n    CMP X1, #4\n    B.EQ L_mc_mw_agg\n    CMP X1, #5\n    B.EQ L_mc_mw_sum\n    CMP X1, #7\n    B.EQ L_mc_m_list\n    CMP X1, #8\n    B.EQ L_mc_m_str\n    B L_mc_m_ref\nL_mc_mw_agg:\n    MOV X1, X2\n    B L_mc_m_agg\nL_mc_mw_sum:\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    MOV X1, X2\n    BL L_mc_sum_desc\n    CBZ X1, L_mc_mw_sum_done\n    BL L_mc_m_agg\nL_mc_mw_sum_done:\n    LDP X29, X30, [SP], #16\nL_mc_mw_ret:\n    RET\n")
+}
+
+// L_mc_m_ref(X0 = ref / buf word, X1 = kind 2 | 3 | 6, X2 = aux): the copy's sizes (L_mc_ref), each
+// node once. [SP] = the REFTUP payload word index.
+fn mc_h_measure_ref() -> string {
+    concat(concat(
+        "L_mc_m_ref:\n    CMP X0, #65536\n    B.LO L_mc_mref_asis\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STP X26, X27, [SP, #-16]!\n    STR X28, [SP, #-16]!\n    SUB SP, SP, #16\n    MOV X26, X0\n    MOV X27, X1\n    MOV X28, X2\n    BL L_mc_lookup\n    CBNZ X0, L_mc_mref_done\n    MOV X0, X26\n    MOV X1, #1\n    BL L_mc_insert\n    CMP X27, #2\n    B.EQ L_mc_mref_ref1\n    CMP X27, #3\n    B.EQ L_mc_mref_rec\n    LDR X9, [X26, #-8]\n    MUL X9, X9, X28\n    ADD X9, X9, #15\n    AND X9, X9, #0xfffffffffffffff8\n    ADD X25, X25, X9\n    B L_mc_mref_done\n",
+        "L_mc_mref_ref1:\n    ADD X25, X25, #8\n    LDR X0, [X26]\n    ADD X10, X28, #16\n    LDR X1, [X10]\n    LDR X2, [X10, #8]\n    BL L_mc_m_word\n    B L_mc_mref_done\nL_mc_mref_rec:\n    LDR X10, [X28]\n    LSL X9, X10, #3\n    ADD X9, X9, #15\n    AND X9, X9, #0xfffffffffffffff0\n    ADD X9, X9, #8\n    ADD X25, X25, X9\n    STR XZR, [SP]\n"),
+        "L_mc_mref_loop:\n    LDR X9, [SP]\n    LDR X10, [X28]\n    CMP X9, X10\n    B.HS L_mc_mref_done\n    LDR X11, [X26]\n    LDR X0, [X11, X9, LSL #3]\n    ADD X10, X28, #16\n    ADD X10, X10, X9, LSL #4\n    LDR X1, [X10]\n    LDR X2, [X10, #8]\n    BL L_mc_m_word\n    LDR X9, [SP]\n    ADD X9, X9, #1\n    STR X9, [SP]\n    B L_mc_mref_loop\nL_mc_mref_done:\n    ADD SP, SP, #16\n    LDR X28, [SP], #16\n    LDP X26, X27, [SP], #16\n    LDP X29, X30, [SP], #16\nL_mc_mref_asis:\n    RET\n")
+}
+
+// L_mc_m_list(X0 = handle, X2 = aux): 24 for the handle and CDATA + 16 per chunk of the spine
+// (CDATA = max(16, slot bytes), the slot bytes from the aux header); the element words of a
+// pointer-carrying element type with 8-byte slots are walked, the first chunk from the handle's
+// cursor and every later chunk from its claim word (the lowest offset handed out), at most the
+// handle's length of them. Inline aggregate slots are counted with their chunk and not walked
+// (phase 4 settles their copy). [SP] = elements left, [SP, #8] = slot offset, [SP, #16] = CDATA.
+// L_mc_m_str(X0 = string): a literal (marker -2) counts nothing; a run-time string (marker -1)
+// counts 24 + length + 1 rounded to 8, once.
+fn mc_h_measure_list_str() -> string {
+    concat(concat(
+        "L_mc_m_list:\n    CBZ X0, L_mc_ml_ret\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STP X26, X27, [SP, #-16]!\n    STR X28, [SP, #-16]!\n    SUB SP, SP, #32\n    MOV X26, X0\n    MOV X28, X2\n    BL L_mc_lookup\n    CBNZ X0, L_mc_ml_done\n    MOV X0, X26\n    MOV X1, #1\n    BL L_mc_insert\n    ADD X25, X25, #24\n    LDR X9, [X26]\n    STR X9, [SP]\n    LDR X9, [X28, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X9, X9, X10, HI\n    STR X9, [SP, #16]\n    LDR X27, [X26, #8]\n    LDR X9, [X26, #16]\n    STR X9, [SP, #8]\n",
+        "L_mc_ml_chunk:\n    CBZ X27, L_mc_ml_done\n    LDR X9, [SP, #16]\n    ADD X9, X9, #16\n    ADD X25, X25, X9\n    LDR X9, [X28, #16]\n    CBZ X9, L_mc_ml_next\n    CMP X9, #9\n    B.EQ L_mc_ml_next\n    LDR X9, [X28, #8]\n    CMP X9, #8\n    B.NE L_mc_ml_next\nL_mc_ml_slot:\n    LDR X9, [SP]\n    CBZ X9, L_mc_ml_done\n    LDR X10, [SP, #8]\n    LDR X11, [SP, #16]\n    CMP X10, X11\n    B.HS L_mc_ml_next\n    LDR X0, [X27, X10]\n    ADD X10, X10, #8\n    STR X10, [SP, #8]\n    SUB X9, X9, #1\n    STR X9, [SP]\n    ADD X10, X28, #16\n    LDR X1, [X10]\n    LDR X2, [X10, #8]\n    BL L_mc_m_word\n    B L_mc_ml_slot\nL_mc_ml_next:\n    LDR X9, [SP, #16]\n    LDR X27, [X27, X9]\n    CBZ X27, L_mc_ml_done\n    ADD X9, X9, #8\n    LDR X10, [X27, X9]\n    STR X10, [SP, #8]\n    B L_mc_ml_chunk\nL_mc_ml_done:\n    ADD SP, SP, #32\n    LDR X28, [SP], #16\n    LDP X26, X27, [SP], #16\n    LDP X29, X30, [SP], #16\nL_mc_ml_ret:\n    RET\n"),
+        "L_mc_m_str:\n    CMP X0, #65536\n    B.LO L_mc_mstr_ret\n    LDR X9, [X0]\n    CMN X9, #2\n    B.EQ L_mc_mstr_ret\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STR X26, [SP, #-16]!\n    MOV X26, X0\n    BL L_mc_lookup\n    CBNZ X0, L_mc_mstr_done\n    MOV X0, X26\n    MOV X1, #1\n    BL L_mc_insert\n    LDR X9, [X26, #16]\n    ADD X9, X9, #32\n    AND X9, X9, #0xfffffffffffffff8\n    ADD X25, X25, X9\nL_mc_mstr_done:\n    LDR X26, [SP], #16\n    LDP X29, X30, [SP], #16\nL_mc_mstr_ret:\n    RET\n")
+}
+
 fn emit_message_copy_helper() -> string {
-    concat(concat(concat(mc_h_root(), mc_h_premap()), concat(mc_h_map_region(), mc_h_new_region())), concat(concat(mc_h_reserve(), mc_h_agg()), concat(concat(mc_h_word(), mc_h_ref()), mc_h_table())))
+    concat(concat(concat(concat(mc_h_root(), mc_h_premap()), concat(mc_h_map_region(), mc_h_new_region())), concat(concat(mc_h_reserve(), mc_h_agg()), concat(concat(mc_h_word(), mc_h_ref()), mc_h_table()))), concat(concat(mc_h_measure_root(), mc_h_measure_agg_word()), concat(mc_h_measure_ref(), mc_h_measure_list_str())))
+}
+
+// ---- per-type descriptor labels (design §3.6 "Descriptor emission") ---------------------------------
+//
+// L_td_<fn label> names the descriptor of a function's result type, L_td_<fn label>_s a behaviour's
+// state type and L_td_<fn label>_r its reply type. Bodies are emitted once per distinct type per module
+// (L_td_<module>_<k>_0 and children) and every function label is a `.set` alias of its body.
+
+fn md_type_label(fnl: string, suffix: string) -> string {
+    concat("L_td_", concat(fnl, suffix))
+}
+
+// A result type that is a pointer at its root, or a record / tuple / sum (itself a node): kinds
+// 2 to 8. Scalars, regions and closures get no descriptor.
+fn md_root_needs_descriptor(t: string) -> boolean {
+    k: int64 <- mc_kind_of(t, false);
+    k >= 2 and k <= 8
+}
+
+// The descriptor rodata of a type rooted at <label>_0: an aggregate or sum as md_descriptor_rodata
+// emits it; any other pointer kind as a one-entry descriptor `.quad 1, -1` over the root word.
+fn md_root_descriptor_rodata(t: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    case mc_kind_of(t, false) of {
+        4 -> mc_agg_desc(t, label, 0, table, 0, "").text;
+        5 -> mc_sum_table(t, label, 0, table, 0, "").text;
+        _: int64 -> {
+            e: { line: string, child: string, k: int64 } <- mc_entry(t, label, 1, table, 0, "");
+            concat(mc_lbl(label, 0), concat(":\n    .quad 1, -1\n", concat(e.line, e.child)))
+        }
+    }
+}
+
+// The state type of a behaviour's return type: the last element of `(:reply, R, S)` or `(:no_reply, S)`,
+// "" otherwise.
+fn mc_state_type(return_type: string) -> string {
+    t: string <- prims_record@strip_spaces_rt(return_type);
+    case mc_starts_with(t, "(:reply,") and mc_tuple_arity(t) == 3 of {
+        true -> prims_tuple@tuple_type_nth_element(t, 2);
+        false -> case mc_starts_with(t, "(:no_reply,") and mc_tuple_arity(t) == 2 of {
+            true -> prims_tuple@tuple_type_nth_element(t, 1);
+            false -> ""
+        }
+    }
+}
+
+fn mc_tuple_arity(t: string) -> int64 {
+    mc_count_elems(substring(t, 1, length_bytes(t) - 1), 0, 0)
+}
+
+fn mc_count_elems(inner: string, i: int64, n: int64) -> int64 {
+    case i >= length_bytes(inner) of {
+        true -> n;
+        false -> mc_count_elems(inner, mc_top_sep(inner, i, 0, ",") + 1, n + 1)
+    }
+}
+
+// The distinct types seen so far, one per line ("<type>\n"); the index of a type is its line number.
+fn mc_type_line_index(seen: string, t: string, i: int64, k: int64) -> int64 {
+    case i >= length_bytes(seen) of {
+        true -> 0 - 1;
+        false -> {
+            e: int64 <- mc_find_from(seen, "\n", i);
+            case substring(seen, i, e) == t of {
+                true -> k;
+                false -> mc_type_line_index(seen, t, e + 1, k + 1)
+            }
+        }
+    }
+}
+
+// One label: the body (when the type is new) and the alias line.
+fn md_td_one(t0: string, label: string, module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, acc: { seen: string, n: int64, bodies: string, aliases: string }) -> { seen: string, n: int64, bodies: string, aliases: string } {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    case length_bytes(t) == 0 or md_root_needs_descriptor(t) == false of {
+        true -> acc;
+        false -> {
+            k0: int64 <- mc_type_line_index(acc.seen, t, 0, 0);
+            body_label: string <- concat("L_td_", concat(module_name, concat("_", mc_itos(case k0 < 0 of { true -> acc.n; false -> k0 }))));
+            alias: string <- concat(".set ", concat(label, concat(", ", concat(mc_lbl(body_label, 0), "\n"))));
+            case k0 < 0 of {
+                true -> { seen: concat(acc.seen, concat(t, "\n")), n: acc.n + 1, bodies: concat(acc.bodies, md_root_descriptor_rodata(t, body_label, table)), aliases: concat(acc.aliases, alias) };
+                false -> { seen: acc.seen, n: acc.n, bodies: acc.bodies, aliases: concat(acc.aliases, alias) }
+            }
+        }
+    }
+}
+
+fn md_td_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, acc: { seen: string, n: int64, bodies: string, aliases: string }) -> { seen: string, n: int64, bodies: string, aliases: string } {
+    case fns.is_nil of {
+        true -> acc;
+        false -> {
+            fnl: string <- module_linkage@asm_symbol_for_definition(module_name, fns.head.name);
+            rt: string <- fns.head.return_type;
+            a1: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_one(rt, md_type_label(fnl, ""), module_name, table, acc);
+            a2: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_one(mc_state_type(rt), md_type_label(fnl, "_s"), module_name, table, a1);
+            a3: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_one(mc_reply_type(rt), md_type_label(fnl, "_r"), module_name, table, a2);
+            md_td_functions(fns.tail, module_name, table, a3)
+        }
+    }
+}
+
+// The module's block: the bodies in the pointer-bearing constant section, then the aliases.
+fn md_type_descriptors_block(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    r: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_functions(fns, module_name, table, { seen: "", n: 0, bodies: "", aliases: "" });
+    case length_bytes(r.bodies) == 0 of {
+        true -> "";
+        false -> concat("\n", concat(md_rodata_block(r.bodies), r.aliases))
+    }
 }

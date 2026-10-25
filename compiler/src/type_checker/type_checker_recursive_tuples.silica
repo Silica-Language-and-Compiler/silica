@@ -31,11 +31,44 @@ export ref_fits_ref_optional_slot/2;
 export type_contains_rec/1;
 export tuple_type_contains_rec/1;
 export validate_recursive_type_declaration/2;
+export validate_rec_bound/2;
 export validate_alloc_rec_element_type/2;
 export case_pattern_matches_ref_optional/2;
 
+// Every helper below starts from trim_type, so this is the module's hot path, and a spelled node
+// type (Q19, 2026-10-24) made its operands long: the run-by-run strip copied the whole accumulated
+// prefix once per run of non-spaces (O(n * runs) bytes into the never-released string arena), and
+// trim_type ran it twice per call. A surface without a space is returned as it is (no copy at all);
+// one with spaces is stripped by halves (O(n log n) bytes). Same text either way.
 fn strip_spaces(s: string) -> string {
-    strip_spaces_from(s, 0, "")
+    case contains(s, " ") of {
+        false -> s;
+        true -> strip_spaces_range(s, 0, length_bytes(s))
+    }
+}
+
+fn strip_spaces_range(s: string, lo: int64, hi: int64) -> string {
+    case hi - lo <= 64 of {
+        true -> strip_spaces_small(s, lo, hi, "");
+        false -> {
+            mid: int64 <- lo + (hi - lo) / 2;
+            concat(strip_spaces_range(s, lo, mid), strip_spaces_range(s, mid, hi))
+        }
+    }
+}
+
+// Strips [i, hi) run by run: each run of non-spaces is appended to acc (short ranges only).
+fn strip_spaces_small(s: string, i: int64, hi: int64, acc: string) -> string {
+    case i >= hi of {
+        true -> acc;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> strip_spaces_small(s, i + 1, hi, acc);
+            false -> {
+                e: int64 <- strip_spaces_from_run_end(s, i, hi);
+                strip_spaces_small(s, e, hi, concat(acc, substring(s, i, e)))
+            }
+        }
+    }
 }
 
 fn strip_spaces_from_run_end(s: string, j: int64, n: int64) -> int64 {
@@ -48,35 +81,10 @@ fn strip_spaces_from_run_end(s: string, j: int64, n: int64) -> int64 {
     }
 }
 
-fn strip_spaces_from(s: string, i: int64, acc: string) -> string {
-    case i >= length_bytes(s) of {
-        true -> acc;
-        false -> case substring(s, i, i + 1) == " " of {
-            true -> strip_spaces_from(s, i + 1, acc);
-            false -> {
-                n: int64 <- length_bytes(s);
-                e: int64 <- strip_spaces_from_run_end(s, i, n);
-                strip_spaces_from(s, e, concat(acc, substring(s, i, e)))
-            }
-        }
-    }
-}
-
+// strip_spaces leaves no space at either end, so trimming its result (which this did, with a full
+// copy, after stripping twice) changes nothing: the stripped text is the trimmed text.
 fn trim_type(s: string) -> string {
-    trim_type_from(strip_spaces(s), 0, length_bytes(strip_spaces(s)) - 1)
-}
-
-fn trim_type_from(s: string, start: int64, last_idx: int64) -> string {
-    case start > last_idx of {
-        true -> "";
-        false -> case substring(s, start, start + 1) == " " of {
-            true -> trim_type_from(s, start + 1, last_idx);
-            false -> case substring(s, last_idx, last_idx + 1) == " " of {
-                true -> trim_type_from(s, start, last_idx - 1);
-                false -> substring(s, start, last_idx + 1)
-            }
-        }
-    }
+    strip_spaces(s)
 }
 
 fn top_level_param_count(inner: string) -> int64 {
@@ -112,30 +120,33 @@ fn top_level_param_count_from(s: string, i: int64, depth: int64, count: int64) -
 }
 
 fn nth_top_level_param(inner: string, target: int64) -> string {
-    nth_top_level_param_from(inner, 0, target, 0, 0, "")
+    nth_top_level_param_from(inner, 0, target, 0, 0, 0)
 }
 
-fn nth_top_level_param_from(s: string, i: int64, target: int64, depth: int64, idx: int64, acc: string) -> string {
+// The parameter being read is the text from `start` (just after its top-level comma) to the
+// current index; it is cut out once when it ends. (Before 2026-10-25 it was rebuilt by appending
+// one character at a time, which copied O(n^2) bytes of a long spelled node type.)
+fn nth_top_level_param_from(s: string, i: int64, target: int64, depth: int64, idx: int64, start: int64) -> string {
     case i >= length_bytes(s) of {
-        true -> case idx == target of { true -> trim_type(acc); false -> "" };
+        true -> case idx == target of { true -> trim_type(substring(s, start, i)); false -> "" };
         false -> {
             ch: string <- substring(s, i, i + 1);
             case ch == "(" or ch == "[" or ch == "{" of {
-                true -> nth_top_level_param_from(s, i + 1, target, depth + 1, idx, concat(acc, ch));
+                true -> nth_top_level_param_from(s, i + 1, target, depth + 1, idx, start);
                 false -> case ch == ")" or ch == "]" or ch == "}" of {
                     true -> case depth == 0 of {
-                        true -> case idx == target of { true -> trim_type(acc); false -> "" };
-                        false -> nth_top_level_param_from(s, i + 1, target, depth - 1, idx, concat(acc, ch))
+                        true -> case idx == target of { true -> trim_type(substring(s, start, i)); false -> "" };
+                        false -> nth_top_level_param_from(s, i + 1, target, depth - 1, idx, start)
                     };
                     false -> case ch == "," of {
                         true -> case depth == 0 of {
                             true -> case idx == target of {
-                                true -> trim_type(acc);
-                                false -> nth_top_level_param_from(s, i + 1, target, 0, idx + 1, "")
+                                true -> trim_type(substring(s, start, i));
+                                false -> nth_top_level_param_from(s, i + 1, target, 0, idx + 1, i + 1)
                             };
-                            false -> nth_top_level_param_from(s, i + 1, target, depth, idx, concat(acc, ch))
+                            false -> nth_top_level_param_from(s, i + 1, target, depth, idx, start)
                         };
-                        false -> nth_top_level_param_from(s, i + 1, target, depth, idx, concat(acc, ch))
+                        false -> nth_top_level_param_from(s, i + 1, target, depth, idx, start)
                     }
                 }
             }
@@ -356,14 +367,27 @@ fn recursive_types_equal(a: string, b: string) -> boolean {
     equal_core(ta, tb, root_a, root_b, 0, "")
 }
 
+// Both callers pass trim_type's result, which holds no space; only a tab or a newline is left to
+// drop, and almost no surface has one, so the text is returned without the character-by-character
+// copy (O(n^2) bytes per call on a spelled node type).
 fn rt_strip_spaces(s: string, i: int64, acc: string) -> string {
+    case i == 0 and length_bytes(acc) == 0 of {
+        false -> rt_strip_spaces_each(s, i, acc);
+        true -> case contains(s, " ") or contains(s, "\t") or contains(s, "\n") of {
+            false -> s;
+            true -> rt_strip_spaces_each(s, i, acc)
+        }
+    }
+}
+
+fn rt_strip_spaces_each(s: string, i: int64, acc: string) -> string {
     case i >= length_bytes(s) of {
         true -> acc;
         false -> {
             c: string <- substring(s, i, i + 1);
             case c == " " or c == "\t" or c == "\n" of {
-                true -> rt_strip_spaces(s, i + 1, acc);
-                false -> rt_strip_spaces(s, i + 1, concat(acc, c))
+                true -> rt_strip_spaces_each(s, i + 1, acc);
+                false -> rt_strip_spaces_each(s, i + 1, concat(acc, c))
             }
         }
     }
@@ -755,6 +779,107 @@ fn case_pattern_matches_ref_optional(scrutinee_type: string, pattern_type: strin
             false -> {
                 inner: string <- ref_optional_inner_ref_type(scrutinee_type);
                 ref_types_equal_for_case(inner, pattern_type)
+            }
+        }
+    }
+}
+
+// ---- Q19: an unbound `rec` is E2010 in every position ---------------------------------------------
+//
+// data_structure_redesign_requirements.md §2 row Q19 and decision 38; chunk15_stack_memory_design.md
+// §5.1 and §11.1 phase 0 (2026-10-24). `rec` binds to its innermost enclosing TUPLE TYPE, so a `rec`
+// with no enclosing tuple type names no layout: it is rejected in binding annotations, record
+// fields, parameter and return types, case-pattern and tuple-pattern annotations alike. A tuple type
+// is `(A, B, ...)`; the parentheses of ref?(...), ref(...), fn(...), buf(...), region(...) and of any
+// other constructor are not tuples, and a record `{ ... }` or a `List[...]` is looked through to the
+// tuple around it (so `List[ref?(L, S, rec), mem(S)]` inside a node tuple is bound to that node).
+// The check is a single left-to-right walk of the type text with a stack of the open brackets; it
+// runs only on types that mention `rec`.
+fn validate_rec_bound(type_str: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case contains(type_str, "rec") of {
+        false -> type_checker_core@type_check_ok();
+        true -> case rec_unbound_at(type_str, 0, "", length_bytes(type_str)) of {
+            false -> type_checker_core@type_check_ok();
+            true -> type_checker_core@type_check_err("E2010", location, concat("rec is valid only inside tuple types, got ", type_str), "recursive_tuple§2")
+        }
+    }
+}
+
+// The open brackets so far: "t" a tuple paren, "c" a constructor's paren, "[" and "{". True when a
+// `rec` token appears with no "t" open.
+fn rec_unbound_at(s: string, i: int64, stack: string, n: int64) -> boolean {
+    case i >= n of {
+        true -> false;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" of {
+                true -> rec_unbound_at(s, i + 1, concat(stack, case rec_paren_is_tuple(s, i) of { true -> "t"; false -> "c" }), n);
+                false -> case c == "[" or c == "{" of {
+                    true -> rec_unbound_at(s, i + 1, concat(stack, c), n);
+                    false -> case c == ")" or c == "]" or c == "}" of {
+                        true -> rec_unbound_at(s, i + 1, rec_stack_pop(stack), n);
+                        false -> case c == "r" and rec_token_at(s, i, n) of {
+                            true -> case contains(stack, "t") of {
+                                true -> rec_unbound_at(s, i + 3, stack, n);
+                                false -> true
+                            };
+                            false -> rec_unbound_at(s, i + 1, stack, n)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rec_stack_pop(stack: string) -> string {
+    case length_bytes(stack) == 0 of {
+        true -> stack;
+        false -> substring(stack, 0, length_bytes(stack) - 1)
+    }
+}
+
+fn rec_is_ident_char(c: string) -> boolean {
+    length_bytes(c) == 1 and contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", c)
+}
+
+// `rec` at i as a whole word (not `record`, `recent`, `prec`).
+fn rec_token_at(s: string, i: int64, n: int64) -> boolean {
+    case i + 3 > n or substring(s, i, i + 3) != "rec" of {
+        true -> false;
+        false -> case i > 0 and rec_is_ident_char(substring(s, i - 1, i)) of {
+            true -> false;
+            false -> case i + 3 < n and rec_is_ident_char(substring(s, i + 3, i + 4)) of {
+                true -> false;
+                false -> true
+            }
+        }
+    }
+}
+
+// A `(` is a tuple's unless an identifier or `?` precedes it (ref?(, ref(, fn(, buf(, region(, a name).
+fn rec_paren_is_tuple(s: string, i: int64) -> boolean {
+    j: int64 <- rec_prev_nonspace(s, i - 1);
+    case j < 0 of {
+        true -> true;
+        false -> {
+            p: string <- substring(s, j, j + 1);
+            case p == "?" or rec_is_ident_char(p) of {
+                true -> false;
+                false -> true
+            }
+        }
+    }
+}
+
+fn rec_prev_nonspace(s: string, j: int64) -> int64 {
+    case j < 0 of {
+        true -> 0 - 1;
+        false -> {
+            c: string <- substring(s, j, j + 1);
+            case c == " " or c == "\t" or c == "\n" or c == "\r" of {
+                true -> rec_prev_nonspace(s, j - 1);
+                false -> j
             }
         }
     }

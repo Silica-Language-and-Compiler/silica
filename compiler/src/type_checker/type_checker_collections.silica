@@ -108,15 +108,31 @@ fn strip_all_spaces_col_from_run_end(s: string, j: int64, n: int64) -> int64 {
     }
 }
 
+// Stripped by halves (as type_interner and type_checker_record_types do): appending run after run
+// to one accumulator copied the whole prefix per run, O(n * runs) bytes into the never-released
+// string arena for every long record or node surface. Same text.
 fn strip_all_spaces_col_from(s: string, i: int64, acc: string) -> string {
-    case i >= length_bytes(s) of {
+    concat(acc, strip_all_spaces_col_range(s, i, length_bytes(s)))
+}
+
+fn strip_all_spaces_col_range(s: string, lo: int64, hi: int64) -> string {
+    case hi - lo <= 64 of {
+        true -> strip_all_spaces_col_small(s, lo, hi, "");
+        false -> {
+            mid: int64 <- lo + (hi - lo) / 2;
+            concat(strip_all_spaces_col_range(s, lo, mid), strip_all_spaces_col_range(s, mid, hi))
+        }
+    }
+}
+
+fn strip_all_spaces_col_small(s: string, i: int64, hi: int64, acc: string) -> string {
+    case i >= hi of {
         true -> acc;
         false -> case substring(s, i, i + 1) == " " of {
-            true -> strip_all_spaces_col_from(s, i + 1, acc);
+            true -> strip_all_spaces_col_small(s, i + 1, hi, acc);
             false -> {
-                n: int64 <- length_bytes(s);
-                e: int64 <- strip_all_spaces_col_from_run_end(s, i, n);
-                strip_all_spaces_col_from(s, e, concat(acc, substring(s, i, e)))
+                e: int64 <- strip_all_spaces_col_from_run_end(s, i, hi);
+                strip_all_spaces_col_small(s, e, hi, concat(acc, substring(s, i, e)))
             }
         }
     }
@@ -423,10 +439,26 @@ fn is_tree_type(s: string) -> boolean {
     ok
 }
 
+// Each of the ten tests strips the whole surface before it looks at the prefix, so a record or node
+// type (long once Q19 spells the node in every ref?) was copied ten times per question. A test
+// can only succeed when the stripped text starts with its trait name, i.e. when the first
+// character that is not a space is the first letter of one of the names; anything else (`{`, `(`,
+// `r`, a lower-case scalar) is answered without stripping. Same answer either way.
 fn is_collection_trait_type(s: string) -> boolean {
-    is_ordered_set_type(s) or is_ordered_map_type(s) or is_heap_type(s) or is_directed_graph_type(s)
-        or is_search_tree_type(s) or is_undirected_graph_type(s) or is_weighted_graph_type(s)
-        or is_priority_queue_type(s) or is_tree_type(s) or is_binary_tree_type(s)
+    case collection_trait_first_letter(s) of {
+        false -> false;
+        true -> is_ordered_set_type(s) or is_ordered_map_type(s) or is_heap_type(s) or is_directed_graph_type(s)
+            or is_search_tree_type(s) or is_undirected_graph_type(s) or is_weighted_graph_type(s)
+            or is_priority_queue_type(s) or is_tree_type(s) or is_binary_tree_type(s)
+    }
+}
+
+// OrderedSet OrderedMap Heap DirectedGraph SearchTree UndirectedGraph WeightedGraph PriorityQueue
+// Tree BinaryTree.
+fn collection_trait_first_letter(s: string) -> boolean {
+    j: int64 <- skip_spaces_index_col(s, 0);
+    c: string <- substring(s, j, j + 1);
+    length_bytes(c) == 1 and contains("OHDSUWPTB", c)
 }
 
 fn comparator_return_type_ok(ret: string) -> boolean {
@@ -2575,6 +2607,32 @@ fn cat_fn_result(s: string) -> string {
     }
 }
 
+// The length of a space-free reference type's opening ("ref?(" 5, "ref(" 4), 0 for any other type.
+fn cat_ref_prefix_len(s: string) -> int64 {
+    case starts_with_col(s, "ref?(") of {
+        true -> 5;
+        false -> case starts_with_col(s, "ref(") of {
+            true -> 4;
+            false -> 0
+        }
+    }
+}
+
+// True when `s` is one whole reference type: its opening parenthesis closes at the last character.
+fn cat_is_whole_ref(s: string, plen: int64) -> boolean {
+    plen > 0 and find_matching_closing_bracket_col(s, plen, 1) == length_bytes(s) - 1
+}
+
+fn cat_both_whole_refs(a: string, f: string) -> boolean {
+    pa: int64 <- cat_ref_prefix_len(a);
+    pa > 0 and pa == cat_ref_prefix_len(f) and cat_is_whole_ref(a, pa) and cat_is_whole_ref(f, pa)
+}
+
+// The arguments of a whole reference type, between its parentheses.
+fn cat_ref_inner(s: string) -> string {
+    substring(s, cat_ref_prefix_len(s), length_bytes(s) - 1)
+}
+
 fn cat_leaf_equal(a: string, f: string) -> boolean {
     case cat_normalize_leaf(a) == cat_normalize_leaf(f) of {
         true -> true;
@@ -2614,7 +2672,14 @@ fn cat_compat_shapes(a: string, f: string, world: List[{ module_name: string, pr
                     true -> cat_fns_compatible(a, f, world, fuel);
                     false -> case cat_is_tuple_type(a) and cat_is_tuple_type(f) of {
                         true -> cat_seq_compatible(cat_paren_inner(a), cat_paren_inner(f), false, world, fuel);
-                        false -> type_checker_lists@formal_type_accepts_actual(a, f, world) or type_checker_lists@formal_type_accepts_actual(f, a, world)
+                        // Two references of one kind (ref? or ref) meet argument by argument, so a callee
+                        // placeholder inside a spelled recursive node (Q19: `ref?(L, S, (ItemType, ...,
+                        // ref?(L, S, rec), ...))`) meets the caller's concrete node as it does inside a record,
+                        // list, function or tuple.
+                        false -> case cat_both_whole_refs(a, f) of {
+                            true -> cat_seq_compatible(cat_ref_inner(a), cat_ref_inner(f), false, world, fuel) or type_checker_lists@formal_type_accepts_actual(a, f, world) or type_checker_lists@formal_type_accepts_actual(f, a, world);
+                            false -> type_checker_lists@formal_type_accepts_actual(a, f, world) or type_checker_lists@formal_type_accepts_actual(f, a, world)
+                        }
                     }
                 }
             }
