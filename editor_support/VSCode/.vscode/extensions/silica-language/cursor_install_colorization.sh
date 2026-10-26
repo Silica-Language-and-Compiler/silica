@@ -60,6 +60,10 @@ cp "${SCRIPT_DIR}/package.json" "${TARGET_DIR}/package.json"
 cp "${SCRIPT_DIR}/language-configuration.json" "${TARGET_DIR}/language-configuration.json"
 mkdir -p "${TARGET_DIR}/syntaxes"
 cp "${SCRIPT_DIR}/syntaxes/silica.tmLanguage.json" "${TARGET_DIR}/syntaxes/silica.tmLanguage.json"
+if [[ -d "${SCRIPT_DIR}/themes" ]]; then
+    mkdir -p "${TARGET_DIR}/themes"
+    cp "${SCRIPT_DIR}/themes/"*.json "${TARGET_DIR}/themes/"
+fi
 
 python3 - "$REGISTRY" "$TARGET_DIR" "$EXTENSION_ID" "$VERSION" "$FOLDER_NAME" <<'PY'
 import json, os, sys, time
@@ -107,5 +111,6 @@ echo "✅ Extension installed and registered."
 echo ""
 echo "📝 Next steps:"
 echo "   1. Reload Cursor (Cmd+Shift+P → 'Developer: Reload Window')"
-echo "   2. Open a .silica file — language mode should show 'Silica'"
-echo "   3. If not, run: Developer: Show Running Extensions and confirm '${EXTENSION_ID}' is enabled"
+echo "   2. Color Theme → Silica Dark or Silica Light"
+echo "   3. Open a .silica file — language mode should show 'Silica'"
+echo "   4. If not, run: Developer: Show Running Extensions and confirm '${EXTENSION_ID}' is enabled"
