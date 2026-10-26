@@ -20,6 +20,7 @@
 
 use parser_ast;
 use type_checker_core;
+use type_surface_cache;
 
 export is_memory_region_type/1;
 export validate_memory_region_type/2;
@@ -36,9 +37,13 @@ export get_space_from_region_type/1;
 export get_space_from_ref_type/1;
 export is_region_builtin_call/1;
 export check_sequence_return_lifetime/2;
-export ref_types_equal_modulo_lifetime/2;
-export device_window_types_equal_modulo_lifetime/2;
-export carrier_lifetime_ident/1;
+export lifetime_text_has_carrier/1;
+export lifetime_map_is_conflict/1;
+export lifetime_map_renames/1;
+export lifetime_conflict_message/2;
+export lifetime_unify/4;
+export lifetime_result_only_names/2;
+export lifetime_subst_apply/2;
 export is_valid_memory_space/1;
 
 // Valid memory space keywords per spec §4.4.1
@@ -783,100 +788,491 @@ fn union_list_string(a: List[string, mem(normal)], b: List[string, mem(normal)])
     }
 }
 
-// Spec 12.1.4: a lifetime named in a function signature ("functions may take `L: lifetime` as a parameter
-// for polymorphism") is a binder local to that signature, not a name the caller has to spell the same way.
-// True when both surfaces are the same lifetime carrier (ref, ref?, region, buf, atomic_ref) and agree on
-// everything except the lifetime identifier in the first parameter slot.
-// Two surfaces equal once every device_window's lifetime name is erased, anywhere in the text (a
-// window alone, or windows inside a tuple / record / function type). A window's lifetime is a fresh
-// binder per map, so windows are compared by tag; false when neither surface names a window.
-fn device_window_types_equal_modulo_lifetime(a: string, b: string) -> boolean {
-    an: string <- erase_window_lifetimes_lm(strip_spaces_lm(a, 0, ""), 0, "");
-    bn: string <- erase_window_lifetimes_lm(strip_spaces_lm(b, 0, ""), 0, "");
-    case starts_with_anywhere_lm(an, "device_window(", 0) of {
-        false -> false;
-        true -> an == bn
-    }
+// ---- Lifetime polymorphism: one substitution per call (Q10 option A) ------------------------------
+//
+// Spec §12.1.4; region_memory_safety_design.md §5 (Q10, decided 2026-10-23); chunk15_stack_memory_design.md
+// §6.5, §6.8 and §11.1 phase 1. Every lifetime name in a function's signature is a variable of that
+// function. A call instantiates them once, consistently across the arguments and the result: the call
+// checker (type_checker_expressions_user_call_check_args) builds the substitution from the arguments,
+// binds a lifetime that only the result names to the caller's binding annotation (the result is
+// evacuated into the caller's frame), and checks the call against the SUBSTITUTED formals, which are then
+// compared literally. A callee lifetime bound to two caller lifetimes is E2311 LifetimeConflictAtCall.
+// This replaces the identifier binder fallback (expected_lifetime_is_binder with
+// ref_types_equal_modulo_lifetime) and the device_window lifetime erasure (H7): a window's lifetime is
+// substituted like any other and then compared.
+//
+// A substitution is a string of entries "~K=V" (callee lifetime K := caller lifetime V); "" is the empty
+// substitution. A conflict is "!K|V1|V2". The lifetime is the first parameter of a carrier: ref(, ref?(,
+// region(, buf(, atomic_ref(, device_window( (spec §4.4.2, §12.1).
+//
+// lifetime_unify walks the formal and the actual side by side over their space-free texts: equal text
+// advances both; two carriers at a token start bind the formal's lifetime to the actual's; where the texts
+// differ (a placeholder against its witness, `rec` against a spelled node, a trait type against a record)
+// one type expression is skipped on each side and the walk goes on after it. The walk concludes nothing
+// about the types themselves: the ordinary type check runs afterwards on the substituted formals.
+// Long equal runs without a carrier are skipped 48 characters at a time (the formals of the compiler's
+// own functions are records several KB long), so the walk costs about one 64-byte compare per 48
+// characters away from carriers.
+
+fn lifetime_text_has_carrier(s: string) -> boolean {
+    contains(s, "ref") or contains(s, "region") or contains(s, "buf") or contains(s, "device_window")
 }
 
-fn starts_with_anywhere_lm(s: string, pat: string, i: int64) -> boolean {
-    case i + length_bytes(pat) > length_bytes(s) of {
+fn lifetime_map_is_conflict(map: string) -> boolean {
+    length_bytes(map) > 0 and substring(map, 0, 1) == "!"
+}
+
+// True when some entry renames (K := V with V != K); a substitution of identities changes no text.
+fn lifetime_map_renames(map: string) -> boolean {
+    case length_bytes(map) == 0 or lifetime_map_is_conflict(map) of {
         true -> false;
-        false -> case substring(s, i, i + length_bytes(pat)) == pat of {
-            true -> true;
-            false -> starts_with_anywhere_lm(s, pat, i + 1)
-        }
+        false -> lt_renames_from(map, 0)
     }
 }
 
-fn erase_window_lifetimes_lm(s: string, i: int64, acc: string) -> string {
-    case i >= length_bytes(s) of {
-        true -> acc;
-        false -> case i + 14 <= length_bytes(s) and substring(s, i, i + 14) == "device_window(" of {
-            false -> erase_window_lifetimes_lm(s, i + 1, concat(acc, substring(s, i, i + 1)));
-            true -> {
-                c: int64 <- first_comma_from_lm(s, i + 14);
-                case c < 0 of {
-                    true -> concat(acc, substring(s, i, length_bytes(s)));
-                    false -> erase_window_lifetimes_lm(s, c, concat(acc, "device_window(_"))
+fn lt_renames_from(map: string, i: int64) -> boolean {
+    case i >= length_bytes(map) of {
+        true -> false;
+        false -> {
+            eq: int64 <- lt_index_of(map, "=", i);
+            case eq < 0 of {
+                true -> false;
+                false -> {
+                    v_end: int64 <- lt_value_end(map, eq + 1);
+                    case substring(map, i + 1, eq) != substring(map, eq + 1, v_end) of {
+                        true -> true;
+                        false -> lt_renames_from(map, v_end)
+                    }
                 }
             }
         }
     }
 }
 
-fn ref_types_equal_modulo_lifetime(a: string, b: string) -> boolean {
-    an: string <- strip_spaces_lm(a, 0, "");
-    bn: string <- strip_spaces_lm(b, 0, "");
-    pa: string <- lifetime_carrier_prefix_lm(an);
-    pb: string <- lifetime_carrier_prefix_lm(bn);
-    case length_bytes(pa) > 0 and pa == pb of {
-        false -> false;
+// "lifetime L of push is bound to both L1 and L2" for a conflict "!L|L1|L2".
+fn lifetime_conflict_message(map: string, callee: string) -> string {
+    body: string <- substring(map, 1, length_bytes(map));
+    b1: int64 <- lt_index_of(body, "|", 0);
+    k: string <- substring(body, 0, b1);
+    rest: string <- substring(body, b1 + 1, length_bytes(body));
+    b2: int64 <- lt_index_of(rest, "|", 0);
+    v1: string <- substring(rest, 0, b2);
+    v2: string <- substring(rest, b2 + 1, length_bytes(rest));
+    concat(concat(concat(concat("lifetime ", k), concat(" of ", callee)), concat(" is bound to both ", v1)), concat(" and ", v2))
+}
+
+fn lt_index_of(s: string, pat: string, i: int64) -> int64 {
+    case i + length_bytes(pat) > length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + length_bytes(pat)) == pat of {
+            true -> i;
+            false -> lt_index_of(s, pat, i + 1)
+        }
+    }
+}
+
+fn lt_value_end(map: string, p: int64) -> int64 {
+    case p >= length_bytes(map) of {
+        true -> p;
+        false -> case substring(map, p, p + 1) == "~" of {
+            true -> p;
+            false -> lt_value_end(map, p + 1)
+        }
+    }
+}
+
+// The caller lifetime bound to k, or "" when k is unbound.
+fn lt_lookup(map: string, k: string) -> string {
+    key: string <- concat(concat("~", k), "=");
+    case contains(map, key) of {
+        false -> "";
         true -> {
-            ca: int64 <- first_comma_from_lm(an, length_bytes(pa));
-            cb: int64 <- first_comma_from_lm(bn, length_bytes(pb));
-            case ca < 0 or cb < 0 of {
-                true -> false;
-                false -> is_lifetime_ident_lm(substring(an, length_bytes(pa), ca)) and is_lifetime_ident_lm(substring(bn, length_bytes(pb), cb)) and substring(an, ca, length_bytes(an)) == substring(bn, cb, length_bytes(bn))
+            p: int64 <- lt_index_of(map, key, 0) + length_bytes(key);
+            substring(map, p, lt_value_end(map, p))
+        }
+    }
+}
+
+// Binds k := v; `only` ("~M~N~") limits the binding to those names ("" allows every name).
+fn lt_bind(map: string, k: string, v: string, only: string) -> string {
+    case length_bytes(only) > 0 and contains(only, concat(concat("~", k), "~")) == false of {
+        true -> map;
+        false -> {
+            old: string <- lt_lookup(map, k);
+            case length_bytes(old) == 0 of {
+                true -> concat(map, concat(concat("~", k), concat("=", v)));
+                false -> case old == v of {
+                    true -> map;
+                    false -> concat(concat(concat("!", k), concat("|", old)), concat("|", v))
+                }
             }
         }
     }
 }
 
-fn strip_spaces_lm(s: string, i: int64, acc: string) -> string {
-    case i >= length_bytes(s) of {
+// Space-free copy (a surface printed by the interner spells its tokens apart); the text itself when it
+// holds no space. Stripped by halves (O(n log n) bytes, not O(n^2)) and remembered process-wide in the
+// type_surface_cache actor, the same raw -> stripped memo type_interner's strip_type_spaces uses (the
+// same answer: spaces only), so a signature met at every call is stripped once.
+fn lt_strip(s: string) -> string {
+    case contains(s, " ") of {
+        false -> s;
+        true -> {
+            hit: string <- type_surface_cache@stripped_for(s);
+            case length_bytes(hit) > 0 of {
+                true -> hit;
+                false -> type_surface_cache@remember_stripped(s, lt_strip_range(s, 0, length_bytes(s)))
+            }
+        }
+    }
+}
+
+fn lt_strip_range(s: string, lo: int64, hi: int64) -> string {
+    case hi - lo <= 64 of {
+        true -> lt_strip_small(s, lo, hi, "");
+        false -> {
+            mid: int64 <- lo + (hi - lo) / 2;
+            concat(lt_strip_range(s, lo, mid), lt_strip_range(s, mid, hi))
+        }
+    }
+}
+
+fn lt_is_space(c: string) -> boolean {
+    c == " "
+}
+
+fn lt_strip_small(s: string, i: int64, hi: int64, acc: string) -> string {
+    case i >= hi of {
         true -> acc;
+        false -> case lt_is_space(substring(s, i, i + 1)) of {
+            true -> lt_strip_small(s, i + 1, hi, acc);
+            false -> {
+                e: int64 <- lt_run_end(s, i, hi);
+                lt_strip_small(s, e, hi, concat(acc, substring(s, i, e)))
+            }
+        }
+    }
+}
+
+fn lt_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case lt_is_space(substring(s, j, j + 1)) of {
+            true -> j;
+            false -> lt_run_end(s, j + 1, n)
+        }
+    }
+}
+
+// Characters after which a type expression (or a carrier) may start in a space-free surface.
+fn lt_boundary_char(c: string) -> boolean {
+    c == "(" or c == "," or c == "[" or c == "{" or c == "|" or c == ":" or c == ">" or c == "<"
+}
+
+// Written as a case (not one `and`) for the bootstrap boundary: an emitter before 2026-10-25 kept a
+// third parameter of a call-free, case-free body in X2, which the length helper overwrites
+// (trials/functions_addition/third_param_survives_string_helper); a case body takes the full shadow.
+fn lt_has_at(s: string, i: int64, pat: string) -> boolean {
+    case i + length_bytes(pat) <= length_bytes(s) of {
+        false -> false;
+        true -> substring(s, i, i + length_bytes(pat)) == pat
+    }
+}
+
+fn lt_token_start(s: string, i: int64) -> boolean {
+    case i <= 0 of {
+        true -> true;
+        false -> lt_boundary_char(substring(s, i - 1, i))
+    }
+}
+
+// The carrier prefix starting at token start i ("ref?(", "ref(", ...), or "".
+fn lt_carrier_at(s: string, i: int64) -> string {
+    case i >= length_bytes(s) of {
+        true -> "";
         false -> {
             c: string <- substring(s, i, i + 1);
-            case c == " " or c == "\t" or c == "\n" or c == "\r" of {
-                true -> strip_spaces_lm(s, i + 1, acc);
-                false -> strip_spaces_lm(s, i + 1, concat(acc, c))
+            case (c == "r" or c == "b" or c == "a" or c == "d") and lt_token_start(s, i) of {
+                false -> "";
+                true -> case lt_has_at(s, i, "ref?(") of {
+                    true -> "ref?(";
+                    false -> case lt_has_at(s, i, "ref(") of {
+                        true -> "ref(";
+                        false -> case lt_has_at(s, i, "region(") of {
+                            true -> "region(";
+                            false -> case lt_has_at(s, i, "buf(") of {
+                                true -> "buf(";
+                                false -> case lt_has_at(s, i, "atomic_ref(") of {
+                                    true -> "atomic_ref(";
+                                    false -> case lt_has_at(s, i, "device_window(") of {
+                                        true -> "device_window(";
+                                        false -> ""
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 }
 
-fn starts_with_lm(s: string, prefix: string) -> boolean {
-    length_bytes(s) >= length_bytes(prefix) and substring(s, 0, length_bytes(prefix)) == prefix
+// A `ref` meets a `ref?` slot (ref_fits_ref_optional_slot), so the two share their lifetime position.
+fn lt_carriers_compatible(pa: string, pb: string) -> boolean {
+    pa == pb or ((pa == "ref(" or pa == "ref?(") and (pb == "ref(" or pb == "ref?("))
 }
 
-// The type constructors whose first parameter is a lifetime identifier (spec 4.4.2, 12.1).
-fn lifetime_carrier_prefix_lm(s: string) -> string {
-    case starts_with_lm(s, "atomic_ref(") of {
-        true -> "atomic_ref(";
-        false -> case starts_with_lm(s, "ref?(") of {
-            true -> "ref?(";
-            false -> case starts_with_lm(s, "ref(") of {
-                true -> "ref(";
-                false -> case starts_with_lm(s, "region(") of {
-                    true -> "region(";
-                    false -> case starts_with_lm(s, "buf(") of {
-                        true -> "buf(";
-                        false -> case starts_with_lm(s, "device_window(") of {
-                            true -> "device_window(";
-                            false -> ""
+// End of the type expression starting at i: the first `,`, `|` or unmatched closer at depth zero.
+fn lt_expr_end(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> lt_expr_end(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> case depth == 0 of {
+                        true -> i;
+                        false -> lt_expr_end(s, i + 1, depth - 1)
+                    };
+                    false -> case depth == 0 and (c == "," or c == "|") of {
+                        true -> i;
+                        false -> lt_expr_end(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Start of the type expression holding position i: just after the last boundary character, but not
+// before `sync` (the last point where the two walks were put in step).
+fn lt_expr_start(s: string, i: int64, sync: int64) -> int64 {
+    case i <= sync of {
+        true -> sync;
+        false -> case lt_boundary_char(substring(s, i - 1, i)) of {
+            true -> i;
+            false -> lt_expr_start(s, i - 1, sync)
+        }
+    }
+}
+
+// The substitution `map` extended by matching formal against actual; `only` ("~M~N~", or "" for every
+// name) limits which callee lifetimes may be bound. Returns a conflict ("!...") when a callee lifetime
+// meets a second caller lifetime. Equal texts bind nothing: the caller spells the callee's own names.
+fn lifetime_unify(formal: string, actual: string, map: string, only: string) -> string {
+    case lifetime_map_is_conflict(map) or formal == actual or lifetime_text_has_carrier(formal) == false or lifetime_text_has_carrier(actual) == false of {
+        true -> map;
+        false -> lt_walk(lt_strip(formal), lt_strip(actual), 0, 0, 0, map, only, 0)
+    }
+}
+
+// The lifetimes the result names and no parameter does, as "~M~N~" ("" when none): the ones a call
+// binds from the caller's expectation. Remembered per signature in type_surface_cache under a key no
+// type surface can be ("?lt_result_only?" + the signature; "-" stands for none, "" is the cache's miss).
+fn lifetime_result_only_names(params: string, return_type: string) -> string {
+    case lifetime_text_has_carrier(return_type) of {
+        false -> "";
+        true -> {
+            key: string <- concat("?lt_result_only?", concat(params, concat(" -> ", return_type)));
+            hit: string <- type_surface_cache@stripped_for(key);
+            case length_bytes(hit) > 0 of {
+                true -> case hit == "-" of {
+                    true -> "";
+                    false -> hit
+                };
+                false -> {
+                    ro: string <- lt_names_minus(lt_names(return_type), lt_names(params), 1, "");
+                    stored: string <- type_surface_cache@remember_stripped(key, case length_bytes(ro) == 0 of { true -> "-"; false -> ro });
+                    case length_bytes(stored) >= 0 of {
+                        true -> ro;
+                        false -> ro
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The carrier lifetime names of t as "~N~M~" ("" when none).
+fn lt_names(t: string) -> string {
+    case lifetime_text_has_carrier(t) of {
+        false -> "";
+        true -> lt_names_walk(lt_strip(t), 0, "", 0)
+    }
+}
+
+fn lt_names_walk(t: string, i: int64, acc: string, quiet: int64) -> string {
+    case i >= length_bytes(t) of {
+        true -> acc;
+        false -> {
+            p: string <- lt_carrier_at(t, i);
+            case length_bytes(p) > 0 of {
+                true -> {
+                    c: int64 <- first_comma_from_lm(t, i + length_bytes(p));
+                    case c < 0 of {
+                        true -> acc;
+                        false -> {
+                            k: string <- substring(t, i + length_bytes(p), c);
+                            key: string <- concat(concat("~", k), "~");
+                            acc2: string <- case is_lifetime_ident_lm(k) == false or contains(acc, key) of {
+                                true -> acc;
+                                false -> case length_bytes(acc) == 0 of {
+                                    true -> key;
+                                    false -> concat(acc, concat(k, "~"))
+                                }
+                            };
+                            lt_names_walk(t, c, acc2, 0)
                         }
                     }
+                };
+                false -> case quiet <= 0 and i + 64 <= length_bytes(t) of {
+                    true -> case lifetime_text_has_carrier(substring(t, i, i + 64)) of {
+                        false -> lt_names_walk(t, i + 48, acc, 0);
+                        true -> lt_names_walk(t, i + 1, acc, 48)
+                    };
+                    false -> lt_names_walk(t, i + 1, acc, quiet - 1)
+                }
+            }
+        }
+    }
+}
+
+// The names of a ("~N~M~", read from index i) that b does not hold.
+fn lt_names_minus(a: string, b: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(a) of {
+        true -> acc;
+        false -> {
+            e: int64 <- lt_index_of(a, "~", i);
+            case e < 0 of {
+                true -> acc;
+                false -> {
+                    k: string <- substring(a, i, e);
+                    key: string <- concat(concat("~", k), "~");
+                    acc2: string <- case contains(b, key) of {
+                        true -> acc;
+                        false -> case length_bytes(acc) == 0 of {
+                            true -> key;
+                            false -> concat(acc, concat(k, "~"))
+                        }
+                    };
+                    lt_names_minus(a, b, e + 1, acc2)
+                }
+            }
+        }
+    }
+}
+
+// i, j: the positions in a (formal) and b (actual); a[sa..i) equals the same number of characters of b
+// before j. quiet > 0 suppresses the 64-character compare for that many steps (it just failed).
+fn lt_walk(a: string, b: string, i: int64, j: int64, sa: int64, map: string, only: string, quiet: int64) -> string {
+    case lifetime_map_is_conflict(map) or i >= length_bytes(a) or j >= length_bytes(b) of {
+        true -> map;
+        false -> {
+            pa: string <- lt_carrier_at(a, i);
+            pb: string <- case length_bytes(pa) == 0 of {
+                true -> "";
+                false -> lt_carrier_at(b, j)
+            };
+            case length_bytes(pb) > 0 and lt_carriers_compatible(pa, pb) of {
+                true -> lt_walk_carrier(a, b, i + length_bytes(pa), j + length_bytes(pb), map, only);
+                false -> case quiet <= 0 and lt_chunk_equal_plain(a, b, i, j) of {
+                    true -> lt_walk(a, b, i + 48, j + 48, sa, map, only, 0);
+                    false -> {
+                        q: int64 <- case quiet <= 0 of {
+                            true -> 48;
+                            false -> quiet - 1
+                        };
+                        case substring(a, i, i + 1) == substring(b, j, j + 1) of {
+                            true -> lt_walk(a, b, i + 1, j + 1, sa, map, only, q);
+                            false -> lt_walk_diverged(a, b, i, j, sa, map, only)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The next 64 characters are equal on both sides and hold no carrier, so the first 48 can be skipped
+// (a carrier starting within them would end inside the 64).
+fn lt_chunk_equal_plain(a: string, b: string, i: int64, j: int64) -> boolean {
+    case i + 64 <= length_bytes(a) and j + 64 <= length_bytes(b) of {
+        false -> false;
+        true -> {
+            ca: string <- substring(a, i, i + 64);
+            ca == substring(b, j, j + 64) and lifetime_text_has_carrier(ca) == false
+        }
+    }
+}
+
+fn lt_walk_carrier(a: string, b: string, i: int64, j: int64, map: string, only: string) -> string {
+    ca: int64 <- first_comma_from_lm(a, i);
+    cb: int64 <- first_comma_from_lm(b, j);
+    case ca < 0 or cb < 0 of {
+        true -> map;
+        false -> {
+            la: string <- substring(a, i, ca);
+            lb: string <- substring(b, j, cb);
+            case is_lifetime_ident_lm(la) and is_lifetime_ident_lm(lb) of {
+                true -> lt_walk(a, b, ca, cb, ca, lt_bind(map, la, lb, only), only, 0);
+                false -> map
+            }
+        }
+    }
+}
+
+// The texts differ at (i, j): skip the type expression holding the difference on each side and go on
+// after it. Stops when neither side can move on.
+fn lt_walk_diverged(a: string, b: string, i: int64, j: int64, sa: int64, map: string, only: string) -> string {
+    start_a: int64 <- lt_expr_start(a, i, sa);
+    start_b: int64 <- j - (i - start_a);
+    ea: int64 <- lt_expr_end(a, start_a, 0);
+    eb: int64 <- lt_expr_end(b, start_b, 0);
+    case ea >= i and eb >= j and (ea > i or eb > j) of {
+        true -> lt_walk(a, b, ea, eb, ea, map, only, 0);
+        false -> map
+    }
+}
+
+// `s` with every carrier lifetime that `map` renames replaced by its caller lifetime. The text is
+// returned unchanged (spaces and all) when the substitution renames nothing.
+fn lifetime_subst_apply(s: string, map: string) -> string {
+    case lifetime_map_renames(map) and lifetime_text_has_carrier(s) of {
+        false -> s;
+        true -> lt_apply_walk(lt_strip(s), 0, 0, "", map, 0)
+    }
+}
+
+// `start` is the first character of t not yet copied to acc.
+fn lt_apply_walk(t: string, i: int64, start: int64, acc: string, map: string, quiet: int64) -> string {
+    case i >= length_bytes(t) of {
+        true -> concat(acc, substring(t, start, length_bytes(t)));
+        false -> {
+            p: string <- lt_carrier_at(t, i);
+            case length_bytes(p) > 0 of {
+                true -> {
+                    c: int64 <- first_comma_from_lm(t, i + length_bytes(p));
+                    k: string <- case c < 0 of {
+                        true -> "";
+                        false -> substring(t, i + length_bytes(p), c)
+                    };
+                    v: string <- case length_bytes(k) == 0 or is_lifetime_ident_lm(k) == false of {
+                        true -> "";
+                        false -> lt_lookup(map, k)
+                    };
+                    case length_bytes(v) == 0 or v == k of {
+                        true -> lt_apply_walk(t, i + 1, start, acc, map, quiet - 1);
+                        false -> lt_apply_walk(t, c, c, concat(concat(acc, substring(t, start, i + length_bytes(p))), v), map, 0)
+                    }
+                };
+                false -> case quiet <= 0 and i + 64 <= length_bytes(t) of {
+                    true -> case lifetime_text_has_carrier(substring(t, i, i + 64)) of {
+                        false -> lt_apply_walk(t, i + 48, start, acc, map, 0);
+                        true -> lt_apply_walk(t, i + 1, start, acc, map, 48)
+                    };
+                    false -> lt_apply_walk(t, i + 1, start, acc, map, quiet - 1)
                 }
             }
         }
@@ -914,20 +1310,3 @@ fn lifetime_ident_chars_ok_lm(s: string, i: int64) -> boolean {
     }
 }
 
-// The lifetime identifier in the first parameter slot of a lifetime carrier surface, or "" when the
-// surface is not one. Used to tell a signature binder (spec 12.1.4, matched by position) from a
-// lifetime the current scope declared (spec 12.4.1, region isolation, matched literally).
-fn carrier_lifetime_ident(s: string) -> string {
-    t: string <- strip_spaces_lm(s, 0, "");
-    p: string <- lifetime_carrier_prefix_lm(t);
-    case length_bytes(p) == 0 of {
-        true -> "";
-        false -> {
-            c: int64 <- first_comma_from_lm(t, length_bytes(p));
-            case c < 0 of {
-                true -> "";
-                false -> substring(t, length_bytes(p), c)
-            }
-        }
-    }
-}
