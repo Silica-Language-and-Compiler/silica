@@ -101,7 +101,7 @@ clean:
 help:
 	@echo "Silica trials"
 	@echo "  make integrate                 run every suite in parallel (JOBS=$(JOBS), SDS_JOBS=$(SDS_JOBS)), report per suite and overall"
-	@echo "                                 (interactive: asks where to run the trials; Enter = this Mac)"
+	@echo "                                 (interactive: asks where to run the trials; Enter = this host: macOS, Linux x86-64 or Linux AArch64)"
 	@echo "  make integrate TRIAL_TARGET=T  T = host, ESP32-S3_raw (a board on USB) or both; see targets/README.md"
 	@echo "  make integrate TRIAL_SUITES=\"a b\"                         only these suites (host or board; a named suite runs even if INTEGRATE_PENDING)"
 	@echo "  make integrate JOBS=N          cap the parallel pool"

@@ -1,0 +1,103 @@
+// Carriers (actor_memory_budget_plan.md item N, carrier-runtime gap 3: terminate_child_acb and
+// restart_child_acb in prims_actors_child_table_asm.silica): a row child of a :one_for_one
+// supervisor asks its own supervisor to stop its own row (:terminate_child naming its own id) and,
+// from a second row, to restart its own row (:restart_child naming its own id). The trial support's
+// worker (the driver, a plain actor on a carrier) calls each row with the supervisor's reference as
+// the message. Before the fix both requests waited forever: the caller stopped itself and then
+// waited for its own row's exit_done. Now each is answered at once with the error reply (tag
+// :error, error :language_error) and nothing is stopped: both rows still answer, and the
+// supervisor still counts two children. Each row replies 10 * (tag is :error) + (error is
+// :language_error) in 9/6 digits: 99 when both hold.
+//
+//   call the stopper            -> 99
+//   call the restarter          -> 99
+//   :count_children             -> 2, printed as 9
+//   call the stopper again      -> 99 (still alive)
+//
+// Expected output: 99, 99, 9, 99, no failure report, done, exit status 0, at every SILICA_CARRIER_COUNT
+// (a hang before the fix). Printed values avoid the digits 1-4: 9 is a check that holds, 6 one that
+// does not.
+//
+// The driver runs on the trial support's worker (trial_wait_int64: a plain actor on a carrier) and
+// prints done last; main waits for the exit line. trial_wait_int64 (not trial_support_int64) makes
+// this unit compile after the suite's other trial_wait users, so its new atoms renumber none of
+// theirs.
+
+use Supervisor;
+use trial_wait_int64;
+
+impl G3SelfStopSup for Supervisor;
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// Replies 10 * (tag is :error) + (error is :language_error), as 9/6 digits: 99, 96, 69, 66.
+fn self_stopper(msg: supervisor_ref, state: int64) -> (:reply, int64, int64) {
+    sequence
+        r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(msg, { op: :terminate_child, id: :g3_self_stopper } impl SupervisorMessage {});
+        t: int64 <- verdict(case r.tag of { :error -> true; _: atom -> false });
+        e: int64 <- verdict(case r.error of { :language_error -> true; _: atom -> false })
+    produces
+        pure (:reply, t * 10 + e, state + 1)
+    end
+}
+
+fn self_restarter(msg: supervisor_ref, state: int64) -> (:reply, int64, int64) {
+    sequence
+        r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(msg, { op: :restart_child, id: :g3_self_restarter } impl SupervisorMessage {});
+        t: int64 <- verdict(case r.tag of { :error -> true; _: atom -> false });
+        e: int64 <- verdict(case r.error of { :language_error -> true; _: atom -> false })
+    produces
+        pure (:reply, t * 10 + e, state + 1)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: supervisor_ref, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: supervisor_ref, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :g3_self_stopper, agent_type: :worker, initial_state: initial_state, behavior: self_stopper, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :g3_self_restarter, agent_type: :worker, initial_state: initial_state, behavior: self_restarter, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        sup: supervisor_ref <- spawn_registered_supervisor(G3SelfStopSup, 0, :g3_self_stop_sup, stack_policy(0, :keep_last_message));
+        a: int64 <- call_registered(:g3_self_stopper, sup impl ActorMessage {});
+        b: int64 <- call_registered(:g3_self_restarter, sup impl ActorMessage {});
+        counted: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
+        c: int64 <- call_registered(:g3_self_stopper, sup impl ActorMessage {});
+        print_int64(a);
+        println("");
+        print_int64(b);
+        println("");
+        print_int64(verdict(counted.count == 2));
+        println("");
+        print_int64(c);
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 { drive() });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

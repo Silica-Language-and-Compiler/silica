@@ -53,9 +53,11 @@ export record_proj_chain_base_term/1;
 export record_proj_chain_base_is_value/1;
 export emit_inline_record_field_copy_words/5;
 export aggregate_return_heap_promote_x0/1;
+export aggregate_return_heap_promote_x0_copy/2;
 export tuple_elem_sret_reclaim/2;
 export tuple_elem_heap_promote/2;
 export tuple_elem_frame_var_promote/3;
+export frame_var_arg_promote/2;
 export arg_aggregate_heap_promote/2;
 export tuple_elem_var_aggregate_promote_bytes/2;
 export let_stack_agg_escapes_via_tuple/1;
@@ -591,6 +593,28 @@ fn tuple_elem_frame_var_promote(reg: string, elem: { nodes: List[{ kind: int64, 
     }
 }
 
+// A let-bound record or tuple passed BY NAME as a call argument (design region_memory_safety_design.md
+// H3; memory note 2026-09-08; trial region_hazards_open_addition/wbt_map_tuple_value_escapes_via_let):
+// the callee may keep the pointer for good, as wbt_map@insert keeps a tuple value in its node, and the
+// value lives in this function's frame region, [SP, X29), which dies at the epilogue. The literal case
+// (a tuple_make/record_make argument) is promoted by arg_aggregate_heap_promote at the call; this is
+// the same promotion for a name, taken when, and only when, the pointer is inside the current frame
+// (the test tuple_elem_frame_var_promote makes for a pack): results of calls, parameters and
+// projections are region or caller-frame pointers already and are left alone. X17 is the scratch for
+// SP, so the value may sit in X16, the tail path's staging register (tuple_elem_frame_var_promote
+// borrows X16 and cannot be used there). X0-X7 are preserved by arg_aggregate_heap_promote.
+fn frame_var_arg_promote(reg: string, arg: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(arg);
+    nbytes: int64 <- case n.kind == 1 of {
+        true -> aggregate_type_flat_bytes(n.type_name);
+        false -> 0
+    };
+    case nbytes > 0 of {
+        true -> concat(concat(concat("    MOV X17, SP\n    CMP ", reg), concat(", X17\n    B.LO 7f\n    CMP ", reg)), concat(", X29\n    B.HS 7f\n", concat(arg_aggregate_heap_promote(reg, nbytes), "7:\n")));
+        false -> ""
+    }
+}
+
 // Retired: per-pack promote OOMed typecheck. Let-emit promotes once via
 // let_stack_agg_escapes_via_tuple; keep the symbol returning 0 for call sites.
 fn tuple_elem_var_aggregate_promote_bytes(elem: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, bound_name: string) -> int64 {
@@ -660,15 +684,23 @@ fn let_early_heap_promote_asm(rhs_bind: string, nbytes: int64) -> string {
 }
 
 fn aggregate_return_heap_promote_x0(nbytes: int64) -> string {
-    case nbytes <= 0 of {
+    aggregate_return_heap_promote_x0_copy(nbytes, nbytes)
+}
+
+// As aggregate_return_heap_promote_x0, with the block allocated at alloc_bytes and copy_bytes of the
+// value in X0 copied into it. The sret epilogue allocates a record's 16-byte-rounded shell but copies
+// only the value's flat size (prims_tuple@sret_aggregate_copy_bytes): the value may be a box of
+// exactly that size, and reading the rounding word past it faulted at an arena block's end.
+fn aggregate_return_heap_promote_x0_copy(alloc_bytes: int64, copy_bytes: int64) -> string {
+    case alloc_bytes <= 0 of {
         true -> "";
         false -> {
-            words: int64 <- nbytes / 8;
+            words: int64 <- copy_bytes / 8;
             case words <= 0 of {
                 true -> "";
                 false -> {
                     copy_asm: string <- aggregate_heap_copy_words_unrolled(0, words);
-                    concat(concat(concat(concat("    SUB SP, SP, #16\n    STR X0, [SP, #8]\n    MOV X0, #", atom_table@int64_to_decimal_string(nbytes)), "\n    BL _silica_rt_region_alloc\n    MOV X4, X0\n    LDR X1, [SP, #8]\n"), copy_asm), "    MOV X0, X4\n    ADD SP, SP, #16\n")
+                    concat(concat(concat(concat("    SUB SP, SP, #16\n    STR X0, [SP, #8]\n    MOV X0, #", atom_table@int64_to_decimal_string(alloc_bytes)), "\n    BL _silica_rt_region_alloc\n    MOV X4, X0\n    LDR X1, [SP, #8]\n"), copy_asm), "    MOV X0, X4\n    ADD SP, SP, #16\n")
                 }
             }
         }

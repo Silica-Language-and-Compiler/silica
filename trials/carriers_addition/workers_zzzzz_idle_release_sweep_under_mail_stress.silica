@@ -1,0 +1,257 @@
+// Carriers, the :release_when_idle sweep under mail (release_when_idle_design.md §3, trial 4): the
+// sweep's hand-off (a listed actor becomes 6, sweeping, off the list, and is released under its own
+// lock only while it is still 6) is exercised against mail, migration and the budget at once. The
+// suite runs this trial with SILICA_IDLE_STACK_BUDGET=1048576 (the .env file beside it), so with a
+// thousand one-page idle stacks the carriers are over budget throughout and sweep at every dispatch.
+// A thousand :release_when_idle actors are each called ten rounds by four drivers (three started by
+// a cast of the list, the trial's worker the fourth) in interleaved order, 40,000 calls in all,
+// while the sweeps run; in one round each driver also moves every actor to another core. A reply
+// that is not the message ends the program with status 3 (the drivers check every one), so the
+// expected output asserts all 40,000. Each driver reports to a gate actor when it is done and
+// the worker polls the gate (bounded) until all three have; afterwards every actor's state counts
+// exactly 40 messages, and the bounded poll sees every stack released to nothing.
+//
+// Expected output: true (the drivers finished), true (every state is 40), true (all released), 0.
+// The same at every carrier count.
+
+use trial_support_int64;
+
+// Replies the message and counts it; 0 asks for the count.
+fn echo(msg: int64, state: int64) -> (:reply, int64, int64) {
+    case msg == 0 of {
+        true -> (:reply, state, state);
+        false -> (:reply, msg, state + 1)
+    }
+}
+
+fn spawn_all(n: int64, acc: List[actor_ref, mem(normal)]) -> List[actor_ref, mem(normal)] {
+    case n == 0 of {
+        true -> acc;
+        false -> {
+            sequence proc[concurrency, mem(normal)]
+                w: actor_ref <- spawn(0, echo, stack_policy(65536, :release_when_idle));
+                next: List[actor_ref, mem(normal)] <- prepend[actor_ref, mem(normal)](w, acc);
+                rest: List[actor_ref, mem(normal)] <- spawn_all(n - 1, next)
+            produces
+                pure rest
+            end
+        }
+    }
+}
+
+// One call to every actor with k, checking the reply; with move, each is also moved to the core.
+fn round(refs: List[actor_ref, mem(normal)], k: int64, move: boolean, core: int64) -> int64 {
+    case refs.is_nil of {
+        true -> 0;
+        false -> {
+            sequence proc[concurrency]
+                v: int64 <- call(refs.head, k impl ActorMessage {});
+                _: boolean <- case v == k of {
+                    true -> true;
+                    false -> cast_exit(3)
+                };
+                _: atom <- case move of {
+                    true -> migrate_actor(refs.head, core);
+                    false -> :ok
+                };
+                r: int64 <- round(refs.tail, k, move, core)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+// n rounds; the fifth one moves every actor to the core.
+fn rounds(refs: List[actor_ref, mem(normal)], k: int64, core: int64, n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            _: int64 <- round(refs, k, n == 5, core);
+            rounds(refs, k, core, n - 1)
+        }
+    }
+}
+
+// Driver k moves to core k (1, 2) or k - 2 (3, 4).
+fn core_of(k: int64) -> int64 {
+    case k > 2 of {
+        true -> k - 2;
+        false -> k
+    }
+}
+
+// The gate counts the drivers that have finished; 0 asks for the count.
+fn gate(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+// Driver k runs ten rounds of calls over the actors it is sent, then reports to the gate (its
+// state). One behaviour per k: a registered name would be an atom of its own and move every
+// registered name numbered after it in the suite's table.
+fn drive_k(refs: List[actor_ref, mem(normal)], k: int64, gate: actor_ref) -> int64 {
+    sequence proc[concurrency]
+        _: int64 <- rounds(refs, k, core_of(k), 10);
+        reported: int64 <- call(gate, 1 impl ActorMessage {})
+    produces
+        pure reported
+    end
+}
+
+fn driver_1(msg: List[actor_ref, mem(normal)], gate: actor_ref) -> (:no_reply, actor_ref) {
+    _: int64 <- drive_k(msg, 1, gate);
+    (:no_reply, gate)
+}
+
+fn driver_2(msg: List[actor_ref, mem(normal)], gate: actor_ref) -> (:no_reply, actor_ref) {
+    _: int64 <- drive_k(msg, 2, gate);
+    (:no_reply, gate)
+}
+
+fn driver_3(msg: List[actor_ref, mem(normal)], gate: actor_ref) -> (:no_reply, actor_ref) {
+    _: int64 <- drive_k(msg, 3, gate);
+    (:no_reply, gate)
+}
+
+fn gate_poll(gate: actor_ref, n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            sequence proc[concurrency]
+                done: int64 <- call(gate, 0 impl ActorMessage {});
+                r: int64 <- case done == 3 of {
+                    true -> 1;
+                    false -> gate_poll(gate, n - 1)
+                }
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+// Up to n rounds of a thousand gate polls and a tick until the three drivers have reported.
+fn gate_rounds(gate: actor_ref, t: actor_ref, n: int64) -> boolean {
+    case n == 0 of {
+        true -> false;
+        false -> {
+            sequence proc[concurrency]
+                r: int64 <- gate_poll(gate, 1000);
+                _: int64 <- call(t, 200000 impl ActorMessage {});
+                res: boolean <- case r == 1 of {
+                    true -> true;
+                    false -> gate_rounds(gate, t, n - 1)
+                }
+            produces
+                pure res
+            end
+        }
+    }
+}
+
+fn count_wrong_states(refs: List[actor_ref, mem(normal)], acc: int64) -> int64 {
+    case refs.is_nil of {
+        true -> acc;
+        false -> {
+            sequence proc[concurrency]
+                s: int64 <- call(refs.head, 0 impl ActorMessage {});
+                more: int64 <- case s == 40 of {
+                    true -> 0;
+                    false -> 1
+                };
+                r: int64 <- count_wrong_states(refs.tail, acc + more)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+fn sum_committed(refs: List[actor_ref, mem(normal)], acc: int64) -> int64 {
+    case refs.is_nil of {
+        true -> acc;
+        false -> {
+            sequence proc[concurrency]
+                u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(refs.head);
+                r: int64 <- sum_committed(refs.tail, acc + u.committed)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+fn depth(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            r: int64 <- depth(n - 1);
+            r + 1
+        }
+    }
+}
+
+fn tick(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+// Up to n ticks (workers_zzzzz_idle_release_budget_bounds_burst) until every stack is released.
+fn poll_released(refs: List[actor_ref, mem(normal)], t: actor_ref, n: int64) -> boolean {
+    total: int64 <- sum_committed(refs, 0);
+    case total == 0 of {
+        true -> true;
+        false -> tick_then_poll(refs, t, n)
+    }
+}
+
+fn tick_then_poll(refs: List[actor_ref, mem(normal)], t: actor_ref, n: int64) -> boolean {
+    case n == 0 of {
+        true -> false;
+        false -> {
+            sequence proc[concurrency]
+                _: int64 <- call(t, 200000 impl ActorMessage {});
+                r: boolean <- poll_released(refs, t, n - 1)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io, mem(normal)]
+        t: actor_ref <- spawn(0, tick, stack_policy(0, :release_on_return));
+        none: List[actor_ref, mem(normal)] <- [];
+        refs: List[actor_ref, mem(normal)] <- spawn_all(1000, none);
+        g: actor_ref <- spawn(0, gate, stack_policy(0, :keep_last_message));
+        d1: actor_ref <- spawn(g, driver_1, stack_policy(0, :keep_high_water));
+        d2: actor_ref <- spawn(g, driver_2, stack_policy(0, :keep_high_water));
+        d3: actor_ref <- spawn(g, driver_3, stack_policy(0, :keep_high_water));
+        _: boolean <- cast(d1, refs impl ActorMessage {});
+        _: boolean <- cast(d2, refs impl ActorMessage {});
+        _: boolean <- cast(d3, refs impl ActorMessage {});
+        _: int64 <- rounds(refs, 4, core_of(4), 10);
+        finished: boolean <- gate_rounds(g, t, 2000);
+        print_boolean(finished);
+        println("");
+        wrong: int64 <- count_wrong_states(refs, 0);
+        print_boolean(wrong == 0);
+        println("");
+        released: boolean <- poll_released(refs, t, 2000);
+        print_boolean(released);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

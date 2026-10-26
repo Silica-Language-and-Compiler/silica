@@ -1,26 +1,27 @@
 // Layer 3E — persistent rose tree with skew-binary child-slot sequences: the `tree_rose`
 // generated module. Authority: design_documents/Phase1_TODOs/data_structure_designs/tree_trait.md
-// (§4 node, §6 generated surface, §7–§14 semantics) over skew_binary_random_access_list.md (§8
-// reverse orientation); the public Tree trait forwards here.
+// (§4 node, §6 generated surface, §7–§15 semantics and complexity) over
+// skew_binary_random_access_list.md (§8 reverse orientation); the public Tree trait forwards here.
 //
 // Representation (inline at every boundary; ItemType appears only inside nodes):
 //   { root: ref?, compare_item, region, specialization_key, compare_item_ordering_bundle }
-// A node is (item, subtree_node_count, live_child_count, slot_count, anchor, child_slots) with
-// child_slots the forest spine of a skew binary random-access list in the REVERSE orientation
-// (design §4: physical_index = slot_count - 1 - logical_slot, so append is O(1) and every earlier
-// slot number is stable). The list's item type is ref?(L, normal, rec): :none is a vacant slot and
-// a reference is an occupied slot (design §4 writes this as :vacant | (:occupied, ref); an optional
-// reference is that sum with nothing added). The anchor is always :none and exists only because
-// alloc_rec requires a direct recursive slot in the tuple (as brodal_okasaki_node).
+// One nine-field node tuple plays two roles (spelled in full wherever a node type is written):
+//   (item, subtree_node_count, live_child_count, slot_count, weight, slot, left, right, spine)
+//   (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])
+// A ROSE NODE uses item, the three counts and spine (weight 0; slot, left, right :none). A CELL of
+// the skew-binary random-access list over a rose node's child slots uses weight (its complete
+// binary tree's size, 2^k - 1), slot (:none a vacant child slot, a reference an occupied one; the
+// design's :vacant | (:occupied, ref)), left and right (the two half-weight subtrees; :none in a
+// weight-1 cell); its counts are 0, its spine is empty and its item is a filler copied from the
+// owning rose node. A rose node's spine lists the roots of its cell trees in increasing weight
+// (only the first two may be equal). The list uses the REVERSE orientation (design §4:
+// physical_index = slot_count - 1 - logical_slot), so appending a child is an O(1) skew-binary
+// prepend and every earlier slot number is stable; slot lookup and path-copying update are
+// O(log b) for b slots. This module implements the list operations itself (lookup, update,
+// prepend, ascending-slot walk, validation); every cell lives in the tree's canonical arena.
 //
-// Composition with skew_ral (the nested-generic rule): a node stores only the RAL's forest spine and
-// its length; every skew_ral call rebuilds the collection record { count: slot_count, reversed: true,
-// compare_item: slot_compare, forest, region: tree.region, specialization_key: 0 } through slots_of,
-// so each qualified call has a flat, concrete item type (ref?) and its own compare_item witness, and
-// the RAL cells live in the tree's canonical arena. slot_compare is never called (child placement
-// never depends on ordering, design §2).
-//
-// Deviations forced by the bootstrap compiler (each mirrors an existing stdlib module):
+// Deviations forced by the bootstrap compiler (numbering of 2026-10-24; the earlier deviations 6
+// and 8 are retired, see the end of the list):
 //   1. add_child is a supervisor built-in name (spawn/add_child/link/...): a user function so named
 //      is typed and emitted as the built-in and callers must declare proc[concurrency]. The design's
 //      add_child/3 is therefore exported as add_leaf/3 with the same contract.
@@ -34,19 +35,17 @@
 //   5. The Tree[ItemType, mem(SpaceType)] bracket family is registered: a program may annotate a
 //      tree as Tree[string, mem(normal)] (trials/ordered_data_structures/tree_collections/
 //      tree_field_annotation.silica); this module itself declares the inline record above.
-//   6. Preorder traversal materializes each visited node's occupied (slot, child) entries in
-//      ascending slot order (children_of, O(b) cells per node) because a fold callback in this unit
-//      cannot carry this unit's AccType through skew_ral's AccType; the design's cursor remark (§5)
-//      permits an internal cursor. Bounds are unchanged: O(n + s) time.
-//   7. Single parentage (design §13 item 3) is checked on the active path only (cycle detection);
+//   6. Single parentage (design §13 item 3) is checked on the active path only (cycle detection);
 //      a node reachable through two different parents validates with its count per occurrence, as
 //      tree_binary does. compare_item results are validated at every search comparison; an atom
 //      outside :less | :equal | :greater is a deterministic collection error (division by zero).
-//   8. Known open emitter defect, not worked around here: when ItemType is a tuple, a concrete unit
-//      reads a record field that FOLLOWS the ItemType field at an inline-pair offset while this unit
-//      stored one slot, so child_at's child_path and find_first's path are unreadable for tuple items
-//      (get's value, the last field, is fine). Repro: trials/ordered_data_structures/tree_collections/
-//      staged/record_tuple_field_then_list_read.silica.
+//   Retired: the old deviation 6 (preorder materialized each node's (slot, child) entries because
+//   a fold could not carry this unit's AccType through skew_ral's) is gone with skew_ral: the walk
+//   now descends the cells directly, ascending slots, no per-node list. The old deviation 8 (a
+//   record field after a tuple-typed ItemType field read at an inline offset) was fixed by the
+//   boxed record layout (trials/generic_modules_addition/record_tuple_field_then_list_read).
+// A let binding cannot be typed ref?(...) (E1040), so helpers that yield an optional node either
+// return a (region, ref?) pair or are passed inline as one nested call per argument list.
 // Every exported function whose signature mentions ItemType takes the tree record first; folds
 // take the accumulator second (AccType is witnessed by argument two). A user unit that cases on
 // compare_item's result must list :less, :equal, :greater in that order where they first appear
@@ -54,8 +53,6 @@
 //
 // Arena: canonical_arena_lookup(arena_key()) — one application-lifetime arena for every value of
 // this representation.
-
-use skew_ral;
 
 export arena_key/0;
 export with_root/2;
@@ -109,7 +106,7 @@ fn invalid_comparator_halt(_: atom, placeholder: ItemType) -> :less | :equal | :
 // Compares two items with the comparator captured by the tree.
 fn compare_item(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -187,44 +184,85 @@ fn reverse_path(rev: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Nodes and child-slot sequences.
+// Nodes and cells: every read goes through read_rose / read_cell (one destructure each, returned
+// as a record), every allocation through alloc_node / alloc_cell / alloc_leaf_cell.
 // ---------------------------------------------------------------------------------------------
 
-fn slot_compare(_: ref?(L, normal, rec), _: ref?(L, normal, rec)) -> :less | :equal | :greater {
-    :equal
-}
-
-fn none_slot() -> ref?(L, normal, rec) {
+fn none_slot() -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
     :none
 }
 
-fn empty_forest() -> List[(int64, ref?(L, normal, rec)), mem(normal)] {
+fn empty_spine() -> List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] {
     sequence proc[mem(normal)]
-        out: List[(int64, ref?(L, normal, rec)), mem(normal)] <- empty[(int64, ref?(L, normal, rec)), mem(normal)]()
+        out: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- empty[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]()
     produces
         pure out
     end
 }
 
-fn read_node(node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)]))) -> { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } {
+fn spine_cons(head: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), rest: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]) -> List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] {
     sequence proc[mem(normal)]
-        node: (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)]) <- read_ref(node_ref);
-        (item, count: int64, live: int64, slots: int64, _: ref?(L, normal, rec), forest: List[(int64, ref?(L, normal, rec)), mem(normal)]) <- node
+        out: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- prepend[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)](head, rest)
     produces
-        pure { item: item, count: count, live: live, slots: slots, forest: forest }
+        pure out
     end
 }
 
-fn read_count(node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)]))) -> int64 {
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+// The rose-node fields of a node.
+fn read_rose(node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } {
+    sequence proc[mem(normal)]
+        node: (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]) <- read_ref(node_ref);
+        (item, count: int64, live: int64, slots: int64, _: int64, _: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), _: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), _: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]) <- node
+    produces
+        pure { item: item, count: count, live: live, slots: slots, spine: spine }
+    end
+}
+
+// The cell fields of a node.
+fn read_cell(cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) } {
+    sequence proc[mem(normal)]
+        node: (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]) <- read_ref(cell_ref);
+        (_, _: int64, _: int64, _: int64, weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), _: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]) <- node
+    produces
+        pure { weight: weight, slot: slot, left: left, right: right }
+    end
+}
+
+fn read_count(node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> int64 {
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
     parts.count
 }
 
 // Cached logical count of a subtree; zero for :none.
-fn cached_count(node: ref?(L, normal, rec)) -> int64 {
+fn cached_count(node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> int64 {
     case node of {
         :none -> 0;
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> read_count(node_ref)
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> read_count(node_ref)
+    }
+}
+
+fn read_weight(cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> int64 {
+    parts: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) } <- read_cell(cell_ref);
+    parts.weight
+}
+
+// Weight of a cell tree; zero for :none (only a malformed spine holds :none).
+fn cell_weight(cell: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> int64 {
+    case cell of {
+        :none -> 0;
+        cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> read_weight(cell_ref)
+    }
+}
+
+// The weight of each half of a cell tree of weight w (w = 2h + 1).
+fn child_weight(w: int64) -> int64 {
+    w / 2
+}
+
+fn slot_occupancy(slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> int64 {
+    case slot of {
+        :none -> 0;
+        _: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> 1
     }
 }
 
@@ -235,128 +273,216 @@ fn alloc_node(
     count: int64,
     live: int64,
     slots: int64,
-    forest: List[(int64, ref?(L, normal, rec)), mem(normal)]
-) -> (region(L, normal), ref?(L, normal, rec)) {
+    spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]
+) -> (region(L, normal), ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) {
     sequence proc[mem(normal)]
-        cell: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) <- alloc_rec(arena, (item, count, live, slots, :none, forest))
+        node: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) <- alloc_rec(arena, (item, count, live, slots, 0, :none, :none, :none, spine))
+    produces
+        pure (arena, node)
+    end
+}
+
+fn alloc_cell(
+    arena: region(L, normal),
+    filler: ItemType,
+    weight: int64,
+    slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))
+) -> (region(L, normal), ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) {
+    sequence proc[mem(normal)]
+        e: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- empty_spine();
+        cell: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) <- alloc_rec(arena, (filler, 0, 0, 0, weight, slot, left, right, e))
     produces
         pure (arena, cell)
     end
 }
 
-// The child-slot random-access list of one node, rebuilt around its stored spine (reverse
-// orientation, design §4); its cells live in the tree's canonical arena.
-fn slots_of(
-    tree: {
-        root: ref?(L, normal, rec),
-        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
-        region: region(L, normal),
-        specialization_key: int64,
-        compare_item_ordering_bundle: int64
-    },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] }
-) -> {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    } {
-    out: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    } <- {
-        count: parts.slots,
-        reversed: true,
-        compare_item: slot_compare,
-        forest: parts.forest,
-        region: tree.region,
-        specialization_key: 0
-    };
-    out
+fn alloc_leaf_cell(arena: region(L, normal), filler: ItemType, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> (region(L, normal), ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) {
+    sequence proc[mem(normal)]
+        e: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- empty_spine();
+        cell: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) <- alloc_rec(arena, (filler, 0, 0, 0, 1, slot, :none, :none, e))
+    produces
+        pure (arena, cell)
+    end
 }
 
-// The occupied child at a logical slot, :none when the slot is vacant, negative, or past the end.
-fn slot_ref(
+fn new_cell(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
-    slot: int64
-) -> ref?(L, normal, rec) {
-    ral: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
+    filler: ItemType,
+    weight: int64,
+    slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))
+) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
+    pair: (region(L, normal), ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- alloc_cell(tree.region, filler, weight, slot, left, right);
+    (_: region(L, normal), cell: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- pair;
+    cell
+}
+
+fn new_leaf_cell(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
-        specialization_key: int64
-    } <- slots_of(tree, parts);
-    got: { status: :not_found | :found, value: ref?(L, normal, rec) } <- skew_ral@get(ral, slot, none_slot());
-    case got.status of {
-        :not_found -> :none;
-        :found -> got.value
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, filler: ItemType, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
+    pair: (region(L, normal), ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- alloc_leaf_cell(tree.region, filler, slot);
+    (_: region(L, normal), cell: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- pair;
+    cell
+}
+
+// ---------------------------------------------------------------------------------------------
+// The skew-binary child-slot list (design §4, §7, §8). Physical index 0 is the root of the first
+// spine tree; a cell tree of weight w at physical start p holds p at its root, p + 1 .. p + h in
+// its left half and p + h + 1 .. p + w - 1 in its right half (h = w / 2).
+// ---------------------------------------------------------------------------------------------
+
+fn cell_get_at(c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) }, i: int64) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
+    half: int64 <- child_weight(c.weight);
+    case i == 0 of {
+        true -> c.slot;
+        false -> case i <= half of {
+            true -> cell_get(c.left, i - 1);
+            false -> cell_get(c.right, i - 1 - half)
+        }
     }
 }
 
-// Physical order is descending logical order under the reverse orientation, so prepending each
-// occupied entry while walking physically yields ascending slot order.
-fn collect_step(acc: { entries: List[(int64, ref?(L, normal, rec)), mem(normal)], next: int64 }, item: ref?(L, normal, rec)) -> { entries: List[(int64, ref?(L, normal, rec)), mem(normal)], next: int64 } {
-    sequence proc[mem(normal)]
-        out: { entries: List[(int64, ref?(L, normal, rec)), mem(normal)], next: int64 } <- case item of {
-            :none -> { entries: acc.entries, next: acc.next - 1 };
-            _: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-                e: (int64, ref?(L, normal, rec)) <- (acc.next, item);
-                grown: List[(int64, ref?(L, normal, rec)), mem(normal)] <- prepend[(int64, ref?(L, normal, rec)), mem(normal)](e, acc.entries);
-                { entries: grown, next: acc.next - 1 }
-            }
+// The slot at physical index i of the cell tree `t` (0 <= i < its weight).
+fn cell_get(t: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), i: int64) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
+    case t of {
+        :none -> :none;
+        cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) } <- read_cell(cell_ref);
+            cell_get_at(c, i)
         }
-    produces
-        pure out
-    end
+    }
 }
 
-// The occupied (slot, child) entries of one node in ascending slot order; vacant slots are skipped.
-fn children_of(
-    tree: {
-        root: ref?(L, normal, rec),
+// The slot at physical index i of a spine; :none past the end.
+fn spine_get(spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], i: int64) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
+    case spine.is_nil of {
+        true -> :none;
+        false -> {
+            w: int64 <- cell_weight(spine.head);
+            case i < w of {
+                true -> cell_get(spine.head, i);
+                false -> spine_get(spine.tail, i - w)
+            }
+        }
+    }
+}
+
+// The occupied child at a logical slot, :none when the slot is vacant, negative, or past the end.
+fn slot_ref(parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] }, slot: int64) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
+    case slot < 0 or slot >= parts.slots of {
+        true -> :none;
+        false -> spine_get(parts.spine, parts.slots - 1 - slot)
+    }
+}
+
+fn cell_set_at(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
-    },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] }
-) -> List[(int64, ref?(L, normal, rec)), mem(normal)] {
-    sequence
-        ral: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    } <- slots_of(tree, parts);
-        e0: List[(int64, ref?(L, normal, rec)), mem(normal)] <- empty_forest();
-        acc0: { entries: List[(int64, ref?(L, normal, rec)), mem(normal)], next: int64 } <- { entries: e0, next: parts.slots - 1 };
-        acc1: { entries: List[(int64, ref?(L, normal, rec)), mem(normal)], next: int64 } <- skew_ral@fold_physical(ral, acc0, collect_step)
-    produces
-        pure acc1.entries
-    end
+    }, filler: ItemType, c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) }, i: int64, v: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
+    half: int64 <- child_weight(c.weight);
+    case i == 0 of {
+        true -> new_cell(tree, filler, c.weight, v, c.left, c.right);
+        false -> case i <= half of {
+            true -> new_cell(tree, filler, c.weight, c.slot, cell_set(tree, filler, c.left, i - 1, v), c.right);
+            false -> new_cell(tree, filler, c.weight, c.slot, c.left, cell_set(tree, filler, c.right, i - 1 - half, v))
+        }
+    }
 }
 
-fn entry_count(entries: List[(int64, ref?(L, normal, rec)), mem(normal)], acc: int64) -> int64 {
-    case entries.is_nil of {
-        true -> acc;
-        false -> entry_count(entries.tail, acc + 1)
+// Path-copies the cell tree `t` with physical index i set to v; the untouched halves are shared.
+fn cell_set(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, filler: ItemType, t: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), i: int64, v: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
+    case t of {
+        :none -> :none;
+        cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) } <- read_cell(cell_ref);
+            cell_set_at(tree, filler, c, i, v)
+        }
+    }
+}
+
+// Persistently sets physical index i of a spine to v (O(log b) new cells); updated = false past
+// the end.
+fn spine_set(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, filler: ItemType, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], i: int64, v: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> { spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], updated: boolean } {
+    case spine.is_nil of {
+        true -> { spine: spine, updated: false };
+        false -> {
+            w: int64 <- cell_weight(spine.head);
+            case i < w of {
+                true -> {
+                    out: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- spine_cons(cell_set(tree, filler, spine.head, i, v), spine.tail);
+                    { spine: out, updated: true }
+                };
+                false -> {
+                    rest: { spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], updated: boolean } <- spine_set(tree, filler, spine.tail, i - w, v);
+                    case rest.updated of {
+                        false -> rest;
+                        true -> {
+                            grown: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- spine_cons(spine.head, rest.spine);
+                            { spine: grown, updated: true }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn spine_first_weight(spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]) -> int64 {
+    case spine.is_nil of {
+        true -> 0;
+        false -> cell_weight(spine.head)
+    }
+}
+
+fn spine_second_weight(spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]) -> int64 {
+    case spine.is_nil of {
+        true -> 0;
+        false -> spine_first_weight(spine.tail)
+    }
+}
+
+// Skew-binary prepend of v at physical index 0 (O(1)): two equal leading trees of weight w are
+// linked under a new cell of weight 2w + 1, otherwise a weight-1 cell is consed.
+fn spine_push(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, filler: ItemType, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], v: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] {
+    w1: int64 <- spine_first_weight(spine);
+    w2: int64 <- spine_second_weight(spine);
+    case w1 > 0 and w1 == w2 of {
+        true -> spine_cons(new_cell(tree, filler, w1 + w1 + 1, v, spine.head, spine.tail.head), spine.tail.tail);
+        false -> spine_cons(new_leaf_cell(tree, filler, v), spine)
     }
 }
 
@@ -366,22 +492,22 @@ fn entry_count(entries: List[(int64, ref?(L, normal, rec)), mem(normal)], acc: i
 
 fn publish(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    root: ref?(L, normal, rec)
+    root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))
 ) -> {
-    root: ref?(L, normal, rec),
-    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
-    region: region(L, normal),
-    specialization_key: int64,
-    compare_item_ordering_bundle: int64
-} {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    } {
     out: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -402,21 +528,21 @@ fn with_root(
     functions: { compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater },
     root_item: ItemType
 ) -> {
-    root: ref?(L, normal, rec),
-    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
-    region: region(L, normal),
-    specialization_key: int64,
-    compare_item_ordering_bundle: int64
-} {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    } {
     sequence proc[mem(normal)]
         L: lifetime <- fresh_lifetime();
         arena: region(L, normal) <- canonical_arena_lookup(85);
         token: int64 <- ordering_identity_materialize(functions.compare_item);
-        f0: List[(int64, ref?(L, normal, rec)), mem(normal)] <- empty_forest();
-        pair: (region(L, normal), ref?(L, normal, rec)) <- alloc_node(arena, root_item, 1, 0, 0, f0);
-        (_: region(L, normal), root: ref?(L, normal, rec)) <- pair;
+        s0: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- empty_spine();
+        pair: (region(L, normal), ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- alloc_node(arena, root_item, 1, 0, 0, s0);
+        (_: region(L, normal), root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- pair;
         out: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -437,14 +563,14 @@ fn with_root(
 // comparator ordering identity, and specialization key are checked at runtime.
 fn compatible_trees(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
     other: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -464,7 +590,7 @@ fn compatible_trees(
 // ---------------------------------------------------------------------------------------------
 
 fn node_count(tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -475,7 +601,7 @@ fn node_count(tree: {
 
 // Unreachable through public constructors: the tree is never empty (design §2).
 fn root_item_halt(tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -489,7 +615,7 @@ fn root_item_halt(tree: {
 }
 
 fn root_item(tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -497,8 +623,8 @@ fn root_item(tree: {
     }) -> ItemType {
     case tree.root of {
         :none -> root_item_halt(tree);
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             parts.item
         }
     }
@@ -507,22 +633,22 @@ fn root_item(tree: {
 // Follows a root-first path of stable slots; :none when any component is vacant or out of range.
 fn find_node(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     path: List[int64, mem(normal)]
-) -> ref?(L, normal, rec) {
+) -> ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) {
     case node of {
         :none -> :none;
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> case path.is_nil of {
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> case path.is_nil of {
             true -> node;
             false -> {
-                parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
-                find_node(tree, slot_ref(tree, parts, path.head), path.tail)
+                parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
+                find_node(tree, slot_ref(parts, path.head), path.tail)
             }
         }
     }
@@ -530,19 +656,19 @@ fn find_node(
 
 fn item_of(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     placeholder: ItemType
 ) -> { status: :not_found | :found, value: ItemType } {
     case node of {
         :none -> { status: :not_found, value: placeholder };
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             { status: :found, value: parts.item }
         }
     }
@@ -550,7 +676,7 @@ fn item_of(
 
 fn get(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -564,18 +690,18 @@ fn get(
 
 fn live_of(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec)
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))
 ) -> { status: :not_found | :found, count: int64 } {
     case node of {
         :none -> { status: :not_found, count: 0 };
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             { status: :found, count: parts.live }
         }
     }
@@ -583,18 +709,18 @@ fn live_of(
 
 fn slots_at(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec)
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))
 ) -> { status: :not_found | :found, count: int64 } {
     case node of {
         :none -> { status: :not_found, count: 0 };
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             { status: :found, count: parts.slots }
         }
     }
@@ -603,7 +729,7 @@ fn slots_at(
 // Number of occupied child slots at a path.
 fn child_count(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -617,7 +743,7 @@ fn child_count(
 // Number of occupied and vacant child slots at a path (slots are never compacted, design §11).
 fn child_slot_count(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -630,19 +756,19 @@ fn child_slot_count(
 
 fn child_at_parent(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    parent_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])),
+    parent_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     path: List[int64, mem(normal)],
     slot: int64,
     placeholder: ItemType
 ) -> { status: :not_found | :found, value: ItemType, child_path: List[int64, mem(normal)] } {
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(parent_ref);
-    found: { status: :not_found | :found, value: ItemType } <- item_of(tree, slot_ref(tree, parts, slot), placeholder);
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(parent_ref);
+    found: { status: :not_found | :found, value: ItemType } <- item_of(tree, slot_ref(parts, slot), placeholder);
     case found.status of {
         :not_found -> { status: :not_found, value: placeholder, child_path: path };
         :found -> { status: :found, value: found.value, child_path: path_with(path, slot) }
@@ -652,7 +778,7 @@ fn child_at_parent(
 // The direct child at a stable slot of the node at `path`, with the child's own path.
 fn child_at(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -664,18 +790,21 @@ fn child_at(
 ) -> { status: :not_found | :found, value: ItemType, child_path: List[int64, mem(normal)] } {
     case find_node(tree, tree.root, path) of {
         :none -> { status: :not_found, value: placeholder, child_path: path };
-        parent_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> child_at_parent(tree, parent_ref, path, slot, placeholder)
+        parent_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> child_at_parent(tree, parent_ref, path, slot, placeholder)
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Preorder traversal (design §10): node, then occupied slots ascending, each subtree recursively.
-// The cursor `rev` is root-most-last; the callback receives a root-first snapshot.
+// Ascending logical slots are descending physical indexes: the walk takes the later spine trees
+// first and, inside a cell tree, the right half, the left half, then the root. `top` is the
+// logical slot of the current cell's root (slot_count - 1 - its physical index). The cursor `rev`
+// is root-most-last; the callback receives a root-first snapshot.
 // ---------------------------------------------------------------------------------------------
 
-fn fold_children(
+fn fold_spine(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -683,22 +812,66 @@ fn fold_children(
     },
     acc: AccType,
     step: fn(AccType, List[int64, mem(normal)], ItemType) -> AccType,
-    entries: List[(int64, ref?(L, normal, rec)), mem(normal)],
+    spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)],
+    top: int64,
     rev: List[int64, mem(normal)]
 ) -> AccType {
-    case entries.is_nil of {
+    case spine.is_nil of {
         true -> acc;
         false -> {
-            (slot: int64, child: ref?(L, normal, rec)) <- entries.head;
-            acc_child: AccType <- fold_node(tree, acc, step, child, path_cons(slot, rev));
-            fold_children(tree, acc_child, step, entries.tail, rev)
+            w: int64 <- cell_weight(spine.head);
+            acc_rest: AccType <- fold_spine(tree, acc, step, spine.tail, top - w, rev);
+            fold_cell(tree, acc_rest, step, spine.head, top, rev)
+        }
+    }
+}
+
+fn fold_cell_at(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
+    acc: AccType,
+    step: fn(AccType, List[int64, mem(normal)], ItemType) -> AccType,
+    c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) },
+    top: int64,
+    rev: List[int64, mem(normal)]
+) -> AccType {
+    half: int64 <- child_weight(c.weight);
+    acc_right: AccType <- fold_cell(tree, acc, step, c.right, top - 1 - half, rev);
+    acc_left: AccType <- fold_cell(tree, acc_right, step, c.left, top - 1, rev);
+    fold_node(tree, acc_left, step, c.slot, path_cons(top, rev))
+}
+
+fn fold_cell(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
+    acc: AccType,
+    step: fn(AccType, List[int64, mem(normal)], ItemType) -> AccType,
+    t: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    top: int64,
+    rev: List[int64, mem(normal)]
+) -> AccType {
+    case t of {
+        :none -> acc;
+        cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) } <- read_cell(cell_ref);
+            fold_cell_at(tree, acc, step, c, top, rev)
         }
     }
 }
 
 fn fold_node(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -706,24 +879,23 @@ fn fold_node(
     },
     acc: AccType,
     step: fn(AccType, List[int64, mem(normal)], ItemType) -> AccType,
-    node: ref?(L, normal, rec),
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     rev: List[int64, mem(normal)]
 ) -> AccType {
     case node of {
         :none -> acc;
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             here: List[int64, mem(normal)] <- reverse_path(rev);
             acc_node: AccType <- step(acc, here, parts.item);
-            entries: List[(int64, ref?(L, normal, rec)), mem(normal)] <- children_of(tree, parts);
-            fold_children(tree, acc_node, step, entries, rev)
+            fold_spine(tree, acc_node, step, parts.spine, parts.slots - 1, rev)
         }
     }
 }
 
 fn fold_preorder(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -736,58 +908,108 @@ fn fold_preorder(
 }
 
 // ---------------------------------------------------------------------------------------------
-// find_first (design §10): the first preorder node whose item compares :equal to the query.
+// find_first (design §10): the first preorder node whose item compares :equal to the query, in
+// the same order as fold_preorder.
 // ---------------------------------------------------------------------------------------------
 
-fn search_children(
+fn search_spine(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
     item: ItemType,
-    entries: List[(int64, ref?(L, normal, rec)), mem(normal)],
+    spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)],
+    top: int64,
     rev: List[int64, mem(normal)],
     placeholder: ItemType
 ) -> { status: :not_found | :found, value: ItemType, path: List[int64, mem(normal)] } {
-    case entries.is_nil of {
+    case spine.is_nil of {
         true -> { status: :not_found, value: placeholder, path: rev };
         false -> {
-            (slot: int64, child: ref?(L, normal, rec)) <- entries.head;
-            hit: { status: :not_found | :found, value: ItemType, path: List[int64, mem(normal)] } <- search_node(tree, item, child, path_cons(slot, rev), placeholder);
+            w: int64 <- cell_weight(spine.head);
+            hit: { status: :not_found | :found, value: ItemType, path: List[int64, mem(normal)] } <- search_spine(tree, item, spine.tail, top - w, rev, placeholder);
             case hit.status of {
                 :found -> hit;
-                :not_found -> search_children(tree, item, entries.tail, rev, placeholder)
+                :not_found -> search_cell(tree, item, spine.head, top, rev, placeholder)
             }
+        }
+    }
+}
+
+fn search_cell_at(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
+    item: ItemType,
+    c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) },
+    top: int64,
+    rev: List[int64, mem(normal)],
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType, path: List[int64, mem(normal)] } {
+    half: int64 <- child_weight(c.weight);
+    hit_right: { status: :not_found | :found, value: ItemType, path: List[int64, mem(normal)] } <- search_cell(tree, item, c.right, top - 1 - half, rev, placeholder);
+    case hit_right.status of {
+        :found -> hit_right;
+        :not_found -> {
+            hit_left: { status: :not_found | :found, value: ItemType, path: List[int64, mem(normal)] } <- search_cell(tree, item, c.left, top - 1, rev, placeholder);
+            case hit_left.status of {
+                :found -> hit_left;
+                :not_found -> search_node(tree, item, c.slot, path_cons(top, rev), placeholder)
+            }
+        }
+    }
+}
+
+fn search_cell(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
+    item: ItemType,
+    t: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    top: int64,
+    rev: List[int64, mem(normal)],
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType, path: List[int64, mem(normal)] } {
+    case t of {
+        :none -> { status: :not_found, value: placeholder, path: rev };
+        cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) } <- read_cell(cell_ref);
+            search_cell_at(tree, item, c, top, rev, placeholder)
         }
     }
 }
 
 fn search_node(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
     item: ItemType,
-    node: ref?(L, normal, rec),
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     rev: List[int64, mem(normal)],
     placeholder: ItemType
 ) -> { status: :not_found | :found, value: ItemType, path: List[int64, mem(normal)] } {
     case node of {
         :none -> { status: :not_found, value: placeholder, path: rev };
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             case compare_item(tree, item, parts.item) of {
                 :equal -> { status: :found, value: parts.item, path: reverse_path(rev) };
-                _: atom -> {
-                    entries: List[(int64, ref?(L, normal, rec)), mem(normal)] <- children_of(tree, parts);
-                    search_children(tree, item, entries, rev, placeholder)
-                }
+                _: atom -> search_spine(tree, item, parts.spine, parts.slots - 1, rev, placeholder)
             }
         }
     }
@@ -795,7 +1017,7 @@ fn search_node(
 
 fn find_first(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -813,19 +1035,20 @@ fn find_first(
 
 // ---------------------------------------------------------------------------------------------
 // Persistent updates (design §8–§10): the root-to-target path is copied, every copied ancestor
-// persistently updates the one child-slot entry that changed (O(log b_i)), and every other slot
-// and subtree is shared. A rebuild result carries the replacement node, the subtree-count delta
-// it applies to each ancestor, and the operation's own number (child slot / removed count).
+// persistently updates the one child-slot cell path that changed (O(log b_i)), and every other
+// slot, cell and subtree is shared. A rebuild result carries the replacement node, the
+// subtree-count delta it applies to each ancestor, and the operation's own number (child slot /
+// removed count).
 // ---------------------------------------------------------------------------------------------
 
-fn res_missing() -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
-    out: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- { found: false, changed: false, node: :none, delta: 0, info: 0 };
+fn res_missing() -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
+    out: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- { found: false, changed: false, node: :none, delta: 0, info: 0 };
     out
 }
 
 // Found but nothing published: a vacant/out-of-range remove slot or a count overflow.
-fn res_declined(info: int64) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
-    out: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- { found: true, changed: false, node: :none, delta: 0, info: info };
+fn res_declined(info: int64) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
+    out: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- { found: true, changed: false, node: :none, delta: 0, info: info };
     out
 }
 
@@ -833,7 +1056,7 @@ fn res_declined(info: int64) -> { found: boolean, changed: boolean, node: ref?(L
 // returned straight into an argument list is not promoted by the bootstrap emitter).
 fn res_alloc(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -843,65 +1066,50 @@ fn res_alloc(
     count: int64,
     live: int64,
     slots: int64,
-    forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
+    spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)],
     delta: int64,
     info: int64
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
-    pair: (region(L, normal), ref?(L, normal, rec)) <- alloc_node(tree.region, item, count, live, slots, forest);
-    (_: region(L, normal), cell: ref?(L, normal, rec)) <- pair;
-    out: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- { found: true, changed: true, node: cell, delta: delta, info: info };
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
+    pair: (region(L, normal), ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- alloc_node(tree.region, item, count, live, slots, spine);
+    (_: region(L, normal), node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- pair;
+    out: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- { found: true, changed: true, node: node, delta: delta, info: info };
     out
 }
 
 fn rebuild_changed(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] },
     slot: int64,
-    sub: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 }
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
+    sub: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 }
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
     count_pair: (boolean, int64) <- checked_int64_add(parts.count, sub.delta);
     (count_ok: boolean, new_count: int64) <- count_pair;
-    ral: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    } <- slots_of(tree, parts);
-    upd: { list: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    }, updated: boolean } <- skew_ral@set(ral, slot, sub.node);
+    upd: { spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], updated: boolean } <- spine_set(tree, parts.item, parts.spine, parts.slots - 1 - slot, sub.node);
     case count_ok and upd.updated of {
         false -> res_declined(sub.info);
-        true -> res_alloc(tree, parts.item, new_count, parts.live, parts.slots, upd.list.forest, sub.delta, sub.info)
+        true -> res_alloc(tree, parts.item, new_count, parts.live, parts.slots, upd.spine, sub.delta, sub.info)
     }
 }
 
 // Copies the ancestor when its subtree changed; otherwise propagates the missing/declined result.
 fn rebuild_ancestor(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] },
     slot: int64,
-    sub: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 }
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
+    sub: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 }
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
     case sub.changed of {
         false -> sub;
         true -> rebuild_changed(tree, parts, slot, sub)
@@ -910,24 +1118,24 @@ fn rebuild_ancestor(
 
 fn replace_item_at(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     path: List[int64, mem(normal)],
     value: ItemType
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
     case node of {
         :none -> res_missing();
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             case path.is_nil of {
-                true -> res_alloc(tree, value, parts.count, parts.live, parts.slots, parts.forest, 0, 0);
+                true -> res_alloc(tree, value, parts.count, parts.live, parts.slots, parts.spine, 0, 0);
                 false -> {
-                    sub: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- replace_item_at(tree, slot_ref(tree, parts, path.head), path.tail, value);
+                    sub: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- replace_item_at(tree, slot_ref(parts, path.head), path.tail, value);
                     rebuild_ancestor(tree, parts, path.head, sub)
                 }
             }
@@ -936,10 +1144,11 @@ fn replace_item_at(
 }
 
 // Replaces the item at `path`: shape, counts and slot numbers unchanged; changed = true whenever
-// the path is found (no item equality is consulted), the exact old tree otherwise.
+// the path is found (no item equality is consulted), the exact old tree otherwise. The replaced
+// node's cells keep the old item as their filler (a filler is never read as an item).
 fn replace_item(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -949,15 +1158,15 @@ fn replace_item(
     value: ItemType
 ) -> {
     tree: {
-    root: ref?(L, normal, rec),
-    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
-    region: region(L, normal),
-    specialization_key: int64,
-    compare_item_ordering_bundle: int64
-},
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
     changed: boolean
 } {
-    result: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- replace_item_at(tree, tree.root, path, value);
+    result: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- replace_item_at(tree, tree.root, path, value);
     case result.changed of {
         false -> { tree: tree, changed: false };
         true -> { tree: publish(tree, result.node), changed: true }
@@ -968,79 +1177,66 @@ fn replace_item(
 // `parts`: the new slot number is the old slot count; counts are checked before allocation.
 fn attach_child(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
-    child: ref?(L, normal, rec),
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] },
+    child: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     k: int64
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
     count_pair: (boolean, int64) <- checked_int64_add(parts.count, k);
     (count_ok: boolean, new_count: int64) <- count_pair;
     slots_pair: (boolean, int64) <- checked_int64_add1(parts.slots);
     (slots_ok: boolean, new_slots: int64) <- slots_pair;
-    ral: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    } <- slots_of(tree, parts);
-    app: { list: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    }, appended: boolean } <- skew_ral@append(ral, child);
-    case count_ok and slots_ok and app.appended of {
+    case count_ok and slots_ok of {
         false -> res_declined(0);
-        true -> res_alloc(tree, parts.item, new_count, parts.live + 1, new_slots, app.list.forest, k, parts.slots)
+        true -> {
+            grown: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- spine_push(tree, parts.item, parts.spine, child);
+            res_alloc(tree, parts.item, new_count, parts.live + 1, new_slots, grown, k, parts.slots)
+        }
     }
 }
 
 fn add_leaf_here(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] },
     value: ItemType
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
-    f0: List[(int64, ref?(L, normal, rec)), mem(normal)] <- empty_forest();
-    leaf_pair: (region(L, normal), ref?(L, normal, rec)) <- alloc_node(tree.region, value, 1, 0, 0, f0);
-    (_: region(L, normal), leaf: ref?(L, normal, rec)) <- leaf_pair;
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
+    s0: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- empty_spine();
+    leaf_pair: (region(L, normal), ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- alloc_node(tree.region, value, 1, 0, 0, s0);
+    (_: region(L, normal), leaf: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) <- leaf_pair;
     attach_child(tree, parts, leaf, 1)
 }
 
 fn add_leaf_at(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     path: List[int64, mem(normal)],
     value: ItemType
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
     case node of {
         :none -> res_missing();
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             case path.is_nil of {
                 true -> add_leaf_here(tree, parts, value);
                 false -> {
-                    sub: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- add_leaf_at(tree, slot_ref(tree, parts, path.head), path.tail, value);
+                    sub: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- add_leaf_at(tree, slot_ref(parts, path.head), path.tail, value);
                     rebuild_ancestor(tree, parts, path.head, sub)
                 }
             }
@@ -1052,7 +1248,7 @@ fn add_leaf_at(
 // reports its stable slot; a missing parent answers added = false with the exact old tree.
 fn add_leaf(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -1062,16 +1258,16 @@ fn add_leaf(
     value: ItemType
 ) -> {
     tree: {
-    root: ref?(L, normal, rec),
-    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
-    region: region(L, normal),
-    specialization_key: int64,
-    compare_item_ordering_bundle: int64
-},
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
     added: boolean,
     child_slot: int64
 } {
-    result: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- add_leaf_at(tree, tree.root, parent_path, value);
+    result: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- add_leaf_at(tree, tree.root, parent_path, value);
     case result.changed of {
         false -> { tree: tree, added: false, child_slot: -1 };
         true -> { tree: publish(tree, result.node), added: true, child_slot: result.info }
@@ -1080,25 +1276,25 @@ fn add_leaf(
 
 fn add_subtree_at(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     path: List[int64, mem(normal)],
-    child: ref?(L, normal, rec),
+    child: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     k: int64
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
     case node of {
         :none -> res_missing();
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             case path.is_nil of {
                 true -> attach_child(tree, parts, child, k);
                 false -> {
-                    sub: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- add_subtree_at(tree, slot_ref(tree, parts, path.head), path.tail, child, k);
+                    sub: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- add_subtree_at(tree, slot_ref(parts, path.head), path.tail, child, k);
                     rebuild_ancestor(tree, parts, path.head, sub)
                 }
             }
@@ -1108,7 +1304,7 @@ fn add_subtree_at(
 
 fn add_subtree_checked(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -1116,7 +1312,7 @@ fn add_subtree_checked(
     },
     parent_path: List[int64, mem(normal)],
     subtree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -1124,18 +1320,18 @@ fn add_subtree_checked(
     }
 ) -> {
     tree: {
-    root: ref?(L, normal, rec),
-    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
-    region: region(L, normal),
-    specialization_key: int64,
-    compare_item_ordering_bundle: int64
-},
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
     added: boolean,
     child_slot: int64,
     compatible: boolean
 } {
     k: int64 <- cached_count(subtree.root);
-    result: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- add_subtree_at(tree, tree.root, parent_path, subtree.root, k);
+    result: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- add_subtree_at(tree, tree.root, parent_path, subtree.root, k);
     case result.changed and k > 0 of {
         false -> { tree: tree, added: false, child_slot: -1, compatible: true };
         true -> { tree: publish(tree, result.node), added: true, child_slot: result.info, compatible: true }
@@ -1146,7 +1342,7 @@ fn add_subtree_checked(
 // added along the copied path). Incompatibility fails before any allocation.
 fn add_subtree(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -1154,7 +1350,7 @@ fn add_subtree(
     },
     parent_path: List[int64, mem(normal)],
     subtree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -1162,12 +1358,12 @@ fn add_subtree(
     }
 ) -> {
     tree: {
-    root: ref?(L, normal, rec),
-    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
-    region: region(L, normal),
-    specialization_key: int64,
-    compare_item_ordering_bundle: int64
-},
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
     added: boolean,
     child_slot: int64,
     compatible: boolean
@@ -1180,76 +1376,61 @@ fn add_subtree(
 
 fn remove_occupied(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] },
     slot: int64,
     k: int64
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
-    ral: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    } <- slots_of(tree, parts);
-    upd: { list: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    }, updated: boolean } <- skew_ral@set(ral, slot, none_slot());
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
+    upd: { spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], updated: boolean } <- spine_set(tree, parts.item, parts.spine, parts.slots - 1 - slot, none_slot());
     case upd.updated of {
         false -> res_declined(0);
-        true -> res_alloc(tree, parts.item, parts.count - k, parts.live - 1, parts.slots, upd.list.forest, 0 - k, k)
+        true -> res_alloc(tree, parts.item, parts.count - k, parts.live - 1, parts.slots, upd.spine, 0 - k, k)
     }
 }
 
 // Vacates one occupied slot: the slot number stays reserved, no sibling moves (design §9).
 fn remove_here(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] },
     slot: int64
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
-    case slot_ref(tree, parts, slot) of {
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
+    case slot_ref(parts, slot) of {
         :none -> res_declined(0);
-        child_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> remove_occupied(tree, parts, slot, read_count(child_ref))
+        child_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> remove_occupied(tree, parts, slot, read_count(child_ref))
     }
 }
 
 fn remove_child_at(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
     path: List[int64, mem(normal)],
     slot: int64
-) -> { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } {
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } {
     case node of {
         :none -> res_missing();
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
-            parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
             case path.is_nil of {
                 true -> remove_here(tree, parts, slot);
                 false -> {
-                    sub: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- remove_child_at(tree, slot_ref(tree, parts, path.head), path.tail, slot);
+                    sub: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- remove_child_at(tree, slot_ref(parts, path.head), path.tail, slot);
                     rebuild_ancestor(tree, parts, path.head, sub)
                 }
             }
@@ -1261,7 +1442,7 @@ fn remove_child_at(
 // vacant slot or out-of-range slot answers removed = false with the exact old tree.
 fn remove_child(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -1271,16 +1452,16 @@ fn remove_child(
     child_slot: int64
 ) -> {
     tree: {
-    root: ref?(L, normal, rec),
-    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
-    region: region(L, normal),
-    specialization_key: int64,
-    compare_item_ordering_bundle: int64
-},
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    },
     removed: boolean,
     removed_node_count: int64
 } {
-    result: { found: boolean, changed: boolean, node: ref?(L, normal, rec), delta: int64, info: int64 } <- remove_child_at(tree, tree.root, parent_path, child_slot);
+    result: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), delta: int64, info: int64 } <- remove_child_at(tree, tree.root, parent_path, child_slot);
     case result.changed of {
         false -> { tree: tree, removed: false, removed_node_count: 0 };
         true -> { tree: publish(tree, result.node), removed: true, removed_node_count: result.info }
@@ -1290,14 +1471,16 @@ fn remove_child(
 // ---------------------------------------------------------------------------------------------
 // Validation (design §13–§14): depth-first, O(n + s) including tombstones. Per node, in order:
 // arena membership, active-path cycle, count signs and live <= slots, the child-slot list's own
-// invariants and its length against slot_count, the occupied count against live_child_count,
-// then every child, then the cached subtree count against 1 + the exact child counts (checked).
-// Error atoms are created and decoded here only: :ok, :cycle, :wrong_arena, :missing_root,
-// :rank_violation, :negative_count, :size_mismatch, :slot_count_mismatch, :live_count_mismatch,
-// :count_overflow.
+// invariants (spine in preorder: a :none entry, a weight that is not 2^k - 1 or out of skew order,
+// a misshapen cell tree -> :rank_violation; a cell outside the arena -> :wrong_arena) and its
+// weight sum against slot_count (:slot_count_mismatch), the occupied count against
+// live_child_count, then every child in ascending slot order, then the cached subtree count
+// against 1 + the exact child counts (checked). Error atoms are created and decoded here only:
+// :ok, :cycle, :wrong_arena, :missing_root, :rank_violation, :negative_count, :size_mismatch,
+// :slot_count_mismatch, :live_count_mismatch, :count_overflow.
 // ---------------------------------------------------------------------------------------------
 
-fn same_ref(a: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])), b: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)]))) -> boolean {
+fn same_ref(a: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), b: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> boolean {
     sequence
         same: boolean <- ref_eq(a, b)
     produces
@@ -1306,12 +1489,12 @@ fn same_ref(a: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, re
 }
 
 fn in_arena(tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
-    }, node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)]))) -> boolean {
+    }, node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)]))) -> boolean {
     sequence
         inside: boolean <- ref_in_region(node_ref, tree.region)
     produces
@@ -1319,17 +1502,14 @@ fn in_arena(tree: {
     end
 }
 
-fn on_active_path(node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])), ancestors: List[(int64, ref?(L, normal, rec)), mem(normal)]) -> boolean {
+fn on_active_path(node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), ancestors: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]) -> boolean {
     case ancestors.is_nil of {
         true -> false;
-        false -> {
-            (_: int64, ancestor: ref?(L, normal, rec)) <- ancestors.head;
-            case ancestor of {
-                :none -> on_active_path(node_ref, ancestors.tail);
-                ancestor_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> case same_ref(node_ref, ancestor_ref) of {
-                    true -> true;
-                    false -> on_active_path(node_ref, ancestors.tail)
-                }
+        false -> case ancestors.head of {
+            :none -> on_active_path(node_ref, ancestors.tail);
+            ancestor_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> case same_ref(node_ref, ancestor_ref) of {
+                true -> true;
+                false -> on_active_path(node_ref, ancestors.tail)
             }
         }
     }
@@ -1340,7 +1520,7 @@ fn validate_err(error: atom) -> { error: atom, count: int64 } {
 }
 
 // Sign and range checks that need no child (design §13: 0 <= live_child_count <= slot_count).
-fn shape_error(parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] }) -> atom {
+fn shape_error(parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] }) -> atom {
     case parts.count <= 0 of {
         true -> :negative_count;
         false -> case parts.live < 0 or parts.slots < 0 of {
@@ -1353,36 +1533,194 @@ fn shape_error(parts: { item: ItemType, count: int64, live: int64, slots: int64,
     }
 }
 
-// The child-slot list's own invariants (skew_ral@validate) and its length against slot_count. The
-// list's error atoms are decoded through skew_ral@validate_error_code: 2 is its size mismatch (the
-// spine does not sum to slot_count), 6 is a cell outside the arena; anything else is a digit or
-// tree-shape violation.
-fn slots_error(tree: {
-        root: ref?(L, normal, rec),
+fn is_skew_weight(w: int64) -> boolean {
+    case w < 1 of {
+        true -> false;
+        false -> case w == 1 of {
+            true -> true;
+            false -> case w - (w / 2) * 2 == 0 of {
+                true -> false;
+                false -> is_skew_weight(w / 2)
+            }
+        }
+    }
+}
+
+// Spine weights increase; only the first two may be equal.
+fn digit_order_ok(w: int64, prev_w: int64, pos: int64) -> boolean {
+    case pos == 0 of {
+        true -> true;
+        false -> case pos == 1 of {
+            true -> w >= prev_w;
+            false -> w > prev_w
+        }
+    }
+}
+
+fn cell_err(error: atom) -> { error: atom, occupied: int64 } {
+    { error: error, occupied: 0 }
+}
+
+fn leaf_cell_check(c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) }) -> { error: atom, occupied: int64 } {
+    case c.left of {
+        :none -> case c.right of {
+            :none -> { error: :ok, occupied: slot_occupancy(c.slot) };
+            _: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> cell_err(:rank_violation)
+        };
+        _: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> cell_err(:rank_violation)
+    }
+}
+
+fn branch_cell_both(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
-    }, parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] }) -> atom {
-    ral: {
-        count: int64,
-        reversed: boolean,
-        compare_item: fn(ref?(L, normal, rec), ref?(L, normal, rec)) -> :less | :equal | :greater,
-        forest: List[(int64, ref?(L, normal, rec)), mem(normal)],
-        region: region(L, normal),
-        specialization_key: int64
-    } <- slots_of(tree, parts);
-    v: { valid: boolean, error: atom, logical_count: int64 } <- skew_ral@validate(ral);
-    case v.valid of {
-        true -> case v.logical_count == parts.slots of {
-            true -> :ok;
-            false -> :slot_count_mismatch
+    }, c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) }, h: int64) -> { error: atom, occupied: int64 } {
+    lt: { error: atom, occupied: int64 } <- cell_check(tree, c.left, h);
+    case lt.error of {
+        :ok -> {
+            rt: { error: atom, occupied: int64 } <- cell_check(tree, c.right, h);
+            case rt.error of {
+                :ok -> {
+                    own: int64 <- slot_occupancy(c.slot);
+                    { error: :ok, occupied: lt.occupied + rt.occupied + own }
+                };
+                bad: atom -> rt
+            }
         };
-        false -> case skew_ral@validate_error_code(v.error) of {
-            2 -> :slot_count_mismatch;
-            6 -> :wrong_arena;
-            _: int64 -> :rank_violation
+        bad: atom -> lt
+    }
+}
+
+// Both halves present and distinct, each of weight h.
+fn branch_cell_check(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) }, h: int64) -> { error: atom, occupied: int64 } {
+    case c.left of {
+        :none -> cell_err(:rank_violation);
+        l: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> case c.right of {
+            :none -> cell_err(:rank_violation);
+            r: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> case same_ref(l, r) of {
+                true -> cell_err(:rank_violation);
+                false -> branch_cell_both(tree, c, h)
+            }
         }
+    }
+}
+
+fn cell_check_at(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) }, w: int64) -> { error: atom, occupied: int64 } {
+    case c.weight == w of {
+        false -> cell_err(:rank_violation);
+        true -> case w == 1 of {
+            true -> leaf_cell_check(c);
+            false -> branch_cell_check(tree, c, child_weight(w))
+        }
+    }
+}
+
+// The cell tree `t` must exist, live in the arena and have exactly the shape of weight w.
+fn cell_check(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, t: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), w: int64) -> { error: atom, occupied: int64 } {
+    case t of {
+        :none -> cell_err(:rank_violation);
+        cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> case in_arena(tree, cell_ref) of {
+            false -> cell_err(:wrong_arena);
+            true -> {
+                c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) } <- read_cell(cell_ref);
+                cell_check_at(tree, c, w)
+            }
+        }
+    }
+}
+
+fn spine_err(error: atom) -> { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 } {
+    { error: error, prev: 0, pos: 0, sum: 0, occupied: 0 }
+}
+
+fn digit_add(acc: { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 }, w: int64, occupied: int64) -> { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 } {
+    sum_pair: (boolean, int64) <- checked_int64_add(acc.sum, w);
+    (sum_ok: boolean, next_sum: int64) <- sum_pair;
+    case sum_ok of {
+        false -> spine_err(:slot_count_mismatch);
+        true -> { error: :ok, prev: w, pos: acc.pos + 1, sum: next_sum, occupied: acc.occupied + occupied }
+    }
+}
+
+fn digit_check(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, d: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), acc: { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 }) -> { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 } {
+    w: int64 <- cell_weight(d);
+    skew: boolean <- is_skew_weight(w);
+    ordered: boolean <- digit_order_ok(w, acc.prev, acc.pos);
+    case skew and ordered of {
+        false -> spine_err(:rank_violation);
+        true -> {
+            t: { error: atom, occupied: int64 } <- cell_check(tree, d, w);
+            case t.error of {
+                :ok -> digit_add(acc, w, t.occupied);
+                bad: atom -> spine_err(bad)
+            }
+        }
+    }
+}
+
+fn spine_check(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], acc: { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 }) -> { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 } {
+    case spine.is_nil of {
+        true -> acc;
+        false -> {
+            next: { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 } <- digit_check(tree, spine.head, acc);
+            case next.error of {
+                :ok -> spine_check(tree, spine.tail, next);
+                bad: atom -> next
+            }
+        }
+    }
+}
+
+// The child-slot list's own invariants and its weight sum against slot_count; on success the
+// number of occupied slots.
+fn slots_error(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] }) -> { error: atom, occupied: int64 } {
+    acc0: { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 } <- { error: :ok, prev: 0, pos: 0, sum: 0, occupied: 0 };
+    s: { error: atom, prev: int64, pos: int64, sum: int64, occupied: int64 } <- spine_check(tree, parts.spine, acc0);
+    case s.error of {
+        :ok -> case s.sum == parts.slots of {
+            true -> { error: :ok, occupied: s.occupied };
+            false -> cell_err(:slot_count_mismatch)
+        };
+        bad: atom -> cell_err(bad)
     }
 }
 
@@ -1399,22 +1737,17 @@ fn validate_total(cached: int64, child_sum: int64) -> { error: atom, count: int6
     }
 }
 
-fn validate_entries(
-    tree: {
-        root: ref?(L, normal, rec),
+// One child slot: vacant adds nothing; an occupied child is validated and its exact count added.
+fn validate_slot(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
-    },
-    entries: List[(int64, ref?(L, normal, rec)), mem(normal)],
-    ancestors: List[(int64, ref?(L, normal, rec)), mem(normal)],
-    sum: int64
-) -> { error: atom, count: int64 } {
-    case entries.is_nil of {
-        true -> { error: :ok, count: sum };
-        false -> {
-            (_: int64, child: ref?(L, normal, rec)) <- entries.head;
+    }, child: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), ancestors: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], sum: int64) -> { error: atom, count: int64 } {
+    case child of {
+        :none -> { error: :ok, count: sum };
+        _: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
             child_res: { error: atom, count: int64 } <- validate_node(tree, child, ancestors);
             case child_res.error of {
                 :ok -> {
@@ -1422,7 +1755,7 @@ fn validate_entries(
                     (sum_ok: boolean, next_sum: int64) <- sum_pair;
                     case sum_ok of {
                         false -> validate_err(:count_overflow);
-                        true -> validate_entries(tree, entries.tail, ancestors, next_sum)
+                        true -> { error: :ok, count: next_sum }
                     }
                 };
                 bad: atom -> child_res
@@ -1431,32 +1764,81 @@ fn validate_entries(
     }
 }
 
+// Children of one cell tree in ascending slot order (right half, left half, root).
+fn validate_cell_at(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) }, ancestors: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], sum: int64) -> { error: atom, count: int64 } {
+    right: { error: atom, count: int64 } <- validate_cell(tree, c.right, ancestors, sum);
+    case right.error of {
+        :ok -> {
+            left: { error: atom, count: int64 } <- validate_cell(tree, c.left, ancestors, right.count);
+            case left.error of {
+                :ok -> validate_slot(tree, c.slot, ancestors, left.count);
+                bad: atom -> left
+            }
+        };
+        bad: atom -> right
+    }
+}
+
+fn validate_cell(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, t: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), ancestors: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], sum: int64) -> { error: atom, count: int64 } {
+    case t of {
+        :none -> { error: :ok, count: sum };
+        cell_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
+            c: { weight: int64, slot: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), left: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), right: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) } <- read_cell(cell_ref);
+            validate_cell_at(tree, c, ancestors, sum)
+        }
+    }
+}
+
+// Children of a spine in ascending slot order (later spine trees first).
+fn validate_spine(tree: {
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_item_ordering_bundle: int64
+    }, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], ancestors: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)], sum: int64) -> { error: atom, count: int64 } {
+    case spine.is_nil of {
+        true -> { error: :ok, count: sum };
+        false -> {
+            rest: { error: atom, count: int64 } <- validate_spine(tree, spine.tail, ancestors, sum);
+            case rest.error of {
+                :ok -> validate_cell(tree, spine.head, ancestors, rest.count);
+                bad: atom -> rest
+            }
+        }
+    }
+}
+
 fn validate_children(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
-    ancestors: List[(int64, ref?(L, normal, rec)), mem(normal)]
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] },
+    ancestors: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]
 ) -> { error: atom, count: int64 } {
-    sequence proc[mem(normal)]
-        entry: (int64, ref?(L, normal, rec)) <- (parts.count, node);
-        deeper: List[(int64, ref?(L, normal, rec)), mem(normal)] <- prepend[(int64, ref?(L, normal, rec)), mem(normal)](entry, ancestors);
-        entries: List[(int64, ref?(L, normal, rec)), mem(normal)] <- children_of(tree, parts);
-        occupied: int64 <- entry_count(entries, 0);
-        out: { error: atom, count: int64 } <- case occupied == parts.live of {
-            false -> validate_err(:live_count_mismatch);
-            true -> {
-                kids: { error: atom, count: int64 } <- validate_entries(tree, entries, deeper, 0);
-                case kids.error of {
-                    :ok -> validate_total(parts.count, kids.count);
-                    bad: atom -> kids
-                }
-            }
+    sequence
+        deeper: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- spine_cons(node, ancestors);
+        kids: { error: atom, count: int64 } <- validate_spine(tree, parts.spine, deeper, 0);
+        out: { error: atom, count: int64 } <- case kids.error of {
+            :ok -> validate_total(parts.count, kids.count);
+            bad: atom -> kids
         }
     produces
         pure out
@@ -1465,20 +1847,26 @@ fn validate_children(
 
 fn validate_parts(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
-    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] },
-    ancestors: List[(int64, ref?(L, normal, rec)), mem(normal)]
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] },
+    ancestors: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]
 ) -> { error: atom, count: int64 } {
     case shape_error(parts) of {
-        :ok -> case slots_error(tree, parts) of {
-            :ok -> validate_children(tree, node, parts, ancestors);
-            bad: atom -> validate_err(bad)
+        :ok -> {
+            s: { error: atom, occupied: int64 } <- slots_error(tree, parts);
+            case s.error of {
+                :ok -> case s.occupied == parts.live of {
+                    false -> validate_err(:live_count_mismatch);
+                    true -> validate_children(tree, node, parts, ancestors)
+                };
+                bad: atom -> validate_err(bad)
+            }
         };
         bad: atom -> validate_err(bad)
     }
@@ -1486,23 +1874,23 @@ fn validate_parts(
 
 fn validate_node(
     tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     },
-    node: ref?(L, normal, rec),
-    ancestors: List[(int64, ref?(L, normal, rec)), mem(normal)]
+    node: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
+    ancestors: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)]
 ) -> { error: atom, count: int64 } {
     case node of {
         :none -> { error: :ok, count: 0 };
-        node_ref: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> case in_arena(tree, node_ref) of {
+        node_ref: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> case in_arena(tree, node_ref) of {
             false -> validate_err(:wrong_arena);
             true -> case on_active_path(node_ref, ancestors) of {
                 true -> validate_err(:cycle);
                 false -> {
-                    parts: { item: ItemType, count: int64, live: int64, slots: int64, forest: List[(int64, ref?(L, normal, rec)), mem(normal)] } <- read_node(node_ref);
+                    parts: { item: ItemType, count: int64, live: int64, slots: int64, spine: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] } <- read_rose(node_ref);
                     validate_parts(tree, node, parts, ancestors)
                 }
             }
@@ -1511,14 +1899,14 @@ fn validate_node(
 }
 
 fn validate_root(tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
         compare_item_ordering_bundle: int64
     }) -> { error: atom, count: int64 } {
-    sequence proc[mem(normal)]
-        ancestors0: List[(int64, ref?(L, normal, rec)), mem(normal)] <- empty[(int64, ref?(L, normal, rec)), mem(normal)]();
+    sequence
+        ancestors0: List[ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])), mem(normal)] <- empty_spine();
         res: { error: atom, count: int64 } <- validate_node(tree, tree.root, ancestors0)
     produces
         pure res
@@ -1526,7 +1914,7 @@ fn validate_root(tree: {
 }
 
 fn validate(tree: {
-        root: ref?(L, normal, rec),
+        root: ref?(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])),
         compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
         region: region(L, normal),
         specialization_key: int64,
@@ -1534,7 +1922,7 @@ fn validate(tree: {
     }) -> { valid: boolean, error: atom, logical_count: int64 } {
     case tree.root of {
         :none -> { valid: false, error: :missing_root, logical_count: 0 };
-        _: ref(L, normal, (ItemType, int64, int64, int64, ref?(L, normal, rec), List[(int64, ref?(L, normal, rec)), mem(normal)])) -> {
+        _: ref(L, normal, (ItemType, int64, int64, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec), ref?(L, normal, rec), List[ref?(L, normal, rec), mem(normal)])) -> {
             res: { error: atom, count: int64 } <- validate_root(tree);
             case res.error of {
                 :ok -> { valid: true, error: :ok, logical_count: res.count };

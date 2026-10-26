@@ -1,0 +1,99 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 2; risks R1.1 and R2.1): two actors on two
+// carriers grow their stacks at the same time. A is spawned for core 1 and B for core 2 (distinct
+// carriers whenever there are two); the driver casts a kick to a relay bound with B and then calls
+// A with a 500,000-deep message, so the relay's call to B recurses on carrier 2 while A recurses on
+// carrier 1: both reservations take growth faults at once, each attributed through its own
+// carrier's thread record to the actor that carrier is running (the handler grows the current
+// actor's reservation), each handled on its own carrier's signal stack. With one carrier the two
+// run in turn. Both actors keep their high water (:keep_high_water), so what each committed is
+// read back afterwards, independently.
+//
+//   A replies 500000. B's deep message is waited for through B itself (its state is the last deep
+//   result; a 0 message reads it, re-asked through A until it is there), then 500000.
+//   A: committed > 4 MB and committed == high_water; the same for B.
+//
+// Expected output: 500000, 500000, true, true, exit status 0. The same with SILICA_CARRIERS=0 and
+// at every carrier count.
+
+use trial_support_int64;
+
+fn depth(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            r: int64 <- depth(n - 1);
+            r + 1
+        }
+    }
+}
+
+// 0 reads the last deep result; anything else recurses that deep and remembers the result.
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    case msg == 0 of {
+        true -> (:reply, state, state);
+        false -> {
+            r: int64 <- depth(msg);
+            (:reply, r, r)
+        }
+    }
+}
+
+fn relay(msg: int64, state: actor_ref) -> (:no_reply, actor_ref) {
+    sequence proc[concurrency]
+        _: int64 <- call(state, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// B's result once its deep message has been served; each poll goes through a call, which parks
+// this actor, so B's carrier (when it is this one) runs meanwhile. Bounded.
+fn b_result(b: actor_ref, a: actor_ref, tries: int64) -> int64 {
+    sequence proc[concurrency]
+        r: int64 <- call(b, 0 impl ActorMessage {});
+        res: int64 <- case r != 0 or tries == 0 of {
+            true -> r;
+            false -> {
+                sequence proc[concurrency]
+                    _: int64 <- call(a, 0 impl ActorMessage {});
+                    again: int64 <- b_result(b, a, tries - 1)
+                produces
+                    pure again
+                end
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 {
+            sequence proc[concurrency, device_io]
+                a: actor_ref <- spawn(0, beh, stack_policy(0, :keep_high_water), 1);
+                b: actor_ref <- spawn(0, beh, stack_policy(0, :keep_high_water), 2);
+                q: actor_ref <- spawn(b, relay, stack_policy(0, :keep_last_message), 2);
+                _: boolean <- cast(q, 500000 impl ActorMessage {});
+                ra: int64 <- call(a, 500000 impl ActorMessage {});
+                rb: int64 <- b_result(b, a, 100000);
+                print_int64(ra);
+                println("");
+                print_int64(rb);
+                println("");
+                ua: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(a);
+                ub: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(b);
+                print_boolean(ua.committed > 4194304 and ua.committed == ua.high_water);
+                println("");
+                print_boolean(ub.committed > 4194304 and ub.committed == ub.high_water);
+                println("")
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

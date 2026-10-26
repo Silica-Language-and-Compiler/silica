@@ -64,7 +64,7 @@ Mac (source of truth)                                   nix (x86-64, no Silica c
 binaries/silica-compiler (macOS selfhost)
    │  make -C src TARGET=linux_x86_64
    ▼
-binaries/silica-compiler-linux_x86_64                   (Phase 3: Mac-hosted, emits x86-64 text)
+binaries/silica-compiler-linux_x86_64                   (Phase 3: Mac-hosted, emits x86-64 text; historical, this link was removed on 2026-10-21; the Linux hosts now build and run their own native fixed-point compilers (silica-999966-linux-aarch64 on pix, silica-999974-linux-x86_64 on nix))
    │  make -C trials/<suite> integrate                   .sams  ──rsync──►  assemble, link, run,
    │  (compile-only: emit target ≠ host)                                    diff .sout vs .scout
    │
@@ -162,13 +162,13 @@ Gone from the old plan: `src/emitter/linux_x86_64/`, `tools/ll_opaque_ptr.py`, `
 
 There is no bootstrap. A new platform's first native compiler is produced by the Mac and finished on the target, using the two `src/Makefile` targets the AArch64 port introduced:
 
-1. **Mac:** `make -C src TARGET=linux_x86_64` builds a macOS-hosted compiler whose emitter is `emitter/linux_x86_64/` and publishes it as `binaries/silica-NNNNNN-linux_x86_64-macos-applesilicon` with the link `binaries/silica-compiler-linux_x86_64` (`install_compiler.bash target`). It runs on the Mac and emits x86-64 text.
+1. **Mac:** `make -C src TARGET=linux_x86_64` builds a macOS-hosted compiler whose emitter is `emitter/linux_x86_64/` and publishes it as `binaries/silica-NNNNNN-linux_x86_64-macos-applesilicon` with the link `binaries/silica-compiler-linux_x86_64` (`install_compiler.bash target`). It runs on the Mac and emits x86-64 text. (Historical: this link was removed on 2026-10-21; the Linux hosts now build and run their own native fixed-point compilers (silica-999966-linux-aarch64 on pix, silica-999974-linux-x86_64 on nix).)
 2. **Mac:** `make -C src bootstrap-assembly` (with `BOOTSTRAP_TARGET=linux_x86_64` once `platforms.patch` is applied; today the target hard-codes `linux_aarch64`) runs that cross compiler over every unit of `src/`, producing the whole compiler as x86-64 `.sams`. Nothing is assembled on the Mac.
 3. **Copy** the `src/` tree with its `.sams` and `runtime_asm/linux_x86_64/` to nix (`rsync` into `~/silica`, the same relative layout; the Mac tree stays the source of truth).
 4. **nix:** `make -C src bootstrap-link` assembles every `.sams` with `cc`, links with `cc -no-pie -rdynamic` plus `runtime_asm/linux_x86_64/*.s`, and installs the result as `binaries/silica-NNNNNN-linux-x86_64` with `binaries/silica-compiler` pointing at it. No compiler runs during this step.
 5. From here nix self-hosts: `make -C src build` (`gen1`, `gen2`, `fixpoint`) runs natively and the Mac drops out of the loop.
 
-The trial harness already supports the same split for programs: with `SILICA_COMPILER=binaries/silica-compiler-linux_x86_64` a trial on the Mac compiles only (`SILICA_TARGET_IS_HOST=0`, "compiling only, not assembling or running"), and the emitted `.sams` are the deliverable for nix.
+(Historical: the `binaries/silica-compiler-linux_x86_64` link was removed on 2026-10-21; nix now runs its own native compiler, so a trial there uses the ordinary `binaries/silica-compiler` link.) The trial harness already supports the same split for programs: with `SILICA_COMPILER=binaries/silica-compiler-linux_x86_64` a trial on the Mac compiles only (`SILICA_TARGET_IS_HOST=0`, "compiling only, not assembling or running"), and the emitted `.sams` are the deliverable for nix.
 
 **No builds were run for this phase.** It is documentation of the procedure, which Phase 4 executes.
 
@@ -281,7 +281,7 @@ condition-variable shims under contention; `dladdr` on `-rdynamic` symbols for t
 `cpuid` answers of the sysctl shim; FFI `al` and 7th/8th-argument pushes; the `float16` results versus
 the AArch64 goldens.
 
-**Exit gate:** `make -C trials integrate SILICA_COMPILER=…/silica-compiler-linux_x86_64` compiles every suite on the Mac and every emitted program passes its `.scout` on nix; every unit has a `.linux_x86_64.ascomp`; `lint-backend` clean.
+**Exit gate (historical, the cross-compiler link was removed on 2026-10-21):** `make -C trials integrate SILICA_COMPILER=…/silica-compiler-linux_x86_64` compiles every suite on the Mac and every emitted program passes its `.scout` on nix; every unit has a `.linux_x86_64.ascomp`; `lint-backend` clean.
 
 **Executed 2026-09-18/19.** The ladder ran on nix first with `silica-999997` (14/15; the one miss was app 08,
 whose "139" expectation predated the failure-reporting decision — it prints the fault banner and exits 70, like
@@ -300,7 +300,7 @@ the SysV hidden sret pointer (Phase 5 below).
    and links every `.o`, so a tree that still holds another emitter's objects links two emitters.
 2. **Build the cross compiler.** `make -C src build TARGET=linux_x86_64 SILICA_COMPILER=binaries/silica-compiler INSTALL_SELFHOST=0`.
    The published macOS selfhost compiles `src/` with `emitter/linux_x86_64/` baked in; the
-   result is a Mac-hosted compiler that emits x86-64 and is published as `binaries/silica-compiler-linux_x86_64`
+   result is a Mac-hosted compiler that emits x86-64 and was published as `binaries/silica-compiler-linux_x86_64` (historical: link removed 2026-10-21)
    (`install_compiler.bash target`). `emitter_core.silica` is the one unit that could not be
    compile-checked in advance (memory hog): its new functions were compiled in isolation, the rest of its
    edits are helper calls of the shapes the other modules use; expect the first build to be the check.
@@ -355,7 +355,7 @@ compiler's `bootstrap-assembly` output, and the first native compiler is byte-id
 the host changes nothing about the emission. Published on nix as `binaries/silica-999995-linux-x86_64`
 (`silica-compiler`) and as the seed `silica-999998-seed-linux-x86_64` (same bytes); the same file is in the Mac
 tree as `binaries/silica-999995-linux-x86_64`. The Mac's cross compiler is
-`binaries/silica-999995-linux_x86_64-macos-applesilicon` (`silica-compiler-linux_x86_64`).
+`binaries/silica-999995-linux_x86_64-macos-applesilicon` (`silica-compiler-linux_x86_64`; historical, the link was removed on 2026-10-21 and the cross compiler is no longer kept).
 
 Trial tree on nix under that compiler (`make integrate TRIAL_TARGET=host JOBS=3 SDS_JOBS=1`): **✅ 34,044,
 ❌ 74, 35m40s** (Apple reference the same day: 34,005 / 88). Every failure is a documented defect stem

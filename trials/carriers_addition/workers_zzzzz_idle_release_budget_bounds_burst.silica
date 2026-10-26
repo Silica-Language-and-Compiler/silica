@@ -1,0 +1,144 @@
+// Carriers, the :release_when_idle idle-stack budget (release_when_idle_design.md §3, trial 1): the
+// committed stack that idle :release_when_idle actors hold is bounded per carrier by a budget,
+// whatever the spawn rate, because a carrier whose listed idle stacks exceed its budget releases
+// the oldest first before it dispatches again. The suite runs this trial with
+// SILICA_IDLE_STACK_BUDGET=2097152 (the .env file beside it: 2 MB for the process, split over the
+// carriers, at least 16 platform pages each). 4,000 actors with a 64 KB reservation are spawned and
+// each is called once, so each has been dispatched (high_water > 0) and holds its first committed
+// page when it is listed. Without the budget the sum of their committed stack right after the burst
+// would be 4,000 pages for the whole idle period (64 MB on a 16 KB-page host, 16 MB on a 4 KB one);
+// with it the sum is at most the budget plus one page per carrier and the batch in flight. The bound
+// checked is 8 MB, four times the budget: the 16-page floor binds on a 16 KB-page host from eight
+// carriers up (256 KB per carrier). Then every actor is released to nothing within the bounded poll
+// (the idle period, one second by default).
+//
+// The poll's delay is a tick: a deep message to a :release_on_return actor re-faults its stack every
+// time, so each call costs about a hundred page faults (two milliseconds here) and no host makes
+// 2,000 of them shorter than the period; a runtime that never releases still ends, printing false.
+//
+// Expected output: true (every actor has run), true (the sum is bounded), true (all released), 0.
+// The same at every carrier count.
+
+use trial_support_int64;
+
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg + state, state + 1)
+}
+
+fn depth(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            r: int64 <- depth(n - 1);
+            r + 1
+        }
+    }
+}
+
+fn tick(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+// Spawns n :release_when_idle actors, calls each once, and returns them (newest first).
+fn spawn_all(n: int64, acc: List[actor_ref, mem(normal)]) -> List[actor_ref, mem(normal)] {
+    case n == 0 of {
+        true -> acc;
+        false -> {
+            sequence proc[concurrency, mem(normal)]
+                w: actor_ref <- spawn(0, beh, stack_policy(65536, :release_when_idle));
+                _: int64 <- call(w, n impl ActorMessage {});
+                next: List[actor_ref, mem(normal)] <- prepend[actor_ref, mem(normal)](w, acc);
+                rest: List[actor_ref, mem(normal)] <- spawn_all(n - 1, next)
+            produces
+                pure rest
+            end
+        }
+    }
+}
+
+// The sum of the committed stack over the actors.
+fn sum_committed(refs: List[actor_ref, mem(normal)], acc: int64) -> int64 {
+    case refs.is_nil of {
+        true -> acc;
+        false -> {
+            sequence proc[concurrency]
+                u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(refs.head);
+                r: int64 <- sum_committed(refs.tail, acc + u.committed)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+// How many of the actors have never run (high_water == 0).
+fn count_never_ran(refs: List[actor_ref, mem(normal)], acc: int64) -> int64 {
+    case refs.is_nil of {
+        true -> acc;
+        false -> {
+            sequence proc[concurrency]
+                u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(refs.head);
+                more: int64 <- case u.high_water == 0 of {
+                    true -> 1;
+                    false -> 0
+                };
+                r: int64 <- count_never_ran(refs.tail, acc + more)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+// Up to n ticks until the sum of the committed stack over the actors is zero.
+fn poll_released(refs: List[actor_ref, mem(normal)], t: actor_ref, n: int64) -> boolean {
+    total: int64 <- sum_committed(refs, 0);
+    case total == 0 of {
+        true -> true;
+        false -> tick_then_poll(refs, t, n)
+    }
+}
+
+fn tick_then_poll(refs: List[actor_ref, mem(normal)], t: actor_ref, n: int64) -> boolean {
+    case n == 0 of {
+        true -> false;
+        false -> {
+            sequence proc[concurrency]
+                _: int64 <- call(t, 200000 impl ActorMessage {});
+                r: boolean <- poll_released(refs, t, n - 1)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io, mem(normal)]
+        t: actor_ref <- spawn(0, tick, stack_policy(0, :release_on_return));
+        none: List[actor_ref, mem(normal)] <- [];
+        refs: List[actor_ref, mem(normal)] <- spawn_all(4000, none);
+        after_burst: int64 <- sum_committed(refs, 0);
+        never: int64 <- count_never_ran(refs, 0);
+        print_boolean(never == 0);
+        println("");
+        print_boolean(after_burst <= 8388608);
+        println("");
+        released: boolean <- poll_released(refs, t, 2000);
+        print_boolean(released);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

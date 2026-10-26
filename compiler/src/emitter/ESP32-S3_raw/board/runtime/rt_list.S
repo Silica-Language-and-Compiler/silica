@@ -106,7 +106,7 @@ silica_rt_list_at:
 3:  add     a2, a3, a2
     movi    a3, 0
     retw
-9:  call8   silica_rt_abort_list_index
+9:  call8   silica_rt_list_index_failed   // ends the actor, or aborts in main (rt_console.S)
     retw
     .size   silica_rt_list_at, . - silica_rt_list_at
 

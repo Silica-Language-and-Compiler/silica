@@ -1,0 +1,84 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 1): a plain worker on the carrier restarts a
+// supervised worker of the same carrier with :restart_child (the runtime's restart_child). The
+// trial support's worker (the driver, a plain actor on the carrier) starts a :one_for_one
+// supervisor with two counters and calls the target once. call_supervisor runs :restart_child on
+// the caller: the live target is ended and the driver waits for its row exit_done (Lsrestart_wait)
+// from its own stack, parked under SILICA_CARRIERS=1 (a spin there would never let the target, on
+// the same carrier, finish), then the row is respawned from its stored spec. The replacement starts
+// from the initial state again and has a new reference; the other counter is untouched.
+//
+//   call target 5               -> 600 + 5 = 605
+//   :restart_child              -> tag :child_started, 9  (the old target's failure report)
+//   new ref != old ref          -> 9
+//   call the new target 7       -> 600 + 7 = 607  (state reset by the restart)
+//   call keeper 8               -> 500 + 8 = 508
+//
+// Expected output: 605, 9, 9, 607, 508, the old target's failure report (reason_tag 0: the
+// supervisor's own stop sets no reason, as in supervisors_addition), exit status 0, compared as a
+// multiset (the report goes through the FailureReporter, so it may land anywhere among the lines).
+// The same with SILICA_CARRIERS=0. Printed values avoid the digits 1-4 (compare_scout_multiset.sh
+// folds those): 9 is a check that holds, 6 one that does not.
+
+use Supervisor;
+use trial_support_int64;
+
+impl CarrierRestartSiblingSup for Supervisor;
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :carrier_restart_keeper, agent_type: :worker, initial_state: initial_state + 500, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :carrier_restart_target, agent_type: :worker, initial_state: initial_state + 600, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        sup: supervisor_ref <- spawn_registered_supervisor(CarrierRestartSiblingSup, 0, :carrier_restart_sup, stack_policy(0, :keep_last_message));
+        before: int64 <- call_registered(:carrier_restart_target, 5 impl ActorMessage {});
+        old: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: :carrier_restart_target } impl SupervisorMessage {});
+        restarted: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :restart_child, id: :carrier_restart_target } impl SupervisorMessage {});
+        after: int64 <- call(restarted.child, 7 impl ActorMessage {});
+        kept: int64 <- call_registered(:carrier_restart_keeper, 8 impl ActorMessage {});
+        print_int64(before);
+        println("");
+        print_int64(verdict(case restarted.tag of { :child_started -> true; _: atom -> false }));
+        println("");
+        print_int64(verdict(old.child_info.child != restarted.child));
+        println("");
+        print_int64(after);
+        println("");
+        print_int64(kept);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

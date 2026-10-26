@@ -1,0 +1,107 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 1) and the restart protocol
+// (prims_actors_child_table_asm.silica header): a worker of a :one_for_all supervisor is killed
+// with kill_abnormal by a plain actor, and the cascade that follows stops and restarts its two
+// siblings. The killer is a plain actor the driver (the trial support's worker) spawns, not a row of
+// this supervisor (kill_abnormal is allowed only in a behaviour, E2091, so the driver's own work
+// cannot do it). kill_abnormal waits for the victim's row exit_done (the victim's identity, its
+// last act; parked under SILICA_CARRIERS=1) and then drains the supervisor's ingress under the
+// restart token: the killer runs the victim's :one_for_all restart itself, stopping each sibling
+// and waiting for its exit_done (Lmr_ofa_kill_at_idx, parked under SILICA_CARRIERS=1), unless the
+// supervisor's thread took the notice first, in which case the killer waits for that restart to
+// settle. Either way the three replacements exist when kill_abnormal returns. Every replacement
+// starts from its initial state.
+//
+// Before the protocol this hung with SILICA_CARRIERS=0 (the two stopped siblings each drained their
+// own exit notice in their exit paths and ran a second and third :one_for_all cascade, each waiting
+// for the other's exit_done) and with SILICA_CARRIERS=1 (a cascade cleared a row's exit_done that a
+// parked killer had been woken for but had not re-read: a lost wakeup).
+//
+//   call a 5, b 5, c 5          -> 505, 605, 705
+//   call the killer             -> kill_abnormal(b) returns :ok, 9  (three failure reports: b killed, a and c stopped)
+//   call a 5, b 5, c 5          -> 505, 605, 705  (all three restarted)
+//
+// Expected output: 505, 605, 705, 9, 505, 605, 705, three failure reports of the counter (b with
+// reason_tag 1 from kill_abnormal; a and c with reason_tag 0 from the supervisor's stop), exit
+// status 0, compared as a multiset. The same with SILICA_CARRIERS=0. Printed values avoid the
+// digits 1-4 (compare_scout_multiset.sh folds those): 9 is a check that holds, 6 one that does not.
+
+use Supervisor;
+use trial_support_int64;
+
+impl CarrierKillOneForAllSup for Supervisor;
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+// Kills b and replies 9 when kill_abnormal returned :ok, else 6.
+fn ofa_killer(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        killed: atom <- kill_abnormal(:carrier_ofa_b)
+    produces
+        pure (:reply, verdict(case killed of { :ok -> true; _: atom -> false }), state + msg)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_all, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :carrier_ofa_a, agent_type: :worker, initial_state: initial_state + 500, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :carrier_ofa_b, agent_type: :worker, initial_state: initial_state + 600, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :carrier_ofa_c, agent_type: :worker, initial_state: initial_state + 700, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        sup: supervisor_ref <- spawn_registered_supervisor(CarrierKillOneForAllSup, 0, :carrier_ofa_sup, stack_policy(0, :keep_last_message));
+        a1: int64 <- call_registered(:carrier_ofa_a, 5 impl ActorMessage {});
+        b1: int64 <- call_registered(:carrier_ofa_b, 5 impl ActorMessage {});
+        c1: int64 <- call_registered(:carrier_ofa_c, 5 impl ActorMessage {});
+        k: actor_ref <- spawn(0, ofa_killer, stack_policy(0, :keep_last_message));
+        killed: int64 <- call(k, 5 impl ActorMessage {});
+        a2: int64 <- call_registered(:carrier_ofa_a, 5 impl ActorMessage {});
+        b2: int64 <- call_registered(:carrier_ofa_b, 5 impl ActorMessage {});
+        c2: int64 <- call_registered(:carrier_ofa_c, 5 impl ActorMessage {});
+        print_int64(a1);
+        println("");
+        print_int64(b1);
+        println("");
+        print_int64(c1);
+        println("");
+        print_int64(killed);
+        println("");
+        print_int64(a2);
+        println("");
+        print_int64(b2);
+        println("");
+        print_int64(c2);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

@@ -1,0 +1,94 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 3): the mailbox is the actor's own and
+// moves with it, so casts enqueued before, during and after a move are served in order (spec
+// §15.1.2.4.1). The checker (cast-only, so it is reached by casts) keeps the last message seen
+// and turns it to -1 for ever on the first message that is not the previous plus one. The driver
+// casts 1..50, moves it to core 2 (it is ready or running then: the move is pending until a
+// boundary), casts 51..100, moves it to core 1, casts 101..150, moves it to core 2, then casts 0,
+// which is behind every other cast and every move: the checker prints its last message (150: every
+// message in order) and whether it is on core 2's carrier, an equality with the index of a probe
+// spawned for core 2 that it was given as state (the last move was requested before the cast of 0
+// was enqueued, so it was applied at once, or at the boundary of the dispatch before this one).
+// Then it prints the `done` marker and main waits for the `exit` line.
+//
+// Expected output: 150, 9, done, exit status 0. The same with SILICA_CARRIERS=0 and at every
+// carrier count.
+
+use trial_wait_int64;
+
+fn probe(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+fn advance(last: int64, msg: int64) -> int64 {
+    case last >= 0 and msg == last + 1 of {
+        true -> msg;
+        false -> -1
+    }
+}
+
+// state.last: the last message seen, -1 once out of order; state.p2: core 2's carrier index.
+fn checker(msg: int64, state: { last: int64, p2: int64 }) -> (:no_reply, { last: int64, p2: int64 }) {
+    case msg == 0 of {
+        true -> {
+            sequence proc[concurrency, device_io]
+                print_int64(state.last);
+                println("");
+                here: int64 <- actor_carrier_index(self());
+                print_int64(verdict(here == state.p2));
+                println("");
+                println("done")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        false -> (:no_reply, { last: advance(state.last, msg), p2: state.p2 })
+    }
+}
+
+fn flood(c: actor_ref, from: int64, to: int64) -> int64 {
+    case from > to of {
+        true -> 0;
+        false -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(c, from impl ActorMessage {});
+                rest: int64 <- flood(c, from + 1, to)
+            produces
+                pure rest
+            end
+        }
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency]
+        p2: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 2);
+        i_p2: int64 <- actor_carrier_index(p2);
+        c: actor_ref <- spawn({ last: 0, p2: i_p2 }, checker, stack_policy(1048576, :keep_last_message), 1);
+        _: int64 <- flood(c, 1, 50);
+        _: atom <- migrate_actor(c, 2);
+        _: int64 <- flood(c, 51, 100);
+        _: atom <- migrate_actor(c, 1);
+        _: int64 <- flood(c, 101, 150);
+        _: atom <- migrate_actor(c, 2);
+        _: boolean <- cast(c, 0 impl ActorMessage {})
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 { drive() });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

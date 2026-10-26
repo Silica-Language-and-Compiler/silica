@@ -1,0 +1,106 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 2) and the restart protocol
+// (prims_actors_child_table_asm.silica header): a :rest_for_one supervisor whose three row children
+// are bound to carriers in turn (a child spec carries no core id), so with three or more carriers
+// each row child runs on a different one, and a killer (a plain worker outside the supervisor,
+// bound in turn as well, called by the driver) kills the middle one. kill_abnormal parks the
+// killer for the victim's row exit_done (its carrier runs on); the supervisor's thread runs the cascade:
+// the third row is stopped (_silica_rt_actor_stop reaches it on its own carrier) and both are
+// respawned onto carriers in turn again; the first row is untouched. :count_children settles
+// behind the restart, then every child is called.
+//
+//   call c1 5, c2 5, c3 5          -> 505, 605, 705
+//   kill_abnormal(c2)              -> :ok, printed 9
+//   :count_children                -> 3, printed 9
+//   call c1 60, c2 60, c3 60       -> 565 (kept), 660, 760 (both restarted: initial state again)
+//
+// Expected output: 505, 605, 705, 9, 9, 565, 660, 760, two failure reports (c2, reason_tag 1 from
+// kill_abnormal; c3, reason_tag 0 from the supervisor's stop), exit status 0, compared as a
+// multiset. The same with SILICA_CARRIERS=0 and at every carrier count. Printed values avoid the
+// digits 1-4 and 8 (compare_scout_multiset.sh folds those): 9 is a check that holds, 6 one that
+// does not.
+
+use Supervisor;
+use trial_support_int64;
+
+impl CarriersSpreadRowsSup for Supervisor;
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+// The killer: a plain worker outside the supervisor (bound in turn), so its wait for the victim's
+// row exit_done is a park on its own carrier. Replies 9 when kill_abnormal answered :ok.
+fn killer(msg: int64, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        killed: atom <- kill_abnormal(:carriers_spread_c2);
+        v: int64 <- case killed of { :ok -> 9; _: atom -> 6 }
+    produces
+        pure (:reply, v, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :rest_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :carriers_spread_c1, agent_type: :worker, initial_state: initial_state + 500, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :carriers_spread_c2, agent_type: :worker, initial_state: initial_state + 600, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :carriers_spread_c3, agent_type: :worker, initial_state: initial_state + 700, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        sup: supervisor_ref <- spawn_registered_supervisor(CarriersSpreadRowsSup, 0, :carriers_spread_sup, stack_policy(0, :keep_last_message));
+        b1: int64 <- call_registered(:carriers_spread_c1, 5 impl ActorMessage {});
+        b2: int64 <- call_registered(:carriers_spread_c2, 5 impl ActorMessage {});
+        b3: int64 <- call_registered(:carriers_spread_c3, 5 impl ActorMessage {});
+        k: actor_ref <- spawn(0, killer, stack_policy(1048576, :keep_last_message));
+        killed: int64 <- call(k, 0 impl ActorMessage {});
+        counted: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {});
+        a1: int64 <- call_registered(:carriers_spread_c1, 60 impl ActorMessage {});
+        a2: int64 <- call_registered(:carriers_spread_c2, 60 impl ActorMessage {});
+        a3: int64 <- call_registered(:carriers_spread_c3, 60 impl ActorMessage {});
+        print_int64(b1);
+        println("");
+        print_int64(b2);
+        println("");
+        print_int64(b3);
+        println("");
+        print_int64(killed);
+        println("");
+        print_int64(verdict(counted.count == 3));
+        println("");
+        print_int64(a1);
+        println("");
+        print_int64(a2);
+        println("");
+        print_int64(a3);
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

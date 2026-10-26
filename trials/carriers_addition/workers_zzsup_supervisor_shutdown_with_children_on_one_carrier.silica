@@ -1,0 +1,171 @@
+// Supervisors on carriers (actor_memory_budget_plan.md item N, "Carriers are the only model"): a
+// supervisor ends with children on ITS OWN carrier. The root supervisor is spawned for core 1; its
+// one child is a supervisor (sub_start: three counters, shutdown 0); the program moves the child
+// supervisor and its three workers to core 1 (`core mod N`: one carrier at every carrier count).
+// The driver (the trial support's worker, a carrier actor) asks the root for :terminate_child of
+// the child supervisor: it holds the restart token, stops the child supervisor and PARKS for its
+// row's exit_done; the child supervisor's exit path runs on core 1's carrier, on its own stack
+// (LBB1_exit): it shuts its workers down last row first, parking for each (the carrier runs each
+// worker's exit between the parks), then ends; the driver resumes. :restart_child then respawns
+// the child supervisor, whose start trampoline runs in its first dispatch on a carrier and
+// starts three new workers. Before supervisors ran on carriers the child supervisor's thread
+// blocked for its workers and nothing had to park.
+//
+//   call w1 5, w2 5, w3 5          -> 505, 605, 705
+//   sub, w1, w2, w3 moved to core 1 -> all on core 1's carrier (9: equal to a probe spawned for core 1)
+//   :terminate_child sub           -> the root counts 0 children (9)
+//   :restart_child sub             -> the new sub counts 3 children (9); call w1 5 -> 505 (initial state)
+//
+// Expected output: 505, 605, 705, 9, 9, 9, 505, four failure reports (the three workers with
+// reason_tag 1, shut down with shutdown 0; the child supervisor with reason_tag 0, frame #0 its
+// start function), done, exit status 0, compared as a multiset (the printed values avoid the
+// digits 1-4 and 8, which compare_scout_multiset.sh folds).
+
+use Supervisor;
+use trial_wait_int64;
+
+impl ZzsupShutdownRootSup for Supervisor;
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn probe(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// The child supervisor's start: three counters with shutdown 0.
+fn sub_start(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :zzsup_shut_w1, agent_type: :worker, initial_state: initial_state + 500, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :zzsup_shut_w2, agent_type: :worker, initial_state: initial_state + 600, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :zzsup_shut_w3, agent_type: :worker, initial_state: initial_state + 700, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:reply, int64, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :zzsup_shut_sub, agent_type: :supervisor, initial_state: 0, behavior: sub_start, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+// Moves the child supervisor's row child of this id to core 1 and makes the move apply (a call:
+// the move is applied at the child's next dispatch boundary); answers the child's carrier index
+// after it. The child supervisor is an actor_ref here (the :get_child answer's child field, which
+// call_supervisor takes as it takes a supervisor_ref).
+fn move_child_to_core_1(sup: actor_ref, id: atom) -> int64 {
+    sequence proc[concurrency]
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: id } impl SupervisorMessage {});
+        child: actor_ref <- got.child;
+        _: atom <- migrate_actor(child, 1);
+        _: int64 <- call(child, 0 impl ActorMessage {});
+        idx: int64 <- actor_carrier_index(child)
+    produces
+        pure idx
+    end
+}
+
+// Moves the child supervisor itself to core 1: its move applies at its next dispatch boundary,
+// which a :count_children call to it (served by its own dispatch) brings about.
+fn move_sub_to_core_1(root: supervisor_ref) -> int64 {
+    sequence proc[concurrency]
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :get_child, id: :zzsup_shut_sub } impl SupervisorMessage {});
+        sub: actor_ref <- got.child;
+        _: atom <- migrate_actor(sub, 1);
+        _c: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sub, { op: :count_children } impl SupervisorMessage {});
+        idx: int64 <- actor_carrier_index(sub)
+    produces
+        pure idx
+    end
+}
+
+fn count_of(sup: supervisor_ref) -> int64 {
+    sequence
+        c: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {})
+    produces
+        pure c.count
+    end
+}
+
+// The same count of a supervisor reached as the root's child (an actor_ref).
+fn count_of_child(sup: actor_ref) -> int64 {
+    sequence
+        c: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {})
+    produces
+        pure c.count
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        p1: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 1);
+        i_p1: int64 <- actor_carrier_index(p1);
+        root: supervisor_ref <- spawn_registered_supervisor(ZzsupShutdownRootSup, 0, :zzsup_shut_root, stack_policy(0, :keep_last_message), 1);
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :get_child, id: :zzsup_shut_sub } impl SupervisorMessage {});
+        sub: actor_ref <- got.child;
+        a1: int64 <- call_registered(:zzsup_shut_w1, 5 impl ActorMessage {});
+        b1: int64 <- call_registered(:zzsup_shut_w2, 5 impl ActorMessage {});
+        c1: int64 <- call_registered(:zzsup_shut_w3, 5 impl ActorMessage {});
+        i_sub: int64 <- move_sub_to_core_1(root);
+        i1: int64 <- move_child_to_core_1(sub, :zzsup_shut_w1);
+        i2: int64 <- move_child_to_core_1(sub, :zzsup_shut_w2);
+        i3: int64 <- move_child_to_core_1(sub, :zzsup_shut_w3);
+        _t: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :terminate_child, id: :zzsup_shut_sub } impl SupervisorMessage {});
+        after_stop: int64 <- count_of(root);
+        _r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :restart_child, id: :zzsup_shut_sub } impl SupervisorMessage {});
+        again: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(root, { op: :get_child, id: :zzsup_shut_sub } impl SupervisorMessage {});
+        new_sub: actor_ref <- again.child;
+        after_restart: int64 <- count_of_child(new_sub);
+        a2: int64 <- call_registered(:zzsup_shut_w1, 5 impl ActorMessage {});
+        print_int64(a1);
+        println("");
+        print_int64(b1);
+        println("");
+        print_int64(c1);
+        println("");
+        print_int64(verdict(i_sub == i_p1 and i1 == i_p1 and i2 == i_p1 and i3 == i_p1));
+        println("");
+        print_int64(verdict(after_stop == 0));
+        println("");
+        print_int64(verdict(after_restart == 3));
+        println("");
+        print_int64(a2);
+        println("");
+        println("done")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 { drive() });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

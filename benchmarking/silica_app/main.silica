@@ -1,0 +1,131 @@
+// actor_msgs: spawn 1000 actors and cast each of them 1000 messages.
+//
+// Each message carries the parameters (id, n, last) for the pure function work(); the actor's
+// behavior calls it, adds the returned value to its state, and on the last message casts its
+// sum to the registered :collector. The collector counts the sums, and when all 1000 actors
+// have reported it prints the grand total and ends the program.
+
+fn actor_count() -> int64 {
+    1000
+}
+
+fn msg_count() -> int64 {
+    1000
+}
+
+// The function every message asks for: it needs id and n from the message and returns a value.
+fn work(id: int64, n: int64) -> int64 {
+    id * n + 1
+}
+
+// Worker behavior: msg = (id, n, last). State is the running sum of work() results.
+fn worker(msg: (int64, int64, boolean), state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        (id: int64, n: int64, last: boolean) <- msg;
+        new_state: int64 <- state + work(id, n);
+        _: boolean <- case last of {
+            true -> cast_registered(:collector, new_state impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure (:no_reply, new_state)
+    end
+}
+
+// Collector behavior: state = (actors reported, grand total).
+fn collector(sum: int64, state: (int64, int64)) -> (:no_reply, (int64, int64)) {
+    (done: int64, total: int64) <- state;
+    new_done: int64 <- done + 1;
+    new_total: int64 <- total + sum;
+    _: boolean <- case new_done >= actor_count() of {
+        true -> report(new_done, new_total);
+        false -> true
+    };
+    (:no_reply, (new_done, new_total))
+}
+
+fn report(done: int64, total: int64) -> boolean {
+    sequence proc[concurrency, device_io]
+        _: atom <- print_int64(done);
+        _: atom <- print(" actors x ");
+        _: atom <- print_int64(msg_count());
+        _: atom <- print(" messages, total ");
+        _: atom <- print_int64(total);
+        _: atom <- println("");
+        ok: boolean <- cast_exit(0)
+    produces
+        pure ok
+    end
+}
+
+// Casts messages n..msg_count() to actor a.
+fn send_all(a: actor_ref, id: int64, n: int64) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- case n > msg_count() of {
+            true -> true;
+            false -> {
+                _: boolean <- cast(a, (id, n, n == msg_count()) impl ActorMessage {});
+                send_all(a, id, n + 1)
+            }
+        }
+    produces
+        pure sent
+    end
+}
+
+// Spawns actors id..actor_count() and sends each its messages.
+fn spawn_all(id: int64) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- case id > actor_count() of {
+            true -> true;
+            false -> {
+                a: actor_ref <- spawn(0, worker, stack_policy(65536, :keep_last_message));
+                _: boolean <- send_all(a, id, 1);
+                spawn_all(id + 1)
+            }
+        }
+    produces
+        pure sent
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: actor_ref <- spawn_registered((0, 0), collector, :collector, stack_policy(0, :keep_last_message));
+        _: boolean <- spawn_all(1);
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

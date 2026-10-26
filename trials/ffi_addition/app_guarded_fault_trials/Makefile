@@ -58,7 +58,7 @@ integrate-run: fixtures unguarded_probe
 	@ln -sfn "$(FFI_SOURCE_VIEW)" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
 	@test -f "$(FFI_LEGACY_ARCHIVE)" || { echo "  ❌ $(APP_LABEL): missing legacy archive"; exit 1; }
 	@cd "$(APP_TRIAL_DIR)" && rm -f *.sams *.o *.iface $(APP_EXECUTABLES) silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms
-	@cd "$(APP_TRIAL_DIR)" && find "$(APP_TRIAL_DIR)" -maxdepth 1 -name '*.silica' ! -name 'dangerous_unguarded_null_deref_abort.silica' | sed "s|^$(APP_TRIAL_DIR)/||" | sort > silica.config
+	@cd "$(APP_TRIAL_DIR)" && find "$(APP_TRIAL_DIR)" -maxdepth 1 -name '*.silica' ! -name 'dangerous_unguarded_null_deref_abort.silica' | sed "s|^$(APP_TRIAL_DIR)/||" | sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
 	@$(ENSURE_SILICA_COMPILER)
 	@cd "$(APP_TRIAL_DIR)" && if ! { $(RUN_SILICA_COMPILER); }; then echo "❌❌ $(APP_LABEL): compilation failed"; $(INTEGRATE_DOT_FAIL); printf '%d %d\n' 0 1 > .integrate_counts; exit 1; fi
 	@failed=0; ok=0; ko=0; \
@@ -93,9 +93,11 @@ integrate-run: fixtures unguarded_probe
 		ko=$$((ko + 1)); failed=1; break; \
 	fi; \
 	done; \
+	$(TRIAL_SUPPORT_ASSEMBLE); \
 	for trial in dangerous_guarded_null_deref_fault dangerous_guarded_arena_bounds_fault dangerous_guarded_sigbus_fault dangerous_guarded_sigill_fault dangerous_guarded_sigfpe_fault dangerous_handler_altstack_stack_overflow_smoke; do \
 		[ "$$failed" -ne 0 ] && break; \
 		runtime_obj=""; [ -f __silica_runtime.o ] && runtime_obj=__silica_runtime.o; \
+		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$trial.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 						if ! "$(RUST_LLD)" -flavor darwin -o "$$trial" "$$trial.o" $$runtime_obj $$link_archives $(LDFLAGS_rust-lld); then \
 				echo "❌❌ $(APP_LABEL)/$$trial link failed"; \
@@ -136,18 +138,18 @@ integrate-run: fixtures unguarded_probe
 		fi; \
 		fi; \
 		[ "$$failed" -ne 0 ] && break; \
-		if [ ! -f "$$trial.scout" ]; then \
+		if [ ! -f "$(call SCOUT_FOR,$$trial)" ]; then \
 			echo "  ❌ $(APP_LABEL)/$$trial: missing .scout"; ko=$$((ko + 1)); failed=1; \
 			$(INTEGRATE_DOT_FAIL); \
-		elif [ -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$$trial.scout" > /dev/null 2>&1; then \
+		elif [ -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout (normalized compare)"; \
 			$(INTEGRATE_DOT_FAIL); \
-			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$$trial.scout" || true; \
+			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
-		elif [ ! -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! diff -Bw -q "$$trial.sout" "$$trial.scout" > /dev/null 2>&1; then \
+		elif [ ! -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! diff -Bw -q "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout"; \
 			$(INTEGRATE_DOT_FAIL); \
-			diff -Bw "$$trial.sout" "$$trial.scout" || true; \
+			diff -Bw "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
 		else \
 			echo "  ✅✅ $(APP_LABEL)/$$trial output matches .scout"; \
@@ -180,4 +182,4 @@ integrate-run: fixtures unguarded_probe
 	exit $$failed
 
 clean:
-	@cd "$(THIS_DIR)" && rm -f *.sams *.o *.iface $(APP_EXECUTABLES) silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms *.sout dangerous_exposure_source $(UNGUARDED_PROBE) silica_ffi_fault.o unguarded_sigill_probe
+	@cd "$(THIS_DIR)" && rm -rf *.sams *.o *.iface $(APP_EXECUTABLES) silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms *.sout dangerous_exposure_source .trial_stdlib $(UNGUARDED_PROBE) silica_ffi_fault.o unguarded_sigill_probe

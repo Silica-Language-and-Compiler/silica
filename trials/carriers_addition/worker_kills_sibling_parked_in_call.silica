@@ -1,0 +1,127 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 1): a worker kills a sibling that is parked
+// in a call to a third actor. A :one_for_one supervisor has two cast-only workers on the carrier,
+// :carrier_parked_caller (calls the server with each message) and :carrier_parked_killer (kills
+// the caller with kill_abnormal, then tells the server it has done so with a 1000 message). The
+// server is a plain registered actor that replies msg + 50 and adds msg to its state (it is not
+// supervised, so it is not restarted). The driver (the trial support's worker) casts 5 to the
+// caller and 1 to the killer, then polls the server with 0 (a call, so the carrier runs the others
+// in between) until the killer's 1000 has arrived.
+//
+// Under SILICA_CARRIERS=1 the order on the one carrier is fixed by its FIFO run queue: the caller
+// runs first and parks in its call to the server; the killer runs next, kills the parked caller and
+// parks on the caller's row exit_done (Lkab_wait_exit_done through _silica_rt_row_wait_exit_done);
+// the server then answers the driver's first poll and the dead caller's call; the caller resumes,
+// finishes the dispatch it was in (nothing preempts it) and ends, which wakes the killer; the
+// killer, a row child of the same supervisor, waits for the supervisor's thread to restart the
+// caller (a row child never drains its own supervisor's ingress: the restart protocol in
+// prims_actors_child_table_asm.silica), then its 1000 reaches the server. Under SILICA_CARRIERS=0
+// the kill may find the caller anywhere (idle, in the call, after it); the printed result is the
+// same.
+//
+// The server's state at the end is 1000, plus 5 if the caller's call reached it first (always
+// under SILICA_CARRIERS=1), so the check is "at least 1000".
+//
+//   cast_registered to the caller        -> true, 9
+//   cast_registered to the killer        -> true, 9
+//   server state >= 1000 after the poll  -> 9
+//   the caller's row holds a new ref     -> 9
+//
+// Expected output: 9, 9, 9, 9, the killed caller's failure report (reason_tag 1, kill_abnormal),
+// exit status 0. The same with SILICA_CARRIERS=0. Printed values avoid the digits 1-4
+// (compare_scout_multiset.sh folds those): 9 is a check that holds, 6 one that does not.
+
+use Supervisor;
+use trial_support_int64;
+
+impl CarrierParkedCallerSup for Supervisor;
+
+fn caller(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        r: int64 <- call_registered(:carrier_parked_server, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state + r)
+    end
+}
+
+fn killer(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: atom <- kill_abnormal(:carrier_parked_caller);
+        _: int64 <- call_registered(:carrier_parked_server, 1000 impl ActorMessage {})
+    produces
+        pure (:no_reply, state + msg)
+    end
+}
+
+fn server(msg: int64, state: int64) -> (:reply, int64, int64) {
+    case msg == 0 of {
+        true -> (:reply, state, state);
+        false -> (:reply, msg + 50, state + msg)
+    }
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :carrier_parked_caller, agent_type: :worker, initial_state: initial_state, behavior: caller, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :carrier_parked_killer, agent_type: :worker, initial_state: initial_state, behavior: killer, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// Polls the server until the killer's 1000 has reached it (or the bound runs out).
+fn wait_for_kill(n: int64) -> int64 {
+    sequence proc[concurrency]
+        seen: int64 <- call_registered(:carrier_parked_server, 0 impl ActorMessage {});
+        r: int64 <- case seen >= 1000 or n == 0 of {
+            true -> seen;
+            false -> wait_for_kill(n - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- spawn_registered(0, server, :carrier_parked_server, stack_policy(0, :keep_last_message));
+        sup: supervisor_ref <- spawn_registered_supervisor(CarrierParkedCallerSup, 0, :carrier_parked_sup, stack_policy(0, :keep_last_message));
+        before: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: :carrier_parked_caller } impl SupervisorMessage {});
+        to_caller: boolean <- cast_registered(:carrier_parked_caller, 5 impl ActorMessage {});
+        to_killer: boolean <- cast_registered(:carrier_parked_killer, 1 impl ActorMessage {});
+        seen: int64 <- wait_for_kill(100000);
+        after: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: :carrier_parked_caller } impl SupervisorMessage {});
+        print_int64(verdict(to_caller));
+        println("");
+        print_int64(verdict(to_killer));
+        println("");
+        print_int64(verdict(seen >= 1000));
+        println("");
+        print_int64(verdict(before.child_info.child != after.child_info.child));
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

@@ -28,16 +28,27 @@
 // MAP_FIXED remap to PROT_NONE (the same primitive as on Darwin; on Linux it also keeps the two
 // mappings merged, which matters against vm.max_map_count).
 //
-// ACB fields owned by this module (the control block is 408 B; 0..271 and 392..407 are the actor runtime's,
-// actor_memory_budget_plan.md item I):
+// ACB fields owned by this module (the control block is 600 B on Linux: 0..271 and 392..527 are the actor
+// runtime's, actor_memory_budget_plan.md items I and N; 528..591 are the stack-based memory model's,
+// chunk15_stack_memory_design.md §2.2, the same offsets as the Mac, of which only #528 is read in phase 0;
+// #592 is the dangerous actor thread's own-stack SP, prims_actors_runtime_asm.silica):
 //   #272 stack base (reservation low address; 0 = none)   #280 reservation bytes
 //   #288 committed bytes (the run [top-committed, top))     #296 high-water committed bytes
 //   #304 next growth chunk bytes                           #312 release algorithm 1..5
 //   #320 retained bytes (what the algorithm holds now)     #328 32-entry usage ring (track_recent_peak)
 //   #336 ring index                                        #344 last message time, monotonic ns
-//   #352 per-thread signal alt stack (64 KB mapping)       #360 policy as given (for children to inherit)
+//   #352 per-thread signal alt stack (64 KB mapping; 0 for a carrier actor, whose carrier has one)
+//   #360 policy as given (for children to inherit)
 //   #368 runtime SP saved while a behavior runs on the actor stack   #376 1 = reservation was lowered
-//   #384 pending (:explicit, atom) reason atom for the exit payload
+//   #384 pending (:explicit, atom) reason atom for the exit payload; under tag 2 the language error's
+//        detail code for the report's reason line (0 none, 1 division by zero, 2 no case arm matched)
+//   #528 the state edge (chunk15_stack_memory_design.md §2.1, §2.2, §2.4): the lowest address of the
+//        state area at the top of the reservation. Phase 0 (2026-10-24) has no state area yet, so the
+//        edge is top - 1040 for the actor's life: the 1,040 bytes above it are the state-area header
+//        (129 free-list heads, §2.3), never used by a frame. Every SP switch into user code starts at
+//        the edge, silica_rt_stack_measure measures down from it and silica_rt_stack_release_to keeps
+//        and zeroes relative to it; the release algorithms are otherwise unchanged (the header is
+//        released with everything else by :release_on_return until the state area exists, phase 3).
 // Release algorithms: 1 :release_on_return, 2 :keep_last_message, 3 :track_recent_peak,
 // 4 :release_when_idle, 5 :keep_high_water. The packed stack_policy word is (reserve & ~15) | algorithm.
 //
@@ -45,8 +56,24 @@
 // zero at the start of every message (fresh pages are zero and the runtime zeroes what a message used
 // before the next one), so the lowest page holding a nonzero word after the behavior returns is the
 // message's depth. The scan costs the untouched pages, which are exactly the ones about to be released.
-// :release_when_idle has no carrier thread to sweep for it in this thread-per-actor runtime: the actor's
-// own mailbox wait carries a one-second timeout while it holds committed stack, and releases on expiry.
+// :release_when_idle: a carrier actor is swept by its carrier (prims_actors_carrier_asm.silica,
+// silica_rt_carrier_sweep) once the idle period has passed since its last message
+// (silica_rt_stack_idle_due, against one clock reading per sweep), or sooner, oldest first, while
+// the idle stacks listed on its carrier exceed the carrier's idle-stack budget
+// (silica_rt_idle_stack_budget; release_when_idle_design.md, 2026-10-20: the period is an upper bound
+// on how long an idle stack is kept, not a promise); a dangerous actor, on a thread of its own, waits
+// for mail with the period as its timeout while it holds committed stack and releases on expiry
+// (silica_rt_stack_idle_check; it is outside the budget). The period is spec §15.1.2.2's one second
+// unless SILICA_IDLE_RELEASE_MS=<milliseconds> in the environment says otherwise (read once by
+// silica_rt_stack_runtime_init: unset, 0 or not a number keeps 1000 ms; more than 3,600,000 ms is
+// clamped to that hour), kept in nanoseconds in silica_rt_idle_release_ns; a busy carrier looks at
+// its list at most every silica_rt_idle_sweep_ns = min(250 ms, the period / 4). The budget is per
+// carrier: SILICA_IDLE_STACK_BUDGET=<bytes> (the process total; unset, 0 or not a number means the
+// default, the machine's memory plus swap over 32) split evenly over the carriers, at least 16
+// platform pages each. It is a cap on the transient, never a reservation and never a per-actor limit.
+//
+// silica_rt_stack_runtime_init also reads the carrier count (SILICA_CARRIER_COUNT, else the machine's
+// logical cores) and the machine's core counts (prims_actors_carrier_asm.silica).
 //
 // x86-64 conventions (RUNTIME_GUIDE.md): arguments X0..X5 arrive in rdi rsi rdx rcx r8 r9 and every
 // result leaves in rdi; C library results arrive in rax and are moved to rdi. Values the AArch64 text
@@ -59,7 +86,7 @@ use atom_table;
 
 export emit_actor_stack_runtime_asm/1;
 
-fn stack_asm_data(stack_exhausted_idx: string, reserve_failed_idx: string) -> string {
+fn stack_asm_data(reservation_exceeded_idx: string, out_of_memory_idx: string, state_too_large_idx: string, reserve_failed_idx: string, thread_limit_idx: string) -> string {
     p0: string <- "	.bss
 	.p2align	3
 silica_rt_stack_page:
@@ -68,17 +95,42 @@ silica_rt_stack_default_reserve:
 	.zero	8
 silica_rt_stack_init_done:
 	.zero	8
+	.globl	silica_rt_idle_release_ns
+silica_rt_idle_release_ns:
+	.zero	8
+	.globl	silica_rt_idle_sweep_ns
+silica_rt_idle_sweep_ns:
+	.zero	8
+	.globl	silica_rt_idle_stack_budget
+silica_rt_idle_stack_budget:
+	.zero	8
 	.data
 	.p2align	3
-	.globl	silica_rt_stack_exhausted_atom
-silica_rt_stack_exhausted_atom:
+	.globl	silica_rt_reservation_exceeded_atom
+silica_rt_reservation_exceeded_atom:
 	.quad	";
-    p1: string <- concat(concat(p0, stack_exhausted_idx), "
+    p0b: string <- concat(concat(p0, reservation_exceeded_idx), "
+	.globl	silica_rt_out_of_memory_atom
+silica_rt_out_of_memory_atom:
+	.quad	");
+    p0c: string <- concat(concat(p0b, out_of_memory_idx), "
+	.globl	silica_rt_state_too_large_atom
+silica_rt_state_too_large_atom:
+	.quad	");
+    p1: string <- concat(concat(p0c, state_too_large_idx), "
 	.globl	silica_rt_stack_reserve_failed_atom
 silica_rt_stack_reserve_failed_atom:
 	.quad	");
-    concat(concat(p1, reserve_failed_idx), "
+    p2: string <- concat(concat(p1, reserve_failed_idx), "
+	.globl	silica_rt_thread_limit_atom
+silica_rt_thread_limit_atom:
+	.quad	");
+    concat(concat(p2, thread_limit_idx), "
 	.section .rodata
+L_srt_idle_release_env:
+	.asciz	\"SILICA_IDLE_RELEASE_MS\"
+L_srt_idle_budget_env:
+	.asciz	\"SILICA_IDLE_STACK_BUDGET\"
 ")
 }
 
@@ -87,10 +139,12 @@ fn stack_asm_init() -> string {
 	.globl	silica_rt_stack_runtime_init
 	.p2align	2
 silica_rt_stack_runtime_init:
-# Read the platform page and the default reservation (physical memory + swap) once.
+# Read the platform page and the default reservation (physical memory + swap) once; then the carrier
+# count, the machine's core counts, the :release_when_idle period and the idle-stack budget (header).
 # _SC_PAGESIZE = 30, _SC_PHYS_PAGES = 85; struct sysinfo (112 B): totalswap @64, mem_unit (u32) @104.
 # Frame: [rbp - 8] = &silica_rt_stack_init_done (x19), [rbp - 16] = page (x20);
-# [rsp + 32] = pages * page, [rsp + 48 .. 160) = struct sysinfo.
+# [rsp + 32] = pages * page, [rsp + 48 .. 160) = struct sysinfo. The Apple module's x21 (the value
+# being parsed) is r10 here: each parse loop and what it stores run between calls, nothing crosses one.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 240
@@ -141,6 +195,120 @@ Lsri_have_total:
 	and	r10, r11
 	lea	rax, [rip + silica_rt_stack_default_reserve]
 	mov	QWORD PTR [rax], r10
+# The carrier count (item N): SILICA_CARRIER_COUNT=<n> in the environment (decimal, n >= 1; unset,
+# 0 or anything else is ignored), else the machine's logical cores (hw.logicalcpu through the
+# sysctl shim: sysconf(_SC_NPROCESSORS_ONLN)), at least 1. Carriers are the only model
+# (prims_actors_carrier_asm.silica header): there is no gate. r10 = the count being parsed.
+	lea	rdi, [rip + L_srt_carrier_count_env]
+	call	getenv
+	xor	r10d, r10d
+	test	rax, rax
+	jz	Lsri_count_sysctl
+Lsri_count_digit:
+	movzx	ecx, BYTE PTR [rax]
+	sub	ecx, 48
+	cmp	ecx, 9
+	ja	Lsri_count_parsed
+	imul	r10, r10, 10
+	add	r10, rcx
+	inc	rax
+	jmp	Lsri_count_digit
+Lsri_count_parsed:
+	test	r10, r10
+	jnz	Lsri_count_have
+Lsri_count_sysctl:
+	lea	rdi, [rip + L_srt_hw_logicalcpu]
+	call	silica_rt_sysctl_u64
+	mov	r10, rdi
+	test	r10, r10
+	jnz	Lsri_count_have
+	mov	r10d, 1
+Lsri_count_have:
+	mov	QWORD PTR [rip + silica_rt_carrier_count], r10
+# The machine's own counts (item N stage 3), whatever the carrier count: the logical cores
+# (hw.logicalcpu, at least 1), which bound the core ids placement accepts, and the performance
+# cores among them (hw.perflevel0.logicalcpu: the P cores are ids [0, P) as get_cpu_topology
+# reports them; on Linux the shim answers the logical count for both, every core a P core).
+	lea	rdi, [rip + L_srt_hw_logicalcpu]
+	call	silica_rt_sysctl_u64
+	test	rdi, rdi
+	jnz	Lsri_logical_have
+	mov	edi, 1
+Lsri_logical_have:
+	mov	QWORD PTR [rip + silica_rt_logical_cpu_count], rdi
+	lea	rdi, [rip + L_srt_hw_perf0_logicalcpu]
+	call	silica_rt_sysctl_u64
+	test	rdi, rdi
+	jnz	Lsri_pcore_have
+	mov	rdi, QWORD PTR [rip + silica_rt_logical_cpu_count]
+Lsri_pcore_have:
+	mov	QWORD PTR [rip + silica_rt_pcore_count], rdi
+# The :release_when_idle period: SILICA_IDLE_RELEASE_MS=<ms> (decimal; the digits up to the first
+# other character; unset, 0 or no digits keeps spec §15.1.2.2's 1000 ms; clamped to 3,600,000 ms, an
+# hour), kept in nanoseconds; and a busy carrier's sweep cadence, min(250 ms, the period / 4).
+	lea	rdi, [rip + L_srt_idle_release_env]
+	call	getenv
+	xor	r10d, r10d
+	test	rax, rax
+	jz	Lsri_idle_parsed
+Lsri_idle_digit:
+	movzx	ecx, BYTE PTR [rax]
+	sub	ecx, 48
+	cmp	ecx, 9
+	ja	Lsri_idle_parsed
+	imul	r10, r10, 10
+	add	r10, rcx
+	inc	rax
+	cmp	r10, 3600000
+	jb	Lsri_idle_digit
+	mov	r10d, 3600000
+Lsri_idle_parsed:
+	test	r10, r10
+	jnz	Lsri_idle_have
+	mov	r10d, 1000
+Lsri_idle_have:
+	imul	r10, r10, 1000000
+	mov	QWORD PTR [rip + silica_rt_idle_release_ns], r10
+	mov	r11, r10
+	shr	r11, 2
+	mov	ecx, 250000000
+	cmp	r11, rcx
+	cmovae	r11, rcx
+	mov	QWORD PTR [rip + silica_rt_idle_sweep_ns], r11
+# The idle-stack budget per carrier: SILICA_IDLE_STACK_BUDGET=<bytes> (decimal, the process total;
+# unset, 0 or no digits means the default, the memory-plus-swap reservation over 32; the digits stop
+# counting once the value passes 2^60) over the carrier count (silica_rt_carrier_count, stored above,
+# at least 1), at least 16 platform pages ([rbp - 16]).
+	lea	rdi, [rip + L_srt_idle_budget_env]
+	call	getenv
+	xor	r10d, r10d
+	test	rax, rax
+	jz	Lsri_budget_parsed
+Lsri_budget_digit:
+	movzx	ecx, BYTE PTR [rax]
+	sub	ecx, 48
+	cmp	ecx, 9
+	ja	Lsri_budget_parsed
+	imul	r10, r10, 10
+	add	r10, rcx
+	inc	rax
+	mov	r11, r10
+	shr	r11, 60
+	jz	Lsri_budget_digit
+Lsri_budget_parsed:
+	test	r10, r10
+	jnz	Lsri_budget_have
+	mov	r10, QWORD PTR [rip + silica_rt_stack_default_reserve]
+	shr	r10, 5
+Lsri_budget_have:
+	mov	rax, r10
+	xor	edx, edx
+	div	QWORD PTR [rip + silica_rt_carrier_count]
+	mov	r10, QWORD PTR [rbp - 16]
+	shl	r10, 4
+	cmp	rax, r10
+	cmovb	rax, r10
+	mov	QWORD PTR [rip + silica_rt_idle_stack_budget], rax
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rax], 1
 Lsri_done:
@@ -276,6 +444,8 @@ Lasr_mapped:
 	mov	QWORD PTR [rax + 272], rdi
 	mov	rcx, QWORD PTR [rbp - 32]
 	mov	QWORD PTR [rax + 280], rcx
+	lea	r9, [rdi + rcx - 1040]
+	mov	QWORD PTR [rax + 528], r9
 	mov	QWORD PTR [rax + 288], 0
 	mov	QWORD PTR [rax + 296], 0
 	mov	rcx, QWORD PTR [rbp - 40]
@@ -308,6 +478,7 @@ Lasr_no_ring:
 Lasr_fail:
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rax + 272], 0
+	mov	QWORD PTR [rax + 528], 0
 	mov	edi, 1
 Lasr_ret:
 	leave
@@ -316,8 +487,14 @@ Lasr_ret:
 	.p2align	2
 silica_rt_actor_altstack_install:
 # X0 = ACB. Every actor thread faults with SP inside its own inaccessible reservation, so the
-# handler needs an alternate stack of its own on this thread.
-# Frame: [rbp - 8] ACB (x19); stack_t at [rsp]: ss_sp @0, ss_flags (int) @8, ss_size @16.
+# handler needs an alternate stack of its own on this thread (#352). A carrier installs one for
+# its thread the same way (silica_rt_altstack_install_at, the word in its own block).
+	add	rdi, 352
+	.globl	silica_rt_altstack_install_at
+	.p2align	2
+silica_rt_altstack_install_at:
+# X0 = the word that records the 64 KB mapping for this thread's signal alternate stack.
+# Frame: [rbp - 8] the word (x19); stack_t at [rsp]: ss_sp @0, ss_flags (int) @8, ss_size @16.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 112
@@ -333,7 +510,7 @@ silica_rt_actor_altstack_install:
 	cmp	rax, -1
 	je	Lsai_ret
 	mov	rcx, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [rcx + 352], rax
+	mov	QWORD PTR [rcx], rax
 	mov	QWORD PTR [rsp], rax
 	mov	QWORD PTR [rsp + 8], 0
 	mov	QWORD PTR [rsp + 16], 65536
@@ -361,6 +538,7 @@ silica_rt_actor_stack_free:
 	call	munmap
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rax + 272], 0
+	mov	QWORD PTR [rax + 528], 0
 Lsaf_alt:
 	cmp	QWORD PTR [rbp - 16], 0
 	jne	Lsaf_ring
@@ -469,8 +647,10 @@ Lsgt_ret:
 	.globl	silica_rt_stack_measure
 	.p2align	2
 silica_rt_stack_measure:
-# X0 = ACB -> X0 = bytes from the top down to the lowest page holding a nonzero word (0 = none).
-# Leaf: rsi = base (x8), rdx = top (x9), rcx = committed (x10), r8 = page cursor (x11),
+# X0 = ACB -> X0 = bytes from the state edge (#528) down to the lowest page holding a nonzero word
+# (0 = none). The scan runs from the bottom of the committed run up to the edge; the state area
+# above the edge is never scanned (chunk15_stack_memory_design.md §2.4, decision 27).
+# Leaf: rsi = base (x8), rdx = the edge (x9), rcx = committed (x10), r8 = page cursor (x11),
 # r9 = page size (x12), r10 = word cursor (x13), r11 = page end (x14).
 	mov	rsi, QWORD PTR [rdi + 272]
 	mov	rdx, QWORD PTR [rdi + 280]
@@ -478,6 +658,7 @@ silica_rt_stack_measure:
 	mov	rcx, QWORD PTR [rdi + 288]
 	mov	r8, rdx
 	sub	r8, rcx
+	mov	rdx, QWORD PTR [rdi + 528]
 	lea	r9, [rip + silica_rt_stack_page]
 	mov	r9, QWORD PTR [r9]
 Lsm_page:
@@ -505,17 +686,25 @@ Lsm_none:
 	.globl	silica_rt_stack_release_to
 	.p2align	2
 silica_rt_stack_release_to:
-# X0 = ACB, X1 = bytes to keep, X2 = bytes at the top the last message used (zeroed if kept).
-# Releases whole chunks below the smallest chunk prefix that covers X1, in the sizes they grew by.
+# X0 = ACB, X1 = bytes to keep below the state edge, X2 = bytes below the edge the last message used
+# (zeroed if kept). Releases whole chunks below the smallest chunk prefix (measured from the top,
+# so the state area above the edge is inside it) that covers the edge's offset plus X1, in the sizes
+# they grew by. X1 = 0 keeps nothing (phase 0: there is no state area yet, so :release_on_return
+# still returns every page; the state area becomes undecommittable in phase 3, decision 27).
 # Frame: [rbp - 8] ACB (x19), [rbp - 16] keep prefix (x20), [rbp - 24] used (x21), [rbp - 32] next chunk (x22).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rbp - 24], rdx
+	mov	rax, rdi
 	mov	rdi, rsi
 	test	rdi, rdi
 	jz	Lsrt_zero_keep
+	mov	r8, QWORD PTR [rax + 272]
+	add	r8, QWORD PTR [rax + 280]
+	sub	r8, QWORD PTR [rax + 528]
+	add	rdi, r8
 	call	silica_rt_stack_prefix_for
 	jmp	Lsrt_have
 Lsrt_zero_keep:
@@ -562,15 +751,20 @@ Lsrt_zero:
 	mov	rcx, QWORD PTR [rbp - 24]
 	test	rcx, rcx
 	jz	Lsrt_ret
+# committed bytes below the edge: committed - (top - edge), 0 when the run ends above the edge
+	mov	r8, QWORD PTR [rax + 272]
+	add	r8, QWORD PTR [rax + 280]
+	sub	r8, QWORD PTR [rax + 528]
+	sub	r11, r8
+	jae	Lsrt_zero_below
+	xor	r11d, r11d
+Lsrt_zero_below:
 	cmp	rcx, r11
 	cmova	rcx, r11
 	mov	QWORD PTR [rbp - 24], rcx
 	test	rcx, rcx
 	jz	Lsrt_ret
-	mov	r8, QWORD PTR [rax + 272]
-	mov	r10, QWORD PTR [rax + 280]
-	add	r10, r8
-	mov	rdi, r10
+	mov	rdi, QWORD PTR [rax + 528]
 	sub	rdi, rcx
 	xor	esi, esi
 	mov	rdx, rcx
@@ -653,8 +847,10 @@ Lsmr_ret:
 	.p2align	2
 silica_rt_stack_idle_check:
 # X0 = ACB -> X0 = mailbox wait timeout in microseconds (0 = wait without a timeout). Only
-# :release_when_idle actors holding committed stack wait with a timeout; once a second has passed
-# since the last message the stack is released and the wait becomes untimed.
+# :release_when_idle actors holding committed stack wait with a timeout; once the idle period
+# (silica_rt_idle_release_ns) has passed since the last message the stack is released and the wait
+# becomes untimed. A dangerous actor's thread makes this check; a carrier's sweep uses
+# silica_rt_stack_idle_due below.
 # Frame: [rbp - 8] ACB (x19).
 	push	rbp
 	mov	rbp, rsp
@@ -669,7 +865,7 @@ silica_rt_stack_idle_check:
 	mov	rcx, QWORD PTR [rax + 344]
 	mov	rdx, rdi
 	sub	rdx, rcx
-	mov	r8, 1000000000
+	mov	r8, QWORD PTR [rip + silica_rt_idle_release_ns]
 	cmp	rdx, r8
 	jb	Lsic_wait
 	mov	rdi, rax
@@ -689,6 +885,28 @@ Lsic_none:
 	xor	edi, edi
 Lsic_ret:
 	leave
+	ret
+	.globl	silica_rt_stack_idle_due
+	.p2align	2
+silica_rt_stack_idle_due:
+# X0 = ACB (a :release_when_idle actor holding committed stack, on its carrier's sweep list), X1 =
+# the time now (monotonic ns; the sweep reads the clock once for a whole batch) -> X0 = 0 when the
+# idle period (silica_rt_idle_release_ns) has passed since the actor's last message (#344), else
+# the microseconds until it will have, at least 1. Leaf; rax rcx rdx r8 (x9-x10).
+	mov	rcx, rsi
+	sub	rcx, QWORD PTR [rdi + 344]
+	mov	r8, QWORD PTR [rip + silica_rt_idle_release_ns]
+	cmp	rcx, r8
+	jae	Lsid_due
+	sub	r8, rcx
+	mov	rax, r8
+	xor	edx, edx
+	mov	ecx, 1000
+	div	rcx
+	lea	rdi, [rax + 1]
+	ret
+Lsid_due:
+	xor	edi, edi
 	ret
 	.globl	silica_rt_cv_wait_timeout
 	.p2align	2
@@ -746,20 +964,59 @@ fn stack_asm_fail_and_report() -> string {
 	.p2align	2
 silica_rt_actor_fail_current:
 # X0 = the current actor's ACB, X1 = reason atom. Ends the actor with (:explicit, atom): wakes its
-# waiters, delivers the exit to its supervisor, frees what it owns and exits the thread. Runs on the
-# signal alt stack (stack exhaustion) or on the actor stack (a spawn whose reservation failed).
-# Frame: [rbp - 8] ACB (x19), [rbp - 16] row pointer (x20), [rbp - 24] supervisor (x21).
+# waiters, delivers the exit to its supervisor, frees what it owns and exits the thread. For a
+# dangerous actor (a thread of its own) it runs on the signal alt stack (stack exhaustion) or on
+# the actor stack (a spawn whose reservation failed). For a carrier actor it is entered on the
+# carrier's stack (the fault handler returns into it there, through the signal frame with
+# rsp = the carrier's base - 8, so the carrier's alternate-stack state is intact for the next
+# fault) or on the actor's own (a failed spawn inside a behaviour or a start trampoline, a
+# duplicate child id) and ends in the carrier loop; the reservation is freed first, before any
+# waiter is woken, unless the actor has a supervision block ([rbp - 16] = 1): then its children
+# are shut down in the delivering phase, each waited for, and the waits park, which needs a stack
+# the carrier loop leaves alone: the top of its own reservation (every frame below it is
+# abandoned: a fault's signal frame was unwound by the kernel, a failed spawn never returns),
+# unmapped after that phase instead.
+# Frame: [rbp - 8] ACB (x19), [rbp - 16] 1 = delivering on the reservation (x20), [rbp - 24] the
+# carrier (x21; 0 for a dangerous actor). Every stack switch below opens a fresh frame and
+# rewrites the three slots (they are memory, not registers): this routine never returns, so the
+# abandoned frames are not unwound.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rdi + 384], rsi
+	mov	r11, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 24], r11
+	mov	QWORD PTR [rbp - 16], 0
+	test	r11, r11
+	jz	Lafc_thread_actor
+	cmp	QWORD PTR [rdi + 216], 0
+	je	Lafc_carrier_stack
+	mov	r10, QWORD PTR [rdi + 272]
+	test	r10, r10
+	jz	Lafc_carrier_stack
+	mov	r10, QWORD PTR [rdi + 528]
+	mov	rsp, r10
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], 1
+	mov	QWORD PTR [rbp - 24], r11
+	jmp	Lafc_deliver
+Lafc_carrier_stack:
+	mov	r10, QWORD PTR [r11 + 48]
+	mov	rsp, r10
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], 0
+	mov	QWORD PTR [rbp - 24], r11
+	jmp	Lafc_on_stack
+Lafc_thread_actor:
 # Move onto the thread's alt stack (its top; nothing there is needed again) so the actor stack
 # this may be running on can be unmapped now. On the exhaustion path we are already there.
 # The stack is given back before any waiter is woken, as at a message boundary: a caller that
 # wakes on the death and asks get_actor_memory_usage must already see the reservation gone.
-# The frame slots must move with the stack (they are memory here, not x19..x21): a fresh frame is
-# opened at the alt stack top; this routine never returns, so the abandoned frame is not unwound.
 	mov	r10, QWORD PTR [rdi + 352]
 	test	r10, r10
 	jz	Lafc_on_stack
@@ -768,18 +1025,21 @@ silica_rt_actor_fail_current:
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], 0
+	mov	QWORD PTR [rbp - 24], 0
 Lafc_on_stack:
 	mov	rdi, QWORD PTR [rbp - 8]
 	mov	esi, 1
 	call	silica_rt_actor_stack_free
+Lafc_deliver:
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_lock
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rax + 232], 4
 	mov	DWORD PTR [rax + 152], 0
-	lea	rdi, [rax + 80]
-	call	silica_rt_cv_signal
+	mov	rdi, rax
+	call	silica_rt_actor_mail_signal
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
@@ -803,7 +1063,9 @@ Lafc_report_done:
 	mov	r10, QWORD PTR [rbp - 8]
 	cmp	QWORD PTR [r10 + 224], 0
 	jne	Lafc_started_set
-	mov	QWORD PTR [r10 + 224], 2
+	mov	rdi, r10
+	mov	esi, 2
+	call	silica_rt_started_store
 Lafc_started_set:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_signal_pending_call_deaths
@@ -811,14 +1073,101 @@ Lafc_started_set:
 	call	silica_rt_ffi_arena_teardown
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_child_table_free
+# The delivering phase ran on the reservation ([rbp - 16]): nothing waits any more, so onto the
+# carrier's stack (a fresh frame there holds the actor and the carrier) and the reservation goes.
+	cmp	QWORD PTR [rbp - 16], 0
+	je	Lafc_stack_done
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	r11, QWORD PTR [rbp - 24]
+	mov	rsp, QWORD PTR [r11 + 48]
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], 1
+	mov	QWORD PTR [rbp - 24], r11
+	xor	esi, esi
+	call	silica_rt_actor_stack_free
+Lafc_stack_done:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_dealloc_region
+	cmp	QWORD PTR [rbp - 24], 0
+	je	Lafc_thread_end
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_final_release
-Lafc_thread_exit:
+	mov	rdi, QWORD PTR [rbp - 24]
+	jmp	silica_rt_carrier_loop_enter
+Lafc_thread_end:
+# A dangerous actor's thread (on its alt stack, or the reservation): back onto its own stack, the
+# alt stack goes with the holds, and the start routine returns (silica_rt_thread_actor_end; never
+# pthread_exit, which force-unwinds and spins on a stack that is not the thread's).
+	mov	rdi, QWORD PTR [rbp - 8]
+	jmp	silica_rt_thread_actor_end
+	.globl	silica_rt_fail_self
+	.p2align	4
+silica_rt_fail_self:
+# rdi = the reason atom. fail_self(reason) (spec §15.1.2.3): the calling actor ends at once with
+# failure_reason (:explicit, reason) through silica_rt_actor_fail_current, as the runtime's own
+# checks end it (a buffer index out of bounds, a reservation that could not be made): the dispatch
+# is abandoned, a call it is serving gets the actor-death result, queued casts are dropped. Never
+# returns. The type checker admits the call only in a behaviour (E2091); a thread with no current
+# actor is the language-level failure of §15.4.5.5 (silica_rt_language_error_current).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Lfsf_main
+	mov	rsi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_fail_current
+Lfsf_main:
+	leave
+	jmp	silica_rt_language_error_current
+	.globl	silica_rt_stop_self_normal
+	.p2align	4
+silica_rt_stop_self_normal:
+# stop_self(:normal) (spec §15.1.2.3): the calling actor ends at its next dispatch boundary with
+# failure_reason :normal, as remove_actor ends another actor: silica_rt_actor_stop clears its
+# alive flag (tag 0 keeps the default reason), the current dispatch runs to completion, a call it
+# is serving still gets its reply (LBB1_reply_result precedes silica_rt_carrier_requeue), and the
+# exit path runs at the next dispatch. -> rdi = 0 (the emitter answers :ok). With no current actor
+# it is the language-level failure of §15.4.5.5.
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Lssn_main
+	xor	esi, esi
+	xor	edx, edx
+	call	silica_rt_actor_stop
 	xor	edi, edi
-	call	pthread_exit
-	jmp	Lafc_thread_exit
+	pop	rbp
+	ret
+Lssn_main:
+	pop	rbp
+	jmp	silica_rt_language_error_current
+	.globl	silica_rt_stop_self_explicit
+	.p2align	4
+silica_rt_stop_self_explicit:
+# rdi = the reason atom. stop_self((:explicit, reason)): as silica_rt_stop_self_normal, with
+# failure_reason (:explicit, reason): tag 4 at #232 and the atom at #384, read by
+# silica_rt_actor_deliver_exit into the exit payload. -> rdi = 0.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Lsse_main
+	mov	esi, 4
+	mov	rdx, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_stop
+	xor	edi, edi
+	leave
+	ret
+Lsse_main:
+	leave
+	jmp	silica_rt_language_error_current
 	.globl	silica_rt_spawn_reserve_failed
 	.p2align	2
 silica_rt_spawn_reserve_failed:
@@ -837,6 +1186,28 @@ silica_rt_spawn_reserve_failed:
 Lsrf_main:
 	pop	rbp
 	jmp	silica_rt_abort_stack_reserve
+	.globl	silica_rt_spawn_thread_failed
+	.p2align	4
+silica_rt_spawn_thread_failed:
+# A spawn_dangerous, or the start of a :dangerous row, could not make the actor's thread: the host
+# refused it (pthread_create failed; macOS caps a task at kern.num_taskthreads threads, 4096, so
+# about the 4,080th dangerous actor, Linux at its thread and mapping limits). The spawn gave back
+# what it had taken before coming here (actor_memory_budget_plan.md item N, #5 option C). The
+# spawning actor fails with (:explicit, :thread_limit), as it does for a reservation it cannot
+# make; `main` is not an actor and has no supervisor, so there the process ends with a runtime
+# abort, reason the thread of a dangerous actor could not be created, status 71 (spec 15.4.5.5),
+# reported at the spawn routine's call to this function. Never returns.
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Lstf_main
+	lea	rax, [rip + silica_rt_thread_limit_atom]
+	mov	rsi, QWORD PTR [rax]
+	call	silica_rt_actor_fail_current
+Lstf_main:
+	pop	rbp
+	jmp	silica_rt_abort_dangerous_thread
 	.globl	silica_rt_get_actor_memory_usage
 	.p2align	2
 silica_rt_get_actor_memory_usage:
@@ -883,8 +1254,99 @@ Lgmu_ret:
 "
 }
 
-fn emit_actor_stack_runtime_asm(table: { is_empty: boolean, index_map: { root: ref?(L, normal, rec), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
-    stack_exhausted_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":stack_exhausted"));
+// The region and bounds failures (design region_memory_safety_design.md stage 0 H5 and stage 8 Q9 (a)):
+// each entry ends the current actor with (:explicit, atom), reported and supervised like any failure,
+// through silica_rt_actor_fail_current; in main (no current actor) it falls through to the runtime
+// abort entry of the same site (status 71), with the site's own call address reported, as
+// silica_rt_spawn_reserve_failed does. The access or allocation that failed was never performed.
+fn stack_asm_region_failures(region_idx: string, bounds_idx: string, invalid_idx: string, list_idx: string) -> string {
+    concat(concat(concat(concat(concat(concat(concat(concat("	.data
+	.p2align	3
+	.globl	silica_rt_region_alloc_failed_atom
+silica_rt_region_alloc_failed_atom:
+	.quad	", region_idx), "
+	.globl	silica_rt_buf_bounds_atom
+silica_rt_buf_bounds_atom:
+	.quad	"), bounds_idx), "
+	.globl	silica_rt_buf_invalid_atom
+silica_rt_buf_invalid_atom:
+	.quad	"), invalid_idx), "
+	.globl	silica_rt_list_index_atom
+silica_rt_list_index_atom:
+	.quad	"), list_idx), "
+	.text
+	.globl	silica_rt_region_alloc_failed
+	.p2align	4
+silica_rt_region_alloc_failed:
+# an actor's arena could not grow, or alloc_region got no block (design region_memory_safety_design.md H5).
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Lraf_main
+	lea	rax, [rip + silica_rt_region_alloc_failed_atom]
+	mov	rsi, QWORD PTR [rax]
+	call	silica_rt_actor_fail_current
+Lraf_main:
+	pop	rbp
+	jmp	silica_rt_abort_region_overflow
+	.globl	silica_rt_buf_bounds_failed
+	.p2align	4
+silica_rt_buf_bounds_failed:
+# a buffer index is out of bounds (design §8, Q9 (a)); the access was not performed.
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Lbbf_main
+	lea	rax, [rip + silica_rt_buf_bounds_atom]
+	mov	rsi, QWORD PTR [rax]
+	call	silica_rt_actor_fail_current
+Lbbf_main:
+	pop	rbp
+	jmp	silica_rt_abort_buf_bounds
+	.globl	silica_rt_buf_invalid_failed
+	.p2align	4
+silica_rt_buf_invalid_failed:
+# a buffer size is negative or overflows (design §8, Q9 (a)); nothing was allocated.
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Lbif_main
+	lea	rax, [rip + silica_rt_buf_invalid_atom]
+	mov	rsi, QWORD PTR [rax]
+	call	silica_rt_actor_fail_current
+Lbif_main:
+	pop	rbp
+	jmp	silica_rt_abort_buf_invalid
+	.globl	silica_rt_list_index_failed
+	.p2align	4
+silica_rt_list_index_failed:
+# a list index is out of range (design §8, Q9 (a)); the access was not performed.
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Llif_main
+	lea	rax, [rip + silica_rt_list_index_atom]
+	mov	rsi, QWORD PTR [rax]
+	call	silica_rt_actor_fail_current
+Llif_main:
+	pop	rbp
+	jmp	silica_rt_abort_list_index
+")
+}
+
+fn emit_actor_stack_runtime_asm(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    reservation_exceeded_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":reservation_exceeded"));
+    out_of_memory_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":out_of_memory"));
+    state_too_large_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":state_too_large"));
     reserve_failed_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":stack_reserve_failed"));
-    concat(concat(concat(concat(stack_asm_data(stack_exhausted_idx, reserve_failed_idx), stack_asm_init()), stack_asm_reserve()), stack_asm_grow_release()), stack_asm_fail_and_report())
+    thread_limit_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":thread_limit"));
+    region_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":region_alloc_failed"));
+    bounds_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":buf_bounds"));
+    invalid_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":buf_invalid"));
+    list_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":list_index"));
+    concat(concat(concat(concat(concat(stack_asm_data(reservation_exceeded_idx, out_of_memory_idx, state_too_large_idx, reserve_failed_idx, thread_limit_idx), stack_asm_init()), stack_asm_reserve()), stack_asm_grow_release()), stack_asm_fail_and_report()), stack_asm_region_failures(region_idx, bounds_idx, invalid_idx, list_idx))
 }

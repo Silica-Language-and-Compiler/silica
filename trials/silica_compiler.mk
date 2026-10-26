@@ -15,6 +15,13 @@
 # Leaf helpers that already include this file (do not re-point the compiler elsewhere):
 #   standard_data_structures_phase1/leaf.mk
 #   ffi_addition/common_app.mk
+#
+# Per-target goldens (defined below, after the emit target): assembly <stem>$(ASCOMP_EXT), errors
+# <stem>$(GOLDEN_FAIL_EXT).golden_fail, run output $(call SCOUT_FOR,<stem>). The plain names
+# (<stem>.ascomp, .golden_fail, .scout) are the macOS goldens; on any other emit target
+# <stem>.<target>.{ascomp,golden_fail,scout} is used instead -- always for .ascomp, and for
+# .golden_fail / .scout only when that file exists (else the plain one). <target> is
+# $(SILICA_EMIT_TARGET): linux_aarch64, linux_x86_64, ESP32-S3_raw.
 
 _SILICA_COMPILER_MK_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 BINARIES_DIR := $(abspath $(_SILICA_COMPILER_MK_DIR)../binaries)
@@ -70,6 +77,20 @@ ASCOMP_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),.ascomp,.$(
 # plain <stem>.golden_fail (the macOS golden). GOLDEN_FAIL_EXT is empty on the Mac.
 GOLDEN_FAIL_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,.$(SILICA_EMIT_TARGET))
 
+# The output golden a trial's run (<stem>.sout) is compared against. The plain <stem>.scout is the
+# macOS (Darwin) golden and the default for every target; a target whose run legitimately prints
+# something else (a host-specific fact, e.g. the CPU topology) keeps <stem>.<target>.scout beside it,
+# and that file wins on that target when it exists. SCOUT_EXT is empty on the Mac, so the Mac always
+# reads the plain .scout, exactly as before. A target-specific scout is a golden, never a trial: the
+# trials are the .silica files, and markers (<stem>.scout.multiset, .sorted, .alt, ...) stay keyed on
+# the plain stem.
+#   "$(call SCOUT_FOR,$$base)"  ->  the path of the golden for shell variable base, in a recipe.
+# On the Mac it expands to plain "$base.scout" (no subshell); elsewhere to a POSIX-sh
+# $( if [ -f ... ] ...) that picks "$base.<target>.scout" when that file exists, else "$base.scout".
+SCOUT_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,.$(SILICA_EMIT_TARGET))
+_SCOUT_PICK_SH = $$(if [ -f "$(1)$(SCOUT_EXT).scout" ]; then echo "$(1)$(SCOUT_EXT).scout"; else echo "$(1).scout"; fi)
+SCOUT_FOR = $(if $(SCOUT_EXT),$(_SCOUT_PICK_SH),$(1).scout)
+
 # Toolchain for the emitted target's code: trials/platform/<emit target>.mk (assembler, linker,
 # link flags, FFI fixture flags, golden suffix, skip list). Optional while the per-trial makefiles
 # still carry their own macOS values; once those lines are deleted this include is the only source.
@@ -77,6 +98,11 @@ GOLDEN_FAIL_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,.$(SI
 
 # If silica-compiler is missing, run update_silica_compiler_link.bash and re-check.
 define ENSURE_SILICA_COMPILER
+	if [ "$(SILICA_COMPILER)" = "$(_SILICA_COMPILER_SEED)" ] && [ -L "$(SILICA_COMPILER)" ] && [ -n "$(SILICA_HOST_PLATFORM)" ] \
+		&& case "$$(readlink "$(SILICA_COMPILER)")" in *-$(SILICA_HOST_PLATFORM)) false;; *) true;; esac; then \
+		echo "$(SILICA_COMPILER) -> $$(readlink "$(SILICA_COMPILER)") is not a $(SILICA_HOST_PLATFORM) build; relinking for this host..."; \
+		"$(UPDATE_SILICA_COMPILER_LINK)" "$(SILICA_HOST_PLATFORM)" || exit 1; \
+	fi; \
 	if [ ! -x "$(SILICA_COMPILER)" ]; then \
 		echo "Missing $(SILICA_COMPILER); running update_silica_compiler_link.bash..."; \
 		"$(UPDATE_SILICA_COMPILER_LINK)" || exit 1; \
@@ -295,10 +321,30 @@ endef
 # its exit status and $$integrate_killed is 1 when the watchdog killed it, in which case
 # the recipe reports the trial as incomplete instead of comparing its output.
 #
+#
+# Peak memory ceiling (trials/README.md, "Peak memory ceiling"): when the directory the suite runs in
+# holds <trial>.max_rss_mb, where <trial> is the label's last /-separated word (every suite labels a
+# run $(MSG_PREFIX)<trial> or <app label>/<trial>), the command runs under run_with_rss_ceiling.py,
+# which appends a failure line to the trial's .sout when the peak resident set size is above the
+# ceiling, so the normal .sout/.scout comparison fails. Host runs only (SILICA_TARGET_IS_HOST=1); a
+# board run never reaches these macros (targets/board_suite.sh runs the board). With no marker the
+# command line is exactly the one used before the ceiling existed.
+INTEGRATE_RSS_RUNNER := $(_SILICA_COMPILER_MK_DIR)run_with_rss_ceiling.py
+# Sets integrate_rss_mark to the marker path when the ceiling applies to this run, else to "".
+define INTEGRATE_RSS_MARK
+integrate_rss_mark="$(1)"; integrate_rss_mark="$${integrate_rss_mark##*/}.max_rss_mb"; \
+if [ "$(SILICA_TARGET_IS_HOST)" != 1 ] || [ ! -f "$$integrate_rss_mark" ]; then integrate_rss_mark=""; fi
+endef
+#
 # $(call INTEGRATE_RUN_TRIAL,<label>,<sout path>,<command>): output then exit status into <sout path>.
 define INTEGRATE_RUN_TRIAL
 integrate_killed=0; \
+$(call INTEGRATE_RSS_MARK,$(1)); \
+if [ -n "$$integrate_rss_mark" ]; then \
+perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' python3 "$(INTEGRATE_RSS_RUNNER)" "$(1)" "$$integrate_rss_mark" "$(2)" -- $(3) 7>&1 > "$(2)" 2>&1 & integrate_pid=$$!; \
+else \
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $(3) > "$(2)" 2>&1 & integrate_pid=$$!; \
+fi; \
 integrate_reg="$${SILICA_INTEGRATE_ROOT:-.}/.integrate_running/$$integrate_pid"; \
 { printf '%s %s\n' "$$integrate_pid" "$(1)" > "$$integrate_reg"; } 2>/dev/null; \
 wait $$integrate_pid; integrate_rc=$$?; \
@@ -306,10 +352,16 @@ printf '%s\n' "$$integrate_rc" >> "$(2)"; \
 if [ -f "$$integrate_reg.killed" ]; then integrate_killed=1; fi; \
 rm -f "$$integrate_reg" "$$integrate_reg.killed" 2>/dev/null
 endef
-# $(call INTEGRATE_EXEC_TRIAL,<label>,<command>): the command manages its own output.
+# $(call INTEGRATE_EXEC_TRIAL,<label>,<command>): the command manages its own output. With a ceiling
+# marker the command must write <trial>.sout in the current directory (every caller does).
 define INTEGRATE_EXEC_TRIAL
 integrate_killed=0; \
+$(call INTEGRATE_RSS_MARK,$(1)); \
+if [ -n "$$integrate_rss_mark" ]; then \
+perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' python3 "$(INTEGRATE_RSS_RUNNER)" "$(1)" "$$integrate_rss_mark" "$${integrate_rss_mark%.max_rss_mb}.sout" -- $(2) 7>&1 & integrate_pid=$$!; \
+else \
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $(2) & integrate_pid=$$!; \
+fi; \
 integrate_reg="$${SILICA_INTEGRATE_ROOT:-.}/.integrate_running/$$integrate_pid"; \
 { printf '%s %s\n' "$$integrate_pid" "$(1)" > "$$integrate_reg"; } 2>/dev/null; \
 wait $$integrate_pid; integrate_rc=$$?; \
@@ -326,7 +378,7 @@ INTEGRATE_KILLED_MSG = killed by the watchdog after $$SILICA_INTEGRATE_WATCHDOG_
 #
 # Trial targets (targets/README.md). The outermost `integrate` -- the one the user typed, in
 # trials/ or in a suite -- first decides where the trials run:
-#   TRIAL_TARGET=host              this Mac, binaries/silica-compiler (what integrate always did)
+#   TRIAL_TARGET=host              this host (macOS, Linux x86-64 or AArch64), binaries/silica-compiler (what integrate always did)
 #   TRIAL_TARGET=<board target>    e.g. ESP32-S3_raw: compiled by binaries/silica-compiler-<target>,
 #                                  run on the board (targets/trial_target.sh does the whole run)
 #   TRIAL_TARGET=both              host, then every board target, one after the other

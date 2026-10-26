@@ -85,7 +85,7 @@ The generated owning value contains, conceptually:
 ```text
 {
     r: region(R, SpaceType),
-    root: ref?(R, SpaceType, RecursiveBinaryNode),
+    root: ref?(R, SpaceType, RecursiveBinaryNode),   // spelled as the full inline node tuple; a bare rec here is E2010
     compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
     specialization_key: int64
 }

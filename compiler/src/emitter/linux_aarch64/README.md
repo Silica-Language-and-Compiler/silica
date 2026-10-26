@@ -34,6 +34,8 @@ Linux (`HOST_RT_ASM`, `LDFLAGS_STACK`).
 
 ## Bootstrap
 
+Historical: the Mac-hosted cross-compiler link `silica-compiler-linux_aarch64` was removed on 2026-10-21; the Pi now builds and runs its own native compiler (silica-999966-linux-aarch64). The steps below are the original bring-up method.
+
 1. macOS: `make TARGET=linux_aarch64 EXECUTABLE=silica-compiler-linux_aarch64 INSTALL_SELFHOST=0`
    builds a macOS-hosted cross compiler that emits Linux assembly.
 2. Run it over `src/` (its `silica.config`) to produce the Linux `.sams` tree, copy the

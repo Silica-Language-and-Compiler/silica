@@ -65,6 +65,8 @@ Lrta_r_stack_commit:
 	.asciz	\"cannot commit memory for a growing actor stack\"
 Lrta_r_stack_reserve:
 	.asciz	\"stack reservation failed\"
+Lrta_r_dangerous_thread:
+	.asciz	\"the thread of a dangerous actor could not be created\"
 	.text
 	.globl	silica_rt_abort_with
 	.p2align	2
@@ -198,6 +200,12 @@ silica_rt_abort_exit_queue_full:
 silica_rt_abort_stack_reserve:
 	adrp	x0, Lrta_r_stack_reserve
 	add	x0, x0, :lo12:Lrta_r_stack_reserve
+	b	silica_rt_abort_with
+	.globl	silica_rt_abort_dangerous_thread
+	.p2align	2
+silica_rt_abort_dangerous_thread:
+	adrp	x0, Lrta_r_dangerous_thread
+	add	x0, x0, :lo12:Lrta_r_dangerous_thread
 	b	silica_rt_abort_with
 "
 }
@@ -448,11 +456,42 @@ Lsfh_pc_done:
 	cbnz	w0, L_sfh_done
 	b	L_sfh_crash
 L_sfh_exhausted:
-// The end of a reservation the program lowered: (:explicit, :stack_exhausted) for this actor only.
+// The end of the reservation, for this actor only (decision 39, chunk15_stack_memory_design.md §10):
+// (:explicit, :reservation_exceeded) when the program lowered it (#376 = 1), (:explicit, :out_of_memory)
+// when the default reservation, the machine's memory plus swap, is used up. X8 = the reason atom.
+	ldr	x9, [x20, #376]
+	cbz	x9, L_sfh_exhausted_default
+	adrp	x8, silica_rt_reservation_exceeded_atom
+	add	x8, x8, :lo12:silica_rt_reservation_exceeded_atom
+	ldr	x8, [x8]
+	b	L_sfh_exhausted_reason
+L_sfh_exhausted_default:
+	adrp	x8, silica_rt_out_of_memory_atom
+	add	x8, x8, :lo12:silica_rt_out_of_memory_atom
+	ldr	x8, [x8]
+L_sfh_exhausted_reason:
+	ldr	x9, [x20, #440]
+	cbz	x9, L_sfh_exhausted_thread
+// A carrier actor (item N stage 1): the exit runs on the carrier's stack, reached by returning from
+// this handler into silica_rt_actor_fail_current(ACB, atom) with the signal frame unwound by the
+// kernel, so the carrier thread's alternate-stack state and signal mask are those of a thread
+// outside a handler when the next actor on it faults. Linux AArch64 ucontext_t (X24): uc_mcontext
+// (struct sigcontext) inline at +176: fault_address +0, regs[0..30] at +8 (x0 at 184, x1 at 192),
+// sp at +256 (432), pc at +264 (440, what the handler reads above), pstate at 448. The handler
+// returns normally; glibc's restorer (sa_restorer, set by sigaction) runs rt_sigreturn, which
+// restores the signal mask (uc_sigmask, untouched) and the registers from this frame; the next
+// fault on the thread is taken on its alternate stack again because SP is then outside it.
+	str	x20, [x24, #184]
+	str	x8, [x24, #192]
+	ldr	x11, [x9, #48]
+	str	x11, [x24, #432]
+	adrp	x11, silica_rt_actor_fail_current
+	add	x11, x11, :lo12:silica_rt_actor_fail_current
+	str	x11, [x24, #440]
+	b	L_sfh_done
+L_sfh_exhausted_thread:
 	mov	x0, x20
-	adrp	x8, silica_rt_stack_exhausted_atom
-	add	x8, x8, :lo12:silica_rt_stack_exhausted_atom
-	ldr	x1, [x8]
+	mov	x1, x8
 	bl	silica_rt_actor_fail_current
 	b	L_sfh_crash
 L_sfh_unrecoverable:
@@ -601,8 +640,8 @@ L_gff_have_actor:
 	mov	x8, #5
 	str	x8, [x19, #232]
 	str	wzr, [x19, #152]
-	add	x0, x19, #80
-	bl	silica_rt_cv_signal
+	mov	x0, x19
+	bl	silica_rt_actor_mail_signal
 	add	x0, x19, #16
 	bl	silica_rt_lock_unlock
 	ldr	x8, [x19, #216]
@@ -625,14 +664,27 @@ L_gff_after_report:
 // exit notice is parked at #400 until its spawner has committed it to the row.
 	ldr	x8, [x19, #224]
 	cbnz	x8, L_gff_started_set
-	mov	x8, #2
-	add	x9, x19, #224
-	stlr	x8, [x9]
+	mov	x0, x19
+	mov	x1, #2
+	bl	silica_rt_started_store
 L_gff_started_set:
 	mov	x0, x19
 	bl	silica_rt_actor_signal_pending_call_deaths
 // The recovery siglongjmp'd back onto the actor stack; this thread ends here, so move onto its alt
-// stack (top; nothing there is needed again) before that stack is unmapped, as fail_current does.
+// stack (top; nothing there is needed again) before that stack is unmapped, as fail_current does;
+// the thread itself ends through silica_rt_thread_actor_end, back on its own stack. A carrier
+// actor is not reachable here (the FFI is confined to dangerous actors, which keep a thread each;
+// prims_actors_carrier_asm.silica header); the branch would move onto its carrier's stack and end
+// in the carrier loop.
+	ldr	x21, [x19, #440]
+	cbz	x21, L_gff_thread_actor
+	ldr	x9, [x21, #48]
+	mov	sp, x9
+	mov	x0, x19
+	mov	x1, xzr
+	bl	silica_rt_actor_stack_free
+	b	L_gff_keep_stack
+L_gff_thread_actor:
 	ldr	x9, [x19, #352]
 	cbz	x9, L_gff_keep_stack
 	mov	x10, #65536
@@ -648,12 +700,14 @@ L_gff_keep_stack:
 	bl	silica_rt_child_table_free
 	mov	x0, x19
 	bl	silica_rt_actor_dealloc_region
+	cbz	x21, L_gff_thread_end
 	mov	x0, x19
 	bl	silica_rt_actor_final_release
-L_gff_thread_exit:
-	mov	x0, xzr
-	bl	pthread_exit
-	b	L_gff_thread_exit
+	mov	x0, x21
+	b	silica_rt_carrier_loop_enter
+L_gff_thread_end:
+	mov	x0, x19
+	b	silica_rt_thread_actor_end
 L_gff_process:
 // A guarded foreign fault with no current actor has no supervisor to deliver it to: a fatal fault
 // (spec §15.4.5.5), reported from the fields the handler recorded before it jumped back here.

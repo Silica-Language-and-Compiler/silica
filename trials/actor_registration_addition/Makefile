@@ -167,13 +167,13 @@ integrate-run:
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1; continue; \
 		fi; \
-		if [ -f "$$stem.scout" ]; then \
+		if [ -f "$(call SCOUT_FOR,$$stem)" ]; then \
 			{ { grep -q '^use trial_support_' "$$stem.silica" || [ -f "$$stem.no_stdin_exit" ] || printf 'exit\n'; } | ./$$stem 2>&1; echo $$?; } > "$$stem.sout"; \
 			if [ -f "$$stem.scout.multiset" ]; then set -- bash "$(THIS_DIR)compare_scout_multiset.sh"; else set -- diff -Bw; fi; \
-			if ! "$$@" "$$stem.sout" "$$stem.scout" > /dev/null 2>&1; then \
+			if ! "$$@" "$$stem.sout" "$(call SCOUT_FOR,$$stem)" > /dev/null 2>&1; then \
 				echo "❌❌ $(MSG_PREFIX)$$stem .sout differs from .scout"; \
 				$(INTEGRATE_DOT_FAIL); \
-				"$$@" "$$stem.sout" "$$stem.scout" || true; \
+				"$$@" "$$stem.sout" "$(call SCOUT_FOR,$$stem)" || true; \
 				ko=$$((ko + 1)); failed=1; \
 			else \
 				echo "✅✅ $(MSG_PREFIX)$$stem output matches .scout"; \

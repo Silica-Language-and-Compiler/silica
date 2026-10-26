@@ -22,6 +22,47 @@ and Return. It is not a trial and is not run by any harness.
   machine's memory plus swap of address space, so address space runs out first, after a few thousand
   actors, and the number says little about memory. A small reserve measures what idle actors really cost.
 
+## Measured with `:release_when_idle` (2026-10-20, Apple Silicon)
+
+On a 16 GB, 10-core Mac, each actor sent one message right after spawn, reserve 65536, 1,000,000 idle actors:
+
+| Release policy | Wall time to the last total | Peak RSS | RSS at rest |
+| --- | ---: | ---: | ---: |
+| `:release_when_idle`, current runtime | 5.48 s | 1,262 MB | 654 MB |
+| `:release_when_idle`, before the budgeted sweep | 28.16 s | 1,240 MB | not recorded |
+| `:release_on_return` | 5.95 s | not recorded | 655 MB |
+
+Peak RSS comes from polling the process's resident set size every 50 ms, which
+`programmer_tools/peak_rss.sh` does (BSD `ps -o rss=` on macOS; `/proc/<pid>/status` on Linux, no `bc` or BSD
+`ps` needed). It also reports the peak thread count on Linux and, with `RWI_RSS_CAP_MB` and
+`RWI_MIN_AVAIL_MB`, stops the program before it can exhaust the machine.
+
+## Measured on Linux (2026-10-20)
+
+Same program with the spawner changed to stop at the target (one `case new_total >= N` around the
+`cast_registered` at the end of `spawner`, otherwise the file is unchanged), reserve 65536, each actor sent
+one message, `:release_when_idle`, run through `peak_rss.sh`:
+
+| Machine | Idle actors | Wall time to the last total | Peak RSS | RSS at rest | Threads |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AArch64 (pix) | 100,000 | 0.15 to 0.20 s | 109 MB | 55 MB | not recorded |
+| x86-64 (nix, 8 cores) | 100,000 | 0.30 s | 55.5 MB | 55.5 MB | 9 |
+| x86-64 (nix, 8 cores) | 1,000,000 | 2.48 s | 536 MB | 536 MB | 9 |
+
+`SILICA_CARRIER_COUNT` sets the carrier threads, and the thread count is the carriers plus one. On nix,
+100,000 actors took 0.29 to 0.31 s and 55.4 to 55.5 MB with `SILICA_CARRIER_COUNT` 1, 2 and 4 (threads 2, 3
+and 5) as with it unset (8 carriers, 9 threads). The unmodified program (no stopping point) starts and prints
+`1000 idle actors` at each of those settings; left running it reaches about 650 to 690 MB of RSS within three
+seconds, so stop it with `exit` and Return.
+
+## Environment variables for `:release_when_idle`
+
+- `SILICA_IDLE_RELEASE_MS=<milliseconds>`: the idle period after which a stack is given back (default 1000;
+  unset, 0 or non-numeric gives the default; values above 3,600,000 are clamped). It is an upper bound: the
+  runtime keeps a budget for the stacks idle actors still hold and releases the oldest early when it is exceeded.
+- `SILICA_IDLE_STACK_BUDGET=<bytes>`: that budget for the whole process (default: the machine's memory plus
+  swap divided by 32, shared among the carriers, at least 16 platform pages each).
+
 ## Build (macOS on Apple silicon)
 
 From this directory, with the repository's published compiler:
@@ -34,12 +75,42 @@ clang -c -x assembler __silica_runtime.sams -o __silica_runtime.o
 clang main.o __silica_runtime.o -o idle_actor_capacity -Wl,-e,main
 ```
 
+## Build (Linux, x86-64 or AArch64)
+
+The same compile with the native compiler for the machine (`binaries/silica-compiler`), then assemble and link as `trials/linux_host.mk` does:
+
+```sh
+echo main.silica > silica.config
+../../../binaries/silica-compiler
+cc -c -x assembler main.sams -o main.o
+cc -c -x assembler __silica_runtime.sams -o __silica_runtime.o
+cc main.o __silica_runtime.o -o idle_actor_capacity -no-pie -rdynamic -lpthread
+```
+
+Do not pass `-Wl,-e,main` on Linux. The macOS line above works because dyld calls the entry point as a
+function and exits with its result; on Linux the entry point is where the kernel starts the process, with
+`argc` at the top of the stack and no return address. Entered that way, `main` runs on a stack that is 8
+bytes off the System V alignment its callees expect (`rsp` is 16-byte aligned at the entry point, and
+16-byte aligned plus 8 at a function's entry), so the first libc routine that keeps a 16-byte value on its
+stack faults before any output: on x86-64 `movaps` in `pthread_create`, reached from the injected
+`silica_pid_registry_init` as the registry actor takes the first carrier thread, reported as
+`[silica] fault at ... addr=0x0 actor=0x0`, exit 70. And `main`'s `ret` would have nowhere to go. With
+`crt1.o` (no `-e`), `_start` calls `main` the ordinary way. `-no-pie`: the emitted data tables hold absolute
+addresses. `-rdynamic`: the failure banner names behaviours through `dladdr`, which on glibc sees only
+`.dynsym`.
+
+On Linux the program ends only when it reads the line `exit` (with its newline) on a standard input that stays
+open; end-of-file alone never ends it, so do not start it under `nohup` or with `</dev/null`. Run it from a
+terminal and type `exit`, or drive it with the harness: `python3 trials/carriers_addition/run_integration_exit_after_marker.py
+<dir>/ idle_actor_capacity out.txt "100000 idle actors" 1`, or `(sleep 20; echo exit) | ./idle_actor_capacity`.
+The last line of the output is the exit status, 0 after a clean stop.
+
 The compile, assemble and link steps were checked on 2026-10-08 with `silica-999955` (an 83 KB executable).
 Since 2026-10-11 `main` registers a FailureReporter before it starts the spawner (spec §15.4.13.4, error
 E2236 otherwise); the reporter writes each failure report to stderr, as the runtime did before. That version
 was compiled, assembled and linked again on 2026-10-16 with a private build of the current tree (a 106 KB
 executable), and run for two seconds on macOS before being stopped: it printed `1000 idle actors`,
-`2000 idle actors`, and so on, reaching `411000 idle actors` in those two seconds, with no failure. The
+`2000 idle actors`, and so on, reaching `411000 idle actors` in those two seconds, with no failure. (Later note, 2026-10-20: that figure could not be reproduced; the thread-backed program reaches about 4,000 actors. The measured carrier figure is 1,000,000 idle actors, 630 MB RSS, item N stage 4.) The
 compile writes its outputs next to `main.silica`, so build in a scratch copy of this directory rather than in
 the repository tree.
 

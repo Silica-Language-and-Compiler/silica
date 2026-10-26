@@ -20,7 +20,7 @@
 // concatenates these in the same order as the AArch64 original; every chunk starts at a section
 // boundary (chunk 9 .rodata, 10 .bss, 11 .text, 12 .rodata, 13 .text), so no routine straddles into
 // or out of this module. All data layouts, control-block offsets and constants are those documented
-// in prims_actors_runtime_asm.silica (ACB 408 B, item I, 152 B message nodes, mailbox pairs at #128/#136 and
+// in prims_actors_runtime_asm.silica (ACB 528 B, items I and N, 152 B message nodes, mailbox pairs at #128/#136 and
 // #232/#240 with the u32 depth at #248, arena fields #160..#184, region list cells [next][size]).
 //
 // Register model (shared by the linux_x86_64 runtime modules): X0..X7 -> rdi rsi rdx rcx r8 r9 r14 r15,
@@ -37,7 +37,8 @@
 // Cross-routine register contracts kept from the AArch64 text:
 //   silica_rt_tls_actor_set_from_x19: on x86-64 the ACB arrives in rdi (X0); callers load their X19
 //     value into rdi before the call (the caller's [rbp-8] slot is not read: C-called routines may
-//     have pushed registers there).
+//     have pushed registers there). Since item N it is silica_rt_tls_actor_set (prims_actors_carrier_asm):
+//     the pthread key names a two-word thread record, the current actor and the carrier, not the ACB.
 //   silica_rt_region_mark returns the mark in rax (X16) and silica_rt_region_release_to takes it
 //     in rax (X16), preserving rdi/rsi (X0/X1) as the original preserved X0/X1.
 //   L_bc_push (private to silica_rt_apple_build_cache_levels) now takes the list head in rdi instead
@@ -114,35 +115,145 @@ L_tok_opt_advsimd:
 	.p2align	2
 # -- Begin function silica_rt_build_int_range_list
 silica_rt_build_int_range_list:
-# rdi=start rsi=count -> rdi=cons list [start..start+count-1] or nil
-# frame: [rbp-8] start (X19), [rbp-16] count (X20), [rbp-24] head (X21), [rbp-32] value (X22)
+# rdi = start, rsi = count -> rdi = the List[int64, mem(normal)] [start .. start + count - 1], or 0
+# (nil) when count <= 0 or the region is exhausted. The layout is the one the compiled list prims
+# read (prims_list.silica): a 24-byte handle {length, first chunk, cursor} over 32-byte chunks
+# {two int64 slots filled back to front, next chunk at +16, claim at +24}. The elements go in
+# from the last to the first, so every chunk after the first is full (cursor 0) as
+# L_list_tail_helper expects when it steps to a successor, and the first chunk's claim equals its
+# cursor so a later prepend takes its free slot in place. Allocation is the actor's region
+# (silica_rt_region_alloc: rdi = bytes -> rdi = block), as the compiled prepend allocates, so the
+# list is released with the actor that asked for it. Earlier this built 16-byte cons cells
+# {value, next}: read as a handle, the first value was the length and the next cell the chunk,
+# which is what cpu_topology_runtime_queries faulted on.
+# frame: [rbp-8] start (X19), [rbp-16] remaining (X20), [rbp-24] chunk (X21), [rbp-32] cursor (X22),
+#        [rbp-40] value (X23), [rbp-48] count (X24)
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rbp - 16], rsi
+	mov	QWORD PTR [rbp - 48], rsi
 	mov	QWORD PTR [rbp - 24], 0
+	mov	QWORD PTR [rbp - 32], 0
 	test	rsi, rsi
-	jz	LBBrl_done
-	lea	rax, [rdi + rsi - 1]
-	mov	QWORD PTR [rbp - 32], rax
+	jle	LBBrl_nil
+	lea	rax, [rdi + rsi]
+	mov	QWORD PTR [rbp - 40], rax
 LBBrl_loop:
-	mov	edi, 16
-	call	malloc
-	test	rax, rax
-	jz	LBBrl_done
+	cmp	QWORD PTR [rbp - 16], 0
+	je	LBBrl_handle
+	sub	QWORD PTR [rbp - 40], 1
+	cmp	QWORD PTR [rbp - 32], 0
+	jne	LBBrl_store
+	mov	edi, 32
+	call	silica_rt_region_alloc
+	test	rdi, rdi
+	jz	LBBrl_nil
+	mov	rax, QWORD PTR [rbp - 24]
+	mov	QWORD PTR [rdi + 16], rax
+	mov	QWORD PTR [rdi + 24], 0
+	mov	QWORD PTR [rbp - 24], rdi
+	mov	QWORD PTR [rbp - 32], 16
+LBBrl_store:
 	mov	rcx, QWORD PTR [rbp - 32]
-	mov	QWORD PTR [rax], rcx
-	mov	rcx, QWORD PTR [rbp - 24]
-	mov	QWORD PTR [rax + 8], rcx
-	mov	QWORD PTR [rbp - 24], rax
-	mov	rcx, QWORD PTR [rbp - 32]
-	sub	rcx, 1
+	sub	rcx, 8
 	mov	QWORD PTR [rbp - 32], rcx
-	cmp	rcx, QWORD PTR [rbp - 8]
-	jge	LBBrl_loop
-LBBrl_done:
-	mov	rdi, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [rbp - 24]
+	mov	rdx, QWORD PTR [rbp - 40]
+	mov	QWORD PTR [rax + rcx], rdx
+	sub	QWORD PTR [rbp - 16], 1
+	jmp	LBBrl_loop
+LBBrl_handle:
+	mov	rax, QWORD PTR [rbp - 24]
+	mov	rcx, QWORD PTR [rbp - 32]
+	mov	QWORD PTR [rax + 24], rcx
+	mov	edi, 24
+	call	silica_rt_region_alloc
+	test	rdi, rdi
+	jz	LBBrl_nil
+	mov	rax, QWORD PTR [rbp - 48]
+	mov	QWORD PTR [rdi], rax
+	mov	rax, QWORD PTR [rbp - 24]
+	mov	QWORD PTR [rdi + 8], rax
+	mov	rax, QWORD PTR [rbp - 32]
+	mov	QWORD PTR [rdi + 16], rax
+	leave
+	ret
+LBBrl_nil:
+	xor	edi, edi
+	leave
+	ret
+# -- End function
+	.p2align	2
+# -- Begin function silica_rt_build_list_from_words
+silica_rt_build_list_from_words:
+# rdi = array of one-word elements (element i at [rdi + 8 i]), rsi = count -> rdi = the
+# List[T, mem(normal)] holding those words in array order, or 0 (nil) when count <= 0 or the
+# region is exhausted. The handle and chunk layout and the back-to-front fill are those of
+# silica_rt_build_int_range_list above; the word is what the element type keeps in a chunk slot
+# (prims_list chunk_elem_slot_bytes): a pointer to a boxed record for every record the runtime
+# does not splice inline, a string header pointer, an int64. get_cpu_topology builds cores,
+# numa_nodes, memory_ranges and cache_hierarchy.levels through it, and
+# silica_rt_apple_hw_optional_caps_list the capabilities strings.
+# frame: [rbp-8] array (X19), [rbp-16] remaining (X20), [rbp-24] chunk (X21), [rbp-32] cursor (X22),
+#        [rbp-40] value (X23), [rbp-48] count (X24)
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	mov	QWORD PTR [rbp - 48], rsi
+	mov	QWORD PTR [rbp - 24], 0
+	mov	QWORD PTR [rbp - 32], 0
+	test	rsi, rsi
+	jle	LBBlw_nil
+LBBlw_loop:
+	mov	rcx, QWORD PTR [rbp - 16]
+	test	rcx, rcx
+	jz	LBBlw_handle
+	sub	rcx, 1
+	mov	QWORD PTR [rbp - 16], rcx
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rax, QWORD PTR [rax + rcx*8]
+	mov	QWORD PTR [rbp - 40], rax
+	cmp	QWORD PTR [rbp - 32], 0
+	jne	LBBlw_store
+	mov	edi, 32
+	call	silica_rt_region_alloc
+	test	rdi, rdi
+	jz	LBBlw_nil
+	mov	rax, QWORD PTR [rbp - 24]
+	mov	QWORD PTR [rdi + 16], rax
+	mov	QWORD PTR [rdi + 24], 0
+	mov	QWORD PTR [rbp - 24], rdi
+	mov	QWORD PTR [rbp - 32], 16
+LBBlw_store:
+	mov	rcx, QWORD PTR [rbp - 32]
+	sub	rcx, 8
+	mov	QWORD PTR [rbp - 32], rcx
+	mov	rax, QWORD PTR [rbp - 24]
+	mov	rdx, QWORD PTR [rbp - 40]
+	mov	QWORD PTR [rax + rcx], rdx
+	jmp	LBBlw_loop
+LBBlw_handle:
+	mov	rax, QWORD PTR [rbp - 24]
+	mov	rcx, QWORD PTR [rbp - 32]
+	mov	QWORD PTR [rax + 24], rcx
+	mov	edi, 24
+	call	silica_rt_region_alloc
+	test	rdi, rdi
+	jz	LBBlw_nil
+	mov	rax, QWORD PTR [rbp - 48]
+	mov	QWORD PTR [rdi], rax
+	mov	rax, QWORD PTR [rbp - 24]
+	mov	QWORD PTR [rdi + 8], rax
+	mov	rax, QWORD PTR [rbp - 32]
+	mov	QWORD PTR [rdi + 16], rax
+	leave
+	ret
+LBBlw_nil:
+	xor	edi, edi
 	leave
 	ret
 # -- End function
@@ -171,112 +282,149 @@ L_si32_fail:
 	mov	edi, -1
 	leave
 	ret
-# rdi = C string pointer, rsi = tail (cons list or 0). Returns rdi = new head; malloc fail returns the tail.
+# rdi = C string pointer -> rdi = a Silica string over those bytes: the 24-byte header {-1, bytes,
+# byte length} every emitted string literal and string helper reads (string_literal_pool emits
+# `.quad -1`, the data label, the length), allocated in the actor's region; 0 when the region is
+# exhausted. The bytes stay where they are (rodata here). Replaces silica_rt_cons_cstr_list, which
+# consed bare C-string pointers into 16-byte cells that no compiled list or string code could read.
 	.p2align	2
-silica_rt_cons_cstr_list:
-# frame: [rbp-8] cstring (X19), [rbp-16] tail (X20)
+silica_rt_cstr_to_string:
+# frame: [rbp-8] cstring (X19), [rbp-16] length (X20)
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
-	mov	QWORD PTR [rbp - 16], rsi
-	mov	edi, 16
-	call	malloc
-	test	rax, rax
-	jz	L_ccl_fail
-	mov	rcx, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [rax], rcx
-	mov	rcx, QWORD PTR [rbp - 16]
-	mov	QWORD PTR [rax + 8], rcx
-	mov	rdi, rax
+	xor	eax, eax
+L_c2s_len:
+	cmp	BYTE PTR [rdi + rax], 0
+	je	L_c2s_alloc
+	add	rax, 1
+	jmp	L_c2s_len
+L_c2s_alloc:
+	mov	QWORD PTR [rbp - 16], rax
+	mov	edi, 24
+	call	silica_rt_region_alloc
+	test	rdi, rdi
+	jz	L_c2s_done
+	mov	QWORD PTR [rdi], -1
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rdi + 8], rax
+	mov	rax, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rdi + 16], rax
+L_c2s_done:
 	leave
 	ret
-L_ccl_fail:
-	mov	rdi, QWORD PTR [rbp - 16]
-	leave
-	ret
-# Machine-wide sysctl hw.optional.* flags -> cons list of cstrings (see cpu_topology_implementation_plan).
+# Machine-wide sysctl hw.optional.* flags -> List[string, mem(normal)] of their names (see
+# cpu_topology_implementation_plan): each present flag's name becomes a string header
+# (silica_rt_cstr_to_string) in the 8-word frame array at [rbp-144 .. rbp-80) (the AArch64
+# [x29, #64]), and the list is built over the array in detection order. Shared by every core_info.
 	.globl	silica_rt_apple_hw_optional_caps_list
 	.p2align	2
 silica_rt_apple_hw_optional_caps_list:
-# frame: [rbp-8] list head (X19)
+# frame: [rbp-8] entry count (X19); [rbp-144 + 8 i] entry i
 	push	rbp
 	mov	rbp, rsp
-	sub	rsp, 80
+	sub	rsp, 160
 	mov	QWORD PTR [rbp - 8], 0
 	lea	rdi, [rip + L_sc_opt_neon]
 	call	silica_rt_sysctl_i32
 	cmp	edi, 1
 	jne	L_iho_1
 	lea	rdi, [rip + L_tok_opt_neon]
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_cons_cstr_list
-	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_cstr_to_string
+	test	rdi, rdi
+	jz	L_iho_1
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp + rax*8 - 144], rdi
+	add	QWORD PTR [rbp - 8], 1
 L_iho_1:
 	lea	rdi, [rip + L_sc_opt_armv8crc]
 	call	silica_rt_sysctl_i32
 	cmp	edi, 1
 	jne	L_iho_2
 	lea	rdi, [rip + L_tok_opt_armv8crc]
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_cons_cstr_list
-	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_cstr_to_string
+	test	rdi, rdi
+	jz	L_iho_2
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp + rax*8 - 144], rdi
+	add	QWORD PTR [rbp - 8], 1
 L_iho_2:
 	lea	rdi, [rip + L_sc_opt_arm64]
 	call	silica_rt_sysctl_i32
 	cmp	edi, 1
 	jne	L_iho_3
 	lea	rdi, [rip + L_tok_opt_arm64]
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_cons_cstr_list
-	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_cstr_to_string
+	test	rdi, rdi
+	jz	L_iho_3
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp + rax*8 - 144], rdi
+	add	QWORD PTR [rbp - 8], 1
 L_iho_3:
 	lea	rdi, [rip + L_sc_opt_lse]
 	call	silica_rt_sysctl_i32
 	cmp	edi, 1
 	jne	L_iho_4
 	lea	rdi, [rip + L_tok_opt_lse]
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_cons_cstr_list
-	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_cstr_to_string
+	test	rdi, rdi
+	jz	L_iho_4
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp + rax*8 - 144], rdi
+	add	QWORD PTR [rbp - 8], 1
 L_iho_4:
 	lea	rdi, [rip + L_sc_opt_sha512]
 	call	silica_rt_sysctl_i32
 	cmp	edi, 1
 	jne	L_iho_5
 	lea	rdi, [rip + L_tok_opt_sha512]
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_cons_cstr_list
-	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_cstr_to_string
+	test	rdi, rdi
+	jz	L_iho_5
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp + rax*8 - 144], rdi
+	add	QWORD PTR [rbp - 8], 1
 L_iho_5:
 	lea	rdi, [rip + L_sc_opt_sha256]
 	call	silica_rt_sysctl_i32
 	cmp	edi, 1
 	jne	L_iho_6
 	lea	rdi, [rip + L_tok_opt_sha256]
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_cons_cstr_list
-	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_cstr_to_string
+	test	rdi, rdi
+	jz	L_iho_6
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp + rax*8 - 144], rdi
+	add	QWORD PTR [rbp - 8], 1
 L_iho_6:
 	lea	rdi, [rip + L_sc_opt_aes]
 	call	silica_rt_sysctl_i32
 	cmp	edi, 1
 	jne	L_iho_7
 	lea	rdi, [rip + L_tok_opt_aes]
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_cons_cstr_list
-	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_cstr_to_string
+	test	rdi, rdi
+	jz	L_iho_7
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp + rax*8 - 144], rdi
+	add	QWORD PTR [rbp - 8], 1
 L_iho_7:
 	lea	rdi, [rip + L_sc_opt_advsimd]
 	call	silica_rt_sysctl_i32
 	cmp	edi, 1
 	jne	L_iho_done
 	lea	rdi, [rip + L_tok_opt_advsimd]
-	mov	rsi, QWORD PTR [rbp - 8]
-	call	silica_rt_cons_cstr_list
-	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_cstr_to_string
+	test	rdi, rdi
+	jz	L_iho_done
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp + rax*8 - 144], rdi
+	add	QWORD PTR [rbp - 8], 1
 L_iho_done:
-	mov	rdi, QWORD PTR [rbp - 8]
+	lea	rdi, [rbp - 144]
+	mov	rsi, QWORD PTR [rbp - 8]
+	call	silica_rt_build_list_from_words
 	leave
 	ret
 # rdi = sysctl name cstring. Returns rdi = uint64 (0 on failure).
@@ -287,9 +435,12 @@ silica_rt_sysctl_u64:
 	mov	rbp, rsp
 	sub	rsp, 96
 	mov	QWORD PTR [rbp - 8], rdi
-	mov	DWORD PTR [rsp + 8], 8
+# The value and length words are zeroed first and the length (8) stored after them: before
+# 2026-10-19 the zeroing followed the length store and wiped it, so the query saw a length of 0
+# and every caller got 0 (hw.memsize for get_cpu_topology among them). Same fix as apple_silicon_mac.
 	mov	QWORD PTR [rsp], 0
 	mov	QWORD PTR [rsp + 8], 0
+	mov	DWORD PTR [rsp + 8], 8
 	mov	rdi, QWORD PTR [rbp - 8]
 	mov	rsi, rsp
 	lea	rdx, [rsp + 8]
@@ -307,16 +458,18 @@ L_s64_fail:
 	ret
 # Apple Silicon cache_info.levels: sysctl exposes per-cluster L1D/L2 (hw.perflevel0/1.*), aggregate hw.l1d/l2/l3,
 # hw.cachelinesize, hw.nperflevels. Not exposed in sysctl: SLC/unified last-level cache as a stable L3; associativity
-# (we store 0). rdi=P, rsi=E, rdx=total, rcx=all-core-ids list. Returns rdi = list head (cons spine) or 0.
+# (we store 0). rdi=P, rsi=E, rdx=total, rcx=all-core-ids list. Returns rdi = the boxed cache_info
+# record { levels: List[cache level] } (levels nil when none is known), or 0 when malloc fails.
 	.globl	silica_rt_apple_build_cache_levels
 	.p2align	2
 silica_rt_apple_build_cache_levels:
-# frame: [rbp-8] P (X19), [rbp-16] E (X20), [rbp-24] total (X21), [rbp-32] head (X22), [rbp-40] line (X23),
+# frame: [rbp-8] P (X19), [rbp-16] E (X20), [rbp-24] total (X21), [rbp-32] entry count (X22), [rbp-40] line (X23),
 # [rbp-48] P ids (X24), [rbp-56] E ids (X25), [rbp-64] all ids (X26), [rbp-72] nperflevels (X27),
-# [rbp-80] all-core-ids arg (X28); [rsp] sysctl value, [rsp+8] sysctl length
+# [rbp-80] all-core-ids arg (X28); [rbp-160 .. rbp-96) the 8-word entry array (the AArch64 [x29, #96]),
+# filled from the top by L_bc_push: entry c goes to [rbp - 104 - 8 c]; [rsp] sysctl value, [rsp+8] sysctl length
 	push	rbp
 	mov	rbp, rsp
-	sub	rsp, 96
+	sub	rsp, 176
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rbp - 16], rsi
 	mov	QWORD PTR [rbp - 24], rdx
@@ -372,9 +525,11 @@ L_bc_agg:
 	mov	rcx, QWORD PTR [rbp - 40]
 	xor	r8d, r8d
 	mov	r9, QWORD PTR [rbp - 64]
-	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 104]
 	call	L_bc_push
-	mov	QWORD PTR [rbp - 32], rdi
+	add	QWORD PTR [rbp - 32], rdi
 L_bc_a_skip_l3:
 	lea	rdi, [rip + L_hw_l2cachesize_str]
 	call	silica_rt_sysctl_u64
@@ -388,9 +543,11 @@ L_bc_a_skip_l3:
 	mov	rcx, QWORD PTR [rbp - 40]
 	xor	r8d, r8d
 	mov	r9, QWORD PTR [rbp - 64]
-	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 104]
 	call	L_bc_push
-	mov	QWORD PTR [rbp - 32], rdi
+	add	QWORD PTR [rbp - 32], rdi
 L_bc_a_skip_l2:
 	lea	rdi, [rip + L_hw_l1dcachesize_str]
 	call	silica_rt_sysctl_u64
@@ -404,9 +561,11 @@ L_bc_a_skip_l2:
 	mov	rcx, QWORD PTR [rbp - 40]
 	xor	r8d, r8d
 	mov	r9, QWORD PTR [rbp - 64]
-	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 104]
 	call	L_bc_push
-	mov	QWORD PTR [rbp - 32], rdi
+	add	QWORD PTR [rbp - 32], rdi
 	jmp	L_bc_done
 L_bc_dual:
 	lea	rdi, [rip + L_hw_l3cachesize_str]
@@ -421,9 +580,11 @@ L_bc_dual:
 	mov	rcx, QWORD PTR [rbp - 40]
 	xor	r8d, r8d
 	mov	r9, QWORD PTR [rbp - 64]
-	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 104]
 	call	L_bc_push
-	mov	QWORD PTR [rbp - 32], rdi
+	add	QWORD PTR [rbp - 32], rdi
 L_bc_d_skip_l3:
 	cmp	DWORD PTR [rbp - 16], 0
 	je	L_bc_d_skip_el2
@@ -439,9 +600,11 @@ L_bc_d_skip_l3:
 	mov	rcx, QWORD PTR [rbp - 40]
 	xor	r8d, r8d
 	mov	r9, QWORD PTR [rbp - 56]
-	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 104]
 	call	L_bc_push
-	mov	QWORD PTR [rbp - 32], rdi
+	add	QWORD PTR [rbp - 32], rdi
 L_bc_d_skip_el2:
 	cmp	DWORD PTR [rbp - 8], 0
 	je	L_bc_d_skip_pl2
@@ -457,9 +620,11 @@ L_bc_d_skip_el2:
 	mov	rcx, QWORD PTR [rbp - 40]
 	xor	r8d, r8d
 	mov	r9, QWORD PTR [rbp - 48]
-	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 104]
 	call	L_bc_push
-	mov	QWORD PTR [rbp - 32], rdi
+	add	QWORD PTR [rbp - 32], rdi
 L_bc_d_skip_pl2:
 	cmp	DWORD PTR [rbp - 16], 0
 	je	L_bc_d_skip_el1
@@ -475,9 +640,11 @@ L_bc_d_skip_pl2:
 	mov	rcx, QWORD PTR [rbp - 40]
 	xor	r8d, r8d
 	mov	r9, QWORD PTR [rbp - 56]
-	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 104]
 	call	L_bc_push
-	mov	QWORD PTR [rbp - 32], rdi
+	add	QWORD PTR [rbp - 32], rdi
 L_bc_d_skip_el1:
 	cmp	DWORD PTR [rbp - 8], 0
 	je	L_bc_done
@@ -493,10 +660,21 @@ L_bc_d_skip_el1:
 	mov	rcx, QWORD PTR [rbp - 40]
 	xor	r8d, r8d
 	mov	r9, QWORD PTR [rbp - 48]
-	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 104]
 	call	L_bc_push
-	mov	QWORD PTR [rbp - 32], rdi
+	add	QWORD PTR [rbp - 32], rdi
 L_bc_done:
+# levels: the [rbp-32] entries sit at the top of the entry array (L_bc_push fills it from the
+# top), so the list over [rbp - 96 - 8 count, count) runs L1 .. L3 as the cons spine this replaced
+# did; [rbp-32] becomes the list handle (0 when there are no levels).
+	mov	rax, QWORD PTR [rbp - 32]
+	neg	rax
+	lea	rdi, [rbp + rax*8 - 96]
+	mov	rsi, QWORD PTR [rbp - 32]
+	call	silica_rt_build_list_from_words
+	mov	QWORD PTR [rbp - 32], rdi
 	mov	edi, 16
 	call	malloc
 	mov	rdi, QWORD PTR [rbp - 32]
@@ -508,10 +686,12 @@ L_bc_done:
 L_bc_wrapped:
 	leave
 	ret
-# rdi=head rsi=level rdx=size_kb rcx=line r8=assoc r9=shared -> rdi=new head (malloc failure returns head)
+# rdi = the caller's array slot for this entry, rsi=level rdx=size_kb rcx=line r8=assoc r9=shared
+# -> rdi = 1 when the boxed cache-level record (48 bytes: shape word + 5 fields) was built and its
+# pointer stored in the slot, 0 when malloc failed (the caller adds rdi to its entry count).
 L_bc_push:
-# frame: [rbp-8] head (X19), [rbp-16] level (X20), [rbp-24] size_kb (X21), [rbp-32] line, [rbp-40] assoc,
-# [rbp-48] shared, [rbp-56] entry pointer
+# frame: [rbp-8] slot (X19), [rbp-16] level (X20), [rbp-24] size_kb (X21), [rbp-32] line, [rbp-40] assoc,
+# [rbp-48] shared
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -536,20 +716,13 @@ L_bc_push:
 	mov	QWORD PTR [rax + 32], rcx
 	mov	rcx, QWORD PTR [rbp - 48]
 	mov	QWORD PTR [rax + 40], rcx
-	mov	QWORD PTR [rbp - 56], rax
-	mov	edi, 16
-	call	malloc
-	test	rax, rax
-	jz	L_bcp_fail
-	mov	rcx, QWORD PTR [rbp - 56]
-	mov	QWORD PTR [rax], rcx
 	mov	rcx, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [rax + 8], rcx
-	mov	rdi, rax
+	mov	QWORD PTR [rcx], rax
+	mov	edi, 1
 	leave
 	ret
 L_bcp_fail:
-	mov	rdi, QWORD PTR [rbp - 8]
+	xor	edi, edi
 	leave
 	ret
 "
@@ -603,7 +776,9 @@ L_tlse_done:
 	.globl	silica_rt_tls_current_actor_get
 	.p2align	2
 silica_rt_tls_current_actor_get:
-# -> rdi = current actor (pthread_getspecific result) or 0
+# -> rdi = this thread's current actor: the first word of the thread's record (the pthread key names
+# it; silica_rt_tls_record_set), 0 on a thread with no record (main before any drain) or whose
+# record holds none (a carrier between actors).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -611,26 +786,19 @@ silica_rt_tls_current_actor_get:
 	lea	rax, [rip + silica_actor_pthread_key]
 	mov	rdi, QWORD PTR [rax]
 	call	pthread_getspecific
-	mov	rdi, rax
+	xor	edi, edi
+	test	rax, rax
+	jz	L_tcag_ret
+	mov	rdi, QWORD PTR [rax]
+L_tcag_ret:
 	leave
 	ret
 	.globl	silica_rt_tls_actor_set_from_x19
 	.p2align	2
 silica_rt_tls_actor_set_from_x19:
-# rdi = ACB (the caller's X19 value, moved into rdi by the caller); kept in [rsp] across
-# silica_rt_ensure_actor_tls_key. Nothing of the caller's frame is read or reloaded.
-	push	rbp
-	mov	rbp, rsp
-	sub	rsp, 96
-	mov	QWORD PTR [rsp], rdi
-	call	silica_rt_ensure_actor_tls_key
-	mov	rsi, QWORD PTR [rsp]
-	lea	rax, [rip + silica_actor_pthread_key]
-	mov	rdi, QWORD PTR [rax]
-	call	pthread_setspecific
-	mov	rdi, rax
-	leave
-	ret
+# rdi = the ACB to install as this thread's current actor (the caller's X19 value, moved into rdi
+# by the caller). The record's first word (prims_actors_carrier_asm.silica).
+	jmp	silica_rt_tls_actor_set
 	.p2align	2
 silica_rt_actor_init_region: # arena bookkeeping for the actor's implicit heap
 # rdi=actor_ptr. The arena is a chain of anonymous blocks allocated on demand by
@@ -763,12 +931,25 @@ silica_rt_migrate_actor:
 	jmp	silica_rt_ref_call
 	.p2align	2
 silica_rt_migrate_actor_acb:
-# rdi=actor_ref rsi=target_core -> rdi = 0 (:ok) or 2 (:actor_not_found, a null reference); the emitter
-# maps the code to the program's atom (prims_actors emit_prim_op_with_atoms). Hosted pinning is the
-# thread's affinity hint; the OS may still share or move the thread (spec §22.10), so the hint's own
-# result is not reported.
+# rdi = ACB (held) or 0, rsi = target core -> rdi = 0 (:ok: the move is requested, and done at the
+# actor's next dispatch boundary, at once when it is idle), 1 (:invalid_target: no logical core of
+# that id on this machine, silica_rt_logical_cpu_count, the count get_cpu_topology reports),
+# 2 (:actor_not_found: a null reference, or an actor that has ended); the emitter maps the code to
+# the program's atom (prims_actors emit_prim_op_with_atoms). 3 (:migration_blocked) only when the
+# target carrier has no thread yet and the host refuses one (dangerous actors may hold every
+# thread it allows; item N #5): nothing else blocks a move. A carrier actor (#144 = 0, item N stage 3) is
+# moved to the carrier of the core, `core mod N` as at spawn (silica_rt_carrier_migrate, which
+# says what happens per status). A dangerous actor (a thread of its own, #144) gets the thread's
+# affinity hint, as every actor did before carriers; the OS may still share or move the thread
+# (spec §22.10), so the hint's own result is not reported.
 	test	rdi, rdi
 	jz	Lmig_not_found
+	cmp	DWORD PTR [rdi + 152], 0
+	je	Lmig_not_found
+	cmp	rsi, QWORD PTR [rip + silica_rt_logical_cpu_count]
+	jae	Lmig_invalid
+	cmp	QWORD PTR [rdi + 144], 0
+	je	Lmig_carrier
 # frame: [rbp-8] target core (X19), [rbp-16] thread (X20); [rsp] the 4-byte policy tag
 	push	rbp
 	mov	rbp, rsp
@@ -787,6 +968,22 @@ silica_rt_migrate_actor_acb:
 	xor	edi, edi
 	leave
 	ret
+Lmig_carrier:
+# frame: [rbp-8] ACB (X19)
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rdi, rsi
+	call	silica_rt_carrier_for_core
+	mov	rsi, rdi
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_carrier_migrate
+	leave
+	ret
+Lmig_invalid:
+	mov	edi, 1
+	ret
 Lmig_not_found:
 	mov	edi, 2
 	ret
@@ -797,6 +994,23 @@ Lmig_not_found:
 fn actor_rt_asm_chunk_13() -> string {
     "	.text
 # get_actor_memory_usage lives in prims_actors_stack_asm.silica (four-field record).
+	.globl	silica_rt_region_alloc_in
+	.p2align	2
+silica_rt_region_alloc_in:
+# rdi = an ACB or 0, rsi = size: as silica_rt_region_alloc, but in THAT actor's arena (0: the
+# fallback list, as in main). The reply boundary move copies a composite reply into the caller's
+# arena with it (design region_memory_safety_design.md H4); the caller is blocked in its call, so
+# nothing else bumps that arena meanwhile. Same frame as silica_rt_region_alloc.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 96
+	lea	rax, [rsi + 7]
+	and	rax, -8
+	mov	QWORD PTR [rbp - 8], rax
+	mov	QWORD PTR [rbp - 16], rdi
+	test	rdi, rdi
+	jz	LBBra_fallback
+	jmp	LBBra_have_actor
 	.globl	silica_rt_region_alloc
 	.p2align	2
 # -- Begin function silica_rt_region_alloc
@@ -814,6 +1028,7 @@ silica_rt_region_alloc:
 	mov	QWORD PTR [rbp - 16], rdi
 	test	rdi, rdi
 	jz	LBBra_fallback
+LBBra_have_actor:
 	mov	rax, QWORD PTR [rdi + 176]
 	test	rax, rax
 	jz	LBBra_grow
@@ -874,9 +1089,9 @@ LBBra_grow_map:
 	leave
 	ret
 LBBra_grow_failed:
-	xor	edi, edi
-	leave
-	ret
+# No block: the actor cannot continue (design region_memory_safety_design.md H5). Its arena is
+# untouched, so the exit path releases what it had; never returns.
+	call	silica_rt_region_alloc_failed
 LBBra_fallback:
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
@@ -1063,8 +1278,8 @@ silica_rt_actor_supervision_ingress_enqueue_acb:
 	mov	r10d, DWORD PTR [rcx + 16]
 	add	r10d, 1
 	mov	DWORD PTR [rcx + 16], r10d
-	lea	rdi, [rax + 80]
-	call	silica_rt_cv_signal
+	mov	rdi, rax
+	call	silica_rt_actor_mail_signal
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
@@ -1085,9 +1300,12 @@ Lsie_abort:
 	.globl	silica_rt_sb_require
 	.p2align	2
 silica_rt_sb_require:
-# rdi = ACB -> rdi = its supervision block (SB, 112 B: +0/+8 ingress front/rear, +16 depth u32,
+# rdi = ACB -> rdi = its supervision block (SB, 144 B: +0/+8 ingress front/rear, +16 depth u32,
 # +24 child-table head, +32 len, +40 sync_failure_reported, +48 start trampoline, +56 strategy,
-# +64 allowed restarts, +72 time frame, +80 restart count, +88 window start, +96 children counted in a replacement wait, +104 tearing down: sup_wait_enter, +112 references: sb_unref), made now when the
+# +64 allowed restarts, +72 time frame, +80 restart count, +88 window start, +96/+104 unused,
+# +112 references: sb_unref, +120 the holder of the restart token (0 free; the protocol in
+# prims_actors_child_table_asm.silica's header), +128 the carrier actors parked for the token,
+# +136 unused), made now when the
 # actor had none: by spawn for an actor with a trampoline, by the ingress enqueue for any other
 # actor that receives an exit notice (an add_child parent; the caller holds the target's lock),
 # by the child-table paths for the running actor. Freed by its last reference (sb_unref).
@@ -1099,7 +1317,7 @@ silica_rt_sb_require:
 	test	rdi, rdi
 	jnz	Lsbr_have
 	mov	edi, 1
-	mov	esi, 120
+	mov	esi, 144
 	call	calloc
 	mov	rdi, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rdi + 216], rax

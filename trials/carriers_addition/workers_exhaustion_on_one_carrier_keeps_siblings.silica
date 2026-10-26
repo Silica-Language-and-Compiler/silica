@@ -1,0 +1,111 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 2; risk R2.3): an actor exhausting a lowered
+// reservation on one carrier ends only itself; its carrier and the others run on. w (a 256 KB
+// reservation) and the relay q are spawned for core 1, the siblings s1 for core 1 and s2 for core
+// 2. The driver casts the deep message to q, whose call to w exhausts w's reservation: the fault
+// handler on carrier 1's signal stack rewrites the signal frame so that the kernel returns into
+// _silica_rt_actor_fail_current on carrier 1's own stack, w ends with (:explicit, :reservation_exceeded) (decision 39; was :stack_exhausted),
+// q's call raises actor_not_found and q ends the same way, and carrier 1 goes back to its queue.
+// The driver then waits for w's reservation and committed stack to be gone, polling through a
+// call to s1 each time (the call parks the driver, so a carrier shared with w runs w's exit
+// meanwhile; a busy poll on one carrier would never let it), and calls s1 and s2 with messages
+// that recurse 300,000 deep: a carrier that just handled an exhaustion grows a sibling's stack
+// past 8 MB afterwards, and so does the other carrier.
+//
+// Expected output (compared as a multiset: the reports are asynchronous):
+//   9                                       w's lowered reservation is 262144 (a check)
+//   55                                      call(w, 55) recurses 55 deep within it
+//   failure report, #0 beh, reason_tag 4    w's 1,000,000-deep message exhausts the reservation
+//   failure report, #0 relay, reason_tag 4  q's call to w raises actor_not_found
+//   9                                       w's reservation and committed stack were released
+//   300000, 300000                          s1 (w's carrier) and s2 answer deep messages afterwards
+//   0                                       exit status
+// The same with SILICA_CARRIERS=0 and at every carrier count. Printed values avoid the digits 1-4
+// and 8 where they are checks (compare_scout_multiset.sh folds those): 9 holds, 6 does not.
+
+use trial_support_int64;
+
+fn depth(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            r: int64 <- depth(n - 1);
+            r + 1
+        }
+    }
+}
+
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+fn relay(msg: int64, state: actor_ref) -> (:no_reply, actor_ref) {
+    sequence proc[concurrency]
+        _: int64 <- call(state, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// True once w holds no reservation and no committed stack; false after `tries` polls, each
+// separated by a call to s1 (a park, so the carrier runs the others).
+fn released(w: actor_ref, s1: actor_ref, tries: int64) -> boolean {
+    sequence proc[concurrency]
+        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        free: boolean <- u.reserved == 0 and u.committed == 0;
+        r: boolean <- case free or tries <= 0 of {
+            true -> free;
+            false -> {
+                sequence proc[concurrency]
+                    _: int64 <- call(s1, 1 impl ActorMessage {});
+                    again: boolean <- released(w, s1, tries - 1)
+                produces
+                    pure again
+                end
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 {
+            sequence proc[concurrency, device_io]
+                w: actor_ref <- spawn(0, beh, stack_policy(262144, :keep_high_water), 1);
+                s1: actor_ref <- spawn(0, beh, stack_policy(0, :keep_last_message), 1);
+                s2: actor_ref <- spawn(0, beh, stack_policy(0, :keep_last_message), 2);
+                u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+                print_int64(verdict(u.reserved == 262144));
+                println("");
+                small: int64 <- call(w, 55 impl ActorMessage {});
+                print_int64(small);
+                println("");
+                q: actor_ref <- spawn(w, relay, stack_policy(0, :keep_last_message), 1);
+                _: boolean <- cast(q, 1000000 impl ActorMessage {});
+                print_int64(verdict(released(w, s1, 10000)));
+                println("");
+                d1: int64 <- call(s1, 300000 impl ActorMessage {});
+                print_int64(d1);
+                println("");
+                d2: int64 <- call(s2, 300000 impl ActorMessage {});
+                print_int64(d2);
+                println("")
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

@@ -141,17 +141,17 @@ integrate-run:
 		$(INTEGRATE_DOT_FAIL); \
 		ko=$$((ko + 1)); failed=1; \
 	elif [ -x "$$base" ]; then \
-			if [ -f "$$base.scout" ]; then \
+			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
 				$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,./$$base); \
 				if [ "$$integrate_killed" = 1 ]; then \
 					echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 					$(INTEGRATE_DOT_FAIL); \
 					ko=$$((ko + 1)); failed=1; continue; \
 				fi; \
-				if ! diff -Bw -q "$$base.sout" "$$base.scout" > /dev/null 2>&1; then \
+				if ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout"; \
 					$(INTEGRATE_DOT_FAIL); \
-					diff -Bw "$$base.sout" "$$base.scout" || true; \
+					diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \

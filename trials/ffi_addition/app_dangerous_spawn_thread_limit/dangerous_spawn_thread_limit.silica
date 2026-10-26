@@ -1,0 +1,220 @@
+// Dangerous-actor thread cap (actor_memory_budget_plan.md item N, #5 option C): every dangerous
+// actor keeps a thread of its own, so a program that spawns them without bound meets the host's
+// limit. On macOS kern.num_taskthreads is 4096, so about the 4,080th spawn_dangerous has its
+// pthread_create refused; a Linux host refuses at its thread or mapping limits (a reservation it
+// cannot map fails the same way). The runtime gives back what the spawn took (identity,
+// reservation, alternate stack, control block) and the SPAWNING actor fails with
+// (:explicit, :thread_limit), reason_tag 4, exactly as a spawn whose stack reservation cannot be
+// made (:stack_reserve_failed) does; main would end with a runtime abort, status 71. Nothing is
+// returned to the spawner: a spawn never answers a dead reference. The earlier dangerous actors
+// keep their threads, and a carrier that has no thread yet when the cap is reached is not fatal
+// either: an actor bound to it is placed on a carrier that runs (the restart of the spawner below
+// is such an adoption at every carrier count).
+//
+// The spawner is a :permanent row of a one_for_one supervisor. On its one message it registers
+// the first dangerous worker under :dangerous_thread_limit_first and then spawns dangerous
+// workers (1 MB reservations, so the count, not the address space, is what runs out) until the
+// host refuses one, bounded at 65,536. The failing spawn ends it and the supervisor restarts it.
+// The FailureReporter, on the spawner's report, casts 5 to the first worker, which still has its
+// thread: it adds 2 through the legacy wrapper and casts 7 to the sink, which prints it and
+// `done`. The thousands of idle dangerous workers end with the process.
+//
+// Expected output, in this order (the reporter writes the report before it casts):
+//   failure report, #0 the spawner, reason_tag 4
+//   7                                  the first dangerous worker still answers
+//   done
+//   0
+
+module dangerous_spawn_thread_limit;
+
+use Supervisor;
+
+wrapper_meta "dangerous_exposure_source/legacy/silica_legacy_math_wrapper.meta";
+
+foreign c_wrapper "silica_legacy_math_add_int64"
+fn add_raw(left: int64, right: int64) -> int64;
+
+impl DangerousSpawnThreadLimitSup for Supervisor;
+
+fn sink(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        print_int64(msg);
+        println("");
+        println("done")
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Every dangerous worker: adds 2 to its message through the wrapper and casts the sum to the sink.
+fn ffi_worker(msg: int64, reply_to: actor_ref) -> (:no_reply, actor_ref) {
+    sequence proc[external_danger, concurrency]
+        sum: int64 <- add_raw(2, msg);
+        _: boolean <- cast(reply_to, sum impl ActorMessage {})
+    produces
+        pure (:no_reply, reply_to)
+    end
+}
+
+// Spawns dangerous workers until the host refuses a thread (the spawn then ends this actor) or
+// the bound runs out.
+fn spawn_until_refused(reply_to: actor_ref, left: int64, made: int64) -> int64 {
+    case left == 0 of {
+        true -> made;
+        false -> {
+            sequence proc[concurrency]
+                _: dangerous_actor_ref <- spawn_dangerous(reply_to, ffi_worker, stack_policy(1048576, :keep_last_message));
+                r: int64 <- spawn_until_refused(reply_to, left - 1, made + 1)
+            produces
+                pure r
+            end
+        }
+    }
+}
+
+// The spawner row: its message is the sink.
+fn spawner(msg: actor_ref, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: dangerous_actor_ref <- spawn_dangerous_registered(msg, ffi_worker, :dangerous_thread_limit_first, stack_policy(1048576, :keep_last_message));
+        made: int64 <- spawn_until_refused(msg, 65536, 0)
+    produces
+        pure (:no_reply, state + made)
+    end
+}
+
+fn init(_initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: actor_ref, state: int64) -> (:no_reply, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+            strategy: :one_for_one | :one_for_all | :rest_for_one,
+            allowed_restart_count: int64,
+            restarts_time_frame: int64
+        } <- { strategy: :one_for_one, allowed_restart_count: 5, restarts_time_frame: 60 };
+        children: List[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: int64,
+                behavior: fn(msg: actor_ref, state: int64) -> (:no_reply, int64),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous
+            },
+            mem(normal)
+        ] <- [
+            {
+                id: :thread_limit_spawner,
+                agent_type: :worker,
+                initial_state: 0,
+                behavior: spawner,
+                restart: :permanent,
+                shutdown: 0,
+                flavor: :plain
+            }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn current_spawner(sup: supervisor_ref) -> actor_ref {
+    sequence
+        g: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, { op: :get_child, id: :thread_limit_spawner } impl SupervisorMessage {})
+    produces
+        pure g.child
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        sink_ref: actor_ref <- spawn(0, sink, stack_policy(0, :keep_last_message));
+        sup: supervisor_ref <- spawn_registered_supervisor(DangerousSpawnThreadLimitSup, 0, :thread_limit_sup, stack_policy(0, :keep_last_message));
+        first: actor_ref <- current_spawner(sup);
+        _: boolean <- cast(first, sink_ref impl ActorMessage {});
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+// The spawner's report (the host refused a thread) is the cue to ask the first dangerous worker,
+// spawned long before the cap, for its sum: it still runs.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> case contains(report, "#0  dangerous_spawn_thread_limit_spawner") of {
+                true -> cast_dangerous_registered(:dangerous_thread_limit_first, 5 impl ActorMessage {});
+                false -> true
+            }
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

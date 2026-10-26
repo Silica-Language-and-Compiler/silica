@@ -1,0 +1,96 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 3): an actor parked in a call is inside a
+// dispatch; a move requested then is pending until the dispatch ends, and the actor resumes on
+// the carrier it parked on (spec §15.1.2: a suspended actor resumes on the same core, inside the
+// same dispatch). The caller (core 1) calls the migrator (core 2) with its own reference; the
+// migrator moves it to core 2 while it is parked (or still between its enqueue and its park,
+// which gives the same answers) and replies the caller's carrier as read then; the caller resumes
+// and replies both readings, packed; its next dispatch is on core 2's carrier. Facts are
+// equalities with probes spawned for the cores, so they hold at every carrier count and with
+// the gate off.
+//
+//   call caller 1 -> (seen by the migrator, seen by the caller after its resume) = (core 1's
+//   carrier, core 1's carrier); call caller 0 -> core 2's carrier.
+//
+// Expected output: 9, 9, 9, 9, exit status 0. The same with SILICA_CARRIERS=0 and at every
+// carrier count.
+
+use trial_support_int64;
+
+fn probe(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// The migrator: moves the actor the message names to core 2 and replies its carrier as read now.
+fn migrator(msg: actor_ref, state: int64) -> (:reply, int64, int64) {
+    sequence proc[concurrency]
+        _: atom <- migrate_actor(msg, 2);
+        seen: int64 <- actor_carrier_index(msg)
+    produces
+        pure (:reply, seen, state)
+    end
+}
+
+// The caller: msg 0 replies its carrier now; msg 1 calls the migrator with self(), then replies
+// (seen + 100) * 1000 + (here + 100), here being its carrier right after the resume.
+fn caller(msg: int64, b: actor_ref) -> (:reply, int64, actor_ref) {
+    case msg == 0 of {
+        true -> {
+            sequence proc[concurrency]
+                here: int64 <- actor_carrier_index(self())
+            produces
+                pure (:reply, here, b)
+            end
+        };
+        false -> {
+            sequence proc[concurrency]
+                seen: int64 <- call(b, self() impl ActorMessage {});
+                here: int64 <- actor_carrier_index(self())
+            produces
+                pure (:reply, (seen + 100) * 1000 + (here + 100), b)
+            end
+        }
+    }
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        p1: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 1);
+        p2: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 2);
+        b: actor_ref <- spawn(0, migrator, stack_policy(1048576, :keep_last_message), 2);
+        a: actor_ref <- spawn(b, caller, stack_policy(1048576, :keep_last_message), 1);
+        i_p1: int64 <- actor_carrier_index(p1);
+        i_p2: int64 <- actor_carrier_index(p2);
+        before: int64 <- actor_carrier_index(a);
+        print_int64(verdict(before == i_p1));
+        println("");
+        packed: int64 <- call(a, 1 impl ActorMessage {});
+        seen: int64 <- packed / 1000 - 100;
+        here: int64 <- packed - (packed / 1000) * 1000 - 100;
+        print_int64(verdict(seen == i_p1));
+        println("");
+        print_int64(verdict(here == i_p1));
+        println("");
+        after: int64 <- call(a, 0 impl ActorMessage {});
+        print_int64(verdict(after == i_p2));
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

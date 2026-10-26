@@ -473,9 +473,13 @@ and the runtime answers `:actor_not_found` for no actor or an ended one. Before 
 itself reached the runtime, which clamped every index above 2 to normal, so the priority queues had
 never been exercised: the new trials are the first to run them.
 
-Hosted targets have no ready queue of their own to order (their actors are threads the OS schedules),
-so `set_scheduler_policy` is a no-op there that answers `:ok` for any atom (`prims_actors.silica` of
-the three hosted emitters, the `pin_actor_to_efficiency_core` precedent). Trials:
+Hosted targets now have a ready queue per carrier thread (item N of
+`actor_memory_budget_plan.md`; carriers on `apple_silicon_mac`, and on Linux AArch64 and x86-64 in
+`aa8101edf2` and `ef2e778126`), so `set_scheduler_policy` is real there: each target's
+`prims_actors_carrier_asm.silica` defines `silica_rt_set_scheduler_policy`, which selects one of
+`:priority_fifo`, `:round_robin`, `:weighted_fair` and `:lottery`, applied by every carrier to its own
+queues as the board applies one per core. (Before the carriers, hosted actors were threads the OS
+schedules and the call was a no-op answering `:ok` for any atom.) Trials:
 `trials/scheduler_policy_addition` (its README says how the order trials are compared on a target that
 defines no order). No specification change: this is a runtime configuration choice made through an
 ordinary atom argument, not a new normative guarantee.
@@ -493,3 +497,42 @@ define that new yield-point kind and say how it interacts with the existing guar
 preempts an actor between yield points -- which this policy would, by construction, break for the
 actor whose budget ran out. Until then the four policies above are the whole of the feature, and every
 one of them keeps the invariant that a running actor stops only where §15.1.2 says it may.
+
+### 8.11 Clocks and timers (spec §22.14, §4.5.2)
+
+`monotonic_time`, `current_time`, `send_after`, `cancel_timer` and `timer_ref` exist on the board since
+2026-10-23 (`rt_actors.S`, the "Clocks and timers" block at its end; the emitter's `timer_cast` /
+`send_after` / `cancel_timer` prims in `terms/prims/prims_actors.silica`).
+
+- **Clock.** The 16 MHz system timer (SYSTIMER unit 0, the unit `silica_rt_now_seconds` already uses),
+  read as a 64-bit count (`silica_rt_timer_now_ticks`: HI, LO, HI, repeated when HI changed, since the
+  other core may latch a new value between the loads). `monotonic_time` is `ticks * 125 / 2`
+  nanoseconds since the timer started. `current_time` is `ticks / 16000`: milliseconds since the timer
+  started, **not** the Unix epoch of §22.14.1, because the board has no wall clock to read; a program
+  that needs the epoch gets it from a host. The spec and the port docs said nothing about the board's
+  wall clock; this is the choice made.
+- **Timers.** One list ordered by deadline (ticks, 64-bit), under `silica_rt_timer_lock` (a leaf lock,
+  the free list's shape). `send_after` takes a never-reused 64-bit number, links the record (after equal
+  deadlines, so equal deadlines deliver first-armed first); a delay of 0 casts at once from the caller;
+  a target that has already ended is a timer cancelled already (released, never found). Every core's
+  scheduler loop calls `silica_rt_timers_fire` at its label 12, before the idle scan: a dispatch
+  boundary or an idle pass, never inside a dispatch (§15.1.2), so a timer fires no earlier than its
+  deadline and at most one dispatch after a core's loop could have seen it due. Firing is the cast's
+  own path (`silica_rt_enqueue_by_id`; an ended or call-only target drops the message silently).
+  `cancel_timer` unlinks under the lock (`:cancelled`) or finds nothing (`:not_found`); a pending timer
+  whose target has ended counts as cancelled automatically (`:not_found`). The unlink and the pop are
+  both under the lock, so a cancel racing a firing timer yields exactly one of delivered / `:cancelled`.
+- **The message.** A timer's message follows the cast's rules at the `send_after` call (the copy, the
+  owned-payload flag). A timer that will not deliver runs the site's release thunk (the message record's
+  top-level region fields, as the receiver's dispatch would have destroyed them), frees an owned payload
+  copy and frees its record (`silica_rt_timer_release`). The thunk's address travels in a7, the high word
+  of X2, next to the owned flag in a6.
+- **Not verified on the board yet** (2026-10-23): the code cross-assembles (`xtensa-esp32s3-elf-gcc -c
+  -mlongcalls rt_actors.S`) and mirrors the hosted runtime, which passes `trials/timers_addition`; the
+  board run of that suite is open.
+- **Image assembly gap (2026-10-23 to 2026-10-24).** Board images failed to assemble from commit 4d045655
+  (2026-10-23 07:51) until the 2026-10-24 fix: `emitter_core.silica` lacked a newline before
+  `.global silica_registry_atom_buf_bounds`. So no board image built between those two points, and the
+  timer code above was cross-assembled only as the runtime file, not run in an image. The board's actor
+  failure banner also gains the `reason:` line and reason tag 3 for a CPU exception in an actor (runtime
+  failure reporting §7); its board run is pending.

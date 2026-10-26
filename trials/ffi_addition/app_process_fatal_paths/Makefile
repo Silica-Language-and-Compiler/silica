@@ -92,14 +92,14 @@ integrate-run:
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1; continue; \
 		fi; \
-		if "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$$trial.scout" > /dev/null 2>&1; then \
+		if "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ✅✅ $(APP_LABEL)/$$trial output matches .scout"; \
 			$(INTEGRATE_DOT_OK); \
 			ok=$$((ok + 1)); \
 		else \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout (normalized compare)"; \
 			$(INTEGRATE_DOT_FAIL); \
-			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$$trial.scout" || true; \
+			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
 		fi; \
 	done; \

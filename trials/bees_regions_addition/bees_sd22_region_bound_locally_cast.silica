@@ -1,0 +1,82 @@
+// bees_sd22_region_bound_locally_cast
+//
+// Shows: a region handle bound to a local name in the sending function and moved into a cast
+// (§12.1.6) is not freed when that function's scope exits, so each of three messages is read
+// with its own value. send_bound makes a fresh heap { r } with new_heap(), builds the message
+// { r, c } with bees_term@mk_int in that region, and casts it; the sink prints int_of(c) for
+// each message and `done` after the third.
+// Origin: project-bees defect SD-22 (region-release design: chunk 4 hazard H2, a region carried
+// away by cast is destroyed by its function). It used to print 333: the scope-exit free let the
+// next region reuse the memory, so all three messages read the last value.
+// Observed 2026-10-22 on the Mac compiler (999943): prints 123 then done (fixed in output).
+// Caveat: the region reaches the cast inside the message record, and a region inside a record
+// is never released (H9; see bees_regions_open_addition/region_in_returned_record_released and
+// bees_sd7_message_region_released). The correct output today may be due to that leak rather
+// than to a correct move: no region is freed, so none is reused. When H9 and SD-7 are fixed,
+// this trial is the check that the release does not come back as a scope-exit free.
+// Helper: bees_term.silica in this directory (project-bees's term module, unchanged).
+// Expected output: 123, done, then exit 0 (the harness sends `exit` after `done`).
+use bees_term;
+fn sink(msg: { r: region(L, normal), c: ref?(L, normal, (int64, int64, float64, atom, actor_ref, ref?(L, normal, rec), ref?(L, normal, rec))) }, state: { h: { r: region(L, normal) }, n: int64 }) -> (:no_reply, { h: { r: region(L, normal) }, n: int64 }) {
+    sequence proc[device_io]
+        _: atom <- print_int64(bees_term@int_of(msg.c));
+        _: atom <- case state.n == 2 of { true -> { println(""); println("done"); :ok }; false -> :ok }
+    produces pure (:no_reply, { h: state.h, n: state.n + 1 }) end
+}
+fn new_heap() -> { r: region(L, normal) } {
+    sequence proc[mem(normal)]
+        L: lifetime <- fresh_lifetime();
+        r: region(L, normal) <- alloc_region(normal)
+    produces pure { r: r } end
+}
+fn send_bound(a: actor_ref, n: int64) -> boolean {
+    sequence proc[concurrency]
+        mh: { r: region(L, normal) } <- new_heap();
+        m: { r: region(L, normal), c: ref?(L, normal, (int64, int64, float64, atom, actor_ref, ref?(L, normal, rec), ref?(L, normal, rec))) } <- { r: mh.r, c: bees_term@mk_int(mh, n) };
+        ok: boolean <- cast(a, m impl ActorMessage {})
+    produces pure ok end
+}
+fn main() -> int64 {
+    sequence proc[mem(normal), device_io, concurrency]
+        _: atom <- start_reporter();
+        L: lifetime <- fresh_lifetime();
+        rs: region(L, normal) <- alloc_region(normal);
+        a: actor_ref <- spawn({ h: { r: rs }, n: 0 }, sink, stack_policy(0, :keep_last_message));
+        _: boolean <- send_bound(a, 1);
+        _: boolean <- send_bound(a, 2);
+        _: boolean <- send_bound(a, 3);
+        _: int64 <- wait_for_exit()
+    produces pure 0 end
+}
+
+// ---- port addition: FailureReporter (E2236 requires one before any spawn), copied from
+// ---- docs/examples/idle_actor_capacity/main.silica
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

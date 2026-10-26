@@ -1,0 +1,253 @@
+// A :dangerous row child under a carrier supervisor (actor_memory_budget_plan.md item N): a
+// dangerous row child keeps a thread of its own while its supervisor, its siblings and the driver
+// are carrier actors. The root (one_for_one) holds two child supervisors:
+//   :zzzzd_sub_ofo (one_for_one): :zzzzd_keeper (plain, 500) and :dangerous_zzzzd_counter (600)
+//   :zzzzd_sub_ofa (one_for_all): :zzzzd_ofa_plain (plain, 700) and :dangerous_zzzzd_ofa (800)
+// Every row child has the cast-type counter: a message n posts state + n on the board (a
+// call-type actor the driver polls), 0 divides by zero so the child ends on its own thread.
+//
+//   cast 5 to the dangerous counter                     -> 605
+//   cast 0: it fails on its own thread; the supervisor restarts it (the driver's get_child
+//   drains the notice from a carrier); the replacement differs, cast 7 -> 9, 607
+//   cast 8 to the keeper                                -> 508
+//   terminate_child + restart_child of the dangerous row (its thread is stopped while idle,
+//   the replacement spawned from the driver's call)     -> 9, 9, then cast 9 -> 609
+//   one_for_all: kill the plain row; the dangerous row is restarted too -> 9, cast 5 -> 805
+//   kill the dangerous row (kill_abnormal of a dangerous name); the plain row is restarted
+//   too                                                 -> 9, cast 5 -> 705
+//   terminate_child of the ofo supervisor (it shuts its dangerous row down) and restart_child
+//   of it (its trampoline spawns the dangerous row again) -> 9, 9, cast 5 -> 605
+//
+// Expected output: the values above in order, then done, exit status 0; the failure reports (the
+// counter ended by division by zero, reason_tag 1; the rows the supervisors stop, reason_tag 0;
+// the killed rows, reason_tag 1; the ofo supervisor stopped, reason_tag 0) land anywhere, so the
+// output is compared as a multiset. Printed values avoid the digits 1-4 (folded by the comparer):
+// 9 is a check that holds, 6 one that does not.
+
+use Supervisor;
+use trial_wait_int64;
+
+impl ZzzzDangerousRowRootSup for Supervisor;
+
+// The board: 0 answers the last posted value, anything else is posted and answered.
+fn board(msg: int64, state: int64) -> (:reply, int64, int64) {
+    case msg == 0 of {
+        true -> (:reply, state, state);
+        false -> (:reply, msg, msg)
+    }
+}
+
+// The cast-type counter of every row: posts state + msg; 0 divides by zero.
+fn counter(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        v: int64 <- case msg == 0 of {
+            true -> state / msg;
+            false -> state + msg
+        };
+        _: int64 <- call_registered(:zzzzd_board, v impl ActorMessage {})
+    produces
+        pure (:no_reply, v)
+    end
+}
+
+// Kills the named row (kill_abnormal runs only inside a behaviour) and replies its answer.
+fn killer(msg: atom, state: int64) -> (:reply, atom, int64) {
+    sequence proc[concurrency]
+        r: atom <- kill_abnormal(msg)
+    produces
+        pure (:reply, r, state)
+    end
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+fn sub_ofo_start(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 9, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :zzzzd_keeper, agent_type: :worker, initial_state: initial_state + 500, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :dangerous_zzzzd_counter, agent_type: :worker, initial_state: initial_state + 600, behavior: counter, restart: :permanent, shutdown: 0, flavor: :dangerous }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn sub_ofa_start(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_all, allowed_restart_count: 9, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :zzzzd_ofa_plain, agent_type: :worker, initial_state: initial_state + 700, behavior: counter, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :dangerous_zzzzd_ofa, agent_type: :worker, initial_state: initial_state + 800, behavior: counter, restart: :permanent, shutdown: 0, flavor: :dangerous }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 9, restarts_time_frame: 10 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(initial_state: int64) -> ({ strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 }, List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: int64, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :zzzzd_sub_ofo, agent_type: :supervisor, initial_state: initial_state, behavior: sub_ofo_start, restart: :permanent, shutdown: 0, flavor: :plain },
+            { id: :zzzzd_sub_ofa, agent_type: :supervisor, initial_state: initial_state, behavior: sub_ofa_start, restart: :permanent, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+// The row's current child (a supervisor reached as the root's child is an actor_ref).
+fn child_of(sup: actor_ref, id: atom) -> actor_ref {
+    sequence
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: id } impl SupervisorMessage {})
+    produces
+        pure got.child
+    end
+}
+
+fn root_child_of(sup: supervisor_ref, id: atom) -> actor_ref {
+    sequence
+        got: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :get_child, id: id } impl SupervisorMessage {})
+    produces
+        pure got.child
+    end
+}
+
+// Polls get_child until the row holds a child other than `old` (bounded: a restart that never
+// comes ends the trial with a wrong value instead of hanging it).
+fn replacement_of(sup: actor_ref, id: atom, old: actor_ref, tries: int64) -> actor_ref {
+    sequence
+        now: actor_ref <- child_of(sup, id);
+        r: actor_ref <- case actor_ref_not_equal(now, old) or tries <= 0 of {
+            true -> now;
+            false -> replacement_of(sup, id, old, tries - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn terminate_tag(sup: actor_ref, id: atom) -> int64 {
+    sequence
+        t: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :terminate_child, id: id } impl SupervisorMessage {})
+    produces
+        pure verdict(case t.tag of { :ok -> true; _: atom -> false })
+    end
+}
+
+fn restart_tag(sup: actor_ref, id: atom) -> int64 {
+    sequence
+        r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :restart_child, id: id } impl SupervisorMessage {})
+    produces
+        pure verdict(case r.tag of { :child_started -> true; _: atom -> false })
+    end
+}
+
+fn root_terminate_tag(sup: supervisor_ref, id: atom) -> int64 {
+    sequence
+        t: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :terminate_child, id: id } impl SupervisorMessage {})
+    produces
+        pure verdict(case t.tag of { :ok -> true; _: atom -> false })
+    end
+}
+
+fn root_restart_tag(sup: supervisor_ref, id: atom) -> int64 {
+    sequence
+        r: { tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom } <- call_supervisor(sup, { op: :restart_child, id: id } impl SupervisorMessage {})
+    produces
+        pure verdict(case r.tag of { :child_started -> true; _: atom -> false })
+    end
+}
+
+// Polls the board until it holds `expect` (bounded), then answers what it holds.
+fn posted(expect: int64, tries: int64) -> int64 {
+    sequence proc[concurrency]
+        v: int64 <- call_registered(:zzzzd_board, 0 impl ActorMessage {});
+        r: int64 <- case v == expect or tries <= 0 of {
+            true -> v;
+            false -> posted(expect, tries - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn show(v: int64) -> int64 {
+    sequence proc[device_io]
+        _: atom <- print_int64(v);
+        _: atom <- println("")
+    produces
+        pure v
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: actor_ref <- spawn_registered(0, board, :zzzzd_board, stack_policy(0, :keep_last_message));
+        k: actor_ref <- spawn(0, killer, stack_policy(0, :keep_last_message));
+        root: supervisor_ref <- spawn_registered_supervisor(ZzzzDangerousRowRootSup, 0, :zzzzd_root, stack_policy(0, :keep_last_message));
+        ofo: actor_ref <- root_child_of(root, :zzzzd_sub_ofo);
+        ofa: actor_ref <- root_child_of(root, :zzzzd_sub_ofa);
+        d0: actor_ref <- child_of(ofo, :dangerous_zzzzd_counter);
+        _: boolean <- cast(d0, 5 impl ActorMessage {});
+        _: int64 <- show(posted(605, 1000000));
+        _: boolean <- cast(d0, 0 impl ActorMessage {});
+        d1: actor_ref <- replacement_of(ofo, :dangerous_zzzzd_counter, d0, 1000000);
+        _: int64 <- show(verdict(actor_ref_not_equal(d1, d0)));
+        _: boolean <- cast(d1, 7 impl ActorMessage {});
+        _: int64 <- show(posted(607, 1000000));
+        _: boolean <- cast_registered(:zzzzd_keeper, 8 impl ActorMessage {});
+        _: int64 <- show(posted(508, 1000000));
+        _: int64 <- show(terminate_tag(ofo, :dangerous_zzzzd_counter));
+        _: int64 <- show(restart_tag(ofo, :dangerous_zzzzd_counter));
+        d2: actor_ref <- child_of(ofo, :dangerous_zzzzd_counter);
+        _: boolean <- cast(d2, 9 impl ActorMessage {});
+        _: int64 <- show(posted(609, 1000000));
+        a0: actor_ref <- child_of(ofa, :dangerous_zzzzd_ofa);
+        _: atom <- call(k, :zzzzd_ofa_plain impl ActorMessage {});
+        a1: actor_ref <- replacement_of(ofa, :dangerous_zzzzd_ofa, a0, 1000000);
+        _: int64 <- show(verdict(actor_ref_not_equal(a1, a0)));
+        _: boolean <- cast(a1, 5 impl ActorMessage {});
+        _: int64 <- show(posted(805, 1000000));
+        p1: actor_ref <- child_of(ofa, :zzzzd_ofa_plain);
+        _: atom <- call(k, :dangerous_zzzzd_ofa impl ActorMessage {});
+        p2: actor_ref <- replacement_of(ofa, :zzzzd_ofa_plain, p1, 1000000);
+        _: int64 <- show(verdict(actor_ref_not_equal(p2, p1)));
+        _: boolean <- cast(p2, 5 impl ActorMessage {});
+        _: int64 <- show(posted(705, 1000000));
+        _: int64 <- show(root_terminate_tag(root, :zzzzd_sub_ofo));
+        _: int64 <- show(root_restart_tag(root, :zzzzd_sub_ofo));
+        ofo2: actor_ref <- root_child_of(root, :zzzzd_sub_ofo);
+        d3: actor_ref <- child_of(ofo2, :dangerous_zzzzd_counter);
+        _: boolean <- cast(d3, 5 impl ActorMessage {});
+        _: int64 <- show(posted(605, 1000000));
+        _: atom <- println("done")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

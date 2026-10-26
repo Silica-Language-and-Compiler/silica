@@ -1,0 +1,96 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 2): the binding policy, exercised from an
+// actor and from the driver. A spawn with a nonzero core id binds the actor to carrier
+// `core mod N` (7 lands on carrier 7 mod N: 1 when N = 2 or 3, 3 when N = 4, 0 when N = 1); one
+// without a core id, or with core id 0, takes the next carrier in turn, the process-wide
+// round robin (the board's rule, rt_actors.S spawn), whatever thread spawns it. A spawner actor
+// bound to core 1 spawns five counters that way (cores 0, 1, 2, 7 and none), and the driver
+// spawns one for core 3 by spawn_registered; each counter is called once from the actor that
+// spawned it and once from the driver, through the references and the registered name, so a
+// child on any carrier answers both its spawner's carrier and another. The placement itself is
+// not visible to a program yet (no stage-2 builtin reports it): what is checked here is that
+// every binding path yields a working actor and that calls across every pair of carriers the
+// policy produces complete. The bindings were confirmed with an instrumented runtime when the
+// stage was built (the plan's "Stage 2 status").
+//
+//   the spawner calls its five with 5, 6, 7, 9, 5: replies 5, 6, 7, 9, 5, sum 32; then with 10
+//   each: the new states 15 + 16 + 17 + 19 + 15 = 82; it replies 32 * 1000 + 82 (printed as two
+//   lines by the driver)
+//   the registered counter (state 50) answers 55 from the driver and 65 on a second call
+//
+// Expected output: 32, 82, 55, 65, exit status 0. The same with SILICA_CARRIERS=0 and at every
+// carrier count.
+
+use trial_support_int64;
+
+fn counter(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+// Calls the five with 5, 6, 7, 9, 5 when base is 0, with base each otherwise; the sum of the replies.
+fn call_all(c1: actor_ref, c2: actor_ref, c3: actor_ref, c4: actor_ref, c5: actor_ref, base: int64) -> int64 {
+    sequence proc[concurrency]
+        m1: int64 <- case base == 0 of { true -> 5; false -> base };
+        m2: int64 <- case base == 0 of { true -> 6; false -> base };
+        m3: int64 <- case base == 0 of { true -> 7; false -> base };
+        m4: int64 <- case base == 0 of { true -> 9; false -> base };
+        r1: int64 <- call(c1, m1 impl ActorMessage {});
+        r2: int64 <- call(c2, m2 impl ActorMessage {});
+        r3: int64 <- call(c3, m3 impl ActorMessage {});
+        r4: int64 <- call(c4, m4 impl ActorMessage {});
+        r5: int64 <- call(c5, m1 impl ActorMessage {})
+    produces
+        pure r1 + r2 + r3 + r4 + r5
+    end
+}
+
+// The holder is one more actor the spawner calls (bound to core 2) with the first sum, so the
+// spawner's reply goes through a call to a third carrier before it is made.
+fn holder(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, msg, state)
+}
+
+// One message: spawn the five, call each (5, 6, 7, 9, 5), call each again with 10, call the
+// holder, and reply first * 1000 + second.
+fn spawner(msg: int64, state: actor_ref) -> (:reply, int64, actor_ref) {
+    sequence proc[concurrency]
+        c1: actor_ref <- spawn(0, counter, stack_policy(1048576, :keep_last_message), 0);
+        c2: actor_ref <- spawn(0, counter, stack_policy(1048576, :keep_last_message), 1);
+        c3: actor_ref <- spawn(0, counter, stack_policy(1048576, :keep_last_message), 2);
+        c4: actor_ref <- spawn(0, counter, stack_policy(1048576, :keep_last_message), 7);
+        c5: actor_ref <- spawn(0, counter, stack_policy(1048576, :keep_last_message));
+        first: int64 <- call_all(c1, c2, c3, c4, c5, 0);
+        second: int64 <- call_all(c1, c2, c3, c4, c5, 10);
+        _: int64 <- call(state, first impl ActorMessage {})
+    produces
+        pure (:reply, first * 1000 + second, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 {
+            sequence proc[concurrency, device_io]
+                h: actor_ref <- spawn(0, holder, stack_policy(1048576, :keep_last_message), 2);
+                sp: actor_ref <- spawn(h, spawner, stack_policy(1048576, :keep_last_message), 1);
+                _: actor_ref <- spawn_registered(50, counter, :carriers_bind_registered, stack_policy(1048576, :keep_last_message), 3);
+                both: int64 <- call(sp, 0 impl ActorMessage {});
+                reg1: int64 <- call_registered(:carriers_bind_registered, 5 impl ActorMessage {});
+                reg2: int64 <- call_registered(:carriers_bind_registered, 10 impl ActorMessage {});
+                print_int64(both / 1000);
+                println("");
+                print_int64(both - (both / 1000) * 1000);
+                println("");
+                print_int64(reg1);
+                println("");
+                print_int64(reg2);
+                println("")
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

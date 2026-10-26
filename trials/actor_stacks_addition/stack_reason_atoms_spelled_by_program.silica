@@ -1,0 +1,107 @@
+// Decision 39 (data_structure_redesign_requirements.md §2A; chunk15_stack_memory_design.md §10, §11.1
+// phase 0): the stack runtime's failure reasons are (:explicit, :reservation_exceeded),
+// (:explicit, :out_of_memory), (:explicit, :state_too_large) and (:explicit, :stack_reserve_failed);
+// atom_table@build_runtime_atom_table appends them after :killed so a program that never spells them
+// still gets their names in the failure report (stack_lowered_reservation_exhausted). Here the program
+// spells all four itself, so each is already in the build's atom table when the runtime's entries are
+// appended: an appended atom keeps the program's index (one entry, not two), and the runtime's atom
+// word reads that index, so the reason line still names :reservation_exceeded.
+// The work casts w its deep message directly (no caller blocks on w, so w's report is the only one),
+// then polls w's memory usage until its reservation and committed stack are back to 0 (bounded: it
+// prints false if they never are). A cast needs a :no_reply behaviour (E2237 rejects a cast to a
+// call-only actor), so w runs `deep`; the echo actor e, which the poll calls, keeps the replying `beh`.
+//
+// Expected output (compared as a multiset: the report is asynchronous):
+//   reservation_exceeded, out_of_memory, state_too_large, stack_reserve_failed   the four atoms
+//   262144                                     w's lowered reservation
+//   failure report, #0 deep, reason (:explicit, :reservation_exceeded), reason_tag 4
+//   true                                       w's reservation and committed stack were released
+//   done                                       the marker; the harness then sends `exit`
+//   0                                          wait_for_exit returns, main produces 0
+
+use trial_wait_int64;
+
+fn depth(n: int64) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            r: int64 <- depth(n - 1);
+            r + 1
+        }
+    }
+}
+
+fn beh(msg: int64, state: int64) -> (:reply, int64, int64) {
+    r: int64 <- depth(msg);
+    (:reply, r, state)
+}
+
+// w's behaviour: cast-only, so the work can cast it the deep message without a relay.
+fn deep(msg: int64, state: int64) -> (:no_reply, int64) {
+    r: int64 <- depth(msg);
+    (:no_reply, state + r)
+}
+
+fn spin(n: int64) -> int64 {
+    case n <= 0 of {
+        true -> 0;
+        false -> spin(n - 1)
+    }
+}
+
+// True once w holds no reservation and no committed stack; false after `tries` polls. Each poll
+// first calls the echo actor e, a yield point for the cooperative carriers.
+fn released(e: actor_ref, w: actor_ref, tries: int64) -> boolean {
+    sequence proc[concurrency]
+        u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+        free: boolean <- u.reserved == 0 and u.committed == 0;
+        r: boolean <- case free or tries <= 0 of {
+            true -> free;
+            false -> released_after_spin(e, w, tries - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+fn released_after_spin(e: actor_ref, w: actor_ref, tries: int64) -> boolean {
+    sequence proc[concurrency]
+        _: int64 <- call(e, 0 impl ActorMessage {});
+        _: int64 <- spin(10000);
+        r: boolean <- released(e, w, tries)
+    produces
+        pure r
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency, device_io]
+                _: atom <- print_atom(:reservation_exceeded);
+                println("");
+                _: atom <- print_atom(:out_of_memory);
+                println("");
+                _: atom <- print_atom(:state_too_large);
+                println("");
+                _: atom <- print_atom(:stack_reserve_failed);
+                println("");
+                w: actor_ref <- spawn(0, deep, stack_policy(262144, :keep_high_water));
+                u: { reserved: int64, committed: int64, retained: int64, high_water: int64 } <- get_actor_memory_usage(w);
+                print_int64(u.reserved);
+                println("");
+                e: actor_ref <- spawn(0, beh, stack_policy(0, :keep_last_message));
+                _: boolean <- cast(w, 1000000 impl ActorMessage {});
+                print_boolean(released(e, w, 10000));
+                println("");
+                println("done")
+            produces
+                pure 0
+            end
+        });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

@@ -15,12 +15,19 @@
    limitations under the License.
 -}
 
-// Application-lifetime canonical arena registry for standard data structures (Layer 1 §7.1), Linux x86-64.
+// Application-lifetime canonical arena registry for standard data structures (Layer 1 §7.1).
 // One bump arena per stable int64 specialization key; arenas are never freed before process exit.
 // Arena layout matches prims_memory alloc_region: [0:8]=bump, [8:16]=end, [16:24]=extension chain
 // (empty here; L_region_grow fills it if one of these arenas ever fills up), [24:32]=own data end,
-// data from offset 32.
-// Arguments arrive in rdi rsi, results leave in rdi; malloc's result arrives in rax.
+// data from offset 32. Hand-written x86-64 (SysV: rdi = key -> rdi = region).
+//
+// The table is process-shared and read from every thread (design region_memory_safety_design.md
+// §9.4, H1). A probe reads each key with a plain load (x86 loads keep program order); an insert
+// happens under silica_rt_region_lock (the word L_region_grow also takes), which stores the arena
+// pointer first and the key last (stores keep program order too), so a probe that sees the key sees
+// the arena. A thread that found an empty slot takes the lock and probes again from the start:
+// another insert of the same key may have landed in between, and the table changes only under the
+// lock. [rbp-24] = 1 once this call holds the lock.
 
 export emit_canonical_arena_runtime_asm/0;
 
@@ -34,20 +41,25 @@ silica_rt_canonical_arena_table:
 	.globl	silica_rt_canonical_arena_count
 silica_rt_canonical_arena_count:
 	.space	8
+	.globl	silica_rt_region_lock
+silica_rt_region_lock:
+	.space	8
 	.text
 	.globl	silica_rt_canonical_arena_lookup
 	.p2align	4
 silica_rt_canonical_arena_lookup:
 # rdi = stable specialization key (non-zero) -> rdi = region base pointer
-# [rbp-8] = key (X19), [rbp-16] = table slot address (X12) across malloc.
+# [rbp-8] = key (X19), [rbp-16] = table slot address (X12) across malloc, [rbp-24] = lock held.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 24], 0
 	test	rdi, rdi
 	jz	Lcal_abort_key
+Lcal_restart:
 	mov	r10d, 512
-	mov	eax, edi
+	mov	eax, DWORD PTR [rbp - 8]
 	xor	edx, edx
 	div	r10d
 	mov	r8d, edx
@@ -61,7 +73,7 @@ Lcal_probe:
 	add	rcx, r9
 	mov	rdx, QWORD PTR [rcx]
 	test	rdx, rdx
-	jz	Lcal_insert
+	jz	Lcal_empty
 	cmp	rdx, QWORD PTR [rbp - 8]
 	je	Lcal_found
 	inc	r8d
@@ -72,8 +84,22 @@ Lcal_probe:
 	jmp	Lcal_probe
 Lcal_found:
 	mov	rdi, QWORD PTR [rcx + 8]
+	cmp	QWORD PTR [rbp - 24], 0
+	je	Lcal_return
+	mov	DWORD PTR [rip + silica_rt_region_lock], 0
+Lcal_return:
 	leave
 	ret
+Lcal_empty:
+	cmp	QWORD PTR [rbp - 24], 0
+	jne	Lcal_insert
+Lcal_lock:
+	mov	eax, 1
+	xchg	eax, DWORD PTR [rip + silica_rt_region_lock]
+	test	eax, eax
+	jnz	Lcal_lock
+	mov	QWORD PTR [rbp - 24], 1
+	jmp	Lcal_restart
 Lcal_insert:
 	mov	QWORD PTR [rbp - 16], rcx
 	mov	edi, 4128
@@ -87,11 +113,12 @@ Lcal_insert:
 	mov	QWORD PTR [rax + 8], r8
 	mov	QWORD PTR [rax + 16], 0
 	mov	QWORD PTR [rax + 24], r8
+	mov	QWORD PTR [rcx + 8], rax
 	mov	r9, QWORD PTR [rbp - 8]
 	mov	QWORD PTR [rcx], r9
-	mov	QWORD PTR [rcx + 8], rax
 	lea	rdx, [rip + silica_rt_canonical_arena_count]
 	inc	QWORD PTR [rdx]
+	mov	DWORD PTR [rip + silica_rt_region_lock], 0
 	mov	rdi, rax
 	leave
 	ret

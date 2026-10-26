@@ -1,0 +1,133 @@
+// Carriers (actor_memory_budget_plan.md item N, stage 3): pin_actor_to_performance_core and
+// pin_actor_to_efficiency_core choose a carrier by core kind from the topology the runtime
+// reports (get_core_capabilities(id).core_type, from sysctl hw.perflevel0 / 1: the P cores are
+// ids [0, P), the E cores [P, P + E)): carrier i is logical core i's, so the P carriers are
+// [0, min(P, N)) and the E carriers [P, N), none at a carrier count of P or less, and none on a
+// uniform machine. An actor already on a carrier of the kind stays; otherwise it moves to the
+// next carrier of that kind in turn. The counts come from get_core_capabilities, one id at a
+// time (the core-id lists of get_efficiency_cores / get_performance_cores read wrongly through
+// the list builtins today, cpu_discovery_and_spawn_pinning/cpu_topology_runtime_queries fails
+// the same way with the installed compiler). The facts printed hold at every carrier count,
+// with and without E carriers, and with the gate off (every index is -1 then).
+//
+//   a (core 1) pinned to a performance core stays on core 1's carrier (a P carrier at every
+//   count); pinned to an efficiency core it either stays (no E carrier at this count) or lands
+//   on a carrier whose index is an efficiency core id, and a second such pin changes nothing;
+//   pinned to a performance core again its index is below the performance core count, and a
+//   second such pin changes nothing; e (core 5, or the machine's last core when it has fewer
+//   than six, so that the core exists and e binds to its carrier `core mod N` like the probe pe
+//   spawned for the same core; a core the machine lacks is placed in turn, which would part the
+//   two) pinned to an efficiency core stays on that core's carrier when that is an E carrier or
+//   none exists, else lands on one. On a 10-core Mac (4 P + 6 E) core 5 is an E core.
+//
+// Expected output: 9, 9, 9, 9, 9, 9, 9, 9, exit status 0. The same with SILICA_CARRIERS=0 and
+// at every carrier count.
+
+use trial_support_int64;
+
+fn probe(msg: int64, state: int64) -> (:reply, int64, int64) {
+    (:reply, state + msg, state + msg)
+}
+
+fn verdict(holds: boolean) -> int64 {
+    case holds of {
+        true -> 9;
+        false -> 6
+    }
+}
+
+// The performance cores among ids from i up (get_core_capabilities answers id < 0 past the last).
+fn count_performance(i: int64, acc: int64) -> int64 {
+    sequence proc[concurrency]
+        caps: { id: int64, core_type: atom, capabilities: List[string, mem(normal)], frequency_mhz: int64 } <- get_core_capabilities(i);
+        r: int64 <- case caps.id < 0 of {
+            true -> acc;
+            false -> count_performance(i + 1, case caps.core_type == :performance of { true -> acc + 1; false -> acc })
+        }
+    produces
+        pure r
+    end
+}
+
+// The largest core id from i up to want that the machine has, as the uint64 spawn takes (c counts
+// along with i; get_core_capabilities answers id < 0 past the last), c - 1 when it has none from i up.
+fn core_up_to(i: int64, c: uint64, want: int64) -> uint64 {
+    sequence proc[concurrency]
+        caps: { id: int64, core_type: atom, capabilities: List[string, mem(normal)], frequency_mhz: int64 } <- get_core_capabilities(i);
+        r: uint64 <- case caps.id < 0 of {
+            true -> c - 1;
+            false -> case i == want of { true -> c; false -> core_up_to(i + 1, c + 1, want) }
+        }
+    produces
+        pure r
+    end
+}
+
+// The first efficiency core id from i up, 1000000 when there is none.
+fn first_efficiency(i: int64) -> int64 {
+    sequence proc[concurrency]
+        caps: { id: int64, core_type: atom, capabilities: List[string, mem(normal)], frequency_mhz: int64 } <- get_core_capabilities(i);
+        r: int64 <- case caps.id < 0 of {
+            true -> 1000000;
+            false -> case caps.core_type == :efficiency of { true -> i; false -> first_efficiency(i + 1) }
+        }
+    produces
+        pure r
+    end
+}
+
+fn drive() -> int64 {
+    sequence proc[concurrency, device_io]
+        pcount: int64 <- count_performance(0, 0);
+        first_e: int64 <- first_efficiency(0);
+        core_e: uint64 <- core_up_to(0, 0, 5);
+        p1: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 1);
+        pe: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), core_e);
+        a: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), 1);
+        e: actor_ref <- spawn(0, probe, stack_policy(1048576, :keep_last_message), core_e);
+        i_p1: int64 <- actor_carrier_index(p1);
+        i_pe: int64 <- actor_carrier_index(pe);
+        i0: int64 <- actor_carrier_index(a);
+        print_int64(verdict(i0 == i_p1));
+        println("");
+        _: (int64, affinity_error) <- pin_actor_to_performance_core(a);
+        i1: int64 <- actor_carrier_index(a);
+        print_int64(verdict(i1 == i_p1));
+        println("");
+        _: (int64, affinity_error) <- pin_actor_to_efficiency_core(a);
+        i2: int64 <- actor_carrier_index(a);
+        print_int64(verdict(i2 == i_p1 or i2 >= first_e));
+        println("");
+        _: (int64, affinity_error) <- pin_actor_to_efficiency_core(a);
+        i2b: int64 <- actor_carrier_index(a);
+        print_int64(verdict(i2b == i2));
+        println("");
+        _: (int64, affinity_error) <- pin_actor_to_performance_core(a);
+        i3: int64 <- actor_carrier_index(a);
+        print_int64(verdict(i3 < pcount));
+        println("");
+        _: (int64, affinity_error) <- pin_actor_to_performance_core(a);
+        i3b: int64 <- actor_carrier_index(a);
+        print_int64(verdict(i3b == i3));
+        println("");
+        i4: int64 <- actor_carrier_index(e);
+        print_int64(verdict(i4 == i_pe));
+        println("");
+        _: (int64, affinity_error) <- pin_actor_to_efficiency_core(e);
+        i5: int64 <- actor_carrier_index(e);
+        print_int64(verdict(i5 == i_pe or i5 >= first_e));
+        println("")
+    produces
+        pure 0
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 { drive() });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
