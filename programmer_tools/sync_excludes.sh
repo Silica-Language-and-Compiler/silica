@@ -47,6 +47,11 @@
 #                              INTEGRATE_PENDING (a hand-written suite marker).
 #
 # silica.link.scout is a golden and is kept: only the exact name silica.link is excluded.
+# The 60 Mach-O trial executables that were tracked until commit c541caa468 (and every other built
+# trial program, ffi app, probe, train_* binary) are covered by sync_exe_excludes below: each is a
+# dot-less file with the execute bit, or a dot-less file whose first bytes are a Mach-O/ELF magic.
+# They were reaching Linux hosts through git checkouts (tracked), where make judged them newer than
+# their sources; they are untracked and gitignored now.
 # Patterns are for rsync (-a, no --delete-excluded, so nothing already on the remote is removed).
 
 SYNC_BUILD_EXCLUDES=(
@@ -74,6 +79,22 @@ SYNC_BUILD_EXCLUDES=(
 sync_exe_excludes() {  # $1 = directory to scan, $2 = its path within the transfer ("" or "/trials")
     local dir="$1" prefix="${2:-}"
     [ -d "$dir" ] || return 0
-    ( cd "$dir" && find . -type f -perm -u+x ! -name '*.*' -print ) \
-        | sed -e 's|^\./||' -e 's/[][*?\\]/\\&/g' -e "s|^|$prefix/|"
+    {
+        ( cd "$dir" && find . -type f -perm -u+x ! -name '*.*' -print )
+        # A compiled executable that lost its execute bit (a checkout, a copy) is still a Mach-O or ELF
+        # file for another machine: the dot-less files without the bit are listed too when their first
+        # four bytes are an executable magic number (Makefile, INTEGRATE_PENDING and the like are text).
+        ( cd "$dir" && find . -type f ! -perm -u+x ! -name '*.*' -print ) | python3 -I -c '
+import sys
+magic = {bytes.fromhex(h) for h in ("cffaedfe", "cefaedfe", "feedfacf", "feedface", "cafebabe", "7f454c46")}
+for line in sys.stdin:
+    p = line.rstrip("\n")
+    try:
+        with open(p, "rb") as f:
+            if f.read(4) in magic:
+                print(p)
+    except OSError:
+        pass
+'
+    } | sed -e 's|^\./||' -e 's/[][*?\\]/\\&/g' -e "s|^|$prefix/|"
 }

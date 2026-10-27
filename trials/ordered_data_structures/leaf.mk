@@ -45,7 +45,7 @@ INTEGRATE_PRE_CLEAN = cd "$(THIS_DIR)" && \
 	rm -rf $(LEAF_SANDBOX) && \
 	for s in *.sams; do \
 		[ -f "$$s" ] || continue; \
-		rm -f "$${s%.sams}"; \
+		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done
 
 # Root `make integrate` compiles these once into SDS_STDLIB_CACHE and passes both vars.
@@ -512,7 +512,7 @@ record-positive-golden: silica.config
 	done
 	@cd "$(THIS_DIR)" && for trial in $(POSITIVE_SILICA); do \
 		base=$${trial%.silica}; \
-		rm -f "$$base" "$$base.o"; \
+		$(call TRIAL_RM_UNTRACKED,"$$base"); rm -f "$$base.o"; \
 	done
 	@cd "$(THIS_DIR)" && rm -f __silica_runtime.o lib/*.o *.iface lib/*.iface *.sams lib/*.sams *.sout .integrate_counts
 	@echo "✅ $(MSG_PREFIX)record-positive-golden complete"
@@ -523,7 +523,7 @@ clean:
 	@echo "$(MSG_PREFIX)clean: removing prior artifacts..."
 	@cd "$(THIS_DIR)" && for s in *.sams; do \
 		[ -f "$$s" ] || continue; \
-		rm -f "$${s%.sams}"; \
+		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done
 	@cd "$(THIS_DIR)" && rm -f *.sams lib/*.sams *.o lib/*.o *.iface lib/*.iface __silica_runtime.o __silica_runtime.sams.* *.checked .integrate_results smoke_harness_ready *.sout silica.config .integrate_counts silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link
 	@cd "$(THIS_DIR)" && rm -rf $(LEAF_SANDBOX)

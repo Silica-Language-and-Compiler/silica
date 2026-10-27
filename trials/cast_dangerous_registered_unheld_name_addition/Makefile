@@ -92,12 +92,13 @@ integrate-run:
 	fi; \
 	rm -f *.sams *.iface silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link __silica_runtime.sams; \
 	echo "Compiling with silica-compiler..."; \
-	if ! { $(RUN_SILICA_COMPILER); }; then \
+	if ! { $(RUN_SILICA_COMPILER_ISOLATING); }; then \
 		echo "❌❌ $(MSG_PREFIX)compilation failed"; \
 		$(INTEGRATE_DOT_FAIL); \
 		printf '%d %d\n' 0 1 > .integrate_counts; \
 		exit 1; \
 	fi; \
+	$(call INTEGRATE_COMPILE_REJECTS,$(MSG_PREFIX)); \
 	for sams in *.sams; do \
 		[ -f "$$sams" ] || continue; \
 		base=$${sams%.sams}; \
@@ -124,7 +125,7 @@ integrate-run:
 		if ! $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler $$sams -o $$base.o; then \
 		echo "❌❌ $(MSG_PREFIX)$$base assemble failed"; \
 		$(INTEGRATE_DOT_FAIL); \
-		ko=$$((ko + 1)); failed=1; break; \
+		bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 	fi; \
 	done; \
 	while read -r ln; do \
@@ -191,7 +192,7 @@ clean:
 	@cd "$(THIS_DIR)" && \
 	for s in *.sams; do \
 		[ -f "$$s" ] || continue; \
-		rm -f $${s%.sams}; \
+		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done; \
 	rm -f *.sams *.o *.iface *.sout silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts silica.config; \
 	echo "✅ $(MSG_PREFIX)Clean complete"

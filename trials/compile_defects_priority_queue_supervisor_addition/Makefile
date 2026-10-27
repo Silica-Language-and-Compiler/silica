@@ -116,12 +116,13 @@ integrate-run:
 	fi; \
 	rm -f *.sams *.iface silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link __silica_runtime.sams; \
 	echo "Compiling with silica-compiler..."; \
-	if ! { $(RUN_SILICA_COMPILER); }; then \
+	if ! { $(RUN_SILICA_COMPILER_ISOLATING); }; then \
 		echo "❌❌ $(MSG_PREFIX)compilation failed"; \
 		$(INTEGRATE_DOT_FAIL); \
 		printf '%d %d\n' 0 1 > .integrate_counts; \
 		exit 1; \
 	fi; \
+	$(call INTEGRATE_COMPILE_REJECTS,$(MSG_PREFIX)); \
 	for sams in *.sams; do \
 		[ -f "$$sams" ] || continue; \
 		base=$${sams%.sams}; \
@@ -148,7 +149,7 @@ integrate-run:
 		if ! $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler $$sams -o $$base.o; then \
 		echo "❌❌ $(MSG_PREFIX)$$base assemble failed"; \
 		$(INTEGRATE_DOT_FAIL); \
-		ko=$$((ko + 1)); failed=1; break; \
+		bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 	fi; \
 	done; \
 	for line in $$(grep -E '^(\.\./\.\./compiler/stdlib/|\.trial_stdlib/Supervisor\.silica$$)' silica.config 2>/dev/null); do \
@@ -184,13 +185,13 @@ integrate-run:
 			if ! $(RUST_LLD) -flavor darwin -o $$base $$o $$helper_objs $$runtime_obj $(LDFLAGS_rust-lld); then \
 			echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 		fi; \
 		else \
 			if ! $(ASSEMBLER) $$o $$helper_objs $$runtime_obj -o $$base $(LDFLAGS_clang); then \
 			echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 		fi; \
 		fi; \
 	done; \
@@ -200,9 +201,10 @@ integrate-run:
 	[ "$$base" = "__silica_runtime" ] && continue; \
 	grep -qE '^\.global main$$' "$$exe" || continue; \
 		if [ ! -x "$$base" ]; then \
+			case "$$bf" in *" $$base "*) echo "$(MSG_PREFIX)$$base not run: assemble/link failed (reported above)";; *) \
 			echo "❌❌ $(MSG_PREFIX)$$base missing executable (assemble/link failed earlier)"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			ko=$$((ko + 1)); failed=1;; esac; \
 		elif [ -x "$$base" ]; then \
 			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
 				if [ -f "$$base.wait_for_exit" ]; then \
@@ -269,7 +271,7 @@ clean:
 	@cd "$(THIS_DIR)" && \
 	for s in *.sams; do \
 		[ -f "$$s" ] || continue; \
-		rm -f $${s%.sams}; \
+		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done; \
 	rm -f *.sams *.o *.iface *.sout silica.config silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts; \
 	echo "✅ $(MSG_PREFIX)Clean complete"

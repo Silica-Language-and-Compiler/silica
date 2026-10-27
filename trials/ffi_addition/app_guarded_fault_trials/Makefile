@@ -44,25 +44,37 @@ all: integrate
 
 fixtures: ffi-wrapper-archives
 
-$(UNGUARDED_PROBE): $(FIXTURES_DIR)/src/silica_ffi_fault.c
+# A probe that is not a native executable (a Mach-O copied to Linux, or an ELF to the Mac) is deleted when
+# this Makefile is read, so the rule below sees it missing and rebuilds it whatever the mtimes say.
+# Parse time, because make would already have judged the file up to date by its mtime. $(shell) uses
+# /bin/sh (dash on the hosts): no parentheses, make would miscount them.
+ifeq ($(shell uname -s),Darwin)
+  NATIVE_EXE_FORMAT := Mach-O
+else
+  NATIVE_EXE_FORMAT := ELF
+endif
+PROBE_FOREIGN := $(shell if [ -e '$(UNGUARDED_PROBE)' ] && ! file -L '$(UNGUARDED_PROBE)' 2>/dev/null | grep -q '$(NATIVE_EXE_FORMAT)'; then rm -f '$(UNGUARDED_PROBE)'; echo removed; fi)
+
+$(UNGUARDED_PROBE): $(FIXTURES_DIR)/src/silica_ffi_fault.c $(THIS_DIR)unguarded_null_deref_main.c
 	clang $(FFI_CFLAGS) -c $(FIXTURES_DIR)/src/silica_ffi_fault.c -o $(THIS_DIR)/silica_ffi_fault.o
 	clang $(FFI_CFLAGS) $(THIS_DIR)/unguarded_null_deref_main.c $(THIS_DIR)/silica_ffi_fault.o -o $@
 
 unguarded_probe: $(UNGUARDED_PROBE)
 
 altstack_check: dangerous_guarded_null_deref_fault
-	@nm "$(APP_TRIAL_DIR)/dangerous_guarded_null_deref_fault" 2>/dev/null | grep -q '_silica_rt_ffi_altstack_mem' || { echo "  ❌ altstack symbol missing"; exit 1; }
+	@nm "$(APP_TRIAL_DIR)/dangerous_guarded_null_deref_fault" 2>/dev/null | grep -Eq '(^|[^A-Za-z0-9_])_?silica_rt_ffi_altstack_mem' || { echo "  ❌ altstack symbol missing"; exit 1; }
 	@echo "  ✅ altstack memory symbol present"
 
 integrate-run: fixtures unguarded_probe
 	@ln -sfn "$(FFI_SOURCE_VIEW)" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
 	@test -f "$(FFI_LEGACY_ARCHIVE)" || { echo "  ❌ $(APP_LABEL): missing legacy archive"; exit 1; }
-	@cd "$(APP_TRIAL_DIR)" && rm -f *.sams *.o *.iface $(APP_EXECUTABLES) silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms
+	@cd "$(APP_TRIAL_DIR)" && $(call TRIAL_RM_UNTRACKED,$(APP_EXECUTABLES)); rm -f *.sams *.o *.iface  silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms
 	@cd "$(APP_TRIAL_DIR)" && find "$(APP_TRIAL_DIR)" -maxdepth 1 -name '*.silica' ! -name 'dangerous_unguarded_null_deref_abort.silica' | sed "s|^$(APP_TRIAL_DIR)/||" | sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
 	@$(ENSURE_SILICA_COMPILER)
-	@cd "$(APP_TRIAL_DIR)" && if ! { $(RUN_SILICA_COMPILER); }; then echo "❌❌ $(APP_LABEL): compilation failed"; $(INTEGRATE_DOT_FAIL); printf '%d %d\n' 0 1 > .integrate_counts; exit 1; fi
-	@failed=0; ok=0; ko=0; \
+	@cd "$(APP_TRIAL_DIR)" && if ! { $(RUN_SILICA_COMPILER_ISOLATING); }; then echo "❌❌ $(APP_LABEL): compilation failed"; $(INTEGRATE_DOT_FAIL); printf '%d %d\n' 0 1 > .integrate_counts; exit 1; fi
+	@failed=0; ok=0; ko=0; bf=""; \
 	cd "$(APP_TRIAL_DIR)"; \
+	$(call INTEGRATE_COMPILE_REJECTS,$(APP_LABEL)/); \
 	link_archives=$$("$(SILICA_LINK_SH)" .); \
 	for sams in *.sams; do \
 		[ -f "$$sams" ] || continue; \
@@ -88,30 +100,34 @@ integrate-run: fixtures unguarded_probe
 		base=$${sams%.sams}; \
 		echo "Assembling $$sams..."; \
 		if ! clang $(ASFLAGS) -c -x assembler "$$sams" -o "$$base.o"; then \
-		echo "❌❌ $$base assemble failed"; \
+		echo "❌❌ $(APP_LABEL)/$$base assemble failed"; \
 		$(INTEGRATE_DOT_FAIL); \
-		ko=$$((ko + 1)); failed=1; break; \
+		bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 	fi; \
 	done; \
 	$(TRIAL_SUPPORT_ASSEMBLE); \
+	rejected_units=$$(cut -f1 silica.compile.rejected 2>/dev/null); \
 	for trial in dangerous_guarded_null_deref_fault dangerous_guarded_arena_bounds_fault dangerous_guarded_sigbus_fault dangerous_guarded_sigill_fault dangerous_guarded_sigfpe_fault dangerous_handler_altstack_stack_overflow_smoke; do \
-		[ "$$failed" -ne 0 ] && break; \
+		: "Each trial stands alone: a rejected, unassembled, unlinked or failing trial is reported once and the loop moves on."; \
+		if printf '%s\n' "$$rejected_units" | grep -qxF "$$trial.silica"; then continue; fi; \
+		case "$$bf" in *" $$trial "*) echo "$(APP_LABEL)/$$trial not run: assemble failed (reported above)"; continue;; esac; \
+		linked=1; ran=0; \
 		runtime_obj=""; [ -f __silica_runtime.o ] && runtime_obj=__silica_runtime.o; \
 		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$trial.silica)"; \
 		if test -x "$(RUST_LLD)"; then \
 						if ! "$(RUST_LLD)" -flavor darwin -o "$$trial" "$$trial.o" $$runtime_obj $$link_archives $(LDFLAGS_rust-lld); then \
 				echo "❌❌ $(APP_LABEL)/$$trial link failed"; \
 				$(INTEGRATE_DOT_FAIL); \
-				ko=$$((ko + 1)); failed=1; \
+				ko=$$((ko + 1)); failed=1; linked=0; \
 			fi; \
 		else \
 						if ! clang "$$trial.o" $$runtime_obj $$link_archives -o "$$trial" $(LDFLAGS_clang); then \
 				echo "❌❌ $(APP_LABEL)/$$trial link failed"; \
 				$(INTEGRATE_DOT_FAIL); \
-				ko=$$((ko + 1)); failed=1; \
+				ko=$$((ko + 1)); failed=1; linked=0; \
 			fi; \
 		fi; \
-		[ "$$failed" -ne 0 ] && break; \
+		[ "$$linked" = 1 ] || continue; ran=1; \
 		if [ -f "$$trial.wait_for_exit" ]; then \
 			marker=$$(awk 'NF { if ($$NF ~ /^[0-9]+$$/) { m=$$0; sub(/[ \t]+[0-9]+$$/, "", m); print m } else print $$0; exit } END { if (!NR) print "done" }' "$$trial.wait_for_exit"); \
 			marker_count=$$(awk 'NF { if ($$NF ~ /^[0-9]+$$/) print $$NF; else print 1; exit } END { if (!NR) print 1 }' "$$trial.wait_for_exit"); \
@@ -119,25 +135,25 @@ integrate-run: fixtures unguarded_probe
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(APP_LABEL)/$$trial $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
-				ko=$$((ko + 1)); failed=1; \
+				ko=$$((ko + 1)); failed=1; ran=0; \
 			elif [ "$$integrate_rc" -ne 0 ]; then \
 			echo "❌❌ $(APP_LABEL)/$$trial run failed"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			ko=$$((ko + 1)); failed=1; ran=0; \
 		fi; \
 		else \
 			$(call INTEGRATE_RUN_TRIAL,$(APP_LABEL)/$$trial,$$trial.sout,./$$trial); \
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(APP_LABEL)/$$trial $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
-				ko=$$((ko + 1)); failed=1; \
+				ko=$$((ko + 1)); failed=1; ran=0; \
 			elif false; then \
 			echo "❌❌ $(APP_LABEL)/$$trial run failed"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			ko=$$((ko + 1)); failed=1; ran=0; \
 		fi; \
 		fi; \
-		[ "$$failed" -ne 0 ] && break; \
+		[ "$$ran" = 1 ] || continue; \
 		if [ ! -f "$(call SCOUT_FOR,$$trial)" ]; then \
 			echo "  ❌ $(APP_LABEL)/$$trial: missing .scout"; ko=$$((ko + 1)); failed=1; \
 			$(INTEGRATE_DOT_FAIL); \
@@ -182,4 +198,4 @@ integrate-run: fixtures unguarded_probe
 	exit $$failed
 
 clean:
-	@cd "$(THIS_DIR)" && rm -rf *.sams *.o *.iface $(APP_EXECUTABLES) silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms *.sout dangerous_exposure_source .trial_stdlib $(UNGUARDED_PROBE) silica_ffi_fault.o unguarded_sigill_probe
+	@cd "$(THIS_DIR)" && $(call TRIAL_RM_UNTRACKED,$(APP_EXECUTABLES) dangerous_exposure_source $(UNGUARDED_PROBE) unguarded_sigill_probe); rm -rf *.sams *.o *.iface  silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms *.sout .trial_stdlib silica_ffi_fault.o

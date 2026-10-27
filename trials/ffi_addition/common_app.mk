@@ -38,21 +38,22 @@ define APP_INTEGRATE_BODY
 	@for ar in $(FFI_WRAPPER_ARCHIVES); do \
 		test -f "$$ar" || { echo "  ❌ $(APP_LABEL): missing wrapper archive $$ar (run make fixtures)"; exit 1; }; \
 	done
-	@cd "$(APP_TRIAL_DIR)" && rm -f *.sams *.o *.iface $(APP_EXECUTABLES) silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms
+	@cd "$(APP_TRIAL_DIR)" && $(call TRIAL_RM_UNTRACKED,$(APP_EXECUTABLES)); rm -f *.sams *.o *.iface  silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms
 	@cd "$(APP_TRIAL_DIR)" && find "$(APP_TRIAL_DIR)" -maxdepth 1 -name '*.silica' | sed "s|^$(APP_TRIAL_DIR)/||" | sort > silica.config && $(TRIAL_SUPPORT_CONFIG)
-	@cd "$(APP_TRIAL_DIR)" && if ! { $(RUN_SILICA_COMPILER); }; then echo "❌❌ $(APP_LABEL): compilation failed"; $(INTEGRATE_DOT_FAIL); printf '%d %d\n' 0 1 > .integrate_counts; exit 1; fi
-	@failed=0; ok=0; ko=0; \
+	@cd "$(APP_TRIAL_DIR)" && if ! { $(RUN_SILICA_COMPILER_ISOLATING); }; then echo "❌❌ $(APP_LABEL): compilation failed"; $(INTEGRATE_DOT_FAIL); printf '%d %d\n' 0 1 > .integrate_counts; exit 1; fi
+	@failed=0; ok=0; ko=0; bf=""; \
 	cd "$(APP_TRIAL_DIR)"; \
+	$(call INTEGRATE_COMPILE_REJECTS,$(APP_LABEL)/); \
 	if [ -f silica.link.scout ]; then \
 		if [ ! -f silica.link ]; then \
 			echo "  ❌ $(APP_LABEL): silica.link not emitted"; \
 			$(INTEGRATE_DOT_FAIL); \
-			printf '%d %d\n' 0 1 > .integrate_counts; exit 1; \
+			ko=$$((ko + 1)); failed=1; \
 		elif ! diff -Bw -q silica.link silica.link.scout > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL): silica.link differs from .scout"; \
 			$(INTEGRATE_DOT_FAIL); \
 			diff -Bw silica.link silica.link.scout || true; \
-			printf '%d %d\n' 0 1 > .integrate_counts; exit 1; \
+			ko=$$((ko + 1)); failed=1; \
 		else \
 			echo "  ✅✅ $(APP_LABEL)/silica.link matches .scout"; \
 			$(INTEGRATE_DOT_OK); \
@@ -84,33 +85,38 @@ define APP_INTEGRATE_BODY
 		base=$${sams%.sams}; \
 		echo "Assembling $$sams..."; \
 		if ! clang $(ASFLAGS) -c -x assembler "$$sams" -o "$$base.o"; then \
-		echo "❌❌ $$base assemble failed"; \
+		echo "❌❌ $(APP_LABEL)/$$base assemble failed"; \
 		$(INTEGRATE_DOT_FAIL); \
-		ko=$$((ko + 1)); failed=1; break; \
+		bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 	fi; \
 	done; \
+	rejected_units=$$(cut -f1 silica.compile.rejected 2>/dev/null); \
 	for trial in $(APP_EXECUTABLES); do \
-		[ "$$failed" -ne 0 ] && break; \
+		: "Each trial stands alone: a rejected, unassembled, unlinked or failing trial is reported once and the loop moves on."; \
+		if printf '%s\n' "$$rejected_units" | grep -qxF "$$trial.silica"; then continue; fi; \
+		case "$$bf" in *" $$trial "*) echo "$(APP_LABEL)/$$trial not run: assemble failed (reported above)"; continue;; esac; \
 		[ -n "$$tsa_done" ] || { $(TRIAL_SUPPORT_ASSEMBLE); tsa_done=1; }; \
 		runtime_obj=""; \
 		[ -f __silica_runtime.o ] && runtime_obj=__silica_runtime.o; \
 		runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$trial.silica)"; \
+		linked=1; \
 		if test -x "$(RUST_LLD)"; then \
 			objs="$$trial.o $(APP_LINK_OBJECTS)"; \
 			if ! "$(RUST_LLD)" -flavor darwin -o "$$trial" $$objs $$runtime_obj $$link_archives $(LDFLAGS_rust-lld); then \
 			echo "❌❌ $(APP_LABEL)/$$trial link failed"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			ko=$$((ko + 1)); failed=1; linked=0; \
 		fi; \
 		else \
 			objs="$$trial.o $(APP_LINK_OBJECTS)"; \
 			if ! clang $$objs $$runtime_obj $$link_archives -o "$$trial" $(LDFLAGS_clang); then \
 			echo "❌❌ $(APP_LABEL)/$$trial link failed"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			ko=$$((ko + 1)); failed=1; linked=0; \
 		fi; \
 		fi; \
-		[ "$$failed" -ne 0 ] && break; \
+		[ "$$linked" = 1 ] || continue; \
+		ran=1; \
 		if [ -f "$$trial.wait_for_exit" ]; then \
 			marker=$$(awk 'NF { if ($$NF ~ /^[0-9]+$$/) { m=$$0; sub(/[ \t]+[0-9]+$$/, "", m); print m } else print $$0; exit } END { if (!NR) print "done" }' "$$trial.wait_for_exit"); \
 			marker_count=$$(awk 'NF { if ($$NF ~ /^[0-9]+$$/) print $$NF; else print 1; exit } END { if (!NR) print 1 }' "$$trial.wait_for_exit"); \
@@ -118,21 +124,21 @@ define APP_INTEGRATE_BODY
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(APP_LABEL)/$$trial $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
-				ko=$$((ko + 1)); failed=1; \
+				ko=$$((ko + 1)); failed=1; ran=0; \
 			elif [ "$$integrate_rc" -ne 0 ]; then \
 			echo "❌❌ $(APP_LABEL)/$$trial run failed"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			ko=$$((ko + 1)); failed=1; ran=0; \
 		fi; \
 		else \
 			$(call INTEGRATE_RUN_TRIAL,$(APP_LABEL)/$$trial,$$trial.sout,./$$trial); \
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(APP_LABEL)/$$trial $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
-				ko=$$((ko + 1)); failed=1; \
+				ko=$$((ko + 1)); failed=1; ran=0; \
 			fi; \
 		fi; \
-		[ "$$failed" -ne 0 ] && break; \
+		[ "$$ran" = 1 ] || continue; \
 		if [ ! -f "$(call SCOUT_FOR,$$trial)" ]; then \
 			echo "  ❌ $(APP_LABEL)/$$trial: missing .scout"; ko=$$((ko + 1)); failed=1; \
 			$(INTEGRATE_DOT_FAIL); \
