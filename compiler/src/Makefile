@@ -35,6 +35,9 @@ else
 SILICA_COMPILER ?= $(BINARIES_DIR)/seed-compiler
 endif
 SILICA_LINK_SH := $(abspath $(THIS_DIR)../../trials/silica_link.sh)
+# assembly's per-unit compiler log is rewritten by this filter (terminal bar, or one
+# line per stage under CI). SILICA_PROGRESS=off on the make command line keeps the raw log.
+COMPILE_PROGRESS := $(abspath $(THIS_DIR)../tools/compile_progress.sh)
 STDLIB_DS := $(abspath $(THIS_DIR)../stdlib/data_structures)
 # POLICY: src links NO Rust libraries. The bootstrap crate's staticlib
 # (libsilica_compiler.a) used to be linked here and supplied the whole runtime.
@@ -158,6 +161,25 @@ $(THIS_DIR)lib/%.silica: $(STDLIB_DS)/%.silica
 	@if [ ! -f "$<" ]; then echo "FAIL: missing $<"; exit 1; fi
 	@cp "$<" "$@"
 
+# wbt_map.silica is one module of about 8,000 lines. Type-checking all of it is
+# the unit that a 7 GB runner kills. The compiler calls this module through
+# insert (empty, get, fold, contains_key, find_value, size, the compare
+# helpers, and insert). Deletion, from_sorted and validate are the rest of the
+# file and nothing in this tree calls them. SILICA_COMPILER_WBT_THROUGH=insert
+# stages that prefix so the unit fits. compiler/stdlib/data_structures/wbt_map.silica
+# stays whole, which is what programs compiled by the result still use.
+$(THIS_DIR)lib/wbt_map.silica: $(STDLIB_DS)/wbt_map.silica
+	@mkdir -p "$(THIS_DIR)lib"
+	@if [ ! -f "$<" ]; then echo "FAIL: missing $<"; exit 1; fi
+	@if [ "$(SILICA_COMPILER_WBT_THROUGH)" = "insert" ]; then \
+		awk '/^\/\/ §8A\.7 / { exit } \
+			/^export (delete|delete_min|delete_max|from_sorted|from_sorted_counted|from_sorted_error_code|from_sorted_preflight_status|validate|validate_error_code)\// { next } \
+			{ print }' "$<" > "$@"; \
+		echo "staged $@ through insert"; \
+	else \
+		cp "$<" "$@"; \
+	fi
+
 $(THIS_DIR)lib/Supervisor.silica: $(STDLIB_ROOT)/Supervisor.silica
 	@mkdir -p "$(THIS_DIR)lib"
 	@if [ ! -f "$<" ]; then echo "FAIL: missing $<"; exit 1; fi
@@ -233,6 +255,11 @@ silica.config.regen:
 # the rest; the batch then ends with status 1. silica.compile.inprogress / silica.compile.crashed
 # carry that between the processes of one batch and are removed only when a new batch starts.
 # Seed failures cover compilation and emitter errors.
+#
+# The compiler prints a stage line for every unit ("Lexing...", "Type checking...", ...).
+# compile_progress.sh turns that into one carriage-return bar on a terminal, and into one
+# new bar line per stage when CI is set or stdout is not a terminal. The reclaim echo is
+# not printed: the bar already moves. Exit 76 still prints a line of its own.
 #
 # Incremental: keep .sams / .iface whose mtime is not older than their .silica source AND not
 # older than the seed that produced them. If either artifact is missing or outdated, remove both
@@ -327,22 +354,26 @@ assembly: check-seed silica.config stage record-compile-start
 	  fi; \
 	  echo "Compiling with seed host: $(SILICA_COMPILER) ($$need unit(s) to compile)"; \
 	  echo "Emit target: $(TARGET) (see silica.target)"; \
+	  export SILICA_PROGRESS_TOTAL="$$need"; \
+	  ecfile=$$(mktemp); \
 	  while true; do \
-	    "$(SILICA_COMPILER)"; \
-	    ec=$$?; \
-	    if [ $$ec -eq 0 ]; then break; fi; \
-	    if [ $$ec -eq 75 ]; then \
-	      echo "  (reclaiming memory; continuing next unit)"; \
+	    { "$(SILICA_COMPILER)"; echo $$? > "$$ecfile"; } 2>&1 | "$(COMPILE_PROGRESS)"; \
+	    ec=$$(cat "$$ecfile"); \
+	    if [ "$$ec" -eq 0 ]; then break; fi; \
+	    if [ "$$ec" -eq 75 ]; then \
 	      continue; \
 	    fi; \
-	    if [ $$ec -eq 76 ]; then \
-	      echo "  (the compiler crashed in a unit; continuing with the rest of the batch)"; \
+	    if [ "$$ec" -eq 76 ]; then \
+	      printf '\n  (the compiler crashed in a unit; continuing with the rest of the batch)\n'; \
 	      continue; \
 	    fi; \
-	    echo "FAIL: seed compilation failed (exit $$ec)"; \
+	    printf '\n'; \
+	    echo "FAIL: compilation stopped (exit $$ec). The compiler diagnostic is above."; \
+	    rm -f "$$ecfile"; \
 	    $(REPORT_COMPILE_TIME); \
 	    exit 1; \
 	  done; \
+	  rm -f "$$ecfile"; \
 	  echo "✅ Assembly generated (.sams)"; \
 	  $(call MAYBE_REPORT_COMPILE_TIME_SUCCESS,assembly)
 
