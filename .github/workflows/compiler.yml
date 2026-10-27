@@ -1,0 +1,262 @@
+# Build the compiler for every emit target.
+#
+# A pull request builds each architecture and uploads that compiler as an
+# artifact. A push to main (a merge, or a commit pushed straight to main)
+# builds the same compilers and publishes them as a GitHub release.
+#
+# Hosted targets build on a runner of that architecture. The host compiler is
+# the newest committed binary for that platform (lowest silica-NNNNNN), not the
+# seed. The seeds are older and, on these runners, are killed while
+# type-checking lib/wbt_map.silica (macOS signal 9, Linux runner shutdown).
+# ESP32-S3_raw has no host: its cross compiler is built on macOS by
+# binaries/silica-compiler, which is what compiler/src/Makefile does.
+#
+# The build sets SILICA_COMPILER_WBT_THROUGH=insert so the compiler's own copy
+# of wbt_map stops at insert. The Linux jobs turn systemd-oomd off and add swap
+# at /swap-ci. The image's /swapfile is already active.
+
+name: Compiler
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: compiler-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.emit_target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - emit_target: apple_silicon_mac
+            runner: macos-26
+            kind: selfhost
+          - emit_target: linux_aarch64
+            runner: ubuntu-24.04-arm
+            kind: selfhost
+          - emit_target: linux_x86_64
+            runner: ubuntu-24.04
+            kind: selfhost
+          - emit_target: ESP32-S3_raw
+            runner: macos-26
+            kind: cross
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux host tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang
+
+      - name: Leave memory for the compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(uname -s)" = Linux ]; then
+            # systemd-oomd stops the runner when one unit holds memory pressure.
+            # That is the shutdown signal from the Linux jobs, not a compile error.
+            sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
+            sudo systemctl mask systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
+            echo "systemd-oomd=$(systemctl is-active systemd-oomd.service 2>/dev/null || true)"
+            echo "swap already present:"
+            swapon --show || true
+            free -h
+            # The image already swaps on /swapfile. fallocate on that path
+            # returns "Text file busy". Add a second file only when swap is
+            # under 4 GB, and keep going if the disk cannot hold it.
+            have_kb="$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)"
+            if [ "${have_kb}" -lt $((4 * 1024 * 1024)) ]; then
+              avail_kb="$(df -Pk / | awk 'NR==2 { print $4 }')"
+              swap_kb="$((avail_kb - 4 * 1024 * 1024))"
+              if [ "${swap_kb}" -gt $((8 * 1024 * 1024)) ]; then
+                swap_kb="$((8 * 1024 * 1024))"
+              fi
+              if [ "${swap_kb}" -gt $((2 * 1024 * 1024)) ]; then
+                if sudo fallocate -l "${swap_kb}K" /swap-ci \
+                  && sudo chmod 600 /swap-ci \
+                  && sudo mkswap /swap-ci \
+                  && sudo swapon /swap-ci; then
+                  echo "added ${swap_kb}K of swap at /swap-ci"
+                else
+                  echo "could not add /swap-ci; continuing with the swap already on the runner"
+                  sudo swapoff /swap-ci 2>/dev/null || true
+                  sudo rm -f /swap-ci
+                fi
+              fi
+            fi
+            free -h
+          else
+            sudo purge || true
+          fi
+
+      - name: Choose the compiler that builds this one
+        id: host
+        env:
+          EMIT_TARGET: ${{ matrix.emit_target }}
+          BUILD_KIND: ${{ matrix.kind }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          platform="$(make -s --no-print-directory -f project_makefiles/platform/platforms.mk host-platform)"
+          echo "runner platform: ${platform}"
+          echo "emit target: ${EMIT_TARGET}"
+
+          if [ "${BUILD_KIND}" = "cross" ]; then
+            compiler="binaries/silica-compiler"
+          else
+            # Lowest number is the newest compiler. A name is
+            # silica-NNNNNN-<platform> or silica-NNNNNN-seed-<platform>.
+            # Cross compilers (silica-NNNNNN-<target>-<platform>) are not hosts.
+            compiler="$(find binaries -maxdepth 1 -type f \( \
+              -name "silica-[0-9][0-9][0-9][0-9][0-9][0-9]-${platform}" -o \
+              -name "silica-[0-9][0-9][0-9][0-9][0-9][0-9]-seed-${platform}" \
+            \) | sort | head -n 1 || true)"
+          fi
+
+          if [ -z "${compiler}" ] || [ ! -e "${compiler}" ]; then
+            echo "no compiler available to build ${EMIT_TARGET} on ${platform}" >&2
+            exit 1
+          fi
+          chmod +x "${compiler}"
+          echo "building with: ${compiler} -> $(readlink "${compiler}" || basename "${compiler}")"
+          echo "compiler=${compiler}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build the compiler
+        env:
+          EMIT_TARGET: ${{ matrix.emit_target }}
+          BUILD_KIND: ${{ matrix.kind }}
+          HOST_COMPILER: ${{ steps.host.outputs.compiler }}
+          SILICA_COMPILER_WBT_THROUGH: insert
+          SILICA_CARRIER_COUNT: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${BUILD_KIND}" = "cross" ]; then
+            make -C compiler/src build \
+              TARGET="${EMIT_TARGET}" \
+              SILICA_TARGET_PROMPT=0 \
+              SILICA_COMPILER_WBT_THROUGH=insert
+          else
+            make -C compiler/src build \
+              TARGET="${EMIT_TARGET}" \
+              SILICA_TARGET_PROMPT=0 \
+              SILICA_COMPILER_WBT_THROUGH=insert \
+              SILICA_COMPILER="${GITHUB_WORKSPACE}/${HOST_COMPILER}"
+          fi
+
+      # Trials. Left commented until the compiler build is known to finish on
+      # these runners. Uncomment to run the host trial tree with the compiler
+      # this job just published. Board trials need an attached ESP32-S3 and
+      # stay out of this workflow.
+      # - name: Run trials
+      #   if: matrix.kind == 'selfhost'
+      #   run: make -C trials integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host
+
+      - name: Collect the published compiler
+        id: published
+        env:
+          EMIT_TARGET: ${{ matrix.emit_target }}
+          BUILD_KIND: ${{ matrix.kind }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${BUILD_KIND}" = "cross" ]; then
+            link="binaries/silica-compiler-${EMIT_TARGET}"
+          else
+            link="binaries/silica-compiler"
+          fi
+          if [ ! -L "${link}" ]; then
+            echo "build did not publish ${link}" >&2
+            exit 1
+          fi
+          name="$(readlink "${link}")"
+          case "${name}" in
+            /*) echo "published link points outside binaries/: ${name}" >&2; exit 1 ;;
+          esac
+          binary="binaries/${name}"
+          if [ ! -f "${binary}" ]; then
+            echo "published compiler is missing: ${binary}" >&2
+            exit 1
+          fi
+          chmod +x "${binary}"
+          mkdir -p "${RUNNER_TEMP}/compiler-artifact"
+          cp -p "${binary}" "${RUNNER_TEMP}/compiler-artifact/${name}"
+          echo "name=${name}" >> "${GITHUB_OUTPUT}"
+          echo "path=${RUNNER_TEMP}/compiler-artifact/${name}" >> "${GITHUB_OUTPUT}"
+          echo "published ${name}"
+
+      - name: Upload the compiler artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.emit_target }}
+          path: ${{ steps.published.outputs.path }}
+          if-no-files-found: error
+
+  release:
+    name: Release compilers
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download compiler artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "no compiler artifacts to release" >&2
+            exit 1
+          fi
+          chmod +x "${assets[@]}"
+
+          tag="compiler-${GITHUB_SHA}"
+          short="${GITHUB_SHA:0:7}"
+          notes="$(mktemp)"
+          {
+            echo "Compilers built from \`${GITHUB_SHA}\`."
+            echo
+            echo "Each asset is named the same way as the files in \`binaries/\`."
+            echo "\`<platform>\` is the machine the binary runs on."
+            echo "A cross compiler also carries its emit target, with hyphens written as underscores."
+            echo
+            echo "Assets:"
+            for asset in "${assets[@]}"; do
+              echo "- \`$(basename "${asset}")\`"
+            done
+          } > "${notes}"
+
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${assets[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${tag}" "${assets[@]}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "Compiler ${short}" \
+              --notes-file "${notes}"
+          fi
