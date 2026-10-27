@@ -35,6 +35,9 @@ else
 SILICA_COMPILER ?= $(BINARIES_DIR)/seed-compiler
 endif
 SILICA_LINK_SH := $(abspath $(THIS_DIR)../../trials/silica_link.sh)
+# assembly's per-unit compiler log is rewritten by this filter (terminal bar, or one
+# line per stage under CI). SILICA_PROGRESS=off on the make command line keeps the raw log.
+COMPILE_PROGRESS := $(abspath $(THIS_DIR)../tools/compile_progress.sh)
 STDLIB_DS := $(abspath $(THIS_DIR)../stdlib/data_structures)
 # POLICY: src links NO Rust libraries. The bootstrap crate's staticlib
 # (libsilica_compiler.a) used to be linked here and supplied the whole runtime.
@@ -253,6 +256,11 @@ silica.config.regen:
 # carry that between the processes of one batch and are removed only when a new batch starts.
 # Seed failures cover compilation and emitter errors.
 #
+# The compiler prints a stage line for every unit ("Lexing...", "Type checking...", ...).
+# compile_progress.sh turns that into one carriage-return bar on a terminal, and into one
+# new bar line per stage when CI is set or stdout is not a terminal. The reclaim echo is
+# not printed: the bar already moves. Exit 76 still prints a line of its own.
+#
 # Incremental: keep .sams / .iface whose mtime is not older than their .silica source AND not
 # older than the seed that produced them. If either artifact is missing or outdated, remove both
 # and recompile that unit. Orphan .sams/.iface (no matching .silica) are removed.
@@ -346,22 +354,26 @@ assembly: check-seed silica.config stage record-compile-start
 	  fi; \
 	  echo "Compiling with seed host: $(SILICA_COMPILER) ($$need unit(s) to compile)"; \
 	  echo "Emit target: $(TARGET) (see silica.target)"; \
+	  export SILICA_PROGRESS_TOTAL="$$need"; \
+	  ecfile=$$(mktemp); \
 	  while true; do \
-	    "$(SILICA_COMPILER)"; \
-	    ec=$$?; \
-	    if [ $$ec -eq 0 ]; then break; fi; \
-	    if [ $$ec -eq 75 ]; then \
-	      echo "  (reclaiming memory; continuing next unit)"; \
+	    { "$(SILICA_COMPILER)"; echo $$? > "$$ecfile"; } 2>&1 | "$(COMPILE_PROGRESS)"; \
+	    ec=$$(cat "$$ecfile"); \
+	    if [ "$$ec" -eq 0 ]; then break; fi; \
+	    if [ "$$ec" -eq 75 ]; then \
 	      continue; \
 	    fi; \
-	    if [ $$ec -eq 76 ]; then \
-	      echo "  (the compiler crashed in a unit; continuing with the rest of the batch)"; \
+	    if [ "$$ec" -eq 76 ]; then \
+	      printf '\n  (the compiler crashed in a unit; continuing with the rest of the batch)\n'; \
 	      continue; \
 	    fi; \
-	    echo "FAIL: seed compilation failed (exit $$ec)"; \
+	    printf '\n'; \
+	    echo "FAIL: compilation stopped (exit $$ec). The compiler diagnostic is above."; \
+	    rm -f "$$ecfile"; \
 	    $(REPORT_COMPILE_TIME); \
 	    exit 1; \
 	  done; \
+	  rm -f "$$ecfile"; \
 	  echo "✅ Assembly generated (.sams)"; \
 	  $(call MAYBE_REPORT_COMPILE_TIME_SUCCESS,assembly)
 
