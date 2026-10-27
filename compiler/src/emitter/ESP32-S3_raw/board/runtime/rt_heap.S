@@ -66,15 +66,16 @@ silica_rt_heap_lock:
 silica_rt_region_lock:                        // rt_ordering.S's canonical arena insert
     .space  4
 
-// The heap lock, the shape of rt_actors.S's FREE_LOCK. The macro's own local label is 9, so the
-// routines below never use 9 for theirs.
+// The heap lock, the shape of rt_actors.S's FREE_LOCK. Its spin label is unique per expansion
+// (\@), so it never captures a caller's numeric local label.
 .macro HEAP_LOCK ra, rb
     movi    \ra, silica_rt_heap_lock
-9:  movi    \rb, 0
+.Lheap_lock_spin\@:
+    movi    \rb, 0
     wsr     \rb, scompare1
     movi    \rb, 1
     s32c1i  \rb, \ra, 0
-    bnez    \rb, 9b
+    bnez    \rb, .Lheap_lock_spin\@
 .endm
 
 .macro HEAP_UNLOCK ra, rb

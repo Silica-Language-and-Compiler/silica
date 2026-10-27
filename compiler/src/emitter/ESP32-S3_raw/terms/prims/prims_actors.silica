@@ -670,7 +670,13 @@ fn send_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, valu
     n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
     t: string <- sir_term_root_node(sir_term_at(term, n.right_expr)).type_name;
     case term_message_copy@md_prim_value_is_move(n.value) or term_message_copy@md_site_elided(outer_reg, term.root) or term_message_copy@md_type_needs_copy(t) == false of {
-        true -> "";
+        // A fresh record whose only mention is this send (term_message_copy |_hov) is handed over
+        // as the owned payload itself: a non-empty `deep` makes actor_message_copy_x10 skip the
+        // one-level promote and the send pass owned = 1, so the receiver frees this very block.
+        true -> case term_message_copy@md_site_handover(outer_reg, term.root) and aggregate_message_type_bytes(t) > 0 of {
+            true -> "    # owned handover: the fresh message record itself is the payload\n";
+            false -> ""
+        };
         false -> {
             label: string <- term_message_copy@md_site_label(term_message_copy@md_fn_label_of(outer_reg), term.root);
             call: string <- concat(xt_mem@xt_str("X11", "[SP, #-16]!"), concat(xt_isa@xt_mov("X0", "X10"), concat(term_message_copy@md_copy_call_asm(label, ""), concat(xt_isa@xt_mov("X10", "X0"), xt_mem@xt_ldr("X11", "[SP], #16")))));
@@ -932,8 +938,8 @@ fn emit_runtime_binary(dest: string, term: { nodes: List[{ kind: int64, type_nam
 // timer_cast(target, message) is the inner half of send_after: the target is in X11 and the
 // message in X10, copied by the cast rules (actor_message_copy_x10 / send_deep_copy_asm, exactly
 // as emit_message_binary). The runtime gets X0 = the target's identity, X1 = the message, X2 =
-// (low word a6) the owned-payload flag of a copied record or tuple, as a cast passes it, and (high
-// word a7) the release thunk, 0 when the message type carries no owned region; it answers the
+// (low word, the runtime's a6) the owned-payload flag of a copied record or tuple, as a cast passes
+// it, and (high word, the runtime's a7) the release thunk, 0 when the message type carries no owned region; it answers the
 // prepared timer record, an int64 word the outer send_after prim hands on together with the delay.
 //
 // The release thunk is what a cancelled or dropped timer runs instead of the receiver's dispatch:
@@ -968,16 +974,20 @@ fn timer_thunk_destroy_lines(offs: string, i: int64, acc: string) -> string {
     }
 }
 
-// The thunk's address goes into a7, X2's high word, after xt_movi has set the low word (a6).
+// The thunk's address goes into X2's high word after xt_movi has set the low word. At the call8 to
+// _silica_rt_timer_prepare X2 is a14:a15 (xt_vr), which the runtime receives as a6:a7, so the thunk
+// is written to a15. (Until 2026-10-27 this wrote a7, the caller's own register: the runtime read 0
+// from a15, no thunk ever ran, and every cancelled or dropped timer leaked the regions its message
+// carried; timers_addition/cancelled_timers_release_messages ran out of heap on the board.)
 fn timer_release_thunk_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> string {
     t: string <- sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name;
     offs: string <- term_message_regions@tmr_message_record_offsets(t);
     case length_bytes(offs) == 0 of {
-        true -> "    movi a7, 0\n";
+        true -> "    movi a15, 0\n";
         false -> {
             lbl: string <- timer_release_thunk_label(outer_reg, term.root);
             head: string <- concat(xt_isa@xt_b(concat(lbl, "_skip")), concat("    .align 4\n", concat(lbl, ":\n    entry a1, 32\n")));
-            tail: string <- concat("    retw\n", concat(lbl, concat("_skip:\n    movi a7, ", concat(lbl, "\n"))));
+            tail: string <- concat("    retw\n", concat(lbl, concat("_skip:\n    movi a15, ", concat(lbl, "\n"))));
             concat(head, concat(timer_thunk_destroy_lines(offs, 0, ""), tail))
         }
     }
@@ -1197,7 +1207,7 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "monotonic_time" -> emit_runtime_nullary(dest, term);
         "current_time" -> emit_runtime_nullary(dest, term);
         "send_after" -> emit_runtime_binary(dest, term);
-        "timer_cast" -> emit_timer_cast(dest, term, "", "    movi a7, 0\n");
+        "timer_cast" -> emit_timer_cast(dest, term, "", "    movi a15, 0\n");
         "cancel_timer" -> emit_runtime_unary(dest, term);
         "stack_policy" -> emit_stack_policy(dest, term);
         _: string -> concat(concat("    # unsupported actor prim: ", sir_term_root_node(term).name), "\n")

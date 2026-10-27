@@ -16,7 +16,7 @@
 """Run a bare-metal ESP32-S3 image on the board and capture the program's run.
 
     run_on_board.py [--port P] [--timeout S] [--out FILE] [--flash | --no-flash]
-                    [--send TEXT [--send-delay S]] image.bin
+                    [--send TEXT [--send-delay S] [--send-marker M [--send-marker-count N]]] image.bin
     run_on_board.py --probe [--port P] [--expect-mac MAC]
     run_on_board.py --list-ports
 
@@ -26,7 +26,10 @@ Modes:
               faster); the ROM is switched back to 230400 before the jump, because at 921600 the
               console output of images larger than about 40 KB arrives corrupted (measured
               2026-09-13; cause not established). The output is captured on the same open port,
-              so the start marker cannot be missed.
+              so the start marker cannot be missed. The host's Unix time in milliseconds is
+              written into the runtime's wall clock (rt_actors.S silica_rt_wall_clock) last, just
+              before the start, so current_time answers epoch milliseconds (spec §22.14.1); the
+              flash modes leave it unset (milliseconds since the system timer started).
   --flash     Write the image to flash at 0x0, reset, capture (the image then survives resets).
   --no-flash  Reset and capture whatever is already in flash.
   --probe     Connect, check that the device is an ESP32-S3 (and, with --expect-mac, that it is
@@ -41,7 +44,11 @@ target, spec §15.1.2.5) once the start marker has been seen and --send-delay se
 have passed; Python escapes are honoured, so --send 'exit\\n' sends the exit line that makes a
 main waiting in wait_for_exit return 0 (the program ends when main returns, spec §15.1.2.5). The
 delay lets the program's output settle first,
-as the host harness sends `exit` only after a trial's marker.
+as the host harness sends `exit` only after a trial's marker. With --send-marker M (and
+--send-marker-count N, default 1) the text also waits until N occurrences of M are on complete
+output lines and the output has then been quiet for 1.5 s (10 s at most), the host harness's
+rule (trials/*/run_integration_exit_after_marker.py), so a trial that needs longer than the delay
+to reach its marker is not cut short.
 
 The runtime (board/runtime/rt_start.S, rt_console.S) brackets program output with
     \\x02SILICA:START\\x03 ... \\x02SILICA:EXIT:<status>\\x03 [diagnostic]
@@ -70,6 +77,7 @@ import time
 
 START = b"\x02SILICA:START\x03"
 EXIT_PREFIX = b"\x02SILICA:EXIT:"
+WALL_CLOCK_TAG = b"SILICA:WALLCLOCK"
 UPLOAD_BAUD = 921600
 RUN_BAUD = 230400
 
@@ -139,18 +147,44 @@ def mac_of(esp):
     return ":".join("%02x" % b for b in mac)
 
 
+# --send-marker (main): with a marker, --send waits, beyond --send-delay, until the program's output
+# holds --send-marker-count occurrences of the marker on complete lines and has then been quiet for
+# MARKER_IDLE seconds (at most MARKER_DRAIN_CAP after the marker), as the host harness does
+# (trials/*/run_integration_exit_after_marker.py). Without one only the delay counts.
+SEND_MARKER = None
+SEND_MARKER_COUNT = 1
+MARKER_IDLE = 1.5
+MARKER_DRAIN_CAP = 10.0
+
+
+def marker_reached(out):
+    lines = bytes(out).split(b"\n")[:-1]
+    return sum(line.count(SEND_MARKER) for line in lines) >= SEND_MARKER_COUNT
+
+
 def capture(port, timeout, send=None, send_delay=1.0):
     buf = bytearray()
     deadline = time.time() + timeout
     send_at = None
+    last_rx = time.time()
+    marker_at = None
     while time.time() < deadline:
-        buf += port.read(4096)
+        chunk = port.read(4096)
+        if chunk:
+            buf += chunk
+            last_rx = time.time()
         i = buf.find(START)
         if i >= 0:
             if send is not None:
+                now = time.time()
                 if send_at is None:
-                    send_at = time.time() + send_delay
-                elif time.time() >= send_at:
+                    send_at = now + send_delay
+                ready = now >= send_at
+                if ready and SEND_MARKER is not None:
+                    if marker_at is None and marker_reached(buf[i + len(START):]):
+                        marker_at = now
+                    ready = marker_at is not None and (now - last_rx >= MARKER_IDLE or now - marker_at >= MARKER_DRAIN_CAP)
+                if ready:
                     port.write(send)
                     port.flush()
                     send = None
@@ -185,6 +219,16 @@ def run_from_ram(port_name, image, timeout, send=None, send_delay=1.0):
                 esp.mem_block(data[:esp.ESP_RAM_BLOCK], seq)
                 data = data[esp.ESP_RAM_BLOCK:]
                 seq += 1
+        # The wall clock (rt_actors.S silica_rt_wall_clock): the board has none, so the host's Unix
+        # time in milliseconds goes into the word after the runtime's tag, written last so that it
+        # is as close as possible to the start; the runtime adds the system timer's count from there.
+        for seg in img.segments:
+            k = seg.data.find(WALL_CLOCK_TAG)
+            if k >= 0:
+                stamp = struct.pack("<Q", int(time.time() * 1000))
+                esp.mem_begin(len(stamp), 1, esp.ESP_RAM_BLOCK, seg.addr + k + len(WALL_CLOCK_TAG))
+                esp.mem_block(stamp, 0)
+                break
         esp.change_baud(RUN_BAUD)
         # MEM_END without reading its response (esptool's mem_finish would read it): the program
         # starts printing as soon as the ROM jumps to the entry point, and when the host is slow
@@ -250,7 +294,13 @@ def main():
                     help="with --probe: fail unless the board has this MAC (default $BOARD_MAC)")
     ap.add_argument("--send", help="text to write to the console after the start marker (Python escapes, e.g. 'exit\\n')")
     ap.add_argument("--send-delay", type=float, default=1.0, help="seconds after the start marker before --send is written")
+    ap.add_argument("--send-marker", help="with --send: also wait until the output holds this marker (then quiet), as the host harness does")
+    ap.add_argument("--send-marker-count", type=int, default=1, help="occurrences of --send-marker to wait for (default 1)")
     a = ap.parse_args()
+    global SEND_MARKER, SEND_MARKER_COUNT
+    if a.send_marker:
+        SEND_MARKER = a.send_marker.encode("utf-8")
+        SEND_MARKER_COUNT = max(1, a.send_marker_count)
     send = None
     if a.send is not None:
         send = a.send.encode("utf-8").decode("unicode_escape").encode("latin-1")

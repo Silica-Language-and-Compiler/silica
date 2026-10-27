@@ -83,8 +83,12 @@ use atom_table;
 use record_shape;
 use var;
 use xt_isa;
+use reg_conventions;
 
 export md_type_needs_copy/1;
+export fn_owner_markers/2;
+export md_site_handover/2;
+export md_defer_postlude/3;
 export md_descriptor_rodata/3;
 export md_site_label/2;
 export md_rodata_block/1;
@@ -841,6 +845,230 @@ fn md_site_elided(outer_reg: string, node: int64) -> boolean {
 
 fn md_reply_elided(outer_reg: string) -> boolean {
     var@find_sp_binding(outer_reg, "_mvr") == "1"
+}
+
+// ---- fresh record results: handover and deferred release (board heap, 2026-10-27) ---------------
+//
+// A record a function returns is a heap block (silica_rt_region_alloc), and nothing ever freed the
+// one a caller binds: on the board, where the heap is a few hundred KB, a loop of record-returning
+// calls ran out of it (bees_regions_addition/bees_sd21_aggregate_return_does_not_leak_stack: 40 B
+// per call), and so did a loop that builds a message with a function and casts it, since the cast
+// sent a one-level copy and the original was kept (bees_sd7_message_region_released*,
+// timers_addition/cancelled_timers_release_messages: 32 B per message). Two narrow cases are
+// reclaimed, each with an ownership argument that does not depend on the type checker:
+//
+//   FRESH: `x <- f(...)` where f is a function of this unit with a record result and every result
+//   position of f's body (through let bodies and case arms) is a record_make, or a call to another
+//   such function. Such a result is the block the callee's let or epilogue promote has just
+//   allocated: when the call returns, the binding holds the only pointer to it.
+//
+//   HANDOVER (|_hov=<send node>,): x occurs exactly once in the let body, as the message operand of
+//   a send, cast or timer. No other pointer to the block exists and none can be made after the send
+//   (that one occurrence is the only mention), so the block itself goes to the message as its owned
+//   payload instead of a copy of it: the receiver frees it after its dispatch, a cancelled or
+//   dropped timer frees it, and a cast to an ended actor frees it at once, exactly as they free the
+//   copy. The sender never sees it again.
+//
+//   DEFERRED (|_dfr=<call node>,): every occurrence of x in the let body is the record operand of a
+//   record_proj whose result is a scalar (an integer, float, boolean or atom). Reading a scalar field
+//   copies the value out, so nothing derived from x points into the block, and nothing can reach it
+//   once the let ends. The call hands the block to silica_rt_defer_free, which the running actor's
+//   dispatch end frees (rt_actors.S); in main nothing is freed (main's dispatch never ends).
+//
+// Anything else -- a callee in another unit, a result position that is a variable, a field access
+// or an unknown call, a second mention of x, a shadowing rebinding of x -- is left as it was, which
+// is a leak and never a free of live memory.
+
+fn mc_find_function(name: string, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string } {
+    case fns.is_nil of {
+        true -> sir_ast@dummy_sir_function();
+        false -> case fns.head.name == name or fns.head.name == concat("main.", name) of {
+            true -> fns.head;
+            false -> mc_find_function(name, fns.tail)
+        }
+    }
+}
+
+// Is every result position of the term a freshly made record?
+fn mc_fresh_tail(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], depth: int64) -> boolean {
+    case term.root < 0 or depth <= 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind of {
+                2 -> mc_fresh_tail(term_sir_helpers@sir_term_at(term, n.right_expr), fns, depth);
+                3 -> mc_fresh_arms(term_sir_helpers@sir_term_at(term, n.right_expr), fns, depth);
+                6 -> n.name == "record_make";
+                4 -> mc_fresh_call(n, fns, depth - 1);
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+fn mc_fresh_arms(arms: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], depth: int64) -> boolean {
+    case arms.root < 0 of {
+        true -> true;
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(arms);
+            case a.kind of {
+                7 -> mc_fresh_arms(term_sir_helpers@sir_term_at(arms, a.inner), fns, depth) and mc_fresh_arms(term_sir_helpers@sir_term_at(arms, a.right_expr), fns, depth);
+                8 -> mc_fresh_tail(term_sir_helpers@sir_term_at(arms, a.right_expr), fns, depth);
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+// A call (SIR kind 4) to a function of this unit whose record result is always freshly made.
+fn mc_fresh_call(n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], depth: int64) -> boolean {
+    case depth <= 0 or n.kind != 4 or length_bytes(n.name) == 0 or mc_starts_with(n.name, "%") or reg_conventions@is_inline_struct_type(n.type_name) == false of {
+        true -> false;
+        false -> {
+            f: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string } <- mc_find_function(n.name, fns);
+            case f.body.root < 0 or reg_conventions@is_inline_struct_type(f.return_type) == false of {
+                true -> false;
+                false -> mc_fresh_tail(f.body, fns, depth)
+            }
+        }
+    }
+}
+
+fn mc_is_scalar_type(t: string) -> boolean {
+    t == "int64" or t == "int32" or t == "int16" or t == "int8"
+        or t == "uint64" or t == "uint32" or t == "uint16" or t == "uint8"
+        or t == "float64" or t == "float32" or t == "float16"
+        or t == "boolean" or t == "bool" or t == "atom"
+}
+
+// Mentions of variable x in the term (kind-1 nodes, and calls through x); a let or a bind arm that
+// rebinds x counts as 1000, so a shadowed name never passes the checks below.
+fn mc_count_mentions(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, x: string) -> int64 {
+    case term.root < 0 of {
+        true -> 0;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            here: int64 <- case (n.kind == 1 or n.kind == 4 or n.kind == 5) and n.name == x of {
+                true -> 1;
+                false -> case (n.kind == 2 or n.kind == 8) and n.name == x of {
+                    true -> 1000;
+                    false -> 0
+                }
+            };
+            here + mc_count_mentions(term_sir_helpers@sir_term_at(term, n.inner), x) + mc_count_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), x)
+        }
+    }
+}
+
+// True when every mention of x in the term is the record operand of a record_proj with a scalar
+// result (and x is never rebound).
+fn mc_only_scalar_projs(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, x: string) -> boolean {
+    case term.root < 0 of {
+        true -> true;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            base: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, n.inner));
+            case n.kind == 6 and n.name == "record_proj" and base.kind == 1 and base.name == x of {
+                true -> mc_is_scalar_type(n.type_name) and mc_count_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), x) == 0;
+                false -> case (n.kind == 1 or n.kind == 2 or n.kind == 4 or n.kind == 5 or n.kind == 8) and n.name == x of {
+                    true -> false;
+                    false -> mc_only_scalar_projs(term_sir_helpers@sir_term_at(term, n.inner), x) and mc_only_scalar_projs(term_sir_helpers@sir_term_at(term, n.right_expr), x)
+                }
+            }
+        }
+    }
+}
+
+// The send node whose message operand is the variable x itself, or -1.
+fn mc_send_of_var(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, x: string) -> int64 {
+    case term.root < 0 of {
+        true -> 0 - 1;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            op: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, n.right_expr));
+            case n.kind == 6 and mc_is_send_prim(n.name) and op.kind == 1 and op.name == x of {
+                true -> term.root;
+                false -> {
+                    a: int64 <- mc_send_of_var(term_sir_helpers@sir_term_at(term, n.inner), x);
+                    case a >= 0 of {
+                        true -> a;
+                        false -> mc_send_of_var(term_sir_helpers@sir_term_at(term, n.right_expr), x)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Walks the function body; acc is (handover sites, deferred calls) as ",n,m," sets.
+fn mc_owner_scan(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], acc: (string, string)) -> (string, string) {
+    case term.root < 0 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            acc1: (string, string) <- case n.kind == 2 and length_bytes(n.name) > 0 of {
+                false -> acc;
+                true -> {
+                    rhs: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, n.inner));
+                    case rhs.kind == 4 and mc_fresh_call(rhs, fns, 4) of {
+                        false -> acc;
+                        true -> {
+                            (hov: string, dfr: string) <- acc;
+                            body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, n.right_expr);
+                            case mc_only_scalar_projs(body, n.name) of {
+                                true -> (hov, concat(dfr, concat(mc_itos(n.inner), ",")));
+                                false -> case mc_count_mentions(body, n.name) == 1 of {
+                                    false -> acc;
+                                    true -> {
+                                        site: int64 <- mc_send_of_var(body, n.name);
+                                        case site >= 0 of {
+                                            true -> (concat(hov, concat(mc_itos(site), ",")), dfr);
+                                            false -> acc
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            acc2: (string, string) <- mc_owner_scan(term_sir_helpers@sir_term_at(term, n.inner), fns, acc1);
+            mc_owner_scan(term_sir_helpers@sir_term_at(term, n.right_expr), fns, acc2)
+        }
+    }
+}
+
+// The markers emit_sir_function adds to the body's binding string: "|_hov=<node>,..." and
+// "|_dfr=<node>,..." (see above).
+fn fn_owner_markers(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> string {
+    (hov: string, dfr: string) <- mc_owner_scan(fn_val.body, fns, (",", ","));
+    h: string <- case length_bytes(hov) <= 1 of {
+        true -> "";
+        false -> concat("|_hov=", hov)
+    };
+    d: string <- case length_bytes(dfr) <= 1 of {
+        true -> "";
+        false -> concat("|_dfr=", dfr)
+    };
+    concat(h, d)
+}
+
+fn md_site_handover(outer_reg: string, node: int64) -> boolean {
+    m: string <- var@find_sp_binding(outer_reg, "_hov");
+    length_bytes(m) > 1 and mc_has(m, concat(",", concat(mc_itos(node), ",")))
+}
+
+// After a deferred call (|_dfr): its result (dest, an X register) goes to silica_rt_defer_free
+// through X8 -- a THREADPTR-block register, dead after a call -- and the runtime routine leaves
+// X0-X2 and everything else of the caller untouched (rt_actors.S).
+fn md_defer_postlude(outer_reg: string, node: int64, dest: string) -> string {
+    m: string <- var@find_sp_binding(outer_reg, "_dfr");
+    marked: boolean <- length_bytes(m) > 1 and mc_has(m, concat(",", concat(mc_itos(node), ",")));
+    x_dest: boolean <- length_bytes(dest) >= 2 and length_bytes(dest) <= 3 and substring(dest, 0, 1) == "X" and dest != "X8";
+    case marked and x_dest of {
+        true -> concat(xt_isa@xt_mov("X8", dest), xt_isa@xt_call("_silica_rt_defer_free"));
+        false -> ""
+    }
 }
 
 // The deep copy of a behaviour's reply for prims_actors@behaviour_result_move_asm: "" when the
