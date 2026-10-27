@@ -96,7 +96,6 @@
 
 use sir_ast;
 use term_sir_helpers;
-use term_message_regions;
 use prims_record;
 use prims_tuple;
 use prims_list;
@@ -124,6 +123,8 @@ export module_uses_message_copy/1;
 export emit_message_copy_helper/0;
 export md_type_label/2;
 export md_type_descriptors_block/3;
+export ev_type_described/1;
+export ev_site_descriptor_rodata/3;
 
 // ---- strings ----------------------------------------------------------------------------------
 
@@ -371,6 +372,98 @@ fn md_type_needs_copy(t0: string) -> boolean {
     (k == 4 or k == 5) and mc_needs_copy_at(t, 0, false)
 }
 
+// ---- evacuation (chunk 15 phase 2) -------------------------------------------------------------
+
+// Whether every word a value of this type can hold is described: the evacuation walk can then find
+// every node of it. A type parameter, an unbound `rec` or a name the descriptor builder does not
+// expand (a trait type) answers false, and the caller adopts the callee's frame
+// instead of evacuating the result (prims_memory L_adopt), which keeps every node whatever it is.
+fn ev_type_described(t0: string) -> boolean {
+    ev_described_at(prims_record@strip_spaces_rt(t0), 0, false)
+}
+
+fn ev_word_type_ok(t: string) -> boolean {
+    t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16" or t == "int8" or t == "uint8"
+        or t == "float64" or t == "float32" or t == "float16" or t == "boolean" or t == "bool" or t == "unit" or t == "lifetime"
+        or t == "atom" or t == "timer_ref" or t == "actor_ref" or mc_starts_with(t, ":") or mc_ends_with(t, "actor_ref")
+}
+
+fn ev_described_at(t: string, depth: int64, bound: boolean) -> boolean {
+    case depth > 12 or length_bytes(t) == 0 of {
+        true -> false;
+        false -> case mc_kind_of(t, bound) of {
+            0 -> ev_word_type_ok(t);
+            1 -> true;
+            2 -> ev_described_at(mc_ref_elem_type(t), depth + 1, bound);
+            3 -> case mc_ref_elem_type(t) == "rec" of {
+                true -> true;
+                false -> ev_described_at(mc_ref_elem_type(t), depth + 1, true)
+            };
+            4 -> case mc_is_record(t) of {
+                true -> ev_fields_described(substring(t, 1, length_bytes(t) - 1), 0, depth, bound);
+                false -> ev_elems_described(substring(t, 1, length_bytes(t) - 1), 0, depth)
+            };
+            5 -> ev_alts_described(t, 0, depth, bound);
+            6 -> true;
+            7 -> ev_described_at(prims_list@list_elem_type_from_list_t(t), depth + 1, bound);
+            8 -> true;
+            // A function value is a code address (no captured environment is built today), never a node.
+            9 -> true;
+            _: int64 -> false
+        }
+    }
+}
+
+fn ev_alts_described(t: string, i: int64, depth: int64, bound: boolean) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, "|");
+            case ev_described_at(substring(t, i, e), depth + 1, bound) of {
+                false -> false;
+                true -> ev_alts_described(t, e + 1, depth, bound)
+            }
+        }
+    }
+}
+
+fn ev_elems_described(t: string, i: int64, depth: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, ",");
+            case ev_described_at(substring(t, i, e), depth + 1, true) of {
+                false -> false;
+                true -> ev_elems_described(t, e + 1, depth)
+            }
+        }
+    }
+}
+
+fn ev_fields_described(t: string, i: int64, depth: int64, bound: boolean) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, ",");
+            seg: string <- substring(t, i, e);
+            colon: int64 <- mc_top_sep(seg, 0, 0, ":");
+            fty: string <- case colon >= length_bytes(seg) of { true -> ""; false -> substring(seg, colon + 1, length_bytes(seg)) };
+            case ev_described_at(fty, depth + 1, bound) of {
+                false -> false;
+                true -> ev_fields_described(t, e + 1, depth, bound)
+            }
+        }
+    }
+}
+
+// The descriptor an evacuation site passes: `<label>_0: .quad 1, -1` and the one entry that describes
+// the result word (the site loads KIND and AUX from <label>_0 + 16), then what the entry points at.
+fn ev_site_descriptor_rodata(t0: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    e: { line: string, child: string, k: int64 } <- mc_entry(t, label, 1, table, 0, "");
+    concat(mc_lbl(label, 0), concat(":\n    .quad 1, -1\n", concat(e.line, e.child)))
+}
+
 // ---- descriptors --------------------------------------------------------------------------------
 
 fn md_site_label(fnl: string, node: int64) -> string {
@@ -607,7 +700,7 @@ fn mc_vars(term: { nodes: List[{ kind: int64, type_name: string, value: string, 
         false -> {
             n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
             acc1: string <- case n.kind == 1 of {
-                true -> case length_bytes(n.type_name) > 0 and term_message_regions@type_is_pointer_free(n.type_name) of {
+                true -> case length_bytes(n.type_name) > 0 and mc_type_is_pointer_free(n.type_name) of {
                     true -> acc;
                     false -> mc_add(acc, n.name)
                 };
@@ -652,7 +745,7 @@ fn mc_closure_step(term: { nodes: List[{ kind: int64, type_name: string, value: 
             rhs: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, n.inner);
             set1: string <- case n.kind == 2 of {
                 true -> {
-                    fwd: string <- case mc_mentions(rhs, set) and (length_bytes(n.type_name) == 0 or term_message_regions@type_is_pointer_free(n.type_name) == false) of {
+                    fwd: string <- case mc_mentions(rhs, set) and (length_bytes(n.type_name) == 0 or mc_type_is_pointer_free(n.type_name) == false) of {
                         true -> mc_add(set, n.name);
                         false -> set
                     };
@@ -683,7 +776,7 @@ fn mc_case_arms_step(arms: { nodes: List[{ kind: int64, type_name: string, value
                     false -> set;
                     true -> case a.value == "bind" of {
                         true -> {
-                            s1: string <- case mc_mentions(scrut, set) and (length_bytes(a.type_name) == 0 or term_message_regions@type_is_pointer_free(a.type_name) == false) of {
+                            s1: string <- case mc_mentions(scrut, set) and (length_bytes(a.type_name) == 0 or mc_type_is_pointer_free(a.type_name) == false) of {
                                 true -> mc_add(set, a.name);
                                 false -> set
                             };
@@ -1199,3 +1292,127 @@ fn md_type_descriptors_block(fns: List[{ name: string, return_type: string, effe
     }
 }
 
+// ---- pointer-free types (moved here from term_message_regions, which chunk 15 phase 2 removed
+// with the dispatch-scoped message-region release) ----------------------------------------------
+
+fn mcp_starts_with(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+fn mcp_ends_with(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, length_bytes(s) - length_bytes(p), length_bytes(s)) == p
+}
+
+fn mcp_find_sub_from(s: string, sub: string, i: int64) -> int64 {
+    case i + length_bytes(sub) > length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + length_bytes(sub)) == sub of {
+            true -> i;
+            false -> mcp_find_sub_from(s, sub, i + 1)
+        }
+    }
+}
+
+fn mcp_has_sub(s: string, sub: string) -> boolean {
+    mcp_find_sub_from(s, sub, 0) >= 0
+}
+
+// Index of the first `sep` at nesting depth zero (over (), [], {}) at or after i, or the length.
+fn mcp_top_sep(s: string, i: int64, depth: int64, sep: string) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> mcp_top_sep(s, i + 1, depth + 1, sep);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> mcp_top_sep(s, i + 1, depth - 1, sep);
+                    false -> case c == sep and depth == 0 of {
+                        true -> i;
+                        false -> mcp_top_sep(s, i + 1, depth, sep)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mcp_scalar_type(t: string) -> boolean {
+    t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16"
+        or t == "int8" or t == "uint8" or t == "float64" or t == "float32" or t == "float16"
+        or t == "boolean" or t == "bool" or t == "atom" or t == "string" or t == "unit" or t == "lifetime"
+        or t == "timer_ref"
+}
+
+// True when a value of this type cannot hold a pointer that matters to the elision walk: scalars,
+// atoms, strings (immutable; a frame string a send or spawn hands over is first copied to the heap
+// by prims_actors@stack_value_to_heap_asm, chunk 15 phase 2), and tuples, records and sums built
+// only from those. Unknown spellings (List[...], ref, region, buf,
+// function types, type parameters, device windows, actor references) answer false.
+fn mc_type_is_pointer_free(t0: string) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    n: int64 <- length_bytes(t);
+    case n == 0 of {
+        true -> false;
+        false -> case mcp_scalar_type(t) of {
+            true -> true;
+            false -> case mcp_top_sep(t, 0, 0, "|") < n of {
+                true -> mcp_alternatives_pointer_free(t, 0);
+                false -> case mcp_starts_with(t, ":") of {
+                    true -> mcp_has_sub(t, "(") == false and mcp_has_sub(t, "{") == false and mcp_has_sub(t, "[") == false;
+                    false -> case mcp_starts_with(t, "(") and mcp_ends_with(t, ")") of {
+                        true -> mcp_elements_pointer_free(substring(t, 1, n - 1), 0);
+                        false -> case mcp_starts_with(t, "{") and mcp_ends_with(t, "}") of {
+                            true -> mcp_fields_pointer_free(substring(t, 1, n - 1), 0);
+                            false -> false
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn mcp_alternatives_pointer_free(t: string, i: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- mcp_top_sep(t, i, 0, "|");
+            case mc_type_is_pointer_free(substring(t, i, e)) of {
+                false -> false;
+                true -> mcp_alternatives_pointer_free(t, e + 1)
+            }
+        }
+    }
+}
+
+fn mcp_elements_pointer_free(t: string, i: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- mcp_top_sep(t, i, 0, ",");
+            case mc_type_is_pointer_free(substring(t, i, e)) of {
+                false -> false;
+                true -> mcp_elements_pointer_free(t, e + 1)
+            }
+        }
+    }
+}
+
+fn mcp_fields_pointer_free(t: string, i: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> true;
+        false -> {
+            e: int64 <- mcp_top_sep(t, i, 0, ",");
+            seg: string <- substring(t, i, e);
+            colon: int64 <- mcp_top_sep(seg, 0, 0, ":");
+            case colon >= length_bytes(seg) of {
+                true -> false;
+                false -> case mc_type_is_pointer_free(substring(seg, colon + 1, length_bytes(seg))) of {
+                    false -> false;
+                    true -> mcp_fields_pointer_free(t, e + 1)
+                }
+            }
+        }
+    }
+}

@@ -31,11 +31,12 @@ use var;
 use atom_table;
 use string_parse;
 use prims_tuple;
+use term_message_copy;
 use x86_isa;
 use x86_mem;
 
 export emit_call_body/3;
-export emit_call_body_effects/5;
+export emit_call_body_effects/6;
 export emit_call_body_with_callee/3;
 export emit_tail_call_body/4;
 export sir_call_targets_bound_callee/2;
@@ -217,16 +218,55 @@ fn sret_x8_tail_setup(term: { nodes: List[{ kind: int64, type_name: string, valu
     }
 }
 
-fn emit_call_body_effects(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, effect_value: string, outer_reg: string, indirect_via_x9: boolean) -> string {
+// The caller's rsp just before a user call, kept in the frame word [rbp - 16] (chunk 15 phase 2,
+// emitter_core@frame_floor_init_asm).
+fn call_precall_sp_asm() -> string {
+    "    mov QWORD PTR [rbp - 16], rsp\n"
+}
+
+// After the call (chunk15_stack_memory_design.md §3.3): a scalar result names nothing in the callee's
+// frame, so rsp goes back to the pre-call value and the callee's frame is dropped. Any other result
+// may point into the callee's frame or dynamic part, which lie between the callee's rsp and the
+// pre-call rsp; L_adopt keeps that range as the bottom of this frame's dynamic part (the transient
+// pushes below this frame's floor move under it). A result in return position (the `_rpn` list,
+// sir_return_position@rp_call_nodes), a tuple, or one whose type the descriptors cannot follow is
+// adopted; any other is evacuated (prims_memory L_ev_frame: X0-X4 = rdi rsi rdx rcx r8 in, X0 and the
+// new floor in X1 = rsi out) with a descriptor emitted beside the call. rax is free scratch here.
+fn call_post_sp_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    t: string <- sir_term_root_node(term).type_name;
+    case reg_conventions@is_frame_free_scalar_type(t) of {
+        true -> "    mov rsp, QWORD PTR [rbp - 16]\n";
+        false -> {
+            rp: boolean <- sret_node_listed(var@find_sp_binding(outer_reg, "_rpn"), concat(",", concat(atom_table@int64_to_decimal_string(term.root), ",")), 0);
+            // A tuple result may sit in a caller slab pushed on rsp before the arguments and named by an
+            // absolute pointer: evacuation would move that slab, adoption leaves the old copy readable
+            // where the pointer names it, so tuples are adopted (as on AArch64).
+            case rp or reg_conventions@is_tuple_type(t) or term_message_copy@ev_type_described(t) == false of {
+                true -> "    call L_adopt\n";
+                false -> {
+                    label: string <- concat("L_ev_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(term.root))));
+                    rodata: string <- term_message_copy@md_rodata_block(term_message_copy@ev_site_descriptor_rodata(t, label, table));
+                    site: string <- concat(concat("    lea rax, [rip + ", concat(label, "_0]\n")), "    mov rsi, QWORD PTR [rax + 16]\n    mov rdx, QWORD PTR [rax + 24]\n    mov rcx, QWORD PTR [rbp - 16]\n    mov r8, QWORD PTR [rbp - 8]\n    call L_ev_frame\n    mov QWORD PTR [rbp - 8], rsi\n");
+                    concat(rodata, site)
+                }
+            }
+        }
+    }
+}
+
+fn emit_call_body_effects(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, effect_value: string, outer_reg: string, indirect_via_x9: boolean, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     call_effects: string <- effect_value;
     pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
     post_barrier: string <- emitter_effects@barrier_after_call(call_effects);
     eff_comment: string <- emitter_effects@effect_annotation(call_effects);
+    // Chunk 15 phase 2: a Silica callee may return with rsp below its entry value (its dynamic part
+    // stays for the caller), so the caller records rsp in [rbp - 16] just before the call and settles
+    // rsp afterwards (call_post_sp_asm).
     adrp_line: string <- case indirect_via_x9 of {
-        true -> x86_isa@x86_callr("X17");
+        true -> concat(concat(call_precall_sp_asm(), x86_isa@x86_callr("X17")), call_post_sp_asm(term, outer_reg, table));
         false -> {
             callee: string <- module_linkage@asm_linkage_symbol_for_call(outer_reg, sir_term_root_node(term).name);
-            concat(x86_isa@x86_adr("X9", callee), x86_isa@x86_callr("X9"))
+            concat(concat(x86_isa@x86_adr("X9", callee), concat(call_precall_sp_asm(), x86_isa@x86_callr("X9"))), call_post_sp_asm(term, outer_reg, table))
         }
     };
     // ARM64 AAPCS: integer returns land in W0/X0, floats in S0/D0/H0. Move into `dest`
@@ -276,7 +316,7 @@ fn emit_call_body_effects(term: { nodes: List[{ kind: int64, type_name: string, 
 }
 
 fn emit_call_body(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, outer_reg: string) -> string {
-    emit_call_body_effects(term, dest, sir_term_root_node(term).value, outer_reg, false)
+    emit_call_body_effects(term, dest, sir_term_root_node(term).value, outer_reg, false, atom_table@empty_atom_table())
 }
 
 // Tail call ({ nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } kind 5): args already in registers — release frame, then BR (no BLR / no return to this frame).
