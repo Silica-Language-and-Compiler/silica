@@ -158,6 +158,25 @@ $(THIS_DIR)lib/%.silica: $(STDLIB_DS)/%.silica
 	@if [ ! -f "$<" ]; then echo "FAIL: missing $<"; exit 1; fi
 	@cp "$<" "$@"
 
+# wbt_map.silica is one module of about 8,000 lines. Type-checking all of it is
+# the unit that a 7 GB runner kills. The compiler calls this module through
+# insert (empty, get, fold, contains_key, find_value, size, the compare
+# helpers, and insert). Deletion, from_sorted and validate are the rest of the
+# file and nothing in this tree calls them. SILICA_COMPILER_WBT_THROUGH=insert
+# stages that prefix so the unit fits. compiler/stdlib/data_structures/wbt_map.silica
+# stays whole, which is what programs compiled by the result still use.
+$(THIS_DIR)lib/wbt_map.silica: $(STDLIB_DS)/wbt_map.silica
+	@mkdir -p "$(THIS_DIR)lib"
+	@if [ ! -f "$<" ]; then echo "FAIL: missing $<"; exit 1; fi
+	@if [ "$(SILICA_COMPILER_WBT_THROUGH)" = "insert" ]; then \
+		awk '/^\/\/ §8A\.7 / { exit } \
+			/^export (delete|delete_min|delete_max|from_sorted|from_sorted_counted|from_sorted_error_code|from_sorted_preflight_status|validate|validate_error_code)\// { next } \
+			{ print }' "$<" > "$@"; \
+		echo "staged $@ through insert"; \
+	else \
+		cp "$<" "$@"; \
+	fi
+
 $(THIS_DIR)lib/Supervisor.silica: $(STDLIB_ROOT)/Supervisor.silica
 	@mkdir -p "$(THIS_DIR)lib"
 	@if [ ! -f "$<" ]; then echo "FAIL: missing $<"; exit 1; fi
