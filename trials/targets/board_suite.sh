@@ -314,9 +314,19 @@ if [ "${#programs[@]}" -gt 0 ]; then
             # A suite whose host Makefile runs every trial through run_integration_exit_after_marker.py
             # with the marker "done" (supervisors_addition, record_shapes_actors_addition) gets the
             # `exit` line for every trial, as on the host.
+            # The `exit` line also waits for the trial's marker, by the host harness's rule: the
+            # .wait_for_exit file's first field (default "done") and count (second field, default
+            # 1), then 1.5 s of quiet output (run_on_board.py --send-marker). A trial that needs
+            # longer than BOARD_EXIT_DELAY to reach its marker (100,000 dispatches take tens of
+            # seconds on the board) is then not cut short; a faster one gets `exit` as before.
             send=()
             if [ -f "$src/$stem.wait_for_exit" ] || grep -q 'run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "done"' "$src/Makefile" 2>/dev/null; then
-                send=(--send 'exit\n' --send-delay "${BOARD_EXIT_DELAY:-5}")
+                marker=done marker_count=1
+                if [ -f "$src/$stem.wait_for_exit" ]; then
+                    marker=$(awk 'NF { print $1; found=1; exit } END { if (!found) print "done" }' "$src/$stem.wait_for_exit")
+                    marker_count=$(awk 'NF { print ($2 == "" ? 1 : $2); found=1; exit } END { if (!found) print 1 }' "$src/$stem.wait_for_exit")
+                fi
+                send=(--send 'exit\n' --send-delay "${BOARD_EXIT_DELAY:-5}" --send-marker "$marker" --send-marker-count "$marker_count")
             fi
             integrate_killed=0
             perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' \

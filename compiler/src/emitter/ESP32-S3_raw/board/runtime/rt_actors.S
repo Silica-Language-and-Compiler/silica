@@ -83,7 +83,7 @@
 //
 // Layouts (32-bit words unless a width is given; the two 8-byte slots the emitted code reads
 // keep a zero high word). The ACB is what every actor costs at rest (actor_memory_budget_plan.md
-// item I): 144 bytes (ACB_SIZE), the fields a plain actor needs. Everything supervision needs -- the ingress
+// item I): 152 bytes (ACB_SIZE), the fields a plain actor needs. Everything supervision needs -- the ingress
 // queue, the start trampoline, the strategy and restart accounting, the child table and its
 // users/pending words -- lives in a supervision block (SB, 64 B) that only a supervisor gets: one
 // is allocated by spawn for an actor started with a trampoline, and on demand by the ingress
@@ -92,7 +92,7 @@
 // spawn for that algorithm only. Both go back with the ACB (silica_rt_free_acb). Small fields are
 // bytes (l8ui/s8i; a byte store on the data bus is a single write) and atom-sized ones
 // halfwords; the target core is kept as core + 1 so 0 means none.
-//   ACB (144 B)   0 state(8)  8 behaviour(8)
+//   ACB (152 B)   0 state(8)  8 behaviour(8)
 //                 16 status(b)  17 core(b)  18 target_core + 1 (b; 0 none)  19 kind (b: 0 actor,
 //                    1 main, 2 scheduler)  20 priority(b)  21 alive(b)  22 device flag (b; 1:
 //                    started by spawn_device, silica_rt_actor_mark_device)  23 state owned (b; the
@@ -117,6 +117,9 @@
 //                     ring index (16-23)  120/124 most machine / auxiliary chunk bytes ever held
 //                 128/132 identity (§15.1.4: child number, position; what every reference to the
 //                     actor is)  136/140 spawner record (position + 1, next child number)
+//                 144 deferred-free block (0 none): the fresh record results this dispatch's emitted
+//                     code proved die with it (silica_rt_defer_free, freed at the dispatch end)
+//                 148 (pad, keeps the ACB a multiple of 8)
 // (Bytes 128..143 hold the identity and spawner record, added 2026-10-12 when actor references became
 // identities; see "Actor identity" below. The ACB was 128 B before that.)
 //   SB (64 B)     0/4/8 ingress head/tail/depth  12 spawn waiter  16 sync_failure_reported
@@ -196,7 +199,11 @@
 #define ACB_ID           128    // the actor's identity (spec §15.1.4): child number, then position
 #define ACB_SPOS         136    // its spawner record: position + 1 (0 none yet)
 #define ACB_SNEXT        140    //   and the next child number it gives (a row child's is in its row)
-#define ACB_SIZE         144
+#define ACB_DEFER        144    // deferred-free block: [0] count, [4..] up to DEFER_CAP blocks
+#define ACB_SIZE         152
+#define DEFER_CAP        30
+#define BP_DEPTH         16     // a cast's back-pressure (silica_rt_cast_backpressure): queue depth,
+#define BP_WAIT_TICKS    3200000  // and the longest wait per cast: 200 ms of the 16 MHz system timer
 #define ROW_SPOS         96     // rt_supervisors.S: a row child's spawner record, kept across restarts
 
 #define SB_IN_HEAD       0
@@ -485,12 +492,13 @@ silica_rt_atom_names:
 // core holds it can be told apart from the other core holding it (silica_rt_actor_fault_hook).
 .macro SCHED_LOCK ra, rb
     movi    \ra, silica_rt_sched_lock
-9:  movi    \rb, 0
+.Lsched_lock_spin\@:
+    movi    \rb, 0
     wsr     \rb, scompare1
     THIS_CORE \rb
     addi    \rb, \rb, 1
     s32c1i  \rb, \ra, 0
-    bnez    \rb, 9b
+    bnez    \rb, .Lsched_lock_spin\@
 .endm
 
 .macro SCHED_UNLOCK ra, rb
@@ -505,11 +513,12 @@ silica_rt_atom_names:
 // (the list routines are leaves), so holding the scheduler lock around a list call is fine.
 .macro FREE_LOCK ra, rb
     movi    \ra, silica_rt_free_lock
-9:  movi    \rb, 0
+.Lfree_lock_spin\@:
+    movi    \rb, 0
     wsr     \rb, scompare1
     movi    \rb, 1
     s32c1i  \rb, \ra, 0
-    bnez    \rb, 9b
+    bnez    \rb, .Lfree_lock_spin\@
 .endm
 
 .macro FREE_UNLOCK ra, rb
@@ -923,7 +932,15 @@ silica_rt_free_acb:
     s32i    a3, a2, ACB_RING
     mov     a10, a5
     call8   silica_rt_free
-3:  FREE_LOCK a8, a9
+3:  l32i    a5, a2, ACB_DEFER           // and the deferred-free block, with what it still holds (the
+    beqz    a5, 31f                     // actor's context is gone, so are the scopes they died with)
+    mov     a10, a2
+    call8   silica_rt_defer_flush
+    movi    a3, 0
+    s32i    a3, a2, ACB_DEFER
+    mov     a10, a5
+    call8   silica_rt_free
+31: FREE_LOCK a8, a9
     movi    a3, silica_rt_acb_free
     l32i    a4, a3, 0
     s32i    a4, a2, ACB_FREE_NEXT
@@ -2226,6 +2243,41 @@ silica_rt_yield_to_sched:
     retw
     .size   silica_rt_yield_to_sched, . - silica_rt_yield_to_sched
 
+// silica_rt_yield_if_ready(): the running context (main or an actor inside its dispatch) gives its
+// core to the contexts already ready there, once, and carries on when its turn comes back: it is
+// queued at the tail of its own ready queue and switches to the scheduler. Nothing happens when
+// nothing else is ready on this core, or when no context is current (the scheduler itself). It is
+// the suspension of a call (§15.1.2: a call is a yield point) for the call_supervisor queries that
+// this target answers in the caller's context (rt_supervisors.S: :get_child, :which_children,
+// :count_children, ...): without it a loop that polls a supervisor never lets the core's other
+// actors run -- the child whose exit the poll waits for, for one -- because nothing preempts here.
+    .align  4
+    .global silica_rt_yield_if_ready
+    .type   silica_rt_yield_if_ready, @function
+silica_rt_yield_if_ready:
+    entry   a1, 32
+    THIS_CORE_BLOCK a3, a4
+    l32i    a2, a3, CORE_CURRENT
+    beqz    a2, 9f
+    l32i    a5, a3, CORE_SCHED
+    beq     a2, a5, 9f
+    // lock-free peek first (the idle loop's): most queries find nothing else ready
+    l32i    a5, a3, CORE_RQ_HEAD
+    bnez    a5, 1f
+    l32i    a5, a3, CORE_RQ_HEAD + 4
+    bnez    a5, 1f
+    l32i    a5, a3, CORE_RQ_HEAD + 8
+    beqz    a5, 9f
+1:  SCHED_LOCK a8, a9
+    movi    a5, ST_READY
+    s8i     a5, a2, ACB_STATUS
+    mov     a10, a2
+    call8   silica_rt_rq_push
+    SCHED_UNLOCK a8, a9
+    call8   silica_rt_yield_to_sched
+9:  retw
+    .size   silica_rt_yield_if_ready, . - silica_rt_yield_if_ready
+
 // silica_rt_current() -> the running context's ACB (main's pseudo-ACB in main).
     .align  4
     .global silica_rt_current
@@ -2548,6 +2600,8 @@ silica_rt_actor_main:
     mov     a11, a3
     mov     a12, a1
     call8   silica_rt_run_behaviour
+    mov     a10, a2                     // the fresh records this dispatch deferred are dead now
+    call8   silica_rt_defer_flush       // (term_message_copy |_dfr)
     l32i    a3, a1, 24
     // the message copy is dropped now that the behaviour has read it, unless the new state packs it
     // or (the report) the behaviour sent it on to another actor
@@ -3784,6 +3838,161 @@ silica_rt_enqueue_ingress:
     retw
     .size   silica_rt_enqueue_ingress, . - silica_rt_enqueue_ingress
 
+// ---------------------------------------------------------------------------------------------
+// Deferred release of fresh record results (term_message_copy |_dfr, 2026-10-27).
+//
+// A record a function returns is a heap block nothing else frees. Where the emitter proves that a
+// let-bound result is fresh (the callee made it) and is only read for scalar fields in the let's
+// body, nothing can reach the block once the let ends; it hands the block here right after the
+// call. The block is kept in the running actor's deferred-free block (ACB_DEFER) and freed when
+// that actor's dispatch returns (silica_rt_actor_main), when every scope of the dispatch has ended,
+// or when the actor's ACB goes back (silica_rt_free_acb). Main and the schedulers never reach a
+// dispatch end, so there a block is simply left, as before; so is one that finds the block full.
+// Only the actor's own context touches its block, so no lock is needed.
+
+// silica_rt_defer_free(): X8 (the THREADPTR register block's word at 40, low word) = the block.
+// Leaves the caller's X0-X2 (its a10-a15: a2-a7 here) and everything else of the caller as they
+// were, so the emitted call needs no save or restore around it.
+    .align  4
+    .global silica_rt_defer_free
+    .type   silica_rt_defer_free, @function
+silica_rt_defer_free:
+    entry   a1, 48
+    s32i    a2, a1, 0
+    s32i    a3, a1, 4
+    s32i    a4, a1, 8
+    s32i    a5, a1, 12
+    s32i    a6, a1, 16
+    s32i    a7, a1, 20
+    rur     a8, threadptr
+    l32i    a9, a8, 40
+    beqz    a9, 9f
+    s32i    a9, a1, 24
+    call8   silica_rt_current_actor
+    beqz    a10, 9f                     // main or a scheduler: no dispatch end to free it at
+    mov     a2, a10
+    l32i    a3, a2, ACB_DEFER
+    bnez    a3, 1f
+    movi    a10, 4 + DEFER_CAP * 4
+    call8   silica_rt_alloc_or_null     // zeroed: count 0
+    beqz    a10, 9f
+    mov     a3, a10
+    s32i    a3, a2, ACB_DEFER
+1:  l32i    a4, a3, 0
+    movi    a5, DEFER_CAP
+    bgeu    a4, a5, 9f                  // full: this one is left
+    addx4   a5, a4, a3
+    l32i    a6, a1, 24
+    s32i    a6, a5, 4
+    addi    a4, a4, 1
+    s32i    a4, a3, 0
+9:  l32i    a2, a1, 0
+    l32i    a3, a1, 4
+    l32i    a4, a1, 8
+    l32i    a5, a1, 12
+    l32i    a6, a1, 16
+    l32i    a7, a1, 20
+    retw
+    .size   silica_rt_defer_free, . - silica_rt_defer_free
+
+// silica_rt_defer_flush(acb): frees every block the actor deferred and empties its deferred block.
+    .align  4
+    .global silica_rt_defer_flush
+    .type   silica_rt_defer_flush, @function
+silica_rt_defer_flush:
+    entry   a1, 32
+    l32i    a3, a2, ACB_DEFER
+    beqz    a3, 9f
+    l32i    a4, a3, 0
+    beqz    a4, 9f
+    movi    a5, 0
+    s32i    a5, a3, 0
+    addi    a5, a3, 4                   // a5 = cursor, a6 = end
+    addx4   a6, a4, a5
+1:  l32i    a10, a5, 0
+    call8   silica_rt_free
+    addi    a5, a5, 4
+    bltu    a5, a6, 1b
+9:  retw
+    .size   silica_rt_defer_flush, . - silica_rt_defer_flush
+
+// ---------------------------------------------------------------------------------------------
+// Cast back-pressure (2026-10-27). Nothing preempts a sender on this target, so a context that
+// casts in a loop without yielding (main sending a burst, an actor fanning out) queues every
+// message before the receiver runs, and the board's heap -- a few hundred KB -- holds far fewer
+// than a host's memory does (bees_regions_addition/bees_sd7_message_region_released: 100,000
+// messages of ~4 KB each). So a cast or send from emitted code (silica_rt_actor_cast /
+// silica_rt_actor_send; the runtime's own report casts go through silica_rt_cast_try directly and
+// never wait) waits after enqueueing while all of these hold: the heap is more than half in use,
+// the receiver has BP_DEPTH or more messages queued, the receiver is another context that will
+// drain them (ready, running on the other core, or at its dispatch boundary -- not suspended in a
+// call or waiting, which may be waiting on this very sender), and the sender has waited less than
+// BP_WAIT_TICKS for this cast. Waiting is the call's yield point (silica_rt_yield_if_ready): the
+// receiver, when it is on this core, runs in the meantime. Nothing is dropped and nothing is
+// reordered; only when the sender continues changes, and only under memory pressure.
+
+// silica_rt_cast_backpressure(lo, hi): lo/hi = the receiver's identity (§15.1.4).
+    .align  4
+    .global silica_rt_cast_backpressure
+    .type   silica_rt_cast_backpressure, @function
+silica_rt_cast_backpressure:
+    entry   a1, 48
+    s32i    a2, a1, 0
+    s32i    a3, a1, 4
+    call8   silica_rt_current
+    beqz    a10, 9f
+    l8ui    a4, a10, ACB_KIND
+    beqi    a4, KIND_SCHED, 9f          // the scheduler never waits
+    s32i    a10, a1, 8                  // [a1+8] = the sender
+    movi    a4, 0
+    s32i    a4, a1, 12                  // [a1+12] = when the wait began (0: not yet)
+1:  SCHED_LOCK a8, a9
+    l32i    a10, a1, 0
+    l32i    a11, a1, 4
+    call8   silica_rt_idt_find_locked
+    beqz    a11, 8f                     // ended: nothing to wait for
+    l32i    a4, a1, 8
+    beq     a11, a4, 8f                 // a cast to itself: only its own return drains it
+    l8ui    a4, a11, ACB_ALIVE
+    beqz    a4, 8f
+    l8ui    a4, a11, ACB_STATUS
+    beqi    a4, ST_READY, 2f
+    beqi    a4, ST_RUNNING, 2f
+    beqi    a4, ST_BOUNDARY, 2f
+    j       8f                          // suspended or waiting: it may be waiting on the sender
+2:  l32i    a5, a11, ACB_MB_HEAD        // count the queue, up to BP_DEPTH
+    movi    a6, 0
+    movi    a7, BP_DEPTH
+3:  beqz    a5, 4f
+    addi    a6, a6, 1
+    bgeu    a6, a7, 4f
+    l32i    a5, a5, MSG_NEXT
+    j       3b
+4:  SCHED_UNLOCK a8, a9
+    bltu    a6, a7, 9f                  // a short queue: carry on
+    call8   silica_rt_heap_used
+    movi    a4, _silica_heap_end
+    movi    a5, _silica_heap_start
+    sub     a4, a4, a5
+    srli    a4, a4, 1
+    bltu    a10, a4, 9f                 // the heap is at most half used: carry on
+    call8   silica_rt_timer_now_ticks
+    l32i    a4, a1, 12
+    bnez    a4, 5f
+    s32i    a10, a1, 12                 // the wait begins now
+    j       6f
+5:  sub     a5, a10, a4
+    movi    a4, BP_WAIT_TICKS
+    bgeu    a5, a4, 9f                  // waited long enough: carry on
+6:  call8   silica_rt_yield_if_ready    // the receiver runs, when it is on this core
+    movi    a4, 64                      // and when it is on the other one, its core gets the
+7:  addi    a4, a4, -1                  // scheduler lock between our looks at its queue
+    bnez    a4, 7b
+    j       1b
+8:  SCHED_UNLOCK a8, a9
+9:  retw
+    .size   silica_rt_cast_backpressure, . - silica_rt_cast_backpressure
+
 // silica_rt_actor_send(X0 reference, X1 message, X2 payload owned) -> 0. X2 is 1 when the emitter
 // copied a record or tuple message into a heap block of its own (MSG_PAYLOAD_OWNED). It is a cast: an
 // ended (or unknown) actor raises actor_not_found (§16.1.4).
@@ -3800,6 +4009,9 @@ silica_rt_actor_send:
     call8   silica_rt_cast_try
     beqz    a10, 61f
     beqi    a10, 2, 62f
+    mov     a10, a2
+    mov     a11, a3
+    call8   silica_rt_cast_backpressure
     movi    a2, 0
     movi    a3, 0
     retw
@@ -3824,6 +4036,9 @@ silica_rt_actor_cast:
     call8   silica_rt_cast_try
     beqz    a10, 61f
     beqi    a10, 2, 62f
+    mov     a10, a2
+    mov     a11, a3
+    call8   silica_rt_cast_backpressure
     movi    a2, 1
     movi    a3, 0
     retw
@@ -6230,13 +6445,17 @@ silica_rt_get_actor_memory_usage:
 #define TMR_SYSTIMER_LO    0x60023044
 
 // The timer list's lock: FREE_LOCK's shape. A leaf: nothing is called while it is held.
+// The spin label is unique per expansion (\@): a numeric one (it was 9) captured the callers'
+// forward `9f` exits in silica_rt_timers_fire and silica_rt_send_after, sending them into the
+// spin loop past the `movi` of the lock address.
 .macro TIMER_LOCK ra, rb
     movi    \ra, silica_rt_timer_lock
-9:  movi    \rb, 0
+.Ltimer_lock_spin\@:
+    movi    \rb, 0
     wsr     \rb, scompare1
     movi    \rb, 1
     s32c1i  \rb, \ra, 0
-    bnez    \rb, 9b
+    bnez    \rb, .Ltimer_lock_spin\@
 .endm
 
 .macro TIMER_UNLOCK ra, rb
@@ -6308,19 +6527,70 @@ silica_rt_monotonic_time:
     retw
     .size   silica_rt_monotonic_time, . - silica_rt_monotonic_time
 
-// current_time() -> X0 = milliseconds since the system timer started (ticks / 16000): the board
-// has no wall clock; the epoch milliseconds of §22.14.1 are a host's answer.
+// Wall clock (spec §22.14.1: current_time is milliseconds since the Unix epoch). The chip has no
+// battery-backed clock and nothing on this target sets one, so the epoch time comes from the
+// loader: tools/run_on_board.py finds silica_rt_wall_clock in the image by its 16-byte tag and,
+// once the image is in RAM, writes the host's Unix time in milliseconds into the word after the
+// tag just before it starts the program (the RAM load that every trial uses). rt_start.S calls
+// silica_rt_wall_clock_start right before the start marker, which takes the system timer reading
+// that the loader's time corresponds to; current_time is then that time plus the milliseconds the
+// system timer has counted since. An image started without it (from flash, or by another loader)
+// keeps a zero there and current_time answers milliseconds since the system timer started.
+    .section .data.silica_rt_wall_clock, "aw"
+    .balign 8
+    .global silica_rt_wall_clock
+silica_rt_wall_clock:
+    .ascii  "SILICA:WALLCLOCK"          // the loader's tag (16 bytes, unique in the image)
+    .word   0, 0                        // +16: Unix time in ms at the start, low word first; 0 none
+silica_rt_wall_t0:
+    .word   0, 0                        // the system timer reading taken at the start
+
+    .section .text.silica_rt_actors, "ax"
+    .literal_position
+
+// silica_rt_wall_clock_start(): records the system timer reading the loader's time corresponds to.
+    .align  4
+    .global silica_rt_wall_clock_start
+    .type   silica_rt_wall_clock_start, @function
+silica_rt_wall_clock_start:
+    entry   a1, 32
+    call8   silica_rt_timer_now_ticks
+    movi    a4, silica_rt_wall_t0
+    s32i    a10, a4, 0
+    s32i    a11, a4, 4
+    memw
+    retw
+    .size   silica_rt_wall_clock_start, . - silica_rt_wall_clock_start
+
+// current_time() -> X0 = the loader's Unix time in ms plus (ticks - start ticks) / 16000; without a
+// loader time, milliseconds since the system timer started (ticks / 16000).
     .align  4
     .global silica_rt_current_time
     .type   silica_rt_current_time, @function
 silica_rt_current_time:
     entry   a1, 32
     call8   silica_rt_timer_now_ticks
-    movi    a12, 16000
+    movi    a4, silica_rt_wall_clock
+    l32i    a5, a4, 16                  // a5/a6 = the loader's time (kept across the calls)
+    l32i    a6, a4, 20
+    or      a7, a5, a6
+    beqz    a7, 1f
+    movi    a4, silica_rt_wall_t0       // ticks since the start: a 64-bit subtraction
+    l32i    a12, a4, 0
+    l32i    a13, a4, 4
+    sub     a11, a11, a13
+    bgeu    a10, a12, 2f
+    addi    a11, a11, -1                // borrow
+2:  sub     a10, a10, a12
+1:  movi    a12, 16000
     movi    a13, 0
     call8   __udivdi3
-    mov     a2, a10
-    mov     a3, a11
+    add     a2, a10, a5                 // + the loader's time (0 without one), with the carry
+    movi    a3, 0
+    bgeu    a2, a10, 3f
+    movi    a3, 1
+3:  add     a3, a3, a11
+    add     a3, a3, a6
     retw
     .size   silica_rt_current_time, . - silica_rt_current_time
 

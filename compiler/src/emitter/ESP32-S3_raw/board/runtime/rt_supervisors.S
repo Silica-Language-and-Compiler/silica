@@ -156,11 +156,12 @@
 
 .macro SCHED_LOCK ra, rb
     movi    \ra, silica_rt_sched_lock
-9:  movi    \rb, 0
+.Lsched_lock_spin\@:
+    movi    \rb, 0
     wsr     \rb, scompare1
     movi    \rb, 1
     s32c1i  \rb, \ra, 0
-    bnez    \rb, 9b
+    bnez    \rb, .Lsched_lock_spin\@
 .endm
 
 .macro SCHED_UNLOCK ra, rb
@@ -1600,6 +1601,7 @@ silica_rt_child_table_row_ref:
     .type   silica_rt_supervisor_count_children, @function
 silica_rt_supervisor_count_children:
     entry   a1, 32
+    call8   silica_rt_yield_if_ready    // a call's yield point (rt_actors.S)
     mov     a10, a2                     // X0 = the supervisor's reference (§15.1.4)
     mov     a11, a3
     call8   silica_rt_sup_acb
@@ -1656,6 +1658,7 @@ silica_rt_live_row_by_id:
     .type   silica_rt_supervisor_get_child, @function
 silica_rt_supervisor_get_child:
     entry   a1, 32
+    call8   silica_rt_yield_if_ready    // a call's yield point (rt_actors.S)
     mov     a10, a2                     // X0 = the supervisor's reference (§15.1.4)
     mov     a11, a3
     call8   silica_rt_sup_acb
@@ -1684,6 +1687,7 @@ silica_rt_supervisor_get_child:
     .type   silica_rt_supervisor_get_child_info, @function
 silica_rt_supervisor_get_child_info:
     entry   a1, 32
+    call8   silica_rt_yield_if_ready    // a call's yield point (rt_actors.S)
     mov     a10, a2                     // X0 = the supervisor's reference (§15.1.4)
     mov     a11, a3
     call8   silica_rt_sup_acb
@@ -1734,6 +1738,7 @@ silica_rt_supervisor_get_child_info:
     .type   silica_rt_supervisor_get_child_id, @function
 silica_rt_supervisor_get_child_id:
     entry   a1, 32
+    call8   silica_rt_yield_if_ready    // a call's yield point (rt_actors.S)
     mov     a10, a2                     // X0 = the supervisor's reference (§15.1.4)
     mov     a11, a3
     call8   silica_rt_sup_acb
@@ -1748,6 +1753,7 @@ silica_rt_supervisor_get_child_id:
     .type   silica_rt_supervisor_get_child_agent_type, @function
 silica_rt_supervisor_get_child_agent_type:
     entry   a1, 32
+    call8   silica_rt_yield_if_ready    // a call's yield point (rt_actors.S)
     mov     a10, a2                     // X0 = the supervisor's reference (§15.1.4)
     mov     a11, a3
     call8   silica_rt_sup_acb
@@ -1762,6 +1768,7 @@ silica_rt_supervisor_get_child_agent_type:
     .type   silica_rt_supervisor_get_child_restart, @function
 silica_rt_supervisor_get_child_restart:
     entry   a1, 32
+    call8   silica_rt_yield_if_ready    // a call's yield point (rt_actors.S)
     mov     a10, a2                     // X0 = the supervisor's reference (§15.1.4)
     mov     a11, a3
     call8   silica_rt_sup_acb
@@ -1800,6 +1807,7 @@ silica_rt_supervisor_row_field:
     .type   silica_rt_supervisor_which_children, @function
 silica_rt_supervisor_which_children:
     entry   a1, 32
+    call8   silica_rt_yield_if_ready    // a call's yield point (rt_actors.S)
     mov     a10, a2                     // X0 = the supervisor's reference (§15.1.4)
     mov     a11, a3
     call8   silica_rt_sup_acb

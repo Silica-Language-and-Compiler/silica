@@ -164,6 +164,7 @@ silica_rt_canonical_arena_lookup:
     j       7b                    // probe again, now under the lock
 5:  movi    a10, 4128
     call8   silica_rt_alloc
+    movi    a11, 1                // the call returned a3 = 0 into a11; 5 is reached only under the lock
     addi    a8, a10, 32           // bump
     s32i    a8, a10, 0
     movi    a9, 4128
