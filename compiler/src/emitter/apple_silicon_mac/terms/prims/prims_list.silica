@@ -444,11 +444,11 @@ fn emit_list_head_box(nbytes: int64) -> string {
     case nbytes <= 0 of {
         true -> "";
         false -> {
-            save: string <- "    STP X1, X2, [SP, #-16]!\n";
-            alloc: string <- concat("    MOV X0, #", concat(atom_table@int64_to_decimal_string(nbytes), "\n    BL _silica_rt_region_alloc\n"));
-            restore: string <- "    LDP X1, X2, [SP], #16\n";
+            // A frame copy (chunk 15 phase 2): L_dyn_alloc keeps X1 (the head) and X2 (the tail).
+            n16: int64 <- (nbytes + 15) / 16 * 16;
+            alloc: string <- concat("    MOV X16, #", concat(atom_table@int64_to_decimal_string(n16), "\n    BL L_dyn_alloc\n    MOV X0, X16\n"));
             copy: string <- list_head_box_copy_words(0, nbytes / 8);
-            concat(save, concat(alloc, concat(restore, concat(copy, "    MOV X1, X0\n"))))
+            concat(alloc, concat(copy, "    MOV X1, X0\n"))
         }
     }
 }
@@ -479,12 +479,21 @@ fn emit_list_cons(term: { nodes: List[{ kind: int64, type_name: string, value: s
         true -> "    MOV X5, #1\n";
         false -> "    MOV X5, #0\n"
     };
+    // Chunk 15 phase 2 (design §3.7): the handle (32 bytes) and a chunk (CDATA + 16) are one frame
+    // block allocated here and passed in X15; X14 says whether an element can be a pointer, which
+    // decides whether a free slot of an older chunk may take it (L_list_prepend_helper).
+    block: int64 <- (32 + cd + 16 + 15) / 16 * 16;
+    frame: string <- concat("    MOV X16, #", concat(atom_table@int64_to_decimal_string(block), "\n    BL L_dyn_alloc\n    MOV X15, X16\n"));
+    ptr_flag: string <- case reg_conventions@is_frame_free_scalar_type(et) of {
+        true -> "    MOV X14, #0\n";
+        false -> "    MOV X14, #1\n"
+    };
     bl: string <- "    BL L_list_prepend_helper\n";
     mov_d: string <- case dest == "X0" of {
         true -> "";
         false -> concat(concat("    MOV ", dest), ", X0\n")
     };
-    concat(box_asm, concat(concat(concat(concat(mov_es, mov_cd), agg_flag), bl), mov_d))
+    concat(box_asm, concat(concat(concat(concat(concat(frame, ptr_flag), concat(mov_es, mov_cd)), agg_flag), bl), mov_d))
 }
 
 // X9 = list handle pointer.  Dereference handle → chunk → cursor → element.
@@ -567,7 +576,8 @@ fn emit_list_remove_head(term: { nodes: List[{ kind: int64, type_name: string, v
     es_s: string <- atom_table@int64_to_decimal_string(es);
     cd_s: string <- atom_table@int64_to_decimal_string(cd);
     setup: string <- concat("    MOV X0, X9\n", concat("    MOV X1, #", concat(es_s, concat("\n    MOV X2, #", concat(cd_s, "\n")))));
-    bl: string <- "    BL L_list_tail_helper\n";
+    // The tail handle is a 32-byte frame block passed in X15 (chunk 15 phase 2).
+    bl: string <- "    MOV X16, #32\n    BL L_dyn_alloc\n    MOV X15, X16\n    BL L_list_tail_helper\n";
     mov_d: string <- case dest == "X0" of {
         true -> "";
         false -> concat(concat("    MOV ", dest), ", X0\n")
@@ -606,8 +616,16 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
 
 // Module-level helper: L_list_prepend_helper
 // X1 = head value (or pointer to aggregate), X2 = old handle (0=nil),
-// X3 = elem_slot_bytes, X4 = chunk_data_bytes, X5 = is_aggregate (0 or 1).
+// X3 = elem_slot_bytes, X4 = chunk_data_bytes, X5 = is_aggregate (0 or 1),
+// X14 = the element can be a pointer (0 or 1), X15 = a frame block of the caller's (chunk 15 phase 2):
+// the new handle is X15 + 0 and a new or copied chunk X15 + 32, so nothing is allocated here.
 // Returns X0 = new list handle.
+//
+// A free slot in front of the old list is taken only when the old list owns that frontier (the claim
+// rule below) and, for an element that can be a pointer, only when the chunk is in the caller's own
+// frame ([SP, caller's X29)): a chunk in an older frame, the heap or a mailbox region must never point
+// at a node of a younger frame, or an evacuation that leaves the old chunk where it is would lose it.
+// Such a prepend copies the old list's part of the chunk into the new frame chunk instead.
 // Chunk: [data: chunk_data_bytes][next chunk][claim]. The claim word is the lowest data offset
 // already handed out. A prepend fills the free slot in front of the old list's first element only
 // when the old list owns that frontier (claim == its cursor), and then claims the slot; otherwise
@@ -632,7 +650,7 @@ fn emit_list_prepend_helper() -> string {
     ))))),
     concat(
     concat(
-    "    LDR X7, [X2, #8]\n    ADD X12, X7, X4\n    LDR X9, [X12, #8]\n    CMP X9, X6\n    B.NE L_lph_cow\n    SUB X8, X6, X3\n    STR X8, [X12, #8]\n",
+    "    LDR X7, [X2, #8]\n    CBZ X14, L_lph_frame_ok\n    MOV X9, SP\n    CMP X7, X9\n    B.LO L_lph_cow\n    LDR X9, [X29]\n    CMP X7, X9\n    B.HS L_lph_cow\nL_lph_frame_ok:\n    ADD X12, X7, X4\n    LDR X9, [X12, #8]\n    CMP X9, X6\n    B.NE L_lph_cow\n    SUB X8, X6, X3\n    STR X8, [X12, #8]\n",
     concat(
     "    ADD X10, X7, X8\n",
     concat(
@@ -657,7 +675,7 @@ fn emit_list_prepend_helper() -> string {
     concat(
     "L_lph_room_stored:\n",
     concat(
-    "    MOV X0, #24\n    BL _silica_rt_region_alloc\n",
+    "    MOV X0, X15\n",
     concat(
     "    LDR X5, [SP], #16\n    LDP X3, X4, [SP], #16\n    LDP X1, X2, [SP], #16\n",
     concat(
@@ -673,7 +691,7 @@ fn emit_list_prepend_helper() -> string {
     // Copy-on-write: the slot in front of the old list is taken, so the new element goes into a
     // fresh chunk that copies the old list's part of its chunk (cursor .. chunk end) to the same
     // offsets and inherits the old chunk's successor; the element sits just in front of the copy.
-    "L_lph_cow:\n    ADD X0, X4, #16\n    BL _silica_rt_region_alloc\n    MOV X6, X0\n    LDR X5, [SP]\n    LDP X3, X4, [SP, #16]\n    LDP X1, X2, [SP, #32]\n",
+    "L_lph_cow:\n    ADD X0, X15, #32\n    MOV X6, X0\n    LDR X5, [SP]\n    LDP X3, X4, [SP, #16]\n    LDP X1, X2, [SP, #32]\n",
     concat(
     "    LDR X7, [X2, #8]\n    LDR X9, [X2, #16]\n    MOV X12, X9\nL_lph_cow_copy:\n    CMP X12, X4\n    B.GE L_lph_cow_copied\n    LDR X13, [X7, X12]\n    STR X13, [X6, X12]\n    ADD X12, X12, #8\n    B L_lph_cow_copy\n",
     concat(
@@ -688,7 +706,7 @@ fn emit_list_prepend_helper() -> string {
     concat(
     "L_lph_new_chunk:\n",
     concat(
-    "    ADD X0, X4, #16\n    BL _silica_rt_region_alloc\n    MOV X6, X0\n",
+    "    ADD X0, X15, #32\n    MOV X6, X0\n",
     concat(
     "    LDR X5, [SP]\n    LDP X3, X4, [SP, #16]\n    LDP X1, X2, [SP, #32]\n",
     concat(
@@ -723,7 +741,7 @@ fn emit_list_prepend_helper() -> string {
     concat(
     "L_lph_alloc_handle:\n    ADD X9, X6, X4\n    STR X8, [X9, #8]\n    STP X6, X8, [SP, #-16]!\n",
     concat(
-    "    MOV X0, #24\n    BL _silica_rt_region_alloc\n",
+    "    MOV X0, X15\n",
     concat(
     "    LDP X6, X8, [SP], #16\n",
     concat(
@@ -740,7 +758,8 @@ fn emit_list_prepend_helper() -> string {
 }
 
 // Module-level helper: L_list_tail_helper
-// X0 = handle, X1 = elem_slot_bytes, X2 = chunk_data_bytes.
+// X0 = handle, X1 = elem_slot_bytes, X2 = chunk_data_bytes, X15 = a 32-byte frame block of the
+// caller's that becomes the tail handle (chunk 15 phase 2).
 // Returns X0 = tail handle (or 0 for nil tail).
 fn emit_list_tail_helper() -> string {
     concat(
@@ -758,7 +777,7 @@ fn emit_list_tail_helper() -> string {
     concat(
     "    STP X3, X4, [SP, #-16]!\n    STP X6, XZR, [SP, #-16]!\n",
     concat(
-    "    MOV X0, #24\n    BL _silica_rt_region_alloc\n",
+    "    MOV X0, X15\n",
     concat(
     "    LDP X6, XZR, [SP], #16\n    LDP X3, X4, [SP], #16\n",
     "    STR X3, [X0]\n    STR X4, [X0, #8]\n    STR X6, [X0, #16]\n    LDP X29, X30, [SP], #16\n    RET\n"
@@ -768,7 +787,7 @@ fn emit_list_tail_helper() -> string {
     concat(
     "    SUB X3, X3, #1\n    CBZ X3, L_lth_nil\n",
     concat(
-    "    STP X3, X7, [SP, #-16]!\n    MOV X0, #24\n    BL _silica_rt_region_alloc\n",
+    "    STP X3, X7, [SP, #-16]!\n    MOV X0, X15\n",
     concat(
     "    LDP X3, X7, [SP], #16\n",
     concat(

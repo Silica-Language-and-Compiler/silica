@@ -36,6 +36,8 @@ compiler rejects (as it will once E2313 and E2314 exist) aborts the batch for ev
 | `buf_invalid_size_ends_actor` | Q9: invalid buffer size (`L_buf_invalid`) in an actor | §8 ("same for `L_buf_invalid`"), §10, §15 Q9 | fails: `105`, then `[silica] abort: invalid buffer size at <PTR>`, status 71 | `L_buf_invalid` in an actor ends the actor with `(:explicit, :buf_invalid)` | 8 |
 | `list_index_ends_actor` | Q9: list index past the end in an actor | §15 Q9 ("the list-index abort by the same reasoning") | fails: `109`, then `[silica] abort: list index out of range at <PTR>`, status 71 | `L_lat_oob` in an actor ends the actor (reason atom not fixed by the design) | 8 |
 | `buf_bounds_in_main_still_aborts` | Q9 guard: in `main` it stays abort 71 | §8, §15 Q9 (a) | **passes** (it must keep passing after the Q9 fix) | nothing; it catches a fix that routes `main`'s bounds failure through actor failure | 8 |
+| `write_ref_young_into_older_cell` | Phase 2 open hazard: `write_ref` of a pointer to a younger frame's node into a ref cell of an older frame; the evacuator scans old aggregates but not old REF1/REFTUP cells | Phase2_notes.md §3 item 4 | **fails** (phase 2 Mac compiler, 2026-10-26): prints `6102673616` (a stale value read through the dangling pointer) then `0`; wanted `7` then `0` | scan old ref cells in the evacuator, or promote the stored pointer in `write_ref` | chunk 15 phase 2 |
+| `write_ref_young_into_heap_shell_ref` | the same through a ref inside an actor's heap state shell; compiles (picked up by the `find`-generated `silica.config`) | Phase2_notes.md §3 item 4 | **fails** (phase 2 Mac compiler, 2026-10-26): prints `0`, `0`, `0`; wanted `0`, `7`, `0` | same | chunk 15 phase 2 |
 
 In the other suite:
 

@@ -39,7 +39,6 @@ use prims_tuple;
 use term_message_copy;
 use var;
 use module_linkage;
-use term_message_regions;
 use x86_isa;
 use x86_mem;
 
@@ -54,6 +53,7 @@ export gpr_x_view/1;
 export composite_move_bytes/1;
 export composite_move_has_scalar_alt/1;
 export behaviour_result_move_asm/4;
+export behaviour_result_evacuate_asm/3;
 export behaviour_convention_prefix/1;
 
 
@@ -654,6 +654,62 @@ fn behaviour_convention_prefix(return_type: string) -> string {
     }
 }
 
+// Chunk 15 phase 2, interim until phase 3 (state at the base) and phase 4 (replies into the caller):
+// X0 = rdi = the result tuple. The new state and a composite reply are walked out of the behaviour's
+// frame ([rsp, entry rsp), the entry rsp being rbp + 16) into the actor's heap by L_ev_heap
+// (prims_memory), so the shell moves of behaviour_result_move_asm and the runtime see heap data only.
+// A type the descriptors cannot follow (a type parameter, a trait type) is left as it is.
+fn behaviour_result_evacuate_asm(return_type: string, entry_label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    t: string <- prims_record@strip_spaces_rt(return_type);
+    reply_form: bool <- length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,";
+    stype: string <- case reply_form of {
+        true -> prims_tuple@tuple_type_nth_element(t, 2);
+        false -> prims_tuple@tuple_type_nth_element(t, 1)
+    };
+    soff: int64 <- case reply_form of { true -> 16; false -> 8 };
+    s_part: { code: string, data: string } <- bev_one(stype, soff, concat("L_evb_", concat(entry_label, "_s")), table);
+    r_part: { code: string, data: string } <- case reply_form of {
+        true -> bev_one(prims_tuple@tuple_type_nth_element(t, 1), 8, concat("L_evb_", concat(entry_label, "_r")), table);
+        false -> { code: "", data: "" }
+    };
+    case length_bytes(s_part.code) == 0 and length_bytes(r_part.code) == 0 of {
+        true -> "";
+        false -> concat(concat(x86_mem@x86_str("X0", "[SP, #-16]!"), concat(s_part.code, r_part.code)), concat(x86_mem@x86_ldr("X0", "[SP], #16"), concat(s_part.data, r_part.data)))
+    }
+}
+
+fn bev_one(t: string, off: int64, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> { code: string, data: string } {
+    case length_bytes(t) == 0 or reg_conventions@is_frame_free_scalar_type(t) or term_message_copy@ev_type_described(t) == false of {
+        true -> { code: "", data: "" };
+        false -> {
+            o: string <- atom_table@int64_to_decimal_string(off);
+            load: string <- concat("    mov r10, QWORD PTR [rsp]\n    mov rdi, QWORD PTR [r10 + ", concat(o, "]\n"));
+            desc: string <- concat("    lea rax, [rip + ", concat(label, "_0]\n    mov rsi, QWORD PTR [rax + 16]\n    mov rdx, QWORD PTR [rax + 24]\n"));
+            // A record or tuple shell stays put (the move below copies it); only what it points at moves.
+            entry: string <- case reg_conventions@is_aggregate_struct_or_tuple_return_type(t) of {
+                true -> "L_ev_heap_shell";
+                false -> "L_ev_heap"
+            };
+            call: string <- concat(concat("    lea rcx, [rbp + 16]\n    call ", entry), concat("\n    mov r10, QWORD PTR [rsp]\n    mov QWORD PTR [r10 + ", concat(o, "], rdi\n")));
+            { code: concat(load, concat(desc, call)), data: term_message_copy@md_rodata_block(term_message_copy@ev_site_descriptor_rodata(t, label, table)) }
+        }
+    }
+}
+
+// The value in `vreg` (a message, an initial state) is walked out of every frame of this stack
+// ([rsp, L_stack_top)) into this actor's heap before it is handed over; `keep_reg` is kept across.
+fn stack_value_to_heap_asm(t: string, label: string, vreg: string, keep_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    case length_bytes(t) == 0 or reg_conventions@is_frame_free_scalar_type(t) or term_message_copy@ev_type_described(t) == false of {
+        true -> "";
+        false -> {
+            save: string <- concat(x86_mem@x86_stp(vreg, keep_reg, "[SP, #-16]!"), "    call L_stack_top\n    mov rcx, rdi\n    mov rdi, QWORD PTR [rsp]\n");
+            desc: string <- concat("    lea rax, [rip + ", concat(label, "_0]\n    mov rsi, QWORD PTR [rax + 16]\n    mov rdx, QWORD PTR [rax + 24]\n"));
+            back: string <- concat("    call L_ev_heap\n", concat(x86_isa@x86_mov(vreg, "X0"), concat(x86_mem@x86_ldr(keep_reg, "[SP, #8]"), x86_isa@x86_add("SP", "SP", "#16"))));
+            concat(concat(save, concat(desc, back)), term_message_copy@md_rodata_block(term_message_copy@ev_site_descriptor_rodata(t, label, table)))
+        }
+    }
+}
+
 fn behaviour_result_move_asm(return_type: string, entry_label: string, reuse_state: bool, reply_copy: string) -> string {
     t: string <- prims_record@strip_spaces_rt(return_type);
     reply_form: bool <- length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,";
@@ -727,28 +783,30 @@ fn actor_message_copy_bytes(msg: { nodes: List[{ kind: int64, type_name: string,
 fn send_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
     t: string <- sir_term_root_node(sir_term_at(term, n.right_expr)).type_name;
-    case term_message_copy@md_prim_value_is_move(n.value) or term_message_copy@md_site_elided(outer_reg, term.root) or term_message_copy@md_type_needs_copy(t) == false of {
+    to_heap: string <- stack_value_to_heap_asm(t, concat("L_evs_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(term.root)))), "X10", "X11", table);
+    concat(to_heap, case term_message_copy@md_prim_value_is_move(n.value) or term_message_copy@md_site_elided(outer_reg, term.root) or term_message_copy@md_type_needs_copy(t) == false of {
         true -> "";
         false -> {
             label: string <- term_message_copy@md_site_label(term_message_copy@md_fn_label_of(outer_reg), term.root);
             call: string <- concat(concat(x86_mem@x86_str("X11", "[SP, #-16]!"), x86_isa@x86_mov("X0", "X10")), concat(term_message_copy@md_copy_call_asm(label, ""), concat(x86_isa@x86_mov("X10", "X0"), x86_mem@x86_ldr("X11", "[SP], #16"))));
             concat(call, term_message_copy@md_rodata_block(term_message_copy@md_descriptor_rodata(t, label, table)))
         }
-    }
+    })
 }
 
 // The initial state is in X11 and the flat argument words in X10 (parked around the copy).
 fn spawn_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
     t: string <- sir_term_root_node(sir_term_at(term, n.inner)).type_name;
-    case term_message_copy@md_prim_value_is_move(n.value) or term_message_copy@md_site_elided(outer_reg, term.root) or term_message_copy@md_type_needs_copy(t) == false of {
+    to_heap: string <- stack_value_to_heap_asm(t, concat("L_evp_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(term.root)))), "X11", "X10", table);
+    concat(to_heap, case term_message_copy@md_prim_value_is_move(n.value) or term_message_copy@md_site_elided(outer_reg, term.root) or term_message_copy@md_type_needs_copy(t) == false of {
         true -> "";
         false -> {
             label: string <- term_message_copy@md_site_label(term_message_copy@md_fn_label_of(outer_reg), term.root);
             call: string <- concat(concat(x86_mem@x86_str("X10", "[SP, #-16]!"), x86_isa@x86_mov("X0", "X11")), concat(term_message_copy@md_copy_call_asm(label, ""), concat(x86_isa@x86_mov("X11", "X0"), x86_mem@x86_ldr("X10", "[SP], #16"))));
             concat(call, term_message_copy@md_rodata_block(term_message_copy@md_descriptor_rodata(t, label, table)))
         }
-    }
+    })
 }
 
 fn actor_message_copy_x10(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string) -> string {
@@ -995,7 +1053,9 @@ fn caller_module_from_outer_reg(outer_reg: string) -> string {
 fn emit_register_failure_reporter(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, caller_module: string) -> string {
     rdl_label: string <- module_linkage@asm_symbol_for_definition(caller_module, "region_dump_limit");
     save: string <- concat(x86_isa@x86_sub("SP", "SP", "#16"), x86_mem@x86_str("X9", "[SP, #0]"));
-    call_rdl: string <- concat(asm_bl(rdl_label), asm_bl("silica_rt_failure_reporter_set_dump_limit"));
+    // region_dump_limit is a Silica function: it may return with rsp lowered (chunk 15 phase 2), so rsp
+    // is recorded before the call and put back after it, as at every user call (call@call_precall_sp_asm).
+    call_rdl: string <- concat(concat("    mov QWORD PTR [rbp - 16], rsp\n", concat(asm_bl(rdl_label), "    mov rsp, QWORD PTR [rbp - 16]\n")), asm_bl("silica_rt_failure_reporter_set_dump_limit"));
     restore: string <- concat(x86_mem@x86_ldr("X9", "[SP, #0]"), x86_isa@x86_add("SP", "SP", "#16"));
     reg: string <- concat(x86_isa@x86_mov("X0", "X9"), asm_bl("silica_rt_failure_reporter_register"));
     concat(concat(concat(concat(save, call_rdl), restore), reg), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
@@ -1013,58 +1073,10 @@ fn emit_runtime_binary(dest: string, term: { nodes: List[{ kind: int64, type_nam
     concat(concat(stage_x0_x1("X9", "X10"), asm_bl(runtime_label(sir_term_root_node(term).name))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
 }
 
-// ---- Clocks and timers (spec §22.14) ----------------------------------------------------------
-// timer_cast(target, message) is the inner half of send_after: the target is in X11 and the
-// message in X10, copied by the cast rules (actor_message_copy_x10 / send_deep_copy_asm, exactly
-// as emit_actor_cast). The runtime gets X0 = the target's identity, X1 = the message, X2 = the
-// release thunk (0 when the message type carries no owned region) and answers the prepared timer
-// record, an int64 word the outer send_after prim hands on together with the delay.
-//
-// The release thunk is what a cancelled or dropped timer runs instead of the receiver's dispatch:
-// the behaviour would have destroyed the message record's top-level region fields at its return
-// (term_message_regions, region design §18.7), so the thunk destroys the same fields. It is emitted
-// in line, jumped over, and named per site. It is a C-convention leaf of this unit (rdi = the
-// message; rbx kept; the stack 16-aligned at its call), as the runtime calls it from its thread.
-fn timer_release_thunk_label(outer_reg: string, root: int64) -> string {
-    concat("L_tr_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(root))))
-}
-
-fn tr_find_comma(s: string, i: int64) -> int64 {
-    case i >= length_bytes(s) of {
-        true -> i;
-        false -> case substring(s, i, i + 1) == "," of {
-            true -> i;
-            false -> tr_find_comma(s, i + 1)
-        }
-    }
-}
-
-// offs is ",8,24,": one load and one region destroy per boxed field offset.
-fn timer_thunk_destroy_lines(offs: string, i: int64, acc: string) -> string {
-    case i >= length_bytes(offs) of {
-        true -> acc;
-        false -> case substring(offs, i, i + 1) == "," of {
-            true -> timer_thunk_destroy_lines(offs, i + 1, acc);
-            false -> {
-                e: int64 <- tr_find_comma(offs, i);
-                timer_thunk_destroy_lines(offs, e, concat(acc, concat("    mov rdi, QWORD PTR [rbx + ", concat(substring(offs, i, e), "]\n    call silica_rt_region_destroy\n"))))
-            }
-        }
-    }
-}
-
 fn timer_release_thunk_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> string {
-    t: string <- sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name;
-    offs: string <- term_message_regions@tmr_message_record_offsets(t);
-    case length_bytes(offs) == 0 of {
-        true -> x86_isa@x86_movi("X2", 0);
-        false -> {
-            lbl: string <- timer_release_thunk_label(outer_reg, term.root);
-            head: string <- concat(x86_isa@x86_b(concat(lbl, "_skip")), concat(lbl, ":\n    push rbp\n    mov rbp, rsp\n    push rbx\n    sub rsp, 8\n    mov rbx, rdi\n"));
-            tail: string <- concat("    add rsp, 8\n    pop rbx\n    pop rbp\n    ret\n", concat(lbl, concat("_skip:\n", x86_isa@x86_adr("X2", lbl))));
-            concat(head, concat(timer_thunk_destroy_lines(offs, 0, ""), tail))
-        }
-    }
+    // Chunk 15 phase 2: messages no longer carry regions a receiver destroys (design §9.1), so a
+    // cancelled or dropped timer has nothing to release: the runtime gets no thunk (X2 = 0).
+    x86_isa@x86_movi("X2", 0)
 }
 
 fn emit_timer_cast(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, deep: string, thunk: string) -> string {

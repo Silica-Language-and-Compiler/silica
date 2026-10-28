@@ -129,6 +129,7 @@ assembly: ensure-silica-compiler
 clean: clean-silica-ifaces
 clean-silica-ifaces:
 	@find "$(CURDIR)" -name '*.iface' -type f -delete 2>/dev/null || true
+	@rm -rf "$(CURDIR)/silica.compile.rejected" "$(CURDIR)/silica.compile.rejected.d" "$(CURDIR)/silica.config.full" "$(CURDIR)/silica.compile.attempt.log" "$(CURDIR)/silica.compile.attempt.rc"
 	@[ -n "$$SILICA_INTEGRATE_ACTIVE" ] || { rm -f $(INTEGRATE_FILES); rm -rf "$(INTEGRATE_RUNNING_DIR)"; }
 
 # So prerequisites like `integrate: $(SILICA_COMPILER)` create the binaries/ link if needed.
@@ -189,6 +190,55 @@ endef
 
 define RUN_SILICA_COMPILER_QUIET
 	$(call RUN_SILICA_COMPILER_QUIET_WITH,"$(SILICA_COMPILER)")
+endef
+
+# ---- a rejected unit fails its own trial only (Lee: no set of trials fails because one of its
+# trials fails) ---------------------------------------------------------------------------------
+# The suite's integrate recipes compile the whole silica.config in one run, which stops at the first
+# unit the compiler rejects. RUN_SILICA_COMPILER_ISOLATING[_WITH] (compile_isolating.sh) keeps that one
+# run for the all-good case; on a failure it takes the blamed unit out of the configuration, records it
+# in silica.compile.rejected (+ silica.compile.rejected.d/<unit>.txt) and compiles the rest again, until
+# a run succeeds. It exits non-zero only when the failure cannot be blamed on a unit of the suite, which
+# the caller still reports as the whole suite's compilation failing.
+#   if ! { $(RUN_SILICA_COMPILER_ISOLATING); }; then <suite compilation failed>; fi; \
+#   $(call INTEGRATE_COMPILE_REJECTS,$(MSG_PREFIX)); \
+# INTEGRATE_COMPILE_REJECTS then prints one failure line per rejected unit (with the compiler's error),
+# marks it, and adds it to the caller's shell variables ko (once per unit) and failed. Callers need
+# ok/ko/failed initialised before it. The rejected unit has no .sams, so the later stages never see it.
+# (Assembling, linking and running are isolated the same way: one trial's failure of any stage is that
+# trial's failure only.)
+define RUN_SILICA_COMPILER_ISOLATING_WITH
+	SILICA_COMPILE_TIMEOUT=$(SILICA_COMPILE_TIMEOUT) sh "$(_SILICA_COMPILER_MK_DIR)compile_isolating.sh" "$(1)"
+endef
+
+define RUN_SILICA_COMPILER_ISOLATING
+	$(call RUN_SILICA_COMPILER_ISOLATING_WITH,$(SILICA_COMPILER))
+endef
+
+# $(call INTEGRATE_COMPILE_REJECTS,<label prefix, e.g. $(MSG_PREFIX)>)
+define INTEGRATE_COMPILE_REJECTS
+if [ -s silica.compile.rejected ]; then \
+	while IFS="$$(printf '\t')" read -r rj_unit rj_rc rj_why; do \
+		rj_name=$${rj_unit##*/}; \
+		echo "❌❌ $(1)$${rj_name%.silica} compilation failed: $$rj_why"; \
+		$(INTEGRATE_DOT_FAIL); \
+		sed 's/^/    /' "silica.compile.rejected.d/$$rj_name.txt" 2>/dev/null | head -n 20; \
+		ko=$$((ko + 1)); failed=1; \
+	done < silica.compile.rejected; \
+fi
+endef
+
+# $(call TRIAL_RM_UNTRACKED,<files>): remove build outputs, but never a file git tracks. Some built trial
+# executables (Mach-O) are tracked in the repository; a clean must not delete them. A tracked file that is
+# left behind is overwritten by the next successful link, and a trial whose assemble or link fails is
+# reported and skipped, never run from a stale file. Without git (a synced host) every file is removed.
+define TRIAL_RM_UNTRACKED
+for rm_f in $(1); do { [ -e "$$rm_f" ] || [ -L "$$rm_f" ]; } || continue; git ls-files --error-unmatch -- "$$rm_f" >/dev/null 2>&1 || rm -rf -- "$$rm_f"; done
+endef
+
+# The compiler's error for the unit in shell variable $base, when the compile isolated it as rejected.
+define INTEGRATE_REJECT_DETAIL
+{ rj_f="silica.compile.rejected.d/$${base##*/}.silica.txt"; [ -f "$$rj_f" ] && sed 's/^/    /' "$$rj_f" | head -n 20; true; }
 endef
 
 # ---- supervisor-actor shaped trials (actor_memory_budget_plan.md item M) ----

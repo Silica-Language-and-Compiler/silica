@@ -75,24 +75,7 @@ fn emit_rest_args(rest: { nodes: List[{ kind: int64, type_name: string, value: s
             gpr_after_cur: int64 <- term_user_call_abi@user_call_next_gpr_slot(cur_ty, gpr_slot);
             fp_after_cur: int64 <- term_user_call_abi@user_call_next_fp_slot(cur_ty, fp_slot);
             arg_raw: string <- emit_child(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).inner),  reg, pools,  { bound_name: bound.bound_name, bound_reg: bound.bound_reg, outer_reg: outer_f, debug: bound.debug });
-            // Silica moves: the callee may keep this pointer for good (wbt_map stores a
-            // tuple-typed value straight into its node), but a make lives in this frame's
-            // region, which dies at our epilogue. Copy it to the region before the pointer
-            // leaves -- the same rule the return path follows, see
-            // aggregate_callee_return_promote_bytes.
-            // See trials/standard_data_structures/wbt_core/wbt_map_tuple_value_escapes_frame. A let-bound
-            // aggregate passed by name gets the same copy when its pointer is inside this frame
-            // (frame_var_arg_promote, design H3, region_hazards_open_addition/wbt_map_tuple_value_escapes_via_let).
-            arg_promote: string <- case term_call_helpers@is_aggregate_make(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).inner)) of {
-                true -> term_aggregate_helpers@arg_aggregate_heap_promote(reg, term_aggregate_helpers@agg_promote_bytes(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).inner)));
-                false -> term_aggregate_helpers@frame_var_arg_promote(reg, term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).inner))
-            };
-            // arg_raw carries no trailing newline (the join sites add it), so the
-            // promote must open its own line.
-            arg_asm: string <- case length_bytes(arg_promote) > 0 of {
-                true -> concat(concat(arg_raw, "\n"), arg_promote);
-                false -> arg_raw
-            };
+            arg_asm: string <- arg_raw;
             rest_asm: string <- case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).right_expr)).kind < 0 of {
                 true -> "";
                 false -> emit_rest_args(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).right_expr), gpr_after_cur, fp_after_cur, { bound_name: bound.bound_name, bound_reg: bound.bound_reg, outer_reg: outer_f, debug: bound.debug }, pools, emit_child)
@@ -205,8 +188,9 @@ fn reply_buffer_x2_line(x2_root: boolean, spine_reg: string, slab: boolean, abov
         true -> concat("    LDR ", concat(breg, concat(", ", concat("[SP, #", concat(term_call_helpers@dec_str(above), "]")))));
         false -> case length_bytes(spine_reg) > 0 of {
             true -> concat("    MOV ", concat(breg, concat(", ", spine_reg)));
+            // The call's own result buffer (x8_alloc, the frame's dynamic part) is the reply buffer too.
             false -> case slab of {
-                true -> concat("    ADD ", concat(breg, concat(", ", concat("SP", concat(", ", concat("#", term_call_helpers@dec_str(above)))))));
+                true -> concat("    MOV ", concat(breg, ", X8"));
                 false -> ""
             }
         }
@@ -332,18 +316,6 @@ fn reply_arg_marks_rest(rest: { nodes: List[{ kind: int64, type_name: string, va
     }
 }
 
-fn reply_arg_promote_asm(dest: string, nbytes: int64) -> string {
-    to_x0: string <- case dest == "X0" of {
-        true -> "";
-        false -> concat("    MOV X0, ", concat(dest, "\n"))
-    };
-    from_x0: string <- case dest == "X0" of {
-        true -> "";
-        false -> concat("    MOV ", concat(dest, ", X0\n"))
-    };
-    concat(concat("\n", to_x0), concat(concat(term_aggregate_helpers@aggregate_return_heap_promote_x0(nbytes), concat("    ADD SP, SP, #", concat(term_call_helpers@dec_str(nbytes), "\n"))), from_x0))
-}
-
 fn join_before_call_lines(a: string, b: string) -> string {
     case length_bytes(a) == 0 of {
         true -> b;
@@ -418,10 +390,9 @@ fn emit_generic_user_call_asm_inner(term: { nodes: List[{ kind: int64, type_name
                 false -> ""
             }
         };
-        false -> case sret_alloc_bytes > 0 of {
-            true -> concat("    SUB SP, SP, #", concat(term_call_helpers@dec_str(sret_alloc_bytes), "\n    MOV X8, SP\n"));
-            false -> ""
-        }
+        // The X8 buffer of a tuple-returning call is allocated just before the call (x8_alloc below),
+        // in the frame's dynamic part: nothing goes on SP for it.
+        false -> ""
     };
     sret_setup: string <- concat(x2_park, sret_setup_plain);
     arg1_reg: string <- term_user_call_abi@user_call_arg_reg_for_type(a1ty, 0, 0);
@@ -455,8 +426,7 @@ fn emit_generic_user_call_asm_inner(term: { nodes: List[{ kind: int64, type_name
     };
     indirect_via_x9: boolean <- call@sir_call_targets_bound_callee(bound.outer_reg, term_sir_helpers@sir_term_root_node(term).name);
     // An indirect callee address in X17 must survive argument evaluation.
-    // X17 is caller-saved: nested calls, silica_rt_region_alloc (heap-promoted
-    // record/tuple args), and string/list helpers all BL and clobber it.
+    // X17 is caller-saved: nested calls and string/list helpers all BL and clobber it.
     // Always capture X17 before args and reload after. For a kind-5 tail BR,
     // pop the save slot before frame release — dealloc after BR is unreachable.
     save_indirect_callee_around_args: boolean <- indirect_via_x9;
@@ -464,13 +434,6 @@ fn emit_generic_user_call_asm_inner(term: { nodes: List[{ kind: int64, type_name
     use_simple_gpr_parallel_stage: boolean <- staged_arg_count <= 8
         and term_user_call_helpers@simple_gpr_arg_tree_can_stage(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), bound.outer_reg)
         and term_user_call_helpers@simple_gpr_rest_tree_can_stage(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr), bound.outer_reg);
-    arg_stack_bytes_raw: int64 <- term_call_helpers@call_tuple_args_dealloc_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner))
-        + term_call_helpers@call_tuple_args_dealloc_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr));
-    // Parallel staging reclaims aggregate-make slabs before the call.
-    arg_stack_bytes_before_call: int64 <- case use_simple_gpr_parallel_stage of {
-        true -> 0;
-        false -> arg_stack_bytes_raw
-    };
     callee_prep: string <- case indirect_via_x9 of {
         true -> case save_indirect_callee_around_args of {
             true -> concat(call@emit_indirect_callee_address_to_x17(bound.outer_reg, term_sir_helpers@sir_term_root_node(term).name), "    STR X17, [SP, #-16]!\n");
@@ -480,10 +443,7 @@ fn emit_generic_user_call_asm_inner(term: { nodes: List[{ kind: int64, type_name
     };
     callee_reload_after_args: string <- case save_indirect_callee_around_args of {
         false -> "";
-        true -> case arg_stack_bytes_before_call == 0 of {
-            true -> "    LDR X17, [SP, #0]\n";
-            false -> concat("    LDR X17, [SP, #", concat(term_call_helpers@dec_str(arg_stack_bytes_before_call), "]\n"))
-        }
+        true -> "    LDR X17, [SP, #0]\n"
     };
     x2_spine_reg: string <- case on_reply_spine of {
         true -> reply_buf_reg;
@@ -493,7 +453,7 @@ fn emit_generic_user_call_asm_inner(term: { nodes: List[{ kind: int64, type_name
         true -> 16;
         false -> 0
     };
-    x2_above: int64 <- arg_stack_bytes_before_call + x17_slot_bytes;
+    x2_above: int64 <- x17_slot_bytes;
     x2_line: string <- case beh_result_call of {
         true -> reply_buffer_x2_line(x2_root, x2_spine_reg, sret_alloc_bytes > 0, x2_above, reply_buffer_call_reg(term));
         false -> ""
@@ -502,7 +462,16 @@ fn emit_generic_user_call_asm_inner(term: { nodes: List[{ kind: int64, type_name
         true -> reply_word_moves(term);
         false -> ""
     };
-    call_opts_x2: { use_tail: boolean, fn_effects_for_tail: string, blr_effect_value_override: string, line_before_call_asm: string } <- { use_tail: call_opts.use_tail, fn_effects_for_tail: call_opts.fn_effects_for_tail, blr_effect_value_override: call_opts.blr_effect_value_override, line_before_call_asm: join_before_call_lines(call_opts.line_before_call_asm, join_before_call_lines(word_lines, x2_line)) };
+    // Chunk 15 phase 2: a tuple-returning call's result buffer (X8) is a block of the frame's dynamic
+    // part, allocated after the arguments are in place (L_dyn_alloc keeps X0-X15 and X17, so the staged
+    // arguments, X9 and an indirect callee in X17 survive) and before the reply-buffer line, which
+    // passes the same block. It lives as long as the frame, so nothing pops it and nothing copies the
+    // result out of it.
+    x8_alloc: string <- case sret_alloc_bytes > 0 and ffi_found == false and call_opts.use_tail == false of {
+        true -> concat(var@mov_imm_wide("X16", (sret_alloc_bytes + 15) / 16 * 16), "    BL L_dyn_alloc\n    MOV X8, X16");
+        false -> ""
+    };
+    call_opts_x2: { use_tail: boolean, fn_effects_for_tail: string, blr_effect_value_override: string, line_before_call_asm: string } <- { use_tail: call_opts.use_tail, fn_effects_for_tail: call_opts.fn_effects_for_tail, blr_effect_value_override: call_opts.blr_effect_value_override, line_before_call_asm: join_before_call_lines(call_opts.line_before_call_asm, join_before_call_lines(x8_alloc, join_before_call_lines(word_lines, x2_line))) };
     // A self call in tail position (emitter_core@tco_tail_self_calls listed this node) jumps to the
     // function's restart stub instead of calling: the loop runs in constant stack.
     tco_label: string <- var@find_sp_binding(bound.outer_reg, "_tco");
@@ -527,7 +496,7 @@ fn emit_generic_user_call_asm_inner(term: { nodes: List[{ kind: int64, type_name
                 ffi_call_ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string } <- { call_effects: call_eff_for_blr, c_symbol: ffi_c_sym, param_types: ffi_param_types, return_type: ffi_return_type, arg1_type: a1ty, sret_setup: sret_setup, sret_bytes: sret_n, outer_reg: bound.outer_reg };
                 ffi_foreign@emit_foreign_user_call(term, dest, ffi_call_ctx)
             };
-            false -> call@emit_call_body_effects(term, dest, call_eff_for_blr, bound.outer_reg, indirect_via_x9)
+            false -> call@emit_call_body_effects(term, dest, call_eff_for_blr, bound.outer_reg, indirect_via_x9, pools.table)
         }
     }
     };
@@ -536,11 +505,7 @@ fn emit_generic_user_call_asm_inner(term: { nodes: List[{ kind: int64, type_name
     // STR X0; emit arg2 into X1; LDR X0; emit arg1 into X0. Only when arg2 is a call (kind 4): if arg2
     // is a var/const, X0 may no longer hold the first param (e.g. after let inner <- ack(...)) and
     // STR would save the wrong value. Skip 3+ arg chains (user_call_rest with non-dummy tail) and floats.
-    arg_promote: string <- case beh_result_call and sret_alloc_bytes > 0 and x2_root == false and length_bytes(var@find_sp_binding(bound.outer_reg, concat("_ra", term_call_helpers@dec_str(term.root)))) > 0 of {
-        true -> reply_arg_promote_asm(dest, sret_alloc_bytes);
-        false -> ""
-    };
-    concat(term_emit_kind_call_tail@emit_generic_user_call_asm_inner_tail(term, dest, bound, pools, emit_child, call_opts_x2, { a1ty: a1ty, sret_stack_bytes: sret_stack_bytes, sret_setup: sret_setup, arg1_reg: arg1_reg, arg2_reg: arg2_reg, arg1_asm: arg1_asm, rest_asm: rest_asm, save_indirect_callee_around_args: save_indirect_callee_around_args, use_simple_gpr_parallel_stage: use_simple_gpr_parallel_stage, arg_stack_bytes_before_call: arg_stack_bytes_before_call, callee_prep: callee_prep, callee_reload_after_args: callee_reload_after_args, call_asm: call_asm }), arg_promote)
+    term_emit_kind_call_tail@emit_generic_user_call_asm_inner_tail(term, dest, bound, pools, emit_child, call_opts_x2, { a1ty: a1ty, sret_stack_bytes: sret_stack_bytes, sret_setup: sret_setup, arg1_reg: arg1_reg, arg2_reg: arg2_reg, arg1_asm: arg1_asm, rest_asm: rest_asm, save_indirect_callee_around_args: save_indirect_callee_around_args, use_simple_gpr_parallel_stage: use_simple_gpr_parallel_stage, callee_prep: callee_prep, callee_reload_after_args: callee_reload_after_args, call_asm: call_asm })
 }
 
 // Root function body only: SIR kind 5 tail user call with enclosing function effects for frame release + barriers.

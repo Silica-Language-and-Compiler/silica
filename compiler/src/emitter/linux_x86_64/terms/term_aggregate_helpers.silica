@@ -34,18 +34,16 @@ use x86_mem;
 export tuple_flat_memref/2;
 export emit_reg_to_flat_qwords_memcpy_loop/5;
 export agg_shell_bytes/1;
-export agg_promote_bytes/1;
-export let_tail_aggregate_promote_bytes/1;
-export aggregate_callee_return_promote_bytes/1;
 export emit_sub_from_fp/2;
 export agg_addr_prefix/2;
+export agg_dyn_load/3;
+export agg_dyn_block_asm/2;
+export agg_indirect_base/1;
 export tuple_flat_memref_at/2;
 export tuple_make_rec_flat_outer_alloc_bytes/2;
 export tuple_make_rec_flat_nested_trim_bytes/2;
 export flat_record_sum_nested_reserved_in_outer/1;
 export record_field_inline_pointer_value/3;
-export let_user_call_tuple_sret_stack_bytes/3;
-export branch_tail_user_call_sret_stack_bytes/3;
 export let_suppress_base_stack_overlay_rec_flat/2;
 export let_suppressed_base_stack_fixup/1;
 export record_proj_root_record_type/1;
@@ -54,29 +52,13 @@ export record_proj_chain_byte_offset/1;
 export record_proj_chain_base_term/1;
 export record_proj_chain_base_is_value/1;
 export emit_inline_record_field_copy_words/5;
-export aggregate_return_heap_promote_x0/1;
-export aggregate_return_heap_promote_x0_copy/2;
-export tuple_elem_sret_reclaim/2;
-export tuple_elem_heap_promote/2;
-export tuple_elem_frame_var_promote/3;
-export frame_var_arg_promote/2;
-export arg_aggregate_heap_promote/2;
-export tuple_elem_var_aggregate_promote_bytes/2;
 export let_stack_agg_escapes_via_tuple/1;
-export let_early_heap_promote_asm/2;
-export call_tuple_args_dealloc_bytes/1;
 export flat_tuple_total_alloc/1;
 export agg_alloc_inner/1;
 export flat_record_sum_nested_inners/1;
-export record_field_nested_return_bytes/4;
 export flat_record_total_alloc/1;
 export flat_tuple_nested_alloc/3;
-export flat_tuple_dealloc_size/1;
-export flat_record_dealloc_size/1;
-export aggregate_callee_return_stack_bytes/1;
-export term_is_checked_int64_prim/1;
-export list_cons_join_tail_head_op/4;
-export let_tail_aggregate_stack_bytes/1;
+export list_cons_join_tail_head_op/3;
 
 // An offset of -1 means a record field name was not found in the record type. Emitting a
 // memref for it would silently place the value at a wrong (or colliding) slot, so emit an
@@ -100,8 +82,43 @@ fn emit_sub_from_fp(dest: string, n: int64) -> string {
     x86_isa@x86_sub(dest, "X29", concat("#", atom_table@int64_to_decimal_string(n)))
 }
 
+// An aggregate built in the frame's dynamic part (chunk 15 phase 2, a make in a TCO loop that keeps its
+// dynamic part, `_dynagg`): its store base is "*" + the make's frame slot, which holds the pointer to
+// the block. Every access goes through X16: agg_addr_prefix loads the pointer, the memref is [X16, #off],
+// the same shape the far-region path uses.
+fn agg_indirect_base(store_base: string) -> boolean {
+    length_bytes(store_base) > 1 and substring(store_base, 0, 1) == "*"
+}
+
+fn agg_indirect_load_x16(store_base: string) -> string {
+    fb: int64 <- var@parse_x29_neg_offset_bytes(substring(store_base, 1, length_bytes(store_base)));
+    x86_mem@x86_ldr("X16", concat("[X29, #-", concat(atom_table@int64_to_decimal_string(fb), "]")))
+}
+
+// The block for a dynamic-part make: n bytes from L_dyn_alloc (every VR home is kept), its address
+// stored in the make's frame slot `slot` through X9 (prim scratch at the start of a make).
+fn agg_dyn_block_asm(slot: string, n: int64) -> string {
+    fb: int64 <- var@parse_x29_neg_offset_bytes(slot);
+    alloc: string <- concat("    mov eax, ", concat(atom_table@int64_to_decimal_string((n + 15) / 16 * 16), "\n    call L_dyn_alloc\n    mov r10, rax\n"));
+    concat(alloc, x86_mem@x86_str("X9", concat("[X29, #-", concat(atom_table@int64_to_decimal_string(fb), "]"))))
+}
+
+// The pointer value of a dynamic-part make: the block address from its slot, plus `adj` (a record whose
+// shell starts above reserved inline space).
+fn agg_dyn_load(dest: string, slot: string, adj: int64) -> string {
+    fb: int64 <- var@parse_x29_neg_offset_bytes(slot);
+    ld: string <- x86_mem@x86_ldr(dest, concat("[X29, #-", concat(atom_table@int64_to_decimal_string(fb), "]")));
+    case adj > 0 of {
+        true -> concat(ld, x86_isa@x86_add(dest, dest, concat("#", atom_table@int64_to_decimal_string(adj))));
+        false -> ld
+    }
+}
+
 fn agg_far_region(store_base: string, offset: int64) -> boolean {
-    fb: int64 <- var@parse_x29_neg_offset_bytes(store_base);
+    fb: int64 <- case agg_indirect_base(store_base) of {
+        true -> 1 + 255 + offset;
+        false -> var@parse_x29_neg_offset_bytes(store_base)
+    };
     case fb > 0 of {
         true -> fb - offset > 255;
         false -> false
@@ -109,6 +126,13 @@ fn agg_far_region(store_base: string, offset: int64) -> boolean {
 }
 
 fn agg_addr_prefix(store_base: string, offset: int64) -> string {
+    case agg_indirect_base(store_base) of {
+        true -> agg_indirect_load_x16(store_base);
+        false -> agg_addr_prefix_frame(store_base, offset)
+    }
+}
+
+fn agg_addr_prefix_frame(store_base: string, offset: int64) -> string {
     case agg_far_region(store_base, offset) of {
         true -> {
             // X16 = X29 - fb2 (x86_sub takes any immediate).
@@ -248,9 +272,9 @@ fn flat_record_sum_nested_reserved_in_outer(term: { nodes: List[{ kind: int64, t
     }
 }
 
-// A tuple-returning call in record-field position SUBs its own caller sret slab and hands back a
-// heap pointer, and the field store then reclaims that slab (tuple_elem_sret_reclaim), so the make
-// is back on its own SP by the time the next field is stored. Neither the outer SUB nor the
+// A tuple-returning call in record-field position gets its result buffer from L_dyn_alloc right
+// before the call (chunk 15 phase 2; earlier it SUBbed a caller slab the field store then
+// reclaimed), so the make never has bytes of the callee's on its SP. Neither the outer SUB nor the
 // nested-inner sums may count those bytes: reserving them shifted every later field and left the
 // callee's slab unpopped, so the frame grew by the sret size and the epilogue restored X29/X30 from
 // the wrong slots -- `{ p: pair(), b: 9 }` returned to a garbage address and hung.
@@ -281,38 +305,10 @@ fn record_field_inline_pointer_value(elem: { nodes: List[{ kind: int64, type_nam
     }
 }
 
-fn let_user_call_tuple_sret_stack_bytes(rhs: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, bound_name: string) -> int64 {
-    // Keep in lockstep with sret_alloc_bytes in term_emit_kind_call. Zero for pass-through / non-tuple.
-    case (term_sir_helpers@sir_term_root_node(rhs).kind == 4 or term_sir_helpers@sir_term_root_node(rhs).kind == 5) and reg_conventions@is_tuple_type(term_sir_helpers@sir_term_root_node(rhs).type_name) of {
-        false -> 0;
-        true -> case length_bytes(var@find_sp_binding(outer_reg, "_callee_sret")) > 0 and (length_bytes(bound_name) == 0 or term_sir_helpers@sir_term_root_node(rhs).kind == 5) and reply_result_type_agg(term_sir_helpers@sir_term_root_node(rhs).type_name) == false of {
-            true -> 0;
-            false -> term_user_call_abi@user_call_aggregate_return_alloc_bytes(term_sir_helpers@sir_term_root_node(rhs).type_name)
-        }
-    }
-}
-
 fn branch_tail_strip_lets(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
     case term_sir_helpers@sir_term_root_node(t).kind == 2 of {
         true -> branch_tail_strip_lets(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr));
         false -> t
-    }
-}
-
-fn branch_tail_user_call_sret_stack_bytes(rhs: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, bound_name: string) -> int64 {
-    // `true -> { a <- …; b <- …; f(x) }` pushes the same slab as a bare `true -> f(x)`,
-    // so walk the let spine to the tail before deciding (see read_hex_digits in the lexer).
-    tail: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- branch_tail_strip_lets(rhs);
-    tail_is_bound: boolean <- term_sir_helpers@sir_term_root_node(rhs).kind == 2 or length_bytes(bound_name) > 0;
-    reply_tail: boolean <- reply_result_type_agg(term_sir_helpers@sir_term_root_node(tail).type_name);
-    on_reply_spine: boolean <- reply_tail and length_bytes(var@find_sp_binding(outer_reg, "_tuple_sret")) > 0
-        and node_listed_agg(var@find_sp_binding(outer_reg, "_bsp"), concat(",", concat(atom_table@int64_to_decimal_string(tail.root), ",")), 0);
-    case term_sir_helpers@sir_term_root_node(tail).kind == 4 and reg_conventions@is_tuple_type(term_sir_helpers@sir_term_root_node(tail).type_name) and on_reply_spine == false of {
-        false -> 0;
-        true -> case length_bytes(var@find_sp_binding(outer_reg, "_callee_sret")) > 0 and tail_is_bound == false and reply_tail == false of {
-            true -> 0;
-            false -> term_user_call_abi@user_call_aggregate_return_alloc_bytes(term_sir_helpers@sir_term_root_node(tail).type_name)
-        }
     }
 }
 
@@ -508,96 +504,6 @@ fn emit_inline_record_field_copy_words(src_reg: string, store_base: string, dest
 // After a stack-built aggregate is returned in X0, copy it to the heap before ADD SP
 // dealloc so the caller keeps a valid pointer. X0 holds the source pointer on entry.
 
-// A tuple element that is an aggregate LITERAL (record_make / tuple_make) is built on its own
-// stack slab and the tuple stores only a pointer to it. When the enclosing tuple is promoted to
-// the heap on return, the shallow copy carries that pointer verbatim, so it outlives the slab
-// the epilogue pops and the caller dereferences dead stack. Copy the element to the heap here
-// so the pointer stays valid after the frame goes away.
-//
-// Only literals take this path: elem_is_agg is kind 6 tuple_make/record_make, so call results
-// that are already heap pointers (Token*, Lexer*, ...) are untouched and tuple elements remain
-// pointers with a stride of 8. That is what keeps tuple_proj readers unchanged.
-// A tuple-returning call in element position leaves its caller sret slab on the stack: the post-BLR
-// ADD is 0 because a let-bound call pops it at let-end, and an element has no let. Nothing else
-// accounts for it -- flat_tuple_nested_alloc and emit_flat_tuple_stores only shift for elements that
-// are themselves a tuple_make / record_make -- so the remaining elements were stored through an SP
-// sitting inside that slab and the tuple's ADD popped less than it pushed, returning on a wrong SP.
-// Copy the aggregate to the heap (the element is stored as a pointer either way) and give the slab
-// back, which keeps every offset and the dealloc size authority correct.
-// See trials/codegen_regressions/tup_call_elem.silica.
-fn tuple_elem_sret_reclaim(reg: string, nbytes: int64) -> string {
-    case nbytes <= 0 of {
-        true -> "";
-        false -> concat(tuple_elem_heap_promote(reg, nbytes), x86_isa@x86_add("SP", "SP", concat("#", atom_table@int64_to_decimal_string(nbytes))))
-    }
-}
-
-// Promote a frame aggregate held in `reg` to the region, preserving X0-X7: on the
-// direct argument path the earlier arguments of this same call are already sitting
-// in them, and region_alloc clobbers them. The promoted pointer is parked in X16
-// (IP0, caller-saved scratch) across the restore, then moved back into `reg`, so
-// this is correct even when `reg` is itself one of X0-X7.
-fn arg_aggregate_heap_promote(reg: string, nbytes: int64) -> string {
-    case nbytes <= 0 of {
-        true -> "";
-        false -> {
-            save: string <- concat(x86_mem@x86_stp("X0", "X1", "[SP, #-16]!"), concat(x86_mem@x86_stp("X2", "X3", "[SP, #-16]!"), concat(x86_mem@x86_stp("X4", "X5", "[SP, #-16]!"), x86_mem@x86_stp("X6", "X7", "[SP, #-16]!"))));
-            restore: string <- concat(x86_mem@x86_ldp("X6", "X7", "[SP], #16"), concat(x86_mem@x86_ldp("X4", "X5", "[SP], #16"), concat(x86_mem@x86_ldp("X2", "X3", "[SP], #16"), x86_mem@x86_ldp("X0", "X1", "[SP], #16"))));
-            to_x0: string <- x86_isa@x86_mov("X0", reg);
-            park: string <- x86_isa@x86_mov("X16", "X0");
-            back: string <- x86_isa@x86_mov(reg, "X16");
-            concat(save, concat(to_x0, concat(aggregate_return_heap_promote_x0(nbytes), concat(park, concat(restore, back)))))
-        }
-    }
-}
-
-fn tuple_elem_heap_promote(reg: string, nbytes: int64) -> string {
-    case nbytes <= 0 of {
-        true -> "";
-        false -> concat(x86_isa@x86_mov("X0", reg), concat(aggregate_return_heap_promote_x0(nbytes), x86_isa@x86_mov(reg, "X0")))
-    }
-}
-
-// A let-bound record or tuple lives in this function's frame region, [SP, X29). Packed BY NAME into
-// a tuple that outlives the frame -- returned, stored in a collection, sent -- the element pointer
-// dangled: pair_sets@make_pair's `(a, b)` of two wbt_set records came back pointing into the
-// popped frame and wbt_set@size faulted (trials/generic_modules_addition/
-// two_generic_collections_round_trip). The element is copied to the region at the pack when, and
-// only when, its pointer is inside the current frame: results of calls, parameters and projections
-// are region (or caller-frame) pointers already, and copying every aggregate element on every pack
-// was the per-pack promote that OOMed type checking (tuple_elem_var_aggregate_promote_bytes). A
-// tuple still sitting in a caller-reserved sret slab is left to tuple_elem_sret_reclaim, which
-// copies it and gives the slab back. X0-X7 are preserved (later elements may read parameters).
-fn tuple_elem_frame_var_promote(reg: string, elem: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, sret_reclaim_bytes: int64) -> string {
-    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(elem);
-    nbytes: int64 <- case n.kind == 1 and sret_reclaim_bytes == 0 of {
-        true -> aggregate_type_flat_bytes(n.type_name);
-        false -> 0
-    };
-    case nbytes > 0 of {
-        true -> concat(concat(x86_isa@x86_cmp_branch("LO", reg, "SP", "7f"), x86_isa@x86_cmp_branch("HS", reg, "X29", "7f")), concat(arg_aggregate_heap_promote(reg, nbytes), "7:\n"));
-        false -> ""
-    }
-}
-
-// A let-bound record or tuple passed BY NAME as a call argument (design region_memory_safety_design.md
-// H3; memory note 2026-09-08; trial region_hazards_open_addition/wbt_map_tuple_value_escapes_via_let):
-// the callee may keep the pointer for good, as wbt_map@insert keeps a tuple value in its node, and the
-// value lives in this function's frame region, which dies at the epilogue. The literal case (a
-// tuple_make/record_make argument) is promoted by arg_aggregate_heap_promote at the call; this is the
-// same promotion for a name, taken when, and only when, the pointer is inside the current frame: the
-// test tuple_elem_frame_var_promote makes for a pack, whose frame bound needs no scratch register on
-// this target, so it serves the tail path's X16 staging register too. X0-X7 are preserved.
-fn frame_var_arg_promote(reg: string, arg: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    tuple_elem_frame_var_promote(reg, arg, 0)
-}
-
-// Retired: per-pack promote OOMed typecheck. Let-emit promotes once via
-// let_stack_agg_escapes_via_tuple; keep the symbol returning 0 for call sites.
-fn tuple_elem_var_aggregate_promote_bytes(elem: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, bound_name: string) -> int64 {
-    0
-}
-
 fn flat_tuple_spine_packs_var(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, name: string) -> boolean {
     n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(t);
     case n.kind == 6 and n.name == "tuple_make" of {
@@ -642,62 +548,7 @@ fn let_stack_agg_escapes_via_tuple(term: { nodes: List[{ kind: int64, type_name:
     false
 }
 
-// Shallow region copy; does not ADD SP — let epilogue pops the RHS slab.
-fn let_early_heap_promote_asm(rhs_bind: string, nbytes: int64) -> string {
-    case nbytes <= 0 of {
-        true -> "";
-        false -> {
-            to_x0: string <- case rhs_bind == "X0" of {
-                true -> "";
-                false -> x86_isa@x86_mov("X0", rhs_bind)
-            };
-            from_x0: string <- case rhs_bind == "X0" of {
-                true -> "";
-                false -> x86_isa@x86_mov(rhs_bind, "X0")
-            };
-            concat(concat(to_x0, aggregate_return_heap_promote_x0(nbytes)), from_x0)
-        }
-    }
-}
 
-fn aggregate_return_heap_promote_x0(nbytes: int64) -> string {
-    aggregate_return_heap_promote_x0_copy(nbytes, nbytes)
-}
-
-// As aggregate_return_heap_promote_x0, with the block allocated at alloc_bytes and copy_bytes of the
-// value in X0 copied into it. The sret epilogue allocates a record's 16-byte-rounded shell but copies
-// only the value's flat size (prims_tuple@sret_aggregate_copy_bytes): the value may be a box of
-// exactly that size, and reading the rounding word past it faulted at an arena block's end.
-fn aggregate_return_heap_promote_x0_copy(alloc_bytes: int64, copy_bytes: int64) -> string {
-    case alloc_bytes <= 0 of {
-        true -> "";
-        false -> {
-            words: int64 <- copy_bytes / 8;
-            case words <= 0 of {
-                true -> "";
-                false -> {
-                    copy_asm: string <- aggregate_heap_copy_words_unrolled(0, words);
-                    head: string <- concat(x86_isa@x86_sub("SP", "SP", "#16"), concat(x86_mem@x86_str("X0", "[SP, #8]"), x86_isa@x86_mov("X0", concat("#", atom_table@int64_to_decimal_string(alloc_bytes)))));
-                    alloc: string <- concat(x86_isa@x86_call("silica_rt_region_alloc"), concat(x86_isa@x86_mov("X4", "X0"), x86_mem@x86_ldr("X1", "[SP, #8]")));
-                    tail: string <- concat(x86_isa@x86_mov("X0", "X4"), x86_isa@x86_add("SP", "SP", "#16"));
-                    concat(head, concat(alloc, concat(copy_asm, tail)))
-                }
-            }
-        }
-    }
-}
-
-
-
-fn call_tuple_args_dealloc_bytes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
-    case term.root < 0 of {
-        true -> 0;
-        false -> case term_sir_helpers@sir_term_root_node(term).name == "user_call_rest" of {
-            true -> flat_tuple_dealloc_size(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)) + call_tuple_args_dealloc_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr));
-            false -> flat_tuple_dealloc_size(term)
-        }
-    }
-}
 
 
 
@@ -805,39 +656,6 @@ fn flat_record_sum_nested_inners(term: { nodes: List[{ kind: int64, type_name: s
 // memcpy'd into this frame (from_sorted_err). Nested record_make/tuple_make emit their own SUB —
 // counting them here double-subtracts SP (structs_addition/04 hang).
 
-// How far SP moves while this field is emitted, which is what later fields must add to their
-// SP-relative offsets. Only a nested make self-SUBs. A user-call inline return does not move SP --
-// it is memcpy'd out of the returned pointer into space the outer SUB already reserved -- so it is
-// counted once up front, for every field, via flat_record_sum_nested_reserved_in_outer at the
-// emit_flat_record_stores call. Counting it here as well would shift the fields after it twice.
-fn record_field_nested_return_bytes(elem: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fty: string, elem_is_agg: boolean, R: string) -> int64 {
-    case elem_is_agg of {
-        true -> agg_alloc_inner(elem);
-        // Boxed layout: an aggregate VARIABLE stored into a field is copied to the region first
-        // (the let that bound it may still hold it in this frame, and the outer record may
-        // outlive the frame) and the field holds the copy's pointer. The size comes from the
-        // field type, the same authority the readers use. Calls, projections and case results
-        // already hand back heap pointers and are stored as they are.
-        false -> case term_sir_helpers@sir_term_root_node(elem).kind == 1 and prims_record@record_type_keeps_inline_layout(R) == false of {
-            true -> aggregate_type_flat_bytes(fty);
-            false -> 0
-        }
-    }
-}
-
-// Flat byte size of a record or tuple type (0 for anything else): what a region copy of one
-// value of that type must carry.
-fn aggregate_type_flat_bytes(fty: string) -> int64 {
-    t: string <- prims_record@strip_spaces_rt(fty);
-    case reg_conventions@is_inline_struct_type(t) of {
-        true -> prims_record@record_type_value_flat_byte_size(t);
-        false -> case reg_conventions@is_tuple_type(t) of {
-            true -> prims_tuple@flat_alloc_size(prims_tuple@count_type_elements(t));
-            false -> 0
-        }
-    }
-}
-
 
 fn flat_record_total_alloc(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
     case term_sir_helpers@sir_term_root_node(term).kind == 6 and term_sir_helpers@sir_term_root_node(term).name == "record_make" of {
@@ -878,45 +696,6 @@ fn flat_tuple_nested_alloc(term: { nodes: List[{ kind: int64, type_name: string,
 }
 
 
-// What a direct `{...}` body actually pushed: the shell, plus the bytes the SUB reserved below it for
-// user-call inline returns, plus any nested make that self-SUBs. The return type describes only the
-// shell, so popping that alone leaked the reserved area; the epilogue's LDP restores then read the
-// wrong slots and the function returned to a garbage address. Same authority the let path uses for
-// its dealloc, and the counterpart of flat_tuple_dealloc_size for tuples.
-// See trials/codegen_regressions/rec_call_field_direct.silica.
-fn flat_record_dealloc_size(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
-    // Same rule as flat_tuple_dealloc_size: a record_make lives in a frame region
-    // and pushed nothing, so popping for it leaves SP high. zero_loc() emitted an
-    // unpaired "ADD SP, SP, #16", which made LDP restore a bogus X29/X30 and RET
-    // jump into hyperspace -- arg_clobber hung rather than returning a value.
-    case term_sir_helpers@sir_term_root_node(term).kind == 6 and (term_sir_helpers@sir_term_root_node(term).name == "record_make" or term_sir_helpers@sir_term_root_node(term).name == "tuple_make") of {
-        true -> 0;
-        false -> flat_record_total_alloc(term)
-    }
-}
-
-// Aggregate makes allocate in the fixed frame (see emit_tuple_make_stack), so
-// there is no SP slab to pop. Every caller of this function is emitting an
-// "ADD SP" for a make's slab; sizing a region or a heap-promote copy uses
-// flat_tuple_total_alloc / flat_record_total_alloc instead.
-fn flat_tuple_dealloc_size(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
-    // Only an aggregate MAKE moved to a frame region -- it has no SP slab to pop.
-    // Other aggregates reaching here (notably a tuple-returning user call) still
-    // own a real caller sret slab on SP and must still be popped; returning 0 for
-    // those left the slab live and broke compiler_addition/repro_letcall.
-    case term_sir_helpers@sir_term_root_node(term).kind == 6 and (term_sir_helpers@sir_term_root_node(term).name == "tuple_make" or term_sir_helpers@sir_term_root_node(term).name == "record_make") of {
-        true -> 0;
-        false -> agg_promote_bytes(term)
-    }
-}
-
-fn agg_promote_bytes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
-    case term_sir_helpers@sir_term_root_node(term).kind == 6 and term_sir_helpers@sir_term_root_node(term).name == "record_make" of {
-        true -> flat_record_total_alloc(term);
-        false -> flat_tuple_total_alloc(term)
-    }
-}
-
 // Stack bytes for let dealloc: tuple_make/record_make use flat layout on caller SP.
 // Tuple-returning user calls: caller SUB/MOV X8 is paired in let emission (see base_stack_n),
 // not here — case-branch bare calls use pass-through X8 and must stay at 0 (wbt weight_subtree).
@@ -938,52 +717,6 @@ fn agg_promote_bytes(term: { nodes: List[{ kind: int64, type_name: string, value
 // against leaving that SUB live to the epilogue -- this is the other half of the same agreement.
 // See trials/codegen_regressions/prim_tuple_let.silica.
 
-// Whether a term is a checked-int64 prim, which owns its own stack slab: see the 0 case in
-// aggregate_callee_return_stack_bytes for why nobody else may pop it. Exported so the epilogue can ask
-// the same question about a function's return-position tail without importing the prim module.
-fn term_is_checked_int64_prim(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
-    term_sir_helpers@sir_term_root_node(term).kind == 6 and prims_checked_int64@is_checked_int64_prim(term_sir_helpers@sir_term_root_node(term).name)
-}
-
-// A list_at result is the element's region pointer under the boxed layout (prims_list
-// chunk_elem_slot_bytes); only an inline child-spec cell still needs its bytes copied out.
-fn list_at_result_promote_bytes(elem_t: string) -> int64 {
-    case prims_list@list_elem_is_inline_aggregate(elem_t) of {
-        true -> prims_record@record_type_value_flat_byte_size(elem_t);
-        false -> 0
-    }
-}
-
-// Promote size counterpart of aggregate_callee_return_stack_bytes: a make in a
-// frame region pops 0 bytes but still needs its real size copied to the heap
-// before the pointer leaves the frame.
-fn aggregate_callee_return_promote_bytes(rhs: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
-    case reg_conventions@is_aggregate_struct_or_tuple_return_type(term_sir_helpers@sir_term_root_node(rhs).type_name) of {
-        false -> 0;
-        true -> case term_sir_helpers@sir_term_root_node(rhs).kind == 6 and term_sir_helpers@sir_term_root_node(rhs).name == "list_at" of {
-            // Boxed layout: list_at hands back the element's own region pointer (not an address
-            // inside the list chunk), so there is nothing to promote -- except a child-spec cell,
-            // still spliced inline. Copying record_type_value_flat_byte_size of a TUPLE element
-            // copied one word of it.
-            true -> list_at_result_promote_bytes(term_sir_helpers@sir_term_root_node(rhs).type_name);
-            false -> case term_sir_helpers@sir_term_root_node(rhs).kind == 6 and (term_sir_helpers@sir_term_root_node(rhs).name == "tuple_make" or term_sir_helpers@sir_term_root_node(rhs).name == "record_make") of {
-                true -> agg_promote_bytes(rhs);
-                false -> 0
-            }
-        }
-    }
-}
-
-fn aggregate_callee_return_stack_bytes(rhs: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
-    case reg_conventions@is_aggregate_struct_or_tuple_return_type(term_sir_helpers@sir_term_root_node(rhs).type_name) of {
-        false -> 0;
-        true -> case term_sir_helpers@sir_term_root_node(rhs).kind == 6 and (term_sir_helpers@sir_term_root_node(rhs).name == "tuple_make" or term_sir_helpers@sir_term_root_node(rhs).name == "record_make") of {
-            true -> flat_tuple_dealloc_size(rhs);
-            false -> 0
-        }
-    }
-}
-
 // Caller sret slab for a let-bound tuple-returning user call (paired with sret_alloc_bytes in
 // emit_generic_user_call_asm_inner). Zero for pass-through / non-tuple.
 
@@ -991,50 +724,10 @@ fn aggregate_callee_return_stack_bytes(rhs: { nodes: List[{ kind: int64, type_na
 // Tail is placed in X2, then head is evaluated into X1. Head is often a BL (trim, concat,
 // user call) and clobbers caller-saved X2, so prepend sees a garbage list and faults
 // (selfhost typecheck hang on `:plain` via split_atom_parts). Save X2 across the head.
-// When the head left a tuple slab (cons_dealloc > 0), the save sits under that slab;
-// restore from [SP, #N] and free slab+save together.
 // See trials/compiler_addition/list_cons_head_call.silica.
-fn list_cons_join_tail_head_op(arg2_asm: string, arg1_asm: string, op_asm: string, cons_dealloc: int64) -> string {
+fn list_cons_join_tail_head_op(arg2_asm: string, arg1_asm: string, op_asm: string) -> string {
     save: string <- x86_mem@x86_str("X2", "[SP, #-16]!");
-    case cons_dealloc > 0 of {
-        true -> {
-            n_s: string <- atom_table@int64_to_decimal_string(cons_dealloc);
-            restore: string <- x86_mem@x86_ldr("X2", concat("[SP, #", concat(n_s, "]")));
-            free_n: int64 <- cons_dealloc + 16;
-            free_s: string <- atom_table@int64_to_decimal_string(free_n);
-            free: string <- concat("\n", x86_isa@x86_add("SP", "SP", concat("#", free_s)));
-            concat(concat(concat(concat(arg2_asm, "\n"), save), concat(arg1_asm, "\n")), concat(restore, concat(op_asm, free)))
-        };
-        false -> {
-            restore: string <- x86_mem@x86_ldr("X2", "[SP], #16");
-            concat(concat(concat(concat(arg2_asm, "\n"), save), concat(arg1_asm, "\n")), concat(restore, op_asm))
-        }
-    }
+    restore: string <- x86_mem@x86_ldr("X2", "[SP], #16");
+    concat(concat(concat(concat(arg2_asm, "\n"), save), concat(arg1_asm, "\n")), concat(restore, op_asm))
 }
 
-// Same let-spine walk as let_tail_aggregate_stack_bytes, but returning the REAL
-// aggregate size rather than the SP-pop size. A tail make now lives in a frame
-// region, so it pops 0 bytes -- but it must still be heap-promoted before return
-// or the caller gets a pointer into a dead frame (arg_clobber faulted this way).
-fn let_tail_aggregate_promote_bytes(tail: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
-    case term_sir_helpers@sir_term_root_node(tail).kind == 2 of {
-        true -> let_tail_aggregate_promote_bytes(term_sir_helpers@sir_term_at(tail, term_sir_helpers@sir_term_root_node(tail).right_expr));
-        false -> case term_sir_helpers@sir_term_root_node(tail).kind == 6 and term_sir_helpers@sir_term_root_node(tail).name == "list_at" of {
-            true -> list_at_result_promote_bytes(term_sir_helpers@sir_term_root_node(tail).type_name);
-            false -> case term_sir_helpers@sir_term_root_node(tail).kind == 6 and (term_sir_helpers@sir_term_root_node(tail).name == "record_make" or term_sir_helpers@sir_term_root_node(tail).name == "tuple_make") of {
-                true -> agg_promote_bytes(tail);
-                false -> 0
-            }
-        }
-    }
-}
-
-fn let_tail_aggregate_stack_bytes(tail: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
-    case term_sir_helpers@sir_term_root_node(tail).kind == 2 of {
-        true -> let_tail_aggregate_stack_bytes(term_sir_helpers@sir_term_at(tail, term_sir_helpers@sir_term_root_node(tail).right_expr));
-        false -> case term_sir_helpers@sir_term_root_node(tail).kind == 6 and (term_sir_helpers@sir_term_root_node(tail).name == "record_make" or term_sir_helpers@sir_term_root_node(tail).name == "tuple_make") and reg_conventions@is_aggregate_struct_or_tuple_return_type(term_sir_helpers@sir_term_root_node(tail).type_name) of {
-            true -> flat_tuple_dealloc_size(tail);
-            false -> 0
-        }
-    }
-}

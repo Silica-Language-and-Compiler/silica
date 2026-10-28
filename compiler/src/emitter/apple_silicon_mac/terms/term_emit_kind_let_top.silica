@@ -52,7 +52,10 @@ fn emit_kind_let_toplevel(term: { nodes: List[{ kind: int64, type_name: string, 
                                 }
                             };
                             iap_tl: string <- "";
-                            packs_escape_tl: boolean <- term_aggregate_helpers@let_stack_agg_escapes_via_tuple(term);
+                            // A `_dynagg` make (chunk 15 phase 2) is built in a dynamic-part block whose address its
+                            // frame slot holds: the binding is that pointer, not a frame region (no `_va`).
+                            packs_escape_tl: boolean <- term_aggregate_helpers@let_stack_agg_escapes_via_tuple(term)
+                                or (length_bytes(var@find_sp_binding(bound.outer_reg, "_dynagg")) > 0 and term_reg_spill@is_aggregate_make(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)));
                             vab_tl: string <- case packs_escape_tl of {
                                 true -> "";
                                 false -> case term_reg_spill@is_aggregate_make(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)) of {
@@ -133,90 +136,6 @@ fn emit_kind_let_toplevel(term: { nodes: List[{ kind: int64, type_name: string, 
                             body_asm_pre: string <- emit_child(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr),  dest, pools,  { bound_name: term_sir_helpers@sir_term_root_node(term).name, bound_reg: body_bound_tl, outer_reg: outer_for_body_tl, debug: bound.debug });
                             body_asm: string <- concat(spd_diag_tl, body_asm_pre);
                             tuple_sret_outer_tl: string <- var@find_sp_binding(outer_for_body_tl, "_tuple_sret");
-                            // Phase E e4b (mirror of base_stack_n above): record_make never writes into SRET, so its SUB SP must
-                            // always be balanced even when _tuple_sret is set on the outer (behavior reply path).
-                            base_stack_tl: int64 <- case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).kind == 6 and term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).name == "record_make" of {
-                                true -> term_aggregate_helpers@aggregate_callee_return_stack_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner));
-                                false -> case length_bytes(tuple_sret_outer_tl) > 0 of {
-                                    // The call emitter reserves a caller sret slab for every tuple-returning
-                                    // user call unless the enclosing function passes its own X8 through
-                                    // (`_callee_sret`); a behaviour's `_tuple_sret` reply buffer is not that,
-                                    // so the let must pop what the call pushed. Returning 0 here left the slab
-                                    // under the callee-saved restores: `(status, value) <- safe_divide(100, msg)`
-                                    // in a behaviour returned to a garbage LR (exit 70).
-                                    // See trials/supervisors_addition/tuple_unpack_in_behaviour.
-                                    true -> term_aggregate_helpers@let_user_call_tuple_sret_stack_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), bound.outer_reg, bound.bound_name);
-                                    false -> {
-                                        agg_tl: int64 <- term_aggregate_helpers@aggregate_callee_return_stack_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner));
-                                        case agg_tl > 0 of {
-                                            true -> agg_tl;
-                                            false -> term_aggregate_helpers@let_user_call_tuple_sret_stack_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), bound.outer_reg, bound.bound_name)
-                                        }
-                                    }
-                                }
-                            };
-                            // See packs_escape_b: keep RHS slab until let-end.
-                            base_stack_eff_tl: int64 <- case term_aggregate_helpers@let_suppress_base_stack_overlay_rec_flat(term, base_stack_tl) of {
-                                true -> term_aggregate_helpers@let_suppressed_base_stack_fixup(term);
-                                false -> base_stack_tl
-                            };
-                            // An aggregate built as the tail of a nested let chain (`x <- let a = .. in {..}`,
-                            // the shape call_supervisor lowers to) lives in a frame region that the next
-                            // aggregate make reuses. A direct aggregate RHS is promoted before its pointer
-                            // is bound; the nested-let RHS was not (the inner let promotes only into X0,
-                            // the return register), so get_reply pointed at a region which_reply then
-                            // overwrote. Move it to the heap here, at the binding, like the direct case.
-                            let_tail_agg_n: int64 <- case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).kind == 2 and rhs_reg != "X0" of {
-                                true -> term_aggregate_helpers@let_tail_aggregate_promote_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner));
-                                false -> 0
-                            };
-                            early_prom_tl: string <- case packs_escape_tl of {
-                                true -> term_aggregate_helpers@let_early_heap_promote_asm(rhs_bind_tl, term_aggregate_helpers@agg_promote_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)));
-                                false -> case let_tail_agg_n > 0 of {
-                                    true -> term_aggregate_helpers@let_early_heap_promote_asm(rhs_bind_tl, let_tail_agg_n);
-                                    false -> ""
-                                }
-                            };
-                            tail_stack_raw_tl: int64 <- term_aggregate_helpers@let_tail_aggregate_stack_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr));
-                            tail_stack_tl: int64 <- case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr)).kind == 2 of {
-                                true -> 0;
-                                false -> case length_bytes(tuple_sret_outer_tl) > 0 of {
-                                    true -> 0;
-                                    // See the matching comment on tail_stack_n: equal slab sizes are not one slab.
-                                    false -> tail_stack_raw_tl
-                                }
-                            };
-                            dealloc_bytes_tl: int64 <- base_stack_eff_tl + tail_stack_tl;
-                            dealloc: string <- case dealloc_bytes_tl > 0 of {
-                                true -> concat("    ADD SP, SP, #", concat(term_let_helpers@dec_str(dealloc_bytes_tl), "\n"));
-                                false -> ""
-                            };
-                            id_ret_tl: boolean <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr)).kind == 1 and term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr)).name == term_sir_helpers@sir_term_root_node(term).name and reg_conventions@is_aggregate_struct_or_tuple_return_type(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).type_name);
-                            tail_promote_tl: int64 <- case length_bytes(tuple_sret_outer_tl) > 0 of {
-                                true -> 0;
-                                false -> term_aggregate_helpers@let_tail_aggregate_promote_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr))
-                            };
-                            tail_ret_tl: boolean <- tail_promote_tl > 0;
-                            promote_nbytes_tl: int64 <- case tail_ret_tl of {
-                                true -> tail_promote_tl;
-                                false -> case id_ret_tl of {
-                                    true -> term_aggregate_helpers@aggregate_callee_return_promote_bytes(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner));
-                                    false -> 0
-                                }
-                            };
-                            promote_asm_tl: string <- case dest == "X0" and promote_nbytes_tl > 0 and (id_ret_tl or tail_ret_tl) and length_bytes(tuple_sret_outer_tl) == 0 and term_reg_spill@sret_on_spine(bound.outer_reg, term.root) == false of {
-                                true -> term_aggregate_helpers@aggregate_return_heap_promote_x0(promote_nbytes_tl);
-                                false -> ""
-                            };
-                            let_prefix_tl: string <- concat(concat(concat(concat(rhs_asm, "\n"), mov_spill_tl), save_base_tl), early_prom_tl);
-                            // Ownership-based release: a region created here that never
-                            // moves out (not returned, not passed to a call) is owned by
-                            // this scope and is destroyed at its end. Without this a
-                            // local region is never reclaimed -- see
-                            // trials/memory_region_addition/region_local_release.
-                            rgn_local_tl: string <- case term_reg_spill@let_owns_local_region(term) of {
-                                true -> term_reg_spill@emit_region_destroy_reg(rhs_bind_tl);
-                                false -> ""
-                            };
-                            concat(concat(concat(concat(concat(let_prefix_tl, body_asm), "\n"), promote_asm_tl), rgn_local_tl), dealloc)
+                            let_prefix_tl: string <- concat(concat(concat(rhs_asm, "\n"), mov_spill_tl), save_base_tl);
+                            concat(concat(let_prefix_tl, body_asm), "\n")
                         }

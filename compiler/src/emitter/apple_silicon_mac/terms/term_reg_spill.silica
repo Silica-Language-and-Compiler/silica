@@ -32,11 +32,10 @@ export spill_reg_chain_from_outer/1;
 export next_frame_spill_slot/1;
 export next_frame_region/2;
 export frame_region_for/2;
+export frame_region_bytes/1;
 export region_name_escapes/3;
 export body_has_moving_call/1;
-export let_owns_local_region/1;
 export body_kind_census/1;
-export emit_region_destroy_reg/1;
 export agg_subtree_bytes/2;
 export agg_offset_for/4;
 export agg_offset_table/1;
@@ -727,17 +726,6 @@ fn region_name_escapes(term: { nodes: List[{ kind: int64, type_name: string, val
     }
 }
 
-// Destroy a region held in `reg`, preserving X0/X1 (the scope's result) across it.
-fn emit_region_destroy_reg(reg: string) -> string {
-    case length_bytes(reg) == 0 of {
-        true -> "";
-        false -> case var@is_memory_ref(reg) of {
-            true -> concat("    STP X0, X1, [SP, #-16]!\n", concat(var@emit_ldr_mem_ref("X0", reg), "\n    BL _silica_rt_region_destroy\n    LDP X0, X1, [SP], #16\n"));
-            false -> concat("    STP X0, X1, [SP, #-16]!\n    MOV X0, ", concat(reg, "\n    BL _silica_rt_region_destroy\n    LDP X0, X1, [SP], #16\n"))
-        }
-    }
-}
-
 // True when this let binds a locally created region that never leaves the scope.
 // TEMPORARY diagnostic: which node kinds actually appear in this body.
 fn body_kind_census(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
@@ -814,73 +802,6 @@ fn region_used_outside_borrow(term: { nodes: List[{ kind: int64, type_name: stri
     }
 }
 
-fn let_owns_local_region(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
-    rhs: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner);
-    case term_sir_helpers@sir_term_root_node(rhs).name == "alloc_region" of {
-        false -> false;
-        // Conservative: destroy only when the scope contains NO user call. A call is
-        // the only way ownership moves on, and matching the handle to a specific
-        // argument proved unreliable -- move_one and consume both destroyed the same
-        // region, a double free (Trace/BPT trap). Missing a destroy leaks; emitting
-        // one twice corrupts, so this errs toward the leak.
-        // Destroy only when the handle is used EXCLUSIVELY as a borrow-prim argument
-        // (alloc_ref/alloc_buf/alloc_rec/read_*/write_*). Any other appearance may
-        // carry it out of the scope -- notably `{ region: r, ... }`, a record that is
-        // then returned. Checking only for moving CALLS missed that, so the region was
-        // freed while the returned tree still pointed into it (near-null tree.region
-        // in wbt_map_smart_node_finish_alloc).
-        true -> body_has_moving_call(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr)) == false
-                and region_used_outside_borrow(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr), term_sir_helpers@sir_term_root_node(term).name, false) == false
-    }
-}
-
-fn agg_child_is_make(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> boolean {
-    case idx < 0 of {
-        true -> false;
-        false -> {
-            c: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, idx));
-            c.kind == 6 and (c.name == "tuple_make" or c.name == "record_make")
-        }
-    }
-}
-
-// What survives a let into its body: only the RHS's RESULT aggregate. A make handed to a
-// callee needs no room reserved here -- emit_rest_args and emit_simple_gpr_stage_one copy
-// it into the region before the pointer leaves the frame, so the slab is dead once the
-// call is staged and the body may reuse it. That promotion is what makes reuse safe:
-// Silica moves rather than borrows, so without it a callee keeps a pointer into a frame
-// slot the next sibling then overwrites -- two adjacent `m <- insert(m, k, (v, s))` lets
-// shared one offset and the second value tuple replaced the first entry's.
-// See trials/standard_data_structures/wbt_core/wbt_map_insert_tuple_value,
-// wbt_delete_payload_shapes and wbt_map_tuple_value_escapes_frame.
-fn agg_persist_bytes_let(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, let_idx: int64) -> int64 {
-    case let_idx < 0 of {
-        true -> 0;
-        false -> {
-            ln: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, let_idx));
-            // Free at last use: if the binding is never read in the body, its region
-            // dies with the RHS and the body can reuse the space. A make handed to a
-            // callee no longer needs pinning here: emit_rest_args and
-            // emit_simple_gpr_stage_one copy it into the region before the pointer
-            // leaves the frame, so the slab is dead once the call is staged.
-            case agg_name_is_read(term_sir_helpers@sir_term_at(term, ln.right_expr), ln.name) of {
-                false -> 0;
-                true -> agg_persist_bytes(term, ln.inner)
-            }
-        }
-    }
-}
-
-fn agg_persist_bytes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> int64 {
-    case agg_child_is_make(term, idx) of {
-        true -> {
-            own: int64 <- term_aggregate_helpers@agg_shell_bytes(term_sir_helpers@sir_term_at(term, idx));
-            case own < 16 of { true -> 16; false -> (own + 15) / 16 * 16 }
-        };
-        false -> 0
-    }
-}
-
 // list_cons evaluates its tail first (the whole rest of the list, each element already copied into
 // its heap cell) and then the head, whose make emit_list_cons copies into the region before the
 // prepend. So the head's slab and the tail's slabs are never live together and may share one base:
@@ -936,20 +857,15 @@ fn agg_subtree_bytes(term: { nodes: List[{ kind: int64, type_name: string, value
             own: int64 <- term_aggregate_helpers@agg_shell_bytes(term_sir_helpers@sir_term_at(term, idx));
             a: int64 <- agg_subtree_bytes(term, n.inner);
             b: int64 <- agg_subtree_bytes(term, n.right_expr);
-            // Only case branches share: exactly one runs. Make ELEMENTS cannot --
-            // a nested aggregate whose pointer is stored into the parent shell stays
-            // live with the parent, and is not always heap-promoted first. Sharing
-            // there corrupted 16 trials (rec_call_field, tuple3_nested_destr, ...).
-            in_chain: boolean <- n.kind == 6 and (n.name == "tuple_make" or n.name == "record_make");
-            share: boolean <- n.kind == 7 or (in_chain and agg_child_is_make(term, n.inner)) or list_cons_head_shares(term, n, a);
+            // Chunk 15 phase 2: a make's value stays where it was built for the rest of the activation
+            // (the frame is adopted or evacuated by the caller; nothing copies it out any more), so
+            // regions are never reused within an activation. Only case branches share (exactly one
+            // runs), and a list_cons head whose make emit_list_cons copies into its boxed cell.
+            share: boolean <- n.kind == 7 or list_cons_head_shares(term, n, a);
             case share of {
                 true -> own + (case a > b of { true -> a; false -> b });
                 false -> case n.kind == 2 of {
-                    true -> {
-                        pb: int64 <- agg_persist_bytes_let(term, idx);
-                        tot: int64 <- pb + b;
-                        own + let_sret_home_bytes(term, idx) + (case a > tot of { true -> a; false -> tot })
-                    };
+                    true -> own + let_sret_home_bytes(term, idx) + a + b;
                     false -> own + a + b
                 }
             }
@@ -974,14 +890,11 @@ fn agg_offset_for(term: { nodes: List[{ kind: int64, type_name: string, value: s
                 case l >= 0 of {
                     true -> l;
                     false -> {
-                        in_chain_r: boolean <- n.kind == 6 and (n.name == "tuple_make" or n.name == "record_make");
-                        share_r: boolean <- n.kind == 7 or (in_chain_r and agg_child_is_make(term, n.inner)) or (n.kind == 6 and n.name == "list_cons" and list_cons_head_shares(term, n, agg_subtree_bytes(term, n.inner)));
+                        // Same sharing rule as agg_subtree_bytes: case arms and a boxed list head only.
+                        share_r: boolean <- n.kind == 7 or (n.kind == 6 and n.name == "list_cons" and list_cons_head_shares(term, n, agg_subtree_bytes(term, n.inner)));
                         rb: int64 <- case share_r of {
                             true -> cb;
-                            false -> case n.kind == 2 of {
-                                true -> cb + agg_persist_bytes_let(term, idx);
-                                false -> cb + agg_subtree_bytes(term, n.inner)
-                            }
+                            false -> cb + agg_subtree_bytes(term, n.inner)
                         };
                         agg_offset_for(term, n.right_expr, target, rb)
                     }
@@ -1014,28 +927,16 @@ fn agg_offsets_walk(term: { nodes: List[{ kind: int64, type_name: string, value:
             };
             count1: int64 <- case in_chain or home_b > 0 of { true -> count + 1; false -> count };
             (a: int64, acc2: string, count2: int64) <- agg_offsets_walk(term, n.inner, cb, acc1, count1);
-            share: boolean <- n.kind == 7 or (in_chain and agg_child_is_make(term, n.inner)) or list_cons_head_shares(term, n, a);
-            pb: int64 <- case share == false and n.kind == 2 of {
-                true -> agg_persist_bytes_let(term, idx);
-                false -> 0
-            };
+            // The sharing rule of agg_subtree_bytes (case arms and a boxed list head only).
+            share: boolean <- n.kind == 7 or list_cons_head_shares(term, n, a);
             rb: int64 <- case share of {
                 true -> cb;
-                false -> case n.kind == 2 of {
-                    true -> cb + pb;
-                    false -> cb + a
-                }
+                false -> cb + a
             };
             (b: int64, acc3: string, count3: int64) <- agg_offsets_walk(term, n.right_expr, rb, acc2, count2);
             sub: int64 <- case share of {
                 true -> own + (case a > b of { true -> a; false -> b });
-                false -> case n.kind == 2 of {
-                    true -> {
-                        tot: int64 <- pb + b;
-                        own + (case a > tot of { true -> a; false -> tot })
-                    };
-                    false -> own + a + b
-                }
+                false -> own + a + b
             };
             (sub, acc3, count3)
         }
@@ -1100,6 +1001,13 @@ fn aoff_lookup(tab: string, target: int64, arena_len: int64) -> int64 {
 // overwrote each other -- phase_a/phase_e supervisor faults. Node indices are
 // unique, so prefix-summing make sizes below this node gives every make a
 // distinct, non-overlapping region that still fits the agg_region_bytes total.
+// The bytes frame_region_for reserves for a make (its shell, rounded to 16, at least 16): the size of
+// the dynamic block a `_dynagg` make takes instead (term_emit_kind_compound_part1).
+fn frame_region_bytes(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
+    own: int64 <- term_aggregate_helpers@agg_shell_bytes(term);
+    case own < 16 of { true -> 16; false -> (own + 15) / 16 * 16 }
+}
+
 fn frame_region_for(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> string {
     // Regions own the shallow end of the frame spill area, [0 .. _aggb], indexed
     // by SIR node so siblings never alias. Spill slots start below _aggb, so the

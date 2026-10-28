@@ -46,6 +46,10 @@ export emit_buf_store/3;
 export module_uses_region_allocation/1;
 export module_uses_alloc_region/1;
 export emit_region_helpers/0;
+export emit_frame_helpers/0;
+export emit_evacuation_helper/0;
+export emit_stack_top_helper/0;
+export emit_ev_region_alloc/1;
 
 
 // Local SIRTerm arena helpers (sir_ast node accessors are not exported).
@@ -97,7 +101,7 @@ fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: stri
 }
 
 fn is_memory_prim(name: string) -> boolean {
-    name == "alloc_region" or name == "alloc_ref" or name == "alloc_rec" or name == "read_ref" or name == "write_ref" or name == "alloc_buf" or name == "buf_load" or name == "buf_store" or name == "read_buf" or name == "write_buf" or name == "fresh_lifetime" or name == "canonical_arena_lookup" or name == "canonical_arena_same" or name == "ref_eq" or name == "ref_in_region"
+    name == "alloc_region" or name == "alloc_ref" or name == "alloc_rec" or name == "read_ref" or name == "write_ref" or name == "alloc_buf" or name == "buf_load" or name == "buf_store" or name == "read_buf" or name == "write_buf" or name == "fresh_lifetime" or name == "canonical_arena_lookup" or name == "canonical_arena_same" or name == "ref_eq"
 }
 
 // ref_eq(a, b): X1 = ref A, X2 = ref B -> boolean in dest (pointer identity).
@@ -105,14 +109,6 @@ fn emit_ref_eq(dest: string) -> string {
     cmp_set: string <- x86_isa@x86_cmp_set("W5", "EQ", "X1", "X2");
     mov_dest: string <- x86_isa@x86_mov(dest, "X5");
     concat(cmp_set, mov_dest)
-}
-
-// ref_in_region(ref, region): X1 = ref cell, X2 = region base -> boolean in dest.
-// A region can span several blocks, so this asks the helper rather than comparing against one
-// pair of bounds: testing only [region+32, end) would call a ref false as soon as the region grew
-// past the block that ref came from.
-fn emit_ref_in_region(dest: string) -> string {
-    concat(x86_isa@x86_call("L_region_contains"), x86_isa@x86_mov(dest, "X5"))
 }
 
 // canonical_arena_lookup(key): X1 = int64 specialization key -> region base in dest.
@@ -208,6 +204,20 @@ fn memory_tuple_word_count(value: { nodes: List[{ kind: int64, type_name: string
 // alloc_ref(region, scalar): bump-allocate one cell in region, store value, return ref.
 // Operands: X1 = region base, X2 = value. Region [X1]=bump, [X1+8]=end.
 // Bounds check: if bump+8 > end, grow the region and allocate from the new block.
+// Chunk 15 phase 2 (design §3.2): an allocation into a region in a normal memory space is a frame
+// allocation (prims_memory L_dyn_alloc), the region handle a lifetime witness that is not read. An
+// atomic or device region keeps the shared block it has today (§2.7).
+fn alloc_in_frame(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    v: string <- sir_term_root_node(term).value;
+    memory_type_contains(v, "atomic") == false and memory_type_contains(v, "device") == false
+}
+
+// alloc_ref(r, scalar) in a frame: a 16-byte cell, the value (X2 = rdx) at +0 and +8 zero (the
+// evacuation's forwarding word, term_message_copy kind 2). X9 = r10 is prim scratch.
+fn emit_alloc_ref_scalar_frame(dest: string) -> string {
+    concat("    mov eax, 16\n    call L_dyn_alloc\n    mov QWORD PTR [rax], rdx\n    mov QWORD PTR [rax + 8], 0\n    mov r10, rax\n", x86_isa@x86_mov(dest, "X9"))
+}
+
 fn emit_alloc_ref_scalar(dest: string) -> string {
     mov_size: string <- x86_isa@x86_movi("X7", 8);
     mov_ref: string <- x86_isa@x86_mov("X4", "X3");
@@ -228,7 +238,10 @@ fn emit_alloc_ref_tuple(term: { nodes: List[{ kind: int64, type_name: string, va
 fn emit_alloc_ref(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     case memory_type_is_tuple(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name) of {
         true -> emit_alloc_ref_tuple(term, dest);
-        false -> emit_alloc_ref_scalar(dest)
+        false -> case alloc_in_frame(term) of {
+            true -> emit_alloc_ref_scalar_frame(dest);
+            false -> emit_alloc_ref_scalar(dest)
+        }
     }
 }
 
@@ -320,9 +333,20 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
     mov_dest: string <- x86_isa@x86_mov(dest, "X4");
     size_calc1: string <- concat(neg_check, mov_elem);
     size_calc: string <- concat(size_calc1, concat(mul_bytes, concat(mul_ov, with_len)));
-    check: string <- emit_region_bump_check(size_calc);
-    alloc: string <- concat(concat(mov_buf, store_len), mov_dest);
-    concat(check, alloc)
+    case alloc_in_frame(term) of {
+        // A frame buffer: X7 = r15 bytes (length word included) rounded to 16, the elements zeroed.
+        // X8 (rbx) and X9 (r10) are this prim's scratch, as on AArch64.
+        true -> {
+            frame_alloc: string <- "    lea rax, [r15 + 15]\n    and rax, -16\n    call L_dyn_alloc\n    mov r8, rax\n    mov QWORD PTR [r8], rdx\n    lea r8, [r8 + 8]\n";
+            zero: string <- "    lea rbx, [r15 - 8]\n    mov r10, r8\n1:\n    test rbx, rbx\n    jz 2f\n    mov QWORD PTR [r10], 0\n    lea r10, [r10 + 8]\n    lea rbx, [rbx - 8]\n    jmp 1b\n2:\n";
+            concat(size_calc, concat(frame_alloc, concat(zero, mov_dest)))
+        };
+        false -> {
+            check: string <- emit_region_bump_check(size_calc);
+            alloc: string <- concat(concat(mov_buf, store_len), mov_dest);
+            concat(check, alloc)
+        }
+    }
 }
 
 fn int64_to_str(n: int64) -> string {
@@ -458,7 +482,29 @@ fn emit_alloc_rec_copy_words(word_index: int64, word_count: int64) -> string {
 // read_ref retains the same one-load representation as alloc_ref. tuple_value
 // is a temporary stack slab and must never escape directly.
 fn emit_alloc_rec(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
-    tuple_count: int64 <- prims_tuple@count_type_elements(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name);
+    case alloc_in_frame(term) of {
+        true -> emit_alloc_rec_frame(term, dest);
+        false -> emit_alloc_rec_region(term, dest)
+    }
+}
+
+// alloc_rec in a frame: one block of 8 + payload bytes, rounded to 16; the cell word at +0 points at
+// the payload copy at +8 (the layout the copier and the evacuation read as kind 3). X2 = rdx is the
+// tuple, X4 = r8 the cell, X6 = r14 the payload, X7 = r15 the copy scratch.
+fn emit_alloc_rec_frame(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    // The words come from the value itself when it is a tuple literal (memory_tuple_word_count), as for
+    // write_ref: the literal's type spelling can name fewer elements than the make stores.
+    tuple_count: int64 <- memory_tuple_word_count(sir_term_at(term, sir_term_root_node(term).right_expr));
+    tuple_bytes: int64 <- prims_tuple@flat_alloc_size(tuple_count);
+    n16: int64 <- (tuple_bytes + 8 + 15) / 16 * 16;
+    alloc: string <- concat("    mov eax, ", concat(atom_table@int64_to_decimal_string(n16), "\n    call L_dyn_alloc\n    mov r8, rax\n    lea r14, [r8 + 8]\n    mov QWORD PTR [r8], r14\n"));
+    copy: string <- emit_alloc_rec_copy_words(0, tuple_bytes / 8);
+    concat(concat(alloc, copy), x86_isa@x86_mov(dest, "X4"))
+}
+
+fn emit_alloc_rec_region(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    // The words come from the value itself when it is a tuple literal (memory_tuple_word_count).
+    tuple_count: int64 <- memory_tuple_word_count(sir_term_at(term, sir_term_root_node(term).right_expr));
     tuple_bytes: int64 <- prims_tuple@flat_alloc_size(tuple_count);
     allocation_bytes: int64 <- tuple_bytes + 8;
     allocation_text: string <- atom_table@int64_to_decimal_string(allocation_bytes);
@@ -594,6 +640,88 @@ fn emit_region_contains_helper() -> string {
     "L_region_contains:\n    push r14\n    push r15\n    lea r14, [rdx + 32]\n    mov r15, QWORD PTR [rdx + 24]\n    cmp rsi, r14\n    jb 2f\n    cmp rsi, r15\n    jb 3f\n2:\n    mov r14, QWORD PTR [rdx + 16]\n1:\n    test r14, r14\n    jz 4f\n    lea r15, [r14 + 32]\n    cmp rsi, r15\n    jb 5f\n    mov r15, QWORD PTR [r14 + 24]\n    cmp rsi, r15\n    jb 3f\n5:\n    mov r14, QWORD PTR [r14 + 16]\n    jmp 1b\n3:\n    mov r9d, 1\n    pop r15\n    pop r14\n    ret\n4:\n    xor r9d, r9d\n    pop r15\n    pop r14\n    ret\n"
 }
 
+// Frame allocation and adoption (chunk15_stack_memory_design.md §3.1-§3.3, phase 2; layout in
+// design_documents/Phase2_notes.md §0). A frame's dynamic part lies between its fixed part and its
+// FLOOR ([rbp - 8], emitter_core@frame_floor_init_asm); the bytes from rsp up to the floor are
+// transient pushes (argument staging, operand parks), only ever addressed relative to rsp. The
+// helpers use only the x86 scratch set (rax, r12, r13, xmm8, xmm9): every VR home is kept.
+//
+// L_dyn_alloc(rax = bytes, a multiple of 16) -> rax = the block [floor - n, floor). The transient
+// area moves down by n (rsp and its contents together, so every rsp-relative address in it still names
+// the same word) and the floor goes down by n. The return address is popped first so it does not move
+// with the transient area. Called from emitted code only: rbp is the allocating frame.
+//
+// L_adopt, right after a user call that returned with rsp below the pre-call rsp ([rbp - 16]): the
+// callee's frame and dynamic part [rsp, pre-call rsp) become the bottom of this frame's dynamic part.
+// The transient area [pre-call rsp, floor) moves below them and the floor becomes the callee's rsp.
+fn emit_frame_helpers() -> string {
+    da: string <- "L_dyn_alloc:\n    pop r12\n    movq xmm8, r12\n    mov r13, QWORD PTR [rbp - 8]\n    neg rax\n    mov r12, rsp\n1:\n    cmp r12, r13\n    jae 2f\n    movq xmm9, QWORD PTR [r12]\n    movq QWORD PTR [r12 + rax], xmm9\n    lea r12, [r12 + 8]\n    jmp 1b\n2:\n    lea rsp, [rsp + rax]\n    lea r13, [r13 + rax]\n    mov QWORD PTR [rbp - 8], r13\n    mov rax, r13\n    movq r12, xmm8\n    jmp r12\n";
+    ad: string <- "L_adopt:\n    pop rax\n    mov r12, QWORD PTR [rbp - 16]\n    cmp rsp, r12\n    jb 1f\n    mov rsp, r12\n    jmp rax\n1:\n    movq xmm8, rax\n    mov r13, QWORD PTR [rbp - 8]\n    mov rax, rsp\n    mov QWORD PTR [rbp - 8], rax\n    sub rax, r13\n    add rax, r12\n    mov rsp, rax\n2:\n    cmp r12, r13\n    jae 3f\n    movq xmm9, QWORD PTR [r12]\n    movq QWORD PTR [rax], xmm9\n    lea r12, [r12 + 8]\n    lea rax, [rax + 8]\n    jmp 2b\n3:\n    movq rax, xmm8\n    jmp rax\n";
+    concat(concat(da, ad), emit_str_forget_helper())
+}
+
+// L_str_forget(r10 = X9 = the address of a string being created): the substring helper's caches are
+// keyed by a string's address, and a frame string can be created where an older, dead one lay, so a
+// key equal to r10 is cleared (the key words of silica_ss_cache, string_substring_mmap_nomte). Only rax
+// and the flags change.
+fn emit_str_forget_helper() -> string {
+    sf: string <- "L_str_forget:\n    lea rax, [rip + silica_ss_cache]\n    cmp QWORD PTR [rax], r10\n    jne 1f\n    mov QWORD PTR [rax], 0\n1:\n    cmp QWORD PTR [rax + 16], r10\n    jne 2f\n    mov QWORD PTR [rax + 16], 0\n2:\n    cmp QWORD PTR [rax + 48], r10\n    jne 3f\n    mov QWORD PTR [rax + 48], 0\n3:\n    ret\n";
+    concat(sf, "    .comm silica_ss_cache, 80, 16\n")
+}
+
+// The evacuation routine (chunk15_stack_memory_design.md §3.5, phase 2): the AArch64 routine of the
+// other emitters (see emitter/apple_silicon_mac prims_memory@emit_evacuation_helper for the algorithm)
+// translated to x86-64 by the chunk 15 translator (Phase2_notes.md, Appendix A and the x86 notes):
+// X0-X7 in the VR homes, X9-X12 in r10-r13, the routine's other registers in slots of its own frame,
+// internal calls through a link slot (a pushed return address would land in the scratch area the walk
+// grows below rsp).
+//
+// L_ev_frame(X0 = rdi value, X1 = rsi KIND, X2 = rdx AUX, X3 = rcx pre-call rsp, X4 = r8 caller floor)
+// -> rdi = the value, rsi = the new floor, rsp = the new rsp. L_ev_heap(rdi, rsi, rdx, rcx = upper bound)
+// -> rdi; L_ev_heap_shell leaves an aggregate root in place. Every register but rbp may change.
+fn emit_evacuation_helper() -> string {
+    ev0: string <- "L_ev_heap_shell:\n    mov r9, 1\n    mov r14, 1\n    jmp L_ev_common\nL_ev_heap:\n    mov r9, 1\n    mov r14, 0\n    jmp L_ev_common\nL_ev_frame:\n    mov r9, 0\n    mov r14, 0\nL_ev_common:\n    pop rax\n    sub rsp, 336\n    mov QWORD PTR [rsp], rbp\n    mov QWORD PTR [rsp + 8], rax\n    mov rbp, rsp\n    lea rax, [rbp + 336]\n    mov QWORD PTR [rbp + 240], rax\n    mov QWORD PTR [rbp + 248], rcx\n    mov QWORD PTR [rbp + 296], r8\n    mov QWORD PTR [rbp + 256], r8\n    mov QWORD PTR [rbp + 264], r9\n    mov QWORD PTR [rbp + 280], rsp\n    mov QWORD PTR [rbp + 144], rdi\n    mov QWORD PTR [rbp + 152], rsi\n    mov QWORD PTR [rbp + 160], rdx\n    test r14, r14\n    jnz Lev_root_shell\n    lea rax, [rip + Lev_rt_1]\n    mov QWORD PTR [rbp + 320], rax\n    jmp L_evw\nLev_rt_1:\n    mov QWORD PTR [rbp + 128], rdi\n    jmp Lev_root_done\nLev_root_shell:\n    mov QWORD PTR [rbp + 128], rdi\n    mov r10, QWORD PTR [rbp + 144]\n    mov rsi, QWORD PTR [rbp + 152]\n    mov rdx, QWORD PTR [rbp + 160]\n";
+    ev1: string <- "    cmp rdi, r10\n    jne Lev_root_done\n    mov r11, 65536\n    cmp r10, r11\n    jb Lev_root_done\n    cmp rsi, 5\n    jne Lev_root_agg\n    mov r11, QWORD PTR [r10]\n    mov r12, QWORD PTR [rdx]\n    not r12\n    lea r13, [rdx + 8]\nLev_root_sum:\n    test r12, r12\n    jz Lev_root_done\n    mov rbx, QWORD PTR [r13 + 0]\n    mov QWORD PTR [rbp + 200], rbx\n    mov rbx, QWORD PTR [r13 + 8]\n    mov QWORD PTR [rbp + 208], rbx\n    lea r13, [r13 + 16]\n    lea r12, [r12 - 1]\n    mov rax, QWORD PTR [rbp + 200]\n    cmp rax, r11\n    jne Lev_root_sum\n    mov rsi, 4\n    mov rax, QWORD PTR [rbp + 208]\n    mov rdx, rax\nLev_root_agg:\n    cmp rsi, 4\n    jne Lev_root_done\n    mov rdi, r10\n    mov rsi, rdx\n    lea rax, [rip + Lev_rt_2]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lev_words\nLev_rt_2:\nLev_root_done:\n    mov rax, QWORD PTR [rbp + 280]\n    mov QWORD PTR [rbp + 272], rax\nLev_scan:\n    mov r10, rsp\n";
+    ev2: string <- "    mov rax, QWORD PTR [rbp + 272]\n    cmp rax, r10\n    jbe Lev_scan_done\n    mov rax, QWORD PTR [rbp + 272]\n    mov r11, QWORD PTR [rax - 48]\n    mov r12, QWORD PTR [rax - 40]\n    mov rax, QWORD PTR [rbp + 272]\n    mov r13, QWORD PTR [rax - 32]\n    mov rbx, QWORD PTR [rax - 24]\n    mov QWORD PTR [rbp + 200], rbx\n    mov rax, QWORD PTR [rbp + 272]\n    mov rbx, QWORD PTR [rax - 16]\n    mov QWORD PTR [rbp + 208], rbx\n    mov rbx, QWORD PTR [rax - 8]\n    mov QWORD PTR [rbp + 216], rbx\n    mov rax, QWORD PTR [rbp + 272]\n    lea rax, [rax - 48]\n    mov QWORD PTR [rbp + 224], rax\n    mov rax, QWORD PTR [rbp + 224]\n    sub rax, QWORD PTR [rbp + 216]\n    mov QWORD PTR [rbp + 224], rax\n    mov rax, QWORD PTR [rbp + 216]\n    cmp rax, 0\n    mov rax, r12\n    cmovne rax, QWORD PTR [rbp + 224]\n    mov QWORD PTR [rbp + 224], rax\n    mov rax, QWORD PTR [rbp + 272]\n    lea rax, [rax - 48]\n    mov QWORD PTR [rbp + 272], rax\n    mov rax, QWORD PTR [rbp + 272]\n    sub rax, QWORD PTR [rbp + 216]\n    mov QWORD PTR [rbp + 272], rax\n    cmp r13, 4\n    je Lev_s_agg\n    cmp r13, 3\n    je Lev_s_reftup\n    cmp r13, 2\n    je Lev_s_ref1\n    cmp r13, 7\n    je Lev_s_handle\n";
+    ev3: string <- "    cmp r13, 17\n    je Lev_s_chunk\n    jmp Lev_scan\nLev_s_agg:\n    mov rax, QWORD PTR [rbp + 224]\n    mov rdi, rax\n    mov rax, QWORD PTR [rbp + 200]\n    mov rsi, rax\n    lea rax, [rip + Lev_rt_3]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lev_words\nLev_rt_3:\n    jmp Lev_scan\nLev_s_reftup:\n    mov rax, QWORD PTR [rbp + 224]\n    lea rdi, [rax + 8]\n    mov rax, QWORD PTR [rbp + 200]\n    mov rsi, rax\n    lea rax, [rip + Lev_rt_4]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lev_words\nLev_rt_4:\n    jmp Lev_scan\nLev_s_ref1:\n    mov rax, QWORD PTR [rbp + 224]\n    mov rdi, rax\n    mov rax, QWORD PTR [rbp + 200]\n    mov rsi, rax\n    lea rax, [rip + Lev_rt_5]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lev_words\nLev_rt_5:\n    jmp Lev_scan\nLev_s_handle:\n    mov rbx, QWORD PTR [rbp + 224]\n    mov QWORD PTR [rbp + 144], rbx\n    mov rax, QWORD PTR [rbp + 224]\n    mov rdi, QWORD PTR [rax + 8]\n    mov rsi, 17\n    mov rax, QWORD PTR [rbp + 200]\n";
+    ev4: string <- "    mov rdx, rax\n    lea rax, [rip + Lev_rt_6]\n    mov QWORD PTR [rbp + 320], rax\n    jmp L_evw\nLev_rt_6:\n    mov rbx, QWORD PTR [rbp + 144]\n    mov QWORD PTR [rbp + 224], rbx\n    mov rax, QWORD PTR [rbp + 224]\n    mov QWORD PTR [rax + 8], rdi\n    jmp Lev_scan\nLev_s_chunk:\n    mov rbx, QWORD PTR [rbp + 224]\n    mov QWORD PTR [rbp + 144], rbx\n    mov rbx, QWORD PTR [rbp + 200]\n    mov QWORD PTR [rbp + 152], rbx\n    mov rax, QWORD PTR [rbp + 200]\n    mov r10, QWORD PTR [rax + 8]\n    mov r11, 16\n    cmp r10, r11\n    cmova r11, r10\n    mov QWORD PTR [rbp + 168], r11\n    mov rax, QWORD PTR [rbp + 224]\n    lea r12, [rax + r11]\n    mov r13, QWORD PTR [r12 + 8]\n    mov QWORD PTR [rbp + 160], r13\n    mov rax, QWORD PTR [rbp + 200]\n    mov rsi, QWORD PTR [rax + 16]\n    mov rdx, QWORD PTR [rax + 24]\n    cmp rsi, 0\n    je Lev_sc_next\n    cmp rsi, 1\n    je Lev_sc_next\n    cmp rsi, 9\n    je Lev_sc_next\nLev_sc_loop:\n    mov r10, QWORD PTR [rbp + 160]\n    mov r11, QWORD PTR [rbp + 168]\n    cmp r10, r11\n    jae Lev_sc_next\n    mov rbx, QWORD PTR [rbp + 152]\n";
+    ev5: string <- "    mov QWORD PTR [rbp + 200], rbx\n    mov rax, QWORD PTR [rbp + 200]\n    mov r12, QWORD PTR [rax + 8]\n    lea r13, [r10 + r12]\n    mov QWORD PTR [rbp + 160], r13\n    mov QWORD PTR [rbp + 176], r10\n    mov rbx, QWORD PTR [rbp + 144]\n    mov QWORD PTR [rbp + 224], rbx\n    mov rax, QWORD PTR [rbp + 200]\n    mov rsi, QWORD PTR [rax + 16]\n    mov rdx, QWORD PTR [rax + 24]\n    cmp r12, 8\n    ja Lev_sc_inline\n    mov rax, QWORD PTR [rbp + 224]\n    mov rdi, QWORD PTR [rax + r10]\n    lea rax, [rip + Lev_rt_7]\n    mov QWORD PTR [rbp + 320], rax\n    jmp L_evw\nLev_rt_7:\n    mov rbx, QWORD PTR [rbp + 144]\n    mov QWORD PTR [rbp + 224], rbx\n    mov r10, QWORD PTR [rbp + 176]\n    mov rax, QWORD PTR [rbp + 224]\n    mov QWORD PTR [rax + r10], rdi\n    jmp Lev_sc_loop\nLev_sc_inline:\n    cmp rsi, 4\n    jne Lev_sc_loop\n    mov rax, QWORD PTR [rbp + 224]\n    lea rdi, [rax + r10]\n    mov rsi, rdx\n    lea rax, [rip + Lev_rt_8]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lev_words\nLev_rt_8:\n    jmp Lev_sc_loop\nLev_sc_next:\n    mov rbx, QWORD PTR [rbp + 144]\n    mov QWORD PTR [rbp + 224], rbx\n    mov r11, QWORD PTR [rbp + 168]\n";
+    ev6: string <- "    mov rax, QWORD PTR [rbp + 224]\n    mov rdi, QWORD PTR [rax + r11]\n    mov rsi, 17\n    mov rdx, QWORD PTR [rbp + 152]\n    lea rax, [rip + Lev_rt_9]\n    mov QWORD PTR [rbp + 320], rax\n    jmp L_evw\nLev_rt_9:\n    mov rbx, QWORD PTR [rbp + 144]\n    mov QWORD PTR [rbp + 224], rbx\n    mov r11, QWORD PTR [rbp + 168]\n    mov rax, QWORD PTR [rbp + 224]\n    mov QWORD PTR [rax + r11], rdi\n    jmp Lev_scan\nLev_scan_done:\n    mov rdi, QWORD PTR [rbp + 128]\n    cmp QWORD PTR [rbp + 264], 0\n    jnz Lev_heap_done\n    mov rax, QWORD PTR [rbp + 296]\n    mov r10, rax\n    sub r10, QWORD PTR [rbp + 256]\n    mov rax, QWORD PTR [rbp + 248]\n    mov r11, rax\n    mov rax, QWORD PTR [rbp + 296]\n    mov r12, rax\n    mov rax, QWORD PTR [rbp + 280]\n    mov r13, rax\n    mov QWORD PTR [rbp + 200], rsp\n    mov rax, r11\n    sub rax, r10\n    mov QWORD PTR [rbp + 208], rax\n    cmp r13, QWORD PTR [rbp + 208]\n    jbe Lev_f_noshift\n    mov rax, r13\n    sub rax, QWORD PTR [rbp + 208]\n    mov QWORD PTR [rbp + 216], rax\n    mov rax, QWORD PTR [rbp + 216]\n    lea rax, [rax + 15]\n    mov QWORD PTR [rbp + 216], rax\n    mov rax, QWORD PTR [rbp + 216]\n";
+    ev7: string <- "    and rax, -16\n    mov QWORD PTR [rbp + 216], rax\n    mov rax, QWORD PTR [rbp + 200]\n    sub rax, QWORD PTR [rbp + 216]\n    mov QWORD PTR [rbp + 224], rax\n    mov rax, QWORD PTR [rbp + 224]\n    mov rsp, rax\n    mov rax, QWORD PTR [rbp + 200]\n    mov QWORD PTR [rbp + 232], rax\nLev_f_shift:\n    mov rax, QWORD PTR [rbp + 232]\n    cmp rax, r13\n    jae Lev_f_shifted\n    mov rax, QWORD PTR [rbp + 232]\n    mov rbx, QWORD PTR [rax]\n    mov QWORD PTR [rbp + 192], rbx\n    mov rax, QWORD PTR [rbp + 232]\n    lea rax, [rax + 8]\n    mov QWORD PTR [rbp + 232], rax\n    mov rbx, QWORD PTR [rbp + 192]\n    mov rax, QWORD PTR [rbp + 224]\n    mov QWORD PTR [rax], rbx\n    mov rax, QWORD PTR [rbp + 224]\n    lea rax, [rax + 8]\n    mov QWORD PTR [rbp + 224], rax\n    jmp Lev_f_shift\nLev_f_shifted:\n    sub r13, QWORD PTR [rbp + 216]\n    mov rax, QWORD PTR [rbp + 200]\n    sub rax, QWORD PTR [rbp + 216]\n    mov QWORD PTR [rbp + 200], rax\nLev_f_noshift:\n    mov rcx, QWORD PTR [rbp + 200]\n    mov r8, QWORD PTR [rbp + 208]\n    mov rbx, QWORD PTR [rbp + 8]\n    mov rbp, QWORD PTR [rbp]\n    mov r9, r11\n    mov r14, r8\nLev_f_tmove:\n    cmp r9, r12\n";
+    ev8: string <- "    jae Lev_f_tmoved\n    mov rax, QWORD PTR [r9]\n    mov QWORD PTR [r14], rax\n    lea r9, [r9 + 8]\n    lea r14, [r14 + 8]\n    jmp Lev_f_tmove\nLev_f_tmoved:\n    mov r9, r13\nLev_f_body:\n    cmp r9, rcx\n    jbe Lev_f_done\n    mov rdx, QWORD PTR [r9 - 40]\n    mov rsi, QWORD PTR [r9 - 16]\n    mov r15, QWORD PTR [r9 - 8]\n    lea r9, [r9 - 48]\n    sub r9, r15\n    add rsi, 7\n    and rsi, -8\n    xor eax, eax\nLev_f_copy:\n    cmp rax, rsi\n    jae Lev_f_body\n    mov r15, QWORD PTR [r9 + rax]\n    mov QWORD PTR [rdx + rax], r15\n    lea rax, [rax + 8]\n    jmp Lev_f_copy\nLev_f_done:\n    mov rsp, r8\n    mov rsi, r12\n    sub rsi, r10\n    jmp rbx\nLev_heap_done:\n    mov rax, QWORD PTR [rbp + 280]\n    mov QWORD PTR [rbp + 272], rax\nLev_hr_loop:\n    mov r10, rsp\n    mov rax, QWORD PTR [rbp + 272]\n    cmp rax, r10\n    jbe Lev_hr_done\n    mov rax, QWORD PTR [rbp + 272]\n";
+    ev9: string <- "    mov r11, QWORD PTR [rax - 48]\n    mov r12, QWORD PTR [rax - 40]\n    mov rax, QWORD PTR [rbp + 272]\n    mov r13, QWORD PTR [rax - 32]\n    mov rbx, QWORD PTR [rax - 24]\n    mov QWORD PTR [rbp + 200], rbx\n    mov rax, QWORD PTR [rbp + 272]\n    mov rbx, QWORD PTR [rax - 8]\n    mov QWORD PTR [rbp + 216], rbx\n    mov rax, QWORD PTR [rbp + 272]\n    lea rax, [rax - 48]\n    mov QWORD PTR [rbp + 272], rax\n    mov rax, QWORD PTR [rbp + 272]\n    sub rax, QWORD PTR [rbp + 216]\n    mov QWORD PTR [rbp + 272], rax\n    cmp r11, r12\n    je Lev_hr_loop\n    cmp r13, 3\n    je Lev_hr_reftup\n    cmp r13, 2\n    je Lev_hr_ref1\n    cmp r13, 17\n    je Lev_hr_chunk\n    cmp r13, 6\n    je Lev_hr_w0\n    cmp r13, 7\n    je Lev_hr_w0\n    cmp r13, 8\n    je Lev_hr_w0\n    jmp Lev_hr_loop\nLev_hr_w0:\n    mov r10, QWORD PTR [r12]\n    mov QWORD PTR [r11], r10\n    jmp Lev_hr_loop\nLev_hr_reftup:\n    lea r10, [r11 + 8]\n    mov QWORD PTR [r11], r10\n    jmp Lev_hr_loop\nLev_hr_ref1:\n    mov QWORD PTR [r11 + 8], 0\n";
+    ev10: string <- "    jmp Lev_hr_loop\nLev_hr_chunk:\n    mov rax, QWORD PTR [rbp + 200]\n    mov r10, QWORD PTR [rax + 8]\n    mov QWORD PTR [rbp + 208], 16\n    cmp r10, QWORD PTR [rbp + 208]\n    mov rax, QWORD PTR [rbp + 208]\n    cmova rax, r10\n    mov QWORD PTR [rbp + 208], rax\n    mov rax, QWORD PTR [rbp + 208]\n    lea rax, [rax + 8]\n    mov QWORD PTR [rbp + 208], rax\n    mov rbx, QWORD PTR [rbp + 208]\n    mov r10, QWORD PTR [r12 + rbx]\n    mov rbx, QWORD PTR [rbp + 208]\n    mov QWORD PTR [r11 + rbx], r10\n    jmp Lev_hr_loop\nLev_hr_done:\n    mov rax, QWORD PTR [rbp + 8]\n    mov rbx, rbp\n    mov rbp, QWORD PTR [rbx]\n    lea rsp, [rbx + 336]\n    jmp rax\nLev_words:\n    mov rbx, QWORD PTR [rbp + 320]\n    mov QWORD PTR [rbp + 136], rbx\n    mov QWORD PTR [rbp + 96], rdi\n    mov QWORD PTR [rbp + 104], rsi\n    mov r10, QWORD PTR [rsi]\n    mov QWORD PTR [rbp + 120], r10\n    mov QWORD PTR [rbp + 112], 0\nLev_w_loop:\n    mov r10, QWORD PTR [rbp + 112]\n    mov r11, QWORD PTR [rbp + 120]\n    cmp r10, r11\n    jae Lev_w_done\n    mov r12, QWORD PTR [rbp + 104]\n    lea r12, [r12 + 16]\n    mov rbx, r10\n    shl rbx, 4\n";
+    ev11: string <- "    lea r12, [r12 + rbx]\n    mov rsi, QWORD PTR [r12 + 0]\n    mov rdx, QWORD PTR [r12 + 8]\n    lea r13, [r10 + 1]\n    mov QWORD PTR [rbp + 112], r13\n    cmp rsi, 0\n    je Lev_w_loop\n    cmp rsi, 1\n    je Lev_w_loop\n    cmp rsi, 9\n    je Lev_w_loop\n    mov r13, QWORD PTR [rbp + 96]\n    mov rdi, QWORD PTR [r13 + r10*8]\n    lea rax, [rip + Lev_rt_10]\n    mov QWORD PTR [rbp + 320], rax\n    jmp L_evw\nLev_rt_10:\n    mov r13, QWORD PTR [rbp + 96]\n    mov r10, QWORD PTR [rbp + 112]\n    lea r10, [r10 - 1]\n    mov r11, QWORD PTR [r13 + r10*8]\n    cmp r11, rdi\n    je Lev_w_loop\n    mov QWORD PTR [r13 + r10*8], rdi\n    jmp Lev_w_loop\nLev_w_done:\n    mov rbx, QWORD PTR [rbp + 136]\n    mov QWORD PTR [rbp + 320], rbx\n    jmp QWORD PTR [rbp + 320]\nL_evw:\n    mov rax, QWORD PTR [rbp + 320]\n    mov QWORD PTR [rbp + 312], rax\n    cmp rsi, 0\n    je Lw_ret\n    cmp rsi, 1\n    je Lw_ret\n    cmp rsi, 9\n    je Lw_ret\n    mov r10, 65536\n    cmp rdi, r10\n";
+    ev12: string <- "    jb Lw_ret\n    cmp rdi, QWORD PTR [rbp + 240]\n    jb Lw_old\n    cmp rdi, QWORD PTR [rbp + 248]\n    jae Lw_old\n    cmp rsi, 5\n    jne Lw_kind\n    mov r10, QWORD PTR [rdi]\n    mov r11, QWORD PTR [rdx]\n    not r11\n    lea r12, [rdx + 8]\nLw_sum:\n    test r11, r11\n    jz Lw_ret\n    mov r13, QWORD PTR [r12 + 0]\n    mov rbx, QWORD PTR [r12 + 8]\n    mov QWORD PTR [rbp + 200], rbx\n    lea r12, [r12 + 16]\n    lea r11, [r11 - 1]\n    cmp r13, r10\n    jne Lw_sum\n    mov rsi, 4\n    mov rax, QWORD PTR [rbp + 200]\n    mov rdx, rax\nLw_kind:\n    cmp rsi, 4\n    je Lw_agg\n    cmp rsi, 3\n    je Lw_reftup\n    cmp rsi, 2\n    je Lw_ref1\n    cmp rsi, 6\n    je Lw_buf\n    cmp rsi, 7\n    je Lw_handle\n    cmp rsi, 17\n    je Lw_chunk\n    cmp rsi, 8\n    je Lw_string\nLw_ret:\n";
+    ev13: string <- "    jmp QWORD PTR [rbp + 312]\nLw_old:\n    mov r10, rsp\n    cmp rdi, r10\n    jb Lw_old_ok\n    cmp rdi, QWORD PTR [rbp + 240]\n    jb Lw_ret\nLw_old_ok:\n    cmp rsi, 4\n    je Lw_old_agg\n    cmp rsi, 5\n    jne Lw_ret\n    mov r10, QWORD PTR [rdi]\n    mov r11, QWORD PTR [rdx]\n    not r11\n    lea r12, [rdx + 8]\nLw_old_sum:\n    test r11, r11\n    jz Lw_ret\n    mov r13, QWORD PTR [r12 + 0]\n    mov rbx, QWORD PTR [r12 + 8]\n    mov QWORD PTR [rbp + 200], rbx\n    lea r12, [r12 + 16]\n    lea r11, [r11 - 1]\n    cmp r13, r10\n    jne Lw_old_sum\n    mov rax, QWORD PTR [rbp + 200]\n    mov rdx, rax\nLw_old_agg:\n    mov rax, QWORD PTR [rbp + 280]\n    mov r11, rax\nLw_old_seen:\n    mov r10, rsp\n    cmp r11, r10\n    jbe Lw_old_new\n    mov r12, QWORD PTR [r11 - 16]\n    mov r13, QWORD PTR [r11 - 8]\n    mov rbx, QWORD PTR [r11 - 48]\n    mov QWORD PTR [rbp + 200], rbx\n    lea r11, [r11 - 48]\n";
+    ev14: string <- "    sub r11, r13\n    test r13, r13\n    jnz Lw_old_seen\n    test r12, r12\n    jnz Lw_old_seen\n    mov rax, QWORD PTR [rbp + 200]\n    cmp rax, rdi\n    jne Lw_old_seen\n    jmp QWORD PTR [rbp + 312]\nLw_old_new:\n    lea rsp, [rsp - 48]\n    mov r12, rsp\n    mov QWORD PTR [r12 + 0], rdi\n    mov QWORD PTR [r12 + 8], rdi\n    mov r10, 4\n    mov QWORD PTR [r12 + 16], r10\n    mov QWORD PTR [r12 + 24], rdx\n    mov QWORD PTR [r12 + 32], 0\n    mov QWORD PTR [r12 + 40], 0\n    jmp QWORD PTR [rbp + 312]\nLw_fwd:\n    mov rdi, r10\n    btr rdi, 63\n    jmp QWORD PTR [rbp + 312]\nLw_agg:\n    mov rcx, QWORD PTR [rdx]\n    shl rcx, 3\n    lea rax, [rip + Lev_rt_11]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lw_copy\nLev_rt_11:\n    mov rdi, r9\n    jmp QWORD PTR [rbp + 312]\nLw_reftup:\n    mov r10, QWORD PTR [rdi]\n    test r10, r10\n    js Lw_fwd\n    mov rcx, QWORD PTR [rdx]\n    shl rcx, 3\n    lea rcx, [rcx + 8]\n";
+    ev15: string <- "    lea rax, [rip + Lev_rt_12]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lw_copy\nLev_rt_12:\n    lea r10, [r9 + 8]\n    mov QWORD PTR [r14], r10\n    mov r10, r9\n    bts r10, 63\n    mov QWORD PTR [rdi], r10\n    mov rdi, r9\n    jmp QWORD PTR [rbp + 312]\nLw_ref1:\n    mov r10, QWORD PTR [rdi + 8]\n    test r10, r10\n    js Lw_fwd\n    mov rcx, 16\n    lea rax, [rip + Lev_rt_13]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lw_copy\nLev_rt_13:\n    mov QWORD PTR [r14 + 8], 0\n    mov r10, r9\n    bts r10, 63\n    mov QWORD PTR [rdi + 8], r10\n    mov rdi, r9\n    jmp QWORD PTR [rbp + 312]\nLw_buf:\n    mov r10, QWORD PTR [rdi - 8]\n    test r10, r10\n    jns Lw_buf_copy\n    btr r10, 63\n    lea rdi, [r10 + 8]\n    jmp QWORD PTR [rbp + 312]\nLw_buf_copy:\n    mov rcx, r10\n    imul rcx, rdx\n    lea rcx, [rcx + 15]\n    and rcx, -8\n    lea rdi, [rdi - 8]\n    lea rax, [rip + Lev_rt_14]\n";
+    ev16: string <- "    mov QWORD PTR [rbp + 320], rax\n    jmp Lw_copy\nLev_rt_14:\n    mov r10, r9\n    bts r10, 63\n    mov QWORD PTR [rdi], r10\n    lea rdi, [r9 + 8]\n    jmp QWORD PTR [rbp + 312]\nLw_handle:\n    mov r10, QWORD PTR [rdi]\n    test r10, r10\n    js Lw_fwd\n    mov rcx, 24\n    lea rax, [rip + Lev_rt_15]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lw_copy\nLev_rt_15:\n    mov r10, r9\n    bts r10, 63\n    mov QWORD PTR [rdi], r10\n    mov rdi, r9\n    jmp QWORD PTR [rbp + 312]\nLw_chunk:\n    mov r10, QWORD PTR [rdx + 8]\n    mov r11, 16\n    cmp r10, r11\n    cmova r11, r10\n    lea r12, [rdi + r11]\n    mov r10, QWORD PTR [r12 + 8]\n    test r10, r10\n    js Lw_fwd\n    lea rcx, [r11 + 16]\n    lea rax, [rip + Lev_rt_16]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lw_copy\nLev_rt_16:\n    mov r10, QWORD PTR [rdx + 8]\n    mov r11, 16\n    cmp r10, r11\n    cmova r11, r10\n";
+    ev17: string <- "    lea r12, [rdi + r11]\n    mov r10, r9\n    bts r10, 63\n    mov QWORD PTR [r12 + 8], r10\n    mov rdi, r9\n    jmp QWORD PTR [rbp + 312]\nLw_string:\n    mov r10, QWORD PTR [rdi]\n    cmp r10, -1\n    je Lw_str_copy\n    test r10, r10\n    jns Lw_ret\n    cmp r10, -2\n    je Lw_ret\n    jmp Lw_fwd\nLw_str_copy:\n    mov rcx, QWORD PTR [rdi + 16]\n    lea rcx, [rcx + 25]\n    lea rax, [rip + Lev_rt_17]\n    mov QWORD PTR [rbp + 320], rax\n    jmp Lw_copy\nLev_rt_17:\n    mov r10, QWORD PTR [rdi + 8]\n    lea r11, [rdi + 24]\n    cmp r10, r11\n    je Lw_str_fix\n    mov r12, QWORD PTR [rdi + 16]\n    lea r12, [r12 + 1]\n    lea r13, [r14 + 24]\nLw_str_bytes:\n    test r12, r12\n    jz Lw_str_fix\n    movzx ebx, BYTE PTR [r10]\n    mov QWORD PTR [rbp + 200], rbx\n    lea r10, [r10 + 1]\n    mov rbx, QWORD PTR [rbp + 200]\n    mov BYTE PTR [r13], bl\n    lea r13, [r13 + 1]\n    lea r12, [r12 - 1]\n    jmp Lw_str_bytes\n";
+    ev18: string <- "Lw_str_fix:\n    mov r10, r9\n    call L_str_forget\n    lea r10, [r9 + 24]\n    mov QWORD PTR [r14 + 8], r10\n    mov r10, r9\n    bts r10, 63\n    mov QWORD PTR [rdi], r10\n    mov rdi, r9\n    jmp QWORD PTR [rbp + 312]\nLw_copy:\n    mov rax, QWORD PTR [rbp + 320]\n    mov QWORD PTR [rbp + 304], rax\n    lea r15, [rcx + 7]\n    and r15, -8\n    cmp QWORD PTR [rbp + 264], 0\n    jnz Lw_copy_heap\n    lea rax, [rcx + 15]\n    mov QWORD PTR [rbp + 192], rax\n    mov rax, QWORD PTR [rbp + 192]\n    and rax, -16\n    mov QWORD PTR [rbp + 192], rax\n    mov rax, QWORD PTR [rbp + 256]\n    sub rax, QWORD PTR [rbp + 192]\n    mov QWORD PTR [rbp + 256], rax\n    mov rax, QWORD PTR [rbp + 256]\n    mov r9, rax\n    mov rax, QWORD PTR [rbp + 192]\n    lea r10, [rax + 48]\n    mov r11, rsp\n    sub r11, r10\n    mov rsp, r11\n    mov r14, r11\n    mov rbx, QWORD PTR [rbp + 192]\n    lea r12, [r11 + rbx]\n    mov QWORD PTR [r12 + 0], rdi\n    mov QWORD PTR [r12 + 8], r9\n    mov QWORD PTR [r12 + 16], rsi\n    mov QWORD PTR [r12 + 24], rdx\n    mov QWORD PTR [r12 + 32], rcx\n";
+    ev19: string <- "    mov rbx, QWORD PTR [rbp + 192]\n    mov QWORD PTR [r12 + 40], rbx\n    jmp Lw_copy_bytes\nLw_copy_heap:\n    lea rsp, [rsp - 48]\n    mov QWORD PTR [rsp + 0], rdi\n    mov QWORD PTR [rsp + 8], rsi\n    mov QWORD PTR [rsp + 16], rdx\n    mov QWORD PTR [rsp + 24], rcx\n    mov QWORD PTR [rsp + 32], r15\n    mov rdi, r15\n    call L_ev_region_alloc\n    mov r9, rdi\n    mov r15, QWORD PTR [rsp + 32]\n    mov rdx, QWORD PTR [rsp + 16]\n    mov rcx, QWORD PTR [rsp + 24]\n    mov rdi, QWORD PTR [rsp + 0]\n    mov rsi, QWORD PTR [rsp + 8]\n    lea rsp, [rsp + 48]\n    mov r14, r9\n    lea rsp, [rsp - 48]\n    mov r12, rsp\n    mov QWORD PTR [r12 + 0], rdi\n    mov QWORD PTR [r12 + 8], r9\n    mov QWORD PTR [r12 + 16], rsi\n    mov QWORD PTR [r12 + 24], rdx\n    mov QWORD PTR [r12 + 32], rcx\n    mov QWORD PTR [r12 + 40], 0\nLw_copy_bytes:\n    mov r13, 0\nLw_copy_loop:\n    cmp r13, r15\n    jae Lw_copy_done\n    mov rbx, QWORD PTR [rdi + r13]\n    mov QWORD PTR [rbp + 200], rbx\n    mov rbx, QWORD PTR [rbp + 200]\n    mov QWORD PTR [r14 + r13], rbx\n    lea r13, [r13 + 8]\n    jmp Lw_copy_loop\nLw_copy_done:\n";
+    ev20: string <- "    jmp QWORD PTR [rbp + 304]\n";
+    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(ev0, ev1), ev2), ev3), ev4), ev5), ev6), ev7), ev8), ev9), ev10), ev11), ev12), ev13), ev14), ev15), ev16), ev17), ev18), ev19), ev20)
+}
+
+// L_ev_heap's allocator: the actor runtime's silica_rt_region_alloc (rdi = bytes -> rdi = block) where
+// the module uses actors; elsewhere the label exists so the evacuation routine assembles, and is never
+// reached.
+fn emit_ev_region_alloc(with_runtime: boolean) -> string {
+    case with_runtime of {
+        true -> "L_ev_region_alloc:\n    jmp silica_rt_region_alloc\n";
+        false -> "L_ev_region_alloc:\n    ud2\n"
+    }
+}
+
+// L_stack_top -> rdi = the top of the stack this code runs on: the current actor's reservation (ACB
+// +272 base, +280 bytes), or the thread's own stack through glibc (main, a dangerous actor's thread,
+// an actor that has no reservation). Everything a send, a spawn or a reply may hand to another actor
+// that lies in [rsp, top) is frame memory and is copied out first (phase 2 interim, phases 3/4).
+fn emit_stack_top_helper() -> string {
+    "L_stack_top:\n    push rbp\n    mov rbp, rsp\n    sub rsp, 96\n    call silica_rt_tls_current_actor_get\n    test rdi, rdi\n    jz 1f\n    mov rax, QWORD PTR [rdi + 272]\n    test rax, rax\n    jz 1f\n    add rax, QWORD PTR [rdi + 280]\n    mov rdi, rax\n    jmp 2f\n1:\n    call pthread_self\n    mov rdi, rax\n    mov rsi, rsp\n    call pthread_getattr_np\n    mov rdi, rsp\n    lea rsi, [rsp + 64]\n    lea rdx, [rsp + 72]\n    call pthread_attr_getstack\n    mov rax, QWORD PTR [rsp + 64]\n    add rax, QWORD PTR [rsp + 72]\n    mov QWORD PTR [rsp + 80], rax\n    mov rdi, rsp\n    call pthread_attr_destroy\n    mov rdi, QWORD PTR [rsp + 80]\n2:\n    leave\n    ret\n"
+}
+
 // The three failure labels end the current actor with (:explicit, :region_alloc_failed / :buf_invalid /
 // :buf_bounds) and abort the process (71) in main (design region_memory_safety_design.md H5 and Q9 (a),
 // runtime entries in prims_actors_stack_asm); the access or allocation was never performed.
@@ -604,7 +732,11 @@ fn emit_region_helpers() -> string {
 
 fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     case sir_term_root_node(term).name of {
-        "alloc_region" -> emit_alloc_region(dest);
+        "alloc_region" -> case alloc_in_frame(term) of {
+            // The lifetime witness (design §3.2): the allocating frame's X29, never dereferenced.
+            true -> x86_isa@x86_mov(dest, "X29");
+            false -> emit_alloc_region(dest)
+        };
         "alloc_ref" -> emit_alloc_ref(term, dest);
         "alloc_rec" -> emit_alloc_rec(term, dest);
         "read_ref" -> emit_read_ref(dest);
@@ -618,7 +750,6 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "canonical_arena_lookup" -> emit_canonical_arena_lookup(dest);
         "canonical_arena_same" -> emit_canonical_arena_same(dest);
         "ref_eq" -> emit_ref_eq(dest);
-        "ref_in_region" -> emit_ref_in_region(dest);
         _: string -> concat(concat(".error \"unsupported memory prim: ", concat(sir_term_root_node(term).name, "\"\n")), "")
     }
 }

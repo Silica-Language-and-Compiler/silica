@@ -32,7 +32,7 @@ all: clean silica.config
 	@cd "$(THIS_DIR)" && \
 	rm -f *.sams *.iface silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link __silica_runtime.sams lib/*.sams && \
 	echo "Compiling with silica-compiler..." && \
-	if ! { $(RUN_SILICA_COMPILER); }; then \
+	if ! { $(RUN_SILICA_COMPILER_ISOLATING); }; then \
 		echo "❌❌ $(MSG_PREFIX)compilation failed"; \
 		$(INTEGRATE_DOT_FAIL); \
 		exit 1; \
@@ -50,6 +50,7 @@ integrate-run:
 		sams="$$base.sams"; \
 		if [ ! -f "$$sams" ]; then \
 			echo "❌❌ $(MSG_PREFIX)$$base: missing $$sams"; \
+			$(INTEGRATE_REJECT_DETAIL); \
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1; \
 			continue; \
@@ -77,7 +78,7 @@ integrate-run:
 		if ! $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler "$$sams" -o "$$base.o"; then \
 		echo "❌❌ $(MSG_PREFIX)$$base assemble failed"; \
 		$(INTEGRATE_DOT_FAIL); \
-		ko=$$((ko + 1)); failed=1; break; \
+		bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 	fi; \
 	done; \
 	if [ -f "__silica_runtime.sams" ]; then \
@@ -96,7 +97,7 @@ integrate-run:
 		if ! $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler "$$sams" -o "$$obj"; then \
 		echo "❌❌ $(MSG_PREFIX)$$obj assemble failed"; \
 		$(INTEGRATE_DOT_FAIL); \
-		ko=$$((ko + 1)); failed=1; break; \
+		ko=$$((ko + 1)); failed=1; \
 	fi; \
 	done; \
 	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^lib/'); do \
@@ -115,22 +116,23 @@ integrate-run:
 						if ! $(RUST_LLD) -flavor darwin -o "$$base" "$$base.o" $$lib_objs $$runtime_obj $(LDFLAGS_rust-lld); then \
 				echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
 				$(INTEGRATE_DOT_FAIL); \
-				ko=$$((ko + 1)); failed=1; \
+				bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 			fi; \
 		else \
 			if ! $(ASSEMBLER) "$$base.o" $$lib_objs $$runtime_obj -o "$$base" $(LDFLAGS_clang); then \
 			echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
 		fi; \
 		fi; \
 	done; \
 	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^lib/'); do \
 		base=$${line%.silica}; \
 		if [ ! -x "$$base" ]; then \
+			case "$$bf" in *" $$base "*) echo "$(MSG_PREFIX)$$base not run: assemble/link failed (reported above)";; *) \
 			echo "❌❌ $(MSG_PREFIX)$$base missing executable (assemble/link failed earlier)"; \
 			$(INTEGRATE_DOT_FAIL); \
-			ko=$$((ko + 1)); failed=1; \
+			ko=$$((ko + 1)); failed=1;; esac; \
 	elif [ -x "$$base" ]; then \
 			$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,./$$base); \
 			if [ "$$integrate_killed" = 1 ]; then \
@@ -165,7 +167,7 @@ clean:
 	rm -f *.sout lib/*.sams lib/*.o *.iface *.sams __silica_runtime.o && \
 	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^lib/'); do \
 		base=$${line%.silica}; \
-		rm -f "$$base" "$$base.o"; \
+		$(call TRIAL_RM_UNTRACKED,"$$base"); rm -f "$$base.o"; \
 	done && \
 	rm -f silica.config .integrate_counts silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link && \
 	echo "✅ $(MSG_PREFIX)Clean complete"
