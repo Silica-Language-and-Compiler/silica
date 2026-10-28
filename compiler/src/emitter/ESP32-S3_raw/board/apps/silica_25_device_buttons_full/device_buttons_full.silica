@@ -1,0 +1,146 @@
+// ESP32-S3 port app 25: the Silica twin of asm_03_buttons. All seven buttons (Left 21, Right 10,
+// Down 47, Up 11, Point 0, A 34, B 33) get the pad pull-up through the GPIO device worker
+// (device_lib/device_esp32s3_gpio); their idle levels are printed first, "<button> <level>" one per
+// line, then for 30 s (3000 rounds, 10 ms apart) one "<button> <level>" line per change, and the LED
+// (GPIO6) is lit while any button differs from where it started. Then "done" and status 0.
+// The output after the idle lines depends on what is pressed during the 30 s: there is no fixed
+// expected console (no expected.scout); an untouched board prints the 7 idle lines and "done".
+// The polling loop runs inside the worker (:watch_all, as :watch does for app 20): one pass per round
+// reads GPIO_IN and GPIO_IN1, and the worker casts a uint32 to the printer only at the start (the
+// 7-bit idle mask, bit i = button i in the order above) and when the mask changes; after the 3000
+// rounds it turns the LED off and casts 128. The printer keeps the last mask (plus 256 once it has
+// seen one) as its state, prints all 7 lines for the first mask, the changed bits for later ones, and
+// "done" and cast_exit(0) for 128.
+use device_esp32s3_gpio;
+use Supervisor;
+
+fn button_name(i: uint32) -> string {
+    case i of {
+        0 -> "Left";
+        1 -> "Right";
+        2 -> "Down";
+        3 -> "Up";
+        4 -> "Point";
+        5 -> "A";
+        _: uint32 -> "B"
+    }
+}
+
+// Buttons i..6: "<button> <level>" for each whose bit in m differs from s (all of them when s is 0,
+// the first mask).
+fn print_from(i: uint32, m: uint32, s: uint32) -> atom {
+    sequence proc[device_io]
+        one: uint32 <- 1;
+        level: uint32 <- (m shr i) band one;
+        before: uint32 <- (s shr i) band one;
+        _: atom <- case s == 0 or before != level of {
+            true -> {
+                _: atom <- print_string(button_name(i));
+                _: atom <- print_string(" ");
+                _: atom <- print_uint32(level);
+                println("")
+            };
+            false -> :ok
+        };
+        r: atom <- case i == 6 of { true -> :ok; false -> print_from(i + 1, m, s) }
+    produces
+        pure r
+    end
+}
+
+fn printer(m: uint32, s: uint32) -> (:no_reply, uint32) {
+    sequence proc[concurrency, device_io]
+        _: atom <- case m == 128 of {
+            true -> println("done");
+            false -> print_from(0, m, s)
+        };
+        _: boolean <- case m == 128 of { true -> cast_exit(0); false -> true }
+    produces
+        pure (:no_reply, m + 256)
+    end
+}
+
+impl AppSupervisor for Supervisor;
+
+fn app_worker(msg: atom, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        p: actor_ref <- spawn(0, printer, stack_policy(0, :keep_last_message));
+        w: device_actor_ref <- spawn_device(:unmapped, device_esp32s3_gpio@gpio_worker, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_device(w, { op: :init, pin: 0, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :output, pin: 6, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :input_pullup, pin: 21, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :input_pullup, pin: 10, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :input_pullup, pin: 47, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :input_pullup, pin: 11, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :input_pullup, pin: 0, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :input_pullup, pin: 34, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :input_pullup, pin: 33, level: 0, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :hold, pin: 0, level: 2, reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :watch_all, pin: 0, level: 0, reply_to: p } impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 1 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :app_worker, agent_type: :worker, initial_state: initial_state, behavior: app_worker, restart: :transient, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_registered(:app_worker, (:start) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

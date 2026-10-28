@@ -17,15 +17,15 @@ The board is the BYU-I eBadge v4.0 (ESP32-S3-MINI-1-N4R2). Four Silica device ap
 (`silica_16_device_uart`, `silica_17_device_gpio`, `silica_18_device_display`, `silica_19_device_led_hold`);
 three more exist (`silica_20_device_buttons_led`, `silica_21_device_led_row`, `silica_22_device_buzzer`).
 
-**Implementation status (2026-10-16).** Items A to C are in the tree; D to R are not started, and no item
-beyond the ones named here has code.
+**Implementation status (2026-10-28).** Items A to C are in the tree; D is done on the board except two open
+points; E to R are not started, and no item beyond the ones named here has code.
 
 | Item | Status | Where it lives |
 | --- | --- | --- |
 | A | Display on SPI2: `silica_18_device_display` redraws the `asm_13_display_hello` picture through the SPI2 peripheral | `board/apps/device_lib/device_esp32s3_spi2.silica`, `device_st7789.silica`; SPI2 values in `board/pack/board_pack_spi2_values.silica`. The SPI2 base is still marked TRM-unconfirmed in `board_pack.silica` (`window_base_verified`); the board result of the app is not recorded in `board/README.md` beyond its expected output |
 | B | Done: the generator reads Espressif's register headers and writes per-peripheral value and description modules with access modes (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT). Not done for the other chip windows (RTC_CNTL, TIMG0/1, SYSTIMER, USB-Serial-JTAG, I2C0, SPI3, GDMA, USB OTG): the generator covers the seven peripherals above only. Whether spec §4.9.1 gained the "every register" sentence was not checked (no hit for the wording in `silica_device_actor_specification.md`) | `board/tools/gen_board_pack.py` (`--check` diffs it against the tree), `board/pack/` |
 | C | Done: buzzer on LEDC timer 0 (`silica_22_device_buzzer`: 440, 880, 2730 Hz); 24 WS2813B LEDs from RMT channel 0 (`silica_21_device_led_row`, matched its `expected.scout` on the board 2026-10-15). RMT channel RAM is written one `poke` per word; `poke_n` was not needed so far | `device_lib/device_esp32s3_ledc.silica`, `device_buzzer.silica`, `device_esp32s3_rmt.silica`, `device_ws2813b.silica` |
-| D | Partly: the GPIO worker carries `silica_17`, `silica_19` and `silica_20_device_buttons_led`; the per-app twins of `asm_01` to `asm_03`, `asm_08` to `asm_10` and the coverage check of the native apps are not recorded as done | `device_lib/device_esp32s3_gpio.silica` |
+| D | Done on the board 2026-10-28 except two open points (the Point button's change was not observed; the `silica_24` colours were not visually recorded). The GPIO worker carries `silica_17`, `silica_19` and `silica_20_device_buttons_led` and the twins `silica_23_device_blink` (`asm_01`), `silica_24_device_rgb` (`asm_02`), `silica_25_device_buttons_full` (`asm_03`, all seven buttons), `silica_26_device_gpio_diag` (`asm_08`), `silica_27_device_pin_readback` (`asm_09`) and `silica_28_device_pin_hunt` (`asm_10`; 440 Hz square on pins 2, 3, 7, 8, 9, 12 to 18, 45, 46 for about 4 s, run inside the worker by the `:square` op over the `out_w1ts`/`out_w1tc` and `out1_w1ts`/`out1_w1tc` masks). The worker gained the ops `:input_buffer`, `:peek`, `:route_oen`, `:square`, `:watch_all` and the pins 8, 9, 12 to 18, 33, 34 (exact list in the driver's header comment). Coverage check of the native apps: see "Coverage of the native apps" in section 3; gaps filled with `silica_29_recursion_wide` and `silica_30_heap_list`. Board results (`run_app.sh`, RAM load, ESP32-S3 rev v0.2 on /dev/cu.usbserial-310, compiler `silica-999973`): `silica_23` matched `expected.scout` twice and LED1 was seen blinking 10 times; `silica_24` console matched, visual not recorded; `silica_25` see below; `silica_26` ran clean with consistent register values (IO_MUX_GPIO6 0x1800 to 0x1A00 with FUN_IE; IO_MUX_GPIO21 0x1300, pull-up and IE; GPIO_ENABLE and GPIO_OUT bit 6 follow the writes; GPIO_IN bit 6 follows only with the input buffer on, 0xfc000041; FUNC6_OUT_SEL_CFG 0x100 to 0x500) and LED1 was confirmed; `silica_27` printed `pin N: 1 0` for 1, 2, 4, 5, 6, 7, 48 (every pad driven); `silica_28` matched `expected.scout` twice and was confirmed by the observer; `silica_29` matched. `silica_30`: the first version (sum by `[h, t]` pattern walk) aborted "heap exhausted" after printing 2000; it now sums by index with `list_at` (tail-recursive) and matched. `silica_25`: the first version aborted "[silica] abort: heap exhausted" after about 8 s (about 357 B retained per 10 ms round); the 30 s poll now runs inside the worker as `:watch_all` (one peek of GPIO_IN and one of GPIO_IN1 per round; casts the 7-bit button mask on start and on each change, 128 for done; LED1 lit while the mask differs from idle). The second run completed 30 s, printed `done`, status 0; idle levels Left/Right/Down/Up/A/B 0 and Point 1 (six buttons active high, Point/BOOT active low); Left, Right, Up, Down, B and A each logged press and release and LED1 was seen lit while each was held. Point never logged a change in either run (whether it was pressed is not established): open. See "Known issue: board emitter heap" in section 6 and "Environment notes" below it | `device_lib/device_esp32s3_gpio.silica`, `board/apps/silica_23_device_blink` to `silica_30_heap_list` |
 | E to R | Not started | none |
 
 The board pack's own window table now has 12 windows (`window_count()` in `emitter/ESP32-S3_raw/board_pack.silica`):
@@ -72,7 +72,28 @@ Agreed order, steps 1 to 4. Reference apps are under `src/emitter/ESP32-S3_raw/b
 | 3 | `asm_04_buzzer` | new, LEDC | Hardware PWM sets frequency and duty; no software square wave |
 | 3 | `asm_11_addressable_leds` | new, RMT | RMT generates the WS2813B waveform (24 LEDs) from a RAM table; bit-banging cannot meet the nanosecond timing from Silica |
 | 4 | `asm_01_blink`, `asm_02_rgb`, `asm_03_buttons`, `asm_08_gpio_diag`, `asm_09_pin_readback`, `asm_10_pin_hunt` | on the GPIO device worker (extends `silica_17_device_gpio`) | Port reads and writes through the worker's described registers (set/clear/enable-style registers), no per-pin helper loops |
-| 4 | `asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault` | coverage check against `silica_00` to `silica_15` (and `silica_16` to `silica_19`); write whatever is missing | Native Silica already; the work is finding gaps |
+| 4 | `asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault` | coverage check against `silica_00` to `silica_15` (and `silica_16` to `silica_19`); write whatever is missing (done 2026-10-28, see below) | Native Silica already; the work is finding gaps |
+
+### Coverage of the native apps (item D, 2026-10-28)
+
+Only four native apps exist under `board/apps/` (`asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault`), not five; every other `asm_*` app is GPIO, display, LEDC or RMT. Each behaviour of the four and the Silica app that covers it:
+
+| asm app | Behaviour | Covering Silica app(s) |
+| --- | --- | --- |
+| asm_00_hello | UART0 text output ("hello from silica ...") | silica_04_print (prints "hello from silica", then int64 values) |
+| asm_00_hello | main's int64 result becomes the exit status (42) | silica_00_return42 (status 42) |
+| asm_00_hello | text and a non-zero int64 status in one run | silica_04 (text) with silica_00 (status); silica_15 shows output followed by an int64 result. No single app prints and returns 42; judged covered by the two halves |
+| asm_05_recursion | 1000-deep recursion forcing window overflow and underflow | silica_07_recursion_depth (2000 deep), silica_29_recursion_wide (1000 deep) |
+| asm_05_recursion | int64 add with carry into the high word | silica_05_int64_wide (no recursion), silica_29_recursion_wide (1000 x 4294967295 through recursion; new) |
+| asm_05_recursion | values survive across deep calls (sentinels a2..a7) | silica_29_recursion_wide (six bound values checked after both deep calls; new). Register sentinels as such are not expressible: Silica has no register access, the closest is bound values |
+| asm_06_heap | 2000 allocations, linked list of nodes, walk and sum | silica_09_lists (100 elements), silica_30_heap_list (2000 elements, length, sum, end elements; new) |
+| asm_06_heap | blocks are zeroed and 8-byte aligned | not expressible: Silica has no raw allocation or pointer reads; closest silica_11_regions (alloc_ref/alloc_buf read back, region growth) |
+| asm_06_heap | heap usage figure ("heap used 64000") | not expressible: no Silica builtin exposes the runtime heap counter; closest silica_30_heap_list (2000 nodes must fit) |
+| asm_07_fault | load from address 0 gives the fatal fault report and status 70 | not expressible as a load: peek/poke only accept a map_device window (a base outside a window is the runtime abort "illegal device map", status 71, not a fault), and plain Silica has no pointers. Closest: silica_08_stack_guard (fatal fault report "[silica] fault at <PTR>", status 70) |
+| asm_07_fault | output before the fault is flushed ahead of the report | silica_08 prints nothing first; silica_15_list_index_abort prints "9" before its abort report (status 71, abort path, not fault) |
+| asm_07_fault | board-only details after the exit marker (exccause=28 LoadProhibited, EXCVADDR) | not expressible, board-only text (stderr); only asm_07 reaches exccause 28 |
+
+Gaps filled: `silica_29_recursion_wide` (1000-deep recursion, int64 wide sum, values bound across deep calls) and `silica_30_heap_list` (2000-element list built, walked and summed). Not expressible in Silica: register sentinels, block zeroing and alignment, the heap-usage figure, and a load from address 0 (`peek` and `poke` reach only `map_device` windows; a bad base is the "illegal device map" abort, status 71). The closest covered behaviours are named in the table. Both new apps' expected output matches the macOS host run, and both matched on the board 2026-10-28.
 
 **Step 2 detail.** Generate the full register map with access modes into `board_pack`. The compiler reads
 board-pack descriptions (spec §4.9.1), and the hand-written `device_lib` descriptions
@@ -264,7 +285,7 @@ Items A to D are the agreed steps 1 to 4, in that order. Prerequisites sit where
 | A | Step 1: display fill before DISPON; display on SPI2's 64-byte buffer | SPI2 base confirmed against the TRM; SPI2 registers in the pack | SPI2, GPIO, IO_MUX, SYSTEM (clock gate), SYSTIMER |
 | B | Step 2: register-map generator from Espressif headers; generated pack checked in with access modes; compiler reads the pack; `device_lib` duplicates removed; spec §4.9.1 sentence | A (so the SPI2 rows are confirmed before generation replaces them) | all chip windows, via the generator |
 | C | Step 3: buzzer on LEDC; 24 WS2813B LEDs on RMT (channel RAM written one `poke` per word; decide `poke_n` here if the cost shows) | B | LEDC, RMT, SYSTEM, GPIO, IO_MUX |
-| D | Step 4: GPIO apps on the GPIO worker; coverage check of the five native apps against `silica_00` to `silica_19`, filling gaps | B | GPIO, IO_MUX, RTC_CNTL, TIMG0/1, SYSTIMER |
+| D | Step 4: GPIO apps on the GPIO worker; coverage check of the four native apps against `silica_00` to `silica_19`, filling gaps | B | GPIO, IO_MUX, RTC_CNTL, TIMG0/1, SYSTIMER |
 | E | `poke_n` spec addition and implementation, only if C or a later driver needs it | spec decision first (§2) | none |
 | F | USB-Serial-JTAG second-console worker | B | USB-Serial-JTAG (full register set) |
 | G | I2C0 controller worker; accelerometer readings; minibadge I2C; GPIO worker for minibadge lines | B; minibadge pin question (§6) settled | I2C0, GPIO, IO_MUX |
@@ -303,6 +324,49 @@ Items A to D are the agreed steps 1 to 4, in that order. Prerequisites sit where
   that allows.
 - SLIP or PPP for the first link (PPP adds negotiation and authentication; SLIP is smaller).
 
+### Known issue: board emitter heap (recorded 2026-10-28)
+
+On the board emitter, before chunk 15 phase 9 (`chunk15_stack_memory_design.md` §9.1, §11.1; phase 2 changed only the hosted emitters):
+
+- (a) Tuple results of functions that a caller destructures (the GPIO driver's `read_level`/`serve` returning `(g, level)`/`(g1, m)`) are heap-promoted (24 B each) and never freed, so a device worker leaks per message.
+- (b) Each `[h, t]` list match allocates a 32-byte tail handle (`silica_rt_list_tail`) that is never freed, and dead list handles from prepend are not freed either.
+
+Long-running workers and long list walks therefore exhaust the heap ("[silica] abort: heap exhausted"). Fix: chunk 15 phase 9 (large, planned). Workarounds used in item D: the `:watch_all` and `:square` loops run inside the worker; `silica_30` sums by index. The reproducers below were derived from code reading and have not been run.
+
+Reproducer 1, tuple results (board today prints 1000 then 24000; after the fix 1000 then 0):
+
+```
+fn pair(a: int64, b: int64) -> (int64, int64) {
+    (a + 1, b)
+}
+fn spin(n: int64, acc: int64) -> int64 {
+    case n == 0 of {
+        true -> acc;
+        false -> {
+            (x, y) <- pair(acc, n);
+            spin(n - 1, x + y - n)
+        }
+    }
+}
+fn main() -> atom {
+    sequence proc[mem(normal), device_io]
+        h0: int64 <- heap_used();
+        r: int64 <- spin(1000, 0);
+        h1: int64 <- heap_used();
+        p1: atom <- print_int64(r);
+        println();
+        p2: atom <- print_int64(h1 - h0);
+        println()
+    produces pure :ok end
+}
+```
+
+Reproducer 2, list tails: `silica_30`'s original `count_down` and pattern-matching `sum_list` (`[h: int64, t: List[int64, mem(normal)]] -> h + sum_list(t)`) over `count_down(100, none)`, printing the sum and `heap_used()` before and after the sum. Board today: 5050 and 3168 (99 x 32); after the fix: 5050 and 0.
+
+### Environment notes (2026-10-28)
+
+`binaries/silica-compiler-ESP32-S3_raw` currently points (uncommitted) at `silica-999970`, which hangs compiling GPIO-worker apps (`silica_17` did not finish in 300 s); the item D runs used `silica-999973`. `build_image.sh` defaults to xtensa `esp-16.1.0_20260609` and the idf6.2 `esptool`, which are not installed on this machine; the runs used `XTENSA_BIN=esp-15.2.0_20251204` and `ESPTOOL`/`BOARD_PYTHON` from `idf6.1_py3.14_env`.
+
 ## 7. Gate
 
 | Item | Passing on the board |
@@ -310,7 +374,7 @@ Items A to D are the agreed steps 1 to 4, in that order. Prerequisites sit where
 | A | First visible frame is black; full-screen fill visibly fast (seconds, against about 26 s for the bit-banged app) |
 | B | Generated pack validates under spec §4.9.1's rules (unique names, widths, alignment, no overlap, access modes, registers inside windows); no `device_lib` description duplicates a pack device |
 | C | Buzzer at a set frequency (measured, after RV1 is turned up); the 24 LEDs show commanded colours |
-| D | Each GPIO app behaves as its asm twin; coverage list for the five native apps recorded, gaps filled |
+| D | Each GPIO app behaves as its asm twin (met 2026-10-28 on the board, except the open points: Point button change not observed, `silica_24` colours not visually recorded); coverage list for the four native apps recorded (section 3), gaps filled (`silica_29`, `silica_30`) |
 | F | A second console works on USB-Serial-JTAG alongside UART0 |
 | G | Accelerometer readings change when the board tilts; I2C ACK and timeout paths exercised |
 | I | An SD block written and read back |
