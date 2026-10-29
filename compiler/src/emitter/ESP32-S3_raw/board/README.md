@@ -42,7 +42,7 @@ netlist; the supplied pin sheet has the RGB red pin wrong (1 instead of 2).
 | `tools/gen_board_pack.py` | Generates `pack/board_pack_<peripheral>_values.silica`, `pack/device_esp32s3_<peripheral>_registers.silica` and `pack/board_pack_gpio_signals.silica` from the ESP-IDF register headers (default IDF tree `/Volumes/2T/silica-esp-idf`); `--check` regenerates into a temporary directory and diffs against the tree |
 | `pack/` | The generated per-peripheral register and value modules (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT) the device drivers use; do not edit by hand |
 | `apps/device_lib/` | Device-worker drivers written in Silica (GPIO, UART, SPI2/ST7789 display, LEDC/buzzer, RMT/WS2813B LED row) |
-| `apps/silica_*` | Silica sample apps, each with the `expected.scout` from the macOS compiler (except `silica_20_device_buttons_led`, which depends on button presses) |
+| `apps/silica_*` | Silica sample apps, each with the `expected.scout` from the macOS compiler, except `silica_20`, `silica_25` and `silica_26`, `silica_27` (hardware-dependent output: button presses, register dumps, pad levels). Device apps (`silica_16` on) cannot run on the host (E2220: `poke` cannot be compiled for apple_silicon_mac), so the `expected.scout` of `silica_23`, `silica_24` and `silica_28` is written from the source |
 | `apps/asm_*` | Bring-up apps in hand-written Xtensa assembly (runtime and board checks, no compiler involved) |
 | `tests/xt_helpers_selftest/` | 408-case hardware self-test of the emitter's Xtensa instruction helpers (`shared/xt_*.silica`) |
 
@@ -388,6 +388,14 @@ record for the language features.
 | `silica_20_device_buttons_led` | LED1 lit while a direction button is pressed, for about 60 s | interactive (no `expected.scout`): `watching buttons`, `done`, then waits for `exit` |
 | `silica_21_device_led_row` | The 24 WS2813B LEDs (GPIO7) driven from RMT channel 0: white, off, a chase, red, green, blue, off | ✓ 2026-10-15 with `run_app.sh`: matches `expected.scout` |
 | `silica_22_device_buzzer` | The buzzer (GPIO48) from LEDC timer 0: 440, 880, 2730 Hz | expected `440`, `880`, `2730`, `done`, status 0 |
+| `silica_23_device_blink` | Twin of `asm_01_blink`: LED1 (GPIO6) blinks ten times, 250 ms on and off, through the GPIO worker | expected `blink 1` to `blink 10`, `done`, status 0 (`expected.scout` written from the source); ✓ 2026-10-28 with `run_app.sh`: matched twice, LED1 seen blinking 10 times
+| `silica_24_device_rgb` | Twin of `asm_02_rgb`: the RGB LED (GPIO2, 4, 5) shows red, green, blue, white, off, 1 s each | expected `red`, `green`, `blue`, `white`, `off`, status 0 (`expected.scout` written from the source); ✓ 2026-10-28: console matched, visual not recorded
+| `silica_25_device_buttons_full` | Twin of `asm_03_buttons`: all seven buttons for 30 s, LED1 lit while the button mask differs from its idle value; the poll runs inside the GPIO worker (`:watch_all`: one peek of GPIO_IN and one of GPIO_IN1 per 10 ms round, the 7-bit mask cast on start and on each change, 128 for done); prints idle levels, changes, `done` | hardware-dependent (no `expected.scout`); ✓ 2026-10-28: 30 s completed, status 0; idle Left/Right/Down/Up/A/B 0, Point 1; Left, Right, Up, Down, B, A each logged press and release with LED1 lit; Point's change was not observed (open). The first version, polling by messages, aborted `heap exhausted` after about 8 s (see "Known issue: board emitter heap") |
+| `silica_26_device_gpio_diag` | Twin of `asm_08_gpio_diag`: raw register dumps (IO_MUX, FUNC6_OUT_SEL_CFG, GPIO_PIN6, GPIO_ENABLE, GPIO_OUT, GPIO_IN) at six points, with `:peek` | hardware-dependent (no `expected.scout`); ✓ 2026-10-28: ran clean, register values consistent with the writes (IO_MUX_GPIO6 0x1800 to 0x1A00 with FUN_IE; GPIO_IN 0xfc000041; FUNC6_OUT_SEL_CFG 0x100 to 0x500), LED1 confirmed
+| `silica_27_device_pin_readback` | Twin of `asm_09_pin_readback`: pins 1, 2, 4, 5, 6, 7, 48 driven 1 then 0 and read back; `pin N: <level> <level>` | hardware-dependent (no `expected.scout`); ✓ 2026-10-28: `pin N: 1 0` for all seven pins
+| `silica_28_device_pin_hunt` | Twin of `asm_10_pin_hunt`: 440 Hz square on pins 2, 3, 7, 8, 9, 12 to 18, 45, 46 for about 4 s, run in the worker by `:square` | expected `square wave on`, `done`, status 0 (from the source); ✓ 2026-10-28: matched twice, observer confirmed
+| `silica_29_recursion_wide` | Native coverage: 1000-deep recursion, int64 wide sum, values bound across deep calls (`asm_05_recursion`) | `expected.scout` matches the macOS host run; ✓ 2026-10-28: matched on the board
+| `silica_30_heap_list` | Native coverage: 2000-element list built, walked and summed (`asm_06_heap`) | `expected.scout` matches the macOS host run; ✓ 2026-10-28: matched on the board (sums by index with `list_at`; the `[h, t]` pattern walk exhausted the heap)
 
 Every `silica_*` app is compiled by the ESP32-S3_raw emitter and compared byte for byte with the
 `expected.scout` the macOS compiler produced for the same source (`tools/host_reference.sh <app dir>`
@@ -396,7 +404,8 @@ line is compared with its addresses folded (`tools/compare_sout.sh`, see "Proces
 An app that needs other modules (the stdlib, the board pack, the drivers) lists them in its
 `extra_sources.txt`, one path per line relative to `compiler/`, in dependency order; the host
 script, `run_app.sh` and a hand-made board build compile those files first, in one `silica.config`
-with the app. A device app's device worker is `spawn_device`d with the driver's behaviour; the
+with the app. Known limit of this emitter until chunk 15 phase 9: tuple results a caller destructures and `[h, t]` list matches leak heap (24 B and 32 B each), so long-running workers and long list walks end in `heap exhausted`; the plan (`design_documents/esp32s3_board_peripherals_plan.md`, "Known issue: board emitter heap") has the reproducers. Loops that run long therefore live inside the worker (`:watch`, `:watch_all`, `:square`).
+A device app's device worker is `spawn_device`d with the driver's behaviour; the
 windows it maps must be in the board pack's window table (`../board_pack.silica`).
 
 `silica_04_print` binds every `print_int64` result: it was written while a bare
