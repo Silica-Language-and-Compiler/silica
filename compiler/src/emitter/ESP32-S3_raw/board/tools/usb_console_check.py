@@ -28,7 +28,7 @@ run_app.sh prints "run_app: running ... on the board", then watches the USB-Seri
 is only a check and a port with another id is refused) WITHOUT opening it until the chip has been reset
 into the program (the node vanished and reappeared twice: ROM download mode, then the program) or
 --usb-open-delay seconds (default 12) have passed. It then opens it
-with DTR and RTS low (so opening it does not reset the chip), writes --send (default "A") every
+with DTR and RTS left high, the idle state (setting them low resets the chip: see open_port), writes --send (default "A") every
 0.25 s and keeps everything the port sends, until --expect (default "hello from usb serial jtag\nA")
 has arrived or --usb-timeout seconds (default 60, counted from run_app.sh's "running ... on the board" line) have passed.
 
@@ -123,14 +123,13 @@ class UsbHost(threading.Thread):
         s.baudrate = 115200
         s.timeout = 0.05
         s.write_timeout = 0.5
-        # DTR and RTS are set low before open(), so pyserial never raises them. The USB-Serial-JTAG
-        # peripheral decodes DTR/RTS like esptool's usb_jtag_bootloader_reset
-        # (esp_pylib/serial_reset.py:367-391): idle is (DTR, RTS) = (1, 1), the boot-mode / reset pulse
-        # train walks (0, 1) -> (1, 0) -> (1, 1) and deliberately avoids (0, 0), which does nothing.
-        # Staying at (0, 0) therefore never forms that train. (Not verified on this Mac: the OS may
-        # assert both lines for an instant when the node is opened; (1, 1) is also the idle state.)
-        s.dtr = False
-        s.rts = False
+        # DTR and RTS are left at pyserial's default, high: (DTR, RTS) = (1, 1) is the USB-Serial-JTAG
+        # peripheral's idle state (esptool's usb_jtag_bootloader_reset, esp_pylib/serial_reset.py:367-391).
+        # Do NOT set them low before open(). Likely cause (not measured): macOS raises both lines when the
+        # node is opened, and pyserial then lowers DTR before RTS, passing through (0, 1), which the
+        # peripheral takes as a chip reset. Seen on the board: opening with both low reset the chip into
+        # ROM download mode (rst:0x15 USB_UART_CHIP_RESET, "waiting for download"), killing the program;
+        # opening with both left high did not reset it.
         s.open()
         return s
 
