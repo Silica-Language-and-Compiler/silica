@@ -1,0 +1,136 @@
+// ESP32-S3 port app 31: a second console. UART0 (the runtime console) and the USB-Serial-JTAG device
+// worker (device_lib/device_esp32s3_usb_serial_jtag) are used together. The app prints "waiting for usb
+// host" on UART0, then asks the USB worker for one :exchange: it waits (bounded, about 20 s) for a byte
+// from the USB host and, on receiving one, writes "hello from usb serial jtag\n", the byte and a newline
+// to the USB console. The printer then prints "usb byte " and the byte's value on UART0 and ends the
+// program with status 0. With no byte in time the worker casts 256: the printer prints "usb timed out",
+// then the raw USB registers as "usb <name> <decimal>" (ep1_conf, conf0, out_ep1_st, in_ep1_st, jfifo_st,
+// fram_num, fram_num_100ms_later; a changing frame number means the host is sending SOFs) and ends with status 3.
+// Expected UART0 console (a host sent 'A', 65, to the USB port): "waiting for usb host", "usb byte 65",
+// status 0. Expected USB console: "hello from usb serial jtag", then "A" (the echo) on its own line.
+// tools/usb_console_check.py runs the app and plays the USB host (writes 'A' until the reply arrives).
+// The expected.scout is written from the source: device apps cannot compile on the host (E2220).
+use device_esp32s3_usb_serial_jtag;
+use Supervisor;
+
+// Names of the raw register words the worker reports after a receive timeout (state 1 to 7).
+fn diag_name(k: int64) -> string {
+    case k of {
+        1 -> "ep1_conf";
+        2 -> "conf0";
+        3 -> "out_ep1_st";
+        4 -> "in_ep1_st";
+        5 -> "jfifo_st";
+        6 -> "fram_num";
+        _: int64 -> "fram_num_100ms_later"
+    }
+}
+
+// Prints on UART0 what the USB worker reports. State 0: a byte (0..255) ends the program with status 0;
+// 256 (timed out) prints "usb timed out" and the next seven values are register words, printed as
+// "usb <name> <value>" (decimal), the last one ending the program with status 3.
+fn printer(value: uint32, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- case state == 0 of {
+            true -> case value > 255 of {
+                true -> println("usb timed out");
+                false -> {
+                    _: atom <- print_string("usb byte ");
+                    _: atom <- print_uint32(value);
+                    println("")
+                }
+            };
+            false -> {
+                _: atom <- print_string("usb ");
+                _: atom <- print_string(diag_name(state));
+                _: atom <- print_string(" ");
+                _: atom <- print_uint32(value);
+                println("")
+            }
+        };
+        _: boolean <- case state == 0 of {
+            true -> case value > 255 of { true -> false; false -> cast_exit(0) };
+            false -> case state == 7 of { true -> cast_exit(3); false -> false }
+        }
+    produces
+        pure (:no_reply, state + 1)
+    end
+}
+
+impl AppSupervisor for Supervisor;
+
+// The app's work, run by the supervisor's one worker (main only starts the supervisor and casts).
+fn app_worker(msg: atom, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        p: actor_ref <- spawn(0, printer, stack_policy(0, :keep_last_message));
+        u: device_actor_ref <- spawn_device(:unmapped, device_esp32s3_usb_serial_jtag@usb_serial_jtag_worker, stack_policy(0, :keep_last_message));
+        println("waiting for usb host");
+        _: boolean <- cast_device(u, { op: :init, byte: 0, text: "", reply_to: p } impl ActorMessage {});
+        _: boolean <- cast_device(u, { op: :exchange, byte: 0, text: "hello from usb serial jtag\n", reply_to: p } impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 1 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous }, mem(normal)] <- [
+            { id: :app_worker, agent_type: :worker, initial_state: initial_state, behavior: app_worker, restart: :transient, shutdown: 0, flavor: :plain }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message));
+        _: boolean <- cast_registered(:app_worker, (:start) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

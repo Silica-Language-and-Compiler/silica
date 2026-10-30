@@ -1,0 +1,243 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// USB-Serial-JTAG (the chip's built-in USB CDC console) as a device worker: board_pack window 7 at
+// 0x60038000, registers :ep1 (the byte FIFO: a write queues a byte for the host on EP1 IN, a read
+// takes a byte the host sent on EP1 OUT) and :ep1_conf (WR_DONE bit 0: write 1 to flush the IN FIFO to
+// the host; SERIAL_IN_EP_DATA_FREE bit 1: the 64-byte IN FIFO has room; SERIAL_OUT_EP_DATA_AVAIL bit 2:
+// a received byte can be read). It is a second console beside UART0 (silica_31).
+//
+// State: `:unmapped` until the :init message maps the window inside a register_rwr sequence, then
+// (:mapped, window). Messages: { op: :init | :putc | :puts | :notify | :getc | :exchange, byte: uint32,
+// text: string, reply_to: actor_ref }, the UART worker's shape. :putc queues `byte` and flushes it;
+// :puts writes the text (a character's byte comes from a flat table, as in the UART worker: only the
+// characters the apps print are listed) and flushes it with WR_DONE. :notify casts `byte` to reply_to
+// (the worker handles its mailbox in order). :getc waits for a byte from the host and casts it to
+// reply_to. :exchange waits for a byte, then writes `text`, the byte and a newline, flushes, and casts
+// the byte to reply_to; a byte is 0..255.
+//
+// Every wait is bounded, because without a host reading, the IN FIFO never frees, and without a host
+// writing, no byte ever arrives. The receive wait polls :ep1_conf up to 20000 times, one spin(400)
+// (roughly a millisecond, the GPIO worker's :hold tick) apart, about 20 s; on a timeout it casts 256
+// to reply_to ("timed out"; :exchange then writes nothing and casts seven raw register words, see
+// report_timeout). A send wait polls up to 500 times,
+// one spin(40) apart (about 50 ms) per byte, then drops that byte and goes on. The polls are tail
+// calls that return only the window, so no tuple is destructured per poll.
+
+use device_esp32s3_usb_serial_jtag_registers;
+use board_pack_usb_serial_jtag_values;
+
+export usb_serial_jtag_worker/2;
+
+fn byte_of(ch: string) -> uint32 {
+    case ch of {
+        " " -> 32; "\n" -> 10; "a" -> 97; "b" -> 98; "c" -> 99; "d" -> 100; "e" -> 101; "f" -> 102;
+        "g" -> 103; "h" -> 104; "i" -> 105; "j" -> 106; "k" -> 107; "l" -> 108; "m" -> 109; "n" -> 110;
+        "o" -> 111; "p" -> 112; "q" -> 113; "r" -> 114; "s" -> 115; "t" -> 116; "u" -> 117; "v" -> 118;
+        "w" -> 119; "x" -> 120; "y" -> 121; "z" -> 122; "0" -> 48; "1" -> 49; "2" -> 50; "3" -> 51;
+        "4" -> 52; "5" -> 53; "6" -> 54; "7" -> 55; "8" -> 56; "9" -> 57; "." -> 46; ":" -> 58;
+        _: string -> 63
+    }
+}
+
+fn spin(n: int64) -> int64 {
+    case n == 0 of { true -> 0; false -> spin(n - 1) }
+}
+
+// Waits (at most `polls` polls) until the IN FIFO has room, then queues the byte; a byte that finds
+// no room in time is dropped. The poll is a peek whose value matters, one per turn.
+fn put_byte(w: device_window(L, (:esp32s3_usb_serial_jtag)), byte: uint32, polls: uint32) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr]
+        status: uint32 <- peek(w, :ep1_conf) impl Register32 {};
+        free_mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_serial_in_ep_data_free_mask();
+        r: device_window(L, (:esp32s3_usb_serial_jtag)) <- case (status band free_mask) == 0 of {
+            true -> case polls == 0 of {
+                true -> w;
+                false -> {
+                    _: int64 <- spin(40);
+                    put_byte(w, byte, polls - 1)
+                }
+            };
+            false -> {
+                _: atom <- poke(w, :ep1, byte impl Register32 {});
+                w
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+fn put_text(w: device_window(L, (:esp32s3_usb_serial_jtag)), text: string, i: int64) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr]
+        r: device_window(L, (:esp32s3_usb_serial_jtag)) <- case i >= length_bytes(text) of {
+            true -> w;
+            false -> put_text(put_byte(w, byte_of(substring(text, i, i + 1)), 500), text, i + 1)
+        }
+    produces
+        pure r
+    end
+}
+
+// Writes WR_DONE so the bytes queued so far go to the host.
+fn flush(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr]
+        wr_done: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_wr_done_mask();
+        _: atom <- poke(w, :ep1_conf, wr_done impl Register32 {})
+    produces
+        pure w
+    end
+}
+
+// Waits (at most `polls` polls, about a millisecond apart) until a byte from the host can be read.
+// It returns only the window (a tuple result per poll would be a 24-byte heap leak on this emitter);
+// the caller peeks :ep1_conf once more to tell "available" from "timed out".
+fn wait_avail(w: device_window(L, (:esp32s3_usb_serial_jtag)), polls: uint32) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr]
+        status: uint32 <- peek(w, :ep1_conf) impl Register32 {};
+        avail_mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_serial_out_ep_data_avail_mask();
+        r: device_window(L, (:esp32s3_usb_serial_jtag)) <- case (status band avail_mask) == 0 of {
+            true -> case polls == 0 of {
+                true -> w;
+                false -> {
+                    _: int64 <- spin(400);
+                    wait_avail(w, polls - 1)
+                }
+            };
+            false -> w
+        }
+    produces
+        pure r
+    end
+}
+
+// True when a received byte can be read now (one peek of :ep1_conf).
+fn byte_ready(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> boolean {
+    sequence proc[register_rwr]
+        status: uint32 <- peek(w, :ep1_conf) impl Register32 {};
+        avail_mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_serial_out_ep_data_avail_mask();
+        ready: boolean <- case (status band avail_mask) == 0 of { true -> false; false -> true }
+    produces
+        pure ready
+    end
+}
+
+// Takes one received byte from :ep1 (a read pops it; usb_serial_jtag_ll_read_rxfifo reads it the same way).
+fn read_byte(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> uint32 {
+    sequence proc[register_rwr]
+        word: uint32 <- peek(w, :ep1) impl Register32 {};
+        byte_mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_rdwr_byte_mask()
+    produces
+        pure word band byte_mask
+    end
+}
+
+// After a receive timeout: casts 256, then raw register words for the app to print: :ep1_conf,
+// :conf0, :out_ep1_st, :in_ep1_st, :jfifo_st, :fram_num, and :fram_num again after spin(40000)
+// (roughly 100 ms); a changing frame number means the host sends SOFs, so the link is up.
+fn report_timeout(w: device_window(L, (:esp32s3_usb_serial_jtag)), reply_to: actor_ref) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr, concurrency]
+        timed_out: uint32 <- 256;
+        _: boolean <- cast(reply_to, timed_out impl ActorMessage {});
+        v1: uint32 <- peek(w, :ep1_conf) impl Register32 {};
+        _: boolean <- cast(reply_to, v1 impl ActorMessage {});
+        v2: uint32 <- peek(w, :conf0) impl Register32 {};
+        _: boolean <- cast(reply_to, v2 impl ActorMessage {});
+        v3: uint32 <- peek(w, :out_ep1_st) impl Register32 {};
+        _: boolean <- cast(reply_to, v3 impl ActorMessage {});
+        v4: uint32 <- peek(w, :in_ep1_st) impl Register32 {};
+        _: boolean <- cast(reply_to, v4 impl ActorMessage {});
+        v5: uint32 <- peek(w, :jfifo_st) impl Register32 {};
+        _: boolean <- cast(reply_to, v5 impl ActorMessage {});
+        v6: uint32 <- peek(w, :fram_num) impl Register32 {};
+        _: boolean <- cast(reply_to, v6 impl ActorMessage {});
+        _: int64 <- spin(40000);
+        v7: uint32 <- peek(w, :fram_num) impl Register32 {};
+        _: boolean <- cast(reply_to, v7 impl ActorMessage {})
+    produces
+        pure w
+    end
+}
+
+// :exchange: wait for a byte; if one came, write `text`, the byte and a newline, flush, and cast the
+// byte to reply_to. On a timeout: report_timeout (256, then the register words).
+fn exchange(w: device_window(L, (:esp32s3_usb_serial_jtag)), text: string, reply_to: actor_ref) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr, concurrency]
+        w1: device_window(L, (:esp32s3_usb_serial_jtag)) <- wait_avail(w, 20000);
+        w2: device_window(L, (:esp32s3_usb_serial_jtag)) <- case byte_ready(w1) of {
+            false -> report_timeout(w1, reply_to);
+            true -> {
+                byte: uint32 <- read_byte(w1);
+                w3: device_window(L, (:esp32s3_usb_serial_jtag)) <- put_text(w1, text, 0);
+                w4: device_window(L, (:esp32s3_usb_serial_jtag)) <- put_byte(w3, byte, 500);
+                w5: device_window(L, (:esp32s3_usb_serial_jtag)) <- put_byte(w4, 10, 500);
+                w6: device_window(L, (:esp32s3_usb_serial_jtag)) <- flush(w5);
+                _: boolean <- cast(reply_to, byte impl ActorMessage {});
+                w6
+            }
+        }
+    produces
+        pure w2
+    end
+}
+
+// :getc: wait for a byte; casts it, or 256 when none came, to reply_to.
+fn get_byte(w: device_window(L, (:esp32s3_usb_serial_jtag)), reply_to: actor_ref) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr, concurrency]
+        w1: device_window(L, (:esp32s3_usb_serial_jtag)) <- wait_avail(w, 20000);
+        byte: uint32 <- case byte_ready(w1) of {
+            false -> 256;
+            true -> read_byte(w1)
+        };
+        _: boolean <- cast(reply_to, byte impl ActorMessage {})
+    produces
+        pure w1
+    end
+}
+
+// Casts `value` to `reply_to` (:notify).
+fn notify(w: device_window(L, (:esp32s3_usb_serial_jtag)), reply_to: actor_ref, value: uint32) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[concurrency]
+        _: boolean <- cast(reply_to, value impl ActorMessage {})
+    produces
+        pure w
+    end
+}
+
+fn usb_serial_jtag_worker(msg: { op: atom, byte: uint32, text: string, reply_to: actor_ref }, state: :unmapped | (:mapped, device_window(L, (:esp32s3_usb_serial_jtag)))) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:esp32s3_usb_serial_jtag)))) {
+    sequence proc[register_rwr]
+        next: :unmapped | (:mapped, device_window(L, (:esp32s3_usb_serial_jtag))) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    w: device_window(L, (:esp32s3_usb_serial_jtag)) <- map_device((:esp32s3_usb_serial_jtag), 0x60038000); // board_pack window 7
+                    (:mapped, w)
+                };
+                _: atom -> :unmapped
+            };
+            (:mapped, w: device_window(L, (:esp32s3_usb_serial_jtag))) -> case msg.op of {
+                :putc -> (:mapped, flush(put_byte(w, msg.byte, 500)));
+                :puts -> (:mapped, flush(put_text(w, msg.text, 0)));
+                :notify -> (:mapped, notify(w, msg.reply_to, msg.byte));
+                :getc -> (:mapped, get_byte(w, msg.reply_to));
+                :exchange -> (:mapped, exchange(w, msg.text, msg.reply_to));
+                _: atom -> (:mapped, w)
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}
