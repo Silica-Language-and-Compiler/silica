@@ -69,9 +69,7 @@ Agreed order, steps 1 to 4. Reference apps are under `src/emitter/ESP32-S3_raw/b
 | --- | --- | --- | --- |
 | 1 | `asm_13_display_hello` | `silica_18_device_display` (rework) | Fill before DISPON, so the first visible frame is black. Then the SPI2 peripheral with its 64-byte data buffer (16 x 32-bit registers) instead of bit-banging: about 0.3 pokes per byte instead of about 16, and the clock rate is independent of the CPU |
 | 2 | (none) | board pack generated; `device_lib` descriptions removed | See below |
-| 3 | `asm_04_buzzer` | new, LEDC | Hardware PWM sets frequency and duty; no software square wave |
-| 3 | `asm_11_addressable_leds` | new, RMT | RMT generates the WS2813B waveform (24 LEDs) from a RAM table; bit-banging cannot meet the nanosecond timing from Silica |
-| 4 | `asm_01_blink`, `asm_02_rgb`, `asm_03_buttons`, `asm_08_gpio_diag`, `asm_09_pin_readback`, `asm_10_pin_hunt` | on the GPIO device worker (extends `silica_17_device_gpio`) | Port reads and writes through the worker's described registers (set/clear/enable-style registers), no per-pin helper loops |
+| 4 | `asm_01_blink`, `asm_02_rgb`, `asm_08_gpio_diag`, `asm_09_pin_readback`, `asm_10_pin_hunt` | on the GPIO device worker (extends `silica_17_device_gpio`) | Port reads and writes through the worker's described registers (set/clear/enable-style registers), no per-pin helper loops |
 | 4 | `asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault` | coverage check against `silica_00` to `silica_15` (and `silica_16` to `silica_19`); write whatever is missing | Native Silica already; the work is finding gaps |
 
 **Step 2 detail.** Generate the full register map with access modes into `board_pack`. The compiler reads

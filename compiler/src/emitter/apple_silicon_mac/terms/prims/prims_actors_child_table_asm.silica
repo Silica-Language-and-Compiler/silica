@@ -20,12 +20,17 @@
 // actor_memory_budget_plan.md): SB #24 head (first node ptr), #32 len (i64 row count / list length),
 // #40 sync_failure_reported (0/1; root cap-breach reports synchronously, later thread exit skips duplicate).
 // An actor without a block has no table; start_child and materialize make one for the running actor.
-// Node size 128 B: payload 80 B (same row layout as e3a), next ptr @ +80 (0 = end), the supervision block @ +88
+// Node size 144 B: payload 80 B (same row layout as e3a), next ptr @ +80 (0 = end), the supervision block @ +88
 // (sb_child_done finds it there; the child's reference keeps the node alive), the child's spawner record
 // @ +96 (position + 1) / +104 (next child number), kept across the child's restarts (spec §15.1.4,
 // §15.4.12.1), the current child's identity @ +112 (what call_supervisor answers with), and @ +120 the
 // carrier actors parked for this row's exit_done (linked through ACB #456; _silica_rt_row_wait in
 // prims_actors_carrier_asm.silica, emptied by the child's exit_done store).
+// @ +128 the row's state policy word (decision 40, Lee 2026-10-27: a field of the child spec; the spec's
+// state_policy@64, 0 = :keep_state_area when the spec has none), ORed into every start's policy word.
+// @ +136 the root descriptor of the child's initial-state type (the spec's hidden word@80; 0 for a scalar
+// or undescribed type), passed as X7 to every start and restart so start.0 is copied into the new
+// child's state area (chunk 15 phase 3b, design §5.4 Q14; prims_actors_state_asm.silica).
 // Offsets in row payload: +0 child_ref, +8 id atom, +16 agent_type, +24 start.0, +32 start.1, +40 restart atom,
 // +48 shutdown i64, +56 exit_done, +64 flavor atom (:plain | :dangerous), +72 supervisor_start_trampoline (0 for worker).
 // exit_done is a generation word: the identity (ACB #408) of the last child of the row that ended, stored
@@ -108,7 +113,7 @@ fn child_table_rt_asm_chunk_0() -> string {
     "	.section	__TEXT,__text,regular,pure_instructions
 ; --- Phase E e3a Option B: linked-list child table ---
 ; _silica_rt_child_table_free: X0=ACB* — walk nodes (+80 next), free each, clear anchors.
-; _silica_rt_child_table_ensure_min_cap: X0=ACB*, X1=min node count — X0=0 ok, 1 OOM. Appends 88 B nodes (80 B row + next) until count >= X1.
+; _silica_rt_child_table_ensure_min_cap: X0=ACB*, X1=min node count — X0=0 ok, 1 OOM. Appends 144 B nodes (80 B row + next + the words of the header) until count >= X1.
 	.globl	_silica_rt_child_table_free
 	.p2align	2
 _silica_rt_child_table_free:
@@ -356,7 +361,7 @@ Lct_count_done:
 	cmp	x22, x20
 	b.hs	Lct_ens_ok
 	mov	w0, #1
-	mov	w1, #128
+	mov	w1, #144
 	bl	_calloc
 	cbz	x0, Lct_ens_fail
 	mov	x24, x0
@@ -480,8 +485,10 @@ Lsscr_done:
 // Phase E e3b: _silica_rt_supervisor_materialize_init_children
 // X0=ACB*, X1=tuple_ptr (init return: flags record pointer in slot 0 -- shape word at +0, fields at +8..+31 -- children list head at +8).
 // Walks the list-literal handle of child_spec records (shape word plus 56 B of fields, then the hidden
-// supervisor_start_trampoline at +64 in each child_spec element).
-// Payload layout matches the emitter's record: shape@0, id@8, agent@16, start@(24,32), restart@40, shutdown@48, flavor@56.
+// supervisor_start_trampoline at +72 in each child_spec element, its state policy at +64, the
+// initial-state descriptor at +80).
+// Payload layout matches the emitter's record: shape@0, id@8, agent@16, start@(24,32), restart@40, shutdown@48, flavor@56,
+// state_policy@64, hidden trampoline@72, hidden initial-state descriptor@80 (term_child_spec@child_spec_field_abi_offset).
 // For each child_spec: spawn_linked(start.0, start.1, agent_type, row_ptr), append a linked row node (88 B; 80 B payload).
 // Stores strategy atom, allowed_restart_count, and restarts_time_frame at SB#56/#64/#72 for
 // restart strategy dispatch (e3d) and frequency cap (e3e). Current record emission returns a pointer
@@ -578,7 +585,7 @@ Lmat_walk_row:
 	b	Lmat_walk_row
 Lmat_walk_row_done:
 ";
-    post: string <- concat("    str xzr, [x28]\n    str x25, [x28, #8]\n    str x24, [x28, #16]\n    str x22, [x28, #24]\n    str x23, [x28, #32]\n    str x26, [x28, #40]\n    str x27, [x28, #48]\n    str xzr, [x28, #56]\n    ldr x9, [x15, #56]\n    str x9, [x28, #64]\n    ldr x9, [x15, #64]\n    str x9, [x28, #72]\n", "    mov x0, x28\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n");
+    post: string <- concat("    str xzr, [x28]\n    str x25, [x28, #8]\n    str x24, [x28, #16]\n    str x22, [x28, #24]\n    str x23, [x28, #32]\n    str x26, [x28, #40]\n    str x27, [x28, #48]\n    str xzr, [x28, #56]\n    ldr x9, [x15, #56]\n    str x9, [x28, #64]\n    ldr x9, [x15, #72]\n    str x9, [x28, #72]\n    ldr x9, [x15, #64]\n    str x9, [x28, #128]\n    ldr x9, [x15, #80]\n    str x9, [x28, #136]\n", "    mov x0, x28\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n");
     list_chunk_s: string <- atom_table@int64_to_decimal_string(list_chunk_bytes);
     tail_pre: string <- "	ldr	x10, [x19, #216]
 	ldr	x9, [x10, #32]
@@ -605,7 +612,7 @@ Lmat_done:
 
 // Phase E e3b2: _silica_rt_supervisor_start_child
 // X0 = child_spec record pointer (shape word@+0, id@+8, agent_type@+16, start.0@+24, start.1@+32, restart@+40, shutdown@+48,
-// flavor@+56; hidden supervisor_start_trampoline@+64).
+// flavor@+56; state_policy@+64; hidden supervisor_start_trampoline@+72; hidden initial-state descriptor@+80).
 // Layout matches `_silica_rt_supervisor_materialize_init_children` (cons payload) so the compiler can build a single
 // stack record and pass it to either path. (Earlier comment claimed +40/+48 — that 72 B layout never matched the
 // emitter's value-flat record_make output; e4b corrects this to the canonical +32/+40 used elsewhere.)
@@ -709,8 +716,12 @@ Lsc_append_at_row:
 Lsc_use_reuse_row:
 	mov	x28, xzr
 Lsc_post_row:
-	ldr	x4, [x20, #64]
+	ldr	x4, [x20, #72]
 	str	x4, [x27, #72]
+	ldr	x4, [x20, #64]
+	str	x4, [x27, #128]
+	ldr	x4, [x20, #80]
+	str	x4, [x27, #136]
 ";
     post: string <- concat("    ldr x9, [x20, #56]\n    str xzr, [x27]\n    str x21, [x27, #8]\n    str x22, [x27, #16]\n    str x23, [x27, #24]\n    str x24, [x27, #32]\n    str x25, [x27, #40]\n    str x26, [x27, #48]\n    str x9, [x27, #64]\n    str xzr, [x27, #96]\n    str xzr, [x27, #104]\n", "    mov x0, x27\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n    mov x20, x0\n");
     tail: string <- "	cbz	x28, Lsc_done

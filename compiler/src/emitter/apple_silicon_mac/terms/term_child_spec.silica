@@ -18,15 +18,19 @@
 // Supervisor child_spec / trampoline helpers for record emission.
 
 use prims_record;
+use prims_tuple;
+use reg_conventions;
 use term_sir_helpers;
+use term_message_copy;
 use var;
 use atom_table;
 use instantiated_fn_name;
 
 export is_child_spec_record_type/1;
 export is_supervisor_reply_record_type/1;
-export emit_child_spec_hidden_trampoline_store/3;
+export emit_child_spec_hidden_trampoline_store/5;
 export child_spec_field_abi_offset/1;
+export child_spec_state_type/1;
 
 fn first_at_in_fn_label(s: string, i: int64) -> int64 {
     case i >= length_bytes(s) of {
@@ -144,12 +148,12 @@ fn is_supervisor_reply_record_type(R: string) -> boolean {
         and length_bytes(prims_record@find_field_type_in_record(R, "error")) > 0
 }
 
-// The child_spec hidden trampoline field sits at offset 64 of the record (after the shape
-// word and the seven field slots). That record lives in a fixed-frame region, so a hardcoded
-// "[SP, #64]" would write into whatever happened to be at SP -- nested :supervisor children
+// The child_spec hidden trampoline field sits at offset 72 of the record (after the shape
+// word, the seven field slots and the state_policy slot at 64; decision 40, Lee 2026-10-27). That record lives in a fixed-frame region, so a hardcoded
+// "[SP, #72]" would write into whatever happened to be at SP -- nested :supervisor children
 // lost their trampoline symbol and failed to start. Addressing is inlined here rather
 // than reusing term_aggregate_helpers, which imports this module (cycle).
-fn hidden_field_store(store_base: string, reg: string) -> string {
+fn hidden_field_store(store_base: string, reg: string, off: int64) -> string {
     case length_bytes(store_base) > 1 and substring(store_base, 0, 1) == "*" of {
         // A dynamic-part record (chunk 15 phase 2, term_aggregate_helpers@agg_indirect_base): the slot
         // holds the block's address.
@@ -162,17 +166,17 @@ fn hidden_field_store(store_base: string, reg: string) -> string {
                     false -> concat("    SUB X16, X29, #", concat(atom_table@int64_to_decimal_string(sfb), "\n    LDR X16, [X16]\n"))
                 }
             };
-            concat(ld, concat("    STR ", concat(reg, ", [X16, #64]")))
+            concat(ld, concat("    STR ", concat(reg, concat(", [X16, #", concat(atom_table@int64_to_decimal_string(off), "]")))))
         };
-        false -> hidden_field_store_frame(store_base, reg)
+        false -> hidden_field_store_frame(store_base, reg, off)
     }
 }
 
-fn hidden_field_store_frame(store_base: string, reg: string) -> string {
+fn hidden_field_store_frame(store_base: string, reg: string, off: int64) -> string {
     fb: int64 <- var@parse_x29_neg_offset_bytes(store_base);
     case fb > 0 of {
         true -> {
-            d: int64 <- fb - 64;
+            d: int64 <- fb - off;
             case d <= 255 and d >= 0 of {
                 true -> concat("    STR ", concat(reg, concat(", [X29, #-", concat(atom_table@int64_to_decimal_string(d), "]"))));
                 false -> {
@@ -180,15 +184,60 @@ fn hidden_field_store_frame(store_base: string, reg: string) -> string {
                         true -> concat(var@mov_imm_wide("X16", fb), "    SUB X16, X29, X16\n");
                         false -> concat("    SUB X16, X29, #", concat(atom_table@int64_to_decimal_string(fb), "\n"))
                     };
-                    concat(setup, concat("    STR ", concat(reg, ", [X16, #64]")))
+                    concat(setup, concat("    STR ", concat(reg, concat(", [X16, #", concat(atom_table@int64_to_decimal_string(off), "]")))))
                 }
             }
         };
-        false -> concat("    STR ", concat(reg, ", [SP, #64]"))
+        false -> concat("    STR ", concat(reg, concat(", [SP, #", concat(atom_table@int64_to_decimal_string(off), "]"))))
     }
 }
 
-fn emit_child_spec_hidden_trampoline_store(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, R: string, store_base: string) -> string {
+// The hidden words of a child spec record, written by its record_make after the spelled fields (the
+// state_policy slot at 64 is a spelled field, required by the type checker since phase 3d): the
+// supervisor trampoline at 72 and, chunk 15 phase 3b, the root descriptor of the initial state's type
+// at 80 (design §5.4 Q14: materialize and
+// start_child copy it into the row, +136, and every start and restart of the row's child hands it to the
+// runtime's state copier, so start.0 is copied into the new child's state area with one copier table per
+// slot). outer_reg names the function (site-unique descriptor labels), table the atoms (sum tags).
+fn emit_child_spec_hidden_trampoline_store(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, R: string, store_base: string, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    case is_child_spec_record_type(R) of {
+        false -> "";
+        true -> concat(emit_child_spec_hidden_trampoline_word(term, R, store_base), emit_child_spec_state_descriptor_word(term, R, store_base, outer_reg, table))
+    }
+}
+
+// The child's initial-state type: the `initial_state` field, or the first element of the `start` tuple.
+fn child_spec_state_type(R: string) -> string {
+    s: string <- prims_record@find_field_type_in_record(R, "initial_state");
+    case length_bytes(s) > 0 of {
+        true -> s;
+        false -> {
+            st: string <- prims_record@strip_spaces_rt(prims_record@find_field_type_in_record(R, "start"));
+            case reg_conventions@is_tuple_type(st) of {
+                true -> prims_tuple@tuple_type_nth_element(st, 0);
+                false -> ""
+            }
+        }
+    }
+}
+
+// The word at 80: the address of `L_sdc_<fn>_<node>_0`, a root-word descriptor of the initial-state
+// type (term_message_copy@ev_site_descriptor_rodata, the form every spawn site emits), or 0 for a scalar
+// type and for a type the descriptors do not follow (then the runtime stores the value as given, as
+// before phase 3b). The rodata follows the store in the function's text.
+fn emit_child_spec_state_descriptor_word(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, R: string, store_base: string, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    t: string <- prims_record@strip_spaces_rt(child_spec_state_type(R));
+    case length_bytes(t) == 0 or reg_conventions@is_frame_free_scalar_type(t) or term_message_copy@ev_type_described(t) == false of {
+        true -> concat("\n", hidden_field_store(store_base, "XZR", 80));
+        false -> {
+            label: string <- concat("L_sdc_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(term.root))));
+            load: string <- concat(concat("\n    ADRP X9, ", concat(label, "_0@PAGE\n")), concat("    ADD X9, X9, ", concat(label, "_0@PAGEOFF\n")));
+            concat(load, concat(hidden_field_store(store_base, "X9", 80), concat("\n", term_message_copy@md_rodata_block(term_message_copy@ev_site_descriptor_rodata(t, label, table)))))
+        }
+    }
+}
+
+fn emit_child_spec_hidden_trampoline_word(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, R: string, store_base: string) -> string {
     case is_child_spec_record_type(R) of {
         false -> "";
         true -> {
@@ -196,7 +245,7 @@ fn emit_child_spec_hidden_trampoline_store(term: { nodes: List[{ kind: int64, ty
             // Do not infer role from child record shape or behavior naming.
             agent_atom: string <- child_spec_agent_type_atom(term);
             case agent_atom == ":supervisor" of {
-                false -> hidden_field_store(store_base, "XZR");
+                false -> hidden_field_store(store_base, "XZR", 72);
                 true -> {
                     label: string <- child_spec_start_fn_label(term);
                     impl_sym: string <- child_spec_supervisor_trampoline_symbol_from_label(label);
@@ -207,8 +256,8 @@ fn emit_child_spec_hidden_trampoline_store(term: { nodes: List[{ kind: int64, ty
                         false -> impl_sym
                     };
                     case length_bytes(sym) == 0 of {
-                        true -> hidden_field_store(store_base, "XZR");
-                        false -> concat(concat(concat(concat(concat("    ADRP X9, ", sym), "@PAGE\n    ADD X9, X9, "), sym), "@PAGEOFF\n"), hidden_field_store(store_base, "X9"))
+                        true -> hidden_field_store(store_base, "XZR", 72);
+                        false -> concat(concat(concat(concat(concat("    ADRP X9, ", sym), "@PAGE\n    ADD X9, X9, "), sym), "@PAGEOFF\n"), hidden_field_store(store_base, "X9", 72))
                     }
                 }
             }
@@ -218,7 +267,9 @@ fn emit_child_spec_hidden_trampoline_store(term: { nodes: List[{ kind: int64, ty
 
 // The child-spec ABI the actor runtime reads (shape word at 0): id@8, agent_type@16,
 // initial_state / start.0@24, behavior / start.1@32, restart@40, shutdown@48, flavor@56,
-// hidden supervisor trampoline@64.
+// state_policy@64 (decision 40; a required spelled field since phase 3d), hidden supervisor trampoline@72,
+// hidden initial-state descriptor@80 (phase 3b; emit_child_spec_state_descriptor_word). The record is
+// 88 bytes (term_record_layout allocates 96; a child-spec list cell is 88, prims_list).
 fn child_spec_field_abi_offset(fname: string) -> int64 {
     case fname == "id" of {
         true -> 8;
@@ -236,7 +287,10 @@ fn child_spec_field_abi_offset(fname: string) -> int64 {
                                 true -> 48;
                                 false -> case fname == "flavor" of {
                                     true -> 56;
-                                    false -> -1
+                                    false -> case fname == "state_policy" of {
+                                        true -> 64;
+                                        false -> -1
+                                    }
                                 }
                             }
                         }

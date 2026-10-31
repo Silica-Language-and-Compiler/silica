@@ -14,6 +14,7 @@ import pty
 import select
 import signal
 import sys
+import termios
 import time
 
 
@@ -66,6 +67,10 @@ def main() -> int:
     retry_attempt = int(os.environ.get("SILICA_INTEGRATION_MARKER_RETRY_ATTEMPT", "0"))
 
     master, slave = pty.openpty()
+    # Do not let the kernel rewrite \n as \r\n in the program's output.
+    attrs = termios.tcgetattr(slave)
+    attrs[1] &= ~termios.OPOST
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
     stdin_r, stdin_w = os.pipe()
 
     pid = os.fork()

@@ -63,6 +63,13 @@
 // same per-message table, and returns the byte total of the copy; phase 0 emits it with the helper
 // and nothing calls it yet (the exact-size mailbox buffer of phase 4 does).
 //
+// Spawn (chunk 15 phase 3b, design §5.4, P5): a spawn's initial state is no longer copied here. The spawn
+// site emits the root-word descriptor of the state type (ev_site_descriptor_rodata, `L_sd_<fn>_<node>`)
+// and hands its address to the runtime, whose state copier (prims_actors_state_asm.silica: the same
+// kinds and sizes as L_mc_measure, one copier table per state slot) copies the value into the child's
+// state area once the reservation exists. Child spec records carry the same descriptor in a hidden word
+// (mc_child_spec_desc, term_child_spec) for every start and restart of the child.
+//
 // Per-type descriptor labels (§3.6 "Descriptor emission"): besides the per-site descriptors below,
 // md_type_descriptors_block emits one descriptor body per DISTINCT pointer-carrying type a module's
 // functions return (L_td_<module>_<k>_0 and children) and aliases L_td_<fn label> (the result type),
@@ -383,7 +390,7 @@ fn ev_type_described(t0: string) -> boolean {
 fn ev_word_type_ok(t: string) -> boolean {
     t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16" or t == "int8" or t == "uint8"
         or t == "float64" or t == "float32" or t == "float16" or t == "boolean" or t == "bool" or t == "unit" or t == "lifetime"
-        or t == "atom" or t == "timer_ref" or t == "actor_ref" or mc_starts_with(t, ":") or mc_ends_with(t, "actor_ref")
+        or t == "atom" or t == "timer_ref" or t == "state_policy" or t == "actor_ref" or mc_starts_with(t, ":") or mc_ends_with(t, "actor_ref")
 }
 
 fn ev_described_at(t: string, depth: int64, bound: boolean) -> boolean {
@@ -530,9 +537,57 @@ fn mc_buf_elem_bytes(t: string) -> int64 {
     }
 }
 
+// A child spec record (term_child_spec@is_child_spec_record_type, repeated here: that module imports
+// this one).
+fn mc_is_child_spec(t: string) -> boolean {
+    length_bytes(prims_record@find_field_type_in_record(t, "id")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(t, "agent_type")) > 0
+        and (length_bytes(prims_record@find_field_type_in_record(t, "start")) > 0
+            or (length_bytes(prims_record@find_field_type_in_record(t, "initial_state")) > 0
+                and length_bytes(prims_record@find_field_type_in_record(t, "behavior")) > 0))
+        and length_bytes(prims_record@find_field_type_in_record(t, "restart")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(t, "shutdown")) > 0
+}
+
+// The child's initial-state type: the `initial_state` field, or the first element of the `start` tuple.
+fn mc_child_spec_state_type(t: string) -> string {
+    s: string <- prims_record@find_field_type_in_record(t, "initial_state");
+    case length_bytes(s) > 0 of {
+        true -> prims_record@strip_spaces_rt(s);
+        false -> {
+            st: string <- prims_record@strip_spaces_rt(prims_record@find_field_type_in_record(t, "start"));
+            case mc_is_tuple(st) of {
+                true -> substring(st, 1, mc_top_sep(st, 1, 0, ","));
+                false -> ""
+            }
+        }
+    }
+}
+
+// The descriptor of a child spec record follows its ABI layout (term_child_spec@child_spec_field_abi_offset),
+// 11 words: shape, id, agent_type, initial_state / start.0, behavior / start.1, restart, shutdown, flavor,
+// state_policy, the hidden supervisor trampoline (72) and the hidden initial-state descriptor (80; chunk
+// 15 phase 3b). Only the state word can hold a node; the others are atoms, small integers and code or
+// rodata addresses, copied as they are. Entries in the type's field order would not line up with the
+// record (a `start` tuple is spliced into two words, state_policy may be unspelled), and a copy of the
+// spelled words alone lost the hidden ones, which every restart of the child reads from the row.
+fn mc_child_spec_desc(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
+    en: { line: string, child: string, k: int64 } <- mc_entry(mc_child_spec_state_type(t), base, k + 1, table, depth, encl);
+    head: string <- concat(mc_lbl(base, k), ":\n    .quad 11, -1\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n");
+    rest: string <- "    .quad 9, 0\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n";
+    { text: concat(head, concat(en.line, concat(rest, en.child))), k: en.k }
+}
+
 // The descriptor of a record or tuple type at label base_k: (rodata, next_k).
 fn mc_agg_desc(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
     inner: string <- substring(t, 1, length_bytes(t) - 1);
+    case mc_is_record(t) and mc_is_child_spec(t) of {
+        true -> mc_child_spec_desc(t, base, k, table, depth, encl);
+        false -> mc_agg_desc_plain(t, inner, base, k, table, depth, encl)
+    }
+}
+
+fn mc_agg_desc_plain(t: string, inner: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
     case mc_is_record(t) of {
         true -> {
             a: { entries: string, children: string, n: int64, ridx: int64, k: int64 } <- mc_field_entries(inner, 0, base, k + 1, table, depth, encl, { entries: "", children: "", n: 1, ridx: 0 - 1, k: k + 1 });
@@ -1335,7 +1390,7 @@ fn mcp_scalar_type(t: string) -> boolean {
     t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16"
         or t == "int8" or t == "uint8" or t == "float64" or t == "float32" or t == "float16"
         or t == "boolean" or t == "bool" or t == "atom" or t == "string" or t == "unit" or t == "lifetime"
-        or t == "timer_ref"
+        or t == "timer_ref" or t == "state_policy"
 }
 
 // True when a value of this type cannot hold a pointer that matters to the elision walk: scalars,

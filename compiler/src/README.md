@@ -34,6 +34,21 @@ They drive the `Makefile` here. Working on the compiler itself, you will also us
 | `make TARGET=<name>` | Bake the backend from `emitter/<name>/` into the binary. |
 | `make clean`, `make help` | As usual; `make help` lists the active emit target and the allowable `TARGET` values. |
 
+### Parallel jobs and the RAM profile
+
+Silica emission is serial; the `.sams` → `.o` assembly runs in parallel. The job count is RAM-aware:
+
+- `JOBS` defaults to `max(1, min(ncpu, floor(usable_RAM_MB / PER_JOB_MB)))`.
+- `usable_RAM_MB` is the memory available when make starts times `JOBS_RAM_PCT` percent (default 50).
+- `PER_JOB_MB` defaults to 2048 and comes from the newest RAM profile; update it when the profile changes.
+- `make JOBS=N` overrides the choice; `make print-jobs` shows it.
+- Test hook: `SILICA_AVAILABLE_MB=N` replaces the measured available memory.
+- Memory is read from `/proc/meminfo` on Linux and `vm_stat` on macOS; if it cannot be read, `JOBS` falls back to `ncpu`.
+
+Each build also writes one RAM profile to `benchmarking/memory_use_reports/data/`, named
+`<UTC>_<compiler>.tsv`. `SILICA_RAM_PROFILE=0` disables it. See
+[../../benchmarking/memory_use_reports/README.md](../../benchmarking/memory_use_reports/README.md).
+
 The build is config-driven, like the trials: regenerate `silica.config.compiler`, copy it to
 `silica.config`, run the compiler with no argv, then `.sams` → `.o` → link. The compiler binary is
 a staleness input, so there is no incremental path between generations: every unit is recompiled.

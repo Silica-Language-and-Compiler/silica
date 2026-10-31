@@ -1,0 +1,594 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The per-behaviour state-release proof over a function's SIR (chunk15_stack_memory_design.md §4.1,
+// decision 18; chunk 15 phase 3c, 2026-10-30). Shared by the emitters (the proof goes into the
+// behaviour's prefix word and its epilogue flag) and by main_compile_pipeline (W2300 for an unproven
+// behaviour, §4.5).
+//
+// A behaviour is a function returning (:reply, R, S) or (:no_reply, S); its state parameter is the
+// second one. A slot is a node-bearing position of S (§4.1), so a behaviour whose S carries no pointer
+// (int64, atom, an atom-only sum, actor_ref, ...) has no slot and is proven as it stands: the runtime
+// answers a scalar state as given (prims_actors_state_asm@_silica_rt_state_dispatch_end), and the
+// counter's `(:reply, state, state + 1)` must not pay a whole-state copy or print W2300 (found by the
+// 3c gate: 332 of actors_addition's 359 W2300 were "built by 'add'" on an int64 state). S is read from
+// the return type (sr_state_type), not from param_types, whose `|` separator is also the sum spelling.
+// OLD names denote the old state or a part of it reached only through projections: the
+// parameter, every let whose value is an Old name or a record_proj / tuple_proj chain over one, and
+// every `bind` arm over such a scrutinee. The proof holds when, in every arm of the body, the new state
+// (the third element of the result tuple, the second for :no_reply) is
+//   * an Old name or a projection of one (the whole state, or a part of it, passed through), or
+//   * a record_make / tuple_make whose pointer-carrying operands are each a projection of an Old name
+//     (a nested record_make / tuple_make is a by-value aggregate and is checked the same way) and no
+//     two of them are the same projection (P2: one version reaches one slot).
+// Everything else is unproven, with the reason the design names: a pointer-carrying operand that is a
+// user call ("'f' is not a logging updater": no logging updater exists before the stdlib's phase 5, so
+// every update is unproven, which is the conservative side of P4), any other fresh value ("slot 'q' is
+// replaced without an update": its old nodes could never be released, §4.1 "what release does not
+// cover"), the same projection kept twice, a record / tuple / list pattern over the old state ("hides
+// its parts", as mc_case_arms_step poisons with "!"), a result that is a call or a shape not analysed.
+// A write_ref anywhere in the body is unproven too: a frame value written into an old state cell is
+// not reached by the evacuation (§4.3 step 1 leaves old nodes alone); §6.3's E2302 takes this over in
+// phase 6. The `|_upd=` update-call rules of §4.1 are not needed until a logging updater exists.
+//
+// SIR shapes read here (sir_generator/terms): a user call is kind 4 / 5 with `inner` the first argument
+// and `right_expr` a `user_call_rest` chain; tuple_make(inner = e1, right = e2 | tuple_make(...));
+// record_make(name = field, inner = value, right = the next field or nothing); record_proj(name =
+// field, inner = the record); tuple_proj(inner = the tuple, right = the index constant); a kind-8 arm
+// has `value` "bind" / "record" / "tuple" / "list_cons" and `name` its binding. The node list is stored
+// newest first (sir_return_position@rp_node_at).
+
+export behaviour_release_reason/1;
+export is_behaviour_return_type/1;
+
+fn sr_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sr_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sr_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+// ---- strings and sets (",a,b,") -----------------------------------------------------------------
+
+fn sr_strip_spaces(s: string) -> string {
+    case length_bytes(s) == 0 of {
+        true -> "";
+        false -> case substring(s, 0, 1) == " " of {
+            true -> sr_strip_spaces(substring(s, 1, length_bytes(s)));
+            false -> concat(substring(s, 0, 1), sr_strip_spaces(substring(s, 1, length_bytes(s))))
+        }
+    }
+}
+
+fn sr_starts_with(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+fn sr_find_from(s: string, needle: string, i: int64) -> int64 {
+    case i + length_bytes(needle) > length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + length_bytes(needle)) == needle of {
+            true -> i;
+            false -> sr_find_from(s, needle, i + 1)
+        }
+    }
+}
+
+fn sr_in_set(set: string, name: string) -> boolean {
+    length_bytes(name) > 0 and sr_find_from(set, concat(",", concat(name, ",")), 0) >= 0
+}
+
+fn sr_add(set: string, name: string) -> string {
+    case length_bytes(name) == 0 or sr_in_set(set, name) of {
+        true -> set;
+        false -> case length_bytes(set) == 0 of {
+            true -> concat(",", concat(name, ","));
+            false -> concat(set, concat(name, ","))
+        }
+    }
+}
+
+// A name and its parameter spelling (`%name`): the SIR refers to a parameter with the prefix.
+fn sr_add_both(set: string, name: string) -> string {
+    case sr_starts_with(name, "%") of {
+        true -> sr_add(sr_add(set, name), substring(name, 1, length_bytes(name)));
+        false -> sr_add(sr_add(set, name), concat("%", name))
+    }
+}
+
+// The idx-th name of "a|b|c".
+fn sr_param_at(names: string, idx: int64) -> string {
+    case length_bytes(names) == 0 of {
+        true -> "";
+        false -> {
+            p: int64 <- sr_find_from(names, "|", 0);
+            case p < 0 of {
+                true -> case idx == 0 of { true -> names; false -> "" };
+                false -> case idx == 0 of {
+                    true -> substring(names, 0, p);
+                    false -> sr_param_at(substring(names, p + 1, length_bytes(names)), idx - 1)
+                }
+            }
+        }
+    }
+}
+
+// ---- types -------------------------------------------------------------------------------------
+
+fn is_behaviour_return_type(return_type: string) -> boolean {
+    t: string <- sr_strip_spaces(return_type);
+    sr_starts_with(t, "(:reply,") or sr_starts_with(t, "(:no_reply,")
+}
+
+// The state type S of a (space-stripped) behaviour return type `(:reply,R,S)` / `(:no_reply,S)`: the text
+// after the last comma at depth 1, without the closing parenthesis. A comma inside (), [] or {} belongs
+// to R or S (a record state, `List[T,mem(normal)]`, a tuple variant of a sum). "" when rt is no tuple.
+fn sr_state_type_scan(rt: string, i: int64, depth: int64, last: int64) -> string {
+    case i >= length_bytes(rt) - 1 of {
+        true -> substring(rt, last + 1, length_bytes(rt) - 1);
+        false -> {
+            c: string <- substring(rt, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> sr_state_type_scan(rt, i + 1, depth + 1, last);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> sr_state_type_scan(rt, i + 1, depth - 1, last);
+                    false -> case c == "," and depth == 1 of {
+                        true -> sr_state_type_scan(rt, i + 1, depth, i);
+                        false -> sr_state_type_scan(rt, i + 1, depth, last)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sr_state_type(rt: string) -> string {
+    case length_bytes(rt) >= 2 and sr_starts_with(rt, "(") of {
+        true -> sr_state_type_scan(rt, 0, 0, 0);
+        false -> ""
+    }
+}
+
+// Every top-level alternative of a (space-stripped) sum is an atom literal (`:on|:off`): no pointer. An
+// alternative that is not an atom (a record, a tuple, a list, a named type) answers false.
+fn sr_atoms_only(t: string) -> boolean {
+    case length_bytes(t) == 0 of {
+        true -> true;
+        false -> case sr_starts_with(t, ":") of {
+            false -> false;
+            true -> {
+                bar: int64 <- sr_find_from(t, "|", 0);
+                alt: string <- case bar < 0 of { true -> t; false -> substring(t, 0, bar) };
+                case sr_find_from(alt, "(", 0) >= 0 or sr_find_from(alt, "[", 0) >= 0 or sr_find_from(alt, "{", 0) >= 0 or sr_find_from(alt, ",", 0) >= 0 of {
+                    true -> false;
+                    false -> case bar < 0 of {
+                        true -> true;
+                        false -> sr_atoms_only(substring(t, bar + 1, length_bytes(t)))
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A type that may hold a pointer (sir_return_position@rp_type_may_point, with the atom sums and the
+// one-word runtime handles of the evacuation's word kinds added). An unknown type may.
+fn sr_type_may_point(t0: string) -> boolean {
+    t: string <- sr_strip_spaces(t0);
+    case t of {
+        "int64" -> false;
+        "uint64" -> false;
+        "int32" -> false;
+        "uint32" -> false;
+        "int16" -> false;
+        "uint16" -> false;
+        "int8" -> false;
+        "uint8" -> false;
+        "float64" -> false;
+        "float32" -> false;
+        "float16" -> false;
+        "boolean" -> false;
+        "bool" -> false;
+        "char" -> false;
+        "atom" -> false;
+        "unit" -> false;
+        "actor_ref" -> false;
+        "timer_ref" -> false;
+        "state_policy" -> false;
+        "stack_policy" -> false;
+        "lifetime" -> false;
+        _: string -> case sr_starts_with(t, ":") of {
+            true -> sr_atoms_only(t) == false;
+            false -> true
+        }
+    }
+}
+
+// ---- the Old set: the state and its projections --------------------------------------------------
+
+// The node is an Old name or a record_proj / tuple_proj chain over one.
+fn sr_is_old_proj(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, old: string) -> boolean {
+    case idx < 0 of {
+        true -> false;
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case a.kind == 1 of {
+                true -> sr_in_set(old, a.name);
+                false -> case a.kind == 6 and (a.name == "record_proj" or a.name == "tuple_proj") of {
+                    true -> sr_is_old_proj(nodes, a.inner, old);
+                    false -> false
+                }
+            }
+        }
+    }
+}
+
+// The projection's path, "state.items" / "state.0", for the one-slot rule (P2).
+fn sr_proj_key(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> string {
+    a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+    case a.kind == 1 of {
+        true -> case sr_starts_with(a.name, "%") of {
+            true -> substring(a.name, 1, length_bytes(a.name));
+            false -> a.name
+        };
+        false -> case a.kind == 6 and a.name == "record_proj" of {
+            true -> concat(sr_proj_key(nodes, a.inner), concat(".", a.value));
+            false -> case a.kind == 6 and a.name == "tuple_proj" of {
+                true -> concat(sr_proj_key(nodes, a.inner), concat(".", sr_node_at(nodes, a.right_expr).value));
+                false -> "?"
+            }
+        }
+    }
+}
+
+fn sr_old_step(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, old: string) -> string {
+    case idx < 0 of {
+        true -> old;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            old1: string <- case n.kind == 2 and sr_is_old_proj(nodes, n.inner, old) of {
+                true -> sr_add_both(old, n.name);
+                false -> old
+            };
+            old2: string <- case n.kind == 3 of {
+                true -> sr_old_arms(nodes, n.right_expr, sr_is_old_proj(nodes, n.inner, old1), old1);
+                false -> old1
+            };
+            old3: string <- sr_old_step(nodes, n.inner, old2);
+            case n.kind == 3 of {
+                true -> old3;
+                false -> sr_old_step(nodes, n.right_expr, old3)
+            }
+        }
+    }
+}
+
+fn sr_old_arms(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, scrut_old: boolean, old: string) -> string {
+    case idx < 0 of {
+        true -> old;
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case a.kind == 7 of {
+                true -> sr_old_arms(nodes, a.right_expr, scrut_old, sr_old_arms(nodes, a.inner, scrut_old, old));
+                false -> case a.kind == 8 of {
+                    false -> sr_old_step(nodes, idx, old);
+                    true -> {
+                        old1: string <- case scrut_old and a.value == "bind" of {
+                            true -> sr_add_both(old, a.name);
+                            false -> case scrut_old and (a.value == "record" or a.value == "tuple" or a.value == "list_cons") of {
+                                true -> sr_add(old, "!");
+                                false -> old
+                            }
+                        };
+                        sr_old_step(nodes, a.right_expr, sr_old_step(nodes, a.inner, old1))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sr_old_closure(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64, old: string, rounds: int64) -> string {
+    next: string <- sr_old_step(nodes, root, old);
+    case rounds <= 0 or length_bytes(next) == length_bytes(old) of {
+        true -> next;
+        false -> sr_old_closure(nodes, root, next, rounds - 1)
+    }
+}
+
+fn sr_has_prim(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], i: int64, n: int64, prim: string) -> boolean {
+    case i >= n of {
+        true -> false;
+        false -> {
+            e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, i);
+            case e.kind == 6 and e.name == prim of {
+                true -> true;
+                false -> sr_has_prim(nodes, i + 1, n, prim)
+            }
+        }
+    }
+}
+
+// The value of the let that binds `name` (its node index), or -1.
+fn sr_find_let_value(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], i: int64, n: int64, name: string) -> int64 {
+    case i >= n of {
+        true -> -1;
+        false -> {
+            e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, i);
+            case e.kind == 2 and (e.name == name or concat("%", e.name) == name or e.name == concat("%", name)) of {
+                true -> e.inner;
+                false -> sr_find_let_value(nodes, i + 1, n, name)
+            }
+        }
+    }
+}
+
+// ---- the new state -----------------------------------------------------------------------------
+
+// The result positions of the body, through lets and case arms, to the state element of each result
+// tuple. "" when every one is proven; else the first reason.
+fn sr_check_result(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, reply_form: boolean, old: string, depth: int64) -> string {
+    case idx < 0 or depth > 64 of {
+        true -> "the result shape is not analysed";
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case n.kind of {
+                2 -> sr_check_result(nodes, n.right_expr, reply_form, old, depth + 1);
+                3 -> sr_check_result_arms(nodes, n.right_expr, reply_form, old, depth + 1);
+                1 -> {
+                    v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), n.name);
+                    case v < 0 of {
+                        true -> concat("the result is '", concat(n.name, "', whose value is not analysed"));
+                        false -> sr_check_result(nodes, v, reply_form, old, depth + 1)
+                    }
+                };
+                4 -> concat("'", concat(n.name, "' is not a logging updater"));
+                5 -> concat("'", concat(n.name, "' is not a logging updater"));
+                6 -> case n.name == "tuple_make" of {
+                    false -> "the result shape is not analysed";
+                    true -> case reply_form of {
+                        false -> sr_check_state(nodes, n.right_expr, old, depth + 1);
+                        true -> {
+                            rest: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, n.right_expr);
+                            case rest.kind == 6 and rest.name == "tuple_make" of {
+                                true -> sr_check_state(nodes, rest.right_expr, old, depth + 1);
+                                false -> "the result shape is not analysed"
+                            }
+                        }
+                    }
+                };
+                _: int64 -> "the result shape is not analysed"
+            }
+        }
+    }
+}
+
+fn sr_check_result_arms(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, reply_form: boolean, old: string, depth: int64) -> string {
+    case idx < 0 of {
+        true -> "";
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case a.kind of {
+                7 -> {
+                    r: string <- sr_check_result_arms(nodes, a.inner, reply_form, old, depth);
+                    case length_bytes(r) > 0 of {
+                        true -> r;
+                        false -> sr_check_result_arms(nodes, a.right_expr, reply_form, old, depth)
+                    }
+                };
+                8 -> sr_check_result(nodes, a.right_expr, reply_form, old, depth);
+                _: int64 -> "the result shape is not analysed"
+            }
+        }
+    }
+}
+
+// The new state: an Old projection, or an aggregate whose pointer-carrying operands are each an Old
+// projection, kept once.
+fn sr_check_state(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, old: string, depth: int64) -> string {
+    case sr_is_old_proj(nodes, idx, old) of {
+        true -> "";
+        false -> {
+            r: string <- sr_check_operands(nodes, idx, old, depth);
+            case length_bytes(r) > 0 of {
+                true -> r;
+                false -> sr_first_dup(sr_state_keys(nodes, idx, old, depth, ","))
+            }
+        }
+    }
+}
+
+fn sr_check_operands(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, old: string, depth: int64) -> string {
+    case idx < 0 or depth > 64 of {
+        true -> "the new state is not analysed";
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case n.kind of {
+                1 -> {
+                    v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), n.name);
+                    case v < 0 of {
+                        true -> concat("the new state is '", concat(n.name, "', whose value is not analysed"));
+                        false -> sr_check_state(nodes, v, old, depth + 1)
+                    }
+                };
+                4 -> concat("'", concat(n.name, "' is not a logging updater"));
+                5 -> concat("'", concat(n.name, "' is not a logging updater"));
+                6 -> case n.name == "record_make" of {
+                    true -> sr_check_record_fields(nodes, idx, old, depth);
+                    false -> case n.name == "tuple_make" of {
+                        true -> {
+                            r: string <- sr_check_operand(nodes, n.inner, "0", old, depth);
+                            case length_bytes(r) > 0 of {
+                                true -> r;
+                                false -> sr_check_operand(nodes, n.right_expr, "1", old, depth)
+                            }
+                        };
+                        false -> concat("the new state is built by '", concat(n.name, "', which is not analysed"))
+                    }
+                };
+                _: int64 -> "the new state is not analysed"
+            }
+        }
+    }
+}
+
+fn sr_check_record_fields(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, old: string, depth: int64) -> string {
+    case idx < 0 of {
+        true -> "";
+        false -> {
+            f: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case f.kind == 6 and f.name == "record_make" of {
+                false -> "";
+                true -> {
+                    r: string <- sr_check_operand(nodes, f.inner, f.value, old, depth);
+                    case length_bytes(r) > 0 of {
+                        true -> r;
+                        false -> sr_check_record_fields(nodes, f.right_expr, old, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One operand of the new state's aggregate: a scalar is anything; a pointer-carrying operand is an Old
+// projection or a nested aggregate of such.
+fn sr_check_operand(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, slot: string, old: string, depth: int64) -> string {
+    case idx < 0 of {
+        true -> "";
+        false -> {
+            o: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case sr_type_may_point(o.type_name) == false of {
+                true -> "";
+                false -> case sr_is_old_proj(nodes, idx, old) of {
+                    true -> "";
+                    false -> case o.kind == 6 and (o.name == "record_make" or o.name == "tuple_make") of {
+                        true -> sr_check_state(nodes, idx, old, depth + 1);
+                        false -> case o.kind == 4 or o.kind == 5 of {
+                            true -> concat("'", concat(o.name, "' is not a logging updater"));
+                            false -> case o.kind == 1 of {
+                                true -> {
+                                    v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), o.name);
+                                    case v < 0 of {
+                                        true -> concat("slot '", concat(slot, concat("' is replaced without an update (by '", concat(o.name, "')"))));
+                                        false -> sr_check_operand(nodes, v, slot, old, depth + 1)
+                                    }
+                                };
+                                false -> concat("slot '", concat(slot, "' is replaced without an update"))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The projection keys of the pointer-carrying operands kept in the new state (with repeats).
+fn sr_state_keys(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, old: string, depth: int64, acc: string) -> string {
+    case idx < 0 or depth > 64 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case sr_type_may_point(n.type_name) == false of {
+                true -> acc;
+                false -> case sr_is_old_proj(nodes, idx, old) of {
+                    true -> concat(acc, concat(sr_proj_key(nodes, idx), ","));
+                    false -> case n.kind == 1 of {
+                        true -> {
+                            v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), n.name);
+                            case v < 0 of { true -> acc; false -> sr_state_keys(nodes, v, old, depth + 1, acc) }
+                        };
+                        false -> case n.kind == 6 and n.name == "record_make" of {
+                            true -> sr_state_keys(nodes, n.right_expr, old, depth, sr_state_keys(nodes, n.inner, old, depth + 1, acc));
+                            false -> case n.kind == 6 and n.name == "tuple_make" of {
+                                true -> sr_state_keys(nodes, n.right_expr, old, depth + 1, sr_state_keys(nodes, n.inner, old, depth + 1, acc));
+                                false -> acc
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ",a,b,a," -> "version 'a' is kept twice in the new state"; "" when no key repeats.
+fn sr_first_dup(keys: string) -> string {
+    case length_bytes(keys) <= 1 of {
+        true -> "";
+        false -> {
+            rest: string <- substring(keys, 1, length_bytes(keys));
+            e: int64 <- sr_find_from(rest, ",", 0);
+            case e < 0 of {
+                true -> "";
+                false -> {
+                    k: string <- substring(rest, 0, e);
+                    tail: string <- substring(rest, e, length_bytes(rest));
+                    case sr_in_set(tail, k) of {
+                        true -> concat("version '", concat(k, "' is kept twice in the new state"));
+                        false -> sr_first_dup(tail)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// "" when the behaviour is proven (or the function is no behaviour); else the reason W2300 prints.
+fn behaviour_release_reason(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    rt: string <- sr_strip_spaces(fn_val.return_type);
+    case sr_starts_with(rt, "(:reply,") or sr_starts_with(rt, "(:no_reply,") of {
+        false -> "";
+        true -> {
+            pname: string <- sr_param_at(fn_val.param_names, 1);
+            case length_bytes(pname) == 0 of {
+                true -> "the behaviour has no state parameter";
+                false -> case sr_type_may_point(sr_state_type(rt)) == false of {
+                    true -> "";
+                    false -> {
+                        old: string <- sr_old_closure(fn_val.body.nodes, fn_val.body.root, sr_add_both(",", pname), 8);
+                        case sr_in_set(old, "!") of {
+                            true -> concat("a pattern on '", concat(pname, "' hides its parts"));
+                            false -> case sr_has_prim(fn_val.body.nodes, 0, sr_nodes_len(fn_val.body.nodes), "write_ref") of {
+                                true -> "write_ref during the dispatch may store a frame value into an old state cell";
+                                false -> sr_check_result(fn_val.body.nodes, fn_val.body.root, sr_starts_with(rt, "(:reply,"), old, 0)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

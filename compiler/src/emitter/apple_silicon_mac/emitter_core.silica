@@ -20,6 +20,7 @@
 
 use sir_ast;
 use sir_return_position;
+use sir_state_release;
 use term_emitter;
 use term_reg_spill;
 use term_message_copy;
@@ -1382,8 +1383,14 @@ fn fs_term_has_hazard(t: { nodes: List[{ kind: int64, type_name: string, value: 
 // third parameter read after such a prim was garbage: `fn has_at(s: string, i: int64, pat: string)
 // -> boolean { i + length_bytes(pat) <= length_bytes(s) and substring(s, i, i + length_bytes(pat)) == pat }`
 // read `pat` from X2 after L_length_bytes_helper had left ~marker (1) there and faulted in the next
-// length helper (chunk 15 phase 1, 2026-10-25). With three or more parameters such a body takes
-// the full shadow. See trials/functions_addition/third_param_survives_string_helper.
+// length helper (chunk 15 phase 1, 2026-10-25). The SECOND parameter is exposed the same way when no
+// entry shadow fires for it: `fn state_len(msg: int64, state: string) -> (:reply, int64, string) {
+// (:reply, length_bytes(state), state) }` has one GPR64 parameter and no call, let or BL prim, so
+// `state` stayed in X1, and L_length_bytes_helper's `LDR X1, [X19]` left the marker (-1) there; the
+// behaviour returned -1 as its state and the 3c dispatch end faulted in Lstc_str (chunk 15 phase 3c,
+// 2026-10-30; trials/actors_addition/spawn_payload_frame_built_string_sender_rereads, latent before
+// 3c because the garbage state was stored and never read). With two or more parameters such a body
+// takes the full shadow. See trials/functions_addition/third_param_survives_string_helper.
 fn fs_is_string_helper_prim(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
     nm: string <- sir_term_root_node(t).name;
     case starts_with(nm, "string_") of {
@@ -2057,7 +2064,7 @@ fn use_full_param_shadow(fn_val: { name: string, return_type: string, effects: s
                             // only int64/uint64/handle and string first parameters out first, so an atom first
                             // parameter died under an atom let and a narrow second parameter under a narrow let.
                             // See trials/functions_addition/emitter_defect_param_in_let_staging_register.
-                            true -> fs_subtree_has_user_call(fn_val.body) or fs_term_has_case(fn_val.body) or body_has_bl_producing_prim(fn_val.body) or fs_term_has_let(fn_val.body) or (n >= 3 and fs_term_has_string_helper_prim(fn_val.body)) or fs_float_param_count(fn_val.param_types, n) > 0
+                            true -> fs_subtree_has_user_call(fn_val.body) or fs_term_has_case(fn_val.body) or body_has_bl_producing_prim(fn_val.body) or fs_term_has_let(fn_val.body) or (n >= 2 and fs_term_has_string_helper_prim(fn_val.body)) or fs_float_param_count(fn_val.param_types, n) > 0
                             }
                         }
                     }
@@ -2669,42 +2676,11 @@ fn reply_buffer_outer_markers(fn_val: { name: string, return_type: string, effec
     }
 }
 
-// The boundary move may overwrite the actor's current state block in place
-// (prims_actors@bmv_state_reuse_asm) only when nothing but the actor can hold a pointer to it: the
-// state is a plain tuple or a boxed record, and this behaviour reads its state parameter only through
-// a destructuring let (`(a, b) <- state`) or a field projection, so the old block cannot have been
-// stored, sent, returned or captured. Before this every message copied the new state to a fresh block
-// and the old one stayed in the actor's region until the actor ended.
-fn behaviour_state_reusable(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> boolean {
-    t: string <- prims_record@strip_spaces_rt(fn_val.return_type);
-    reply_form: boolean <- length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,";
-    stype: string <- case reply_form of {
-        true -> prims_tuple@tuple_type_nth_element(t, 2);
-        false -> prims_tuple@tuple_type_nth_element(t, 1)
-    };
-    plain: boolean <- reg_conventions@is_sret_tuple_type(stype) or (reg_conventions@is_inline_struct_type(stype) and prims_record@record_type_keeps_inline_layout(stype) == false);
-    pname: string <- fs_name_at_index(fn_val.param_names, 1);
-    plain and length_bytes(pname) > 0 and find_pipe_in_param_names(fn_val.param_names, 0) >= 0 and state_param_uses_ok(fn_val.body, fn_val.body.root, pname, false)
-}
-
-fn state_param_uses_ok(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64, pname: string, allowed: boolean) -> boolean {
-    case idx < 0 of {
-        true -> true;
-        false -> {
-            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, idx));
-            case n.kind == 1 and (n.name == pname or n.name == concat("%", pname)) of {
-                true -> allowed;
-                false -> {
-                    inner_ok: boolean <- (n.kind == 2 and length_bytes(n.name) >= 5 and substring(n.name, 0, 5) == "%_td_") or (n.kind == 6 and n.name == "record_proj");
-                    state_param_uses_ok(term, n.inner, pname, inner_ok) and state_param_uses_ok(term, n.right_expr, pname, false)
-                }
-            }
-        }
-    }
-}
-
 fn emit_sir_function(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, all_functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], ctx: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, int64_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int32_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int16_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int8_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] }, debug: boolean, module_name: string, foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)] }) -> string {
     entry_label: string <- module_linkage@asm_symbol_for_definition(ctx.module_name, fn_val.name);
+        // Chunk 15 phase 3c: the state-release proof of design §4.1 (sir_state_release). It goes into the
+        // convention prefix word (the runtime reads it at every dispatch start) and the epilogue's flag.
+        state_release_proven: boolean <- behavior_return_uses_actor_sret_tuple(fn_val.return_type) and length_bytes(sir_state_release@behaviour_release_reason(fn_val)) == 0;
         eff_comment: string <- emitter_effects@fn_effect_annotation(fn_val.effects);
         prologue: string <- control@function_prologue_with_effects(entry_label, fn_val.effects);
         dest_reg: string <- case fn_val.return_type == "float32" of {
@@ -2918,7 +2894,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             false -> ""
         };
         // Return-position user calls (chunk 15 phase 2, sir_return_position): adopted, not evacuated.
-        rp_nodes: string <- sir_return_position@rp_call_nodes(fn_val.body);
+        rp_nodes: string <- sir_return_position@rp_call_nodes(fn_val.body, fn_val.name);
         rp_outer: string <- case length_bytes(rp_nodes) > 0 of {
             true -> concat("|_rpn=", rp_nodes);
             false -> ""
@@ -2975,10 +2951,12 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             false -> ""
         };
         // A kind-5 body's callee has this return type too and runs the move itself.
-        // Chunk 15 phase 2 (interim until phase 3): the new state and the reply are evacuated out of the
-        // behaviour's frame into the actor's heap before the move below copies their shells.
+        // Chunk 15 phase 2 (interim until phase 4): the reply is evacuated out of the behaviour's frame
+        // into the actor's heap before the move below copies its shell. Phase 3c: the state is not moved;
+        // the epilogue records its descriptor and the proof of design §4.1 (sir_state_release) for the
+        // runtime's dispatch end, which places the new nodes in the state area.
         behaviour_move: string <- case kind5_tail_returns_directly == false and sir_term_root_node(fn_val.body).kind != 5 and behavior_return_uses_actor_sret_tuple(fn_val.return_type) of {
-            true -> concat(prims_actors@behaviour_result_evacuate_asm(fn_val.return_type, entry_label, ctx.table), prims_actors@behaviour_result_move_asm(fn_val.return_type, entry_label, behaviour_state_reusable(fn_val), term_message_copy@md_reply_copy_asm(fn_val, entry_label, copy_markers, ctx.table)));
+            true -> concat(prims_actors@behaviour_result_evacuate_asm(fn_val.return_type, entry_label, ctx.table), prims_actors@behaviour_result_move_asm(fn_val.return_type, entry_label, state_release_proven, term_message_copy@md_reply_copy_asm(fn_val, entry_label, copy_markers, ctx.table), ctx.table));
             false -> ""
         };
 
@@ -2990,7 +2968,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
             true -> "";
             false -> concat(concat(sret_copy, behaviour_move), concat(epi_restores, control@function_epilogue_tail_with_effects(fn_val.effects, fn_epilogue_adopts(fn_val))))
         };
-        concat(concat(concat(eff_comment, "\n"), concat(concat(concat(concat(concat(fpb_comment, ra_comment), prims_actors@behaviour_convention_prefix(fn_val.return_type)), concat(prologue_full, frame_floor_init_asm())), sret_save), "\n")), concat(registry_init_inject, concat(concat(concat(concat(tco_body_label, body), "\n"), float_to_exit), concat(epilogue, tco_stub))))
+        concat(concat(concat(eff_comment, "\n"), concat(concat(concat(concat(concat(fpb_comment, ra_comment), prims_actors@behaviour_convention_prefix(fn_val.return_type, state_release_proven)), concat(prologue_full, frame_floor_init_asm())), sret_save), "\n")), concat(registry_init_inject, concat(concat(concat(concat(tco_body_label, body), "\n"), float_to_exit), concat(epilogue, tco_stub))))
 }
 
 // True when main returns float64: emit FCVTZS W0, D0 so process exit code reflects computed value.

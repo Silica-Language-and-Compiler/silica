@@ -239,6 +239,8 @@ How the compiler marks it: the SIR generator tags a return-position kind-5 call 
 
 The same two cases apply to the **behaviour function itself**: its result `(:reply, r, s)` is a static tuple in the runtime's slot (X20, `use_actor_reply_sret_buffer`), and `s` is the new state root; the dispatch-end evacuation of §4 is case (b) with the state area as the destination, and `r` is copied to the caller by §5.3.
 
+> **Amendment, 2026-10-28 (not yet implemented, not yet measured).** Return-time choice for a callee's frame. Frame adoption in (a) is the KEEP option. At a return two costs are compared. KEEP the callee's frame: the callee's garbage G stays on the stack a little longer; the copy of the result R is avoided. COPY the live result out (the evacuation of (b)): R bytes are copied plus a transient scratch about the size of R, and the frame's garbage is freed. Rule: keep the frame while G is small relative to R; copy the live result out once G is large relative to R. This bounds stack retention by the live data plus the limit. The threshold is an open measurement and is not chosen here. This is a copy-versus-retain choice inside frame allocation; it does not change the lifetime rules, the tail-call loop exclusion stays, and a non-return use still needs no copy when the frame dies at return. Committed stack pages are returned after an evacuation so a deep spike does not stay resident for the rest of the unit (this returns committed pages mid-dispatch). Status: the rule is not implemented; the option-1 extension (adoption for the parser shapes, Phase3_notes.md sections 6-8) is uncommitted in the working tree; the stage-2 build and the memory measurements are pending.
+
 ### 3.4 Where the compiler sees the flow: the return-position analysis
 
 The analysis is syntactic over the function's SIR and needs no flow sensitivity:
@@ -256,6 +258,8 @@ rp(node) :=
 A kind-5 user call with `rp(call)` true and the call not the TCO tail is marked `|rp`. A call whose result type is pointer-free (`term_message_regions@type_is_pointer_free`, 135) is never marked: nothing to adopt. A call inside a `case` scrutinee, a let's right-hand side whose name is later read, an argument position, or a comparison is not in return position and is evacuated at that site.
 
 Cost of a wrong classification: none for safety, only for memory. Marking too little evacuates where adoption would do (copies); marking too much is impossible by construction because the predicate is syntactic.
+
+> **Amendment, 2026-10-28 (not yet implemented, not yet measured).** The analysis above decides only whether a call is in return position, that is, whether adoption is possible. The copy-or-keep rule of the §3.3 amendment would add a second decision at a `|rp` call: adopt (keep) while the callee's garbage G is small relative to the result R, evacuate (copy) once G is large relative to R. The two costs are G held longer on the stack (keep) against R bytes copied plus transient scratch about the size of R (copy). The G/R threshold is an open measurement, to be taken before any value is chosen; the tail-call loop exclusion is unchanged. Not implemented.
 
 ### 3.5 The evacuation routine
 
@@ -662,7 +666,26 @@ The zero-growth trials of design §19.4 (`actors_addition/zero_heap_growth_*`, `
 
 ### 11.1 Phases
 
+**Status (updated 2026-10-31; update each line as its phase completes).**
+
+| Phase | Status |
+| --- | --- |
+| 0. Groundwork | done (earlier chunk 15 work) |
+| 1. Lifetime polymorphism | done (earlier chunk 15 work) |
+| 2. Frame allocation and evacuation on return | done: merged to main as PR #48 (merge 0adcec2d8c); selfhost binary as binaries/silica-999938 (earlier publish) |
+| 3. State at the base, dispatch end, retire | closed by Lee 2026-10-31; phase 3 compiler published as binaries/silica-999937-macos-applesilicon; goldens and final gate not verified; 3e and the memory target removed from the completion gate |
+| 4. Messages, replies, spawn | in progress: preparation corrections under way (Phase4_prep.md); implementation not started |
+| 5. Stdlib field removal and result reshaping | not started |
+| 6. Region checker | not started |
+| 7. FFI retention | not started |
+| 8. Linux lock-step close-out | not started; after phase 7 (Lee 2026-10-30) |
+| 9. ESP32-S3 | not started; after phase 7 (Lee 2026-10-30) |
+| 10. The single fixed point | not started |
+
+
 **Gate between phases (Lee, 2026-10-24).** There are **no fixed points between phases**. Exactly one fixed point is reached, after the last phase, on every hosted target. **[Lee, 2026-10-24, second ruling: the last phase is the ESP32-S3 phase 9; the single hosted fixed point is phase 10 and comes after the board phase, run last on the Mac, pix and nix.]** Between phases the gate is: the compiler builds (the incremental development build, `make INSTALL_SELFHOST=0 SILICA_TARGET_PROMPT=0` in `compiler/src`, with the published compiler as the builder) and the trials stay green on the targets the phase touches (`make integrate`, memory note "Trials: integrate is the gate"). No phase's completion depends on a gen1/gen2/fixpoint run. Each phase names a **smoke test** that stands in for the fixed point it does not run (§11.4).
+
+**Linux and ESP32 timing (Lee, 2026-10-30).** For every phase of chunk 15, the Linux (aarch64, x86-64) and ESP32-S3 updates are done after phase 7, not as part of phases 3, 4, 5 and 6. No Linux builds are run until phase 7. Phase 8 is the Linux close-out and phase 9 the ESP32-S3 port, as the table below says.
 
 **Bootstrap rule** (design §13): a language change the compiler's own source uses must be accepted by the published compiler that builds it; so every phase that changes the language lands as implement-then-use, and the compiler's own source adopts a new form only after a compiler that accepts it has been built and used as the builder for the next step (an unpublished build in the scratchpad is enough for development; publishing is Lee's).
 
@@ -833,6 +856,7 @@ Plain statements of where the decisions, taken as written, cannot be implemented
 
 ## Revision history
 
+- 1.2a (2026-10-28): amendment, not yet implemented and not yet measured: the copy-or-keep rule at a return (keep the callee frame while its garbage is small relative to the result, copy the live result out once it is large; threshold to be measured) added under §3.3 and §3.4, with committed stack pages returned after an evacuation. Existing text unchanged.
 - 1.2 (2026-10-24): decision 40 (the programmer chooses how the state area gives memory back) added: ACB word `#576`/byte 157 and request flag (§2.2), §2.4 note, new §4.7, spawn argument and the spawning forms (§5.4), phase 3 and the trials (§11.1, §11.3), proposal P15 (§12).
 - 1.1 (2026-10-24): Lee's answers applied: P1 to P10 and P12 to P14 confirmed (chosen options marked in §12), P11 confirmed with the reason `:state_too_large`; the single fixed point moved after the ESP32-S3 phase (§11.1 phases 8 to 10, §11.4); failure reasons split by cause (decision 39, §10, phase 0), `:stack_reserve_failed` keeps its name.
 - 1.0 (2026-10-24): first version, written by Fable at Lee's request from requirements §2A decisions 1 to 38 and §7.5; one fixed point after all phases (Lee's correction of 2026-10-24 applied in §11.1).

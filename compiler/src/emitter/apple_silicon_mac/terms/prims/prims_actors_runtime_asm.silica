@@ -26,13 +26,16 @@
 // cpu_topology / cache / NUMA helpers (_silica_rt_apple_*, sysctl hw.*): macOS Apple Silicon only (see cpu_topology_implementation_plan Phase G).
 // ABI: spawn(X0,X1,X2)->X0  send(X0,X1)  cast(X0,X1)->W0  call(X0,X1)->X0  self()->X0  recv()->X0
 // X2=optional core_id (0 default) per §15.1.1, X4=packed stack_policy (0 = inherit the spawner's; see prims_actors_stack_asm).
-// Actor control block 592 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
+// Actor control block 608 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
 // the holder count and the parked exit notice; 2026-10-19 +32 for the carrier fields, item N, +16 for
 // the wait-list word of the restart protocol, +16 for the thread record, item N stage 2, and +16 for the
 // pending migration target, stage 3; 2026-10-24 +64 for the stack-based memory model, chunk 15 phase 0,
 // chunk15_stack_memory_design.md §2.2: #528 the state edge, #536/#544/#552 the release log base, count
 // and capacity, #560 release enabled, #568 state bytes live, #576 state policy, #584 compaction
-// requested; only #528 is read in phase 0, prims_actors_stack_asm.silica): #0..#215 the
+// requested; 2026-10-30 +16 for phase 3c: #592 the root-word descriptor of the dispatched behaviour's
+// state type, stored by its epilogue and read and cleared by _silica_rt_state_dispatch_end, #600 spare.
+// #528, #536..#568 and #592 are kept by prims_actors_state_asm.silica; #560 is set at dispatch start
+// from the behaviour's prefix word (_silica_rt_beh_proven_store) and again by the epilogue): #0..#215 the
 // actor runtime's, #216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
 // _silica_rt_sb_require), #224 started flag, #232 pending exit reason_tag (#384 its atom, or a language error's detail code), #240 active call wrapper,
 // #248/#256/#264 FFI arena base/end/bump (Phase 12), #272..#391 the runtime-managed stack fields
@@ -59,7 +62,7 @@
 // boundary by _silica_rt_carrier_apply_pending); #520 the priority level (item N stage 4; spec §22.10:
 // 0 low, 1 normal, 2 high; every actor starts at normal, stored right after both callocs below, and
 // _silica_rt_set_actor_priority changes it; a carrier actor's level is the run queue it is pushed to
-// and its weight class, _silica_rt_rq_push). Control block 592 B.
+// and its weight class, _silica_rt_rq_push). Control block 608 B.
 // spawn_linked Phase A (supervisors_implementation_development_plan): spawn_linked(X0,X1,X2,X3,X4)->X0
 // X0=init X1=beh X2=agent_type (int64) X3=row/core metadata (0 default), X4=optional supervisor trampoline.
 // Offsets: #192 supervisor actor_ref (0 root), #200 agent_type atom, #208 core_id (the row pointer of a
@@ -94,6 +97,7 @@
 
 use prims_actors_child_table_asm;
 use prims_actors_stack_asm;
+use prims_actors_state_asm;
 use prims_actors_carrier_asm;
 use prims_actors_timer_asm;
 use atom_table;
@@ -123,15 +127,19 @@ _silica_rt_actor_spawn_dangerous:
 	.p2align	2
 _silica_rt_actor_spawn:                 ; @silica_rt_actor_spawn
 	.cfi_startproc
+; X0 init, X1 beh, W2 core, X3 supervisor trampoline, X4 stack policy word, X5 dangerous (set above),
+; X6 the root descriptor of the initial state's type, or 0 (phase 3b: the state is copied into the
+; child's state area by _silica_rt_state_install once the reservation exists, prims_actors_state_asm).
 	mov	x5, xzr
 Lsp_entry:
 ; %bb.0:
-	stp	x24, x23, [sp, #-80]!           ; 16-byte Folded Spill
+	stp	x24, x23, [sp, #-96]!           ; 16-byte Folded Spill
 	stp	x22, x21, [sp, #16]             ; 16-byte Folded Spill
 	stp	x20, x19, [sp, #32]             ; 16-byte Folded Spill
 	stp	x29, x30, [sp, #48]             ; 16-byte Folded Spill
 	str	x25, [sp, #64]
 	str	x26, [sp, #72]
+	str	x27, [sp, #80]
 	add	x29, sp, #48
 	.cfi_def_cfa w29, 16
 	.cfi_offset w30, -8
@@ -142,6 +150,7 @@ Lsp_entry:
 	.cfi_offset w22, -48
 	.cfi_offset w23, -56
 	.cfi_offset w24, -64
+	mov	x27, x6
 	mov	x26, x5
 	mov	x25, x4
 	mov	x24, x3
@@ -150,7 +159,7 @@ Lsp_entry:
 	mov	x21, x0
 	mov	w22, #1                         ; =0x1
 	mov	w0, #1                          ; =0x1
-	mov	w1, #592
+	mov	w1, #608
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBB0_4
@@ -198,6 +207,14 @@ Lsp0_no_sb:
 	mov	x1, x25
 	bl	_silica_rt_actor_stack_reserve
 	cbnz	x0, LBB0_reserve_failed
+; The initial state goes into the child's state area now, before the actor can run (design §5.4): one
+; copier table per state slot (P5), the copy's root at ACB #0. A state the reservation cannot hold
+; fails the spawner with (:explicit, :state_too_large).
+	mov	x0, x19
+	mov	x1, x21
+	mov	x2, x27
+	bl	_silica_rt_state_install
+	cbnz	x0, LBB0_state_failed
 	bl	_silica_rt_install_sync_fault_handlers
 	mov	x0, x19
 	bl	_silica_rt_actor_init_region
@@ -256,6 +273,17 @@ LBB0_reserve_failed:
 	mov	x0, x19
 	bl	_free
 	bl	_silica_rt_spawn_reserve_failed
+LBB0_state_failed:
+; The reservation exists but cannot hold the initial state: identity, reservation and control block
+; go back, then the spawner fails (or main aborts). Never returns here.
+	mov	x0, x19
+	bl	_silica_rt_idt_remove
+	mov	x0, x19
+	mov	x1, xzr
+	bl	_silica_rt_actor_stack_free
+	mov	x0, x19
+	bl	_free
+	bl	_silica_rt_spawn_state_too_large
 LBB0_3:
 	ldur	x0, [x19, #144]
 	bl	_pthread_detach
@@ -287,10 +315,11 @@ LBB0_wr_skip:
 	mov	x0, x19
 	ldr	x25, [sp, #64]
 	ldr	x26, [sp, #72]
+	ldr	x27, [sp, #80]
 	ldp	x29, x30, [sp, #48]             ; 16-byte Folded Reload
 	ldp	x20, x19, [sp, #32]             ; 16-byte Folded Reload
 	ldp	x22, x21, [sp, #16]             ; 16-byte Folded Reload
-	ldp	x24, x23, [sp], #80             ; 16-byte Folded Reload
+	ldp	x24, x23, [sp], #96             ; 16-byte Folded Reload
 	ret
 	.loh AdrpAdd	Lloh0, Lloh1
 	.loh AdrpAdd	LBB0_wr_try, LBB0_wr_page
@@ -303,7 +332,8 @@ _silica_rt_actor_spawn_linked:          ; @silica_rt_actor_spawn_linked
 	mov	x6, xzr
 Lsl_entry:
 ; X6 = 1 for a dangerous actor (spawn_dangerous_linked, a :dangerous row): it keeps a thread of its
-; own; every other actor is bound to a carrier.
+; own; every other actor is bound to a carrier. X7 = the initial state's root descriptor or 0, from
+; the spawn_linked site (prims_actors@emit_spawn_linked).
 	mov	x5, xzr
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
@@ -312,12 +342,14 @@ Lsl_entry:
 	ldp	x29, x30, [sp], #16
 	ret
 LBBsl_common:
-; X0-X5 as above, X6 = 1 dangerous (kept in X26).
-	stp	x26, x25, [sp, #-80]!
+; X0-X5 as above, X6 = 1 dangerous (kept in X26), X7 = the root descriptor of the initial state's type
+; or 0 (kept in X27; phase 3b: _silica_rt_state_install copies the state into the child's state area).
+	stp	x26, x25, [sp, #-96]!
 	stp	x24, x23, [sp, #16]
 	stp	x22, x21, [sp, #32]
 	stp	x20, x19, [sp, #48]
 	stp	x29, x30, [sp, #64]
+	str	x27, [sp, #80]
 	add	x29, sp, #64
 	.cfi_def_cfa w29, 16
 	.cfi_offset w30, -8
@@ -330,6 +362,7 @@ LBBsl_common:
 	.cfi_offset w24, -64
 	.cfi_offset w25, -72
 	.cfi_offset w26, -80
+	mov	x27, x7
 	mov	x26, x6
 	mov	x25, x5
 	mov	x23, x2
@@ -338,7 +371,7 @@ LBBsl_common:
 	mov	x20, x1
 	mov	x21, x0
 	mov	w0, #1
-	mov	w1, #592
+	mov	w1, #608
 	bl	_calloc
 	mov	x19, x0
 	cbz	x0, LBBsl_4
@@ -422,15 +455,29 @@ Lslp_skip_list:
 ; thread's current actor (X1 = 0), since a row is respawned from any actor's drain of the
 ; supervisor's ingress (prims_actors_child_table_asm.silica, supervisor_drain_ingress), which no
 ; longer installs the supervisor as the current actor; anything else the current actor's.
+; A row child's own state policy (decision 40: the child spec's state_policy field, kept in its row at
+; +128, X24 = the row) replaces the state bits of that word; the runtime stores them at ACB #576.
 	mov	x0, x19
 	mov	x1, xzr
 	cbz	x25, Lslp_policy
 	ldr	x1, [x25, #360]
-	cbnz	x1, Lslp_policy
+	cbnz	x1, Lslp_have_policy
 	mov	x1, #2
+Lslp_have_policy:
+	cbz	x24, Lslp_policy
+	ldr	x9, [x24, #128]
+	and	x9, x9, #0x30
+	orr	x1, x1, x9
 Lslp_policy:
 	bl	_silica_rt_actor_stack_reserve
 	cbnz	x0, LBBsl_reserve_failed
+; The initial state (ACB #0, stored above) goes into the child's state area before the actor can run
+; (design §5.4; a row child's every start and restart copies the row's start.0 afresh, Q14).
+	mov	x0, x19
+	ldr	x1, [x19]
+	mov	x2, x27
+	bl	_silica_rt_state_install
+	cbnz	x0, LBBsl_state_failed
 	bl	_silica_rt_install_sync_fault_handlers
 	mov	x0, x19
 	bl	_silica_rt_actor_init_region
@@ -504,6 +551,19 @@ LBBsl_reserve_failed:
 	mov	x0, x25
 	bl	_silica_rt_acb_release
 	bl	_silica_rt_spawn_reserve_failed
+LBBsl_state_failed:
+; The reservation cannot hold the initial state: identity, reservation, control block and the hold on
+; the supervisor go back, then the spawner fails (or main aborts). Never returns here.
+	mov	x0, x19
+	bl	_silica_rt_idt_remove
+	mov	x0, x19
+	mov	x1, xzr
+	bl	_silica_rt_actor_stack_free
+	mov	x0, x19
+	bl	_free
+	mov	x0, x25
+	bl	_silica_rt_acb_release
+	bl	_silica_rt_spawn_state_too_large
 LBBsl_3:
 	ldur	x0, [x19, #144]
 	bl	_pthread_detach
@@ -517,11 +577,12 @@ LBBsl_adopted:
 	bl	_silica_rt_spawn_wait_started
 LBBsl_4:
 	mov	x0, x19
+	ldr	x27, [sp, #80]
 	ldp	x29, x30, [sp, #64]
 	ldp	x20, x19, [sp, #48]
 	ldp	x22, x21, [sp, #32]
 	ldp	x24, x23, [sp, #16]
-	ldp	x26, x25, [sp], #80
+	ldp	x26, x25, [sp], #96
 	ret
 	.loh AdrpAdd	Lslp_tm0, Lslp_tm1
 	.cfi_endproc
@@ -535,12 +596,16 @@ _silica_rt_actor_spawn_dangerous_linked:
 	.p2align	2
 _silica_rt_actor_spawn_linked_row:
 ; A supervisor starts the child of one of its rows: X0-X4 as spawn_linked, X3 = the row, X5 = the
-; supervisor's ACB, X6 = 1 for a :dangerous row. The child's reference on the supervision block (the
-; row's +88) is taken here, before its thread can run and end; a spawn that fails gives it back.
+; supervisor's ACB, X6 = 1 for a :dangerous row; X7, the initial state's root descriptor, is the row's
+; +136 (the child spec's hidden word, copied into the row by materialize and start_child), so every
+; restart copies start.0 into the new child's state area as the first start did. The child's reference
+; on the supervision block (the row's +88) is taken here, before its thread can run and end; a spawn
+; that fails gives it back.
 	stp	x20, x19, [sp, #-32]!
 	stp	x29, x30, [sp, #16]
 	add	x29, sp, #16
 	mov	x19, x3
+	ldr	x7, [x19, #136]
 	ldr	x9, [x19, #88]
 	add	x9, x9, #112
 Lslr_ref:
@@ -752,6 +817,7 @@ LBB1_payload_not_owned:
 	ldr	x0, [x20, #8]
 	ldp	x1, x8, [x19]
 	cbz	x8, LBB1_ingress_no_beh
+	bl	_silica_rt_beh_proven_store
 	mov	x2, sp
 	ldr	x9, [x19, #272]
 	cbz	x9, LBB1_sw_none_1
@@ -828,6 +894,7 @@ LBB1_ingress_user_beh:
 	ldr	x0, [x20, #8]
 	ldp	x1, x8, [x19]
 	cbz	x8, LBB1_ingress_no_beh
+	bl	_silica_rt_beh_proven_store
 	mov	x2, sp
 	ldr	x9, [x19, #272]
 	cbz	x9, LBB1_sw_none_2
@@ -855,9 +922,18 @@ LBB1_ingress_no_reply_result:
 	mov	w22, #0
 	b	LBB1_post_beh
 LBB1_post_beh:
-; Message boundary: the behavior has returned and its stack is empty, so the release algorithm
-; runs now, before the reply is handed to the caller (spec §15.1.2.2).
+; Message boundary: the behavior has returned and its stack is empty. Dispatch end first (chunk 15
+; phase 3c, chunk15_stack_memory_design.md §4.6 step 2: the new state's nodes into the state area, the
+; release log, the state policy; an exit notice served in the behaviour's place, w22, has no state),
+; then the release algorithm, measuring from the new edge, before the reply is handed to the caller
+; (spec §15.1.2.2).
 	mov	x23, x9
+	cbnz	w22, LBB1_post_state_kept
+	mov	x0, x19
+	mov	x1, x9
+	bl	_silica_rt_state_dispatch_end
+	mov	x23, x0
+LBB1_post_state_kept:
 	mov	x0, x19
 	bl	_silica_rt_stack_on_message_return
 	mov	x9, x23
@@ -3804,6 +3880,26 @@ _silica_rt_heap_used:
 	add	x8, x8, _silica_rt_heap_in_use@PAGEOFF
 	ldar	x0, [x8]
 	ret
+	.globl	_silica_rt_compact_state
+	.p2align	2
+_silica_rt_compact_state:
+; compact_state() (decision 40, P15; chunk15_stack_memory_design.md §4.7): under :compact_on_request
+; (ACB #576 = 2) it sets the compaction request (#584 = 1), which the dispatch end reads and clears;
+; under :keep_state_area and :shrink_after_compaction, and outside an actor (main), it does nothing.
+; -> X0 = 0 (unit).
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	bl	_silica_rt_tls_current_actor_get
+	cbz	x0, Lcst_done
+	ldr	x9, [x0, #576]
+	cmp	x9, #2
+	b.ne	Lcst_done
+	mov	x9, #1
+	str	x9, [x0, #584]
+Lcst_done:
+	mov	x0, xzr
+	ldp	x29, x30, [sp], #16
+	ret
 	.globl	_silica_rt_raw_alloc
 _silica_rt_raw_alloc:
 ; X0=size. malloc with a [next][size] header, NOT linked into the global region
@@ -5709,6 +5805,7 @@ _silica_rt_pid_registry_init_spawn:
 	mov	x0, x9
 	mov	x1, x10
 	mov	w2, wzr
+	mov	x6, xzr
 	adrp	x8, _silica_rt_runtime_spawner@PAGE
 	add	x8, x8, _silica_rt_runtime_spawner@PAGEOFF
 	adrp	x9, _silica_rt_spawn_rec_override@PAGE
@@ -5754,6 +5851,7 @@ _silica_rt_dangerous_pid_registry_init_spawn:
 	mov	x0, x9
 	mov	x1, x10
 	mov	w2, wzr
+	mov	x6, xzr
 	adrp	x8, _silica_rt_runtime_spawner@PAGE
 	add	x8, x8, _silica_rt_runtime_spawner@PAGEOFF
 	adrp	x9, _silica_rt_spawn_rec_override@PAGE
@@ -5798,6 +5896,7 @@ _silica_rt_device_pid_registry_init_spawn:
 	mov	x0, x9
 	mov	x1, x10
 	mov	w2, wzr
+	mov	x6, xzr
 	adrp	x8, _silica_rt_runtime_spawner@PAGE
 	add	x8, x8, _silica_rt_runtime_spawner@PAGEOFF
 	adrp	x9, _silica_rt_spawn_rec_override@PAGE
@@ -6626,9 +6725,9 @@ _silica_rt_exit_payload_free:
 	b	_silica_rt_acb_release
 Lepf_ret:
 	ret
-; The dead actor (never alive, never freed: its holder count can never reach 0). 592 bytes, the
-; control block's size: #392 holders, #400 notice, #408 identity -1, then zeros to #591 (#528 the state
-; edge, 0: no stack).
+; The dead actor (never alive, never freed: its holder count can never reach 0). 608 bytes, the
+; control block's size: #392 holders, #400 notice, #408 identity -1, then zeros to #607 (#528 the state
+; edge, 0: no stack; #592 no state descriptor).
 	.section	__DATA,__data
 	.p2align	4
 	.globl	_silica_rt_dead_acb
@@ -6644,6 +6743,7 @@ _silica_rt_dead_acb:
 	.quad	0, 0, 0, 0
 	.quad	0, 0
 	.quad	0, 0
+	.quad	0, 0
 	.section	__TEXT,__text,regular,pure_instructions
 ; _silica_rt_registry_name_taken: a registered name was already held by a live actor or supervisor
 ; (spec §20.3.1: spawn_registered, spawn_registered_supervisor, a supervised child id). Ends the current
@@ -6653,7 +6753,9 @@ _silica_rt_dead_acb:
 ; _silica_rt_beh_convention(X0 = behaviour entry or 0) -> X0 = 1 call-only, 2 cast-only, 0 not checked
 ; (spec §16.2.6.4). The emitter writes 0x5C1AC0F1 / 0x5C1AC0F2 in the word before the entry of every
 ; function declared to return (:reply, ...) / (:no_reply, ...); runtime-internal behaviours and
-; supervisors (no behaviour) have no such word. Leaf; clobbers X9-X10 only.
+; supervisors (no behaviour) have no such word. Bit 2 of the word (0x5C1AC0F5 / 0x5C1AC0F6) is the
+; state-release proof of chunk15_stack_memory_design.md §4.1 (phase 3c, prims_actors@
+; behaviour_convention_prefix): bits 0-1 are the convention. Leaf; clobbers X9-X10 only.
 	.globl	_silica_rt_beh_convention
 	.p2align	2
 _silica_rt_beh_convention:
@@ -6664,12 +6766,32 @@ _silica_rt_beh_convention:
 	movk	w0, #0x5C1, lsl #16
 	cmp	w10, w0
 	b.ne	Lbc_none
-	and	x0, x9, #0xF
+	and	x0, x9, #0x3
 	cmp	x0, #3
 	b.lo	Lbc_ret
 Lbc_none:
 	mov	x0, xzr
 Lbc_ret:
+	ret
+; _silica_rt_beh_proven_store(X8 = behaviour entry, X19 = ACB): stores the prefix word's proof bit at
+; ACB #560 (release enabled, §4.2) at dispatch start, so retire() logs during a proven behaviour's
+; dispatch; 0 for a word that is not a behaviour prefix. The epilogue stores the flag again (the value
+; the dispatch end trusts: a behaviour-shaped helper called inside the body has its own prologue-free
+; prefix, and only the function that returns to the runtime decides). Leaf; clobbers X9-X11 only.
+	.globl	_silica_rt_beh_proven_store
+	.p2align	2
+_silica_rt_beh_proven_store:
+	ldur	w9, [x8, #-4]
+	lsr	w10, w9, #4
+	movz	w11, #0xAC0F
+	movk	w11, #0x5C1, lsl #16
+	cmp	w10, w11
+	b.ne	Lbps_none
+	ubfx	x9, x9, #2, #1
+	str	x9, [x19, #560]
+	ret
+Lbps_none:
+	str	xzr, [x19, #560]
 	ret
 ; _silica_rt_convention_mismatch: a call()/cast() whose target was spawned with the other calling
 ; convention (spec §16.2.6.4), or kill_abnormal naming the calling actor (§15.1.2.3). Nothing was
@@ -7258,6 +7380,6 @@ fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref
     canonical_arena_asm: string <- canonical_arena_runtime_asm@emit_canonical_arena_runtime_asm();
     ordering_identity_asm: string <- ordering_identity_runtime_asm@emit_ordering_identity_runtime_asm();
     checked_int64_asm: string <- checked_int64_runtime_asm@emit_checked_int64_runtime_asm();
-    stack_asm: string <- concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
+    stack_asm: string <- concat(concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_state_asm@emit_actor_state_runtime_asm()), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
     concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), actor_rt_asm_chunk_9()), actor_rt_asm_chunk_10()), actor_rt_asm_chunk_11()), actor_rt_asm_chunk_12()), actor_rt_asm_chunk_13()), actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), actor_rt_asm_badarith_chunk()), concat(actor_rt_asm_case_clause_chunk(), concat(actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, checked_int64_asm))))))))), concat(stack_asm, prims_actors_timer_asm@emit_actor_timer_runtime_asm()))
 }

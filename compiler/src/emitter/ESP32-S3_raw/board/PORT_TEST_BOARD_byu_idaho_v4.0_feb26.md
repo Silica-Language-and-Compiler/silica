@@ -149,7 +149,7 @@ minidip A header J9 on GPIO13-18; UART1 header on GPIO35/36.
 | RGB LED | **Red GPIO2, green GPIO4, blue GPIO5**, all active high (confirmed one colour at a time). The sheet's "Red: 1" is wrong: GPIO1 is a display-connector pin |
 | Single LED (GPIO6) | Works, active high, but **faint**: a red 0603 LED behind 5.1 kΩ (~0.3 mA). Easy to miss in room light |
 | Buzzer (GPIO48) | Works. Fed from +3.3 V through the **RV1 trimmer** (blue block marked W102 beside BUZZER1, a 0-1 kΩ volume control, 25-turn, slips at the ends); on this unit it arrived turned to the quiet end and was silent until turned ~30 turns counter-clockwise. Loudest at its 2.7 kHz resonance |
-| Addressable LEDs (GPIO7) | Work: 24 x WS2813B-2121, GRB order, driven by a bit-banged stream (`asm_11_addressable_leds`) without a level shifter (3.3 V data into 5 V LEDs). A square wave cannot light them (every long low is a reset). The pulse widths are nop counts, so asm_11 now measures the CPU clock first: 4/14 nops (0/1) at the 20 MHz hand-off of 2026-09-12; at the 40 MHz hand-off of 2026-09-29, 12–14 / 32–36 nops give clean frames, 9/29 mixed colours, 16/40 all ones (white); the app uses 13/34 |
+| Addressable LEDs (GPIO7) | Work: 24 x WS2813B-2121, GRB order, driven by a bit-banged stream (`silica_21_device_led_row`) without a level shifter (3.3 V data into 5 V LEDs). A square wave cannot light them (every long low is a reset). The pulse widths are nop counts, so the LED timing now measures the CPU clock first: 4/14 nops (0/1) at the 20 MHz hand-off of 2026-09-12; at the 40 MHz hand-off of 2026-09-29, 12–14 / 32–36 nops give clean frames, 9/29 mixed colours, 16/40 all ones (white); the app uses 13/34 |
 | J4 jumpers | All 15 fitted on this unit (photo, 2026-09-12) |
 
 ## Port notes (derived from the sheet, not part of it)
@@ -204,12 +204,12 @@ on macOS as well.
 
 | Item | Result |
 | --- | --- |
-| CPU clock after ROM hand-off | **40 MHz** (40.00 M CCOUNT cycles per `ets_delay_us(1 s)`, real seconds by wall clock; asm_04's 20.0 M cycles per 0.5 s tone says the same) — twice the ~20 MHz measured on 2026-09-12, on both units. Nop-timed pulses (asm_11) came out half as wide and no LED decoded them until the app measured the clock and doubled its nop counts |
+| CPU clock after ROM hand-off | **40 MHz** (40.00 M CCOUNT cycles per `ets_delay_us(1 s)`, real seconds by wall clock) — twice the ~20 MHz measured on 2026-09-12, on both units. Nop-timed pulses came out half as wide and no LED decoded them until the app measured the clock and doubled its nop counts |
 | Pad read-back (asm_09) | GPIO 1, 2, 4, 5, 6, 7, 48 and (probe) GPIO 0, 1, 3, 45, 46 all drive 1 and 0 — GPIO46 is output-capable on the ESP32-S3 |
 | LED (GPIO6) | blinks, faint |
 | RGB LED | red GPIO2, green GPIO4, blue GPIO5, active high |
 | Buzzer (GPIO48) | three rising tones once RV1 is turned up |
 | Buttons | Left 21, Right 10, Down 47, Up 11, A 34, B 33: idle 0, pressed 1. **Point is the BOOT switch** (SW1 → 470 Ω → GPIO0): idle 1, pressed 0. The joystick has no push wired to a GPIO |
 | Joystick | GPIO8 = X, GPIO9 = Y (pot wipers). Read as digital inputs: 1 at rest (mid-rail); X reads 0 pushed left and 1 pushed right, Y reads 0 pushed up and 1 pushed down. Anything finer needs the ADC |
-| Addressable LEDs (GPIO7) | Work: all 24, red / green / blue / running white, once asm_11 measured the 40 MHz clock and used its 13/34-nop table. With the 20 MHz table only LED 1 lit (green for a red frame) and the rest held stale data — a timing symptom, not a fault |
+| Addressable LEDs (GPIO7) | Work: all 24, red / green / blue / running white, once the LED timing measured the 40 MHz clock and used its 13/34-nop table. With the 20 MHz table only LED 1 lit (green for a red frame) and the rest held stale data — a timing symptom, not a fault |
 | Display | works — see the section above |
