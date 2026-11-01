@@ -1,0 +1,553 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Actor / concurrency builtins (silica-specification ?4.5 actor_ref, ?15 spawn, ?16 call/cast/send, self).
+// String-only helpers and spawn signature validation; call sites use type_checker_expressions@check_expr.
+
+use parser_ast;
+use type_checker_core;
+
+export count_chain_args/1;
+export trim_leading_actor/1;
+export behavior_return_is_call_only/1;
+export behavior_return_is_cast_only/1;
+export validate_spawn_behavior_function_type/3;
+export parse_behavior_state_param_type/1;
+export parse_behavior_reply_type/1;
+export parse_function_return_actor/1;
+export parse_behavior_msg_param_type/1;
+export lookup_actor_behavior_type/2;
+export lookup_actor_behavior_name/2;
+export env_lookup_surface/2;
+export actor_behavior_name_key/1;
+export qualified_behavior_name/2;
+export self_alias_marker_name/1;
+export actor_target_self_kind/2;
+export actor_target_name/1;
+export self_termination_message/2;
+export spawn_init_expr/1;
+export spawn_behavior_expr/1;
+export spawn_placement_expr/1;
+export call_has_impl_am_marker/1;
+export supervisor_reply_record_type/0;
+export check_behavior_no_self_recursion/1;
+export is_actor_behavior_declaration/1;
+export tc_in_behavior_marker_name/0;
+export type_context_has_behavior_marker/1;
+export tc_in_main_marker_name/0;
+export type_context_has_main_marker/1;
+
+// Mirrors count_call_args_user_call in type_checker_expressions.silica (call arg chain encoding).
+fn count_chain_args(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> int64 {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.inner);
+    right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.right_expr);
+    inner_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(inner_e);
+    right_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(right_e);
+    case inner_node.kind == -1 of {
+        true -> 0;
+        false -> case right_node.kind == -1 of {
+            true -> 1;
+            false -> case right_node.kind == 4 of {
+                true -> 1 + count_chain_args(right_e);
+                false -> 2
+            }
+        }
+    }
+}
+
+fn trim_leading_actor_from(s: string, i: int64) -> string {
+    case i >= length_bytes(s) of {
+        true -> "";
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> trim_leading_actor_from(s, i + 1);
+            false -> substring(s, i, length_bytes(s))
+        }
+    }
+}
+
+fn trim_leading_actor(s: string) -> string {
+    trim_leading_actor_from(s, 0)
+}
+
+// ?15.1.1 / ?15.1.2: behavior returns (:reply, Reply, State) or (:no_reply, State).
+// Tuple type strings preserve atom lexemes (e.g. :reply, :no_reply). Legacy checks also accept (atom, R, S) / (atom, S).
+// Distinguish by arity: 3-element reply tuple = :reply; 2-element = :no_reply.
+fn behavior_return_is_call_only(return_type: string) -> boolean {
+    t: string <- trim_leading_actor(return_type);
+    case length_bytes(t) >= 8 of {
+        false -> false;
+        true -> substring(t, 0, 8) == "(:reply," or behavior_return_first_elem_is(t, ":reply") or behavior_return_is_atom_3_tuple(t)
+    }
+}
+
+// Bracket-aware form of the "(:reply," prefix test: the parser re-joins some annotations from
+// tokens with a space after every token ("( :reply , ..."), e.g. when the State type carries
+// fn-typed or ref?/region fields, and the 8-byte prefix test then rejected a valid behaviour.
+fn behavior_return_first_elem_is(t: string, want: string) -> boolean {
+    case length_bytes(t) < 2 or substring(t, 0, 1) != "(" of {
+        true -> false;
+        false -> {
+            inner: string <- substring(t, 1, length_bytes(t));
+            first_comma: int64 <- find_top_level_comma_actor(inner, 0, 0);
+            first: string <- trim_leading_actor(substring(inner, 0, first_comma));
+            trim_trailing_actor_ws(first) == want
+        }
+    }
+}
+
+fn trim_trailing_actor_ws(s: string) -> string {
+    case length_bytes(s) == 0 of {
+        true -> s;
+        false -> case substring(s, length_bytes(s) - 1, length_bytes(s)) == " " of {
+            true -> trim_trailing_actor_ws(substring(s, 0, length_bytes(s) - 1));
+            false -> s
+        }
+    }
+}
+
+fn behavior_return_is_atom_3_tuple(t: string) -> boolean {
+    case length_bytes(t) >= 6 of {
+        false -> false;
+        true -> case substring(t, 0, 6) == "(atom," of {
+            true -> count_top_level_commas_actor(t, 1, 0, 0) == 2;
+            false -> false
+        }
+    }
+}
+
+fn behavior_return_is_atom_2_tuple(t: string) -> boolean {
+    case length_bytes(t) >= 6 of {
+        false -> false;
+        true -> case substring(t, 0, 6) == "(atom," of {
+            true -> count_top_level_commas_actor(t, 1, 0, 0) == 1;
+            false -> false
+        }
+    }
+}
+
+fn count_top_level_commas_actor(s: string, i: int64, depth: int64, count: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> count;
+        false -> case substring(s, i, i + 1) == "(" of {
+            true -> count_top_level_commas_actor(s, i + 1, depth + 1, count);
+            false -> case substring(s, i, i + 1) == ")" of {
+                true -> case depth == 0 of {
+                    true -> count;
+                    false -> count_top_level_commas_actor(s, i + 1, depth - 1, count)
+                };
+                false -> case substring(s, i, i + 1) == "," of {
+                    true -> case depth == 0 of {
+                        true -> count_top_level_commas_actor(s, i + 1, depth, count + 1);
+                        false -> count_top_level_commas_actor(s, i + 1, depth, count)
+                    };
+                    false -> count_top_level_commas_actor(s, i + 1, depth, count)
+                }
+            }
+        }
+    }
+}
+
+fn behavior_return_is_cast_only(return_type: string) -> boolean {
+    t: string <- trim_leading_actor(return_type);
+    case length_bytes(t) >= 11 of {
+        false -> behavior_return_is_atom_2_tuple(t);
+        true -> substring(t, 0, 11) == "(:no_reply," or behavior_return_is_atom_2_tuple(t)
+    }
+}
+
+// Top-level arrow only: a behaviour whose State (or Reply) type carries an fn-typed field, e.g.
+// a wbt_map's compare_key, has " -> " INSIDE the parameter types; taking the first arrow split the
+// function type there and rejected the behaviour with "return type must be (:reply, ...)".
+fn find_arrow_pos_actor(s: string, i: int64) -> int64 {
+    find_arrow_pos_actor_depth(s, i, 0)
+}
+
+fn find_arrow_pos_actor_depth(s: string, i: int64, depth: int64) -> int64 {
+    case i + 4 > length_bytes(s) of {
+        true -> -1;
+        false -> case depth == 0 and substring(s, i, i + 4) == " -> " of {
+            true -> i;
+            false -> case substring(s, i, i + 1) == "(" or substring(s, i, i + 1) == "[" or substring(s, i, i + 1) == "{" of {
+                true -> find_arrow_pos_actor_depth(s, i + 1, depth + 1);
+                false -> case substring(s, i, i + 1) == ")" or substring(s, i, i + 1) == "]" or substring(s, i, i + 1) == "}" of {
+                    true -> find_arrow_pos_actor_depth(s, i + 1, depth - 1);
+                    false -> find_arrow_pos_actor_depth(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+fn get_params_inner_actor(func_type: string) -> string {
+    arrow_pos: int64 <- find_arrow_pos_actor(func_type, 0);
+    case arrow_pos < 0 of {
+        true -> "";
+        false -> {
+            params_part: string <- substring(func_type, 0, arrow_pos);
+            case length_bytes(params_part) < 2 of {
+                true -> "";
+                false -> trim_leading_actor(substring(params_part, 1, length_bytes(params_part) - 1))
+            }
+        }
+    }
+}
+
+fn find_top_level_comma_actor(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> case substring(s, i, i + 1) == "(" or substring(s, i, i + 1) == "[" or substring(s, i, i + 1) == "{" of {
+            true -> find_top_level_comma_actor(s, i + 1, depth + 1);
+            false -> case substring(s, i, i + 1) == ")" or substring(s, i, i + 1) == "]" or substring(s, i, i + 1) == "}" of {
+                true -> case depth <= 0 of {
+                    true -> length_bytes(s);
+                    false -> find_top_level_comma_actor(s, i + 1, depth - 1)
+                };
+                false -> case substring(s, i, i + 1) == "," of {
+                    true -> case depth == 0 of {
+                        true -> i;
+                        false -> find_top_level_comma_actor(s, i + 1, depth)
+                    };
+                    false -> find_top_level_comma_actor(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+fn get_first_param_actor(params_inner: string) -> (string, string) {
+    case length_bytes(params_inner) == 0 of {
+        true -> ("", "");
+        false -> {
+            comma_pos: int64 <- find_top_level_comma_actor(params_inner, 0, 0);
+            case comma_pos >= length_bytes(params_inner) of {
+                true -> (trim_leading_actor(params_inner), "");
+                false -> {
+                    first: string <- trim_leading_actor(substring(params_inner, 0, comma_pos));
+                    rest: string <- trim_leading_actor(substring(params_inner, comma_pos + 1, length_bytes(params_inner)));
+                    (first, rest)
+                }
+            }
+        }
+    }
+}
+
+fn parse_function_return_actor(func_type: string) -> string {
+    arrow_pos: int64 <- find_arrow_pos_actor(func_type, 0);
+    case arrow_pos < 0 of {
+        true -> "";
+        false -> trim_leading_actor(substring(func_type, arrow_pos + 4, length_bytes(func_type)))
+    }
+}
+
+// Second parameter type is the actor state (initial_state must match it). ?15.1.1.
+fn parse_behavior_state_param_type(func_type: string) -> string {
+    inner: string <- get_params_inner_actor(func_type);
+    (_msg: string, after_msg: string) <- get_first_param_actor(inner);
+    (state_t: string, tail: string) <- get_first_param_actor(after_msg);
+    case length_bytes(trim_leading_actor(tail)) > 0 of {
+        true -> "";
+        false -> trim_leading_actor(state_t)
+    }
+}
+
+// ?16: Extract the message parameter type (first param) from a behavior function type.
+fn parse_behavior_msg_param_type(func_type: string) -> string {
+    inner: string <- get_params_inner_actor(func_type);
+    (msg_t: string, _rest: string) <- get_first_param_actor(inner);
+    msg_t
+}
+
+fn validate_spawn_behavior_function_type(builtin_label: string, func_type: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    arrow_pos: int64 <- find_arrow_pos_actor(func_type, 0);
+    case arrow_pos < 0 of {
+        true -> type_checker_core@type_check_err("E2005", location, concat(concat(builtin_label, ": behavior must be a function type (Msg, State) -> (:reply, ...) or (:no_reply, ...)"), " ?15.1.1"), "sect15");
+        false -> {
+            inner: string <- get_params_inner_actor(func_type);
+            (_msg_t: string, after_msg: string) <- get_first_param_actor(inner);
+            case length_bytes(trim_leading_actor(after_msg)) == 0 of {
+                true -> type_checker_core@type_check_err("E2005", location, concat(concat(builtin_label, ": behavior must take exactly two parameters (message, state)"), " ?15.1.1"), "sect15");
+                false -> {
+                    (_state_t: string, tail: string) <- get_first_param_actor(after_msg);
+                    case length_bytes(trim_leading_actor(tail)) > 0 of {
+                        true -> type_checker_core@type_check_err("E2005", location, concat(concat(builtin_label, ": behavior must take exactly two parameters (message, state)"), " ?15.1.1"), "sect15");
+                        false -> {
+                            ret: string <- parse_function_return_actor(func_type);
+                            case behavior_return_is_call_only(ret) of {
+                                true -> type_checker_core@type_check_ok();
+                                false -> case behavior_return_is_cast_only(ret) of {
+                                    true -> type_checker_core@type_check_ok();
+                                    false -> type_checker_core@type_check_err("E2005", location, concat(builtin_label, ": behavior return type must be (:reply, Reply, State) or (:no_reply, State) per ?15.1.2"), "sect15")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// spawn(init, behavior): inner = init, right_expr.kind==4, right_expr.inner = behavior (when 2 args).
+fn spawn_init_expr(call_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(call_expr);
+    parser_ast@expr_at(call_expr, node.inner)
+}
+
+fn spawn_behavior_expr(call_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(call_expr);
+    right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(call_expr, node.right_expr);
+    right_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(right_e);
+    parser_ast@expr_at(call_expr, right_node.inner)
+}
+
+// Third argument when present: call_expr.right_expr.right_expr.inner
+fn spawn_placement_expr(call_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(call_expr);
+    right1: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(call_expr, node.right_expr);
+    right1_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(right1);
+    right2: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(call_expr, right1_node.right_expr);
+    right2_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(right2);
+    parser_ast@expr_at(call_expr, right2_node.inner)
+}
+
+// ?16.3.2: Check if a call's message argument has the postfix `impl ActorMessage {}` marker.
+// The parser stores "AM" in the value field of the kind-4 pair node holding the message argument.
+fn arg_chain_has_impl_am_marker(arg_chain: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arg_chain);
+    case node.kind == 4 of {
+        false -> false;
+        true -> case node.value == "AM" of {
+            true -> true;
+            false -> arg_chain_has_impl_am_marker(parser_ast@expr_at(arg_chain, node.right_expr))
+        }
+    }
+}
+
+fn call_has_impl_am_marker(call_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(call_expr);
+    arg_chain_has_impl_am_marker(parser_ast@expr_at(call_expr, node.right_expr))
+}
+
+fn supervisor_reply_record_type() -> string {
+    "{ tag: :child_started | :ok | :children | :count | :child_info | :error, child: actor_ref, status: atom, children: List[{ id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient },mem(normal)], count: int64, child_info: { id: atom, agent_type: :worker | :supervisor, child: actor_ref, restart: :permanent | :temporary | :transient }, error: atom }"
+}
+
+// Local env walk: seed iface spells is_effect_alias as boolean on TypeContext but bool on lookup_symbol_*.
+fn env_has_name(env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], name: string) -> boolean {
+    case env.is_nil of {
+        true -> false;
+        false -> case env.head.name == name of {
+            true -> true;
+            false -> env_has_name(env.tail, name)
+        }
+    }
+}
+
+fn env_lookup_surface(env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], name: string) -> string {
+    case env.is_nil of {
+        true -> "";
+        false -> case env.head.name == name of {
+            true -> env.head.surface_type;
+            false -> env_lookup_surface(env.tail, name)
+        }
+    }
+}
+
+// Look up the behavior function type for an actor_ref used in call/cast/send.
+// At spawn, the type checker stores __actor_beh__<var> -> behavior_type in the env.
+fn lookup_actor_behavior_type(call_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, context: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> string {
+    call_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(call_expr);
+    ref_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(call_expr, call_node.inner);
+    ref_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(ref_e);
+    case ref_node.kind == 1 of {
+        true -> {
+            key: string <- concat("__actor_beh__", ref_node.name);
+            env_lookup_surface(context.env, key)
+        };
+        false -> ""
+    }
+}
+
+// The qualified name of the behaviour an actor_ref binding was spawned with ("module@name"),
+// stored at the spawn binding as __actor_beh_name__<var>; "" when it is not known.
+fn lookup_actor_behavior_name(call_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, context: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> string {
+    call_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(call_expr);
+    ref_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(call_expr, call_node.inner);
+    ref_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(ref_e);
+    case ref_node.kind == 1 of {
+        true -> env_lookup_surface(context.env, actor_behavior_name_key(ref_node.name));
+        false -> ""
+    }
+}
+
+fn actor_behavior_name_key(var_name: string) -> string {
+    concat("__actor_beh_name__", var_name)
+}
+
+// "module@name" for a behaviour named in a spawn: a qualified name as written, an unqualified
+// one in the module of the file that names it.
+fn qualified_behavior_name(name: string, file: string) -> string {
+    case contains(name, "@") of {
+        true -> name;
+        false -> concat(concat(module_name_of_path(file), "@"), name)
+    }
+}
+
+fn module_name_of_path(path: string) -> string {
+    base: string <- path_after_last_slash(path, 0, 0);
+    n: int64 <- length_bytes(base);
+    case n > 7 and ends_with(base, ".silica") of {
+        true -> substring(base, 0, n - 7);
+        false -> base
+    }
+}
+
+fn path_after_last_slash(path: string, i: int64, start: int64) -> string {
+    case i >= length_bytes(path) of {
+        true -> substring(path, start, length_bytes(path));
+        false -> case substring(path, i, i + 1) == "/" of {
+            true -> path_after_last_slash(path, i + 1, i + 1);
+            false -> path_after_last_slash(path, i + 1, start)
+        }
+    }
+}
+
+// Env marker for an actor_ref binding known to hold self() (spec 15.1.2.3, 16.2.6.5):
+// surface "1" when the binding is self() itself, "0" when a later binding of the name is not.
+fn self_alias_marker_name(var_name: string) -> string {
+    concat("__self_alias__", var_name)
+}
+
+// 1 when `ref_e` (the target argument of call, remove_actor or kill_abnormal) is self(),
+// 2 when it is a name bound from self(), 0 otherwise.
+fn actor_target_self_kind(ref_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, context: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> int64 {
+    ref_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(ref_e);
+    case ref_node.kind == 4 and ref_node.name == "self" of {
+        true -> 1;
+        false -> case ref_node.kind == 1 and env_lookup_surface(context.env, self_alias_marker_name(ref_node.name)) == "1" of {
+            true -> 2;
+            false -> 0
+        }
+    }
+}
+
+// The name a self-alias target is written with ("" for self() itself).
+fn actor_target_name(ref_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> string {
+    ref_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(ref_e);
+    case ref_node.kind == 1 of {
+        true -> ref_node.name;
+        false -> ""
+    }
+}
+
+// ?16.1.1: Extract Reply type from behavior's (:reply, Reply, State) return.
+fn parse_behavior_reply_type(func_type: string) -> string {
+    ret: string <- parse_function_return_actor(func_type);
+    t: string <- trim_leading_actor(ret);
+    case behavior_return_is_call_only(t) of {
+        false -> "";
+        true -> {
+            inner: string <- case length_bytes(t) >= 2 of {
+                true -> substring(t, 1, length_bytes(t) - 1);
+                false -> ""
+            };
+            case length_bytes(inner) == 0 of {
+                true -> "";
+                false -> {
+                    first_comma: int64 <- find_top_level_comma_actor(inner, 0, 0);
+                    case first_comma >= length_bytes(inner) of {
+                        true -> "";
+                        false -> {
+                            after_first: string <- trim_leading_actor(substring(inner, first_comma + 1, length_bytes(inner)));
+                            second_comma: int64 <- find_top_level_comma_actor(after_first, 0, 0);
+                            case second_comma >= length_bytes(after_first) of {
+                                true -> "";
+                                false -> trim_leading_actor(substring(after_first, 0, second_comma))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ?15.1.2: Behavior functions must not call themselves; the runtime owns the message loop.
+fn body_has_self_call(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, name: string) -> boolean {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(e);
+    case node.kind < 0 of {
+        true -> false;
+        false -> case node.kind == 4 and node.name == name of {
+            true -> true;
+            false -> case body_has_self_call(parser_ast@expr_at(e, node.inner), name) of {
+                true -> true;
+                false -> body_has_self_call(parser_ast@expr_at(e, node.right_expr), name)
+            }
+        }
+    }
+}
+
+fn check_behavior_no_self_recursion(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    is_behavior: boolean <- behavior_return_is_call_only(decl.return_type_name) or behavior_return_is_cast_only(decl.return_type_name);
+    case is_behavior of {
+        false -> type_checker_core@type_check_ok();
+        true -> case body_has_self_call(decl.body, decl.name) of {
+            true -> type_checker_core@type_check_err("E2005", decl.location, concat(concat("behavior function '", decl.name), "' must not be recursive (?15.1.2); the actor runtime owns the message loop"), "sect15");
+            false -> type_checker_core@type_check_ok()
+        }
+    }
+}
+
+// Two-parameter function with behavior return tuple (?15.1.1–?15.1.2): body may use
+// spawn_linked, link, monitor, demonitor (§15.4.8.3–§15.4.8.7; supervisors plan Phase D/G).
+fn is_actor_behavior_declaration(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> boolean {
+    behavior_return_is_call_only(decl.return_type_name) or behavior_return_is_cast_only(decl.return_type_name)
+}
+
+// Type-checker-only env marker (not a language keyword); type_checker_declarations_functions adds it while checking behavior bodies.
+fn tc_in_behavior_marker_name() -> string {
+    "__silica_tc_in_behavior"
+}
+
+fn type_context_has_behavior_marker(ctx: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> boolean {
+    env_has_name(ctx.env, tc_in_behavior_marker_name())
+}
+
+// supervisors plan Phase I: wait_for_exit/0 is only legal in main's body — env marker during main type-check (like behavior).
+fn tc_in_main_marker_name() -> string {
+    "__silica_tc_in_main"
+}
+
+fn type_context_has_main_marker(ctx: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> boolean {
+    env_has_name(ctx.env, tc_in_main_marker_name())
+}
+
+// Spec 15.1.2.3: remove_actor and kill_abnormal must not name the calling actor.
+fn self_termination_message(builtin: string, alias: string) -> string {
+    written: string <- case length_bytes(alias) == 0 of {
+        true -> "self()";
+        false -> alias
+    };
+    target: string <- case length_bytes(alias) == 0 of {
+        true -> "self()";
+        false -> concat(concat("'", alias), "', which is bound to self(),")
+    };
+    head: string <- concat(concat(concat(builtin, "("), written), ") names the calling actor: ");
+    body: string <- concat(concat(concat(builtin, " ends another actor, and "), target), " is the actor making the call; an actor ends itself only with stop_self or fail_self (§15.1.2.3)");
+    concat(head, body)
+}

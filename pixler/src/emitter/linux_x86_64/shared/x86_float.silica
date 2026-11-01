@@ -1,0 +1,368 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Floating point over virtual registers on Linux x86-64 (SSE2 scalar, SSE4.1 round, F16C halves).
+//
+//   float64 (D VRs)  addsd / subsd / mulsd / divsd / sqrtsd, ucomisd, cvtsi2sd, cvttsd2si
+//   float32 (S VRs)  the ss forms
+//   float16 (H VRs)  widened with vcvtph2ps, computed in float32, narrowed with vcvtps2ph (round to
+//                    nearest even), which is bit-identical to a native half operation for + - * / sqrt
+// A float VR's bits live in its home exactly as on AArch64 (D: 8 bytes, S: the low 4, H: the low 2), so
+// FMOV is a bit copy (x86_isa@x86_mov). Scratch: xmm8-xmm11, rax, r12.
+//
+// Compares. FCMP a, b followed by an AArch64 condition maps onto ucomisd/ucomiss flags (ZF, PF, CF):
+//   a < b: CF   a == b: ZF   a > b: none   unordered: ZF PF CF
+// so a condition that must exclude (or include) the unordered case tests PF as well; the table is in
+// fcc_branch / fcc_set. x86_fcmp itself is flag-setting; the consumers are flag-transparent.
+
+use string_parse;
+use x86_vr;
+use x86_isa;
+
+export x86_fop/4;
+export x86_fneg/2;
+export x86_fabs/2;
+export x86_fsqrt/2;
+export x86_fcmp/2;
+export x86_fcset/2;
+export x86_fbcond/2;
+export x86_fcmp_set/4;
+export x86_fcmp_branch/4;
+export x86_fcmp_select/6;
+export x86_fcvt/2;
+export x86_scvtf/2;
+export x86_ucvtf/2;
+export x86_fcvtzs/2;
+export x86_fcvtzu/2;
+export x86_frintz/2;
+export x86_fclass/3;
+export x86_fput32/2;
+export x86_fput16/2;
+
+fn ins1(op: string, a: string) -> string {
+    x86_vr@x86_ins(op, a)
+}
+
+fn ins2(op: string, a: string, b: string) -> string {
+    x86_vr@x86_ins(op, concat(a, concat(", ", b)))
+}
+
+fn ins3(op: string, a: string, b: string, c: string) -> string {
+    x86_vr@x86_ins(op, concat(a, concat(", ", concat(b, concat(", ", c)))))
+}
+
+fn cls(v: string) -> string {
+    x86_vr@vr_class(v)
+}
+
+// The 64 home bits of v into scratch xmm x; an H value is widened to a float32 in x's low lane.
+fn fin(v: string, x: string) -> string {
+    case cls(v) == "H" of {
+        true -> concat(x86_vr@x86_fload(v, x), ins2("vcvtph2ps", x, x));
+        false -> x86_vr@x86_fload(v, x)
+    }
+}
+
+// Write the low 32 bits of scratch xmm x to a float VR, zero-extended in its home (an S result).
+fn x86_fput32(dst: string, x: string) -> string {
+    case x86_vr@vr_is_reg(dst) of {
+        true -> concat(ins2("movd", "eax", x), ins2("movd", x86_vr@vr_xmm(dst), "eax"));
+        false -> concat(ins2("movd", "eax", x), ins2("mov", x86_vr@vr_slot_mem_sized(dst, "QWORD"), "rax"))
+    }
+}
+
+// Narrow the float32 in x's low lane to a half and write it, zero-extended, to dst (an H result).
+fn x86_fput16(dst: string, x: string) -> string {
+    narrow: string <- concat(ins3("vcvtps2ph", x, x, "0"), concat(ins2("movd", "eax", x), ins2("movzx", "eax", "ax")));
+    case x86_vr@vr_is_reg(dst) of {
+        true -> concat(narrow, ins2("movd", x86_vr@vr_xmm(dst), "eax"));
+        false -> concat(narrow, ins2("mov", x86_vr@vr_slot_mem_sized(dst, "QWORD"), "rax"))
+    }
+}
+
+// Result in x (D bits, S bits, or a float32 to be narrowed) into dst by dst's class.
+fn fout(dst: string, x: string) -> string {
+    c: string <- cls(dst);
+    case c == "D" of {
+        true -> x86_vr@x86_fput(dst, x);
+        false -> case c == "S" of {
+            true -> x86_fput32(dst, x);
+            false -> x86_fput16(dst, x)
+        }
+    }
+}
+
+// --- arithmetic ------------------------------------------------------------------------------
+
+fn op_sd(op: string) -> string {
+    case op of {
+        "add" -> "addsd"; "sub" -> "subsd"; "mul" -> "mulsd"; _: string -> "divsd"
+    }
+}
+
+fn op_ss(op: string) -> string {
+    case op of {
+        "add" -> "addss"; "sub" -> "subss"; "mul" -> "mulss"; _: string -> "divss"
+    }
+}
+
+// dest = a <op> b, op in add/sub/mul/div; precision from dest's class (D, S or H).
+fn x86_fop(op: string, dest: string, a: string, b: string) -> string {
+    c: string <- cls(dest);
+    load: string <- concat(fin(a, "xmm8"), fin(b, "xmm9"));
+    body: string <- case c == "D" of {
+        true -> ins2(op_sd(op), "xmm8", "xmm9");
+        false -> ins2(op_ss(op), "xmm8", "xmm9")
+    };
+    concat(concat(load, body), fout(dest, "xmm8"))
+}
+
+// Sign-bit operations are exact bit operations at every precision; masks are built in a GPR (no
+// constant pool) and moved into xmm9.
+fn mask_into_xmm9(c: string, sign_only: boolean) -> string {
+    case c == "D" of {
+        true -> concat(ins2("mov", "rax", case sign_only of { true -> "-9223372036854775808"; false -> "9223372036854775807" }), ins2("movq", "xmm9", "rax"));
+        false -> case c == "S" of {
+            true -> concat(ins2("mov", "eax", case sign_only of { true -> "2147483648"; false -> "2147483647" }), ins2("movd", "xmm9", "eax"));
+            false -> concat(ins2("mov", "eax", case sign_only of { true -> "32768"; false -> "32767" }), ins2("movd", "xmm9", "eax"))
+        }
+    }
+}
+
+fn x86_fneg(dest: string, a: string) -> string {
+    c: string <- cls(dest);
+    concat(concat(concat(x86_vr@x86_fload(a, "xmm8"), mask_into_xmm9(c, true)), ins2("pxor", "xmm8", "xmm9")), x86_vr@x86_fput(dest, "xmm8"))
+}
+
+fn x86_fabs(dest: string, a: string) -> string {
+    c: string <- cls(dest);
+    concat(concat(concat(x86_vr@x86_fload(a, "xmm8"), mask_into_xmm9(c, false)), ins2("pand", "xmm8", "xmm9")), x86_vr@x86_fput(dest, "xmm8"))
+}
+
+fn x86_fsqrt(dest: string, a: string) -> string {
+    c: string <- cls(dest);
+    body: string <- case c == "D" of {
+        true -> ins2("sqrtsd", "xmm8", "xmm8");
+        false -> ins2("sqrtss", "xmm8", "xmm8")
+    };
+    concat(concat(fin(a, "xmm8"), body), fout(dest, "xmm8"))
+}
+
+// --- compares --------------------------------------------------------------------------------
+
+// FCMP a, b: ucomisd / ucomiss on the widened operands. Sets ZF, PF, CF.
+fn x86_fcmp(a: string, b: string) -> string {
+    c: string <- cls(a);
+    load: string <- concat(fin(a, "xmm8"), fin(b, "xmm9"));
+    case c == "D" of {
+        true -> concat(load, ins2("ucomisd", "xmm8", "xmm9"));
+        false -> concat(load, ins2("ucomiss", "xmm8", "xmm9"))
+    }
+}
+
+// Branch on an AArch64 condition after FCMP. Conditions that need two flags use a private skip label.
+fn fcc_branch(cond: string, label: string) -> string {
+    case cond of {
+        "EQ" -> concat(ins1("jp", "93f"), concat(ins1("je", label), "93:\n"));
+        "NE" -> concat(ins1("jne", label), ins1("jp", label));
+        "MI" -> concat(ins1("jp", "93f"), concat(ins1("jb", label), "93:\n"));
+        "LO" -> concat(ins1("jp", "93f"), concat(ins1("jb", label), "93:\n"));
+        "CC" -> concat(ins1("jp", "93f"), concat(ins1("jb", label), "93:\n"));
+        "LT" -> ins1("jb", label);
+        "GE" -> ins1("jae", label);
+        "GT" -> ins1("ja", label);
+        "LE" -> ins1("jbe", label);
+        "HI" -> concat(ins1("ja", label), ins1("jp", label));
+        "LS" -> concat(ins1("jp", "93f"), concat(ins1("jbe", label), "93:\n"));
+        "HS" -> concat(ins1("jae", label), ins1("jp", label));
+        "CS" -> concat(ins1("jae", label), ins1("jp", label));
+        "PL" -> concat(ins1("jae", label), ins1("jp", label));
+        "VS" -> ins1("jp", label);
+        "VC" -> ins1("jnp", label);
+        _: string -> concat("    .error \"x86_float: condition ", concat(cond, "\"\n"))
+    }
+}
+
+// al = 0/1 for the condition after FCMP.
+fn fcc_set() -> string {
+    ""
+}
+
+fn set2(a: string, b: string, join: string) -> string {
+    concat(concat(ins1(concat("set", a), "al"), ins1(concat("set", b), "r12b")), ins2(join, "al", "r12b"))
+}
+
+fn fcc_al(cond: string) -> string {
+    case cond of {
+        "EQ" -> set2("e", "np", "and");
+        "NE" -> set2("ne", "p", "or");
+        "MI" -> set2("b", "np", "and");
+        "LO" -> set2("b", "np", "and");
+        "CC" -> set2("b", "np", "and");
+        "LT" -> ins1("setb", "al");
+        "GE" -> ins1("setae", "al");
+        "GT" -> ins1("seta", "al");
+        "LE" -> ins1("setbe", "al");
+        "HI" -> set2("a", "p", "or");
+        "LS" -> set2("be", "np", "and");
+        "HS" -> set2("ae", "p", "or");
+        "CS" -> set2("ae", "p", "or");
+        "PL" -> set2("ae", "p", "or");
+        "VS" -> ins1("setp", "al");
+        "VC" -> ins1("setnp", "al");
+        _: string -> concat("    .error \"x86_float: condition ", concat(cond, "\"\n"))
+    }
+}
+
+// CSET dst, cond after an FCMP.
+fn x86_fcset(dst: string, cond: string) -> string {
+    concat(concat(fcc_al(cond), ins2("movzx", "eax", "al")), x86_vr@x86_put64(dst, "rax"))
+}
+
+// B.cond label after an FCMP.
+fn x86_fbcond(cond: string, label: string) -> string {
+    fcc_branch(cond, label)
+}
+
+fn x86_fcmp_set(dst: string, cond: string, a: string, b: string) -> string {
+    concat(x86_fcmp(a, b), x86_fcset(dst, cond))
+}
+
+fn x86_fcmp_branch(cond: string, a: string, b: string, label: string) -> string {
+    concat(x86_fcmp(a, b), x86_fbcond(cond, label))
+}
+
+// FCMP a, b; CSEL dst, t, f, cond over integer VRs t / f.
+fn x86_fcmp_select(dst: string, t: string, f: string, cond: string, a: string, b: string) -> string {
+    flag: string <- concat(x86_fcmp(a, b), fcc_al(cond));
+    pick: string <- concat(concat(x86_isa@x86_mov("X16", f), x86_isa@x86_mov("X17", t)), concat(ins2("test", "al", "al"), concat(ins2("mov", "rax", "QWORD PTR [rbp - SVR_X16]"), ins2("cmovne", "rax", "QWORD PTR [rbp - SVR_X17]"))));
+    concat(concat(flag, pick), x86_vr@x86_put64(dst, "rax"))
+}
+
+// --- conversions -----------------------------------------------------------------------------
+
+// FCVT between precisions.
+fn x86_fcvt(dest: string, a: string) -> string {
+    dc: string <- cls(dest);
+    ac: string <- cls(a);
+    case dc == ac of {
+        true -> x86_isa@x86_mov(dest, a);
+        false -> case dc == "D" of {
+            // S or H (widened to S by fin) -> D
+            true -> concat(concat(fin(a, "xmm8"), ins2("cvtss2sd", "xmm8", "xmm8")), x86_vr@x86_fput(dest, "xmm8"));
+            false -> case ac == "D" of {
+                // D -> S or H
+                true -> concat(concat(x86_vr@x86_fload(a, "xmm8"), ins2("cvtsd2ss", "xmm8", "xmm8")), fout(dest, "xmm8"));
+                // S <-> H: fin widens an H, fout narrows to an H
+                false -> concat(fin(a, "xmm8"), fout(dest, "xmm8"))
+            }
+        }
+    }
+}
+
+// SCVTF: signed integer (W or X) -> float.
+fn x86_scvtf(dest: string, a: string) -> string {
+    wide: boolean <- cls(a) == "X";
+    dc: string <- cls(dest);
+    src: string <- case wide of { true -> "rax"; false -> "eax" };
+    load: string <- case wide of { true -> x86_vr@x86_load64(a, "rax"); false -> x86_vr@x86_load32(a, "rax") };
+    conv: string <- case dc == "D" of {
+        true -> ins2("cvtsi2sd", "xmm8", src);
+        false -> ins2("cvtsi2ss", "xmm8", src)
+    };
+    concat(concat(load, concat(ins2("pxor", "xmm8", "xmm8"), conv)), fout(dest, "xmm8"))
+}
+
+// UCVTF: unsigned integer -> float. A 32-bit source is zero-extended and converted as a 64-bit signed
+// value; a 64-bit source with the top bit set is halved (keeping the sticky low bit) and doubled after.
+fn x86_ucvtf(dest: string, a: string) -> string {
+    wide: boolean <- cls(a) == "X";
+    dc: string <- cls(dest);
+    cvt: string <- case dc == "D" of { true -> "cvtsi2sd"; false -> "cvtsi2ss" };
+    dbl: string <- case dc == "D" of { true -> ins2("addsd", "xmm8", "xmm8"); false -> ins2("addss", "xmm8", "xmm8") };
+    load: string <- case wide of { true -> x86_vr@x86_load64(a, "rax"); false -> x86_vr@x86_load32(a, "rax") };
+    body: string <- case wide of {
+        false -> ins2(cvt, "xmm8", "rax");
+        true -> concat(concat(concat(ins2("test", "rax", "rax"), ins1("js", "94f")), concat(ins2(cvt, "xmm8", "rax"), ins1("jmp", "95f"))), concat(concat("94:\n", concat(ins2("mov", "r12", "rax"), concat(ins2("shr", "r12", "1"), concat(ins2("and", "eax", "1"), ins2("or", "r12", "rax"))))), concat(ins2(cvt, "xmm8", "r12"), concat(dbl, "95:\n"))))
+    };
+    concat(concat(load, concat(ins2("pxor", "xmm8", "xmm8"), body)), fout(dest, "xmm8"))
+}
+
+// FCVTZS: float -> signed integer, rounding toward zero.
+fn x86_fcvtzs(dest: string, a: string) -> string {
+    wide: boolean <- cls(dest) == "X";
+    is_d: boolean <- cls(a) == "D";
+    r: string <- case wide of { true -> "rax"; false -> "eax" };
+    conv: string <- case is_d of {
+        true -> ins2("cvttsd2si", r, "xmm8");
+        false -> ins2("cvttss2si", r, "xmm8")
+    };
+    concat(concat(fin(a, "xmm8"), conv), x86_vr@x86_put64(dest, "rax"))
+}
+
+// FCVTZU: float -> unsigned integer, rounding toward zero. Values at or above 2^63 (2^31 for W) are
+// converted after subtracting that power of two and the bit is restored afterwards.
+fn x86_fcvtzu(dest: string, a: string) -> string {
+    wide: boolean <- cls(dest) == "X";
+    is_d: boolean <- cls(a) == "D";
+    cvt: string <- case is_d of { true -> "cvttsd2si"; false -> "cvttss2si" };
+    big: string <- case is_d of {
+        true -> concat(ins2("mov", "rax", case wide of { true -> "4890909195324358656"; false -> "4746794007248502784" }), ins2("movq", "xmm9", "rax"));
+        false -> concat(ins2("mov", "eax", case wide of { true -> "1593835520"; false -> "1325400064" }), ins2("movd", "xmm9", "eax"))
+    };
+    cmp: string <- case is_d of { true -> ins2("ucomisd", "xmm8", "xmm9"); false -> ins2("ucomiss", "xmm8", "xmm9") };
+    sub: string <- case is_d of { true -> ins2("subsd", "xmm8", "xmm9"); false -> ins2("subss", "xmm8", "xmm9") };
+    fix: string <- case wide of {
+        true -> concat(ins2("mov", "r12", "-9223372036854775808"), ins2("xor", "rax", "r12"));
+        false -> concat(ins2("mov", "r12d", "2147483648"), ins2("xor", "eax", "r12d"))
+    };
+    r: string <- case wide of { true -> "rax"; false -> "eax" };
+    body: string <- concat(concat(concat(big, cmp), concat(ins1("jae", "96f"), concat(ins2(cvt, r, "xmm8"), ins1("jmp", "97f")))), concat("96:\n", concat(sub, concat(ins2(cvt, r, "xmm8"), concat(fix, "97:\n")))));
+    concat(concat(fin(a, "xmm8"), body), x86_vr@x86_put64(dest, "rax"))
+}
+
+// FRINTZ: round toward zero to an integral value of the same precision.
+fn x86_frintz(dest: string, a: string) -> string {
+    c: string <- cls(a);
+    body: string <- case c == "D" of {
+        true -> ins3("roundsd", "xmm8", "xmm8", "3");
+        false -> ins3("roundss", "xmm8", "xmm8", "3")
+    };
+    concat(concat(fin(a, "xmm8"), body), fout(dest, "xmm8"))
+}
+
+// is_nan / is_inf / is_finite (kind "nan", "inf", "finite") from the compare flags: a value is NaN when
+// it is unordered with itself; infinite when |a| == +inf; finite when |a| < +inf. Result 0/1 in dest.
+fn x86_fclass(dest: string, kind: string, a: string) -> string {
+    c: string <- cls(a);
+    inf_bits: string <- case c == "D" of {
+        true -> concat(ins2("mov", "rax", "9218868437227405312"), ins2("movq", "xmm9", "rax"));
+        false -> concat(ins2("mov", "eax", "2139095040"), ins2("movd", "xmm9", "eax"))
+    };
+    cmp: string <- case c == "D" of { true -> ins2("ucomisd", "xmm8", "xmm9"); false -> ins2("ucomiss", "xmm8", "xmm9") };
+    case kind == "nan" of {
+        true -> concat(concat(x86_fcmp(a, a), fcc_al("VS")), concat(ins2("movzx", "eax", "al"), x86_vr@x86_put64(dest, "rax")));
+        false -> {
+            absv: string <- concat(concat(fin(a, "xmm8"), mask_into_xmm9(case c == "D" of { true -> "D"; false -> "S" }, false)), ins2("pand", "xmm8", "xmm9"));
+            flag: string <- case kind == "inf" of {
+                true -> fcc_al("EQ");
+                false -> fcc_al("MI")
+            };
+            concat(concat(concat(absv, inf_bits), concat(cmp, flag)), concat(ins2("movzx", "eax", "al"), x86_vr@x86_put64(dest, "rax")))
+        }
+    }
+}

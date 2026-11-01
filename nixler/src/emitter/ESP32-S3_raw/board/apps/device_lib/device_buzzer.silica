@@ -1,0 +1,120 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The port test board's buzzer (board_pack: GPIO48 through J4 27-28, an MLT-5020 behind a DTC114E
+// transistor, loudest at buzzer_resonance_hz() = 2730 Hz; the RV1 trimmer is its volume control and
+// is silent at one end) as a device worker that makes a square wave from LEDC low-speed timer 0 and
+// channel 0 (device_esp32s3_ledc), where asm_04_buzzer bit-banged the pin with delay loops. A tone
+// costs a handful of register writes; the pin is then driven by the hardware and the worker is free,
+// so :hold (the only wait) is the one place the worker spends time.
+//
+// This worker owns four windows: GPIO and IO_MUX for the pad (make_output, then LEDC_LS_SIG_OUT0
+// routed to it through the GPIO matrix), SYSTEM for LEDC's clock gate, and LEDC. Two workers must
+// not share a controller (spec §5.1), so an app that drives the buzzer does its other GPIO work
+// through this worker or not at all.
+//
+// State: `:unmapped` until :init; then (:mapped, gpio, mux, system, ledc), one flat tuple of the
+// four windows. A message costs the 48-byte state tuple it returns, freed at the next dispatch (the
+// board runtime gives back only the actor's previous state block and the message copy); a tone
+// allocates nothing else, the register helpers hand back only the window.
+//
+// Messages: { op: :init | :tone | :silence | :hold | :notify, freq: uint32, index: int64,
+// reply_to: actor_ref }. :init maps the windows, enables LEDC, configures timer 0 and channel 0 at
+// 50% duty with the output off, and routes the pad; the buzzer stays silent. :tone starts the
+// square wave at `freq` Hz (39..39,062 Hz after clamping, 0 is the lowest); a second :tone while
+// sounding only changes the divider, so the pitch steps without a gap. :silence stops the output
+// (the pad idles low). :hold busy-waits `index` ticks of about a millisecond in message order (no
+// delay builtin); :notify casts `freq` to reply_to so an app can print in the worker's order.
+
+use device_esp32s3_gpio;
+use device_esp32s3_ledc;
+use device_esp32s3_gpio_registers;
+use device_esp32s3_io_mux_registers;
+use device_esp32s3_ledc_registers;
+use device_esp32s3_system_registers;
+use board_pack;
+use board_pack_gpio_signals;
+
+export buzzer_worker/2;
+
+fn spin(n: int64) -> int64 {
+    case n == 0 of { true -> 0; false -> spin(n - 1) }
+}
+
+// About a millisecond per tick at the 40 MHz hand-off clock (device_esp32s3_gpio's count).
+fn hold_ticks(n: int64) -> int64 {
+    case n <= 0 of {
+        true -> 0;
+        false -> {
+            _: int64 <- spin(400);
+            hold_ticks(n - 1)
+        }
+    }
+}
+
+// The buzzer pad as a push-pull output driven low, then handed to LEDC channel 0's output signal.
+fn configure_pin(g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux))) -> (device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux))) {
+    sequence proc[register_rwr]
+        pin: uint32 <- board_pack@pin_buzzer();
+        ledc_out0: uint32 <- board_pack_gpio_signals@gpio_signal_ledc_ls_sig_out0();
+        (g1, m1) <- device_esp32s3_gpio@make_output(g, m, pin);
+        g2: device_window(L, (:esp32s3_gpio)) <- device_esp32s3_gpio@route_signal(g1, pin, ledc_out0)
+    produces
+        pure (g2, m1)
+    end
+}
+
+fn buzzer_worker(msg: { op: atom, freq: uint32, index: int64, reply_to: actor_ref }, state: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_ledc)))) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_ledc)))) {
+    sequence proc[register_rwr, concurrency]
+        next: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_ledc))) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    g: device_window(L, (:esp32s3_gpio)) <- map_device((:esp32s3_gpio), 0x60004000); // board_pack window 1
+                    m: device_window(L, (:esp32s3_io_mux)) <- map_device((:esp32s3_io_mux), 0x60009000); // board_pack window 3
+                    s: device_window(L, (:esp32s3_system)) <- map_device((:esp32s3_system), 0x600C0000); // board_pack window 8
+                    l: device_window(L, (:esp32s3_ledc)) <- map_device((:esp32s3_ledc), 0x60019000); // board_pack window 11
+                    s1: device_window(L, (:esp32s3_system)) <- device_esp32s3_ledc@ledc_enable(s);
+                    l1: device_window(L, (:esp32s3_ledc)) <- device_esp32s3_ledc@ledc_init(l);
+                    l2: device_window(L, (:esp32s3_ledc)) <- device_esp32s3_ledc@ledc_channel0_configure(l1);
+                    (g1, m1) <- configure_pin(g, m);
+                    (:mapped, g1, m1, s1, l2)
+                };
+                _: atom -> :unmapped
+            };
+            (:mapped, g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), l: device_window(L, (:esp32s3_ledc))) -> case msg.op of {
+                :tone -> {
+                    l1: device_window(L, (:esp32s3_ledc)) <- device_esp32s3_ledc@ledc_set_divider(l, device_esp32s3_ledc@ledc_divider(msg.freq));
+                    l2: device_window(L, (:esp32s3_ledc)) <- device_esp32s3_ledc@ledc_channel0_start(l1, device_esp32s3_ledc@ledc_half_duty());
+                    (:mapped, g, m, s, l2)
+                };
+                :silence -> (:mapped, g, m, s, device_esp32s3_ledc@ledc_channel0_stop(l));
+                :hold -> {
+                    _: int64 <- hold_ticks(msg.index);
+                    state
+                };
+                :notify -> {
+                    code: uint32 <- msg.freq;
+                    _: boolean <- cast(msg.reply_to, code impl ActorMessage {});
+                    state
+                };
+                _: atom -> state
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}

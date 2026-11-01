@@ -1,0 +1,114 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Control flow: function prologue/epilogue for Linux x86-64 (System V frame chain, Intel syntax).
+// Effect-aware: mem(atomic) gets an mfence at entry and exit (DMB ISH on AArch64, spec §9.1.1).
+//
+// The frame (design_documents/ports/porting_to_linux_x86_64_hosted.md Phase 3, regs/README.md):
+//     push rbp ; mov rbp, rsp ; sub rsp, SVR_AREA
+// SVR_AREA is an assembler symbol emitter_core defines in front of every function once its body is
+// known (x86_frame_header): the area of frame-slot homes for the virtual registers X11-X28 / D8-D31.
+// The emitter's own [X29, #-N] slot area sits below it (X29's value is rbp - SVR_AREA), so every
+// AArch64 frame offset carries over unchanged. Saved rbp and the return address are at [rbp] and
+// [rbp + 8], the standard x86-64 chain, so debuggers and the failure banner walk it. `leave` restores
+// rsp from rbp, which is what LDP X29, X30, [SP], #16 required of SP anyway.
+
+use emitter_effects;
+use x86_mem;
+
+export function_prologue/1;
+export function_epilogue_with_frame/0;
+export function_prologue_with_effects/2;
+export function_epilogue_with_effects/1;
+export function_tail_frame_release/1;
+export function_prologue_main_with_effects/2;
+export function_epilogue_main_with_effects/1;
+export function_epilogue_tail_with_effects/2;
+
+// Label and frame. Every definition is also declared .globl here (see the linux_aarch64 note: glibc's
+// dladdr reads only .dynsym, so the actor failure banner needs the definitions exported by -rdynamic).
+fn function_prologue(name: string) -> string {
+    globl_line: string <- concat(concat(".globl ", name), "\n");
+    concat(globl_line, concat(name, ":\n    push rbp\n    mov rbp, rsp\n    sub rsp, SVR_AREA\n"))
+}
+
+// Restore frame, then return (matches function_prologue).
+fn function_epilogue_with_frame() -> string {
+    concat("    leave\n", "    ret")
+}
+
+fn has_atomic_effect(fn_effects: string) -> boolean {
+    case emitter_effects@is_pure(fn_effects) of {
+        true -> false;
+        false -> emitter_effects@has_mem_atomic(fn_effects)
+    }
+}
+
+// Effect-aware prologue: label + frame + entry barrier for mem(atomic) functions.
+fn function_prologue_with_effects(name: string, fn_effects: string) -> string {
+    base: string <- function_prologue(name);
+    case has_atomic_effect(fn_effects) of {
+        true -> concat(base, "    mfence\n");
+        false -> base
+    }
+}
+
+// Effect-aware epilogue: exit barrier + frame restore + return.
+fn function_epilogue_with_effects(fn_effects: string) -> string {
+    base: string <- function_epilogue_with_frame();
+    case has_atomic_effect(fn_effects) of {
+        true -> concat("    mfence\n", base);
+        false -> base
+    }
+}
+
+// The end of an epilogue for chunk 15 phase 2 (no callee-saved restores: X19-X28 are frame slots
+// here). `adopt` returns with rsp where the body left it -- the frame's nodes, and anything below its
+// floor a result can still name, stay for the caller, which adopts or evacuates [rsp, its pre-call rsp)
+// after the call -- by reading the return address and the caller's rbp out of the frame record and
+// jumping; otherwise `leave; ret` puts rsp back at the entry value (behaviours and main, whose callers
+// are the runtime and crt). rax is free here: results are in rdi / xmm0.
+fn function_epilogue_tail_with_effects(fn_effects: string, adopt: boolean) -> string {
+    base: string <- case adopt of {
+        true -> "    mov rax, QWORD PTR [rbp + 8]\n    mov rbp, QWORD PTR [rbp]\n    jmp rax";
+        false -> function_epilogue_with_frame()
+    };
+    case has_atomic_effect(fn_effects) of {
+        true -> concat("    mfence\n", base);
+        false -> base
+    }
+}
+
+// Release the frame before a tail transfer (jmp): same barrier + leave ordering, no ret -- the callee
+// returns to our caller.
+fn function_tail_frame_release(fn_effects: string) -> string {
+    case has_atomic_effect(fn_effects) of {
+        true -> "    mfence\n    leave\n";
+        false -> "    leave\n"
+    }
+}
+
+// Program main is called by glibc's crt1 under the C ABI: rbx and r12-r15 (virtual-register homes and
+// scratch here) must be preserved, and the exit status returned in rax rather than X0's home rdi. The
+// registers are parked in five slots x86_frame_header reserves when it sees SVR_CS0 in the body.
+fn function_prologue_main_with_effects(name: string, fn_effects: string) -> string {
+    concat(function_prologue_with_effects(name, fn_effects), x86_mem@x86_c_csave())
+}
+
+fn function_epilogue_main_with_effects(fn_effects: string) -> string {
+    concat(concat("    mov rax, rdi\n", x86_mem@x86_c_crestore()), function_epilogue_with_effects(fn_effects))
+}

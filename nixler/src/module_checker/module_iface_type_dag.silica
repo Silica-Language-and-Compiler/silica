@@ -1,0 +1,749 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Phase 4: persist interned type DAGs in .iface and rematerialize on import
+// so dependents do not re-parse fat export surfaces.
+// Design: design_documents/module_interface_cache_and_bottom_up_typecheck_plan.md §Phase 4
+
+use type_interner;
+use type_checker_core;
+use atom_table;
+use parser_ast;
+
+export dag_section_lines/2;
+export skip_to_export_blocks/1;
+export import_iface_from_content/3;
+export add_exports_by_surface/3;
+
+fn empty_int_roots() -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[int64, mem(normal)] <- empty[int64, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn cons_int_root(v: int64, rest: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[int64, mem(normal)] <- prepend[int64, mem(normal)](v, rest)
+    produces
+        pure result
+    end
+}
+
+fn reverse_int_roots(lst: List[int64, mem(normal)], acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    case lst.is_nil of {
+        true -> acc;
+        false -> reverse_int_roots(lst.tail, cons_int_root(lst.head, acc))
+    }
+}
+
+fn empty_dag_nodes() -> List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] <- empty[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn cons_dag_node(n: { kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, rest: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)]) -> List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] <- prepend[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)](n, rest)
+    produces
+        pure result
+    end
+}
+
+fn reverse_dag_nodes(lst: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], acc: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)]) -> List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] {
+    case lst.is_nil of {
+        true -> acc;
+        false -> reverse_dag_nodes(lst.tail, cons_dag_node(lst.head, acc))
+    }
+}
+
+fn empty_dag_names() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn cons_dag_name(s: string, rest: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- prepend[string, mem(normal)](s, rest)
+    produces
+        pure result
+    end
+}
+
+fn reverse_dag_names(lst: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case lst.is_nil of {
+        true -> acc;
+        false -> reverse_dag_names(lst.tail, cons_dag_name(lst.head, acc))
+    }
+}
+
+fn intern_export_surfaces(
+    exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)],
+    interner: {
+        nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+        by_key: {
+            root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+            compare_key: fn(string, string) -> :less | :equal | :greater,
+            compare_value: fn(int64, int64) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64,
+            compare_key_ordering_bundle: int64,
+            compare_value_ordering_bundle: int64
+        },
+        names: {
+            root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+            compare_key: fn(string, string) -> :less | :equal | :greater,
+            compare_value: fn(int64, int64) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64,
+            compare_key_ordering_bundle: int64,
+            compare_value_ordering_bundle: int64
+        },
+        name_lexemes: List[string, mem(normal)],
+        next_id: int64,
+        seq_nil_id: int64
+    },
+    acc: List[int64, mem(normal)],
+    all_ok: boolean
+) -> {
+    interner: {
+        nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+        by_key: {
+            root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+            compare_key: fn(string, string) -> :less | :equal | :greater,
+            compare_value: fn(int64, int64) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64,
+            compare_key_ordering_bundle: int64,
+            compare_value_ordering_bundle: int64
+        },
+        names: {
+            root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+            compare_key: fn(string, string) -> :less | :equal | :greater,
+            compare_value: fn(int64, int64) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64,
+            compare_key_ordering_bundle: int64,
+            compare_value_ordering_bundle: int64
+        },
+        name_lexemes: List[string, mem(normal)],
+        next_id: int64,
+        seq_nil_id: int64
+    },
+    roots: List[int64, mem(normal)],
+    ok: boolean
+} {
+    case exports.is_nil of {
+        true -> { interner: interner, roots: reverse_int_roots(acc, empty_int_roots()), ok: all_ok };
+        false -> {
+            pr: { interner: {
+                nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+                by_key: {
+                    root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                    compare_key: fn(string, string) -> :less | :equal | :greater,
+                    compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                    region: region(L, normal),
+                    specialization_key: int64,
+                    compare_key_ordering_bundle: int64,
+                    compare_value_ordering_bundle: int64
+                },
+                names: {
+                    root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                    compare_key: fn(string, string) -> :less | :equal | :greater,
+                    compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                    region: region(L, normal),
+                    specialization_key: int64,
+                    compare_key_ordering_bundle: int64,
+                    compare_value_ordering_bundle: int64
+                },
+                name_lexemes: List[string, mem(normal)],
+                next_id: int64,
+                seq_nil_id: int64
+            }, id: int64, ok: boolean } <- type_interner@parse_type(interner, exports.head.type_surface);
+            tid: int64 <- case pr.ok of { true -> pr.id; false -> type_interner@invalid_type_id() };
+            next_ok: boolean <- case all_ok of { false -> false; true -> pr.ok };
+            intern_export_surfaces(exports.tail, pr.interner, cons_int_root(tid, acc), next_ok)
+        }
+    }
+}
+
+fn join_root_ids(ids: List[int64, mem(normal)]) -> string {
+    case ids.is_nil of {
+        true -> "";
+        false -> case ids.tail.is_nil of {
+            true -> atom_table@int64_to_decimal_string(ids.head);
+            false -> concat(concat(atom_table@int64_to_decimal_string(ids.head), ","), join_root_ids(ids.tail))
+        }
+    }
+}
+
+fn flag_digit(b: boolean) -> string {
+    case b of { true -> "1"; false -> "0" }
+}
+
+fn encode_dag_node_line(n: { kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }) -> string {
+    concat(
+        concat(atom_table@int64_to_decimal_string(n.kind), ","),
+        concat(
+            concat(atom_table@int64_to_decimal_string(n.arg_a), ","),
+            concat(
+                concat(atom_table@int64_to_decimal_string(n.arg_b), ","),
+                concat(concat(atom_table@int64_to_decimal_string(n.arg_c), ","), flag_digit(n.buf_size_is_name))
+            )
+        )
+    )
+}
+
+fn collect_name_lines_rev(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, i: int64, n: int64, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= n of {
+        true -> acc;
+        false -> collect_name_lines_rev(interner, i + 1, n, cons_dag_name(type_interner@interner_dag_name_at(interner, i), acc))
+    }
+}
+
+fn collect_node_lines_rev(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, i: int64, n: int64, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= n of {
+        true -> acc;
+        false -> collect_node_lines_rev(interner, i + 1, n, cons_dag_name(encode_dag_node_line(type_interner@interner_dag_node_at(interner, i)), acc))
+    }
+}
+
+fn dag_section_lines(
+    exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)],
+    impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]
+) -> List[string, mem(normal)] {
+    sequence
+        i0: {
+            nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+            by_key: {
+                root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                compare_key: fn(string, string) -> :less | :equal | :greater,
+                compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                region: region(L, normal),
+                specialization_key: int64,
+                compare_key_ordering_bundle: int64,
+                compare_value_ordering_bundle: int64
+            },
+            names: {
+                root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                compare_key: fn(string, string) -> :less | :equal | :greater,
+                compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                region: region(L, normal),
+                specialization_key: int64,
+                compare_key_ordering_bundle: int64,
+                compare_value_ordering_bundle: int64
+            },
+            name_lexemes: List[string, mem(normal)],
+            next_id: int64,
+            seq_nil_id: int64
+        } <- type_interner@create_type_interner();
+        ex: {
+            interner: {
+                nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+                by_key: {
+                    root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                    compare_key: fn(string, string) -> :less | :equal | :greater,
+                    compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                    region: region(L, normal),
+                    specialization_key: int64,
+                    compare_key_ordering_bundle: int64,
+                    compare_value_ordering_bundle: int64
+                },
+                names: {
+                    root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                    compare_key: fn(string, string) -> :less | :equal | :greater,
+                    compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                    region: region(L, normal),
+                    specialization_key: int64,
+                    compare_key_ordering_bundle: int64,
+                    compare_value_ordering_bundle: int64
+                },
+                name_lexemes: List[string, mem(normal)],
+                next_id: int64,
+                seq_nil_id: int64
+            },
+            roots: List[int64, mem(normal)],
+            ok: boolean
+        } <- intern_export_surfaces(exports, i0, empty_int_roots(), true);
+        im: {
+            interner: {
+                nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+                by_key: {
+                    root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                    compare_key: fn(string, string) -> :less | :equal | :greater,
+                    compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                    region: region(L, normal),
+                    specialization_key: int64,
+                    compare_key_ordering_bundle: int64,
+                    compare_value_ordering_bundle: int64
+                },
+                names: {
+                    root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                    compare_key: fn(string, string) -> :less | :equal | :greater,
+                    compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                    region: region(L, normal),
+                    specialization_key: int64,
+                    compare_key_ordering_bundle: int64,
+                    compare_value_ordering_bundle: int64
+                },
+                name_lexemes: List[string, mem(normal)],
+                next_id: int64,
+                seq_nil_id: int64
+            },
+            roots: List[int64, mem(normal)],
+            ok: boolean
+        } <- intern_export_surfaces(impls, ex.interner, empty_int_roots(), ex.ok);
+        result: List[string, mem(normal)] <- case im.ok of {
+            false -> empty_dag_names();
+            true -> {
+                nc: int64 <- type_interner@interner_dag_name_count(im.interner);
+                kc: int64 <- type_interner@interner_dag_node_count(im.interner);
+                names_rev: List[string, mem(normal)] <- collect_name_lines_rev(im.interner, 0, nc, empty_dag_names());
+                nodes_rev: List[string, mem(normal)] <- collect_node_lines_rev(im.interner, 0, kc, empty_dag_names());
+                acc0: List[string, mem(normal)] <- cons_dag_name(concat("impl_roots=", join_root_ids(im.roots)), empty_dag_names());
+                acc1: List[string, mem(normal)] <- cons_dag_name(concat("export_roots=", join_root_ids(ex.roots)), acc0);
+                acc2: List[string, mem(normal)] <- reverse_dag_names(nodes_rev, acc1);
+                acc3: List[string, mem(normal)] <- cons_dag_name(concat("nodes=", atom_table@int64_to_decimal_string(kc)), acc2);
+                acc4: List[string, mem(normal)] <- reverse_dag_names(names_rev, acc3);
+                acc5: List[string, mem(normal)] <- cons_dag_name(concat("names=", atom_table@int64_to_decimal_string(nc)), acc4);
+                cons_dag_name("===DAG===", acc5)
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+fn skip_until_dash(lines: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case lines.is_nil of {
+        true -> lines;
+        false -> case lines.head == "---" of {
+            true -> lines;
+            false -> skip_until_dash(lines.tail)
+        }
+    }
+}
+
+fn skip_to_export_blocks(lines: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case lines.is_nil of {
+        true -> lines;
+        false -> case lines.head == "---" of {
+            true -> lines;
+            false -> case lines.head == "===DAG===" of {
+                true -> skip_until_dash(lines.tail);
+                false -> skip_to_export_blocks(lines.tail)
+            }
+        }
+    }
+}
+
+fn is_digit_dag(c: string) -> boolean {
+    c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9"
+}
+
+fn parse_signed_dec_dag(s: string) -> (boolean, int64) {
+    case length_bytes(s) == 0 of {
+        true -> (false, 0);
+        false -> case substring(s, 0, 1) == "-" of {
+            true -> {
+                (ok: boolean, n: int64) <- parse_unsigned_dec_dag(substring(s, 1, length_bytes(s)));
+                case ok of { true -> (true, 0 - n); false -> (false, 0) }
+            };
+            false -> parse_unsigned_dec_dag(s)
+        }
+    }
+}
+
+fn parse_unsigned_dec_dag(s: string) -> (boolean, int64) {
+    case length_bytes(s) == 0 of {
+        true -> (false, 0);
+        false -> parse_unsigned_dec_dag_loop(s, 0, 0)
+    }
+}
+
+fn parse_unsigned_dec_dag_loop(s: string, i: int64, acc: int64) -> (boolean, int64) {
+    case i >= length_bytes(s) of {
+        true -> (true, acc);
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case is_digit_dag(ch) of {
+                false -> (false, 0);
+                true -> {
+                    digit: int64 <- case ch of {
+                        "0" -> 0; "1" -> 1; "2" -> 2; "3" -> 3; "4" -> 4;
+                        "5" -> 5; "6" -> 6; "7" -> 7; "8" -> 8; _: string -> 9
+                    };
+                    parse_unsigned_dec_dag_loop(s, i + 1, acc * 10 + digit)
+                }
+            }
+        }
+    }
+}
+
+fn find_comma_dag(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + 1) == "," of {
+            true -> i;
+            false -> find_comma_dag(s, i + 1)
+        }
+    }
+}
+
+fn parse_root_ids_line(s: string, i: int64, acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    case i >= length_bytes(s) of {
+        true -> reverse_int_roots(acc, empty_int_roots());
+        false -> {
+            c: int64 <- find_comma_dag(s, i);
+            case c < 0 of {
+                true -> {
+                    piece: string <- substring(s, i, length_bytes(s));
+                    case length_bytes(piece) == 0 of {
+                        true -> reverse_int_roots(acc, empty_int_roots());
+                        false -> {
+                            (ok: boolean, n: int64) <- parse_signed_dec_dag(piece);
+                            case ok of {
+                                true -> reverse_int_roots(cons_int_root(n, acc), empty_int_roots());
+                                false -> reverse_int_roots(acc, empty_int_roots())
+                            }
+                        }
+                    }
+                };
+                false -> {
+                    piece: string <- substring(s, i, c);
+                    (ok: boolean, n: int64) <- parse_signed_dec_dag(piece);
+                    next: List[int64, mem(normal)] <- case ok of { true -> cons_int_root(n, acc); false -> acc };
+                    parse_root_ids_line(s, c + 1, next)
+                }
+            }
+        }
+    }
+}
+
+fn parse_dag_node_line(s: string) -> (boolean, { kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }) {
+    c1: int64 <- find_comma_dag(s, 0);
+    case c1 < 0 of {
+        true -> (false, { kind: 0, arg_a: 0, arg_b: 0, arg_c: 0, buf_size_is_name: false });
+        false -> {
+            c2: int64 <- find_comma_dag(s, c1 + 1);
+            case c2 < 0 of {
+                true -> (false, { kind: 0, arg_a: 0, arg_b: 0, arg_c: 0, buf_size_is_name: false });
+                false -> {
+                    c3: int64 <- find_comma_dag(s, c2 + 1);
+                    case c3 < 0 of {
+                        true -> (false, { kind: 0, arg_a: 0, arg_b: 0, arg_c: 0, buf_size_is_name: false });
+                        false -> {
+                            c4: int64 <- find_comma_dag(s, c3 + 1);
+                            case c4 < 0 of {
+                                true -> (false, { kind: 0, arg_a: 0, arg_b: 0, arg_c: 0, buf_size_is_name: false });
+                                false -> {
+                                    (ok_k: boolean, k: int64) <- parse_signed_dec_dag(substring(s, 0, c1));
+                                    (ok_a: boolean, a: int64) <- parse_signed_dec_dag(substring(s, c1 + 1, c2));
+                                    (ok_b: boolean, b: int64) <- parse_signed_dec_dag(substring(s, c2 + 1, c3));
+                                    (ok_c: boolean, c: int64) <- parse_signed_dec_dag(substring(s, c3 + 1, c4));
+                                    flag_s: string <- substring(s, c4 + 1, length_bytes(s));
+                                    case ok_k and ok_a and ok_b and ok_c of {
+                                        false -> (false, { kind: 0, arg_a: 0, arg_b: 0, arg_c: 0, buf_size_is_name: false });
+                                        true -> (true, { kind: k, arg_a: a, arg_b: b, arg_c: c, buf_size_is_name: flag_s == "1" })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn take_n_name_lines(lines: List[string, mem(normal)], n: int64, acc: List[string, mem(normal)]) -> (boolean, List[string, mem(normal)], List[string, mem(normal)]) {
+    case n <= 0 of {
+        true -> (true, reverse_dag_names(acc, empty_dag_names()), lines);
+        false -> case lines.is_nil of {
+            true -> (false, empty_dag_names(), lines);
+            false -> take_n_name_lines(lines.tail, n - 1, cons_dag_name(lines.head, acc))
+        }
+    }
+}
+
+fn take_n_node_lines(lines: List[string, mem(normal)], n: int64, acc: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)]) -> (boolean, List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], List[string, mem(normal)]) {
+    case n <= 0 of {
+        true -> (true, reverse_dag_nodes(acc, empty_dag_nodes()), lines);
+        false -> case lines.is_nil of {
+            true -> (false, empty_dag_nodes(), lines);
+            false -> {
+                (ok: boolean, node: { kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }) <- parse_dag_node_line(lines.head);
+                case ok of {
+                    false -> (false, empty_dag_nodes(), lines);
+                    true -> take_n_node_lines(lines.tail, n - 1, cons_dag_node(node, acc))
+                }
+            }
+        }
+    }
+}
+
+fn starts_with_dag(s: string, prefix: string) -> boolean {
+    case length_bytes(s) < length_bytes(prefix) of {
+        true -> false;
+        false -> substring(s, 0, length_bytes(prefix)) == prefix
+    }
+}
+
+fn header_after_dag(line: string, key: string) -> string {
+    case starts_with_dag(line, key) of {
+        true -> {
+            // seed miscompiles length_bytes(<other var>) inline as substring's START arg (yields ""); bind it first.
+            k: int64 <- length_bytes(key);
+            substring(line, k, length_bytes(line))
+        };
+        false -> ""
+    }
+}
+
+fn find_newline_dag(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + 1) == "\n" of {
+            true -> i;
+            false -> find_newline_dag(s, i + 1)
+        }
+    }
+}
+
+fn split_lines_dag(s: string, i: int64, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= length_bytes(s) of {
+        true -> reverse_dag_names(acc, empty_dag_names());
+        false -> {
+            nl: int64 <- find_newline_dag(s, i);
+            case nl < 0 of {
+                true -> {
+                    line: string <- substring(s, i, length_bytes(s));
+                    case length_bytes(line) == 0 of {
+                        true -> reverse_dag_names(acc, empty_dag_names());
+                        false -> reverse_dag_names(cons_dag_name(line, acc), empty_dag_names())
+                    }
+                };
+                false -> split_lines_dag(s, nl + 1, cons_dag_name(substring(s, i, nl), acc))
+            }
+        }
+    }
+}
+
+fn find_dag_marker(lines: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case lines.is_nil of {
+        true -> lines;
+        false -> case lines.head == "===DAG===" of {
+            true -> lines.tail;
+            false -> find_dag_marker(lines.tail)
+        }
+    }
+}
+
+fn parse_dag_from_content(content: string) -> (
+    boolean,
+    List[string, mem(normal)],
+    List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    List[int64, mem(normal)],
+    List[int64, mem(normal)]
+) {
+    case length_bytes(content) == 0 of {
+        true -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+        false -> {
+            lines: List[string, mem(normal)] <- split_lines_dag(content, 0, empty_dag_names());
+            dag: List[string, mem(normal)] <- find_dag_marker(lines);
+            case dag.is_nil of {
+                true -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+                false -> {
+                        (ok_nc: boolean, nc: int64) <- parse_unsigned_dec_dag(header_after_dag(dag.head, "names="));
+                        case ok_nc of {
+                            false -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+                            true -> {
+                                (ok_n: boolean, names: List[string, mem(normal)], after_n: List[string, mem(normal)]) <- take_n_name_lines(dag.tail, nc, empty_dag_names());
+                                case ok_n of {
+                                    false -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+                                    true -> case after_n.is_nil of {
+                                        true -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+                                        false -> {
+                                            (ok_kc: boolean, kc: int64) <- parse_unsigned_dec_dag(header_after_dag(after_n.head, "nodes="));
+                                            case ok_kc of {
+                                                false -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+                                                true -> {
+                                                    (ok_k: boolean, nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], rest: List[string, mem(normal)]) <- take_n_node_lines(after_n.tail, kc, empty_dag_nodes());
+                                                    case ok_k of {
+                                                        false -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+                                                        true -> case rest.is_nil of {
+                                                            true -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+                                                            false -> case rest.tail.is_nil of {
+                                                                true -> (false, empty_dag_names(), empty_dag_nodes(), empty_int_roots(), empty_int_roots());
+                                                                false -> {
+                                                                    er: List[int64, mem(normal)] <- parse_root_ids_line(header_after_dag(rest.head, "export_roots="), 0, empty_int_roots());
+                                                                    ir: List[int64, mem(normal)] <- parse_root_ids_line(header_after_dag(rest.tail.head, "impl_roots="), 0, empty_int_roots());
+                                                                    (true, names, nodes, er, ir)
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                }
+            }
+        }
+    }
+}
+
+fn add_exports_by_surface(
+    ctx: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } },
+    exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)],
+    source_mod: string
+) -> { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } } {
+    case exports.is_nil of {
+        true -> ctx;
+        false -> add_exports_by_surface(
+            type_checker_core@context_add_symbol_surface(ctx, exports.head.name, exports.head.type_surface, parser_ast@empty_effect_name_list(), source_mod),
+            exports.tail,
+            source_mod
+        )
+    }
+}
+
+fn add_exports_from_roots(
+    ctx: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } },
+    exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)],
+    roots: List[int64, mem(normal)],
+    remap: List[int64, mem(normal)],
+    source_mod: string
+) -> { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } } {
+    case exports.is_nil of {
+        true -> ctx;
+        false -> case roots.is_nil of {
+            true -> ctx;
+            false -> {
+                tid: int64 <- type_interner@remap_dag_id(remap, roots.head);
+                next: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } } <- case tid < 0 of {
+                    true -> ctx;
+                    false -> type_checker_core@context_add_symbol_id(ctx, exports.head.name, tid, exports.head.type_surface, parser_ast@empty_effect_name_list(), source_mod)
+                };
+                add_exports_from_roots(next, exports.tail, roots.tail, remap, source_mod)
+            }
+        }
+    }
+}
+
+fn import_iface_from_content(
+    ctx: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } },
+    iface: { module_name: string, source_path: string, export_trait: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] },
+    content: string
+) -> { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } } {
+    sequence
+        (ok: boolean, names: List[string, mem(normal)], nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], er: List[int64, mem(normal)], ir: List[int64, mem(normal)]) <- parse_dag_from_content(content);
+        result: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } } <- case ok of {
+            false -> add_exports_by_surface(ctx, iface.exports, iface.module_name);
+            true -> {
+                replayed: {
+                    interner: {
+                        nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+                        by_key: {
+                            root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                            compare_key: fn(string, string) -> :less | :equal | :greater,
+                            compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                            region: region(L, normal),
+                            specialization_key: int64,
+                            compare_key_ordering_bundle: int64,
+                            compare_value_ordering_bundle: int64
+                        },
+                        names: {
+                            root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                            compare_key: fn(string, string) -> :less | :equal | :greater,
+                            compare_value: fn(int64, int64) -> :less | :equal | :greater,
+                            region: region(L, normal),
+                            specialization_key: int64,
+                            compare_key_ordering_bundle: int64,
+                            compare_value_ordering_bundle: int64
+                        },
+                        name_lexemes: List[string, mem(normal)],
+                        next_id: int64,
+                        seq_nil_id: int64
+                    },
+                    remap: List[int64, mem(normal)]
+                } <- type_interner@replay_type_dag(ctx.interner, names, nodes);
+                ctx_i: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } } <- type_checker_core@context_with_interner(ctx, replayed.interner);
+                ctx_e: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } } <- add_exports_from_roots(ctx_i, iface.exports, er, replayed.remap, iface.module_name);
+                add_exports_from_roots(ctx_e, iface.impls, ir, replayed.remap, iface.module_name)
+            }
+        }
+    produces
+        pure result
+    end
+}

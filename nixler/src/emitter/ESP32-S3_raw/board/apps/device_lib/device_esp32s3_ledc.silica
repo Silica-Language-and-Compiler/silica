@@ -1,0 +1,292 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// LEDC (LED PWM controller) on the ESP32-S3 port test board: low-speed timer 0 and channel 0 as a
+// square-wave generator for the buzzer (device_buzzer). The window is board_pack.silica window 11
+// (0x60019000, 4 KB, base TRM-unconfirmed); the SYSTEM window (8, 0x600C0000) holds its clock gate
+// and reset. Register names, offsets and field values are the generated board pack's
+// (device_esp32s3_ledc_registers, board_pack_ledc_values, board_pack_system_values, from ESP-IDF
+// ledc_reg.h / system_reg.h); the order of operations is ESP-IDF's esp_driver_ledc ledc.c (timer
+// config, then channel config and ledc_update_duty), none of it yet checked against the TRM.
+//
+// Clock: the LEDC core clock is the 40 MHz crystal (CONF apb_clk_sel 3; the ROM hands off without
+// the PLL, so the APB clock is not a fixed rate -- the crystal is, as for the RMT). Timer 0 counts
+// 2^10 steps per period (duty resolution 10 bits) from the core clock divided by an 18-bit divider
+// with 8 fractional bits, so the output frequency is
+//     f = 40,000,000 * 256 / (div * 1024) = 10,000,000 / div
+// and the divider for a frequency is div = round(10,000,000 / f), all in 32-bit integers (the 40e6
+// * 256 form does not fit). A divider below 256 (an integer divisor under 1) or above 0x3FFFF is
+// clamped, which makes the usable range 39 Hz to 39,062 Hz; a frequency of 0 gets the slowest
+// divider. Resolution 10 bits puts 50% duty at 512 steps. The fractional divider makes the period
+// jitter by a core-clock tick, inaudible on a buzzer.
+// Duty: the duty register holds the duty in steps shifted left 4 (the low four bits are the
+// fade-scaling fraction). The channel is set for no fading: increment, step 1, cycle 1, scale 0,
+// the values ledc_set_duty_with_hpoint uses. A channel starts when sig_out_en, duty_start and
+// para_up have been written, in ledc_update_duty's order; it stops when sig_out_en is cleared and
+// para_up written, and the pad then idles at the idle level (low: the DTC114E transistor off).
+// One hardware caveat from ESP-IDF: 100% duty (1024 steps) is unreachable at the maximum
+// resolution, so the driver never writes more than 512.
+
+use device_esp32s3_ledc_registers;
+use device_esp32s3_system_registers;
+use board_pack_ledc_values;
+use board_pack_system_values;
+
+export ledc_enable/1;
+export ledc_init/1;
+export ledc_divider/1;
+export ledc_actual_hz/1;
+export ledc_set_divider/2;
+export ledc_channel0_configure/1;
+export ledc_channel0_start/2;
+export ledc_channel0_stop/1;
+export ledc_half_duty/0;
+export ledc_conf/1;
+export ledc_timer0_conf/1;
+export ledc_timer0_value/1;
+export ledc_channel0_conf0/1;
+export ledc_channel0_conf1/1;
+export ledc_channel0_duty/1;
+export ledc_channel0_duty_read/1;
+
+// Core clock source: apb_clk_sel 3 = XTAL.
+fn ledc_xtal_select() -> uint32 {
+    3
+}
+
+fn ledc_duty_bits() -> uint32 {
+    10
+}
+
+fn ledc_fraction_bits() -> uint32 {
+    8
+}
+
+// The duty register's low four bits are the fade fraction; the whole steps start at bit 4.
+fn ledc_duty_fraction_bits() -> uint32 {
+    4
+}
+
+// 50% duty in timer steps.
+fn ledc_half_duty() -> uint32 {
+    512
+}
+
+// The 40 MHz crystal frequency, times 2^fraction bits, divided by 2^duty bits: 10,000,000.
+fn ledc_scaled_hz() -> uint32 {
+    40000000 shr (ledc_duty_bits() - ledc_fraction_bits())
+}
+
+fn ledc_divider_min() -> uint32 {
+    256
+}
+
+fn ledc_divider_max() -> uint32 {
+    0x3FFFF
+}
+
+// The timer divider (8 fractional bits) for a frequency in Hz, clamped to the divider's range.
+fn ledc_divider(freq: uint32) -> uint32 {
+    case freq of {
+        0 -> ledc_divider_max();
+        f: uint32 -> case (ledc_scaled_hz() + f / 2) / f of {
+            d: uint32 if d < ledc_divider_min() -> ledc_divider_min();
+            d: uint32 if d > ledc_divider_max() -> ledc_divider_max();
+            d: uint32 -> d
+        }
+    }
+}
+
+// The whole-Hz frequency a divider produces (rounded).
+fn ledc_actual_hz(div: uint32) -> uint32 {
+    case div of {
+        0 -> 0;
+        d: uint32 -> (ledc_scaled_hz() + d / 2) / d
+    }
+}
+
+// Clock on, then a reset pulse, so the peripheral starts from its defaults whatever ran before.
+fn ledc_enable(s: device_window(L, (:esp32s3_system))) -> device_window(L, (:esp32s3_system)) {
+    sequence proc[register_rwr]
+        clk: uint32 <- board_pack_system_values@system_ledc_clk_en_mask();
+        rst_bit: uint32 <- board_pack_system_values@system_ledc_rst_mask();
+        keep: uint32 <- bnot rst_bit;
+        en: uint32 <- peek(s, :perip_clk_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_clk_en0, (en bor clk) impl Register32 {});
+        rst: uint32 <- peek(s, :perip_rst_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_rst_en0, (rst bor rst_bit) impl Register32 {});
+        _: atom <- poke(s, :perip_rst_en0, (rst band keep) impl Register32 {})
+    produces
+        pure s
+    end
+}
+
+// Timer 0's CONF without the one-shot bits: divider, resolution, running (pause 0, rst 0).
+fn timer0_conf_word(div: uint32) -> uint32 {
+    div_shift: uint32 <- board_pack_ledc_values@ledc_clk_div_lstimer_shift();
+    (div shl div_shift) bor ledc_duty_bits()
+}
+
+// Channel 0's CONF0 with the timer selected (timer 0), idle level low, output not enabled.
+fn channel0_conf0_idle() -> uint32 {
+    sel_shift: uint32 <- board_pack_ledc_values@ledc_timer_sel_lsch_shift();
+    zero: uint32 <- 0;
+    zero shl sel_shift
+}
+
+// Channel 0's CONF1 for no fading: increment, step 1, cycle 1, scale 0; duty_start not set.
+fn channel0_conf1_static() -> uint32 {
+    inc: uint32 <- board_pack_ledc_values@ledc_duty_inc_lsch_mask();
+    num_shift: uint32 <- board_pack_ledc_values@ledc_duty_num_lsch_shift();
+    cycle_shift: uint32 <- board_pack_ledc_values@ledc_duty_cycle_lsch_shift();
+    one: uint32 <- 1;
+    inc bor (one shl num_shift) bor (one shl cycle_shift)
+}
+
+// Divider only: timer 0 gets the new divider and the update is latched (para_up self-clears). The
+// timer keeps counting; the new period starts at the next overflow.
+fn ledc_set_divider(l: device_window(L, (:esp32s3_ledc)), div: uint32) -> device_window(L, (:esp32s3_ledc)) {
+    sequence proc[register_rwr]
+        up: uint32 <- board_pack_ledc_values@ledc_lstimer_para_up_mask();
+        word: uint32 <- timer0_conf_word(div);
+        _: atom <- poke(l, :lstimer0_conf, word impl Register32 {});
+        _: atom <- poke(l, :lstimer0_conf, (word bor up) impl Register32 {})
+    produces
+        pure l
+    end
+}
+
+// Core clock = crystal with the register clock forced on, timer 0 at the divider for 440 Hz and 10
+// bits, released from reset, updated, then reset once so the counter starts from zero.
+fn ledc_init(l: device_window(L, (:esp32s3_ledc))) -> device_window(L, (:esp32s3_ledc)) {
+    sequence proc[register_rwr]
+        sel_shift: uint32 <- board_pack_ledc_values@ledc_apb_clk_sel_shift();
+        clk_en: uint32 <- board_pack_ledc_values@ledc_clk_en_mask();
+        up: uint32 <- board_pack_ledc_values@ledc_lstimer_para_up_mask();
+        rst: uint32 <- board_pack_ledc_values@ledc_lstimer_rst_mask();
+        word: uint32 <- timer0_conf_word(ledc_divider(440));
+        _: atom <- poke(l, :conf, ((ledc_xtal_select() shl sel_shift) bor clk_en) impl Register32 {});
+        _: atom <- poke(l, :lstimer0_conf, word impl Register32 {});
+        _: atom <- poke(l, :lstimer0_conf, (word bor up) impl Register32 {});
+        _: atom <- poke(l, :lstimer0_conf, (word bor rst) impl Register32 {});
+        _: atom <- poke(l, :lstimer0_conf, word impl Register32 {})
+    produces
+        pure l
+    end
+}
+
+// Channel 0 bound to timer 0, hpoint 0, duty 0, no fading, output off (the pad idles low).
+fn ledc_channel0_configure(l: device_window(L, (:esp32s3_ledc))) -> device_window(L, (:esp32s3_ledc)) {
+    sequence proc[register_rwr]
+        up: uint32 <- board_pack_ledc_values@ledc_para_up_lsch_mask();
+        zero: uint32 <- 0;
+        _: atom <- poke(l, :lsch0_hpoint, zero impl Register32 {});
+        _: atom <- poke(l, :lsch0_duty, zero impl Register32 {});
+        _: atom <- poke(l, :lsch0_conf1, channel0_conf1_static() impl Register32 {});
+        _: atom <- poke(l, :lsch0_conf0, channel0_conf0_idle() impl Register32 {});
+        _: atom <- poke(l, :lsch0_conf0, (channel0_conf0_idle() bor up) impl Register32 {})
+    produces
+        pure l
+    end
+}
+
+// Channel 0 driving the pad at `duty` timer steps (0..512 at 10 bits): duty, then sig_out_en,
+// duty_start and para_up in ledc_update_duty's order.
+fn ledc_channel0_start(l: device_window(L, (:esp32s3_ledc)), duty: uint32) -> device_window(L, (:esp32s3_ledc)) {
+    sequence proc[register_rwr]
+        up: uint32 <- board_pack_ledc_values@ledc_para_up_lsch_mask();
+        out_en: uint32 <- board_pack_ledc_values@ledc_sig_out_en_lsch_mask();
+        start: uint32 <- board_pack_ledc_values@ledc_duty_start_lsch_mask();
+        conf0: uint32 <- channel0_conf0_idle() bor out_en;
+        _: atom <- poke(l, :lsch0_duty, (duty shl ledc_duty_fraction_bits()) impl Register32 {});
+        _: atom <- poke(l, :lsch0_conf0, conf0 impl Register32 {});
+        _: atom <- poke(l, :lsch0_conf1, (channel0_conf1_static() bor start) impl Register32 {});
+        _: atom <- poke(l, :lsch0_conf0, (conf0 bor up) impl Register32 {})
+    produces
+        pure l
+    end
+}
+
+// Channel 0 off: output disabled (ledc_stop: idle level low, sig_out_en 0, para_up); the timer
+// keeps running.
+fn ledc_channel0_stop(l: device_window(L, (:esp32s3_ledc))) -> device_window(L, (:esp32s3_ledc)) {
+    sequence proc[register_rwr]
+        up: uint32 <- board_pack_ledc_values@ledc_para_up_lsch_mask();
+        _: atom <- poke(l, :lsch0_conf0, (channel0_conf0_idle() bor up) impl Register32 {})
+    produces
+        pure l
+    end
+}
+
+// Read-backs for probes. Each is a read, so the window is not handed back.
+fn ledc_conf(l: device_window(L, (:esp32s3_ledc))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(l, :conf) impl Register32 {}
+    produces
+        pure v
+    end
+}
+
+fn ledc_timer0_conf(l: device_window(L, (:esp32s3_ledc))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(l, :lstimer0_conf) impl Register32 {}
+    produces
+        pure v
+    end
+}
+
+// Timer 0's counter (0..1023 at 10 bits); two reads that differ show the timer running.
+fn ledc_timer0_value(l: device_window(L, (:esp32s3_ledc))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(l, :lstimer0_value) impl Register32 {}
+    produces
+        pure v
+    end
+}
+
+fn ledc_channel0_conf0(l: device_window(L, (:esp32s3_ledc))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(l, :lsch0_conf0) impl Register32 {}
+    produces
+        pure v
+    end
+}
+
+fn ledc_channel0_conf1(l: device_window(L, (:esp32s3_ledc))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(l, :lsch0_conf1) impl Register32 {}
+    produces
+        pure v
+    end
+}
+
+fn ledc_channel0_duty(l: device_window(L, (:esp32s3_ledc))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(l, :lsch0_duty) impl Register32 {}
+    produces
+        pure v
+    end
+}
+
+// The duty the hardware is using (DUTY_R), in timer steps shifted left 4.
+fn ledc_channel0_duty_read(l: device_window(L, (:esp32s3_ledc))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(l, :lsch0_duty_r) impl Register32 {}
+    produces
+        pure v
+    end
+}

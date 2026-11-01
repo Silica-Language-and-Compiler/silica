@@ -1,0 +1,694 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Sidecar `.meta` loader (silica_ffi_wrapper_specification.md §13): parse link_library / wrapper entries,
+// associate foreign c_wrapper bindings with referenced sidecar files. Phase 4 — compile-time validation only.
+
+use parser_ast;
+use sir_ast;
+use diagnostics_core;
+
+export validate_program_sidecar_metadata/1;
+export collect_program_link_libraries/1;
+export collect_program_foreign_symbols/1;
+export foreign_symbol_from_decl/1;
+export sidecar_paths_for_foreign_decl/2;
+export collect_module_default_sidecar_lexemes_from_program/1;
+export lookup_sidecar_wrapper_result_kind/2;
+export first_foreign_or_meta_location_from_program/1;
+
+fn nil_sidecar_wrappers() -> List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] <- empty[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn cons_sidecar_wrapper(w: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, rest: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)]) -> List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] <- prepend[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)](w, rest)
+    produces
+        pure result
+    end
+}
+
+fn dummy_sidecar_wrapper() -> { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } {
+    sequence
+        result: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } <- { symbol: "", result: "", error_domain: "", has_result: 0, has_error_domain: 0 }
+    produces
+        pure result
+    end
+}
+
+fn strip_string_literal_quotes(lexeme: string) -> string {
+    case length_bytes(lexeme) >= 2 of {
+        false -> lexeme;
+        true -> case substring(lexeme, 0, 1) == "\"" of {
+            false -> lexeme;
+            true -> case substring(lexeme, length_bytes(lexeme) - 1, length_bytes(lexeme)) == "\"" of {
+                false -> lexeme;
+                true -> substring(lexeme, 1, length_bytes(lexeme) - 1)
+            }
+        }
+    }
+}
+
+fn string_starts_with(s: string, prefix: string) -> boolean {
+    case length_bytes(s) >= length_bytes(prefix) of {
+        false -> false;
+        true -> substring(s, 0, length_bytes(prefix)) == prefix
+    }
+}
+
+fn string_ends_with(s: string, suffix: string) -> boolean {
+    ls: int64 <- length_bytes(s);
+    lf: int64 <- length_bytes(suffix);
+    case ls < lf of {
+        true -> false;
+        false -> substring(s, ls - lf, ls) == suffix
+    }
+}
+
+fn is_whitespace_char(c: string) -> boolean {
+    c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+fn trim_leading_from(s: string, pos: int64) -> string {
+    case pos >= length_bytes(s) of {
+        true -> "";
+        false -> {
+            c: string <- substring(s, pos, pos + 1);
+            case is_whitespace_char(c) of {
+                true -> trim_leading_from(s, pos + 1);
+                false -> substring(s, pos, length_bytes(s))
+            }
+        }
+    }
+}
+
+fn trim_leading(s: string) -> string {
+    trim_leading_from(s, 0)
+}
+
+fn trim_trailing_from(s: string, pos: int64) -> string {
+    case pos < 0 of {
+        true -> "";
+        false -> {
+            c: string <- substring(s, pos, pos + 1);
+            case is_whitespace_char(c) of {
+                true -> trim_trailing_from(s, pos - 1);
+                false -> substring(s, 0, pos + 1)
+            }
+        }
+    }
+}
+
+fn trim_trailing(s: string) -> string {
+    trim_trailing_from(s, length_bytes(s) - 1)
+}
+
+fn trim_line(s: string) -> string {
+    trim_trailing(trim_leading(s))
+}
+
+fn find_char_from(s: string, pos: int64, ch: string) -> int64 {
+    case pos >= length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, pos, pos + 1) == ch of {
+            true -> pos;
+            false -> find_char_from(s, pos + 1, ch)
+        }
+    }
+}
+
+fn extract_first_quoted_string(s: string) -> string {
+    q1: int64 <- find_char_from(s, 0, "\"");
+    case q1 < 0 of {
+        true -> "";
+        false -> {
+            q2: int64 <- find_char_from(s, q1 + 1, "\"");
+            case q2 < 0 of {
+                true -> "";
+                false -> substring(s, q1 + 1, q2)
+            }
+        }
+    }
+}
+
+fn extract_value_after_key(line: string, key: string) -> string {
+    case string_starts_with(trim_line(line), key) of {
+        false -> "";
+        true -> extract_first_quoted_string(line)
+    }
+}
+
+fn sidecar_path_from_lexeme(lexeme: string) -> string {
+    strip_string_literal_quotes(lexeme)
+}
+
+fn append_sir_strings_unique(items: List[string, mem(normal)], s: string) -> List[string, mem(normal)] {
+    case length_bytes(s) == 0 of {
+        true -> items;
+        false -> case sir_ast@sir_string_list_contains(items, s) of {
+            true -> items;
+            false -> sir_ast@cons_sir_string(s, items)
+        }
+    }
+}
+
+fn collect_wrapper_meta_paths_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> List[string, mem(normal)] {
+    case decls.is_nil of {
+        true -> sir_ast@nil_sir_strings();
+        false -> case decls.head.tag == 8 of {
+            true -> sir_ast@cons_sir_string(decls.head.name, collect_wrapper_meta_paths_loop(decls.tail));
+            false -> collect_wrapper_meta_paths_loop(decls.tail)
+        }
+    }
+}
+
+fn collect_default_sidecar_paths(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> List[string, mem(normal)] {
+    collect_wrapper_meta_paths_loop(decls)
+}
+
+fn program_has_foreign_binding_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 9 of {
+            true -> true;
+            false -> program_has_foreign_binding_loop(decls.tail)
+        }
+    }
+}
+
+fn sidecar_wrapper_has_complete_fields(w: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }) -> boolean {
+    case length_bytes(w.symbol) > 0 of {
+        false -> false;
+        true -> case w.has_result == 1 of {
+            false -> false;
+            true -> w.has_error_domain == 1
+        }
+    }
+}
+
+fn merge_wrapper_field(existing: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, key: string, value: string) -> { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } {
+    case key == "symbol:" of {
+        true -> { symbol: value, result: existing.result, error_domain: existing.error_domain, has_result: existing.has_result, has_error_domain: existing.has_error_domain };
+        false -> case key == "result:" of {
+            true -> { symbol: existing.symbol, result: value, error_domain: existing.error_domain, has_result: 1, has_error_domain: existing.has_error_domain };
+            false -> case key == "error_domain:" of {
+                true -> { symbol: existing.symbol, result: existing.result, error_domain: value, has_result: existing.has_result, has_error_domain: 1 };
+                false -> existing
+            }
+        }
+    }
+}
+
+fn apply_wrapper_field_line(w: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, line: string) -> { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } {
+    trimmed: string <- trim_line(line);
+    case string_starts_with(trimmed, "symbol:") of {
+        true -> merge_wrapper_field(w, "symbol:", extract_value_after_key(trimmed, "symbol:"));
+        false -> case string_starts_with(trimmed, "result:") of {
+            true -> merge_wrapper_field(w, "result:", extract_value_after_key(trimmed, "result:"));
+            false -> case string_starts_with(trimmed, "error_domain:") of {
+                true -> merge_wrapper_field(w, "error_domain:", extract_value_after_key(trimmed, "error_domain:"));
+                false -> w
+            }
+        }
+    }
+}
+
+fn parse_sidecar_link_library_scan(content: string, pos: int64, have_link_library: int64, link_library: string) -> (int64, string) {
+    case pos >= length_bytes(content) of {
+        true -> (have_link_library, link_library);
+        false -> {
+            line: string <- substring_until_char(content, pos, '\n');
+            line_len: int64 <- length_bytes(line);
+            next_pos: int64 <- pos + line_len + 1;
+            trimmed: string <- trim_line(line);
+            case have_link_library == 1 of {
+                true -> parse_sidecar_link_library_scan(content, next_pos, 1, link_library);
+                false -> case string_starts_with(trimmed, "link_library:") of {
+                    true -> parse_sidecar_link_library_scan(content, next_pos, 1, extract_value_after_key(trimmed, "link_library:"));
+                    false -> parse_sidecar_link_library_scan(content, next_pos, 0, link_library)
+                }
+            }
+        }
+    }
+}
+
+fn parse_wrapper_block_lines(content: string, pos: int64, in_arguments: boolean, acc: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }) -> ({ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, int64) {
+    case pos >= length_bytes(content) of {
+        true -> (acc, pos);
+        false -> {
+            line: string <- substring_until_char(content, pos, '\n');
+            line_len: int64 <- length_bytes(line);
+            next_pos: int64 <- pos + line_len + 1;
+            trimmed: string <- trim_line(line);
+            case in_arguments of {
+                true -> case string_ends_with(trimmed, "]") of {
+                    true -> parse_wrapper_block_lines(content, next_pos, false, acc);
+                    false -> parse_wrapper_block_lines(content, next_pos, true, acc)
+                };
+                false -> case trimmed == "}" of {
+                    true -> (acc, next_pos);
+                    false -> case string_starts_with(trimmed, "arguments:") of {
+                        true -> parse_wrapper_block_lines(content, next_pos, true, acc);
+                        false -> {
+                            updated: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } <- apply_wrapper_field_line(acc, line);
+                            parse_wrapper_block_lines(content, next_pos, false, updated)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn skip_to_next_line(content: string, pos: int64) -> int64 {
+    case pos >= length_bytes(content) of {
+        true -> pos;
+        false -> {
+            line: string <- substring_until_char(content, pos, '\n');
+            pos + length_bytes(line) + 1
+        }
+    }
+}
+
+fn parse_sidecar_wrappers_scan(content: string, pos: int64, acc: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)]) -> List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] {
+    case pos >= length_bytes(content) of {
+        true -> acc;
+        false -> {
+            line: string <- substring_until_char(content, pos, '\n');
+            line_len: int64 <- length_bytes(line);
+            next_pos: int64 <- pos + line_len + 1;
+            trimmed: string <- trim_line(line);
+            case string_starts_with(trimmed, "wrapper ") of {
+                false -> parse_sidecar_wrappers_scan(content, next_pos, acc);
+                true -> {
+                    block_start: int64 <- next_pos;
+                    (wrapper: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, after_block: int64) <- parse_wrapper_block_lines(content, block_start, false, dummy_sidecar_wrapper());
+                    case sidecar_wrapper_has_complete_fields(wrapper) of {
+                        false -> parse_sidecar_wrappers_scan(content, after_block, acc);
+                        true -> parse_sidecar_wrappers_scan(content, after_block, cons_sidecar_wrapper(wrapper, acc))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_sidecar_content(content: string) -> { link_library: string, has_link_library: boolean, wrappers: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] } {
+    (have_ll: int64, ll: string) <- parse_sidecar_link_library_scan(content, 0, 0, "");
+    wrappers: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] <- parse_sidecar_wrappers_scan(content, 0, nil_sidecar_wrappers());
+    { link_library: ll, has_link_library: have_ll == 1, wrappers: wrappers }
+}
+
+fn sidecar_wrapper_list_find_symbol(items: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)], sym: string) -> boolean {
+    sequence
+        result: boolean <- case items of {
+            []: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] -> false;
+            [head: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, tail: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)]] -> case head.symbol == sym of {
+                true -> true;
+                false -> sidecar_wrapper_list_find_symbol(tail, sym)
+            };
+            _: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] -> false
+        }
+    produces
+        pure result
+    end
+}
+
+fn sidecar_wrapper_list_find_incomplete(items: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)]) -> boolean {
+    sequence
+        result: boolean <- case items of {
+            []: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] -> false;
+            [head: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, tail: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)]] -> case sidecar_wrapper_has_complete_fields(head) of {
+                false -> true;
+                true -> sidecar_wrapper_list_find_incomplete(tail)
+            };
+            _: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] -> false
+        }
+    produces
+        pure result
+    end
+}
+
+fn foreign_symbol_from_decl(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> string {
+    strip_string_literal_quotes(parser_ast@expr_root_node(decl.body).value)
+}
+
+fn sidecar_paths_for_foreign_decl(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, default_paths: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    meta_path: string <- parser_ast@expr_root_node(decl.body).name;
+    case length_bytes(meta_path) > 0 of {
+        true -> sir_ast@cons_sir_string(meta_path, sir_ast@nil_sir_strings());
+        false -> default_paths
+    }
+}
+
+fn sidecar_path_list_contains(items: List[string, mem(normal)], path_lexeme: string) -> boolean {
+    sequence
+        result: boolean <- case items of {
+            []: List[string, mem(normal)] -> false;
+            [head: string, tail: List[string, mem(normal)]] -> case head == path_lexeme of {
+                true -> true;
+                false -> sidecar_path_list_contains(tail, path_lexeme)
+            };
+            _: List[string, mem(normal)] -> false
+        }
+    produces
+        pure result
+    end
+}
+
+fn append_unique_sidecar_path_lexeme(items: List[string, mem(normal)], path_lexeme: string) -> List[string, mem(normal)] {
+    case sidecar_path_list_contains(items, path_lexeme) of {
+        true -> items;
+        false -> sir_ast@cons_sir_string(path_lexeme, items)
+    }
+}
+
+fn collect_referenced_sidecar_lexemes_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> List[string, mem(normal)] {
+    sequence
+        result: List[string, mem(normal)] <- case decls of {
+            []: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] -> sir_ast@nil_sir_strings();
+            [head: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, tail: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]] -> case head.tag == 8 of {
+                true -> append_unique_sidecar_path_lexeme(collect_referenced_sidecar_lexemes_loop(tail), head.name);
+                false -> case head.tag == 9 of {
+                    true -> {
+                        meta_path: string <- parser_ast@expr_root_node(head.body).name;
+                        case length_bytes(meta_path) > 0 of {
+                            true -> append_unique_sidecar_path_lexeme(collect_referenced_sidecar_lexemes_loop(tail), meta_path);
+                            false -> collect_referenced_sidecar_lexemes_loop(tail)
+                        }
+                    };
+                    false -> collect_referenced_sidecar_lexemes_loop(tail)
+                }
+            };
+            _: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] -> sir_ast@nil_sir_strings()
+        }
+    produces
+        pure result
+    end
+}
+
+fn collect_module_default_sidecar_lexemes(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence
+        result: List[string, mem(normal)] <- case decls of {
+            []: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] -> acc;
+            [head: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, tail: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]] -> case head.tag == 8 of {
+                true -> append_unique_sidecar_path_lexeme(collect_module_default_sidecar_lexemes(tail, acc), head.name);
+                false -> collect_module_default_sidecar_lexemes(tail, acc)
+            };
+            _: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] -> acc
+        }
+    produces
+        pure result
+    end
+}
+
+fn collect_module_default_sidecar_lexemes_from_program(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> List[string, mem(normal)] {
+    collect_module_default_sidecar_lexemes(decls, sir_ast@nil_sir_strings())
+}
+
+fn print_sidecar_error(code: string, loc: { file: string, line: int64, column: int64, offset: int64 }, msg: string) -> int64 {
+    _: int8 <- diagnostics_core@print_compiler_error("ModuleError", code, loc, msg, "sect13.2");
+    1
+}
+
+fn validate_loaded_sidecar(parsed: { link_library: string, has_link_library: boolean, wrappers: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] }, path_lexeme: string, loc: { file: string, line: int64, column: int64, offset: int64 }) -> int64 {
+     case parsed.has_link_library of {
+        false -> {
+            msg: string <- concat(concat("sidecar file ", sidecar_path_from_lexeme(path_lexeme)), " is missing link_library (spec 13.2)");
+            print_sidecar_error("E4032", loc, msg)
+        };
+        true -> case sidecar_wrapper_list_find_incomplete(parsed.wrappers) of {
+            true -> {
+                msg2: string <- concat(concat("sidecar file ", sidecar_path_from_lexeme(path_lexeme)), " has wrapper entry missing required result or error_domain fields (spec 13.2)");
+                print_sidecar_error("E4033", loc, msg2)
+            };
+            false -> 0
+        }
+    }
+}
+
+fn find_wrapper_in_sidecar(parsed: { link_library: string, has_link_library: boolean, wrappers: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] }, sym: string) -> boolean {
+    sidecar_wrapper_list_find_symbol(parsed.wrappers, sym)
+}
+
+fn validate_foreign_binding_sidecar_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], default_paths: List[string, mem(normal)]) -> int64 {
+    case decls.is_nil of {
+        true -> 0;
+        false -> case decls.head.tag == 9 of {
+            true -> {
+                paths: List[string, mem(normal)] <- sidecar_paths_for_foreign_decl(decls.head, default_paths);
+                sym: string <- foreign_symbol_from_decl(decls.head);
+                st: int64 <- validate_symbol_in_sidecar_paths(paths, sym, decls.head.location);
+                case st == 0 of {
+                    false -> st;
+                    true -> validate_foreign_binding_sidecar_loop(decls.tail, default_paths)
+                }
+            };
+            false -> validate_foreign_binding_sidecar_loop(decls.tail, default_paths)
+        }
+    }
+}
+
+fn validate_symbol_in_one_sidecar(path_lexeme: string, sym: string, loc: { file: string, line: int64, column: int64, offset: int64 }) -> int64 {
+    sequence proc[DeviceIO]
+        disk_path: string <- sidecar_path_from_lexeme(path_lexeme);
+        exists: boolean <- file_exists(disk_path);
+        result: int64 <- case exists of {
+            false -> {
+                msg: string <- concat(concat("sidecar file not found: ", disk_path), " (spec 13.1)");
+                print_sidecar_error("E4030", loc, msg)
+            };
+            true -> {
+                content: string <- read_lines(disk_path);
+                parsed: { link_library: string, has_link_library: boolean, wrappers: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] } <- parse_sidecar_content(content);
+                vld: int64 <- validate_loaded_sidecar(parsed, path_lexeme, loc);
+                case vld == 0 of {
+                    false -> vld;
+                    true -> case find_wrapper_in_sidecar(parsed, sym) of {
+                        false -> {
+                            p1: string <- concat("no wrapper entry for symbol ", sym);
+                            p2: string <- concat(p1, " in sidecar ");
+                            msg: string <- concat(p2, disk_path);
+                            print_sidecar_error("E4031", loc, msg)
+                        };
+                        true -> 0
+                    }
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+fn validate_symbol_in_sidecar_paths(paths: List[string, mem(normal)], sym: string, loc: { file: string, line: int64, column: int64, offset: int64 }) -> int64 {
+    case paths.is_nil of {
+        true -> {
+            msg: string <- concat("no sidecar path available for foreign symbol ", sym);
+            print_sidecar_error("E4031", loc, msg)
+        };
+        false -> {
+            first: int64 <- validate_symbol_in_one_sidecar(paths.head, sym, loc);
+            case first == 0 of {
+                true -> 0;
+                false -> case paths.tail.is_nil of {
+                    true -> first;
+                    false -> validate_symbol_in_sidecar_paths(paths.tail, sym, loc)
+                }
+            }
+        }
+    }
+}
+
+fn validate_each_sidecar_file_loop(paths: List[string, mem(normal)], loc: { file: string, line: int64, column: int64, offset: int64 }) -> int64 {
+    case paths.is_nil of {
+        true -> 0;
+        false -> {
+            st: int64 <- validate_symbol_in_one_sidecar_for_file_only(paths.head, loc);
+            case st == 0 of {
+                false -> st;
+                true -> validate_each_sidecar_file_loop(paths.tail, loc)
+            }
+        }
+    }
+}
+
+fn validate_symbol_in_one_sidecar_for_file_only(path_lexeme: string, loc: { file: string, line: int64, column: int64, offset: int64 }) -> int64 {
+    sequence proc[DeviceIO]
+        disk_path: string <- sidecar_path_from_lexeme(path_lexeme);
+        exists: boolean <- file_exists(disk_path);
+        result: int64 <- case exists of {
+            false -> {
+                msg: string <- concat(concat("sidecar file not found: ", disk_path), " (spec 13.1)");
+                print_sidecar_error("E4030", loc, msg)
+            };
+            true -> {
+                content: string <- read_lines(disk_path);
+                parsed: { link_library: string, has_link_library: boolean, wrappers: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] } <- parse_sidecar_content(content);
+                validate_loaded_sidecar(parsed, path_lexeme, loc)
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+fn first_foreign_or_meta_location_from_program(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> { file: string, line: int64, column: int64, offset: int64 } {
+    first_foreign_or_meta_location(program.declarations)
+}
+
+fn first_foreign_or_meta_location(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { file: string, line: int64, column: int64, offset: int64 } {
+    case decls.is_nil of {
+        true -> parser_ast@zero_location();
+        false -> case decls.head.tag == 9 of {
+            true -> decls.head.location;
+            false -> case decls.head.tag == 8 of {
+                true -> decls.head.location;
+                false -> first_foreign_or_meta_location(decls.tail)
+            }
+        }
+    }
+}
+
+fn collect_link_libraries_from_sidecar_paths(paths: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[DeviceIO]
+        result: List[string, mem(normal)] <- case paths.is_nil of {
+                true -> acc;
+                false -> {
+                    disk_path: string <- sidecar_path_from_lexeme(paths.head);
+                    exists: boolean <- file_exists(disk_path);
+                    rest: List[string, mem(normal)] <- collect_link_libraries_from_sidecar_paths(paths.tail, acc);
+                    case exists of {
+                        false -> rest;
+                        true -> {
+                            content: string <- read_lines(disk_path);
+                            parsed: { link_library: string, has_link_library: boolean, wrappers: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] } <- parse_sidecar_content(content);
+                            case parsed.has_link_library of {
+                                false -> rest;
+                                true -> append_sir_strings_unique(rest, parsed.link_library)
+                            }
+                        }
+                    }
+                }
+            }
+    produces
+        pure result
+    end
+}
+
+fn sidecar_wrapper_list_get_symbol(items: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)], sym: string) -> { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } {
+    sequence
+        result: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } <- case items of {
+            []: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] -> dummy_sidecar_wrapper();
+            [head: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, tail: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)]] -> case head.symbol == sym of {
+                true -> head;
+                false -> sidecar_wrapper_list_get_symbol(tail, sym)
+            };
+            _: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] -> dummy_sidecar_wrapper()
+        }
+    produces
+        pure result
+    end
+}
+
+fn lookup_sidecar_wrapper_in_one_path(path_lexeme: string, sym: string) -> { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } {
+    sequence proc[DeviceIO]
+        disk_path: string <- sidecar_path_from_lexeme(path_lexeme);
+            exists: boolean <- file_exists(disk_path);
+        result: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } <- case exists of {
+                false -> dummy_sidecar_wrapper();
+                true -> {
+                    content: string <- read_lines(disk_path);
+                    parsed: { link_library: string, has_link_library: boolean, wrappers: List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] } <- parse_sidecar_content(content);
+                    sidecar_wrapper_list_get_symbol(parsed.wrappers, sym)
+                }
+            }
+    produces
+        pure result
+    end
+}
+
+fn lookup_sidecar_wrapper_result_kind(paths: List[string, mem(normal)], sym: string) -> (boolean, string) {
+    sequence
+        result: (boolean, string) <- case paths of {
+            []: List[string, mem(normal)] -> (false, "");
+            [head: string, tail: List[string, mem(normal)]] -> {
+                found: { symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 } <- lookup_sidecar_wrapper_in_one_path(head, sym);
+                case length_bytes(found.symbol) > 0 of {
+                    true -> (true, found.result);
+                    false -> lookup_sidecar_wrapper_result_kind(tail, sym)
+                }
+            };
+            _: List[string, mem(normal)] -> (false, "")
+        }
+    produces
+        pure result
+    end
+}
+
+fn validate_program_sidecar_metadata(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> int64 {
+    sequence
+        result: int64 <- case program_has_foreign_binding_loop(program.declarations) of {
+                false -> 0;
+                true -> {
+                    default_paths: List[string, mem(normal)] <- collect_module_default_sidecar_lexemes_from_program(program.declarations);
+                    all_paths: List[string, mem(normal)] <- collect_referenced_sidecar_lexemes_loop(program.declarations);
+                    meta_loc: { file: string, line: int64, column: int64, offset: int64 } <- first_foreign_or_meta_location(program.declarations);
+                    file_st: int64 <- validate_each_sidecar_file_loop(all_paths, meta_loc);
+                    case file_st == 0 of {
+                        false -> file_st;
+                        true -> validate_foreign_binding_sidecar_loop(program.declarations, default_paths)
+                    }
+                }
+            }
+    produces
+        pure result
+    end
+}
+
+fn collect_foreign_symbols_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence
+        result: List[string, mem(normal)] <- case decls of {
+            []: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] -> acc;
+            [head: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, tail: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]] -> case head.tag == 9 of {
+                true -> collect_foreign_symbols_loop(tail, append_sir_strings_unique(acc, foreign_symbol_from_decl(head)));
+                false -> collect_foreign_symbols_loop(tail, acc)
+            };
+            _: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] -> acc
+        }
+    produces
+        pure result
+    end
+}
+
+fn collect_program_foreign_symbols(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> List[string, mem(normal)] {
+    collect_foreign_symbols_loop(program.declarations, sir_ast@nil_sir_strings())
+}
+
+fn collect_program_link_libraries(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> List[string, mem(normal)] {
+    sequence
+        paths: List[string, mem(normal)] <- collect_referenced_sidecar_lexemes_loop(program.declarations);
+        result: List[string, mem(normal)] <- collect_link_libraries_from_sidecar_paths(paths, sir_ast@nil_sir_strings())
+    produces
+        pure result
+    end
+}

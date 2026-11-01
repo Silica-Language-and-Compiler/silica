@@ -1,0 +1,184 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// User-call staging predicates and helpers (non-recursive with the term dispatcher).
+
+use atom_table;
+use var;
+use term_sir_helpers;
+use term_user_call_abi;
+use reg_conventions;
+
+export term_subterm_has_user_call/1;
+export call_arg2_tree_for_gpr_reorder_scan/1;
+export simple_gpr_call_arg_can_stage/2;
+export simple_gpr_rest_can_stage/2;
+export simple_gpr_arg_tree_can_stage/2;
+export simple_gpr_rest_tree_can_stage/2;
+export simple_gpr_call_arg_count/1;
+export emit_simple_gpr_stage_loads/2;
+
+fn term_subterm_has_user_call(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case t.root < 0 of {
+        true -> false;
+        false -> case term_sir_helpers@sir_term_root_node(t).kind of {
+            4 -> true;
+            5 -> true;
+            2 -> case term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)) of {
+                true -> true;
+                false -> term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
+            };
+            3 -> case term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)) of {
+                true -> true;
+                false -> term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
+            };
+            5 -> case term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)) of {
+                true -> true;
+                false -> term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
+            };
+            // list_cons lowers to BL L_list_prepend_helper and clobbers X0 just like a user call.
+            // append(combined, prepend(node, empty)) must reorder/stage around it (make_expr).
+            6 -> case term_sir_helpers@sir_term_root_node(t).name == "list_cons" of {
+                true -> true;
+                false -> case term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)) of {
+                    true -> true;
+                    false -> term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
+                }
+            };
+            7 -> case term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)) of {
+                true -> true;
+                false -> term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
+            };
+            8 -> case term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)) of {
+                true -> true;
+                false -> term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
+            };
+            _: int64 -> false
+        }
+    }
+}
+
+fn call_arg2_tree_for_gpr_reorder_scan(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr)).name == "user_call_rest" of {
+        true -> term_sir_helpers@sir_term_at(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr), term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr)).inner);
+        false -> term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr)
+    }
+}
+
+fn simple_gpr_call_arg_can_stage(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> boolean {
+    case term_user_call_abi@user_call_arg_consumes_fp(term_sir_helpers@sir_term_root_node(term).type_name) of {
+        true -> false;
+        false -> case term_sir_helpers@sir_term_root_node(term).kind == 0 of {
+            true -> true;
+            false -> case term_sir_helpers@sir_term_root_node(term).kind == 1 of {
+                false -> false;
+                true -> {
+                    binding: string <- var@find_sp_binding_bare_or_percent_param(outer_reg, term_sir_helpers@sir_term_root_node(term).name);
+                    // Register or spilled stack slot: both stage via X16. Refusing memory_ref
+                    // forced sequential emit; nested list_cons then clobbered a spilled X0 arg
+                    // (parser_ast@make_expr: append(combined, prepend(...)) → dummy body → #0).
+                    case length_bytes(binding) > 0 of {
+                        true -> true;
+                        false -> var@type_name_is_function(term_sir_helpers@sir_term_root_node(term).type_name)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn simple_gpr_rest_can_stage(rest: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> boolean {
+    case rest.root < 0 of {
+        true -> true;
+        false -> case term_sir_helpers@sir_term_root_node(rest).name == "user_call_rest" of {
+            true -> case simple_gpr_call_arg_can_stage(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).inner), outer_reg) of {
+                false -> false;
+                true -> simple_gpr_rest_can_stage(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).right_expr), outer_reg)
+            };
+            false -> simple_gpr_call_arg_can_stage(rest, outer_reg)
+        }
+    }
+}
+
+// A computed argument (nested call, prim) may be staged too, which is what keeps a
+// nested call from destroying arguments already sitting in caller-saved X0-X7.
+// Staging pushes a 16-byte STR slot per argument. record_make/tuple_make SUB SP for their
+// payload; emit_simple_gpr_stage_chain heap-promotes and reclaims that slab before the STR
+// so slots stay contiguous and release (count*16) is sound. Only a TUPLE
+// return needs a caller sret buffer that the staging release would pop, so just those stay on the
+// sequential path; see sret_alloc_bytes in emit_generic_user_call_asm_inner. A record return
+// heap-promotes in the callee and allocates nothing here, so it must be staged like any other
+// call -- rejecting it left the args in X0-X7 while the nested call overwrote them.
+fn simple_gpr_arg_tree_can_stage(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> boolean {
+    case t.root < 0 of {
+        true -> true;
+        false -> case term_user_call_abi@user_call_arg_consumes_fp(term_sir_helpers@sir_term_root_node(t).type_name) of {
+            true -> false;
+            false -> case reg_conventions@is_tuple_type(term_sir_helpers@sir_term_root_node(t).type_name) of {
+                true -> false;
+                false -> case term_sir_helpers@sir_term_root_node(t).kind <= 1 of {
+                    true -> simple_gpr_call_arg_can_stage(t, outer_reg);
+                    false -> case simple_gpr_arg_tree_can_stage(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner), outer_reg) of {
+                        false -> false;
+                        true -> simple_gpr_arg_tree_can_stage(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr), outer_reg)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn simple_gpr_rest_tree_can_stage(rest: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string) -> boolean {
+    case rest.root < 0 of {
+        true -> true;
+        false -> case term_sir_helpers@sir_term_root_node(rest).name == "user_call_rest" of {
+            true -> case simple_gpr_arg_tree_can_stage(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).inner), outer_reg) of {
+                false -> false;
+                true -> simple_gpr_rest_tree_can_stage(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).right_expr), outer_reg)
+            };
+            false -> simple_gpr_arg_tree_can_stage(rest, outer_reg)
+        }
+    }
+}
+
+fn simple_gpr_call_arg_count(rest: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
+    case rest.root < 0 of {
+        true -> 0;
+        false -> case term_sir_helpers@sir_term_root_node(rest).name == "user_call_rest" of {
+            true -> 1 + simple_gpr_call_arg_count(term_sir_helpers@sir_term_at(rest, term_sir_helpers@sir_term_root_node(rest).right_expr));
+            false -> 1
+        }
+    }
+}
+
+fn emit_simple_gpr_stage_loads(arg_index: int64, arg_count: int64) -> string {
+    case arg_index >= arg_count of {
+        true -> "";
+        false -> {
+            offset: string <- atom_table@int64_to_decimal_string((arg_count - arg_index - 1) * 16);
+            reg: string <- term_user_call_abi@user_call_abi_reg_digit(arg_index);
+            load: string <- concat(concat(concat("    LDR X", reg), ", [SP, #"), concat(offset, "]\n"));
+            concat(load, emit_simple_gpr_stage_loads(arg_index + 1, arg_count))
+        }
+    }
+}
+
+// A call whose arguments are register-resident scalar/function values is a
+// parallel move, not a sequence of destructive MOVs. Stage every source before
+// loading any ABI destination so cycles and fan-out (X0->X2 while X0 is also a
+// destination) are correct for any argument count supported by X0-X7.
+

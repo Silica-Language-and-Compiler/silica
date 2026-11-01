@@ -1,0 +1,340 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// RMT (remote control transceiver) on the ESP32-S3 port test board: transmit channel 0 as a pulse
+// generator the CPU feeds through the channel RAM, for the addressable LED driver (device_ws2813b).
+// The window is board_pack.silica window 10 (0x60016000, 4 KB, base TRM-unconfirmed); the SYSTEM
+// window (8, 0x600C0000) holds its clock gate. Register names, offsets and field values are the
+// generated board pack's (device_esp32s3_rmt_registers, board_pack_rmt_values,
+// board_pack_system_values, from ESP-IDF rmt_reg.h / system_reg.h); the order of operations is
+// ESP-IDF v5.1 hal/esp32s3/include/hal/rmt_ll.h's, none of it yet checked against the TRM.
+//
+// Clock: the group clock is the 40 MHz crystal (SYS_CONF sclk_sel 3, sclk_div_num 0 = divide by 1;
+// the ROM hands off without the PLL, so the APB clock is not a fixed rate) and channel 0 divides it
+// by rmt_tx0_div_cnt() = 2: one tick is 50 ns, which puts every WS2813B pulse width on a tick
+// (measured 2026-10-06: 191 words of 200 ticks took 2.00 ms).
+// Memory: the four transmit channels' RAM blocks (4 x 48 words from offset 0x800) are chained
+// under channel 0 (mem_size 4, 192 words) in wrap mode, and the CPU fills them through the APB
+// FIFO: every store to CH0DATA lands at the next word and the write pointer wraps from word 191
+// to word 0 by itself (measured: 192 stores then 8 more left the pointer at 8 and words 0..7 held
+// the last 8 values). So a stream longer than 192 words is fed in halves without any addressing:
+// the threshold event (tx_lim 96) is raised each time 96 words have gone out, and the half just
+// sent is refilled through CH0DATA while the other half transmits (ESP-IDF's ping-pong scheme,
+// polled on INT_RAW instead of an interrupt -- interrupts are off in this runtime). The FIFO
+// write costs the same for every word (13.6 us measured, 96 words in 1.31 ms), where direct RAM
+// access through a 192-arm case cost 8 us at word 0 and 97 us at word 191 (the case is a linear
+// chain). A word holds two pulses, {level: 1, duration: 15} each, the low half first; a zero
+// duration ends the transmission (tx_end event). Carrier off, idle level low, output enabled while
+// idle, no loop mode. Every offset and bit is still TRM-unconfirmed.
+
+use device_esp32s3_rmt_registers;
+use device_esp32s3_system_registers;
+use board_pack_rmt_values;
+use board_pack_system_values;
+
+export rmt_enable/1;
+export rmt_tx0_init/1;
+export rmt_tx0_rewind/1;
+export rmt_tx0_push/2;
+export rmt_tx0_start/1;
+export rmt_tx0_wait_threshold/2;
+export rmt_tx0_wait_end/2;
+export rmt_tx0_pending/1;
+export rmt_tx0_threshold_seen/1;
+export rmt_tx0_clear_threshold/1;
+export rmt_tx0_clear_events/1;
+export rmt_tx0_status/1;
+export rmt_tx0_sys_conf/0;
+export rmt_tx0_conf0/0;
+export rmt_tx0_half_words/0;
+export rmt_tx0_words/0;
+export rmt_pulse_word/2;
+
+// Words in the chained RAM, and in each ping-pong half.
+fn rmt_tx0_words() -> uint32 {
+    192
+}
+
+fn rmt_tx0_half_words() -> uint32 {
+    96
+}
+
+// Channel clock divider: 40 MHz / 2 = 20 MHz, 50 ns per tick.
+fn rmt_tx0_div_cnt() -> uint32 {
+    2
+}
+
+fn rmt_tx0_mem_blocks() -> uint32 {
+    4
+}
+
+// One RAM word: `first` ticks high, then `second` ticks low (each 1..32767).
+fn rmt_pulse_word(first: uint32, second: uint32) -> uint32 {
+    level_high: uint32 <- 0x8000;
+    (first bor level_high) bor (second shl 16)
+}
+
+// Clock on, then a reset pulse, so the peripheral starts from its defaults whatever ran before.
+fn rmt_enable(s: device_window(L, (:esp32s3_system))) -> device_window(L, (:esp32s3_system)) {
+    sequence proc[register_rwr]
+        clk: uint32 <- board_pack_system_values@system_rmt_clk_en_mask();
+        rst_bit: uint32 <- board_pack_system_values@system_rmt_rst_mask();
+        keep: uint32 <- bnot rst_bit;
+        en: uint32 <- peek(s, :perip_clk_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_clk_en0, (en bor clk) impl Register32 {});
+        rst: uint32 <- peek(s, :perip_rst_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_rst_en0, (rst bor rst_bit) impl Register32 {});
+        _: atom <- poke(s, :perip_rst_en0, (rst band keep) impl Register32 {})
+    produces
+        pure s
+    end
+}
+
+// SYS_CONF for the whole group: FIFO access (apb_fifo_mask 0), RAM powered, crystal clock
+// undivided, active.
+fn rmt_tx0_sys_conf() -> uint32 {
+    mem_pu: uint32 <- board_pack_rmt_values@rmt_mem_force_pu_mask();
+    sel_shift: uint32 <- board_pack_rmt_values@rmt_sclk_sel_shift();
+    xtal: uint32 <- 3;
+    active: uint32 <- board_pack_rmt_values@rmt_sclk_active_mask();
+    clk_en: uint32 <- board_pack_rmt_values@rmt_clk_en_mask();
+    mem_pu bor (xtal shl sel_shift) bor active bor clk_en
+}
+
+// CH0CONF0 without the one-shot bits: divider, four memory blocks, wrap mode, idle output low.
+fn rmt_tx0_conf0() -> uint32 {
+    div_shift: uint32 <- board_pack_rmt_values@rmt_chconf0_tx_div_cnt_shift();
+    size_shift: uint32 <- board_pack_rmt_values@rmt_chconf0_tx_mem_size_shift();
+    wrap: uint32 <- board_pack_rmt_values@rmt_mem_tx_wrap_en_mask();
+    idle_en: uint32 <- board_pack_rmt_values@rmt_idle_out_en_mask();
+    (rmt_tx0_div_cnt() shl div_shift) bor (rmt_tx0_mem_blocks() shl size_shift) bor wrap bor idle_en
+}
+
+// Every channel-0 event bit in INT_RAW / INT_CLR: tx_end, err, tx_thr_event, tx_loop.
+fn rmt_tx0_event_bits() -> uint32 {
+    tx_end: uint32 <- board_pack_rmt_values@rmt_ch0_tx_end_int_raw_mask();
+    err: uint32 <- board_pack_rmt_values@rmt_ch0_err_int_raw_mask();
+    thr: uint32 <- board_pack_rmt_values@rmt_ch0_tx_thr_event_int_raw_mask();
+    tx_loop: uint32 <- board_pack_rmt_values@rmt_ch0_tx_loop_int_raw_mask();
+    tx_end bor err bor thr bor tx_loop
+}
+
+fn rmt_tx0_clear_events(r: device_window(L, (:esp32s3_rmt))) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        _: atom <- poke(r, :int_clr, rmt_tx0_event_bits() impl Register32 {})
+    produces
+        pure r
+    end
+}
+
+// Group clock and memory access, channel 0's configuration applied (conf_update), the threshold at
+// half the RAM, interrupts masked, events cleared.
+fn rmt_tx0_init(r: device_window(L, (:esp32s3_rmt))) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        upd: uint32 <- board_pack_rmt_values@rmt_chconf0_tx_conf_update_mask();
+        conf0: uint32 <- rmt_tx0_conf0();
+        zero: uint32 <- 0;
+        _: atom <- poke(r, :sys_conf, rmt_tx0_sys_conf() impl Register32 {});
+        _: atom <- poke(r, :int_ena, zero impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, conf0 impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, (conf0 bor upd) impl Register32 {});
+        _: atom <- poke(r, :ch0_tx_lim, rmt_tx0_half_words() impl Register32 {});
+        _: atom <- poke(r, :int_clr, rmt_tx0_event_bits() impl Register32 {})
+    produces
+        pure r
+    end
+}
+
+// The FIFO write pointer back to word 0 (apb_mem_rst pulse); the transmitter's read pointer is
+// untouched, so this is safe mid-transmission.
+fn rmt_tx0_rewind(r: device_window(L, (:esp32s3_rmt))) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        conf0: uint32 <- rmt_tx0_conf0();
+        apb_rst: uint32 <- board_pack_rmt_values@rmt_chconf0_tx_apb_mem_rst_mask();
+        _: atom <- poke(r, :ch0conf0, (conf0 bor apb_rst) impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, conf0 impl Register32 {})
+    produces
+        pure r
+    end
+}
+
+// One word into the channel RAM at the FIFO write pointer, which then moves on (wrapping at 192).
+fn rmt_tx0_push(r: device_window(L, (:esp32s3_rmt)), word: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        _: atom <- poke(r, :ch0data, word impl Register32 {})
+    produces
+        pure r
+    end
+}
+
+// Events cleared, both pointers reset (the FIFO pointer sits at 192 = 0 after a full preload, so
+// nothing is lost), configuration applied, transmission started from word 0.
+fn rmt_tx0_start(r: device_window(L, (:esp32s3_rmt))) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        conf0: uint32 <- rmt_tx0_conf0();
+        rd_rst: uint32 <- board_pack_rmt_values@rmt_mem_rd_rst_mask();
+        apb_rst: uint32 <- board_pack_rmt_values@rmt_chconf0_tx_apb_mem_rst_mask();
+        upd: uint32 <- board_pack_rmt_values@rmt_chconf0_tx_conf_update_mask();
+        start: uint32 <- board_pack_rmt_values@rmt_tx_start_mask();
+        _: atom <- poke(r, :int_clr, rmt_tx0_event_bits() impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, (conf0 bor rd_rst) impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, conf0 impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, (conf0 bor apb_rst) impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, conf0 impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, (conf0 bor upd) impl Register32 {});
+        _: atom <- poke(r, :ch0conf0, (conf0 bor start) impl Register32 {})
+    produces
+        pure r
+    end
+}
+
+// Polls INT_RAW until `bits` is set or the poll budget is spent. Each poll is one recursion level
+// and the board's actor stacks are small (8 KB machine stack by default, guard-faulted when
+// exhausted), so the budget is nested three deep, 16 polls per level: `blocks` x 256 polls, at
+// most 16 blocks (4096 polls, about 50 ms at the measured 12.8 us per poll), never more than 48
+// frames. The loops hand back only the window: a tuple result would be a heap block per poll, and
+// the heap is about 110 KB. The caller reads INT_RAW once more to learn the outcome.
+fn poll_once(r: device_window(L, (:esp32s3_rmt)), bits: uint32, polls: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        raw: uint32 <- peek(r, :int_raw) impl Register32 {};
+        one: uint32 <- 1;
+        res: device_window(L, (:esp32s3_rmt)) <- case (raw band bits) == 0 of {
+            false -> r;
+            true -> case polls <= 1 of {
+                true -> r;
+                false -> poll_once(r, bits, polls - one)
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+fn poll_rounds(r: device_window(L, (:esp32s3_rmt)), bits: uint32, rounds: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        one: uint32 <- 1;
+        sixteen: uint32 <- 16;
+        r1: device_window(L, (:esp32s3_rmt)) <- poll_once(r, bits, sixteen);
+        raw: uint32 <- peek(r1, :int_raw) impl Register32 {};
+        res: device_window(L, (:esp32s3_rmt)) <- case (raw band bits) == 0 of {
+            false -> r1;
+            true -> case rounds <= 1 of {
+                true -> r1;
+                false -> poll_rounds(r1, bits, rounds - one)
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+fn poll_blocks(r: device_window(L, (:esp32s3_rmt)), bits: uint32, blocks: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        one: uint32 <- 1;
+        sixteen: uint32 <- 16;
+        r1: device_window(L, (:esp32s3_rmt)) <- poll_rounds(r, bits, sixteen);
+        raw: uint32 <- peek(r1, :int_raw) impl Register32 {};
+        res: device_window(L, (:esp32s3_rmt)) <- case (raw band bits) == 0 of {
+            false -> r1;
+            true -> case blocks <= 1 of {
+                true -> r1;
+                false -> poll_blocks(r1, bits, blocks - one)
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+// Polls until one of `bits` is raised or the budget is spent, and hands back only the window:
+// the caller learns the outcome from rmt_tx0_pending (still raised = seen) and clears the bit
+// itself. A (window, flag) tuple result would be a heap block per wait, never given back in a
+// behaviour (the runtime frees an actor's old state block and message copy at each dispatch, no
+// other allocation), and a frame waits five times.
+fn wait_event(r: device_window(L, (:esp32s3_rmt)), bits: uint32, blocks: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        res: device_window(L, (:esp32s3_rmt)) <- poll_blocks(r, bits, blocks)
+    produces
+        pure res
+    end
+}
+
+// The next threshold event: 96 more words have gone out and the half they came from is free.
+// `blocks` is the poll budget in blocks of 256 polls (1..16). The event bit stays raised until
+// rmt_tx0_clear_threshold.
+fn rmt_tx0_wait_threshold(r: device_window(L, (:esp32s3_rmt)), blocks: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        thr: uint32 <- board_pack_rmt_values@rmt_ch0_tx_thr_event_int_raw_mask();
+        res: device_window(L, (:esp32s3_rmt)) <- wait_event(r, thr, blocks)
+    produces
+        pure res
+    end
+}
+
+// The end of the transmission (a zero-duration word was reached); `blocks` as above. The bit
+// stays raised until rmt_tx0_clear_events.
+fn rmt_tx0_wait_end(r: device_window(L, (:esp32s3_rmt)), blocks: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        tx_end: uint32 <- board_pack_rmt_values@rmt_ch0_tx_end_int_raw_mask();
+        res: device_window(L, (:esp32s3_rmt)) <- wait_event(r, tx_end, blocks)
+    produces
+        pure res
+    end
+}
+
+// Channel 0's raised event bits (INT_RAW masked to rmt_tx0_event_bits): tx_end, err, threshold,
+// loop, each at its board_pack_rmt_values mask. A read, so the window is not handed back.
+fn rmt_tx0_pending(r: device_window(L, (:esp32s3_rmt))) -> uint32 {
+    sequence proc[register_rwr]
+        bits: uint32 <- rmt_tx0_event_bits();
+        raw: uint32 <- peek(r, :int_raw) impl Register32 {}
+    produces
+        pure raw band bits
+    end
+}
+
+// 1 when the threshold event is raised, else 0.
+fn rmt_tx0_threshold_seen(r: device_window(L, (:esp32s3_rmt))) -> uint32 {
+    sequence proc[register_rwr]
+        thr: uint32 <- board_pack_rmt_values@rmt_ch0_tx_thr_event_int_raw_mask();
+        raw: uint32 <- peek(r, :int_raw) impl Register32 {};
+        one: uint32 <- 1;
+        zero: uint32 <- 0;
+        seen: uint32 <- case (raw band thr) == 0 of { true -> zero; false -> one }
+    produces
+        pure seen
+    end
+}
+
+fn rmt_tx0_clear_threshold(r: device_window(L, (:esp32s3_rmt))) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        thr: uint32 <- board_pack_rmt_values@rmt_ch0_tx_thr_event_int_raw_mask();
+        _: atom <- poke(r, :int_clr, thr impl Register32 {})
+    produces
+        pure r
+    end
+}
+
+// CH0STATUS, for probes: read address, state, error bits. The tuple result is a heap block the
+// behaviour never gets back, so this is for one-off probes, not a frame loop.
+fn rmt_tx0_status(r: device_window(L, (:esp32s3_rmt))) -> (device_window(L, (:esp32s3_rmt)), uint32) {
+    sequence proc[register_rwr]
+        st: uint32 <- peek(r, :ch0status) impl Register32 {}
+    produces
+        pure (r, st)
+    end
+}

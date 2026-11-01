@@ -1,0 +1,2269 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Carrier threads (actor_memory_budget_plan.md item N; ROADMAP chunk 2, hosted part).
+//
+// linux_x86_64 port of emitter/apple_silicon_mac/terms/prims/prims_actors_carrier_asm.silica: GNU/ELF
+// Intel syntax, undecorated symbols; the locks are the futex locks of linux_rt_shims_asm.silica
+// (silica_rt_lock_lock / _unlock, no owner check), the carrier's sleep is silica_rt_cv_wait_timeout's
+// futex wait, and the carrier count and the core kinds come from the shim's sysctl table
+// (hw.logicalcpu and hw.perflevel0.logicalcpu both answer sysconf(_SC_NPROCESSORS_ONLN): Linux
+// reports every core as a performance core, so there are no efficiency carriers and
+// pin_actor_to_efficiency_core moves nothing). Carrier affinity is real here: pthread_setaffinity_np
+// binds carrier i to cpu i (silica_rt_carrier_main; the result is kept in the block at +224, never
+// checked). A dangerous actor's thread keeps the shim's silica_rt_thread_policy_set. The design is
+// the Apple module's, routine for routine; what differs is the register model below.
+//
+// Carriers are the only execution model for actors on this target (Lee, 2026-10-19: no thread per
+// actor, no opt-out). N carrier threads, one per logical core (hw.logicalcpu;
+// `SILICA_CARRIER_COUNT=<n>` in the environment overrides the count, n >= 1; unset, 0 or not a
+// number means the machine's count, at least 1), run every actor: workers from `spawn`,
+// `spawn_linked` and `spawn_device`, the rows of every supervisor, supervisors themselves (their
+// start trampoline, a supervisor's init and the materialisation of its children, runs in the
+// actor's first dispatch, Lcar_first) and the runtime's own registry actors (the pid, dangerous
+// and device registries), on the BEAM pattern the board already uses per core (rt_actors.S
+// sched_loop / yield_to_sched / make_ready). The only threads besides the carriers are `main`,
+// which is not an actor (it keeps its blocking futex and spin waits: wait_for_exit, a call, a
+// spawn of a supervisor), and one thread per DANGEROUS actor (spawn_dangerous,
+// spawn_dangerous_registered, a :dangerous row): a dangerous actor's foreign call may block, which
+// would stall a carrier and every actor on it, and its guarded-FFI recovery state is per thread
+// (spec §15.4.13.5, the AArch64 thread-isolation form; ffi_guarded_runtime_asm.silica), so it
+// keeps the thread path of actor_thread_main (ACB #440 = 0).
+//
+//   - The carrier table (silica_rt_carriers): N blocks of 256 B, calloc'd at the first adoption
+//     (silica_rt_carriers_ensure); a carrier's thread is created the first time an actor is bound
+//     to it (silica_rt_carrier_ensure_started). A block: +0 lock (a 4-byte futex lock), +8 futex
+//     word the carrier sleeps on when its run queues are empty, +16 idle (1 while asleep), +24/+32
+//     unused since stage 4 (the one run queue they held became the three below), +40 the actor
+//     being run, +48 the carrier's base SP, +56 its 64 KB signal alternate stack, +64 pthread_t,
+//     +72 started, +80 created, +88/+96 the thread's record (below), +104 the sweep list head
+//     (idle :release_when_idle actors of this carrier still holding committed stack, linked
+//     through ACB #456, oldest first), +112 the carrier's index, +120 the time of its last sweep;
+//     +128 the three run queues, one per priority tier, 24 B each at +128 + 24 * q (q = 0 high, 1
+//     normal, 2 low): head, tail (control blocks linked through ACB #456) and length; +200 the
+//     weighted-fair tier being served and +208 its remaining credit; +216 the lottery's xorshift64
+//     state (0 until the first draw); +224 the result of the thread's pthread_setaffinity_np (0
+//     bound to cpu index, else the errno; Linux only); +232 the sweep list's tail and +240 its
+//     listed bytes (the sum of ACB #288 over the listed actors; the Apple module keeps these two at
+//     +224/+232, where this port keeps the affinity result); +248 spare.
+//   - Dispatch order (stage 4; the board's rt_actors.S silica_rt_rq_push / rq_pop, design in
+//     design_documents/ports/esp32s3_xtensa_port.md §8.10): set_scheduler_policy chooses how the
+//     READY actors of one carrier take turns. One policy word for the process
+//     (silica_rt_sched_policy: 0 :priority_fifo, the default, 1 :round_robin, 2 :weighted_fair,
+//     3 :lottery), applied by every carrier to its own queues, as the board applies one policy per
+//     core. The policy decides only which ready actor runs next: never when a running one stops
+//     (nothing preempts between the yield points of §15.1.2) and never which carrier an actor is
+//     on. Only silica_rt_rq_push (the queue an actor is appended to: its priority tier, or the
+//     normal queue under :round_robin) and silica_rt_rq_pop (the queue whose head runs: the
+//     highest-priority non-empty one under :priority_fifo and :round_robin; deficit round robin
+//     over the tiers with quanta 4 / 2 / 1 and a unit cost per dispatch under :weighted_fair, an
+//     empty tier forfeiting its quantum; a draw over weight x queued actors tickets, 4 / 2 / 1,
+//     under :lottery, the drawn tier's head running) read the policy, both under the carrier's
+//     lock. A policy change takes effect at the next push or pop on every carrier and leaves
+//     queued actors where they are (the board's rule). An actor with more mail goes back to the
+//     tail of its queue at its dispatch boundary (silica_rt_carrier_requeue).
+//   - Priority (stage 4): set_actor_priority stores the level in ACB #520 (0 low, 1 normal, 2
+//     high; every actor starts at normal, written at both calloc sites) for every actor; a carrier
+//     actor's level is the tier it is pushed to and its weight class, read at its next push (a
+//     queued actor stays where it is, as on the board); a dangerous actor's level has no effect
+//     (the OS schedules its thread).
+//   - The thread record: the pthread key (silica_actor_pthread_key) names a two-word record per
+//     thread, the current actor and the carrier (0 when the thread is not a carrier's). A carrier's
+//     record is in its block (+88, +96 = the block itself) and the carrier writes the current actor
+//     with a plain store at each dispatch (risk R2.1: no pthread_setspecific per switch); an actor
+//     thread's is in its control block (#496, #504 = 0); main gets a calloc'd record the first
+//     time something installs a current actor on it (an ingress drain). Every runtime entry and
+//     the fault handler read the current actor through the record (silica_rt_tls_current_actor_get),
+//     and silica_rt_on_carrier_thread is the record's second word.
+//   - Binding: an actor is bound at adoption to one carrier (ACB #440) and stays there until the
+//     program moves it (stage 3) or it ends; the runtime never moves an actor on its own. A core
+//     id given to spawn (ACB #208; a row child's spec has none) that names one of the machine's
+//     logical cores (1 .. silica_rt_logical_cpu_count - 1, the count get_cpu_topology reports;
+//     0 is the default) binds it to carrier `core mod N`, so a program that places on cores 1 and
+//     2 lands on different carriers whenever there are two and is deterministic at every N; a
+//     core the machine does not have, or no core id, takes the carriers in turn
+//     (silica_rt_carrier_next, the board's rule in rt_actors.S spawn). A worker and a supervisor
+//     are adopted alike; a supervisor (a start trampoline, SB #48) is made ready at adoption
+//     instead of started, so its first dispatch runs the trampoline and its spawner waits for the
+//     started word (#224) as before: a carrier actor parks for it, main spins.
+//   - Placement (stage 3; the spec's Actor Pinning Policy, §15.1.2, and §22.10): migrate_actor
+//     moves a carrier actor to the carrier of the target core (silica_rt_carrier_migrate): an
+//     idle actor is bound at once (one on its carrier's sweep list is unlisted and relisted on the
+//     target); a ready, running or parked actor has the target left pending in ACB #512 and
+//     applied at its next dispatch boundary (silica_rt_carrier_apply_pending, from
+//     silica_rt_carrier_requeue and silica_rt_carrier_mark_idle), never while it runs and never
+//     at a resume (a parked actor resumes on the carrier it parked on, inside the same
+//     dispatch). The mailbox is the actor's own and moves with it. Codes: 0 :ok, 1
+//     :invalid_target (no such logical core), 2 :actor_not_found (null or ended); 3
+//     :migration_blocked is never produced here. pin_actor_to_core is that move;
+//     pin_actor_to_performance_core / efficiency_core pick a carrier by core kind
+//     (silica_rt_carrier_pick_kind: P carriers [0, min(P, N)), E carriers [P, N), in turn per
+//     kind, no move when already on one of the kind or none exists); unpin_actor,
+//     pin_actor_realtime and pin_actor_to_numa_node change nothing for a carrier actor. A
+//     dangerous actor (its own thread, #440 = 0) keeps the affinity-hint path for its thread.
+//     The test-only query actor_carrier_index(ref) reports the bound carrier's index (-1 for a
+//     dangerous actor).
+//   - ACB fields (prims_actors_runtime_asm.silica layout): #440 the carrier (0 = a dangerous
+//     actor, on a thread of its own), #448 status (0 none, 1 idle, 2 ready: in a run queue, 3
+//     running, 4 parked in a runtime wait, 5 idle on the carrier's sweep list, 6 sweeping: taken
+//     off that list by its carrier's sweep, which is about to release its stack under the actor's
+//     lock; on no queue or list; a wake handles it like 1, a migration like 2-4), #456 run-queue,
+//     wait-list or sweep-list link, #464 the SP of a parked context (0 = none), #472 the actor
+//     parked in a spawn until this actor has started, #480 the wait list the actor is parked on,
+//     #512 the pending migration target, #520 the priority level, #528 the SP of actor_thread_main's
+//     frame on a dangerous actor's own thread (0 for a carrier actor), where
+//     silica_rt_thread_actor_end returns to end the thread.
+//     Invariant: an actor on a carrier's run queue or sweep list has #440 = that carrier (the push
+//     and the listing read #440 after any pending move is applied, and #440 changes only when the
+//     actor is on neither, under its lock); so a carrier runs only actors bound to it, and every
+//     path that leaves an actor re-enters the loop of the carrier the thread is, read before the
+//     actor's status was published (not #440 afterwards, which a move may have changed).
+//   - Dispatch: the carrier pops a ready actor (silica_rt_rq_pop, the policy's choice), writes its
+//     record's current actor and enters the mailbox loop of actor_thread_main (LBB1_loop) with
+//     the dispatch frame below, exactly as a dangerous actor's own thread does. An actor not yet
+//     started (#224 = 0: a supervisor made ready at adoption) first runs its start trampoline
+//     (Lcar_first). A behaviour runs on the actor's reservation with the carrier's SP kept in
+//     ACB #368 and returns to the carrier on the dispatch boundary; the release algorithm then
+//     runs on the carrier's stack. After the message the actor is re-queued when more mail waits,
+//     else marked idle (silica_rt_carrier_mark_idle: on the sweep list when it is
+//     :release_when_idle and holds committed stack).
+//   - What runs on the actor's own stack, and so may park: the behaviour; the start trampoline;
+//     a supervisor's restart of a row (maybe_restart with its :one_for_all / :rest_for_one
+//     cascade, served from its own ingress at LBB1_ingress_no_beh, or by a drain from the reply
+//     path, LBB1_reply_drain); and the delivering part of every exit path (LBB1_exit, badarith,
+//     case_clause, the registry name-taken failure, silica_rt_actor_fail_current for an actor
+//     with a supervision block): the exit of a supervisor shuts its children down last row first
+//     and waits for each (silica_rt_sup_shutdown_children), and a child on the same carrier can
+//     only end when this carrier runs it, so the wait must be a park, and a park needs a stack
+//     the carrier loop will not reuse: the actor's own reservation, which is unmapped only after
+//     that phase, on the carrier's stack. The carrier's stack is for what never waits: the
+//     mailbox loop, the release algorithm, the re-queue, and the tail of an exit (stack_free,
+//     the arena teardown, the final release).
+//   - The idle sweep (release_when_idle_design.md, 2026-10-20): the sweep list is FIFO by the
+//     actors' last-message stamps (ACB #344): silica_rt_carrier_mark_idle appends at the tail
+//     (+232) in the same dispatch that stamped, and adds the actor's committed bytes (#288) to the
+//     listed total (+240). silica_rt_carrier_sweep takes from the head only, in batches of at
+//     most 64 per call: an actor whose stamp is the idle period old (silica_rt_stack_idle_due,
+//     against ONE clock reading per batch; the period is silica_rt_idle_release_ns, spec
+//     §15.1.2.2's second unless SILICA_IDLE_RELEASE_MS says otherwise), or any head while the
+//     listed total exceeds the carrier's idle-stack budget (silica_rt_idle_stack_budget: oldest
+//     first, whatever its age, so the committed stack idle actors hold on a carrier is bounded by
+//     the budget plus one actor's stack and the batch in flight, whatever the spawn rate). The
+//     walk stops at the first head not yet due, so a sweep costs O(released), never O(listed). No
+//     stack is released under the carrier's lock: per actor the sweep unlinks it and marks it 6
+//     (sweeping) under the carrier's lock, lets that lock go, takes the actor's own lock and, when
+//     its status is still 6, releases it (silica_rt_stack_release_to, on the carrier's stack; it
+//     never waits) and marks it plainly idle (1); a status of 2 found there (mail, a stop or a
+//     migration's wake made it ready meanwhile) means no release: the actor is about to run and
+//     will stamp and relist at its next boundary. Only one of the two locks is held at a time.
+//     A carrier sweeps before it sleeps on an empty queue (batch after batch while the sweep
+//     answers 1, re-checking its queues between batches, then waits with the microseconds until
+//     the head is due as its timeout) and, while busy, at a dispatch when the listed total is over
+//     budget (checked at every pop) or when the head is due and silica_rt_idle_sweep_ns
+//     (min(250 ms, the period / 4)) has passed since the last sweep; a busy sweep that answers 1
+//     is followed by ONE dispatch and then the next batch, so a burst of spawns never starves and
+//     the batch bounds the dispatch latency it adds. A migration relist (Lcmg_listed) appends an
+//     older stamp behind newer ones on the target: it is released when the entry before it is,
+//     at most one extra period late. The list changes only under the carrier's lock (the listing
+//     by mark_idle, the sweep's hand-off, and silica_rt_carrier_unlist when mail or a migration
+//     takes a listed actor off); status 6 is written under the carrier's lock on the carrier's own
+//     thread and read under the actor's lock.
+//   - The carrier loop is re-entered afresh (SP reset to the base, current actor cleared) from every
+//     path that leaves an actor: a dispatch boundary with an empty mailbox, an exit path (which runs
+//     on the carrier's stack, like the board's scheduler running a faulted actor's exit), or a park.
+//   - Parking, and the x86-64 register model (the one real difference from the Apple module): the
+//     AArch64 runtime keeps the dispatch state of actor_thread_main in callee-saved registers
+//     (X19 the actor, X20 the node, X21 the reply, W22 the ingress flag, X24 the carrier, X25 the
+//     payload), which a park saves with the context and a resume brings back. On this target
+//     those values are frame slots of the dispatch frame on the CARRIER's stack ([rbp-8],
+//     [rbp-16], [rbp-24], [rbp-32], [rbp-64], [rbp-56]; RUNTIME_GUIDE.md: nothing but rbp/rsp
+//     survives a call, so x19..x28 are slots), and other actors dispatched on the same carrier
+//     while this one is parked reuse that frame. So the dispatch frame is at one fixed place per
+//     carrier, rbp = base - 16 with its slot area below (Lcar_loop builds it exactly as
+//     actor_thread_main's prologue does: a fake return slot, a saved rbp of 0, 128 bytes of slots;
+//     the behaviour is called with another 48 bytes below for its result tuple, rsp = base - 192,
+//     which ACB #368 holds), and a park (silica_rt_ctx_save) saves, besides rbp rbx r12-r15 and
+//     the return address, the eight slots [rbp-8 .. rbp-64] of that frame, read through the
+//     actor's carrier (#440 -> +48); the resume (silica_rt_ctx_resume, run by the carrier at
+//     Lcar_resume with that frame as its own) writes them back before it restores the registers.
+//     Everything a parked actor's chain of runtime frames needs (row_wait, sup_restart_acquire,
+//     shutdown_children, maybe_restart) lives on the actor's own reservation and survives as is.
+//     An exit path that leaves the reservation for the carrier's stack while its own frame is on
+//     the reservation (badarith, case_clause, name_taken, fail_current) first rebuilds a frame on
+//     the carrier's stack holding the actor and the carrier, since the reservation is unmapped
+//     next; LBB1_exit, whose frame IS the dispatch frame, continues below it (rsp = rbp - 192).
+//   - Mail: every wake of a mailbox (the sites that signalled ACB+80) goes through
+//     silica_rt_actor_mail_signal, which also makes an idle carrier actor ready on its own
+//     carrier and wakes that carrier's futex when it sleeps; every wake of a call wrapper goes
+//     through silica_rt_call_wrapper_wake.
+//   - The restart protocol's primitives live here (the protocol itself is described in
+//     prims_actors_child_table_asm.silica's header): silica_rt_row_wait, the one wait for a row
+//     child's exit (kill_abnormal, terminate_child / remove_child / restart_child, a supervisor's
+//     shutdown, a :one_for_all or :rest_for_one cascade), for one identity in the row's exit_done
+//     (+56, a generation word that is never cleared); silica_rt_actor_stop, the one way another
+//     actor is ended, which also ends a wait the stopped actor is parked or spinning in;
+//     silica_rt_sup_restart_try / _acquire / _release, the supervision block's restart token
+//     (#120) with one holder at a time and a wait list (+128) for carrier actors parked for it. A
+//     carrier actor on its own stack parks (silica_rt_wait_park): it links itself, through ACB
+//     #456, into the list (its head's address kept in ACB #480) under silica_rt_row_wait_lock,
+//     which guards every wait list; the wake side (silica_rt_wait_list_wake: the child's last act,
+//     silica_rt_row_exit_done_store, or a token release) holds it to take the list and never holds
+//     it while it takes an actor's lock; a stop holds the actor's lock and then the wait lock to
+//     unlink. The check and the push are one critical section, so no wake is lost. Anything that
+//     is not a carrier actor on its own stack spins (main, a dangerous actor's thread). A carrier
+//     actor on the carrier's own stack that would spin for another carrier actor is a runtime
+//     abort (Lrw_spin): with every waiting path above moved onto the actor's own stack it is
+//     unreachable, and it is kept as the assertion of that rule.
+//
+// Lock order, with any number of carriers and with supervisors on them (an actor's lock is
+// ACB+16; a supervisor's is the same lock of the supervisor's block):
+//   a call wrapper's lock (+72)  >  the waiting actor's lock  >  the supervisor's lock  >
+//   silica_rt_row_wait_lock  >  a carrier's lock (+0).
+// A supervisor on a carrier is itself the waiting actor in its own cascade and in a drain of its
+// own ingress from its reply path (silica_rt_sup_restart_acquire with the asking actor equal to
+// the supervisor: the one lock is taken once, the futex lock is not recursive either). A carrier's
+// lock is a leaf: it is taken by the carrier loop with nothing else held, and by
+// silica_rt_carrier_push, _mark_idle, _unlist and _sweep with at most one actor's lock (and the
+// locks above it) held; no path holds two carriers' locks. The sweep's two sections (the hand-off
+// under the carrier's lock, the release under the actor's) are taken in sequence with nothing else
+// held, never nested. silica_rt_carriers_lock (the table's creation, once) and the identity
+// table's lock are leaves of their own.
+//
+// Register model (RUNTIME_GUIDE.md, as every linux_x86_64 runtime module): arguments X0..X3 arrive
+// in rdi rsi rdx rcx and every result leaves in rdi (C library results arrive in rax and are
+// moved). What the AArch64 text keeps in x19..x25 lives in frame slots [rbp-8] .. [rbp-56];
+// temporaries use rax rcx rdx r8-r11, never across a call. Frames are `push rbp; mov rbp, rsp;
+// sub rsp, N` (N a multiple of 16) and `leave; ret`. The atomic swaps and the in-turn counters are
+// `xchg` and `lock cmpxchg` loops; the Dekker barrier of the started store is `mfence`; the spin
+// waits of main and of a dangerous actor's thread carry a `pause`.
+//
+// Not here: time beyond send_after / cancel_timer (prims_actors_timer_asm.silica: one service thread
+// per process feeds the mailboxes through silica_rt_actor_mail_signal), call_with_timeout, and any
+// preemption (ROADMAP chunk 11); the
+// pooled FFI worker thread of spec §15.4.13.5 (a dangerous actor is one thread today).
+
+export emit_actor_carrier_runtime_asm/0;
+
+fn carrier_asm_data() -> string {
+    "	.bss
+	.p2align	4
+	.globl	silica_rt_carrier_count
+silica_rt_carrier_count:
+	.zero	8
+	.globl	silica_rt_carriers
+silica_rt_carriers:
+	.zero	8
+silica_rt_carrier_next:
+	.zero	8
+silica_rt_carriers_lock:
+	.zero	8
+	.globl	silica_rt_row_wait_lock
+silica_rt_row_wait_lock:
+	.zero	16
+	.globl	silica_rt_logical_cpu_count
+silica_rt_logical_cpu_count:
+	.zero	8
+	.globl	silica_rt_pcore_count
+silica_rt_pcore_count:
+	.zero	8
+silica_rt_pcore_next:
+	.zero	8
+silica_rt_ecore_next:
+	.zero	8
+	.globl	silica_rt_sched_policy
+silica_rt_sched_policy:
+	.zero	8
+	.section .rodata
+L_srt_carrier_count_env:
+	.asciz	\"SILICA_CARRIER_COUNT\"
+L_srt_hw_logicalcpu:
+	.asciz	\"hw.logicalcpu\"
+L_srt_hw_perf0_logicalcpu:
+	.asciz	\"hw.perflevel0.logicalcpu\"
+Lrta_r_carrier_wait:
+	.asciz	\"a carrier actor waited on the carrier's own stack for another actor of its carrier\"
+Lrta_r_row_wake:
+	.asciz	\"a row child's exit found an actor on its wait list that was not parked for it\"
+Lrta_r_carrier_thread:
+	.asciz	\"the carrier thread could not be created\"
+Lrta_r_carrier_table:
+	.asciz	\"the carrier table could not be made\"
+Lrta_r_thread_record:
+	.asciz	\"the thread's actor record could not be made\"
+	.text
+"
+}
+
+fn carrier_asm_adopt() -> string {
+    "	.globl	silica_rt_carrier_adopt
+	.p2align	4
+silica_rt_carrier_adopt:
+# rdi = a new ACB (reservation made, arena bookkeeping set), rsi = its start trampoline (0 = none),
+# rdx = 1 for a dangerous actor. -> rdi = 1 when the actor was given to a carrier (no thread is to
+# be made): every actor but a dangerous one, whose foreign calls may block and whose guarded-FFI
+# state is per thread, so it keeps a thread of its own (rdi = 0). A supervisor or any other actor
+# with a trampoline is bound and made READY (status 2, on its carrier's run queue) instead of
+# started: its first dispatch runs the trampoline (Lcar_first) and then stores the started word
+# (#224), which its spawner waits for; an actor without one is idle and started at once. The
+# carrier: `core mod N` for a core id (#208) that names one of the machine's logical cores, 1 ..
+# silica_rt_logical_cpu_count - 1 (a row child's #208 is its row pointer, no core id; 0 is the
+# default; a core the machine does not have is placed in turn, the board's rule for an
+# out-of-range core at spawn); else the next carrier in turn.
+# Frame: [rbp-8] ACB (x19), [rbp-16] carrier (x20), [rbp-24] table (x21), [rbp-32] trampoline (x22).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 32], rsi
+	test	rdx, rdx
+	jnz	Lcad_no
+	call	silica_rt_carriers_ensure
+	mov	QWORD PTR [rbp - 24], rdi
+	mov	r10, QWORD PTR [rip + silica_rt_carrier_count]
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rax + 208]
+	cmp	rcx, 4096
+	jae	Lcad_in_turn
+	test	rcx, rcx
+	jz	Lcad_in_turn
+	cmp	rcx, QWORD PTR [rip + silica_rt_logical_cpu_count]
+	jae	Lcad_in_turn
+	mov	rax, rcx
+	xor	edx, edx
+	div	r10
+	mov	rcx, rdx
+	jmp	Lcad_have_index
+Lcad_in_turn:
+	mov	rax, QWORD PTR [rip + silica_rt_carrier_next]
+Lcad_turn_loop:
+	lea	r11, [rax + 1]
+	cmp	r11, r10
+	jb	Lcad_turn_store
+	xor	r11d, r11d
+Lcad_turn_store:
+	lock cmpxchg	QWORD PTR [rip + silica_rt_carrier_next], r11
+	jne	Lcad_turn_loop
+	mov	rcx, rax
+Lcad_have_index:
+	shl	rcx, 8
+	add	rcx, QWORD PTR [rbp - 24]
+	mov	QWORD PTR [rbp - 16], rcx
+	mov	rdi, rcx
+	call	silica_rt_carrier_ensure_started
+	test	rdi, rdi
+	jz	Lcad_bound
+# The host refused this carrier's thread (dangerous actors may hold every thread it allows, item N
+# #5): the actor goes to a carrier that runs instead of its `core mod N` or in-turn one. None running
+# (the first adoption only) is the runtime abort: the carrier thread could not be created.
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_carrier_started_any
+	test	rdi, rdi
+	jz	Lcad_no_carrier
+	mov	QWORD PTR [rbp - 16], rdi
+Lcad_bound:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 440], rcx
+	mov	QWORD PTR [rax + 448], 1
+	mov	QWORD PTR [rax + 456], 0
+	mov	QWORD PTR [rax + 464], 0
+	mov	QWORD PTR [rax + 472], 0
+	mov	QWORD PTR [rax + 512], 0
+	cmp	QWORD PTR [rbp - 32], 0
+	jne	Lcad_ready
+	mov	rdi, rax
+	mov	esi, 1
+	call	silica_rt_started_store
+	mov	edi, 1
+	jmp	Lcad_ret
+Lcad_ready:
+# A trampoline to run: ready on its carrier, under its lock (its identity resolves already, so a
+# cast could race the status; a push needs the status guarded by the actor's lock).
+	lea	rdi, [rax + 16]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 448], 2
+	mov	rdi, rax
+	call	silica_rt_carrier_push
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	edi, 1
+	jmp	Lcad_ret
+Lcad_no_carrier:
+	lea	rdi, [rip + Lrta_r_carrier_thread]
+	call	silica_rt_abort_with
+	jmp	Lcad_no_carrier
+Lcad_no:
+	xor	edi, edi
+Lcad_ret:
+	leave
+	ret
+	.globl	silica_rt_carriers_ensure
+	.p2align	4
+silica_rt_carriers_ensure:
+# -> rdi = the carrier table, made the first time: silica_rt_carrier_count blocks of 256 B (the
+# count was read by silica_rt_stack_runtime_init; 1 when it was not), each knowing itself (+96)
+# and its index (+112), its weighted-fair round starting at the high tier with its quantum (+200
+# = 0 from calloc, +208 = 4, as the board's core block starts). Failure to make it is a runtime
+# abort. Frame: [rbp-8] count (x20), [rbp-16] table (x21).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	rdi, QWORD PTR [rip + silica_rt_carriers]
+	test	rdi, rdi
+	jnz	Lcen_ret
+	lea	rdi, [rip + silica_rt_carriers_lock]
+	call	silica_rt_lock_lock
+	mov	rdi, QWORD PTR [rip + silica_rt_carriers]
+	test	rdi, rdi
+	jnz	Lcen_unlock
+	mov	r10, QWORD PTR [rip + silica_rt_carrier_count]
+	test	r10, r10
+	jnz	Lcen_have_count
+	mov	r10d, 1
+	mov	QWORD PTR [rip + silica_rt_carrier_count], r10
+Lcen_have_count:
+	mov	QWORD PTR [rbp - 8], r10
+	mov	rdi, r10
+	mov	esi, 256
+	call	calloc
+	test	rax, rax
+	jz	Lcen_failed
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rcx, rax
+	xor	r10d, r10d
+	mov	r11, QWORD PTR [rbp - 8]
+Lcen_fill:
+	cmp	r10, r11
+	jae	Lcen_filled
+	mov	QWORD PTR [rcx + 96], rcx
+	mov	QWORD PTR [rcx + 112], r10
+	mov	QWORD PTR [rcx + 208], 4
+	add	rcx, 256
+	inc	r10
+	jmp	Lcen_fill
+Lcen_filled:
+	mov	rax, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rip + silica_rt_carriers], rax
+Lcen_unlock:
+	lea	rdi, [rip + silica_rt_carriers_lock]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rip + silica_rt_carriers]
+Lcen_ret:
+	leave
+	ret
+Lcen_failed:
+	lea	rdi, [rip + Lrta_r_carrier_table]
+	call	silica_rt_abort_with
+	jmp	Lcen_failed
+	.globl	silica_rt_carrier_ensure_started
+	.p2align	4
+silica_rt_carrier_ensure_started:
+# rdi = carrier block. Creates its thread the first time. -> rdi = 0 when the carrier runs (it did
+# already, or its thread was made now), 1 when the host refused the thread (item N #5: dangerous
+# actors, each on a thread of its own, may hold every thread the host allows): the carrier stays
+# without one, and the caller places the actor on a carrier that runs (silica_rt_carrier_adopt)
+# or answers :migration_blocked (silica_rt_carrier_migrate). Frame: [rbp-8] carrier (x19),
+# [rbp-16] the result (x20).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], 0
+	cmp	QWORD PTR [rdi + 80], 0
+	jne	Lces_ret
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [rax + 80], 0
+	jne	Lces_unlock
+	lea	rdi, [rax + 64]
+	xor	esi, esi
+	lea	rdx, [rip + silica_rt_carrier_main]
+	mov	rcx, rax
+	call	pthread_create
+	test	eax, eax
+	jnz	Lces_failed
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rdi, QWORD PTR [rax + 64]
+	call	pthread_detach
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 80], 1
+Lces_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_lock_unlock
+Lces_ret:
+	mov	rdi, QWORD PTR [rbp - 16]
+	leave
+	ret
+Lces_failed:
+	mov	QWORD PTR [rbp - 16], 1
+	jmp	Lces_unlock
+	.globl	silica_rt_carrier_started_any
+	.p2align	4
+silica_rt_carrier_started_any:
+# rdi = the carrier table -> rdi = the first carrier whose thread runs (+80), or 0 when none does
+# (only before the first adoption). Leaf; r10.
+	mov	r10, QWORD PTR [rip + silica_rt_carrier_count]
+	shl	r10, 8
+	add	r10, rdi
+Lcsa_loop:
+	cmp	rdi, r10
+	jae	Lcsa_none
+	cmp	QWORD PTR [rdi + 80], 0
+	jne	Lcsa_ret
+	add	rdi, 256
+	jmp	Lcsa_loop
+Lcsa_none:
+	xor	edi, edi
+Lcsa_ret:
+	ret
+	.globl	silica_rt_tls_record_set
+	.p2align	4
+silica_rt_tls_record_set:
+# rdi = this thread's record: two words, the current actor and the carrier (0 when the thread is
+# not a carrier's). An actor thread's record is in its control block (#496), a carrier's in its
+# block (+88); main has none until silica_rt_tls_actor_set makes it one.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_ensure_actor_tls_key
+	mov	rdi, QWORD PTR [rip + silica_actor_pthread_key]
+	mov	rsi, QWORD PTR [rbp - 8]
+	call	pthread_setspecific
+	leave
+	ret
+	.globl	silica_rt_tls_actor_set
+	.p2align	4
+silica_rt_tls_actor_set:
+# rdi = ACB or 0: this thread's current actor, stored in the thread's record. A thread without a
+# record (main) gets a calloc'd one now, never freed (one thread).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_ensure_actor_tls_key
+	mov	rdi, QWORD PTR [rip + silica_actor_pthread_key]
+	call	pthread_getspecific
+	test	rax, rax
+	jnz	Ltas_store
+	mov	edi, 1
+	mov	esi, 16
+	call	calloc
+	test	rax, rax
+	jz	Ltas_failed
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rdi, QWORD PTR [rip + silica_actor_pthread_key]
+	mov	rsi, rax
+	call	pthread_setspecific
+	mov	rax, QWORD PTR [rbp - 16]
+Ltas_store:
+	mov	rcx, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax], rcx
+	leave
+	ret
+Ltas_failed:
+	lea	rdi, [rip + Lrta_r_thread_record]
+	call	silica_rt_abort_with
+	jmp	Ltas_failed
+"
+}
+
+fn carrier_asm_loop() -> string {
+    "	.globl	silica_rt_carrier_main
+	.p2align	4
+silica_rt_carrier_main:
+# Thread entry (C-called pthread start routine): rdi = carrier block. Never returns.
+# Frame: [rbp-8] carrier; the cpu_set_t (128 B) at [rsp .. rsp + 128).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 160
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rdi + 88], 0
+	lea	rdi, [rdi + 88]
+	call	silica_rt_tls_record_set
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rdi, [rax + 56]
+	call	silica_rt_altstack_install_at
+# Affinity to logical core i (the carrier's index): pthread_setaffinity_np(self, 128, cpu_set_t
+# naming cpu i), a real binding on Linux (the thread runs only on that core while the kernel
+# honours it; the Darwin tree can only hint). The result is recorded in the block (+224: 0 bound,
+# else the errno; EINVAL when the index is no cpu of this machine, as under a SILICA_CARRIER_COUNT
+# above the core count, or above 1023) and never aborts: the carrier is what is guaranteed, the
+# core is best effort (spec §15.1.2, OS-hosted).
+	mov	rdi, rsp
+	xor	esi, esi
+	mov	edx, 128
+	call	memset
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 112]
+	cmp	r10, 1024
+	jae	Lcar_aff_apply
+	mov	r11, r10
+	shr	r11, 6
+	mov	ecx, r10d
+	and	ecx, 63
+	mov	r8d, 1
+	shl	r8, cl
+	or	QWORD PTR [rsp + r11*8], r8
+Lcar_aff_apply:
+	call	pthread_self
+	mov	rdi, rax
+	mov	esi, 128
+	mov	rdx, rsp
+	call	pthread_setaffinity_np
+	mov	eax, eax
+	mov	rcx, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rcx + 224], rax
+# The base: rsp here (16-byte aligned: rbp is, and the locals are 160). The dispatch frames are
+# built below it by Lcar_loop; nothing of this frame is read again.
+	mov	QWORD PTR [rcx + 48], rsp
+	mov	QWORD PTR [rcx + 72], 1
+	mov	rdi, rcx
+Lcar_loop:
+# rdi = the carrier. Entered afresh from every path that leaves an actor: the stack below the base
+# is abandoned, and the dispatch frame of actor_thread_main is rebuilt at its fixed place (the
+# module header): a fake return slot at base - 8, rbp = base - 16 with a saved rbp of 0, the 128
+# bytes of slots below it, [rbp-64] = the carrier (x24), [rbp-8] = the actor once one is chosen.
+	mov	rax, rdi
+	mov	rsp, QWORD PTR [rax + 48]
+	lea	rbp, [rsp - 16]
+	mov	QWORD PTR [rbp], 0
+	mov	QWORD PTR [rbp + 8], 0
+	lea	rsp, [rbp - 128]
+	mov	QWORD PTR [rbp - 64], rax
+	mov	QWORD PTR [rbp - 8], 0
+	mov	QWORD PTR [rax + 40], 0
+	mov	QWORD PTR [rax + 88], 0
+	mov	rdi, rax
+	call	silica_rt_lock_lock
+Lcar_pop:
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 128]
+	or	r10, QWORD PTR [rax + 152]
+	or	r10, QWORD PTR [rax + 176]
+	jz	Lcar_empty
+# A busy carrier sweeps a batch of its idle :release_when_idle actors when their listed bytes are
+# over the carrier's budget (every pop), or when the head is due and the sweep cadence has passed
+# since the last sweep; a batch that answers 1 (more to do) is followed by one dispatch and then
+# the next batch (the last-sweep time is cleared so the cadence does not delay it). rax = the
+# carrier at Lcar_sweep_busy on both paths (reloaded after the clock call).
+	cmp	QWORD PTR [rax + 104], 0
+	je	Lcar_have
+	mov	r10, QWORD PTR [rax + 240]
+	cmp	r10, QWORD PTR [rip + silica_rt_idle_stack_budget]
+	ja	Lcar_sweep_busy
+	call	silica_rt_stack_now_ns
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, rdi
+	sub	r10, QWORD PTR [rax + 120]
+	cmp	r10, QWORD PTR [rip + silica_rt_idle_sweep_ns]
+	jb	Lcar_have
+	mov	r11, QWORD PTR [rax + 104]
+	mov	r10, rdi
+	sub	r10, QWORD PTR [r11 + 344]
+	cmp	r10, QWORD PTR [rip + silica_rt_idle_release_ns]
+	jb	Lcar_have
+Lcar_sweep_busy:
+	mov	rdi, rax
+	call	silica_rt_carrier_sweep
+	cmp	rdi, 1
+	jne	Lcar_have
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 120], 0
+	jmp	Lcar_have
+Lcar_empty:
+# Nothing to run: sweep a batch; more to do (1) means back to the top, where mail that arrived
+# meanwhile is dispatched first; else, since the sweep let this lock go for each release, an actor
+# pushed meanwhile (it found the carrier awake, so it did not signal) is run before any sleep;
+# else sleep until mail (or a parked actor's wake) or the time the head of the list is due (0 =
+# the list is empty: no timeout). The sweep's answer stays in rdi across the queue check (no call
+# between) and becomes the wait's timeout.
+	mov	rdi, QWORD PTR [rbp - 64]
+	call	silica_rt_carrier_sweep
+	cmp	rdi, 1
+	je	Lcar_pop
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 128]
+	or	r10, QWORD PTR [rax + 152]
+	or	r10, QWORD PTR [rax + 176]
+	jnz	Lcar_have
+	mov	rdx, rdi
+	mov	QWORD PTR [rax + 16], 1
+	lea	rdi, [rax + 8]
+	mov	rsi, rax
+	call	silica_rt_cv_wait_timeout
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 16], 0
+	jmp	Lcar_pop
+Lcar_have:
+# The policy's choice among the ready actors (some queue is non-empty, checked under this lock).
+	mov	rdi, QWORD PTR [rbp - 64]
+	call	silica_rt_rq_pop
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rdi, QWORD PTR [rbp - 64]
+	call	silica_rt_lock_unlock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 448], 3
+	mov	QWORD PTR [rcx + 40], rax
+	mov	QWORD PTR [rcx + 88], rax
+	cmp	QWORD PTR [rax + 464], 0
+	jne	Lcar_resume
+	cmp	QWORD PTR [rax + 224], 0
+	je	Lcar_first
+	jmp	LBB1_loop
+Lcar_first:
+# Not started: the actor's start trampoline (SB #48; a supervisor's init and the
+# materialisation of its children) runs first, on the actor's own stack as a behaviour does, so a
+# wait inside it (a child supervisor's start) parks. The dispatch frame with its 48-byte result
+# area is the one a resume rebuilds (Lcar_resume: rsp = rbp - 176) and the carrier's SP is kept in
+# #368 as a behaviour's dispatch keeps it; the frame's slots ([rbp-8] the actor, [rbp-64] the
+# carrier) survive the trampoline and any park (silica_rt_ctx_save / _resume carry them). Then the
+# started word goes to 1 (a spawner parked or spinning on it proceeds) and the mailbox loop
+# begins. An actor that ends inside its trampoline (a duplicate child id, exhaustion, badarith)
+# never returns here: its exit path stores 2 and enters the loop.
+	mov	r10, QWORD PTR [rax + 216]
+	test	r10, r10
+	jz	Lcar_started
+	mov	r10, QWORD PTR [r10 + 48]
+	test	r10, r10
+	jz	Lcar_started
+	sub	rsp, 48
+	mov	QWORD PTR [rax + 368], rsp
+	mov	r11, QWORD PTR [rax + 528]
+	mov	rsp, r11
+	mov	rdi, rax
+	call	r10
+	lea	rsp, [rbp - 128]
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 368], 0
+Lcar_started:
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	esi, 1
+	call	silica_rt_started_store
+	jmp	LBB1_loop
+Lcar_resume:
+# Parked inside a behaviour (or a trampoline, or a drain): the dispatch frame its behaviour will
+# return into is this frame, rebuilt (the post-behaviour code reads the node from ACB #240; the
+# eight slots come back with the context).
+	lea	r10, [rbp - 176]
+	mov	QWORD PTR [rax + 368], r10
+	mov	rdi, rax
+	jmp	silica_rt_ctx_resume
+	.globl	silica_rt_carrier_loop_enter
+	.p2align	4
+silica_rt_carrier_loop_enter:
+# rdi = carrier block. An actor's exit path, run on the carrier's stack, ends here. Never returns.
+	jmp	Lcar_loop
+	.globl	silica_rt_carrier_requeue
+	.p2align	4
+silica_rt_carrier_requeue:
+# rdi = a carrier actor whose message has been served (the dispatch boundary): a pending migration
+# (#512) is applied first, then it is ready again when mail waits or it has been ended meanwhile
+# (its exit path runs at its next dispatch), idle otherwise; then back to the loop of the carrier
+# this thread is ([rbp-16], read before the move: after it the actor's #440 may name another
+# carrier, whose thread may already be running the actor). Never returns.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 16], rax
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_carrier_apply_pending
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	DWORD PTR [rax + 152], 0
+	je	Lcrq_ready
+	mov	r10, QWORD PTR [rax + 216]
+	test	r10, r10
+	jz	Lcrq_std
+	mov	r11, QWORD PTR [r10]
+	or	r11, QWORD PTR [r10 + 8]
+	jnz	Lcrq_ready
+Lcrq_std:
+	mov	r11, QWORD PTR [rax + 128]
+	or	r11, QWORD PTR [rax + 136]
+	jnz	Lcrq_ready
+	mov	rdi, rax
+	call	silica_rt_carrier_mark_idle
+	jmp	Lcrq_unlock
+Lcrq_ready:
+	mov	QWORD PTR [rax + 448], 2
+	mov	rdi, rax
+	call	silica_rt_carrier_push
+Lcrq_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	jmp	silica_rt_carrier_loop_enter
+	.globl	silica_rt_carrier_apply_pending
+	.p2align	4
+silica_rt_carrier_apply_pending:
+# rdi = a carrier actor between dispatches (its message served, or dispatched with no mail), its
+# lock held, not on any run queue or sweep list: a pending migration (#512, the target carrier
+# block) becomes its binding (#440). The word is taken atomically (xchg), so a migrate_actor that
+# stores a new target meanwhile is not lost. Leaf; rax only.
+	xor	eax, eax
+	xchg	QWORD PTR [rdi + 512], rax
+	test	rax, rax
+	jz	Lcap_ret
+	mov	QWORD PTR [rdi + 440], rax
+Lcap_ret:
+	ret
+	.globl	silica_rt_carrier_push
+	.p2align	4
+silica_rt_carrier_push:
+# rdi = a carrier actor whose status its caller has just set to ready (2), under the lock that guards
+# that status. Appends it to the run queue of its own carrier (#440: the caller may be anywhere)
+# that the policy chooses (silica_rt_rq_push) and wakes that carrier when it sleeps. A pending
+# migration is not applied here: a parked actor resumes on the carrier it parked on, inside the
+# same dispatch (spec §15.1.2, scheduler yield points), and moves at its dispatch boundary
+# (silica_rt_carrier_requeue). Frame: [rbp-8] carrier (x19), [rbp-16] actor (x20).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 16], rdi
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 8], rax
+	mov	QWORD PTR [rdi + 456], 0
+	mov	rdi, rax
+	call	silica_rt_lock_lock
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	call	silica_rt_rq_push
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [rax + 16], 0
+	je	Lcpu_unlock
+	lea	rdi, [rax + 8]
+	call	silica_rt_cv_signal
+Lcpu_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_lock_unlock
+	leave
+	ret
+	.globl	silica_rt_carrier_mark_idle
+	.p2align	4
+silica_rt_carrier_mark_idle:
+# rdi = a carrier actor with no mail, between dispatches, its lock held: a pending migration is
+# applied, then it is idle (1), or, when it is :release_when_idle (#312 = 4) and still holds
+# committed stack (#288), idle on its carrier's sweep list (5): appended at the tail (+232; the
+# list is ordered by the last-message stamps, #344, which this dispatch has just written), its
+# committed bytes added to the listed total (+240), under that carrier's lock (the carrier may be
+# the one just moved to: its list changes under its lock, and when it sleeps it is woken, as a push
+# wakes it, so that it waits with the listed actor's due time as its timeout rather than the untimed
+# or longer wait it chose when its list was shorter; a carrier listing on its own thread is awake,
+# so the signal is never sent for it).
+# Frame: [rbp-8] actor (x19), [rbp-16] carrier (x20).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_carrier_apply_pending
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [rax + 312], 4
+	jne	Lcmi_plain
+	cmp	QWORD PTR [rax + 288], 0
+	je	Lcmi_plain
+	mov	rcx, QWORD PTR [rax + 440]
+	mov	QWORD PTR [rbp - 16], rcx
+	mov	rdi, rcx
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 456], 0
+	mov	r10, QWORD PTR [rcx + 232]
+	test	r10, r10
+	jz	Lcmi_first
+	mov	QWORD PTR [r10 + 456], rax
+	jmp	Lcmi_linked
+Lcmi_first:
+	mov	QWORD PTR [rcx + 104], rax
+Lcmi_linked:
+	mov	QWORD PTR [rcx + 232], rax
+	mov	r10, QWORD PTR [rax + 288]
+	add	QWORD PTR [rcx + 240], r10
+	mov	QWORD PTR [rax + 448], 5
+	cmp	QWORD PTR [rcx + 16], 0
+	je	Lcmi_unlock
+	lea	rdi, [rcx + 8]
+	call	silica_rt_cv_signal
+Lcmi_unlock:
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_lock_unlock
+	jmp	Lcmi_ret
+Lcmi_plain:
+	mov	QWORD PTR [rax + 448], 1
+Lcmi_ret:
+	leave
+	ret
+	.globl	silica_rt_carrier_unlist
+	.p2align	4
+silica_rt_carrier_unlist:
+# rdi = a carrier actor its caller found on its carrier's sweep list (status 5), its lock held:
+# taken off the list under the carrier's lock (the tail, +232, fixed up when it was the last entry;
+# its committed bytes taken off the listed total, +240). Not found is fine: the sweep took it off
+# meanwhile (it is 6, sweeping, or already released and 1; the caller's status write settles it).
+# Frame: [rbp-8] actor (x19), [rbp-16] carrier (x20); r10 the link word being read (x9), r11 the
+# entry it names (x10), r9 the entry before it (x11, 0 at the head); no call inside the walk.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rdi, rax
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 16]
+	lea	r10, [rcx + 104]
+	xor	r9d, r9d
+Lcul_find:
+	mov	r11, QWORD PTR [r10]
+	test	r11, r11
+	jz	Lcul_unlock
+	cmp	r11, rax
+	je	Lcul_found
+	mov	r9, r11
+	lea	r10, [r11 + 456]
+	jmp	Lcul_find
+Lcul_found:
+	mov	r8, QWORD PTR [rax + 456]
+	mov	QWORD PTR [r10], r8
+	test	r8, r8
+	jnz	Lcul_tail_kept
+	mov	QWORD PTR [rcx + 232], r9
+Lcul_tail_kept:
+	mov	QWORD PTR [rax + 456], 0
+	mov	r8, QWORD PTR [rax + 288]
+	sub	QWORD PTR [rcx + 240], r8
+Lcul_unlock:
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_lock_unlock
+	leave
+	ret
+	.globl	silica_rt_carrier_sweep
+	.p2align	4
+silica_rt_carrier_sweep:
+# rdi = a carrier, its lock held, on its own thread; returns with it held. One batch of the idle
+# sweep (the module header): up to 64 actors from the head of the sweep list (+104), each taken
+# while it is due (silica_rt_stack_idle_due against the clock read once here) or while the listed
+# bytes (+240) exceed the carrier's budget (silica_rt_idle_stack_budget). Per actor: under the
+# carrier's lock it is unlinked (tail +232 and total +240 kept), marked 6 (sweeping) and the lock
+# let go; then under the actor's own lock alone its stack is released (silica_rt_stack_release_to
+# 0/0, on this carrier's stack: it never waits) and it is marked plainly idle (1), unless its
+# status is no longer 6 (mail, a stop or a migration made it ready, 2: it keeps its stack and will
+# stamp and relist at its next boundary); then the carrier's lock is taken again for the next
+# head. -> rdi = 0 when the list is empty, 1 when more is to be done at once (the batch is full with
+# the list not empty), else the microseconds until the head is due. Records the time of the sweep
+# (+120). An actor marked 6 has #440 = this carrier and is on no queue or list, so a push by its
+# wake lands on this carrier's queue, popped only after this call returns.
+# Frame: [rbp-8] carrier (x19), [rbp-16] the head being taken (x20), [rbp-24] the clock reading
+# (x21), [rbp-32] the batch count (x22), [rbp-40] the budget (x23); every slot is re-read after a
+# call, and the temporaries rax rcx r10 never cross one.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 48
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_stack_now_ns
+	mov	QWORD PTR [rbp - 24], rdi
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 120], rdi
+	mov	r10, QWORD PTR [rip + silica_rt_idle_stack_budget]
+	mov	QWORD PTR [rbp - 40], r10
+	mov	QWORD PTR [rbp - 32], 0
+Lcsw_next:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rax + 104]
+	mov	QWORD PTR [rbp - 16], rcx
+	test	rcx, rcx
+	jz	Lcsw_empty
+	cmp	QWORD PTR [rbp - 32], 64
+	jae	Lcsw_more
+	mov	r10, QWORD PTR [rax + 240]
+	cmp	r10, QWORD PTR [rbp - 40]
+	ja	Lcsw_take
+	mov	rdi, rcx
+	mov	rsi, QWORD PTR [rbp - 24]
+	call	silica_rt_stack_idle_due
+	test	rdi, rdi
+	jnz	Lcsw_ret
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 16]
+Lcsw_take:
+# rax = the carrier, rcx = the head, under the carrier's lock.
+	mov	r10, QWORD PTR [rcx + 456]
+	mov	QWORD PTR [rax + 104], r10
+	test	r10, r10
+	jnz	Lcsw_tail_kept
+	mov	QWORD PTR [rax + 232], 0
+Lcsw_tail_kept:
+	mov	QWORD PTR [rcx + 456], 0
+	mov	r10, QWORD PTR [rcx + 288]
+	sub	QWORD PTR [rax + 240], r10
+	mov	QWORD PTR [rcx + 448], 6
+	inc	QWORD PTR [rbp - 32]
+	mov	rdi, rax
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rcx, QWORD PTR [rbp - 16]
+	cmp	QWORD PTR [rcx + 448], 6
+	jne	Lcsw_skip
+	mov	rdi, rcx
+	xor	esi, esi
+	xor	edx, edx
+	call	silica_rt_stack_release_to
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rcx + 448], 1
+Lcsw_skip:
+	mov	rdi, QWORD PTR [rbp - 16]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_lock_lock
+	jmp	Lcsw_next
+Lcsw_empty:
+	xor	edi, edi
+	jmp	Lcsw_ret
+Lcsw_more:
+	mov	edi, 1
+Lcsw_ret:
+	leave
+	ret
+"
+}
+
+fn carrier_asm_wakes() -> string {
+    "	.globl	silica_rt_actor_mail_signal
+	.p2align	4
+silica_rt_actor_mail_signal:
+# rdi = ACB; the caller holds ACB+16 and has enqueued mail or ended the actor. Signals the mailbox
+# futex (an actor thread waits on it) and, for an idle carrier actor (plainly idle, 1; on its
+# carrier's sweep list, 5, taken off it first; or being swept, 6, already off the list: the sweep
+# finds 2 under this lock and keeps the stack), makes it ready on its own carrier.
+# Frame: [rbp-8] ACB (x19).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	add	rdi, 80
+	call	silica_rt_cv_signal
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [rax + 440], 0
+	je	Lams_ret
+	mov	r10, QWORD PTR [rax + 448]
+	cmp	r10, 1
+	je	Lams_ready
+	cmp	r10, 6
+	je	Lams_ready
+	cmp	r10, 5
+	jne	Lams_ret
+	mov	rdi, rax
+	call	silica_rt_carrier_unlist
+Lams_ready:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 448], 2
+	mov	rdi, rax
+	call	silica_rt_carrier_push
+Lams_ret:
+	leave
+	ret
+	.globl	silica_rt_call_wrapper_wake
+	.p2align	4
+silica_rt_call_wrapper_wake:
+# rdi = call wrapper; the caller holds wrapper+72 and has set reply_set. Signals the wrapper's futex
+# (a thread waits on it) and makes a carrier actor parked on it (wrapper+48) ready on its carrier.
+# Frame: [rbp-8] wrapper (x19).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	add	rdi, 24
+	call	silica_rt_cv_signal
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rax, QWORD PTR [rax + 48]
+	test	rax, rax
+	jz	Lcww_ret
+	cmp	QWORD PTR [rax + 448], 4
+	jne	Lcww_ret
+	mov	QWORD PTR [rax + 448], 2
+	mov	rdi, rax
+	call	silica_rt_carrier_push
+Lcww_ret:
+	leave
+	ret
+	.globl	silica_rt_started_store
+	.p2align	4
+silica_rt_started_store:
+# rdi = ACB, rsi = its started word (#224): 1 started, 2 its start trampoline failed. Stores it and
+# makes a carrier actor parked in the spawn (#472) ready. The parker stores #472 and then reads #224
+# under its own lock; this side stores #224 and then reads #472: with the full barriers (mfence)
+# one of them sees the other's store, and the status check under the parker's lock settles the rest.
+# Frame: [rbp-8] the parker (x19).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rdi + 224], rsi
+	mfence
+	mov	rax, QWORD PTR [rdi + 472]
+	mov	QWORD PTR [rbp - 8], rax
+	test	rax, rax
+	jz	Lsts_ret
+	lea	rdi, [rax + 16]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [rax + 448], 4
+	jne	Lsts_unlock
+	mov	QWORD PTR [rax + 448], 2
+	mov	rdi, rax
+	call	silica_rt_carrier_push
+Lsts_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+Lsts_ret:
+	leave
+	ret
+	.globl	silica_rt_spawn_wait_started
+	.p2align	4
+silica_rt_spawn_wait_started:
+# rdi = a child just spawned. Returns once its started word (#224) is set (at adoption for a plain
+# actor; after the trampoline of its first dispatch for a supervisor). A carrier actor on its own
+# stack parks (the child's started store wakes it); anything else spins (main spawning a root
+# supervisor, a dangerous actor's thread), as the spawn always did. The parker is the actor this
+# carrier runs, on whose stack this runs (silica_rt_carrier_self_on_own_stack: carrier +40 and
+# the SP), never the thread's current actor: a respawn from a drain of a supervisor's ingress on
+# another actor's stack would otherwise have spun (and, with the child bound to this carrier,
+# never seen it start).
+# Frame: [rbp-8] child (x19), [rbp-16] the parking actor (x20), [rbp-24] its carrier (x21).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_carrier_self_on_own_stack
+	mov	QWORD PTR [rbp - 16], rdi
+	test	rdi, rdi
+	jz	Lsws_spin
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 24], rax
+	test	rax, rax
+	jz	Lsws_spin
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 472], rcx
+	mfence
+Lsws_park_loop:
+	mov	rdi, QWORD PTR [rbp - 16]
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [rax + 224], 0
+	jne	Lsws_started
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_ctx_save
+	test	rdi, rdi
+	jnz	Lsws_park_loop
+	mov	rax, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 448], 4
+	lea	rdi, [rax + 16]
+	call	silica_rt_lock_unlock
+# The loop of the carrier this thread is ([rbp-24], read while the actor still ran here): the
+# actor's #440 may change once it is parked (a migration applied at its boundary elsewhere).
+	mov	rdi, QWORD PTR [rbp - 24]
+	jmp	silica_rt_carrier_loop_enter
+Lsws_started:
+	mov	rdi, QWORD PTR [rbp - 16]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	jmp	Lsws_ret
+Lsws_spin:
+	mov	rax, QWORD PTR [rbp - 8]
+Lsws_spin_loop:
+	cmp	QWORD PTR [rax + 224], 0
+	jne	Lsws_ret
+	pause
+	jmp	Lsws_spin_loop
+Lsws_ret:
+	leave
+	ret
+	.globl	silica_rt_on_carrier_thread
+	.p2align	4
+silica_rt_on_carrier_thread:
+# -> rdi = the carrier block when this thread is a carrier's (the second word of the thread's
+# record), else 0.
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_ensure_actor_tls_key
+	mov	rdi, QWORD PTR [rip + silica_actor_pthread_key]
+	call	pthread_getspecific
+	test	rax, rax
+	jz	Loct_none
+	mov	rdi, QWORD PTR [rax + 8]
+	pop	rbp
+	ret
+Loct_none:
+	xor	edi, edi
+	pop	rbp
+	ret
+	.globl	silica_rt_carrier_self_on_own_stack
+	.p2align	4
+silica_rt_carrier_self_on_own_stack:
+# -> rdi = the carrier actor this thread runs when the caller is on that actor's own stack (it can
+# park), else 0: main, an actor thread, or a runtime path on the carrier's own stack. The parked
+# actor is the one the carrier runs (carrier +40), not the thread's current actor: an ingress drain
+# installs the supervisor as the current actor while it runs on the drainer's stack.
+	push	rbp
+	mov	rbp, rsp
+	call	silica_rt_on_carrier_thread
+	test	rdi, rdi
+	jz	Lcso_ret
+	mov	rdi, QWORD PTR [rdi + 40]
+	test	rdi, rdi
+	jz	Lcso_ret
+	mov	r10, rsp
+	mov	r11, QWORD PTR [rdi + 272]
+	cmp	r10, r11
+	jb	Lcso_no
+	add	r11, QWORD PTR [rdi + 280]
+	cmp	r10, r11
+	jae	Lcso_no
+	jmp	Lcso_ret
+Lcso_no:
+	xor	edi, edi
+Lcso_ret:
+	pop	rbp
+	ret
+	.globl	silica_rt_sup_on_own_dispatch
+	.p2align	4
+silica_rt_sup_on_own_dispatch:
+# rdi = a supervisor -> rdi = 1 when this thread is the supervisor's carrier running the supervisor
+# itself (carrier +40: its own dispatch, the ingress served at LBB1_ingress_no_beh or a drain
+# from its reply path, or its exit path), 0 anywhere else: a drain on another actor's stack
+# (which installs the supervisor as the thread's CURRENT actor, so that word cannot be the
+# test), main, or a dangerous actor's thread. The one place the restart-intensity breach and the
+# duplicate-child-id failure make their synchronous root report, with the children shut down
+# first (prims_actors_child_table_asm, Lmr_freq_escalate). What the thread identity (pthread_self
+# against ACB #144) answered when a supervisor had a thread of its own. Frame: [rbp-8] sup.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_on_carrier_thread
+	test	rdi, rdi
+	jz	Lsod_no
+	mov	rax, QWORD PTR [rdi + 40]
+	xor	edi, edi
+	cmp	rax, QWORD PTR [rbp - 8]
+	sete	dil
+	jmp	Lsod_ret
+Lsod_no:
+	xor	edi, edi
+Lsod_ret:
+	leave
+	ret
+	.globl	silica_rt_wait_park
+	.p2align	4
+silica_rt_wait_park:
+# rdi = the carrier actor parking (on its own stack), rsi = the wait list it joins (the address of
+# the head word: a row's +120 or a supervision block's +128; the links are ACB #456, the list is
+# recorded in #480 for a stop to find), rdx = the thread's current actor to restore after the
+# resume. Called with the actor's lock and the wait lock held: it publishes status 4 (parked)
+# under both, releases them and leaves for the carrier loop. Returns, with no lock held, when the
+# actor has been made ready again (by the list's wake or by a stop that unlinked it).
+# Frame: [rbp-8] actor (x19), [rbp-16] list (x20), [rbp-24] current actor (x21), [rbp-32] carrier (x22).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	mov	QWORD PTR [rbp - 24], rdx
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	QWORD PTR [rbp - 32], rax
+	call	silica_rt_ctx_save
+	test	rdi, rdi
+	jnz	Lwpk_resumed
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	r10, QWORD PTR [rcx]
+	mov	QWORD PTR [rax + 456], r10
+	mov	QWORD PTR [rcx], rax
+	mov	QWORD PTR [rax + 480], rcx
+	mov	QWORD PTR [rax + 448], 4
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+# The loop of the carrier this thread is ([rbp-32], read before the park was published).
+	mov	rdi, QWORD PTR [rbp - 32]
+	jmp	silica_rt_carrier_loop_enter
+Lwpk_resumed:
+# The carrier made this actor the thread's current actor at the resume; the wait was entered with
+# [rbp-24] as the current actor (the supervisor, in an ingress drain).
+	mov	rax, QWORD PTR [rbp - 24]
+	cmp	rax, QWORD PTR [rbp - 8]
+	je	Lwpk_ret
+	mov	rdi, rax
+	call	silica_rt_tls_actor_set
+Lwpk_ret:
+	leave
+	ret
+	.globl	silica_rt_wait_list_wake
+	.p2align	4
+silica_rt_wait_list_wake:
+# rdi = the address of a wait list's head word: takes the whole list under the wait lock and makes
+# every actor on it ready, each under its own lock, none under the wait lock. An actor on the list
+# that is not parked cannot happen (it was parked under both locks, and only this wake or a stop,
+# which unlinks it under the wait lock first, changes that): a runtime abort.
+# Frame: [rbp-8] head word, then the next actor (x19), [rbp-16] the actor being woken (x20).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rax]
+	mov	QWORD PTR [rax], 0
+	mov	QWORD PTR [rbp - 16], rcx
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_unlock
+Lwlw_wake:
+	mov	rax, QWORD PTR [rbp - 16]
+	test	rax, rax
+	jz	Lwlw_ret
+	mov	rcx, QWORD PTR [rax + 456]
+	mov	QWORD PTR [rbp - 8], rcx
+	lea	rdi, [rax + 16]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 16]
+	cmp	QWORD PTR [rax + 448], 4
+	jne	Lwlw_not_parked
+	mov	QWORD PTR [rax + 480], 0
+	mov	QWORD PTR [rax + 448], 2
+	mov	rdi, rax
+	call	silica_rt_carrier_push
+	mov	rdi, QWORD PTR [rbp - 16]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rbp - 16], rax
+	jmp	Lwlw_wake
+Lwlw_not_parked:
+	lea	rdi, [rip + Lrta_r_row_wake]
+	call	silica_rt_abort_with
+Lwlw_ret:
+	leave
+	ret
+	.globl	silica_rt_row_wait
+	.p2align	4
+silica_rt_row_wait:
+# rdi = a row, rsi = the identity (ACB #408) of the child whose exit is waited for, rdx = 1 when that
+# child is a carrier actor (0 = unknown), rcx = the waiting actor or 0 (main, or a wait that no stop
+# may end). -> rdi = 1 once the row's exit_done (+56) holds that identity, 2 when rcx was ended
+# meanwhile (its supervisor's cascade stops it while it waits in kill_abnormal: the wait is over
+# and the victim is dead or dying). exit_done is a generation word, never cleared: the identity of
+# the last child of the row that ended; a stale value from an earlier incarnation never matches.
+# A carrier actor on its own stack parks on the row's wait list (the exit_done store wakes it, so
+# does a stop of the waiter); anything else spins (main, a dangerous actor's thread). A runtime
+# path on a carrier's own stack never comes here (every waiting path runs on the actor's own
+# stack: the module header); when the awaited child is a carrier actor that is a runtime abort
+# rather than a silent deadlock.
+# Frame: [rbp-8] row (x19), [rbp-16] identity (x20), [rbp-24] the parking actor (x21),
+# [rbp-32] child-is-carrier (x22), [rbp-40] the waiter, then the result (x23), [rbp-48] the
+# current actor (x24).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 48
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	mov	QWORD PTR [rbp - 32], rdx
+	mov	QWORD PTR [rbp - 40], rcx
+	call	silica_rt_carrier_self_on_own_stack
+	mov	QWORD PTR [rbp - 24], rdi
+	test	rdi, rdi
+	jz	Lrw_spin
+	call	silica_rt_tls_current_actor_get
+	mov	QWORD PTR [rbp - 48], rdi
+Lrw_park_loop:
+# The check and the push onto the row's wait list are one critical section under the wait lock
+# (the exit side stores exit_done and takes the list under it; a stop sets the waiter's alive flag
+# under the waiter's own lock), so no wake is lost.
+	mov	rdi, QWORD PTR [rbp - 24]
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 56]
+	cmp	r10, QWORD PTR [rbp - 16]
+	je	Lrw_done_locked
+	mov	rcx, QWORD PTR [rbp - 40]
+	test	rcx, rcx
+	jz	Lrw_park
+	cmp	DWORD PTR [rcx + 152], 0
+	je	Lrw_stopped_locked
+Lrw_park:
+	mov	rdi, QWORD PTR [rbp - 24]
+	mov	rsi, QWORD PTR [rbp - 8]
+	add	rsi, 120
+	mov	rdx, QWORD PTR [rbp - 48]
+	call	silica_rt_wait_park
+	jmp	Lrw_park_loop
+Lrw_done_locked:
+	mov	QWORD PTR [rbp - 40], 1
+	jmp	Lrw_unlock_ret
+Lrw_stopped_locked:
+	mov	QWORD PTR [rbp - 40], 2
+Lrw_unlock_ret:
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 24]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 40]
+	jmp	Lrw_ret
+Lrw_spin:
+	cmp	QWORD PTR [rbp - 32], 0
+	je	Lrw_spin_loop
+	call	silica_rt_on_carrier_thread
+	test	rdi, rdi
+	jz	Lrw_spin_loop
+	lea	rdi, [rip + Lrta_r_carrier_wait]
+	call	silica_rt_abort_with
+Lrw_spin_loop:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 56]
+	cmp	r10, QWORD PTR [rbp - 16]
+	je	Lrw_spin_done
+	mov	rcx, QWORD PTR [rbp - 40]
+	test	rcx, rcx
+	jz	Lrw_spin_pause
+	cmp	DWORD PTR [rcx + 152], 0
+	jne	Lrw_spin_pause
+	mov	edi, 2
+	jmp	Lrw_ret
+Lrw_spin_pause:
+	pause
+	jmp	Lrw_spin_loop
+Lrw_spin_done:
+	mov	edi, 1
+Lrw_ret:
+	leave
+	ret
+	.globl	silica_rt_row_exit_done_store
+	.p2align	4
+silica_rt_row_exit_done_store:
+# rdi = a row whose child has ended (silica_rt_sb_child_done, the child's last act), rsi = that
+# child's identity: exit_done (+56) = the identity, under the wait lock, then every carrier actor
+# parked on the row's wait list (+120) is made ready; each re-checks the identity it waits for.
+# Frame: [rbp-8] row (x19), [rbp-16] identity (x20).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 56], rcx
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 120
+	call	silica_rt_wait_list_wake
+	leave
+	ret
+	.globl	silica_rt_actor_stop
+	.p2align	4
+silica_rt_actor_stop:
+# rdi = an actor to end at its next dispatch boundary, rsi = the exit reason tag to give it (0 keeps
+# what it has: a supervisor's own stop, reason 0 in its report), rdx = the reason atom that goes
+# with a tag (#384; 0 = none). -> rdi = 1 when it is a carrier actor. The one way the runtime ends
+# another actor: under the target's lock its alive flag goes, the reason (tag and atom) is set
+# only while it was still alive (an actor already ending keeps its own), its
+# mailbox is signalled (an idle carrier actor is made ready), and an actor parked on a wait list
+# (a row's exit_done, a supervision block's restart token: #480 names the list) is unlinked under
+# the wait lock and made ready, so a wait that this stop ends (kill_abnormal's) sees it at once. A
+# parked actor the list's wake has already taken (not found on the list) is made ready by that wake.
+# Frame: [rbp-8] actor (x19), [rbp-16] tag (x20), [rbp-24] atom, then the list (x21),
+# [rbp-32] carrier (x22).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	mov	QWORD PTR [rbp - 24], rdx
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	DWORD PTR [rax + 152], 0
+	je	Lsto_was_ended
+	mov	rcx, QWORD PTR [rbp - 16]
+	test	rcx, rcx
+	jz	Lsto_was_ended
+	mov	QWORD PTR [rax + 232], rcx
+	mov	rcx, QWORD PTR [rbp - 24]
+	test	rcx, rcx
+	jz	Lsto_was_ended
+	mov	QWORD PTR [rax + 384], rcx
+Lsto_was_ended:
+	mov	DWORD PTR [rax + 152], 0
+	mov	rdi, rax
+	call	silica_rt_actor_mail_signal
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rax + 440]
+	mov	QWORD PTR [rbp - 32], rcx
+	test	rcx, rcx
+	jz	Lsto_unlock
+	cmp	QWORD PTR [rax + 448], 4
+	jne	Lsto_unlock
+	mov	rcx, QWORD PTR [rax + 480]
+	mov	QWORD PTR [rbp - 24], rcx
+	test	rcx, rcx
+	jz	Lsto_unlock
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 24]
+	mov	r10, QWORD PTR [rcx]
+	xor	r11d, r11d
+Lsto_find:
+	test	r10, r10
+	jz	Lsto_not_found
+	cmp	r10, rax
+	je	Lsto_found
+	mov	r11, r10
+	mov	r10, QWORD PTR [r10 + 456]
+	jmp	Lsto_find
+Lsto_found:
+	mov	r8, QWORD PTR [rax + 456]
+	test	r11, r11
+	jz	Lsto_unlink_head
+	mov	QWORD PTR [r11 + 456], r8
+	jmp	Lsto_unlinked
+Lsto_unlink_head:
+	mov	QWORD PTR [rcx], r8
+Lsto_unlinked:
+	mov	QWORD PTR [rax + 480], 0
+	mov	QWORD PTR [rax + 456], 0
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_unlock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 448], 2
+	mov	rdi, rax
+	call	silica_rt_carrier_push
+	jmp	Lsto_unlock
+Lsto_not_found:
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_unlock
+Lsto_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	xor	edi, edi
+	cmp	QWORD PTR [rbp - 32], 0
+	setne	dil
+	leave
+	ret
+	.globl	silica_rt_sup_restart_try
+	.p2align	4
+silica_rt_sup_restart_try:
+# rdi = a supervisor, rsi = the actor asking (0 = main). -> rdi = 1 when the caller now holds the
+# supervisor's restart token (supervision block #120: the holder, or 1 for main), 0 when another
+# holder has it, or the supervisor has no block or has ended. One holder at a time dequeues its
+# ingress and runs the restarts (maybe_restart with its cascades), so no two cascades overlap.
+# Frame: [rbp-8] supervisor (x19), [rbp-16] the asker, then the result (x20).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 216]
+	test	r10, r10
+	jz	Lsrt_no
+	cmp	DWORD PTR [rax + 152], 0
+	je	Lsrt_no
+	cmp	QWORD PTR [r10 + 120], 0
+	jne	Lsrt_no
+	mov	r11, QWORD PTR [rbp - 16]
+	test	r11, r11
+	jnz	Lsrt_take
+	mov	r11d, 1
+Lsrt_take:
+	mov	QWORD PTR [r10 + 120], r11
+	mov	QWORD PTR [rbp - 16], 1
+	jmp	Lsrt_unlock
+Lsrt_no:
+	mov	QWORD PTR [rbp - 16], 0
+Lsrt_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	leave
+	ret
+	.globl	silica_rt_sup_restart_release
+	.p2align	4
+silica_rt_sup_restart_release:
+# rdi = a supervisor whose restart token the caller holds: lets it go. Notices still in the ingress
+# are the supervisor's own dispatch's to drain (its mailbox is signalled; the dispatch skips the
+# ingress while another holder has the token), and every actor parked for the token (block +128)
+# is made ready to re-check. Frame: [rbp-8] supervisor (x19), [rbp-16] its block (x20).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 216]
+	mov	QWORD PTR [rbp - 16], r10
+	test	r10, r10
+	jz	Lsrr_unlock
+	mov	QWORD PTR [r10 + 120], 0
+	mov	r11, QWORD PTR [r10]
+	or	r11, QWORD PTR [r10 + 8]
+	jz	Lsrr_unlock
+	mov	rdi, rax
+	call	silica_rt_actor_mail_signal
+Lsrr_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	test	rdi, rdi
+	jz	Lsrr_ret
+	add	rdi, 128
+	call	silica_rt_wait_list_wake
+Lsrr_ret:
+	leave
+	ret
+	.globl	silica_rt_sup_restart_acquire
+	.p2align	4
+silica_rt_sup_restart_acquire:
+# rdi = a supervisor, rsi = the actor asking (0 = main), rdx = 1 to take the restart token, 0 to wait
+# until the token is free and the ingress is empty (a row child of this supervisor never takes the
+# token to DRAIN: the cascade it would run could stop the child itself; it waits for the holder, the
+# supervisor's own dispatch or another drainer, to finish), 2 to take the token only once the
+# ingress is empty (a row child holding the token across a terminate_child / restart_child of a
+# sibling, supervisor_drain_hold: it waits as with 0, then holds with nothing to drain, so no
+# cascade of a pending notice runs on it; a notice that arrives while it holds the token is the
+# supervisor's own dispatch's after the release). -> rdi = 1 taken / settled, 2 when rsi
+# was ended while it waited (its supervisor's cascade stops it: the caller's wait is over), 0 when
+# the supervisor has no block or has ended (nothing to drain or wait for). A carrier actor on its
+# own stack parks on the block's wait list (+128; a release wakes it, so does a stop of the
+# waiter); anything else (main, a dangerous actor's thread) polls. Lock order everywhere: the
+# waiting actor, then the supervisor, then the wait lock, then (in the push of a woken actor) its
+# carrier's lock. The waiting actor may BE the supervisor (its reply path drains its own ingress,
+# LBB1_reply_drain, on its own stack): the one lock is then taken once and serves both positions
+# (the futex lock is not recursive).
+# Frame: [rbp-8] supervisor (x19), [rbp-16] asker (x20), [rbp-24] take (x21), [rbp-32] the parking
+# actor (x22), [rbp-40] result (x23), [rbp-48] current actor (x24), [rbp-56] block (x25).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 64
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	mov	QWORD PTR [rbp - 24], rdx
+	call	silica_rt_carrier_self_on_own_stack
+	mov	QWORD PTR [rbp - 32], rdi
+	call	silica_rt_tls_current_actor_get
+	mov	QWORD PTR [rbp - 48], rdi
+Lsra_loop:
+	mov	rdi, QWORD PTR [rbp - 32]
+	test	rdi, rdi
+	jz	Lsra_lock_sup
+	cmp	rdi, QWORD PTR [rbp - 8]
+	je	Lsra_lock_sup
+	add	rdi, 16
+	call	silica_rt_lock_lock
+Lsra_lock_sup:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	QWORD PTR [rbp - 40], 0
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 216]
+	test	r10, r10
+	jz	Lsra_unlock
+	mov	QWORD PTR [rbp - 56], r10
+	cmp	DWORD PTR [rax + 152], 0
+	je	Lsra_unlock
+	mov	rcx, QWORD PTR [rbp - 16]
+	test	rcx, rcx
+	jz	Lsra_self_ok
+	cmp	DWORD PTR [rcx + 152], 0
+	jne	Lsra_self_ok
+	mov	QWORD PTR [rbp - 40], 2
+	jmp	Lsra_unlock
+Lsra_self_ok:
+	cmp	QWORD PTR [r10 + 120], 0
+	jne	Lsra_wait
+	cmp	QWORD PTR [rbp - 24], 0
+	je	Lsra_settle
+	cmp	QWORD PTR [rbp - 24], 2
+	jne	Lsra_take_now
+# Mode 2: the token is free; take it only with an empty ingress, else wait for the supervisor's
+# dispatch to serve the notices (each release wakes this actor to look again).
+	mov	r11, QWORD PTR [r10]
+	or	r11, QWORD PTR [r10 + 8]
+	jnz	Lsra_wait
+Lsra_take_now:
+	mov	r11, QWORD PTR [rbp - 16]
+	test	r11, r11
+	jnz	Lsra_take
+	mov	r11d, 1
+Lsra_take:
+	mov	QWORD PTR [r10 + 120], r11
+	mov	QWORD PTR [rbp - 40], 1
+	jmp	Lsra_unlock
+Lsra_settle:
+	mov	r11, QWORD PTR [r10]
+	or	r11, QWORD PTR [r10 + 8]
+	jnz	Lsra_wait
+	mov	QWORD PTR [rbp - 40], 1
+Lsra_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 32]
+	test	rdi, rdi
+	jz	Lsra_ret
+	cmp	rdi, QWORD PTR [rbp - 8]
+	je	Lsra_ret
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	jmp	Lsra_ret
+Lsra_wait:
+	cmp	QWORD PTR [rbp - 32], 0
+	je	Lsra_poll
+# Park: the wait lock is taken before the supervisor's lock goes, so a release that follows cannot
+# take the list before this actor is on it. When the parker is the supervisor itself its one lock
+# stays held for silica_rt_wait_park, which releases it.
+	lea	rdi, [rip + silica_rt_row_wait_lock]
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 32]
+	cmp	rax, QWORD PTR [rbp - 8]
+	je	Lsra_park
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+Lsra_park:
+	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rsi, QWORD PTR [rbp - 56]
+	add	rsi, 128
+	mov	rdx, QWORD PTR [rbp - 48]
+	call	silica_rt_wait_park
+	jmp	Lsra_loop
+Lsra_poll:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	edi, 50
+	call	usleep
+	jmp	Lsra_loop
+Lsra_ret:
+	mov	rdi, QWORD PTR [rbp - 40]
+	leave
+	ret
+"
+}
+
+// Placement on carriers (stage 3): migrate_actor and the pin_actor_* family for a carrier actor
+// (their entries in prims_actors_runtime_asm.silica resolve the reference and keep the thread
+// path for a dangerous actor), and the test-only query actor_carrier_index.
+fn carrier_asm_placement() -> string {
+    "	.globl	silica_rt_carrier_for_core
+	.p2align	4
+silica_rt_carrier_for_core:
+# rdi = a core id below silica_rt_logical_cpu_count -> rdi = the carrier block for it, `core mod N`
+# (the carrier the same core id binds to at spawn), the table made if need be. Frame: [rbp-8] core.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_carriers_ensure
+	mov	rcx, rdi
+	mov	rax, QWORD PTR [rbp - 8]
+	xor	edx, edx
+	div	QWORD PTR [rip + silica_rt_carrier_count]
+	shl	rdx, 8
+	lea	rdi, [rcx + rdx]
+	leave
+	ret
+	.globl	silica_rt_carrier_migrate
+	.p2align	4
+silica_rt_carrier_migrate:
+# rdi = a carrier actor (#440 != 0), held by the caller, rsi = the target carrier block. -> rdi = 0
+# (:ok, the move is requested or done) or 2 (:actor_not_found: it has ended). Under the actor's
+# lock, by its status: idle (1) it is bound to the target at once (nothing of it is queued or
+# listed, and mail for it takes this lock); idle on its carrier's sweep list (5) it is taken off
+# that list (under the old carrier's lock), bound, and listed again on the target by
+# silica_rt_carrier_mark_idle (under the target's lock; it joins the tail behind newer stamps, so
+# it is released when the entry before it is, at most one idle period late); ready (2, queued on
+# its carrier), running (3), parked (4, inside a dispatch) or being swept (6: its carrier's sweep
+# holds it off the list and will release it or find it ready under this lock; never relisted here)
+# the target is left pending in #512 and applied at the actor's next dispatch boundary
+# (silica_rt_carrier_requeue, or silica_rt_carrier_mark_idle when the dispatch finds no mail),
+# never while it runs and never at a resume: a parked actor resumes
+# where it parked, inside the same dispatch. At most one carrier lock is held at any point, never
+# with the target's and the old carrier's locks together, so the lock order of this module's
+# header holds. The mailbox is the actor's own and moves with it; message order is unchanged.
+# The target's thread is created first when it has none yet (nothing held); 3 (:migration_blocked)
+# when the host refuses it (item N #5).
+# Frame: [rbp-8] actor (x19), [rbp-16] target (x20), [rbp-24] result (x21).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	mov	rdi, rsi
+	call	silica_rt_carrier_ensure_started
+	test	rdi, rdi
+	jnz	Lcmg_blocked
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	DWORD PTR [rax + 152], 0
+	je	Lcmg_ended
+	mov	r10, QWORD PTR [rax + 448]
+	cmp	r10, 1
+	je	Lcmg_idle
+	cmp	r10, 5
+	je	Lcmg_listed
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 512], rcx
+	jmp	Lcmg_ok
+Lcmg_listed:
+	mov	rdi, rax
+	call	silica_rt_carrier_unlist
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 448], 1
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 440], rcx
+	mov	rdi, rax
+	call	silica_rt_carrier_mark_idle
+	jmp	Lcmg_ok
+Lcmg_idle:
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 440], rcx
+Lcmg_ok:
+	mov	QWORD PTR [rbp - 24], 0
+	jmp	Lcmg_unlock
+Lcmg_ended:
+	mov	QWORD PTR [rbp - 24], 2
+Lcmg_unlock:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 24]
+	leave
+	ret
+Lcmg_blocked:
+# The target has no thread and the host refused one (nothing held yet): 3, :migration_blocked.
+	mov	edi, 3
+	leave
+	ret
+	.globl	silica_rt_carrier_pick_kind
+	.p2align	4
+silica_rt_carrier_pick_kind:
+# rdi = a carrier actor, rsi = 1 for a performance core, 0 for an efficiency core -> rdi = the carrier
+# to move it to, or 0 when it stays: it is on a carrier of that kind already, or no carrier of
+# that kind exists. Carrier i is the carrier of logical core i, and the topology the runtime
+# reports (get_cpu_topology, get_performance_cores: the sysctl shim's hw.perflevel0 / 1) puts the
+# P cores at [0, P) and the E cores at [P, P + E), so the P carriers are [0, min(P, N)) and the E
+# carriers [P, N) (none when P >= N, as under a SILICA_CARRIER_COUNT below P, or when the machine
+# reports no E cores: on Linux every core is a performance core, so none ever). Among the carriers
+# of a kind the choice is in turn (silica_rt_pcore_next / ecore_next), a round robin per kind, so
+# repeated pins spread over them, the hosted balance of the BEAM pattern; no exclusivity is implied.
+# Frame: [rbp-8] the chosen index (x19).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	rax, QWORD PTR [rdi + 440]
+	mov	r9, QWORD PTR [rax + 112]
+	mov	r10, QWORD PTR [rip + silica_rt_carrier_count]
+	mov	r11, QWORD PTR [rip + silica_rt_pcore_count]
+	test	r11, r11
+	jnz	Lcpk_have_p
+	mov	r11, r10
+Lcpk_have_p:
+	cmp	r11, r10
+	jbe	Lcpk_p_clamped
+	mov	r11, r10
+Lcpk_p_clamped:
+# r9 = the actor's carrier index, r10 = N, r11 = P clamped to N: P carriers [0, r11), E [r11, N).
+	test	rsi, rsi
+	jz	Lcpk_efficiency
+	cmp	r9, r11
+	jb	Lcpk_stay
+	test	r11, r11
+	jz	Lcpk_stay
+	lea	r8, [rip + silica_rt_pcore_next]
+	xor	ecx, ecx
+	mov	rdx, r11
+	jmp	Lcpk_turn
+Lcpk_efficiency:
+	cmp	r9, r11
+	jae	Lcpk_stay
+	cmp	r11, r10
+	jae	Lcpk_stay
+	lea	r8, [rip + silica_rt_ecore_next]
+	mov	rcx, r11
+	mov	rdx, r10
+Lcpk_turn:
+# The next index in turn over [rcx, rdx): the counter at r8 counts from 0 over the range's length.
+	sub	rdx, rcx
+	mov	rax, QWORD PTR [r8]
+Lcpk_turn_loop:
+	lea	rsi, [rax + 1]
+	cmp	rsi, rdx
+	jb	Lcpk_turn_store
+	xor	esi, esi
+Lcpk_turn_store:
+	lock cmpxchg	QWORD PTR [r8], rsi
+	jne	Lcpk_turn_loop
+	cmp	rax, rdx
+	jb	Lcpk_turn_in_range
+	xor	eax, eax
+Lcpk_turn_in_range:
+	add	rax, rcx
+	mov	QWORD PTR [rbp - 8], rax
+	call	silica_rt_carriers_ensure
+	mov	rax, QWORD PTR [rbp - 8]
+	shl	rax, 8
+	add	rdi, rax
+	jmp	Lcpk_ret
+Lcpk_stay:
+	xor	edi, edi
+Lcpk_ret:
+	leave
+	ret
+	.globl	silica_rt_actor_carrier_index
+	.p2align	4
+silica_rt_actor_carrier_index:
+# actor_carrier_index(ref) -> int64, a test-only query (trials/carriers_addition): the index of the
+# carrier the actor is bound to now (#440, +112), -1 for a dangerous actor (a thread of its own)
+# or a reference that names no actor. A pending migration is not reported until it is applied.
+	lea	r10, [rip + silica_rt_actor_carrier_index_acb]
+	jmp	silica_rt_ref_call
+	.p2align	4
+silica_rt_actor_carrier_index_acb:
+	test	rdi, rdi
+	jz	Laci_none
+	mov	rax, QWORD PTR [rdi + 440]
+	test	rax, rax
+	jz	Laci_none
+	mov	rdi, QWORD PTR [rax + 112]
+	ret
+Laci_none:
+	mov	rdi, -1
+	ret
+"
+}
+
+fn carrier_asm_context() -> string {
+    "	.globl	silica_rt_ctx_save
+	.p2align	4
+silica_rt_ctx_save:
+# rdi = the current carrier actor, on its own stack. Saves rbp rbx r12-r15 and the eight dispatch
+# frame slots of its carrier ([rbp_d - 8 .. rbp_d - 64], rbp_d = the carrier's base - 16: the
+# module header) below the return address and records that SP in #464. Returns 0 at once with SP
+# left lowered (the frame is live until the actor leaves for the carrier loop); returns 1, with SP,
+# the registers and the slots restored, when the carrier resumes the actor (silica_rt_ctx_resume).
+# Layout from the recorded SP: +0..+63 the slots, +64 pad, +72..+119 r15 r14 r13 r12 rbx rbp, +120
+# the return address.
+	push	rbp
+	push	rbx
+	push	r12
+	push	r13
+	push	r14
+	push	r15
+	sub	rsp, 72
+	mov	r10, QWORD PTR [rdi + 440]
+	mov	r10, QWORD PTR [r10 + 48]
+	mov	rax, QWORD PTR [r10 - 24]
+	mov	QWORD PTR [rsp], rax
+	mov	rax, QWORD PTR [r10 - 32]
+	mov	QWORD PTR [rsp + 8], rax
+	mov	rax, QWORD PTR [r10 - 40]
+	mov	QWORD PTR [rsp + 16], rax
+	mov	rax, QWORD PTR [r10 - 48]
+	mov	QWORD PTR [rsp + 24], rax
+	mov	rax, QWORD PTR [r10 - 56]
+	mov	QWORD PTR [rsp + 32], rax
+	mov	rax, QWORD PTR [r10 - 64]
+	mov	QWORD PTR [rsp + 40], rax
+	mov	rax, QWORD PTR [r10 - 72]
+	mov	QWORD PTR [rsp + 48], rax
+	mov	rax, QWORD PTR [r10 - 80]
+	mov	QWORD PTR [rsp + 56], rax
+	mov	QWORD PTR [rdi + 464], rsp
+	xor	edi, edi
+	jmp	QWORD PTR [rsp + 120]
+	.globl	silica_rt_ctx_resume
+	.p2align	4
+silica_rt_ctx_resume:
+# rdi = a carrier actor with a parked context (#464); rbp = the carrier's dispatch frame (Lcar_resume
+# runs with it). Never returns to its caller: the slots go back into the frame, then the actor
+# continues after its silica_rt_ctx_save, with rdi = 1.
+	mov	rsp, QWORD PTR [rdi + 464]
+	mov	QWORD PTR [rdi + 464], 0
+	mov	rax, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 8], rax
+	mov	rax, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rax, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 24], rax
+	mov	rax, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 32], rax
+	mov	rax, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 40], rax
+	mov	rax, QWORD PTR [rsp + 40]
+	mov	QWORD PTR [rbp - 48], rax
+	mov	rax, QWORD PTR [rsp + 48]
+	mov	QWORD PTR [rbp - 56], rax
+	mov	rax, QWORD PTR [rsp + 56]
+	mov	QWORD PTR [rbp - 64], rax
+	add	rsp, 72
+	pop	r15
+	pop	r14
+	pop	r13
+	pop	r12
+	pop	rbx
+	pop	rbp
+	mov	edi, 1
+	ret
+"
+}
+
+// The run queues and the dispatch-order policy (stage 4; the board's silica_rt_rq_push / _rq_take /
+// _rq_pop and silica_rt_set_scheduler_policy, rt_actors.S). Every function here is entered with
+// the carrier's lock held, except silica_rt_set_scheduler_policy, which holds nothing.
+fn carrier_asm_run_queues() -> string {
+    "	.globl	silica_rt_rq_push
+	.p2align	4
+silica_rt_rq_push:
+# rdi = a carrier (its lock held), rsi = an actor its caller has made ready (status 2). Appends it
+# to the tail of the queue the policy chooses: the actor's priority tier (ACB #520: 0 low, 1
+# normal, 2 high -> queue 2 - level; a level above 2, never stored, counts as normal) or, under
+# :round_robin (1), the normal queue, whatever the level, so ready actors run in arrival order.
+# Leaf; rax r10 r11.
+	mov	rax, QWORD PTR [rip + silica_rt_sched_policy]
+	cmp	rax, 1
+	je	Lrqp_normal
+	mov	rax, QWORD PTR [rsi + 520]
+	cmp	rax, 2
+	ja	Lrqp_normal
+	mov	r10d, 2
+	sub	r10, rax
+	jmp	Lrqp_have_q
+Lrqp_normal:
+	mov	r10d, 1
+Lrqp_have_q:
+	imul	r10, r10, 24
+	lea	r10, [rdi + r10 + 128]
+	inc	QWORD PTR [r10 + 16]
+	mov	QWORD PTR [rsi + 456], 0
+	mov	r11, QWORD PTR [r10 + 8]
+	test	r11, r11
+	jz	Lrqp_empty
+	mov	QWORD PTR [r11 + 456], rsi
+	mov	QWORD PTR [r10 + 8], rsi
+	ret
+Lrqp_empty:
+	mov	QWORD PTR [r10], rsi
+	mov	QWORD PTR [r10 + 8], rsi
+	ret
+	.globl	silica_rt_rq_take
+	.p2align	4
+silica_rt_rq_take:
+# rdi = a carrier (its lock held), rsi = a queue index whose queue is not empty -> rdi = that queue's
+# head, taken off it (its link cleared). Leaf; rax r10 r11.
+	imul	r10, rsi, 24
+	lea	r10, [rdi + r10 + 128]
+	mov	rax, QWORD PTR [r10]
+	mov	r11, QWORD PTR [rax + 456]
+	mov	QWORD PTR [r10], r11
+	test	r11, r11
+	jnz	Lrqt_len
+	mov	QWORD PTR [r10 + 8], 0
+Lrqt_len:
+	dec	QWORD PTR [r10 + 16]
+	mov	QWORD PTR [rax + 456], 0
+	mov	rdi, rax
+	ret
+	.globl	silica_rt_rq_pop
+	.p2align	4
+silica_rt_rq_pop:
+# rdi = a carrier (its lock held) -> rdi = the next actor to run under the policy in force, 0 when
+# every queue is empty.
+#   :priority_fifo (0), and :round_robin (1), whose pushes all land in the normal queue: the head
+#   of the highest-priority non-empty queue.
+#   :weighted_fair (2): deficit round robin. The tier being served (+200) runs its head while it
+#   has credit (+208) and actors, a unit cost per dispatch; otherwise the next tier starts with
+#   its quantum (high 4, normal 2, low 1), an empty tier forfeiting its turn (DRR zeroes the
+#   deficit of an idle queue). Some queue is non-empty, so at most three tier changes reach a
+#   tier that runs.
+#   :lottery (3): tickets = weight x actors queued, per tier, the same weights; a draw in
+#   [0, total) picks the tier in proportion to its tickets and the tier's head runs. The
+#   generator is a xorshift64 (Marsaglia 2003: 13, 7, 17) per carrier (+216, under this lock),
+#   seeded from the clock and the carrier's index at the first draw, kept non-zero; nothing of
+#   cryptographic strength is needed.
+# Frame: [rbp-8] carrier (x19). rsi = the queue index handed to silica_rt_rq_take.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rax, QWORD PTR [rip + silica_rt_sched_policy]
+	cmp	rax, 2
+	je	Lrqo_wf
+	cmp	rax, 3
+	je	Lrqo_lottery
+	xor	esi, esi
+Lrqo_scan:
+	imul	r10, rsi, 24
+	cmp	QWORD PTR [rdi + r10 + 128], 0
+	jne	Lrqo_take
+	inc	rsi
+	cmp	rsi, 3
+	jb	Lrqo_scan
+	xor	edi, edi
+	jmp	Lrqo_ret
+Lrqo_take:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_rq_take
+	jmp	Lrqo_ret
+Lrqo_wf:
+	mov	r10, QWORD PTR [rdi + 128]
+	or	r10, QWORD PTR [rdi + 152]
+	or	r10, QWORD PTR [rdi + 176]
+	jnz	Lrqo_wf_have
+	xor	edi, edi
+	jmp	Lrqo_ret
+Lrqo_wf_have:
+	mov	rsi, QWORD PTR [rdi + 200]
+	mov	rdx, QWORD PTR [rdi + 208]
+Lrqo_wf_try:
+	imul	r10, rsi, 24
+	cmp	QWORD PTR [rdi + r10 + 128], 0
+	je	Lrqo_wf_next
+	test	rdx, rdx
+	jz	Lrqo_wf_next
+	dec	rdx
+	mov	QWORD PTR [rdi + 200], rsi
+	mov	QWORD PTR [rdi + 208], rdx
+	jmp	Lrqo_take
+Lrqo_wf_next:
+	inc	rsi
+	cmp	rsi, 3
+	jb	Lrqo_wf_quantum
+	xor	esi, esi
+Lrqo_wf_quantum:
+	mov	edx, 4
+	test	rsi, rsi
+	jz	Lrqo_wf_try
+	mov	edx, 2
+	cmp	rsi, 1
+	je	Lrqo_wf_try
+	mov	edx, 1
+	jmp	Lrqo_wf_try
+Lrqo_lottery:
+	cmp	QWORD PTR [rdi + 216], 0
+	jne	Lrqo_lot_seeded
+	call	silica_rt_stack_now_ns
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 112]
+	inc	r10
+	shl	r10, 32
+	xor	rdi, r10
+	or	rdi, 1
+	mov	QWORD PTR [rax + 216], rdi
+	mov	rdi, rax
+Lrqo_lot_seeded:
+	mov	r10, QWORD PTR [rdi + 144]
+	shl	r10, 2
+	mov	r11, QWORD PTR [rdi + 168]
+	shl	r11, 1
+	mov	r8, QWORD PTR [rdi + 192]
+	lea	r9, [r10 + r11]
+	add	r9, r8
+	test	r9, r9
+	jnz	Lrqo_lot_draw
+	xor	edi, edi
+	jmp	Lrqo_ret
+Lrqo_lot_draw:
+	mov	rax, QWORD PTR [rdi + 216]
+	mov	rcx, rax
+	shl	rcx, 13
+	xor	rax, rcx
+	mov	rcx, rax
+	shr	rcx, 7
+	xor	rax, rcx
+	mov	rcx, rax
+	shl	rcx, 17
+	xor	rax, rcx
+	mov	QWORD PTR [rdi + 216], rax
+	xor	edx, edx
+	div	r9
+	xor	esi, esi
+	cmp	rdx, r10
+	jb	Lrqo_take
+	sub	rdx, r10
+	mov	esi, 1
+	cmp	rdx, r11
+	jb	Lrqo_take
+	mov	esi, 2
+	jmp	Lrqo_take
+Lrqo_ret:
+	leave
+	ret
+	.globl	silica_rt_set_scheduler_policy
+	.p2align	4
+silica_rt_set_scheduler_policy:
+# set_scheduler_policy(policy): rdi = the policy code (0 :priority_fifo, 1 :round_robin, 2
+# :weighted_fair, 3 :lottery; the emitter maps the program's atoms to the codes and the result
+# back, prims_actors emit_set_scheduler_policy_with_atoms) -> rdi = 0 (:ok) or 1 (:invalid_policy:
+# any other code, the policy unchanged). One word for the process, read by every carrier at its
+# next push or pop (this module's header says what happens to actors already queued). A
+# dangerous actor, on a thread of its own, is scheduled by the OS and takes no part. Leaf.
+	cmp	rdi, 4
+	jae	Lssp_invalid
+	mov	QWORD PTR [rip + silica_rt_sched_policy], rdi
+	xor	edi, edi
+	ret
+Lssp_invalid:
+	mov	edi, 1
+	ret
+"
+}
+
+fn emit_actor_carrier_runtime_asm() -> string {
+    concat(concat(concat(concat(concat(concat(carrier_asm_data(), carrier_asm_adopt()), carrier_asm_loop()), carrier_asm_wakes()), carrier_asm_placement()), carrier_asm_run_queues()), carrier_asm_context())
+}

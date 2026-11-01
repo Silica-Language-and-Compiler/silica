@@ -1,0 +1,766 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Supervisors Phase E (design_documents/supervisors_implementation_development_plan.md, §15.4.12–15.4.13.2):
+// `impl … for Supervisor { fn init … }` must declare a return type that names the static child table
+// and escalation fields the runtime uses for automatic restart (shared with module_checker export-trait
+// validation — same string predicates).
+
+use parser_ast;
+use type_checker_core;
+use type_checker_traits;
+use type_checker_expressions_actors;
+
+export supervisor_init_return_tuple_has_flags_and_children/1;
+export supervisor_init_return_has_phase_e_declarative_fields/1;
+export program_has_impl_for_supervisor/1;
+export collect_supervisor_impl_types_csv/1;
+export check_init_if_supervisor_impl_phase_e/2;
+export check_supervisor_impl_has_init_phase_b/1;
+export supervisor_walk_validate_child_spec_agent_type_atoms/1;
+export supervisor_walk_validate_child_spec_flavor_atoms/1;
+export supervisor_walk_validate_dangerous_flavor_constraints/2;
+export validate_supervisor_init_body_literal_agent_types_if_needed/2;
+export validate_supervisor_init_body_literal_flavor_if_needed/2;
+export validate_supervisor_init_body_dangerous_flavor_constraints_if_needed/3;
+export validate_supervisor_init_body_duplicate_child_ids_if_needed/2;
+
+fn supervisor_string_contains_from(h: string, needle: string, i: int64, nh: int64) -> boolean {
+    case i + nh > length_bytes(h) of {
+        true -> false;
+        false -> case substring(h, i, i + nh) == needle of {
+            true -> true;
+            false -> supervisor_string_contains_from(h, needle, i + 1, nh)
+        }
+    }
+}
+
+fn supervisor_string_contains(h: string, needle: string) -> boolean {
+    nh: int64 <- length_bytes(needle);
+    case nh == 0 of {
+        true -> true;
+        false -> supervisor_string_contains_from(h, needle, 0, nh)
+    }
+}
+
+// §15.4.13.1: tuple (flags, static children). Same top-level comma scan as module_checker / trait_checker.
+fn supervisor_trait_top_level_comma_in_type(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case depth == 0 and substring(s, i, i + 1) == "," of {
+            true -> i;
+            false -> {
+                c: string <- substring(s, i, i + 1);
+                d2: int64 <- case c == "(" of {
+                    true -> depth + 1;
+                    false -> case c == ")" of {
+                        true -> depth - 1;
+                        false -> case c == "{" of {
+                            true -> depth + 1;
+                            false -> case c == "}" of {
+                                true -> depth - 1;
+                                false -> case c == "[" of {
+                                    true -> depth + 1;
+                                    false -> case c == "]" of {
+                                        true -> depth - 1;
+                                        false -> depth
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                supervisor_trait_top_level_comma_in_type(s, i + 1, d2)
+            }
+        }
+    }
+}
+
+fn supervisor_init_return_tuple_has_flags_and_children(ret: string) -> boolean {
+    t: string <- type_checker_traits@trim_type_text(ret);
+    case length_bytes(t) < 2 of {
+        true -> false;
+        false -> case substring(t, 0, 1) == "(" and substring(t, length_bytes(t) - 1, length_bytes(t)) == ")" of {
+            false -> false;
+            true -> {
+                inner: string <- type_checker_traits@trim_type_text(substring(t, 1, length_bytes(t) - 1));
+                comma_at_top: int64 <- supervisor_trait_top_level_comma_in_type(inner, 0, 0);
+                comma_at_top >= 0
+            }
+        }
+    }
+}
+
+// §15.4.13.2 fields for Phase E static child table and escalation (substring match on parsed return type text).
+// Return-type text arrives tokenized from the parser (token lexemes joined with spaces), so
+// field annotations like `strategy :` carry a space before the colon (see SIR `required_fn` dump).
+// The old checks used `name:` (no space) and never matched real trait text — hence the rewrite to
+// the space-before-colon form that the parser actually produces.
+fn supervisor_init_return_has_phase_e_declarative_fields(ret: string) -> boolean {
+    t: string <- type_checker_traits@trim_type_text(ret);
+    case supervisor_string_contains(t, "strategy :") of {
+        false -> false;
+        true -> case supervisor_string_contains(t, "allowed_restart_count :") of {
+            false -> false;
+            true -> case supervisor_string_contains(t, "restarts_time_frame :") of {
+                false -> false;
+                true -> case supervisor_string_contains(t, "List [") or supervisor_string_contains(t, "List[") of {
+                    false -> false;
+                    true -> case supervisor_string_contains(t, ", normal") or supervisor_string_contains(t, ", mem") of {
+                        false -> false;
+                        true -> case supervisor_string_contains(t, "id :") of {
+                            false -> false;
+                            true -> case supervisor_string_contains(t, "agent_type : :worker | :supervisor") of {
+                                false -> false;
+                                true -> case supervisor_string_contains(t, "initial_state :") of {
+                                    false -> false;
+                                    true -> case supervisor_string_contains(t, "behavior :") of {
+                                        false -> false;
+                                        true -> case supervisor_string_contains(t, "restart :") of {
+                                            false -> false;
+                                            true -> case supervisor_string_contains(t, "shutdown :") of {
+                                                false -> false;
+                                                true -> supervisor_string_contains(t, "flavor :")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn for_supervisor_impl_suffix() -> string {
+    " for Supervisor"
+}
+
+fn for_supervisor_phase_a_impl_suffix() -> string {
+    " for SupervisorPhaseA"
+}
+
+fn string_ends_with_suffix(s: string, suf: string) -> boolean {
+    ls: int64 <- length_bytes(s);
+    lf: int64 <- length_bytes(suf);
+    case ls < lf of { true -> false; false -> substring(s, ls - lf, ls) == suf }
+}
+
+// Tag-6 marker: `impl ConcreteActorType for Supervisor;` (sir_generator/declarations/traits.silica).
+fn program_has_impl_for_supervisor_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 6 of {
+            true -> {
+                t: string <- type_checker_traits@trim_type_text(decls.head.return_type_name);
+                case string_ends_with_suffix(t, for_supervisor_impl_suffix()) of {
+                    true -> true;
+                    false -> program_has_impl_for_supervisor_loop(decls.tail)
+                }
+            };
+            false -> program_has_impl_for_supervisor_loop(decls.tail)
+        }
+    }
+}
+
+fn program_has_impl_for_supervisor(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> boolean {
+    program_has_impl_for_supervisor_loop(decls)
+}
+
+fn collect_supervisor_impl_types_csv_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], acc: string) -> string {
+    case decls.is_nil of {
+        true -> acc;
+        false -> case decls.head.tag == 6 of {
+            true -> {
+                t: string <- type_checker_traits@trim_type_text(decls.head.return_type_name);
+                case string_ends_with_suffix(t, for_supervisor_impl_suffix()) or string_ends_with_suffix(t, for_supervisor_phase_a_impl_suffix()) of {
+                    true -> {
+                        suffix_len: int64 <- case string_ends_with_suffix(t, for_supervisor_impl_suffix()) of {
+                            true -> length_bytes(for_supervisor_impl_suffix());
+                            false -> length_bytes(for_supervisor_phase_a_impl_suffix())
+                        };
+                        actor_ty: string <- substring(t, 0, length_bytes(t) - suffix_len);
+                        next: string <- case length_bytes(acc) == 0 of {
+                            true -> actor_ty;
+                            false -> concat(concat(acc, ","), actor_ty)
+                        };
+                        collect_supervisor_impl_types_csv_loop(decls.tail, next)
+                    };
+                    false -> collect_supervisor_impl_types_csv_loop(decls.tail, acc)
+                }
+            };
+            false -> collect_supervisor_impl_types_csv_loop(decls.tail, acc)
+        }
+    }
+}
+
+fn collect_supervisor_impl_types_csv(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> string {
+    collect_supervisor_impl_types_csv_loop(decls, "")
+}
+
+fn init_decl_has_one_parameter(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> boolean {
+    case decl.name == "init" of {
+        false -> false;
+        true -> case decl.parameters.is_nil of {
+            true -> false;
+            false -> decl.parameters.tail.is_nil
+        }
+    }
+}
+
+fn program_has_init_one_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 0 and init_decl_has_one_parameter(decls.head) of {
+            true -> true;
+            false -> program_has_init_one_loop(decls.tail)
+        }
+    }
+}
+
+fn first_supervisor_impl_location_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { file: string, line: int64, column: int64, offset: int64 } {
+    case decls.is_nil of {
+        true -> parser_ast@zero_location();
+        false -> case decls.head.tag == 6 of {
+            true -> {
+                t: string <- type_checker_traits@trim_type_text(decls.head.return_type_name);
+                case string_ends_with_suffix(t, for_supervisor_impl_suffix()) of {
+                    true -> decls.head.location;
+                    false -> first_supervisor_impl_location_loop(decls.tail)
+                }
+            };
+            false -> first_supervisor_impl_location_loop(decls.tail)
+        }
+    }
+}
+
+fn check_supervisor_impl_has_init_phase_b(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case program_has_impl_for_supervisor(decls) of {
+        false -> type_checker_core@type_check_ok();
+        true -> case program_has_init_one_loop(decls) of {
+            true -> type_checker_core@type_check_ok();
+            false -> {
+                loc: { file: string, line: int64, column: int64, offset: int64 } <- first_supervisor_impl_location_loop(decls);
+                type_checker_core@type_check_err("E2092", loc, "impl T for Supervisor requires fn init/1; supervisor init is called only by spawn_registered_supervisor", "sect15.4.13")
+            }
+        }
+    }
+}
+
+// When a module defines `impl T for Supervisor` and `fn init(state) -> ...`, the return type must
+// name Phase E declarative `supervisor_flags` + `List[child_spec, mem(ρ)|…]` (or legacy `, normal`) fields
+// (runtime static table and automatic restart per §15.4.13.1–2).
+fn check_supervisor_init_return_type_phase_e_shape(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    retn: string <- type_checker_traits@trim_type_text(decl.return_type_name);
+    case length_bytes(retn) > 0 of {
+        false -> type_checker_core@type_check_err("E2092", decl.return_type_location, "Supervisor init must declare return type (supervisor_flags, List[child_spec, mem(ρ) | …]); spec §15.4.13.1–§15.4.13.2 (supervisors plan Phase E)", "sect15.4.13.1");
+        true -> case supervisor_init_return_tuple_has_flags_and_children(decl.return_type_name) of {
+            false -> type_checker_core@type_check_err("E2092", decl.return_type_location, "Supervisor init must return a tuple (supervisor_flags, static child list) per spec §15.4.13.1 (supervisors plan Phase E)", "sect15.4.13.1");
+            true -> case supervisor_init_return_has_phase_e_declarative_fields(decl.return_type_name) of {
+                false -> type_checker_core@type_check_err("E2092", decl.return_type_location, "Supervisor init return type must include supervisor_flags (strategy, allowed_restart_count, restarts_time_frame) and child_spec fields (id, agent_type: :worker | :supervisor, initial_state, behavior, restart, shutdown, flavor: :plain | :dangerous) in List[..., mem(ρ) | …] or List[..., normal] for automatic restart (supervisors plan Phase B; spec §15.4.13.2)", "sect15.4.13.2");
+                true -> type_checker_core@type_check_ok()
+            }
+        }
+    }
+}
+
+fn check_init_if_supervisor_impl_phase_e(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, all_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case program_has_impl_for_supervisor(all_decls) of {
+        false -> type_checker_core@type_check_ok();
+        true -> case decl.name == "init" of {
+            false -> type_checker_core@type_check_ok();
+            true -> case init_decl_has_one_parameter(decl) of {
+                false -> type_checker_core@type_check_ok();
+                true -> check_supervisor_init_return_type_phase_e_shape(decl)
+            }
+        }
+    }
+}
+
+fn supervisor_child_spec_agent_type_initializer_ok(init_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(init_e);
+    case node.kind == 5 of {
+        false -> false;
+        true -> node.value == ":worker" or node.value == ":supervisor"
+    }
+}
+
+// child_spec.agent_type must be a literal :worker or :supervisor (no other atoms, no variables).
+fn supervisor_validate_record_field_agent_type(field_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(field_e);
+    case node.name == "agent_type" of {
+        false -> type_checker_core@type_check_ok();
+        true -> {
+            inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(field_e, node.inner);
+            inner_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(inner_e);
+            case inner_node.kind == 5 of {
+                false -> type_checker_core@type_check_err(
+                    "E2093",
+                    node.location,
+                    "child_spec agent_type must be a literal :worker or :supervisor (§15.4.13.2 / supervisor child table)",
+                    "sect15.4.13.2"
+                );
+                true -> case supervisor_child_spec_agent_type_initializer_ok(inner_e) of {
+                    true -> type_checker_core@type_check_ok();
+                    false -> type_checker_core@type_check_err(
+                        "E2093",
+                        inner_node.location,
+                        concat(concat("invalid child_spec agent_type ", inner_node.value), "; only :worker or :supervisor are allowed"),
+                        "sect15.4.13.2"
+                    )
+                }
+            }
+        }
+    }
+}
+
+// Walk an expression AST and validate every inline record field named agent_type used in supervisor child specs.
+fn supervisor_walk_validate_child_spec_agent_type_atoms(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    case node.kind < 0 of {
+        true -> type_checker_core@type_check_ok();
+        false -> {
+            fld: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- case node.kind == 21 of {
+                true -> supervisor_validate_record_field_agent_type(expr);
+                false -> type_checker_core@type_check_ok()
+            };
+            case fld.is_ok of {
+                false -> fld;
+                true -> case node.kind == 991 of {
+                    true -> supervisor_walk_validate_child_spec_agent_type_atoms(parser_ast@expr_at(expr, node.inner));
+                    false -> case node.kind == 992 of {
+                        true -> type_checker_core@type_check_ok();
+                        false -> {
+                            inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.inner);
+                            right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.right_expr);
+                            rin: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- supervisor_walk_validate_child_spec_agent_type_atoms(inner_e);
+                            case rin.is_ok of {
+                                false -> rin;
+                                true -> supervisor_walk_validate_child_spec_agent_type_atoms(right_e)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_supervisor_init_body_literal_agent_types_if_needed(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, all_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case program_has_impl_for_supervisor(all_decls) of {
+        false -> type_checker_core@type_check_ok();
+        true -> case decl.name == "init" of {
+            false -> type_checker_core@type_check_ok();
+            true -> case init_decl_has_one_parameter(decl) of {
+                false -> type_checker_core@type_check_ok();
+                true -> supervisor_walk_validate_child_spec_agent_type_atoms(decl.body)
+            }
+        }
+    }
+}
+
+fn supervisor_child_spec_flavor_initializer_ok(init_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(init_e);
+    case node.kind == 5 of {
+        false -> false;
+        true -> node.value == ":plain" or node.value == ":dangerous"
+    }
+}
+
+fn supervisor_validate_record_field_flavor(field_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(field_e);
+    case node.name == "flavor" of {
+        false -> type_checker_core@type_check_ok();
+        true -> {
+            inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(field_e, node.inner);
+            inner_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(inner_e);
+            case inner_node.kind == 5 of {
+                false -> type_checker_core@type_check_err(
+                    "E2094",
+                    node.location,
+                    "child_spec flavor must be a literal :plain or :dangerous (§15.4.13.2 / supervisor child table)",
+                    "sect15.4.13.2"
+                );
+                true -> case supervisor_child_spec_flavor_initializer_ok(inner_e) of {
+                    true -> type_checker_core@type_check_ok();
+                    false -> type_checker_core@type_check_err(
+                        "E2094",
+                        inner_node.location,
+                        concat(concat("invalid child_spec flavor ", inner_node.value), "; only :plain or :dangerous are allowed"),
+                        "sect15.4.13.2"
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn supervisor_walk_validate_child_spec_flavor_atoms(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    case node.kind < 0 of {
+        true -> type_checker_core@type_check_ok();
+        false -> {
+            fld: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- case node.kind == 21 of {
+                true -> supervisor_validate_record_field_flavor(expr);
+                false -> type_checker_core@type_check_ok()
+            };
+            case fld.is_ok of {
+                false -> fld;
+                true -> case node.kind == 991 of {
+                    true -> supervisor_walk_validate_child_spec_flavor_atoms(parser_ast@expr_at(expr, node.inner));
+                    false -> case node.kind == 992 of {
+                        true -> type_checker_core@type_check_ok();
+                        false -> {
+                            inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.inner);
+                            right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.right_expr);
+                            rin: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- supervisor_walk_validate_child_spec_flavor_atoms(inner_e);
+                            case rin.is_ok of {
+                                false -> rin;
+                                true -> supervisor_walk_validate_child_spec_flavor_atoms(right_e)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_supervisor_init_body_literal_flavor_if_needed(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, all_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case program_has_impl_for_supervisor(all_decls) of {
+        false -> type_checker_core@type_check_ok();
+        true -> case decl.name == "init" of {
+            false -> type_checker_core@type_check_ok();
+            true -> case init_decl_has_one_parameter(decl) of {
+                false -> type_checker_core@type_check_ok();
+                true -> supervisor_walk_validate_child_spec_flavor_atoms(decl.body)
+            }
+        }
+    }
+}
+
+fn find_atom_field_in_record_chain(field_chain: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, field_name: string) -> string {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(field_chain);
+    case node.kind == 21 of {
+        false -> "";
+        true -> case node.name == field_name of {
+            true -> {
+                inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(field_chain, node.inner);
+                inner_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(inner_e);
+                case inner_node.kind == 5 of {
+                    true -> inner_node.value;
+                    false -> ""
+                }
+            };
+            false -> find_atom_field_in_record_chain(parser_ast@expr_at(field_chain, node.right_expr), field_name)
+        }
+    }
+}
+
+fn find_fn_ref_name_in_record_chain(field_chain: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, field_name: string) -> string {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(field_chain);
+    case node.kind == 21 of {
+        false -> "";
+        true -> case node.name == field_name of {
+            true -> {
+                inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(field_chain, node.inner);
+                inner_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(inner_e);
+                case inner_node.kind == 1 of {
+                    true -> inner_node.name;
+                    false -> ""
+                }
+            };
+            false -> find_fn_ref_name_in_record_chain(parser_ast@expr_at(field_chain, node.right_expr), field_name)
+        }
+    }
+}
+
+fn find_field_location_in_record_chain(field_chain: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, field_name: string) -> { file: string, line: int64, column: int64, offset: int64 } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(field_chain);
+    case node.kind == 21 of {
+        false -> parser_ast@zero_location();
+        true -> case node.name == field_name of {
+            true -> node.location;
+            false -> find_field_location_in_record_chain(parser_ast@expr_at(field_chain, node.right_expr), field_name)
+        }
+    }
+}
+
+fn find_fn_return_type_in_decls(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], fn_name: string) -> string {
+    case decls.is_nil of {
+        true -> "";
+        false -> case decls.head.tag == 0 and decls.head.name == fn_name of {
+            true -> decls.head.return_type_name;
+            false -> find_fn_return_type_in_decls(decls.tail, fn_name)
+        }
+    }
+}
+
+fn starts_with_dangerous_prefix(s: string) -> boolean {
+    length_bytes(s) >= 11 and substring(s, 0, 11) == ":dangerous_"
+}
+
+fn validate_dangerous_child_spec_record(field_chain: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    flavor: string <- find_atom_field_in_record_chain(field_chain, "flavor");
+    case flavor == ":dangerous" of {
+        false -> type_checker_core@type_check_ok();
+        true -> {
+            id_val: string <- find_atom_field_in_record_chain(field_chain, "id");
+            case starts_with_dangerous_prefix(id_val) of {
+                false -> {
+                    id_loc: { file: string, line: int64, column: int64, offset: int64 } <- find_field_location_in_record_chain(field_chain, "id");
+                    type_checker_core@type_check_err(
+                        "E2094",
+                        id_loc,
+                        concat(concat("child_spec with flavor :dangerous requires id starting with :dangerous_; got ", id_val), " (§15.4.13.2)"),
+                        "sect15.4.13.2"
+                    )
+                };
+                true -> {
+                    beh_fn_name: string <- find_fn_ref_name_in_record_chain(field_chain, "behavior");
+                    case length_bytes(beh_fn_name) == 0 of {
+                        true -> type_checker_core@type_check_ok();
+                        false -> {
+                            ret_type: string <- find_fn_return_type_in_decls(decls, beh_fn_name);
+                            case length_bytes(ret_type) == 0 of {
+                                true -> type_checker_core@type_check_ok();
+                                false -> case type_checker_expressions_actors@behavior_return_is_cast_only(ret_type) of {
+                                    true -> type_checker_core@type_check_ok();
+                                    false -> {
+                                        beh_loc: { file: string, line: int64, column: int64, offset: int64 } <- find_field_location_in_record_chain(field_chain, "behavior");
+                                        type_checker_core@type_check_err(
+                                            "E2095",
+                                            beh_loc,
+                                            "child_spec with flavor :dangerous requires a cast-type behavior returning (:no_reply, State); reply-type behaviors are not allowed for dangerous children (§15.4.13.2)",
+                                            "sect15.4.13.2"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_child_spec_record_chain(field_chain: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    length_bytes(find_atom_field_in_record_chain(field_chain, "agent_type")) > 0
+        and length_bytes(find_atom_field_in_record_chain(field_chain, "flavor")) > 0
+}
+
+fn supervisor_walk_validate_dangerous_flavor_constraints(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    case node.kind < 0 of {
+        true -> type_checker_core@type_check_ok();
+        false -> {
+            cross: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- case node.kind == 21 and node.name == "id" of {
+                true -> case is_child_spec_record_chain(expr) of {
+                    true -> validate_dangerous_child_spec_record(expr, decls);
+                    false -> type_checker_core@type_check_ok()
+                };
+                false -> type_checker_core@type_check_ok()
+            };
+            case cross.is_ok of {
+                false -> cross;
+                true -> case node.kind == 991 of {
+                    true -> supervisor_walk_validate_dangerous_flavor_constraints(parser_ast@expr_at(expr, node.inner), decls);
+                    false -> case node.kind == 992 of {
+                        true -> type_checker_core@type_check_ok();
+                        false -> {
+                            inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.inner);
+                            right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.right_expr);
+                            rin: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- supervisor_walk_validate_dangerous_flavor_constraints(inner_e, decls);
+                            case rin.is_ok of {
+                                false -> rin;
+                                true -> supervisor_walk_validate_dangerous_flavor_constraints(right_e, decls)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_supervisor_init_body_dangerous_flavor_constraints_if_needed(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, all_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], decls_for_lookup: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case program_has_impl_for_supervisor(all_decls) of {
+        false -> type_checker_core@type_check_ok();
+        true -> case decl.name == "init" of {
+            false -> type_checker_core@type_check_ok();
+            true -> case init_decl_has_one_parameter(decl) of {
+                false -> type_checker_core@type_check_ok();
+                true -> supervisor_walk_validate_dangerous_flavor_constraints(decl.body, decls_for_lookup)
+            }
+        }
+    }
+}
+
+// §20.3.1 "Supervised children with the same id": an `id` that appears twice in one supervisor's init
+// child list is E2235 DuplicateChildId, reported at the second occurrence, where the list is a literal
+// the compiler can see (a kind-20 list literal whose elements are child_spec records). Each literal is
+// checked on its own, so the same id in two arms of a case is not a duplicate.
+fn child_ids_nil() -> List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- empty[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn child_ids_cons(entry: { id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, rest: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- prepend[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)](entry, rest)
+    produces
+        pure result
+    end
+}
+
+fn child_names_nil() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn child_names_cons(name: string, rest: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- prepend[string, mem(normal)](name, rest)
+    produces
+        pure result
+    end
+}
+
+fn child_names_contain(names: List[string, mem(normal)], name: string) -> boolean {
+    case names.is_nil of {
+        true -> false;
+        false -> case names.head == name of {
+            true -> true;
+            false -> child_names_contain(names.tail, name)
+        }
+    }
+}
+
+// One element of a list literal: its child_spec id, when it is a child_spec record with one.
+fn child_ids_add_element(elem: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, acc: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(elem);
+    case node.kind == 21 and is_child_spec_record_chain(elem) of {
+        false -> acc;
+        true -> {
+            id_val: string <- find_atom_field_in_record_chain(elem, "id");
+            case length_bytes(id_val) == 0 of {
+                true -> acc;
+                false -> child_ids_cons({ id: id_val, loc: find_field_location_in_record_chain(elem, "id") }, acc)
+            }
+        }
+    }
+}
+
+// The spine of a list literal is right-nested (parser constraint_extract_expr_lits.silica): a pair
+// node (kind 20, name ",") holds an element in inner and the rest in right_expr; the last right_expr
+// is the last element itself; the literal's root is a kind-20 node whose name is not "," (its value
+// is the List type only when the literal carries a `: List[...]` suffix). The ids come back
+// last-first (consed); child_ids_reverse restores source order for first_repeated_child_id.
+fn child_ids_in_spine(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, idx: int64, acc: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case idx < 0 of {
+        true -> acc;
+        false -> {
+            at: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, idx);
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(at);
+            case node.kind == 20 and node.name == "," of {
+                true -> child_ids_in_spine(expr, node.right_expr, child_ids_add_element(parser_ast@expr_at(expr, node.inner), acc));
+                false -> child_ids_add_element(at, acc)
+            }
+        }
+    }
+}
+
+fn child_ids_reverse(ids: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], acc: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case ids.is_nil of {
+        true -> acc;
+        false -> child_ids_reverse(ids.tail, child_ids_cons(ids.head, acc))
+    }
+}
+
+fn first_repeated_child_id(ids: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], seen: List[string, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case ids.is_nil of {
+        true -> type_checker_core@type_check_ok();
+        false -> case child_names_contain(seen, ids.head.id) of {
+            true -> type_checker_core@type_check_err(
+                "E2235",
+                ids.head.loc,
+                concat(concat("child_spec id ", ids.head.id), " appears twice in this supervisor's init child list; a child is registered under its id, and a name is held by one actor or supervisor (§20.3.1)"),
+                "sect20.3.1"
+            );
+            false -> first_repeated_child_id(ids.tail, child_names_cons(ids.head.id, seen))
+        }
+    }
+}
+
+// A list literal root (kind 20, name not ","): the elements of this one literal.
+fn check_child_spec_list_literal(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    first: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- child_ids_add_element(parser_ast@expr_at(expr, node.inner), child_ids_nil());
+    all_ids: List[{ id: string, loc: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- child_ids_in_spine(expr, node.right_expr, first);
+    first_repeated_child_id(child_ids_reverse(all_ids, child_ids_nil()), child_names_nil())
+}
+
+fn supervisor_walk_validate_duplicate_child_ids(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    case node.kind < 0 of {
+        true -> type_checker_core@type_check_ok();
+        false -> {
+            here: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- case node.kind == 20 and node.name != "," of {
+                true -> check_child_spec_list_literal(expr);
+                false -> type_checker_core@type_check_ok()
+            };
+            case here.is_ok of {
+                false -> here;
+                true -> case node.kind == 991 of {
+                    true -> supervisor_walk_validate_duplicate_child_ids(parser_ast@expr_at(expr, node.inner));
+                    false -> case node.kind == 992 of {
+                        true -> type_checker_core@type_check_ok();
+                        false -> {
+                            rin: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- supervisor_walk_validate_duplicate_child_ids(parser_ast@expr_at(expr, node.inner));
+                            case rin.is_ok of {
+                                false -> rin;
+                                true -> supervisor_walk_validate_duplicate_child_ids(parser_ast@expr_at(expr, node.right_expr))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_supervisor_init_body_duplicate_child_ids_if_needed(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, all_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case program_has_impl_for_supervisor(all_decls) of {
+        false -> type_checker_core@type_check_ok();
+        true -> case decl.name == "init" of {
+            false -> type_checker_core@type_check_ok();
+            true -> case init_decl_has_one_parameter(decl) of {
+                false -> type_checker_core@type_check_ok();
+                true -> supervisor_walk_validate_duplicate_child_ids(decl.body)
+            }
+        }
+    }
+}

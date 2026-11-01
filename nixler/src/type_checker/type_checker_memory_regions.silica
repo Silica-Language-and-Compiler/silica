@@ -1,0 +1,1312 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Memory region type validation: ref(R, Space, T), region(R, Space), buf(R, Space, T, N), atomic_ref(R, Space, T)
+// Used by let bindings, function return types, and (future) function parameters
+
+use parser_ast;
+use type_checker_core;
+use type_surface_cache;
+
+export is_memory_region_type/1;
+export validate_memory_region_type/2;
+export validate_memory_region_type_in_context/3;
+export validate_type_for_parameter/2;
+export ref_type_to_region_type/1;
+export extract_element_type_from_ref/1;
+export extract_element_type_from_buf/1;
+export extract_length_from_buf/1;
+export buf_type_to_region_type/1;
+export atomic_ref_type_to_region_type/1;
+export extract_element_type_from_atomic_ref/1;
+export get_space_from_region_type/1;
+export get_space_from_ref_type/1;
+export is_region_builtin_call/1;
+export check_sequence_return_lifetime/2;
+export lifetime_text_has_carrier/1;
+export lifetime_map_is_conflict/1;
+export lifetime_map_renames/1;
+export lifetime_conflict_message/2;
+export lifetime_unify/4;
+export lifetime_result_only_names/2;
+export lifetime_subst_apply/2;
+export is_valid_memory_space/1;
+
+// Valid memory space keywords per spec §4.4.1
+fn is_valid_memory_space(space: string) -> boolean {
+    space == "normal" or space == "normal_writeback" or space == "normal_writethrough" or space == "normal_noncacheable" or space == "atomic" or space == "device"
+}
+
+fn env_lookup_surface(env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], name: string) -> string {
+    case env.is_nil of {
+        true -> "";
+        false -> case env.head.name == name of {
+            true -> env.head.surface_type;
+            false -> env_lookup_surface(env.tail, name)
+        }
+    }
+}
+
+// Trim leading/trailing whitespace from string
+fn trim_type(s: string) -> string {
+    trim_type_from(s, 0, length_bytes(s) - 1)
+}
+
+fn trim_type_from(s: string, start: int64, last_idx: int64) -> string {
+    case start > last_idx of {
+        true -> "";
+        false -> case substring(s, start, start + 1) == " " of {
+            true -> trim_type_from(s, start + 1, last_idx);
+            false -> case substring(s, last_idx, last_idx + 1) == " " of {
+                true -> trim_type_from(s, start, last_idx - 1);
+                false -> substring(s, start, last_idx + 1)
+            }
+        }
+    }
+}
+
+// Split inner content by top-level commas (respecting nested parens). Returns list as string segments.
+// We use a simple approach: collect params one by one.
+fn split_params_at_top_level(inner: string) -> List[string, mem(normal)] {
+    split_params_loop(inner, 0, 0, "", nil_list_string())
+}
+
+// String list helpers use List[string, mem(normal)] (spec §3.4.2).
+
+fn nil_list_string() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+
+fn cons_string(s: string, rest: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- prepend[string, mem(normal)](s, rest)
+    produces
+        pure result
+    end
+}
+
+
+fn split_params_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case substring(s, j, j + 1) == "(" of {
+            true -> j;
+            false -> case substring(s, j, j + 1) == ")" of {
+                true -> j;
+                false -> case substring(s, j, j + 1) == "," of {
+                    true -> j;
+                    false -> split_params_run_end(s, j + 1, n)
+                }
+            }
+        }
+    }
+}
+
+fn split_params_loop(s: string, i: int64, depth: int64, acc: string, result: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= length_bytes(s) of {
+        true -> case length_bytes(acc) > 0 of {
+            true -> cons_string(trim_type(acc), result);
+            false -> result
+        };
+        false -> case substring(s, i, i + 1) == "(" of {
+            true -> split_params_loop(s, i + 1, depth + 1, concat(acc, "("), result);
+            false -> case substring(s, i, i + 1) == ")" of {
+                true -> split_params_loop(s, i + 1, depth - 1, concat(acc, ")"), result);
+                false -> case substring(s, i, i + 1) == "," of {
+                    true -> case depth == 0 of {
+                        true -> {
+                            trimmed: string <- trim_type(acc);
+                            new_result: List[string, mem(normal)] <- cons_string(trimmed, result);
+                            split_params_loop(s, i + 1, 0, "", new_result)
+                        };
+                        false -> split_params_loop(s, i + 1, depth, concat(acc, ","), result)
+                    };
+                    false -> {
+                        n: int64 <- length_bytes(s);
+                        e: int64 <- split_params_run_end(s, i, n);
+                        split_params_loop(s, e, depth, concat(acc, substring(s, i, e)), result)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Reverse List[string, mem(normal)] (cons builds in reverse order)
+fn reverse_list_string(lst: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    reverse_list_string_acc(lst, nil_list_string())
+}
+
+fn reverse_list_string_acc(lst: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case lst.is_nil of {
+        true -> acc;
+        false -> reverse_list_string_acc(lst.tail, cons_string(lst.head, acc))
+    }
+}
+
+// Count elements in List[string, mem(normal)]
+fn list_string_length(lst: List[string, mem(normal)]) -> int64 {
+    case lst.is_nil of {
+        true -> 0;
+        false -> 1 + list_string_length(lst.tail)
+    }
+}
+
+// Get nth element (0-based)
+fn list_string_nth(lst: List[string, mem(normal)], n: int64) -> string {
+    case lst.is_nil of {
+        true -> "";
+        false -> case n == 0 of {
+            true -> lst.head;
+            false -> list_string_nth(lst.tail, n - 1)
+        }
+    }
+}
+
+// True if type string is a memory region type (ref, region, buf, atomic_ref)
+fn is_memory_region_type(type_str: string) -> boolean {
+    is_ref: boolean <- length_bytes(type_str) >= 4 and substring(type_str, 0, 3) == "ref" and substring(type_str, 3, 4) == "(";
+    is_ref_q: boolean <- length_bytes(type_str) >= 5 and substring(type_str, 0, 4) == "ref?" and substring(type_str, 4, 5) == "(";
+    is_region: boolean <- length_bytes(type_str) >= 7 and substring(type_str, 0, 6) == "region" and substring(type_str, 6, 7) == "(";
+    is_buf: boolean <- length_bytes(type_str) >= 4 and substring(type_str, 0, 3) == "buf" and substring(type_str, 3, 4) == "(";
+    is_atomic: boolean <- length_bytes(type_str) >= 11 and substring(type_str, 0, 10) == "atomic_ref" and substring(type_str, 10, 11) == "(";
+    is_ref or is_ref_q or is_region or is_buf or is_atomic
+}
+
+// Extract constructor name (ref, region, buf, atomic_ref) and inner params
+fn parse_memory_region_type(type_str: string) -> (string, string) {
+    case length_bytes(type_str) >= 10 and substring(type_str, 0, 10) == "atomic_ref" of {
+        true -> case length_bytes(type_str) >= 11 and substring(type_str, 10, 11) == "(" of {
+            true -> ("atomic_ref", substring(type_str, 11, length_bytes(type_str) - 1));
+            false -> ("", "")
+        };
+        false -> case length_bytes(type_str) >= 6 and substring(type_str, 0, 6) == "region" of {
+            true -> case length_bytes(type_str) >= 7 and substring(type_str, 6, 7) == "(" of {
+                true -> ("region", substring(type_str, 7, length_bytes(type_str) - 1));
+                false -> ("", "")
+            };
+            false -> case length_bytes(type_str) >= 3 and substring(type_str, 0, 3) == "buf" of {
+                true -> case length_bytes(type_str) >= 4 and substring(type_str, 3, 4) == "(" of {
+                    true -> ("buf", substring(type_str, 4, length_bytes(type_str) - 1));
+                    false -> ("", "")
+                };
+                false -> case length_bytes(type_str) >= 4 and substring(type_str, 0, 4) == "ref?" and substring(type_str, 4, 5) == "(" of {
+                    true -> case substring(type_str, length_bytes(type_str) - 1, length_bytes(type_str)) == ")" of {
+                        true -> ("ref?", substring(type_str, 5, length_bytes(type_str) - 1));
+                        false -> ("", "")
+                    };
+                    false -> case length_bytes(type_str) >= 3 and substring(type_str, 0, 3) == "ref" of {
+                        true -> case length_bytes(type_str) >= 4 and substring(type_str, 3, 4) == "(" of {
+                            true -> ("ref", substring(type_str, 4, length_bytes(type_str) - 1));
+                            false -> ("", "")
+                        };
+                        false -> ("", "")
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Validate memory region type string.
+fn validate_memory_region_type(type_str: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    (ctor: string, inner: string) <- parse_memory_region_type(type_str);
+    case length_bytes(ctor) == 0 of {
+        true -> type_checker_core@type_check_err("E2010", location, concat("invalid memory region type: ", type_str), "sect4.4");
+        false -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            n: int64 <- list_string_length(params);
+            case ctor of {
+                "ref" -> case n == 3 of {
+                    true -> validate_ref_params(params, location);
+                    false -> type_checker_core@type_check_err("E2010", location, "ref(R, Space, T) requires 3 parameters", "sect4.4.2")
+                };
+                "ref?" -> case n == 3 of {
+                    true -> validate_ref_params(params, location);
+                    false -> type_checker_core@type_check_err("E2010", location, "ref?(R, Space, T) requires 3 parameters", "recursive_tuple§2")
+                };
+                "region" -> case n == 2 of {
+                    true -> validate_region_params(params, location);
+                    false -> type_checker_core@type_check_err("E2010", location, "region(R, Space) requires 2 parameters", "sect4.4.1")
+                };
+                "buf" -> case n == 4 of {
+                    true -> validate_buf_params(params, location);
+                    false -> type_checker_core@type_check_err("E2010", location, "buf(R, Space, T, N) requires 4 parameters", "sect4.4.3")
+                };
+                "atomic_ref" -> case n == 3 of {
+                    true -> validate_atomic_ref_params(params, location);
+                    false -> type_checker_core@type_check_err("E2010", location, "atomic_ref(R, Space, T) requires 3 parameters", "sect4.4.4")
+                };
+                _: string -> type_checker_core@type_check_err("E2010", location, concat("unknown memory region constructor: ", ctor), "sect4.4")
+            }
+        }
+    }
+}
+
+fn validate_ref_params(params: List[string, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    r: string <- trim_type(list_string_nth(params, 0));
+    space: string <- trim_type(list_string_nth(params, 1));
+    t: string <- trim_type(list_string_nth(params, 2));
+    case length_bytes(r) == 0 of {
+        true -> type_checker_core@type_check_err("E2010", location, "ref: region identifier R cannot be empty", "sect4.4.2");
+        false -> case is_valid_memory_space(space) of {
+            true -> case length_bytes(t) == 0 of {
+                true -> type_checker_core@type_check_err("E2010", location, "ref: element type T cannot be empty", "sect4.4.2");
+                false -> type_checker_core@type_check_ok()
+            };
+            false -> type_checker_core@type_check_err("E2010", location, concat(concat("ref: invalid memory space '", space), "', expected normal/normal_writeback/normal_writethrough/normal_noncacheable/atomic/device"), "sect4.4.1")
+        }
+    }
+}
+
+fn validate_region_params(params: List[string, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    r: string <- trim_type(list_string_nth(params, 0));
+    space: string <- trim_type(list_string_nth(params, 1));
+    case length_bytes(r) == 0 of {
+        true -> type_checker_core@type_check_err("E2010", location, "region: region identifier R cannot be empty", "sect4.4.1");
+        false -> case is_valid_memory_space(space) of {
+            true -> type_checker_core@type_check_ok();
+            false -> type_checker_core@type_check_err("E2010", location, concat(concat("region: invalid memory space '", space), "', expected normal/normal_writeback/normal_writethrough/normal_noncacheable/atomic/device"), "sect4.4.1")
+        }
+    }
+}
+
+fn validate_buf_params(params: List[string, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    r: string <- trim_type(list_string_nth(params, 0));
+    space: string <- trim_type(list_string_nth(params, 1));
+    t: string <- trim_type(list_string_nth(params, 2));
+    n_str: string <- trim_type(list_string_nth(params, 3));
+    case length_bytes(r) == 0 of {
+        true -> type_checker_core@type_check_err("E2010", location, "buf: region identifier R cannot be empty", "sect4.4.3");
+        false -> case is_valid_memory_space(space) of {
+            true -> case length_bytes(t) == 0 of {
+                true -> type_checker_core@type_check_err("E2010", location, "buf: element type T cannot be empty", "sect4.4.3");
+                false -> validate_buf_length_param(n_str, location)
+            };
+            false -> type_checker_core@type_check_err("E2010", location, concat(concat("buf: invalid memory space '", space), "'"), "sect4.4.1")
+        }
+    }
+}
+
+fn is_digit_char(c: string) -> boolean {
+    c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9"
+}
+
+fn is_nonnegative_integer_literal_from(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> true;
+        false -> case is_digit_char(substring(s, i, i + 1)) of {
+            true -> is_nonnegative_integer_literal_from(s, i + 1);
+            false -> false
+        }
+    }
+}
+
+fn is_nonnegative_integer_literal(s: string) -> boolean {
+    length_bytes(s) > 0 and is_nonnegative_integer_literal_from(s, 0)
+}
+
+fn buf_length_char_forbidden(c: string) -> boolean {
+    c == " " or c == "\t" or c == "\n" or c == "\r" or c == "+" or c == "-" or c == "*" or c == "/" or c == "%" or c == "," or c == "(" or c == ")" or c == "{" or c == "}" or c == "[" or c == "]" or c == "<" or c == ">" or c == "|" or c == ":"
+}
+
+fn is_simple_buf_length_identifier_from(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> true;
+        false -> case buf_length_char_forbidden(substring(s, i, i + 1)) of {
+            true -> false;
+            false -> is_simple_buf_length_identifier_from(s, i + 1)
+        }
+    }
+}
+
+fn is_simple_buf_length_identifier(s: string) -> boolean {
+    case length_bytes(s) > 0 of {
+        false -> false;
+        true -> case is_digit_char(substring(s, 0, 1)) of {
+            true -> false;
+            false -> is_simple_buf_length_identifier_from(s, 0)
+        }
+    }
+}
+
+fn validate_buf_length_param(n_str: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    n: string <- trim_type(n_str);
+    case length_bytes(n) == 0 of {
+        true -> type_checker_core@type_check_err("E2010", location, "buf: length N cannot be empty", "sect4.4.3");
+        false -> case substring(n, 0, 1) == "-" of {
+            true -> type_checker_core@type_check_err("E2010", location, "buf: length N must be non-negative", "sect4.4.3");
+            false -> case is_nonnegative_integer_literal(n) of {
+                true -> type_checker_core@type_check_ok();
+                false -> case is_simple_buf_length_identifier(n) of {
+                    true -> type_checker_core@type_check_ok();
+                    false -> type_checker_core@type_check_err("E2010", location, "buf: length N must be a non-negative integer literal or runtime int64 identifier", "sect4.4.3")
+                }
+            }
+        }
+    }
+}
+
+fn validate_buf_length_param_in_context(n_str: string, location: { file: string, line: int64, column: int64, offset: int64 }, context: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    base: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- validate_buf_length_param(n_str, location);
+    case base.is_ok of {
+        false -> base;
+        true -> case is_nonnegative_integer_literal(trim_type(n_str)) of {
+            true -> type_checker_core@type_check_ok();
+            false -> {
+                name: string <- trim_type(n_str);
+                ty: string <- env_lookup_surface(context.env, name);
+                case length_bytes(ty) == 0 of {
+                    true -> type_checker_core@type_check_err("E2010", location, concat(concat("buf: runtime length identifier '", name), "' is not in scope"), "sect4.4.3");
+                    false -> case ty == "int64" of {
+                        true -> type_checker_core@type_check_ok();
+                        false -> type_checker_core@type_check_err("E2010", location, concat(concat(concat("buf: runtime length identifier '", name), "' must have type int64, got "), ty), "sect4.4.3")
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_buf_params_in_context(params: List[string, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 }, context: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    r: string <- trim_type(list_string_nth(params, 0));
+    space: string <- trim_type(list_string_nth(params, 1));
+    t: string <- trim_type(list_string_nth(params, 2));
+    n_str: string <- trim_type(list_string_nth(params, 3));
+    case length_bytes(r) == 0 of {
+        true -> type_checker_core@type_check_err("E2010", location, "buf: region identifier R cannot be empty", "sect4.4.3");
+        false -> case is_valid_memory_space(space) of {
+            true -> case length_bytes(t) == 0 of {
+                true -> type_checker_core@type_check_err("E2010", location, "buf: element type T cannot be empty", "sect4.4.3");
+                false -> validate_buf_length_param_in_context(n_str, location, context)
+            };
+            false -> type_checker_core@type_check_err("E2010", location, concat(concat("buf: invalid memory space '", space), "'"), "sect4.4.1")
+        }
+    }
+}
+
+fn validate_memory_region_type_in_context(type_str: string, location: { file: string, line: int64, column: int64, offset: int64 }, context: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    (ctor: string, inner: string) <- parse_memory_region_type(type_str);
+    case length_bytes(ctor) == 0 of {
+        true -> type_checker_core@type_check_err("E2010", location, concat("invalid memory region type: ", type_str), "sect4.4");
+        false -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            n: int64 <- list_string_length(params);
+            case ctor of {
+                "buf" -> case n == 4 of {
+                    true -> validate_buf_params_in_context(params, location, context);
+                    false -> type_checker_core@type_check_err("E2010", location, "buf(R, Space, T, N) requires 4 parameters", "sect4.4.3")
+                };
+                _: string -> validate_memory_region_type(type_str, location)
+            }
+        }
+    }
+}
+
+fn validate_atomic_ref_params(params: List[string, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    r: string <- trim_type(list_string_nth(params, 0));
+    space: string <- trim_type(list_string_nth(params, 1));
+    t: string <- trim_type(list_string_nth(params, 2));
+    case length_bytes(r) == 0 of {
+        true -> type_checker_core@type_check_err("E2010", location, "atomic_ref: region identifier R cannot be empty", "sect4.4.4");
+        false -> case is_valid_memory_space(space) of {
+            true -> case length_bytes(t) == 0 of {
+                true -> type_checker_core@type_check_err("E2010", location, "atomic_ref: element type T cannot be empty", "sect4.4.4");
+                false -> type_checker_core@type_check_ok()
+            };
+            false -> type_checker_core@type_check_err("E2010", location, concat(concat("atomic_ref: invalid memory space '", space), "'"), "sect4.4.1")
+        }
+    }
+}
+
+// Validate type for function parameter. For memory region types, delegates to validate_memory_region_type.
+// For non-memory types, returns ok (other validation handled elsewhere).
+fn validate_type_for_parameter(type_str: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case is_memory_region_type(type_str) of {
+        true -> validate_memory_region_type(type_str, location);
+        false -> type_checker_core@type_check_ok()
+    }
+}
+
+// Extract region(R, Space) from ref(R, Space, T). Returns "" if not a ref type.
+fn ref_type_to_region_type(ref_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(ref_type);
+    case ctor == "ref" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            r: string <- trim_type(list_string_nth(params, 0));
+            space: string <- trim_type(list_string_nth(params, 1));
+            concat(concat(concat(concat("region(", r), ", "), space), ")")
+        };
+        false -> ""
+    }
+}
+
+// Extract element type T from ref(R, Space, T). Returns "" if not a ref type.
+fn extract_element_type_from_ref(ref_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(ref_type);
+    case ctor == "ref" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            trim_type(list_string_nth(params, 2))
+        };
+        false -> ""
+    }
+}
+
+// Extract element type T from buf(R, Space, T, N). Returns "" if not a buf type.
+fn extract_element_type_from_buf(buf_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(buf_type);
+    case ctor == "buf" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            trim_type(list_string_nth(params, 2))
+        };
+        false -> ""
+    }
+}
+
+// Extract length parameter N from buf(R, Space, T, N). Returns "" if not a buf type.
+fn extract_length_from_buf(buf_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(buf_type);
+    case ctor == "buf" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            trim_type(list_string_nth(params, 3))
+        };
+        false -> ""
+    }
+}
+
+// Build region(R, Space) from R, Space strings.
+fn ref_type_to_region_type_from_params(r: string, space: string, _t: string) -> string {
+    concat(concat(concat(concat("region(", r), ", "), space), ")")
+}
+
+// Extract region(R, Space) from buf(R, Space, T, N). Returns "" if not a buf type.
+fn buf_type_to_region_type(buf_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(buf_type);
+    case ctor == "buf" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            r: string <- trim_type(list_string_nth(params, 0));
+            space: string <- trim_type(list_string_nth(params, 1));
+            concat(concat(concat(concat("region(", r), ", "), space), ")")
+        };
+        false -> ""
+    }
+}
+
+// Extract element type T from atomic_ref(R, Space, T). Returns "" if not an atomic_ref type.
+fn extract_element_type_from_atomic_ref(atomic_ref_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(atomic_ref_type);
+    case ctor == "atomic_ref" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            trim_type(list_string_nth(params, 2))
+        };
+        false -> ""
+    }
+}
+
+// Extract region(R, Space) from atomic_ref(R, Space, T). Returns "" if not an atomic_ref type.
+fn atomic_ref_type_to_region_type(atomic_ref_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(atomic_ref_type);
+    case ctor == "atomic_ref" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            r: string <- trim_type(list_string_nth(params, 0));
+            space: string <- trim_type(list_string_nth(params, 1));
+            concat(concat(concat(concat("region(", r), ", "), space), ")")
+        };
+        false -> ""
+    }
+}
+
+// Extract Space from ref(R, Space, T). Returns "" if not a ref type.
+fn get_space_from_ref_type(ref_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(ref_type);
+    case ctor == "ref" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            trim_type(list_string_nth(params, 1))
+        };
+        false -> ""
+    }
+}
+
+// Extract Space from region(R, Space). Returns "" if not a region type. Named to avoid conflict with effect_checker's extract_space_from_region_type which returns (bool, string).
+fn get_space_from_region_type(region_type: string) -> string {
+    (ctor: string, inner: string) <- parse_memory_region_type(region_type);
+    case ctor == "region" of {
+        true -> {
+            params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+            trim_type(list_string_nth(params, 1))
+        };
+        false -> ""
+    }
+}
+
+// True if call_name is a region built-in (alloc_region, alloc_ref, read_ref, write_ref, alloc_buf, buf_load, buf_store, read_buf, write_buf, fresh_lifetime)
+fn is_region_builtin_call(call_name: string) -> boolean {
+    call_name == "alloc_region" or call_name == "alloc_ref" or call_name == "alloc_rec" or call_name == "read_ref" or call_name == "write_ref" or call_name == "alloc_buf" or call_name == "buf_load" or call_name == "buf_store" or call_name == "read_buf" or call_name == "write_buf" or call_name == "fresh_lifetime" or call_name == "canonical_arena_lookup" or call_name == "canonical_arena_same" or call_name == "ref_eq"
+}
+
+// Phase A: Static Region Lifetime Analysis (single scope)
+// Spec §12.1.4 Scope Exit Rule: references cannot outlive their containing region.
+// When a sequence returns, any ref(L,...)/buf(L,...)/atomic_ref(L,...) in the return type must have region(L,...) in the return type.
+// Phases B (nested scopes) and C (cross-function) require implementation after functions are fully supported.
+fn check_sequence_return_lifetime(return_type: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    t: string <- trim_type(return_type);
+    ref_ids: List[string, mem(normal)] <- collect_lifetime_ids_from_ref_types(t);
+    region_ids: List[string, mem(normal)] <- collect_lifetime_ids_from_region_types(t);
+    check_ref_lifetimes_covered(ref_ids, region_ids, location)
+}
+
+fn check_ref_lifetimes_covered(ref_ids: List[string, mem(normal)], region_ids: List[string, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case ref_ids.is_nil of {
+        true -> type_checker_core@type_check_ok();
+        false -> case list_contains_string(trim_type(ref_ids.head), region_ids) of {
+            true -> check_ref_lifetimes_covered(ref_ids.tail, region_ids, location);
+            false -> type_checker_core@type_check_err("E2100", location, concat(concat("reference outlives region: return type contains ref/buf for lifetime '", trim_type(ref_ids.head)), "' but region is not returned; region must be in return value when returning references into it (spec §12.1.4)"), "sect12.1.4")
+        }
+    }
+}
+
+fn list_contains_string(s: string, lst: List[string, mem(normal)]) -> boolean {
+    case lst.is_nil of {
+        true -> false;
+        false -> case trim_type(lst.head) == s of {
+            true -> true;
+            false -> list_contains_string(s, lst.tail)
+        }
+    }
+}
+
+// Recursively collect lifetime IDs from ref(R,...), buf(R,...), atomic_ref(R,...) in type string.
+fn collect_lifetime_ids_from_ref_types(type_str: string) -> List[string, mem(normal)] {
+    t: string <- trim_type(type_str);
+    case length_bytes(t) < 4 of {
+        true -> nil_list_string();
+        false -> case length_bytes(t) >= 11 and substring(t, 0, 10) == "atomic_ref" and substring(t, 10, 11) == "(" of {
+            true -> collect_from_atomic_ref(t);
+            false -> case length_bytes(t) >= 6 and substring(t, 0, 6) == "region" and substring(t, 6, 7) == "(" of {
+                true -> nil_list_string();
+                false -> case length_bytes(t) >= 4 and substring(t, 0, 3) == "buf" and substring(t, 3, 4) == "(" of {
+                    true -> collect_from_buf(t);
+                    false -> case length_bytes(t) >= 4 and substring(t, 0, 3) == "ref" and substring(t, 3, 4) == "(" of {
+                        true -> collect_from_ref(t);
+                        false -> collect_from_tuple_or_union(t)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_from_ref(type_str: string) -> List[string, mem(normal)] {
+    inner: string <- substring(type_str, 4, length_bytes(type_str) - 1);
+    params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+    case list_string_length(params) < 3 of {
+        true -> nil_list_string();
+        false -> {
+            r: string <- trim_type(list_string_nth(params, 0));
+            elem_type: string <- trim_type(list_string_nth(params, 2));
+            rest: List[string, mem(normal)] <- collect_lifetime_ids_from_ref_types(elem_type);
+            cons_string(r, rest)
+        }
+    }
+}
+
+fn collect_from_buf(type_str: string) -> List[string, mem(normal)] {
+    inner: string <- substring(type_str, 4, length_bytes(type_str) - 1);
+    params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+    case list_string_length(params) < 4 of {
+        true -> nil_list_string();
+        false -> {
+            r: string <- trim_type(list_string_nth(params, 0));
+            elem_type: string <- trim_type(list_string_nth(params, 2));
+            rest: List[string, mem(normal)] <- collect_lifetime_ids_from_ref_types(elem_type);
+            cons_string(r, rest)
+        }
+    }
+}
+
+fn collect_from_atomic_ref(type_str: string) -> List[string, mem(normal)] {
+    inner: string <- substring(type_str, 11, length_bytes(type_str) - 1);
+    params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+    case list_string_length(params) < 3 of {
+        true -> nil_list_string();
+        false -> {
+            r: string <- trim_type(list_string_nth(params, 0));
+            elem_type: string <- trim_type(list_string_nth(params, 2));
+            rest: List[string, mem(normal)] <- collect_lifetime_ids_from_ref_types(elem_type);
+            cons_string(r, rest)
+        }
+    }
+}
+
+// Recursively collect lifetime IDs from region(R,...) in type string.
+fn collect_lifetime_ids_from_region_types(type_str: string) -> List[string, mem(normal)] {
+    t: string <- trim_type(type_str);
+    case length_bytes(t) < 8 of {
+        true -> nil_list_string();
+        false -> case length_bytes(t) >= 7 and substring(t, 0, 6) == "region" and substring(t, 6, 7) == "(" of {
+            true -> {
+                inner: string <- substring(t, 7, length_bytes(t) - 1);
+                params: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+                case list_string_length(params) < 1 of {
+                    true -> nil_list_string();
+                    false -> cons_string(trim_type(list_string_nth(params, 0)), nil_list_string())
+                }
+            };
+            false -> collect_region_ids_from_tuple_or_union(t)
+        }
+    }
+}
+
+fn collect_from_tuple_or_union(type_str: string) -> List[string, mem(normal)] {
+    t: string <- trim_type(type_str);
+    case length_bytes(t) >= 2 and substring(t, 0, 1) == "(" and substring(t, length_bytes(t) - 1, length_bytes(t)) == ")" of {
+        true -> collect_from_tuple_contents(substring(t, 1, length_bytes(t) - 1));
+        false -> case find_union_separator(t, 0, 0) >= 0 of {
+            true -> collect_from_union(t);
+            false -> nil_list_string()
+        }
+    }
+}
+
+fn collect_region_ids_from_tuple_or_union(type_str: string) -> List[string, mem(normal)] {
+    t: string <- trim_type(type_str);
+    case length_bytes(t) >= 2 and substring(t, 0, 1) == "(" and substring(t, length_bytes(t) - 1, length_bytes(t)) == ")" of {
+        true -> collect_region_from_tuple_contents(substring(t, 1, length_bytes(t) - 1));
+        false -> case find_union_separator(t, 0, 0) >= 0 of {
+            true -> collect_region_from_union(t);
+            false -> nil_list_string()
+        }
+    }
+}
+
+fn find_union_separator(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case depth == 0 and i + 1 < length_bytes(s) and substring(s, i, i + 2) == " |" of {
+            true -> i;
+            false -> case substring(s, i, i + 1) == "(" of {
+                true -> find_union_separator(s, i + 1, depth + 1);
+                false -> case substring(s, i, i + 1) == ")" of {
+                    true -> find_union_separator(s, i + 1, depth - 1);
+                    false -> find_union_separator(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+fn collect_from_tuple_contents(inner: string) -> List[string, mem(normal)] {
+    parts: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+    collect_from_parts(parts)
+}
+
+fn collect_from_parts(parts: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case parts.is_nil of {
+        true -> nil_list_string();
+        false -> union_list_string(collect_lifetime_ids_from_ref_types(parts.head), collect_from_parts(parts.tail))
+    }
+}
+
+fn collect_region_from_tuple_contents(inner: string) -> List[string, mem(normal)] {
+    parts: List[string, mem(normal)] <- reverse_list_string(split_params_at_top_level(inner));
+    collect_region_from_parts(parts)
+}
+
+fn collect_region_from_parts(parts: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case parts.is_nil of {
+        true -> nil_list_string();
+        false -> union_list_string(collect_lifetime_ids_from_region_types(parts.head), collect_region_from_parts(parts.tail))
+    }
+}
+
+fn collect_from_union(type_str: string) -> List[string, mem(normal)] {
+    sep: int64 <- find_union_separator(type_str, 0, 0);
+    case sep < 0 of {
+        true -> collect_lifetime_ids_from_ref_types(type_str);
+        false -> {
+            left: string <- trim_type(substring(type_str, 0, sep));
+            right_start: int64 <- sep + 2;
+            right: string <- case right_start < length_bytes(type_str) of {
+                true -> trim_type(substring(type_str, right_start, length_bytes(type_str)));
+                false -> ""
+            };
+            union_list_string(collect_lifetime_ids_from_ref_types(left), collect_from_union(right))
+        }
+    }
+}
+
+fn collect_region_from_union(type_str: string) -> List[string, mem(normal)] {
+    sep: int64 <- find_union_separator(type_str, 0, 0);
+    case sep < 0 of {
+        true -> collect_lifetime_ids_from_region_types(type_str);
+        false -> {
+            left: string <- trim_type(substring(type_str, 0, sep));
+            right_start: int64 <- sep + 2;
+            right: string <- case right_start < length_bytes(type_str) of {
+                true -> trim_type(substring(type_str, right_start, length_bytes(type_str)));
+                false -> ""
+            };
+            union_list_string(collect_lifetime_ids_from_region_types(left), collect_region_from_union(right))
+        }
+    }
+}
+
+fn union_list_string(a: List[string, mem(normal)], b: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case a.is_nil of {
+        true -> b;
+        false -> case list_contains_string(a.head, b) of {
+            true -> union_list_string(a.tail, b);
+            false -> cons_string(a.head, union_list_string(a.tail, b))
+        }
+    }
+}
+
+// ---- Lifetime polymorphism: one substitution per call (Q10 option A) ------------------------------
+//
+// Spec §12.1.4; region_memory_safety_design.md §5 (Q10, decided 2026-10-23); chunk15_stack_memory_design.md
+// §6.5, §6.8 and §11.1 phase 1. Every lifetime name in a function's signature is a variable of that
+// function. A call instantiates them once, consistently across the arguments and the result: the call
+// checker (type_checker_expressions_user_call_check_args) builds the substitution from the arguments,
+// binds a lifetime that only the result names to the caller's binding annotation (the result is
+// evacuated into the caller's frame), and checks the call against the SUBSTITUTED formals, which are then
+// compared literally. A callee lifetime bound to two caller lifetimes is E2311 LifetimeConflictAtCall.
+// This replaces the identifier binder fallback (expected_lifetime_is_binder with
+// ref_types_equal_modulo_lifetime) and the device_window lifetime erasure (H7): a window's lifetime is
+// substituted like any other and then compared.
+//
+// A substitution is a string of entries "~K=V" (callee lifetime K := caller lifetime V); "" is the empty
+// substitution. A conflict is "!K|V1|V2". The lifetime is the first parameter of a carrier: ref(, ref?(,
+// region(, buf(, atomic_ref(, device_window( (spec §4.4.2, §12.1).
+//
+// lifetime_unify walks the formal and the actual side by side over their space-free texts: equal text
+// advances both; two carriers at a token start bind the formal's lifetime to the actual's; where the texts
+// differ (a placeholder against its witness, `rec` against a spelled node, a trait type against a record)
+// one type expression is skipped on each side and the walk goes on after it. The walk concludes nothing
+// about the types themselves: the ordinary type check runs afterwards on the substituted formals.
+// Long equal runs without a carrier are skipped 48 characters at a time (the formals of the compiler's
+// own functions are records several KB long), so the walk costs about one 64-byte compare per 48
+// characters away from carriers.
+
+fn lifetime_text_has_carrier(s: string) -> boolean {
+    contains(s, "ref") or contains(s, "region") or contains(s, "buf") or contains(s, "device_window")
+}
+
+fn lifetime_map_is_conflict(map: string) -> boolean {
+    length_bytes(map) > 0 and substring(map, 0, 1) == "!"
+}
+
+// True when some entry renames (K := V with V != K); a substitution of identities changes no text.
+fn lifetime_map_renames(map: string) -> boolean {
+    case length_bytes(map) == 0 or lifetime_map_is_conflict(map) of {
+        true -> false;
+        false -> lt_renames_from(map, 0)
+    }
+}
+
+fn lt_renames_from(map: string, i: int64) -> boolean {
+    case i >= length_bytes(map) of {
+        true -> false;
+        false -> {
+            eq: int64 <- lt_index_of(map, "=", i);
+            case eq < 0 of {
+                true -> false;
+                false -> {
+                    v_end: int64 <- lt_value_end(map, eq + 1);
+                    case substring(map, i + 1, eq) != substring(map, eq + 1, v_end) of {
+                        true -> true;
+                        false -> lt_renames_from(map, v_end)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// "lifetime L of push is bound to both L1 and L2" for a conflict "!L|L1|L2".
+fn lifetime_conflict_message(map: string, callee: string) -> string {
+    body: string <- substring(map, 1, length_bytes(map));
+    b1: int64 <- lt_index_of(body, "|", 0);
+    k: string <- substring(body, 0, b1);
+    rest: string <- substring(body, b1 + 1, length_bytes(body));
+    b2: int64 <- lt_index_of(rest, "|", 0);
+    v1: string <- substring(rest, 0, b2);
+    v2: string <- substring(rest, b2 + 1, length_bytes(rest));
+    concat(concat(concat(concat("lifetime ", k), concat(" of ", callee)), concat(" is bound to both ", v1)), concat(" and ", v2))
+}
+
+fn lt_index_of(s: string, pat: string, i: int64) -> int64 {
+    case i + length_bytes(pat) > length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + length_bytes(pat)) == pat of {
+            true -> i;
+            false -> lt_index_of(s, pat, i + 1)
+        }
+    }
+}
+
+fn lt_value_end(map: string, p: int64) -> int64 {
+    case p >= length_bytes(map) of {
+        true -> p;
+        false -> case substring(map, p, p + 1) == "~" of {
+            true -> p;
+            false -> lt_value_end(map, p + 1)
+        }
+    }
+}
+
+// The caller lifetime bound to k, or "" when k is unbound.
+fn lt_lookup(map: string, k: string) -> string {
+    key: string <- concat(concat("~", k), "=");
+    case contains(map, key) of {
+        false -> "";
+        true -> {
+            p: int64 <- lt_index_of(map, key, 0) + length_bytes(key);
+            substring(map, p, lt_value_end(map, p))
+        }
+    }
+}
+
+// Binds k := v; `only` ("~M~N~") limits the binding to those names ("" allows every name).
+fn lt_bind(map: string, k: string, v: string, only: string) -> string {
+    case length_bytes(only) > 0 and contains(only, concat(concat("~", k), "~")) == false of {
+        true -> map;
+        false -> {
+            old: string <- lt_lookup(map, k);
+            case length_bytes(old) == 0 of {
+                true -> concat(map, concat(concat("~", k), concat("=", v)));
+                false -> case old == v of {
+                    true -> map;
+                    false -> concat(concat(concat("!", k), concat("|", old)), concat("|", v))
+                }
+            }
+        }
+    }
+}
+
+// Space-free copy (a surface printed by the interner spells its tokens apart); the text itself when it
+// holds no space. Stripped by halves (O(n log n) bytes, not O(n^2)) and remembered process-wide in the
+// type_surface_cache actor, the same raw -> stripped memo type_interner's strip_type_spaces uses (the
+// same answer: spaces only), so a signature met at every call is stripped once.
+fn lt_strip(s: string) -> string {
+    case contains(s, " ") of {
+        false -> s;
+        true -> {
+            hit: string <- type_surface_cache@stripped_for(s);
+            case length_bytes(hit) > 0 of {
+                true -> hit;
+                false -> type_surface_cache@remember_stripped(s, lt_strip_range(s, 0, length_bytes(s)))
+            }
+        }
+    }
+}
+
+fn lt_strip_range(s: string, lo: int64, hi: int64) -> string {
+    case hi - lo <= 64 of {
+        true -> lt_strip_small(s, lo, hi, "");
+        false -> {
+            mid: int64 <- lo + (hi - lo) / 2;
+            concat(lt_strip_range(s, lo, mid), lt_strip_range(s, mid, hi))
+        }
+    }
+}
+
+fn lt_is_space(c: string) -> boolean {
+    c == " "
+}
+
+fn lt_strip_small(s: string, i: int64, hi: int64, acc: string) -> string {
+    case i >= hi of {
+        true -> acc;
+        false -> case lt_is_space(substring(s, i, i + 1)) of {
+            true -> lt_strip_small(s, i + 1, hi, acc);
+            false -> {
+                e: int64 <- lt_run_end(s, i, hi);
+                lt_strip_small(s, e, hi, concat(acc, substring(s, i, e)))
+            }
+        }
+    }
+}
+
+fn lt_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case lt_is_space(substring(s, j, j + 1)) of {
+            true -> j;
+            false -> lt_run_end(s, j + 1, n)
+        }
+    }
+}
+
+// Characters after which a type expression (or a carrier) may start in a space-free surface.
+fn lt_boundary_char(c: string) -> boolean {
+    c == "(" or c == "," or c == "[" or c == "{" or c == "|" or c == ":" or c == ">" or c == "<"
+}
+
+// Written as a case (not one `and`) for the bootstrap boundary: an emitter before 2026-10-25 kept a
+// third parameter of a call-free, case-free body in X2, which the length helper overwrites
+// (trials/functions_addition/third_param_survives_string_helper); a case body takes the full shadow.
+fn lt_has_at(s: string, i: int64, pat: string) -> boolean {
+    case i + length_bytes(pat) <= length_bytes(s) of {
+        false -> false;
+        true -> substring(s, i, i + length_bytes(pat)) == pat
+    }
+}
+
+fn lt_token_start(s: string, i: int64) -> boolean {
+    case i <= 0 of {
+        true -> true;
+        false -> lt_boundary_char(substring(s, i - 1, i))
+    }
+}
+
+// The carrier prefix starting at token start i ("ref?(", "ref(", ...), or "".
+fn lt_carrier_at(s: string, i: int64) -> string {
+    case i >= length_bytes(s) of {
+        true -> "";
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case (c == "r" or c == "b" or c == "a" or c == "d") and lt_token_start(s, i) of {
+                false -> "";
+                true -> case lt_has_at(s, i, "ref?(") of {
+                    true -> "ref?(";
+                    false -> case lt_has_at(s, i, "ref(") of {
+                        true -> "ref(";
+                        false -> case lt_has_at(s, i, "region(") of {
+                            true -> "region(";
+                            false -> case lt_has_at(s, i, "buf(") of {
+                                true -> "buf(";
+                                false -> case lt_has_at(s, i, "atomic_ref(") of {
+                                    true -> "atomic_ref(";
+                                    false -> case lt_has_at(s, i, "device_window(") of {
+                                        true -> "device_window(";
+                                        false -> ""
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A `ref` meets a `ref?` slot (ref_fits_ref_optional_slot), so the two share their lifetime position.
+fn lt_carriers_compatible(pa: string, pb: string) -> boolean {
+    pa == pb or ((pa == "ref(" or pa == "ref?(") and (pb == "ref(" or pb == "ref?("))
+}
+
+// End of the type expression starting at i: the first `,`, `|` or unmatched closer at depth zero.
+fn lt_expr_end(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> lt_expr_end(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> case depth == 0 of {
+                        true -> i;
+                        false -> lt_expr_end(s, i + 1, depth - 1)
+                    };
+                    false -> case depth == 0 and (c == "," or c == "|") of {
+                        true -> i;
+                        false -> lt_expr_end(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Start of the type expression holding position i: just after the last boundary character, but not
+// before `sync` (the last point where the two walks were put in step).
+fn lt_expr_start(s: string, i: int64, sync: int64) -> int64 {
+    case i <= sync of {
+        true -> sync;
+        false -> case lt_boundary_char(substring(s, i - 1, i)) of {
+            true -> i;
+            false -> lt_expr_start(s, i - 1, sync)
+        }
+    }
+}
+
+// The substitution `map` extended by matching formal against actual; `only` ("~M~N~", or "" for every
+// name) limits which callee lifetimes may be bound. Returns a conflict ("!...") when a callee lifetime
+// meets a second caller lifetime. Equal texts bind nothing: the caller spells the callee's own names.
+fn lifetime_unify(formal: string, actual: string, map: string, only: string) -> string {
+    case lifetime_map_is_conflict(map) or formal == actual or lifetime_text_has_carrier(formal) == false or lifetime_text_has_carrier(actual) == false of {
+        true -> map;
+        false -> lt_walk(lt_strip(formal), lt_strip(actual), 0, 0, 0, map, only, 0)
+    }
+}
+
+// The lifetimes the result names and no parameter does, as "~M~N~" ("" when none): the ones a call
+// binds from the caller's expectation. Remembered per signature in type_surface_cache under a key no
+// type surface can be ("?lt_result_only?" + the signature; "-" stands for none, "" is the cache's miss).
+fn lifetime_result_only_names(params: string, return_type: string) -> string {
+    case lifetime_text_has_carrier(return_type) of {
+        false -> "";
+        true -> {
+            key: string <- concat("?lt_result_only?", concat(params, concat(" -> ", return_type)));
+            hit: string <- type_surface_cache@stripped_for(key);
+            case length_bytes(hit) > 0 of {
+                true -> case hit == "-" of {
+                    true -> "";
+                    false -> hit
+                };
+                false -> {
+                    ro: string <- lt_names_minus(lt_names(return_type), lt_names(params), 1, "");
+                    stored: string <- type_surface_cache@remember_stripped(key, case length_bytes(ro) == 0 of { true -> "-"; false -> ro });
+                    case length_bytes(stored) >= 0 of {
+                        true -> ro;
+                        false -> ro
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The carrier lifetime names of t as "~N~M~" ("" when none).
+fn lt_names(t: string) -> string {
+    case lifetime_text_has_carrier(t) of {
+        false -> "";
+        true -> lt_names_walk(lt_strip(t), 0, "", 0)
+    }
+}
+
+fn lt_names_walk(t: string, i: int64, acc: string, quiet: int64) -> string {
+    case i >= length_bytes(t) of {
+        true -> acc;
+        false -> {
+            p: string <- lt_carrier_at(t, i);
+            case length_bytes(p) > 0 of {
+                true -> {
+                    c: int64 <- first_comma_from_lm(t, i + length_bytes(p));
+                    case c < 0 of {
+                        true -> acc;
+                        false -> {
+                            k: string <- substring(t, i + length_bytes(p), c);
+                            key: string <- concat(concat("~", k), "~");
+                            acc2: string <- case is_lifetime_ident_lm(k) == false or contains(acc, key) of {
+                                true -> acc;
+                                false -> case length_bytes(acc) == 0 of {
+                                    true -> key;
+                                    false -> concat(acc, concat(k, "~"))
+                                }
+                            };
+                            lt_names_walk(t, c, acc2, 0)
+                        }
+                    }
+                };
+                false -> case quiet <= 0 and i + 64 <= length_bytes(t) of {
+                    true -> case lifetime_text_has_carrier(substring(t, i, i + 64)) of {
+                        false -> lt_names_walk(t, i + 48, acc, 0);
+                        true -> lt_names_walk(t, i + 1, acc, 48)
+                    };
+                    false -> lt_names_walk(t, i + 1, acc, quiet - 1)
+                }
+            }
+        }
+    }
+}
+
+// The names of a ("~N~M~", read from index i) that b does not hold.
+fn lt_names_minus(a: string, b: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(a) of {
+        true -> acc;
+        false -> {
+            e: int64 <- lt_index_of(a, "~", i);
+            case e < 0 of {
+                true -> acc;
+                false -> {
+                    k: string <- substring(a, i, e);
+                    key: string <- concat(concat("~", k), "~");
+                    acc2: string <- case contains(b, key) of {
+                        true -> acc;
+                        false -> case length_bytes(acc) == 0 of {
+                            true -> key;
+                            false -> concat(acc, concat(k, "~"))
+                        }
+                    };
+                    lt_names_minus(a, b, e + 1, acc2)
+                }
+            }
+        }
+    }
+}
+
+// i, j: the positions in a (formal) and b (actual); a[sa..i) equals the same number of characters of b
+// before j. quiet > 0 suppresses the 64-character compare for that many steps (it just failed).
+fn lt_walk(a: string, b: string, i: int64, j: int64, sa: int64, map: string, only: string, quiet: int64) -> string {
+    case lifetime_map_is_conflict(map) or i >= length_bytes(a) or j >= length_bytes(b) of {
+        true -> map;
+        false -> {
+            pa: string <- lt_carrier_at(a, i);
+            pb: string <- case length_bytes(pa) == 0 of {
+                true -> "";
+                false -> lt_carrier_at(b, j)
+            };
+            case length_bytes(pb) > 0 and lt_carriers_compatible(pa, pb) of {
+                true -> lt_walk_carrier(a, b, i + length_bytes(pa), j + length_bytes(pb), map, only);
+                false -> case quiet <= 0 and lt_chunk_equal_plain(a, b, i, j) of {
+                    true -> lt_walk(a, b, i + 48, j + 48, sa, map, only, 0);
+                    false -> {
+                        q: int64 <- case quiet <= 0 of {
+                            true -> 48;
+                            false -> quiet - 1
+                        };
+                        case substring(a, i, i + 1) == substring(b, j, j + 1) of {
+                            true -> lt_walk(a, b, i + 1, j + 1, sa, map, only, q);
+                            false -> lt_walk_diverged(a, b, i, j, sa, map, only)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The next 64 characters are equal on both sides and hold no carrier, so the first 48 can be skipped
+// (a carrier starting within them would end inside the 64).
+fn lt_chunk_equal_plain(a: string, b: string, i: int64, j: int64) -> boolean {
+    case i + 64 <= length_bytes(a) and j + 64 <= length_bytes(b) of {
+        false -> false;
+        true -> {
+            ca: string <- substring(a, i, i + 64);
+            ca == substring(b, j, j + 64) and lifetime_text_has_carrier(ca) == false
+        }
+    }
+}
+
+fn lt_walk_carrier(a: string, b: string, i: int64, j: int64, map: string, only: string) -> string {
+    ca: int64 <- first_comma_from_lm(a, i);
+    cb: int64 <- first_comma_from_lm(b, j);
+    case ca < 0 or cb < 0 of {
+        true -> map;
+        false -> {
+            la: string <- substring(a, i, ca);
+            lb: string <- substring(b, j, cb);
+            case is_lifetime_ident_lm(la) and is_lifetime_ident_lm(lb) of {
+                true -> lt_walk(a, b, ca, cb, ca, lt_bind(map, la, lb, only), only, 0);
+                false -> map
+            }
+        }
+    }
+}
+
+// The texts differ at (i, j): skip the type expression holding the difference on each side and go on
+// after it. Stops when neither side can move on.
+fn lt_walk_diverged(a: string, b: string, i: int64, j: int64, sa: int64, map: string, only: string) -> string {
+    start_a: int64 <- lt_expr_start(a, i, sa);
+    start_b: int64 <- j - (i - start_a);
+    ea: int64 <- lt_expr_end(a, start_a, 0);
+    eb: int64 <- lt_expr_end(b, start_b, 0);
+    case ea >= i and eb >= j and (ea > i or eb > j) of {
+        true -> lt_walk(a, b, ea, eb, ea, map, only, 0);
+        false -> map
+    }
+}
+
+// `s` with every carrier lifetime that `map` renames replaced by its caller lifetime. The text is
+// returned unchanged (spaces and all) when the substitution renames nothing.
+fn lifetime_subst_apply(s: string, map: string) -> string {
+    case lifetime_map_renames(map) and lifetime_text_has_carrier(s) of {
+        false -> s;
+        true -> lt_apply_walk(lt_strip(s), 0, 0, "", map, 0)
+    }
+}
+
+// `start` is the first character of t not yet copied to acc.
+fn lt_apply_walk(t: string, i: int64, start: int64, acc: string, map: string, quiet: int64) -> string {
+    case i >= length_bytes(t) of {
+        true -> concat(acc, substring(t, start, length_bytes(t)));
+        false -> {
+            p: string <- lt_carrier_at(t, i);
+            case length_bytes(p) > 0 of {
+                true -> {
+                    c: int64 <- first_comma_from_lm(t, i + length_bytes(p));
+                    k: string <- case c < 0 of {
+                        true -> "";
+                        false -> substring(t, i + length_bytes(p), c)
+                    };
+                    v: string <- case length_bytes(k) == 0 or is_lifetime_ident_lm(k) == false of {
+                        true -> "";
+                        false -> lt_lookup(map, k)
+                    };
+                    case length_bytes(v) == 0 or v == k of {
+                        true -> lt_apply_walk(t, i + 1, start, acc, map, quiet - 1);
+                        false -> lt_apply_walk(t, c, c, concat(concat(acc, substring(t, start, i + length_bytes(p))), v), map, 0)
+                    }
+                };
+                false -> case quiet <= 0 and i + 64 <= length_bytes(t) of {
+                    true -> case lifetime_text_has_carrier(substring(t, i, i + 64)) of {
+                        false -> lt_apply_walk(t, i + 48, start, acc, map, 0);
+                        true -> lt_apply_walk(t, i + 1, start, acc, map, 48)
+                    };
+                    false -> lt_apply_walk(t, i + 1, start, acc, map, quiet - 1)
+                }
+            }
+        }
+    }
+}
+
+fn first_comma_from_lm(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + 1) == "," of {
+            true -> i;
+            false -> first_comma_from_lm(s, i + 1)
+        }
+    }
+}
+
+fn is_lifetime_ident_lm(s: string) -> boolean {
+    case length_bytes(s) == 0 of {
+        true -> false;
+        false -> lifetime_ident_chars_ok_lm(s, 0)
+    }
+}
+
+// An identifier slot: no delimiter of the type grammar may appear in it.
+fn lifetime_ident_chars_ok_lm(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> true;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == ")" or c == "[" or c == "]" or c == "{" or c == "}" or c == "," or c == "|" or c == ":" or c == "<" or c == ">" or c == "?" or c == "." of {
+                true -> false;
+                false -> lifetime_ident_chars_ok_lm(s, i + 1)
+            }
+        }
+    }
+}
+

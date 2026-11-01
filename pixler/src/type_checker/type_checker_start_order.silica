@@ -1,0 +1,605 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Handler before any start (E2236 StartBeforeFailureReporter, silica-specification §15.4.13.4).
+//
+// In main's order of execution register_failure_reporter must run before any actor or supervisor
+// is started. A start is a call to a spawn builtin (so_is_start_builtin), made in main or in any
+// function main calls, transitively. The walk follows evaluation order: a call's arguments, then
+// the call; a binding's right-hand side, then its body; a sequence's statements, then its result.
+//
+// The walk tracks one fact, "registration has certainly run". Branches are joined conservatively:
+// after a case (or an `if`, or the right operand of `and`/`or`) registration counts as done only
+// when every arm did it, and a start on any arm that can run unregistered is an error. Lambda bodies
+// are not walked (they do not run where they are written), nor are behaviours and supervisor init
+// functions passed to a spawn (they run in actors, not in main).
+//
+// Exemption: the spawn that creates the reporter. A binding `r <- spawn...(...)` whose name is later
+// passed to register_failure_reporter(r) in the binding's scope, and a spawn written directly as
+// register_failure_reporter's argument, are not starts (their arguments are still walked).
+//
+// Each function gets a summary, independent of the caller's state, computed as if it were entered
+// unregistered: code bit 1 = "can start before registering", bit 2 = "registers on every path".
+// A caller that is still unregistered fails at the call when bit 1 is set and counts as registered
+// after it when bit 2 is set. Summaries are memoised per walk (key module@function, -1 while a
+// function is being walked, so recursion contributes nothing a second time).
+//
+// Across units the summaries of exported functions travel in the .iface header line
+// `start_order=<fn>:<code>,<fn>:<code>` (codes that are not 0 only; no line when all are 0). A header
+// line is skipped by readers that do not know it, so older compilers read these ifaces unchanged.
+// At publish module_iface calls start_order_mark_exports and start_order_header_text; at load it
+// calls start_order_apply_header, which appends the token `!sr=<code>` to the export's effects text
+// in memory, and start_order_strip_marker removes it again before the effects are parsed. A callee
+// whose body is in the compile world is walked; one known only from an iface stub uses the code.
+// Programs without `main` are not checked.
+
+use parser_ast;
+
+export start_order_check_main/4;
+export start_order_table_from_ifaces/1;
+export start_order_mark_exports/4;
+export start_order_strip_marker/1;
+export start_order_effects_has_marker/1;
+export start_order_header_text/1;
+export start_order_apply_header/2;
+
+fn so_empty_table() -> List[{ key: string, code: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ key: string, code: int64 }, mem(normal)] <- empty[{ key: string, code: int64 }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn so_cons(key: string, code: int64, rest: List[{ key: string, code: int64 }, mem(normal)]) -> List[{ key: string, code: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        entry: { key: string, code: int64 } <- { key: key, code: code };
+        result: List[{ key: string, code: int64 }, mem(normal)] <- prepend[{ key: string, code: int64 }, mem(normal)](entry, rest)
+    produces
+        pure result
+    end
+}
+
+// -2 when absent; -1 while the function is being walked; else the summary code.
+fn so_lookup(table: List[{ key: string, code: int64 }, mem(normal)], key: string) -> int64 {
+    case table.is_nil of {
+        true -> -2;
+        false -> case table.head.key == key of {
+            true -> table.head.code;
+            false -> so_lookup(table.tail, key)
+        }
+    }
+}
+
+fn so_is_start_builtin(name: string) -> boolean {
+    case name of {
+        "spawn" -> true;
+        "spawn_registered" -> true;
+        "spawn_registered_supervisor" -> true;
+        "spawn_dangerous" -> true;
+        "spawn_dangerous_registered" -> true;
+        "spawn_device" -> true;
+        "spawn_device_registered" -> true;
+        "spawn_linked" -> true;
+        "spawn_affinity_performance_cores" -> true;
+        "spawn_affinity_efficiency_cores" -> true;
+        _: string -> false
+    }
+}
+
+fn so_at_index(s: string, i: int64, n: int64) -> int64 {
+    case i >= n of {
+        true -> -1;
+        false -> case substring(s, i, i + 1) == "@" of {
+            true -> i;
+            false -> so_at_index(s, i + 1, n)
+        }
+    }
+}
+
+fn so_call_module(name: string, current: string) -> string {
+    at: int64 <- so_at_index(name, 0, length_bytes(name));
+    case at < 0 of {
+        true -> current;
+        false -> substring(name, 0, at)
+    }
+}
+
+fn so_call_function(name: string) -> string {
+    n: int64 <- length_bytes(name);
+    at: int64 <- so_at_index(name, 0, n);
+    case at < 0 of {
+        true -> name;
+        false -> substring(name, at + 1, n)
+    }
+}
+
+fn so_state(reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)]) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    { reg: reg, bad: bad, loc: loc, what: what, memo: memo }
+}
+
+fn so_code_of(st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> int64 {
+    case st.bad of {
+        true -> 1;
+        false -> case st.reg of {
+            true -> 2;
+            false -> 0
+        }
+    }
+}
+
+// Apply a callee's summary at a call site reached while still unregistered.
+fn so_apply_code(code: int64, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    case code == 1 or code == 3 of {
+        true -> so_state(false, true, loc, what, st.memo);
+        false -> case code == 2 of {
+            true -> so_state(true, false, st.loc, st.what, st.memo);
+            false -> st
+        }
+    }
+}
+
+fn so_find_decl(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], fn_name: string) -> (boolean, { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) {
+    case decls.is_nil of {
+        true -> (false, parser_ast@dummy_decl());
+        false -> case decls.head.tag == 0 and decls.head.body.root >= 0 and decls.head.name == fn_name of {
+            true -> (true, decls.head);
+            false -> so_find_decl(decls.tail, fn_name)
+        }
+    }
+}
+
+fn so_find_fn(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], module_name: string, fn_name: string) -> (boolean, { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) {
+    (found: boolean, prog: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) <- parser_ast@find_named_program(module_name, world);
+    case found of {
+        true -> so_find_decl(prog.declarations, fn_name);
+        false -> (false, parser_ast@dummy_decl())
+    }
+}
+
+fn so_walk(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    case st.reg or st.bad or e.root < 0 of {
+        true -> st;
+        false -> so_walk_node(world, ext, module_name, e, parser_ast@expr_root_node(e), st)
+    }
+}
+
+// The inner subtree, then the right one: evaluation order for calls (first argument, then the
+// argument chain), bindings (right-hand side, then body), sequences (statements, then result),
+// arithmetic and literals.
+fn so_walk_pair(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    st1: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(e, node.inner), st);
+    so_walk(world, ext, module_name, parser_ast@expr_at(e, node.right_expr), st1)
+}
+
+fn so_walk_node(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    case node.kind == 991 or node.kind == 992 of {
+        true -> st;
+        false -> case node.kind == 4 of {
+            true -> so_walk_call(world, ext, module_name, e, node, st);
+            false -> case node.kind == 6 of {
+                true -> so_walk_binding(world, ext, module_name, e, node, st);
+                false -> case node.kind == 13 of {
+                    true -> {
+                        st1: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(e, node.inner), st);
+                        so_walk_arms(world, ext, module_name, parser_ast@expr_at(e, node.right_expr), st1.reg, st1, true)
+                    };
+                    false -> case node.kind == 19 of {
+                        true -> so_walk_if(world, ext, module_name, e, node, st);
+                        false -> case node.kind == 3 and (node.value == "and" or node.value == "or") of {
+                            true -> {
+                                st1: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(e, node.inner), st);
+                                st2: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(e, node.right_expr), st1);
+                                so_state(st1.reg, st2.bad, st2.loc, st2.what, st2.memo)
+                            };
+                            false -> so_walk_pair(world, ext, module_name, e, node, st)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Case arms (kind 17 list: inner = kind 18 arm, right = next 17). Every arm starts from the state
+// after the scrutinee; registration counts after the case only when every arm registered.
+fn so_walk_arms(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, arms: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, entry_reg: boolean, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }, all_reg: boolean) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    case arms.root < 0 or st.bad of {
+        true -> so_state(all_reg, st.bad, st.loc, st.what, st.memo);
+        false -> {
+            arm_list: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arms);
+            case arm_list.kind == 17 of {
+                false -> {
+                    out: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, arms, so_state(entry_reg, st.bad, st.loc, st.what, st.memo));
+                    so_state(all_reg and out.reg, out.bad, out.loc, out.what, out.memo)
+                };
+                true -> {
+                    out: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(arms, arm_list.inner), so_state(entry_reg, st.bad, st.loc, st.what, st.memo));
+                    so_walk_arms(world, ext, module_name, parser_ast@expr_at(arms, arm_list.right_expr), entry_reg, out, all_reg and out.reg)
+                }
+            }
+        }
+    }
+}
+
+// kind 19: inner = condition, right = kind 9 pair (then, else).
+fn so_walk_if(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    st1: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(e, node.inner), st);
+    branches: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.right_expr);
+    bnode: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(branches);
+    a: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(branches, bnode.inner), st1);
+    b: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(branches, bnode.right_expr), so_state(st1.reg, a.bad, a.loc, a.what, a.memo));
+    so_state(a.reg and b.reg, b.bad, b.loc, b.what, b.memo)
+}
+
+fn so_walk_call(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    case node.name == "register_failure_reporter" of {
+        true -> {
+            arg: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.inner);
+            arg_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arg);
+            st1: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- case arg.root >= 0 and arg_node.kind == 4 and so_is_start_builtin(arg_node.name) of {
+                true -> so_walk_pair(world, ext, module_name, arg, arg_node, st);
+                false -> so_walk(world, ext, module_name, arg, st)
+            };
+            st2: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, parser_ast@expr_at(e, node.right_expr), st1);
+            so_state(true, st2.bad, st2.loc, st2.what, st2.memo)
+        };
+        false -> {
+            st1: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk_pair(world, ext, module_name, e, node, st);
+            case length_bytes(node.name) == 0 of {
+                true -> st1;
+                false -> so_apply_call(world, ext, module_name, node.name, node.location, st1)
+            }
+        }
+    }
+}
+
+// A binding whose right-hand side is a spawn and whose name reaches register_failure_reporter in
+// its scope creates the reporter: its spawn is not a start.
+fn so_walk_binding(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    rhs: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.inner);
+    body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.right_expr);
+    rhs_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(rhs);
+    reporter_spawn: boolean <- case rhs.root >= 0 and rhs_node.kind == 4 and so_is_start_builtin(rhs_node.name) and node.name != "_" of {
+        true -> so_registers_name(body, node.name);
+        false -> false
+    };
+    st1: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- case reporter_spawn of {
+        true -> so_walk_pair(world, ext, module_name, rhs, rhs_node, st);
+        false -> so_walk(world, ext, module_name, rhs, st)
+    };
+    so_walk(world, ext, module_name, body, st1)
+}
+
+// True when `e` holds a call register_failure_reporter(name).
+fn so_registers_name(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, name: string) -> boolean {
+    case e.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(e);
+            case node.kind == 991 or node.kind == 992 of {
+                true -> false;
+                false -> case node.kind == 4 and node.name == "register_failure_reporter" and so_arg_is_name(parser_ast@expr_at(e, node.inner), name) of {
+                    true -> true;
+                    false -> case so_registers_name(parser_ast@expr_at(e, node.inner), name) of {
+                        true -> true;
+                        false -> so_registers_name(parser_ast@expr_at(e, node.right_expr), name)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn so_arg_is_name(arg: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, name: string) -> boolean {
+    case arg.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arg);
+            node.kind == 1 and node.name == name
+        }
+    }
+}
+
+fn so_apply_call(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, name: string, loc: { file: string, line: int64, column: int64, offset: int64 }, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    case st.reg or st.bad of {
+        true -> st;
+        false -> case so_is_start_builtin(name) of {
+            true -> so_state(false, true, loc, name, st.memo);
+            false -> {
+                callee_module: string <- so_call_module(name, module_name);
+                callee_fn: string <- so_call_function(name);
+                key: string <- concat(concat(callee_module, "@"), callee_fn);
+                known: int64 <- so_lookup(st.memo, key);
+                case known >= 0 of {
+                    true -> so_apply_code(known, loc, name, st);
+                    false -> case known == -1 of {
+                        true -> st;
+                        false -> so_summarize_and_apply(world, ext, callee_module, callee_fn, key, name, loc, st)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn so_summarize_and_apply(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], callee_module: string, callee_fn: string, key: string, name: string, loc: { file: string, line: int64, column: int64, offset: int64 }, st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] }) -> { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } {
+    (found: boolean, decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) <- so_find_fn(world, callee_module, callee_fn);
+    case found of {
+        true -> {
+            sub: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, callee_module, decl.body, so_state(false, false, parser_ast@zero_location(), "", so_cons(key, -1, st.memo)));
+            code: int64 <- so_code_of(sub);
+            so_apply_code(code, loc, name, so_state(st.reg, st.bad, st.loc, st.what, so_cons(key, code, sub.memo)))
+        };
+        false -> {
+            ext_code: int64 <- so_lookup(ext, key);
+            code: int64 <- case ext_code > 0 of {
+                true -> ext_code;
+                false -> 0
+            };
+            so_apply_code(code, loc, name, so_state(st.reg, st.bad, st.loc, st.what, so_cons(key, code, st.memo)))
+        }
+    }
+}
+
+fn so_error_message(what: string) -> string {
+    case so_is_start_builtin(what) of {
+        true -> concat(concat("this ", what), " starts an actor or supervisor before main has run register_failure_reporter; every failure, the root supervisor's included, must reach a registered FailureReporter (§15.4.13.4)");
+        false -> concat(concat("this call to ", what), " can start an actor or supervisor before main has run register_failure_reporter; every failure, the root supervisor's included, must reach a registered FailureReporter (§15.4.13.4)")
+    }
+}
+
+// E2236 for the unit that defines `main`; every other unit passes.
+fn start_order_check_main(module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    (found: boolean, main_decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) <- so_find_decl(program.declarations, "main");
+    case found of {
+        false -> { is_ok: true, error_code: "", error_location: parser_ast@zero_location(), error_message: "", spec_section: "" };
+        true -> {
+            out: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_walk(world, ext, module_name, main_decl.body, so_state(false, false, parser_ast@zero_location(), "", so_cons(concat(module_name, "@main"), -1, so_empty_table())));
+            case out.bad of {
+                true -> { is_ok: false, error_code: "E2236", error_location: out.loc, error_message: so_error_message(out.what), spec_section: "sect15.4.13.4" };
+                false -> { is_ok: true, error_code: "", error_location: parser_ast@zero_location(), error_message: "", spec_section: "" }
+            }
+        }
+    }
+}
+
+// --- iface marker -------------------------------------------------------------------------------
+
+fn so_find_marker(s: string, i: int64, n: int64) -> int64 {
+    case i + 4 > n of {
+        true -> -1;
+        false -> case substring(s, i, i + 4) == "!sr=" of {
+            true -> i;
+            false -> so_find_marker(s, i + 1, n)
+        }
+    }
+}
+
+fn start_order_effects_has_marker(effects: string) -> boolean {
+    so_find_marker(effects, 0, length_bytes(effects)) >= 0
+}
+
+fn so_marker_code(effects: string) -> int64 {
+    n: int64 <- length_bytes(effects);
+    at: int64 <- so_find_marker(effects, 0, n);
+    case at < 0 or at + 5 > n of {
+        true -> 0;
+        false -> case substring(effects, at + 4, at + 5) of {
+            "1" -> 1;
+            "2" -> 2;
+            "3" -> 3;
+            _: string -> 0
+        }
+    }
+}
+
+// The effects text without the `!sr=` token (and the `;` before it).
+fn start_order_strip_marker(effects: string) -> string {
+    at: int64 <- so_find_marker(effects, 0, length_bytes(effects));
+    case at < 0 of {
+        true -> effects;
+        false -> case at == 0 of {
+            true -> "";
+            false -> substring(effects, 0, at - 1)
+        }
+    }
+}
+
+fn so_effects_with_marker(effects: string, code: int64) -> string {
+    token: string <- case code of {
+        1 -> "!sr=1";
+        2 -> "!sr=2";
+        _: int64 -> "!sr=3"
+    };
+    case length_bytes(effects) == 0 of {
+        true -> token;
+        false -> concat(concat(effects, ";"), token)
+    }
+}
+
+fn so_exports_into_table(module_name: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], acc: List[{ key: string, code: int64 }, mem(normal)]) -> List[{ key: string, code: int64 }, mem(normal)] {
+    case exports.is_nil of {
+        true -> acc;
+        false -> {
+            code: int64 <- so_marker_code(exports.head.effects);
+            next: List[{ key: string, code: int64 }, mem(normal)] <- case code > 0 of {
+                true -> so_cons(concat(concat(module_name, "@"), exports.head.name), code, acc);
+                false -> acc
+            };
+            so_exports_into_table(module_name, exports.tail, next)
+        }
+    }
+}
+
+// Summary codes carried by loaded ifaces, keyed module@function (only codes that are not 0).
+fn start_order_table_from_ifaces(ifaces: List[{ module_name: string, source_path: string, export_trait: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] }, mem(normal)]) -> List[{ key: string, code: int64 }, mem(normal)] {
+    case ifaces.is_nil of {
+        true -> so_empty_table();
+        false -> so_exports_into_table(ifaces.head.module_name, ifaces.head.exports, start_order_table_from_ifaces(ifaces.tail))
+    }
+}
+
+// Cheap pre-check: does any body name a spawn builtin, register_failure_reporter, or a callee
+// whose iface code is not 0? When none does, every export's code is 0 and no walk is needed.
+fn so_nodes_mention(nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)]) -> boolean {
+    case nodes.is_nil of {
+        true -> false;
+        false -> case nodes.head.kind == 4 and length_bytes(nodes.head.name) > 0 and (so_is_start_builtin(nodes.head.name) or nodes.head.name == "register_failure_reporter" or so_lookup(ext, nodes.head.name) > 0) of {
+            true -> true;
+            false -> so_nodes_mention(nodes.tail, ext)
+        }
+    }
+}
+
+fn so_decls_mention(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)]) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 0 and so_nodes_mention(decls.head.body.nodes, ext) of {
+            true -> true;
+            false -> so_decls_mention(decls.tail, ext)
+        }
+    }
+}
+
+fn so_mark_exports_loop(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], ext: List[{ key: string, code: int64 }, mem(normal)], module_name: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], memo: List[{ key: string, code: int64 }, mem(normal)], acc: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]) -> List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] {
+    case exports.is_nil of {
+        true -> so_reverse_exports(acc, so_empty_exports());
+        false -> {
+            e: { name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string } <- exports.head;
+            st: { reg: boolean, bad: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, what: string, memo: List[{ key: string, code: int64 }, mem(normal)] } <- so_apply_call(world, ext, module_name, e.name, parser_ast@zero_location(), so_state(false, false, parser_ast@zero_location(), "", memo));
+            code: int64 <- so_lookup(st.memo, concat(concat(module_name, "@"), e.name));
+            marked: { name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string } <- case code > 0 and e.decl_tag == 0 of {
+                true -> { name: e.name, arity: e.arity, decl_tag: e.decl_tag, effects: so_effects_with_marker(e.effects, code), type_surface: e.type_surface };
+                false -> e
+            };
+            so_mark_exports_loop(world, ext, module_name, exports.tail, st.memo, so_cons_export(marked, acc))
+        }
+    }
+}
+
+fn so_empty_exports() -> List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] <- empty[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn so_cons_export(e: { name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, rest: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]) -> List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] <- prepend[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)](e, rest)
+    produces
+        pure result
+    end
+}
+
+fn so_reverse_exports(lst: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], acc: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]) -> List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] {
+    case lst.is_nil of {
+        true -> acc;
+        false -> so_reverse_exports(lst.tail, so_cons_export(lst.head, acc))
+    }
+}
+
+// Publish: append `!sr=<code>` to the effects of each exported function whose code is not 0.
+// `ifaces` are the unit's dependency ifaces that carry codes.
+fn start_order_mark_exports(module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }, ifaces: List[{ module_name: string, source_path: string, export_trait: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], impls: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] }, mem(normal)], exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]) -> List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] {
+    ext: List[{ key: string, code: int64 }, mem(normal)] <- start_order_table_from_ifaces(ifaces);
+    case so_decls_mention(program.declarations, ext) of {
+        false -> exports;
+        true -> so_mark_exports_loop(parser_ast@cons_named_program(module_name, program, parser_ast@empty_named_program_list()), ext, module_name, exports, so_empty_table(), so_empty_exports())
+    }
+}
+
+// The `start_order=` header text for exports marked by start_order_mark_exports.
+fn start_order_header_text(exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]) -> string {
+    case exports.is_nil of {
+        true -> "";
+        false -> {
+            rest: string <- start_order_header_text(exports.tail);
+            code: int64 <- so_marker_code(exports.head.effects);
+            case code > 0 of {
+                false -> rest;
+                true -> {
+                    item: string <- concat(concat(exports.head.name, ":"), so_code_text(code));
+                    case length_bytes(rest) == 0 of {
+                        true -> item;
+                        false -> concat(concat(item, ","), rest)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn so_code_text(code: int64) -> string {
+    case code of {
+        1 -> "1";
+        2 -> "2";
+        _: int64 -> "3"
+    }
+}
+
+fn so_find_sub(s: string, pat: string, i: int64, n: int64, m: int64) -> int64 {
+    case i + m > n of {
+        true -> -1;
+        false -> case substring(s, i, i + m) == pat of {
+            true -> i;
+            false -> so_find_sub(s, pat, i + 1, n, m)
+        }
+    }
+}
+
+// The code the header gives `fn_name`, or 0.
+fn so_header_code(wrapped: string, fn_name: string) -> int64 {
+    pat: string <- concat(concat(",", fn_name), ":");
+    n: int64 <- length_bytes(wrapped);
+    m: int64 <- length_bytes(pat);
+    at: int64 <- so_find_sub(wrapped, pat, 0, n, m);
+    case at < 0 or at + m + 1 > n of {
+        true -> 0;
+        false -> case substring(wrapped, at + m, at + m + 1) of {
+            "1" -> 1;
+            "2" -> 2;
+            "3" -> 3;
+            _: string -> 0
+        }
+    }
+}
+
+fn so_apply_header_loop(wrapped: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)], acc: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]) -> List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] {
+    case exports.is_nil of {
+        true -> so_reverse_exports(acc, so_empty_exports());
+        false -> {
+            e: { name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string } <- exports.head;
+            code: int64 <- so_header_code(wrapped, e.name);
+            marked: { name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string } <- case code > 0 of {
+                true -> { name: e.name, arity: e.arity, decl_tag: e.decl_tag, effects: so_effects_with_marker(e.effects, code), type_surface: e.type_surface };
+                false -> e
+            };
+            so_apply_header_loop(wrapped, exports.tail, so_cons_export(marked, acc))
+        }
+    }
+}
+
+// Load: mark the exports named by an iface's `start_order=` header (in memory only).
+fn start_order_apply_header(header: string, exports: List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)]) -> List[{ name: string, arity: int64, decl_tag: int64, effects: string, type_surface: string }, mem(normal)] {
+    case length_bytes(header) == 0 of {
+        true -> exports;
+        false -> so_apply_header_loop(concat(concat(",", header), ","), exports, so_empty_exports())
+    }
+}

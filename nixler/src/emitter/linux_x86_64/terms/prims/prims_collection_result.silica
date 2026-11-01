@@ -1,0 +1,131 @@
+// Collection comparator result validation (Layer 1 §7.7).
+
+use sir_ast;
+use atom_table;
+use x86_isa;
+
+export is_collection_result_prim/1;
+export emit_prim_op_with_table/3;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn is_collection_result_prim(name: string) -> boolean {
+    name == "comparator_result_valid" or name == "comparator_result_validate"
+}
+
+fn atom_index_str(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, lexeme: string) -> string {
+    atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, lexeme))
+}
+
+fn hash_string_acc(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            // Mix in a stable per-character contribution without needing char codes:
+            // use position and a substring length window so distinct sites diverge.
+            piece: string <- substring(s, i, case i + 3 <= length_bytes(s) of { true -> i + 3; false -> length_bytes(s) });
+            // Keep the accumulator non-negative so label suffixes stay valid asm identifiers.
+            mixed: int64 <- acc * 131 + length_bytes(piece) * (i + 1) + length_bytes(s);
+            next: int64 <- case mixed < 0 of { true -> 0 - mixed; false -> mixed };
+            hash_string_acc(s, i + 1, next)
+        }
+    }
+}
+
+fn cmpres_site_id(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+    // Fingerprint the full prim term so two comparator_result_* sites that share
+    // dest register X0 still emit distinct assembly labels.
+    text: string <- sir_ast@sir_term_to_text(term);
+    atom_table@int64_to_decimal_string(hash_string_acc(text, 0, 17))
+}
+
+fn cmpres_label_suffix(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    site: string <- cmpres_site_id(term);
+    case sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).kind == 0 and sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name == "atom" of {
+        true -> {
+            idx: string <- atom_index_str(table, sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).value);
+            concat(concat(concat(dest, "_"), idx), concat("_", site))
+        };
+        false -> concat(dest, concat("_", site))
+    }
+}
+
+fn emit_comparator_result_valid(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    less_idx: string <- atom_index_str(table, ":less");
+    equal_idx: string <- atom_index_str(table, ":equal");
+    greater_idx: string <- atom_index_str(table, ":greater");
+    hit_less: string <- x86_isa@x86_cmp_branch("EQ", "X0", concat("#", less_idx), "1f");
+    hit_equal: string <- x86_isa@x86_cmp_branch("EQ", "X0", concat("#", equal_idx), "1f");
+    hit_greater: string <- x86_isa@x86_cmp_branch("EQ", "X0", concat("#", greater_idx), "1f");
+    miss: string <- concat(x86_isa@x86_movi("X0", 0), x86_isa@x86_b("2f"));
+    hit: string <- concat("1:\n", concat(x86_isa@x86_movi("X0", 1), "2:\n"));
+    concat(concat(concat(hit_less, hit_equal), concat(hit_greater, miss)), hit)
+}
+
+fn emit_comparator_result_validate(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    // Use numeric local labels so duplicate sites in one module cannot redefine globals.
+    less_idx: string <- atom_index_str(table, ":less");
+    equal_idx: string <- atom_index_str(table, ":equal");
+    greater_idx: string <- atom_index_str(table, ":greater");
+    invalid_idx: string <- atom_index_str(table, ":invalid_comparator_result");
+    hit_less: string <- x86_isa@x86_cmp_branch("EQ", "X0", concat("#", less_idx), "1f");
+    hit_equal: string <- x86_isa@x86_cmp_branch("EQ", "X0", concat("#", equal_idx), "1f");
+    hit_greater: string <- x86_isa@x86_cmp_branch("EQ", "X0", concat("#", greater_idx), "1f");
+    invalid: string <- concat(x86_isa@x86_mov("X0", concat("#", invalid_idx)), "1:\n");
+    concat(concat(concat(hit_less, hit_equal), hit_greater), invalid)
+}
+
+fn emit_prim_op_with_table(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    case sir_term_root_node(term).name of {
+        "comparator_result_valid" -> emit_comparator_result_valid(term, dest, table);
+        "comparator_result_validate" -> emit_comparator_result_validate(term, dest, table);
+        _: string -> concat(concat(".error \"unsupported collection result prim: ", concat(sir_term_root_node(term).name, "\"\n")), "\n")
+    }
+}

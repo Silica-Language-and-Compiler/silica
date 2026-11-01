@@ -1,0 +1,264 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Unique SIR / assembly link names when multiple tag-0 functions share the same name and arity
+// (trait `impl fn` overloads). Call-site resolution mirrors the type checker’s qualified-call rules
+// and Phase 0.4 #5 trait-dispatch concrete receiver resolution.
+
+use parser_ast;
+use type_checker_core;
+use type_checker_traits;
+use type_checker_tuple_decompose_helpers;
+use type_checker_expressions_decl_queries;
+use instantiated_fn_name;
+use lexer_keywords;
+use type_surface_cache;
+
+export sir_fn_link_name/2;
+export sir_resolve_qualified_callee_composite/4;
+export mangle_fn_part_if_overloaded/6;
+export type_slug_for_param_type/1;
+export count_call_args_user_call/1;
+
+fn qual_name_local(name: string) -> string {
+    case name of {
+        "m" -> "main";
+        _: string -> name
+    }
+}
+
+fn list_param_length_call(ps: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> int64 {
+    case ps.is_nil of {
+        true -> 0;
+        false -> 1 + list_param_length_call(ps.tail)
+    }
+}
+
+fn count_additional_call_args_user_call(er: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> int64 {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(er);
+    case node.kind == -1 of {
+        true -> 0;
+        false -> case node.kind == 4 of {
+            true -> 1 + count_additional_call_args_user_call(parser_ast@expr_at(er, node.right_expr));
+            false -> 0
+        }
+    }
+}
+
+fn count_call_args_user_call(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> int64 {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    case node.inner == -1 of {
+        true -> 0;
+        false -> 1 + count_additional_call_args_user_call(parser_ast@expr_at(expr, node.right_expr))
+    }
+}
+
+// True when `name` is an exported trait in this decl list (tag 5).
+fn trait_name_exported_mangle(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], name: string) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 5 and decls.head.name == name of {
+            true -> true;
+            false -> trait_name_exported_mangle(decls.tail, name)
+        }
+    }
+}
+
+// First-param type text (trimmed). Param list is stored head=last formal; reverse to source order.
+fn first_param_type_mangle(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> string {
+    source_params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- parser_ast@list_param_reverse_with_acc(params, parser_ast@nil_list_param());
+    case source_params.is_nil of {
+        true -> "";
+        false -> type_checker_traits@trim_type_text(source_params.head.type_name)
+    }
+}
+
+// Provided-method templates (tag 0, Self-typed first param) are not link symbols after
+// trait specialization: they are replaced by concrete clones or dropped when overridden.
+// Iface stubs still inject the Self export as tag 0 alongside concrete impl stubs; counting
+// that template as an overload falsely mangles call sites (e.g. ValueTrait@value override).
+fn is_provided_method_template_mangle(d: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, all_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> boolean {
+    case d.tag == 0 of {
+        false -> false;
+        true -> case d.parameters.is_nil of {
+            true -> false;
+            false -> trait_name_exported_mangle(all_decls, first_param_type_mangle(d.parameters))
+        }
+    }
+}
+
+// Count linkable tag-0 declarations sharing the same operation base name and arity
+// (Phase 0.4 overload set). Skips provided-method templates (see above).
+fn count_tag0_same_name_arity(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], fn_base: string, arity: int64) -> int64 {
+    count_tag0_same_name_arity_scan(decls, decls, fn_base, arity)
+}
+
+fn count_tag0_same_name_arity_scan(scan: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], all_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], fn_base: string, arity: int64) -> int64 {
+    case scan.is_nil of {
+        true -> 0;
+        false -> case scan.head.tag == 0 of {
+            true -> case instantiated_fn_name@fn_base_name_before_brackets(scan.head.name) == fn_base and list_param_length_call(scan.head.parameters) == arity of {
+                true -> case is_provided_method_template_mangle(scan.head, all_decls) of {
+                    true -> count_tag0_same_name_arity_scan(scan.tail, all_decls, fn_base, arity);
+                    false -> 1 + count_tag0_same_name_arity_scan(scan.tail, all_decls, fn_base, arity)
+                };
+                false -> count_tag0_same_name_arity_scan(scan.tail, all_decls, fn_base, arity)
+            };
+            false -> count_tag0_same_name_arity_scan(scan.tail, all_decls, fn_base, arity)
+        }
+    }
+}
+
+fn link_name_from_decl(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, overload_count: int64) -> string {
+    case overload_count <= 1 of {
+        true -> instantiated_fn_name@link_name_to_asm_symbol(decl.name);
+        false -> {
+            ret_slug: string <- type_slug_for_param_type(decl.return_type_name);
+            prefix: string <- instantiated_fn_name@link_name_to_asm_symbol(decl.name);
+            case decl.parameters.is_nil of {
+                true -> concat(prefix, concat("__ret_", ret_slug));
+                false -> {
+                    source_params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- parser_ast@list_param_reverse_with_acc(decl.parameters, parser_ast@nil_list_param());
+                    concat(prefix, concat("__", concat(type_slug_for_param_type(source_params.head.type_name), concat("__ret_", ret_slug))))
+                }
+            }
+        }
+    }
+}
+
+fn find_tag0_decl_for_qualified_call(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], fn_name: string, arity: int64, recv_ty: string, expected_ty: string, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> (boolean, { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) {
+    type_checker_expressions_decl_queries@find_tag0_decl_for_qualified_call(decls, fn_name, arity, recv_ty, expected_ty, world)
+}
+
+// Map type text to a conservative asm-safe slug (alphanumeric + underscore). Any byte outside
+// [A-Za-z0-9_] becomes "_": type text carries "{", "(", ",", "?" (ref?), "|", ":", "-", ">" and
+// more, and GNU as rejects "?" in a symbol even though the Mach-O assembler tolerates it.
+// Must stay identical to instantiated_fn_name@link_slug_char.
+fn type_slug_char(c: string) -> string {
+    case lexer_keywords@is_identifier_char(c) of {
+        true -> c;
+        false -> "_"
+    }
+}
+
+// Divide-and-conquer slug build, the shape of type_interner@strip_type_spaces_range. The old
+// concat(acc, mapped) per byte copied the whole prefix each step: a 1.2 KB graph-trait receiver
+// surface cost n^2/2 = 720 KB of never-released concat arena per scan, and link names are
+// composed once per specialized method and once per call site. Balanced halves copy every byte
+// once per level, n log2(n/48) bytes in total (~6 KB for 1.2 KB), plus a bounded leaf.
+fn type_slug_range(s: string, lo: int64, hi: int64) -> string {
+    case hi - lo <= 48 of {
+        true -> type_slug_small(s, lo, hi, "");
+        false -> {
+            mid: int64 <- lo + (hi - lo) / 2;
+            concat(type_slug_range(s, lo, mid), type_slug_range(s, mid, hi))
+        }
+    }
+}
+
+fn type_slug_small(s: string, i: int64, hi: int64, acc: string) -> string {
+    case i >= hi of {
+        true -> acc;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            mapped: string <- type_slug_char(ch);
+            type_slug_small(s, i + 1, hi, concat(acc, mapped))
+        }
+    }
+}
+
+// Slug memo key in the process-wide type_surface_cache actor. The "@slug:" prefix keeps it
+// apart from the interner's raw-surface -> stripped entries (a type surface never starts with
+// "@"), the way type_interner's parse memo uses "@memo:" inside `names`.
+fn type_slug_memo_key(raw: string) -> string {
+    concat("@slug:", raw)
+}
+
+// Every specialized method of one trait passes the same receiver surface here (all of
+// DirectedGraph's methods share one first-parameter type), and every call site of an overloaded
+// function passes it again through mangle_fn_part_if_overloaded, so the scan runs once per
+// distinct trimmed text; hits allocate only the key.
+fn type_slug_for_param_type(t: string) -> string {
+    raw: string <- type_checker_traits@trim_type_text(t);
+    case length_bytes(raw) == 0 of {
+        true -> "";
+        false -> {
+            key: string <- type_slug_memo_key(raw);
+            hit: string <- type_surface_cache@stripped_for(key);
+            case length_bytes(hit) > 0 of {
+                true -> hit;
+                false -> type_surface_cache@remember_stripped(key, type_slug_range(raw, 0, length_bytes(raw)))
+            }
+        }
+    }
+}
+
+// SIR / asm definition name for a tag-0 declaration within one compilation unit.
+fn sir_fn_link_name(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, all_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> string {
+    case decl.tag == 0 of {
+        false -> qual_name_local(decl.name);
+        true -> {
+            arity: int64 <- list_param_length_call(decl.parameters);
+            fn_base: string <- instantiated_fn_name@fn_base_name_before_brackets(decl.name);
+            n: int64 <- count_tag0_same_name_arity(all_decls, fn_base, arity);
+            link_name_from_decl(decl, n)
+        }
+    }
+}
+
+fn mangle_fn_part_if_overloaded(fn_id: string, arity: int64, recv_ty: string, expected_ty: string, callee_decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> string {
+    fn_base: string <- instantiated_fn_name@fn_base_name_before_brackets(fn_id);
+    n: int64 <- count_tag0_same_name_arity(callee_decls, fn_base, arity);
+    resolved_recv: string <- type_checker_expressions_decl_queries@recv_type_for_trait_link_mangle(recv_ty, callee_decls, world);
+    (df: boolean, d: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) <- find_tag0_decl_for_qualified_call(callee_decls, fn_id, arity, resolved_recv, expected_ty, world);
+    case df of {
+        true -> link_name_from_decl(d, n);
+        false -> {
+            (df2: boolean, d2: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) <- type_checker_expressions_decl_queries@find_function_decl_by_name_arity_call(callee_decls, fn_id, arity);
+            case df2 of {
+                true -> link_name_from_decl(d2, n);
+                false -> fn_id
+            }
+        }
+    }
+}
+
+// Rewrite module@fn when fn is overloaded in the callee module (must match sir_fn_link_name).
+fn sir_resolve_qualified_callee_composite(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], context: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }, expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, composite: string) -> string {
+    (mod_part: string, fn_part: string) <- type_checker_core@split_module_qualified_call_name(composite);
+    case length_bytes(mod_part) == 0 of {
+        true -> composite;
+        false -> {
+            (pf: boolean, prog: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) <- parser_ast@find_named_program(mod_part, world);
+            case pf of {
+                false -> composite;
+                true -> {
+                    ac: int64 <- count_call_args_user_call(expr);
+                    recv_ty: string <- case ac > 0 of {
+                        true -> {
+                            inferred: string <- type_checker_tuple_decompose_helpers@infer_expr_type(parser_ast@expr_at(expr, parser_ast@expr_root_node(expr).inner), context);
+                            type_checker_expressions_decl_queries@recv_type_for_trait_link_mangle(inferred, prog.declarations, world)
+                        };
+                        false -> ""
+                    };
+                    fn2: string <- mangle_fn_part_if_overloaded(fn_part, ac, recv_ty, "", prog.declarations, world);
+                    concat(mod_part, concat("@", fn2))
+                }
+            }
+        }
+    }
+}

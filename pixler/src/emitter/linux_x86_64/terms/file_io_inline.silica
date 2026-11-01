@@ -1,0 +1,175 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Inline emission for DeviceIO file intrinsics.
+// Path/content args are string pointers (literal or SilicaString); runtime
+// silica_*_path helpers accept either representation.
+// SilicaResult ABI (internal convention): X0 = rdi = success bool, X1 = rsi = data pointer.
+
+use emitter_effects;
+use x86_isa;
+
+export emit_read_lines_call/2;
+export emit_file_exists_call/2;
+export emit_delete_file_call/2;
+export emit_append_file_call/2;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn emit_read_lines_call(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    call_effects: string <- sir_term_root_node(term).value;
+    eff_comment: string <- emitter_effects@effect_annotation(call_effects);
+    pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
+    post_barrier: string <- emitter_effects@barrier_after_call(call_effects);
+    comment_line: string <- case length_bytes(eff_comment) > 0 of {
+        true -> concat(eff_comment, "\n");
+        false -> ""
+    };
+    bl_line: string <- x86_isa@x86_call("silica_read_file_path");
+    mov_ret: string <- x86_isa@x86_mov(dest, "X1");
+    with_comment: string <- concat(comment_line, bl_line);
+    with_ret: string <- concat(with_comment, mov_ret);
+    with_post: string <- case length_bytes(post_barrier) > 0 of {
+        true -> concat(with_ret, concat(concat("\n", post_barrier), "\n"));
+        false -> with_ret
+    };
+    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
+        true -> concat(pre_barrier, concat("\n", with_post));
+        false -> with_post
+    };
+    with_pre
+}
+
+fn emit_file_exists_call(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    call_effects: string <- sir_term_root_node(term).value;
+    eff_comment: string <- emitter_effects@effect_annotation(call_effects);
+    pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
+    post_barrier: string <- emitter_effects@barrier_after_call(call_effects);
+    comment_line: string <- case length_bytes(eff_comment) > 0 of {
+        true -> concat(eff_comment, "\n");
+        false -> ""
+    };
+    // file_exists uses read attempt success flag (bootstrap parity).
+    bl_line: string <- x86_isa@x86_call("silica_read_file_path");
+    mov_ret: string <- x86_isa@x86_and(dest, "X0", "#1");
+    with_comment: string <- concat(comment_line, bl_line);
+    with_ret: string <- concat(with_comment, mov_ret);
+    with_post: string <- case length_bytes(post_barrier) > 0 of {
+        true -> concat(with_ret, concat(concat("\n", post_barrier), "\n"));
+        false -> with_ret
+    };
+    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
+        true -> concat(pre_barrier, concat("\n", with_post));
+        false -> with_post
+    };
+    with_pre
+}
+
+fn emit_delete_file_call(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    call_effects: string <- sir_term_root_node(term).value;
+    eff_comment: string <- emitter_effects@effect_annotation(call_effects);
+    pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
+    post_barrier: string <- emitter_effects@barrier_after_call(call_effects);
+    comment_line: string <- case length_bytes(eff_comment) > 0 of {
+        true -> concat(eff_comment, "\n");
+        false -> ""
+    };
+    bl_line: string <- x86_isa@x86_call("silica_delete_file_path");
+    mov_ret: string <- x86_isa@x86_and(dest, "X0", "#1");
+    with_comment: string <- concat(comment_line, bl_line);
+    with_ret: string <- concat(with_comment, mov_ret);
+    with_post: string <- case length_bytes(post_barrier) > 0 of {
+        true -> concat(with_ret, concat(concat("\n", post_barrier), "\n"));
+        false -> with_ret
+    };
+    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
+        true -> concat(pre_barrier, concat("\n", with_post));
+        false -> with_post
+    };
+    with_pre
+}
+
+fn emit_append_file_call(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    call_effects: string <- sir_term_root_node(term).value;
+    eff_comment: string <- emitter_effects@effect_annotation(call_effects);
+    pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
+    post_barrier: string <- emitter_effects@barrier_after_call(call_effects);
+    comment_line: string <- case length_bytes(eff_comment) > 0 of {
+        true -> concat(eff_comment, "\n");
+        false -> ""
+    };
+    bl_line: string <- x86_isa@x86_call("silica_append_file_path");
+    mov_ret: string <- x86_isa@x86_and(dest, "X0", "#1");
+    with_comment: string <- concat(comment_line, bl_line);
+    with_ret: string <- concat(with_comment, mov_ret);
+    with_post: string <- case length_bytes(post_barrier) > 0 of {
+        true -> concat(with_ret, concat(concat("\n", post_barrier), "\n"));
+        false -> with_ret
+    };
+    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
+        true -> concat(pre_barrier, concat("\n", with_post));
+        false -> with_post
+    };
+    with_pre
+}

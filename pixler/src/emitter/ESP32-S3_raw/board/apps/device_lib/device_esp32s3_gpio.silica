@@ -1,0 +1,357 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// GPIO on the ESP32-S3 port test board as a device worker (silica_device_actor_specification.md).
+// The worker owns two windows, the GPIO matrix at 0x60004000 and the IO_MUX at 0x60009000
+// (board_pack.silica windows 1 and 3): both are needed to make a pad an output or a pulled-up
+// input, and two workers must not share a controller (spec §5.1). Only the pins the board wires
+// are described: 0 (Point/BOOT, display CS), 1 (display RST), 2/4/5 (RGB), 3 (display SDA), 6 (LED),
+// 7 (addressable LED data), 21 (Left button), 45 (display D/C), 46 (display SCL), 48 (buzzer).
+// Register names, offsets and field values are board_pack.silica's (rows 2-15, 22 and the
+// io_mux_* / gpio_* constants).
+//
+// State: `:unmapped` until the first message; the `:init` message maps both windows inside a
+// register_rwr sequence (spec §4.3: nothing maps at the spawn site) and the state becomes
+// (:mapped, gpio, mux). Windows never leave the worker: helpers that touch registers take the window
+// and return it, so the move-only handle stays owned here (spec §4.7 "No move", §5.1).
+//
+// Messages: { op: :init | :output | :input_pullup | :write | :read | :hold | :notify, pin: uint32,
+// level: uint32, reply_to: actor_ref }. :read casts the pad level (0 or 1, uint32) to reply_to.
+// :hold busy-waits `level` ticks in message order (one tick is spin(400), roughly a millisecond at
+// the 40 MHz hand-off clock; there is no delay builtin). :notify casts `level` to reply_to, so an
+// app can print in the worker's order. Pins 0..31 use the bank-0 registers, 32..48 the bank-1 ones;
+// per-pin registers are chosen by a flat case on the pin, since a register name must be an atom
+// literal (spec §4.7). route_signal puts a peripheral output (an SPI clock, say) on a pad through
+// the GPIO matrix for a worker that owns both this window and the peripheral's.
+
+use device_esp32s3_gpio_registers;
+use device_esp32s3_io_mux_registers;
+use board_pack;
+use board_pack_gpio_values;
+use board_pack_io_mux_values;
+
+export gpio_worker/2;
+export make_output/3;
+export write_level/3;
+export route_signal/3;
+
+fn pin_mask(pin: uint32) -> uint32 {
+    one: uint32 <- 1;
+    one shl (pin band 31)
+}
+
+fn in_bank1(pin: uint32) -> boolean {
+    pin >= 32
+}
+
+fn spin(n: int64) -> int64 {
+    case n == 0 of { true -> 0; false -> spin(n - 1) }
+}
+
+fn hold_ticks(n: uint32) -> int64 {
+    case n == 0 of {
+        true -> 0;
+        false -> {
+            _: int64 <- spin(400);
+            hold_ticks(n - 1)
+        }
+    }
+}
+
+// GPIO_OUT bit for the pin: set (level != 0) or clear, in the pin's bank.
+fn write_level(g: device_window(L, (:esp32s3_gpio)), pin: uint32, level: uint32) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        m: uint32 <- pin_mask(pin);
+        _: atom <- case in_bank1(pin) of {
+            false -> case level == 0 of {
+                true -> poke(g, :out_w1tc, m impl Register32 {});
+                false -> poke(g, :out_w1ts, m impl Register32 {})
+            };
+            true -> case level == 0 of {
+                true -> poke(g, :out1_w1tc, m impl Register32 {});
+                false -> poke(g, :out1_w1ts, m impl Register32 {})
+            }
+        }
+    produces
+        pure g
+    end
+}
+
+fn enable_output(g: device_window(L, (:esp32s3_gpio)), pin: uint32, enable: boolean) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        m: uint32 <- pin_mask(pin);
+        _: atom <- case in_bank1(pin) of {
+            false -> case enable of {
+                true -> poke(g, :enable_w1ts, m impl Register32 {});
+                false -> poke(g, :enable_w1tc, m impl Register32 {})
+            };
+            true -> case enable of {
+                true -> poke(g, :enable1_w1ts, m impl Register32 {});
+                false -> poke(g, :enable1_w1tc, m impl Register32 {})
+            }
+        }
+    produces
+        pure g
+    end
+}
+
+// FUNCn_OUT_SEL_CFG: OUT_SEL (bits 0-8) is 256 for GPIO_OUT (board_pack gpio_sig_out_idx) or a
+// peripheral output signal's index (ESP-IDF gpio_sig_map.h); OEN_SEL (bit 10) keeps the output
+// enable on GPIO_ENABLE for a routed signal. Field positions from ESP-IDF v5.1 gpio_reg.h
+// (GPIO_FUNC3_OUT_SEL_S 0, GPIO_FUNC3_OEN_SEL_S 10), TRM-unconfirmed.
+fn route(g: device_window(L, (:esp32s3_gpio)), pin: uint32, sel: uint32) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        _: atom <- case pin of {
+            0 -> poke(g, :func0_out_sel_cfg, sel impl Register32 {});
+            1 -> poke(g, :func1_out_sel_cfg, sel impl Register32 {});
+            2 -> poke(g, :func2_out_sel_cfg, sel impl Register32 {});
+            3 -> poke(g, :func3_out_sel_cfg, sel impl Register32 {});
+            4 -> poke(g, :func4_out_sel_cfg, sel impl Register32 {});
+            5 -> poke(g, :func5_out_sel_cfg, sel impl Register32 {});
+            6 -> poke(g, :func6_out_sel_cfg, sel impl Register32 {});
+            7 -> poke(g, :func7_out_sel_cfg, sel impl Register32 {});
+            21 -> poke(g, :func21_out_sel_cfg, sel impl Register32 {});
+            45 -> poke(g, :func45_out_sel_cfg, sel impl Register32 {});
+            46 -> poke(g, :func46_out_sel_cfg, sel impl Register32 {});
+            48 -> poke(g, :func48_out_sel_cfg, sel impl Register32 {});
+            _: uint32 -> :ok
+        }
+    produces
+        pure g
+    end
+}
+
+fn route_output(g: device_window(L, (:esp32s3_gpio)), pin: uint32) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        gpio_out: uint32 <- board_pack@gpio_sig_out_idx();
+        r: device_window(L, (:esp32s3_gpio)) <- route(g, pin, gpio_out)
+    produces
+        pure r
+    end
+}
+
+// A peripheral output signal on a pad that make_output has already made an output.
+fn route_signal(g: device_window(L, (:esp32s3_gpio)), pin: uint32, signal: uint32) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        oen_from_enable: uint32 <- board_pack_gpio_values@gpio_func_oen_sel_mask();
+        r: device_window(L, (:esp32s3_gpio)) <- route(g, pin, oen_from_enable bor signal)
+    produces
+        pure r
+    end
+}
+
+// Bit 2 of GPIO_PINn is open drain; push-pull clears it (board_pack gpio_pin_open_drain_bit).
+fn push_pull(g: device_window(L, (:esp32s3_gpio)), pin: uint32) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        open_drain: uint32 <- board_pack@gpio_pin_open_drain_bit();
+        keep: uint32 <- bnot open_drain;
+        _: atom <- case pin of {
+            0 -> { v: uint32 <- peek(g, :pin0) impl Register32 {}; poke(g, :pin0, (v band keep) impl Register32 {}) };
+            1 -> { v: uint32 <- peek(g, :pin1) impl Register32 {}; poke(g, :pin1, (v band keep) impl Register32 {}) };
+            2 -> { v: uint32 <- peek(g, :pin2) impl Register32 {}; poke(g, :pin2, (v band keep) impl Register32 {}) };
+            3 -> { v: uint32 <- peek(g, :pin3) impl Register32 {}; poke(g, :pin3, (v band keep) impl Register32 {}) };
+            4 -> { v: uint32 <- peek(g, :pin4) impl Register32 {}; poke(g, :pin4, (v band keep) impl Register32 {}) };
+            5 -> { v: uint32 <- peek(g, :pin5) impl Register32 {}; poke(g, :pin5, (v band keep) impl Register32 {}) };
+            6 -> { v: uint32 <- peek(g, :pin6) impl Register32 {}; poke(g, :pin6, (v band keep) impl Register32 {}) };
+            7 -> { v: uint32 <- peek(g, :pin7) impl Register32 {}; poke(g, :pin7, (v band keep) impl Register32 {}) };
+            21 -> { v: uint32 <- peek(g, :pin21) impl Register32 {}; poke(g, :pin21, (v band keep) impl Register32 {}) };
+            45 -> { v: uint32 <- peek(g, :pin45) impl Register32 {}; poke(g, :pin45, (v band keep) impl Register32 {}) };
+            46 -> { v: uint32 <- peek(g, :pin46) impl Register32 {}; poke(g, :pin46, (v band keep) impl Register32 {}) };
+            48 -> { v: uint32 <- peek(g, :pin48) impl Register32 {}; poke(g, :pin48, (v band keep) impl Register32 {}) };
+            _: uint32 -> :ok
+        }
+    produces
+        pure g
+    end
+}
+
+// IO_MUX pad: MCU_SEL = 1 (GPIO), drive strength 2, no pulls, for an output; MCU_SEL = 1 with the
+// input buffer and the pull-up for an input. Values from board_pack's io_mux_* constants.
+fn mux_config(m: device_window(L, (:esp32s3_io_mux)), pin: uint32, as_input: boolean) -> device_window(L, (:esp32s3_io_mux)) {
+    sequence proc[register_rwr]
+        mcu_sel_mask: uint32 <- board_pack_io_mux_values@io_mux_mcu_sel_mask();
+        drv_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_drv_mask();
+        pu_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_pu_mask();
+        pd_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_pd_mask();
+        ie_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_ie_mask();
+        mcu_gpio: uint32 <- board_pack@io_mux_mcu_sel_gpio();
+        drv_20ma: uint32 <- board_pack@io_mux_fun_drv_20ma();
+        clear: uint32 <- bnot (mcu_sel_mask bor drv_mask bor pu_mask bor pd_mask);
+        set_out: uint32 <- mcu_gpio bor drv_20ma;
+        set_in: uint32 <- mcu_gpio bor ie_mask bor pu_mask;
+        set_bits: uint32 <- case as_input of { true -> set_in; false -> set_out };
+        _: atom <- case pin of {
+            0 -> { v: uint32 <- peek(m, :gpio0) impl Register32 {}; poke(m, :gpio0, ((v band clear) bor set_bits) impl Register32 {}) };
+            1 -> { v: uint32 <- peek(m, :gpio1) impl Register32 {}; poke(m, :gpio1, ((v band clear) bor set_bits) impl Register32 {}) };
+            2 -> { v: uint32 <- peek(m, :gpio2) impl Register32 {}; poke(m, :gpio2, ((v band clear) bor set_bits) impl Register32 {}) };
+            3 -> { v: uint32 <- peek(m, :gpio3) impl Register32 {}; poke(m, :gpio3, ((v band clear) bor set_bits) impl Register32 {}) };
+            4 -> { v: uint32 <- peek(m, :gpio4) impl Register32 {}; poke(m, :gpio4, ((v band clear) bor set_bits) impl Register32 {}) };
+            5 -> { v: uint32 <- peek(m, :gpio5) impl Register32 {}; poke(m, :gpio5, ((v band clear) bor set_bits) impl Register32 {}) };
+            6 -> { v: uint32 <- peek(m, :gpio6) impl Register32 {}; poke(m, :gpio6, ((v band clear) bor set_bits) impl Register32 {}) };
+            7 -> { v: uint32 <- peek(m, :gpio7) impl Register32 {}; poke(m, :gpio7, ((v band clear) bor set_bits) impl Register32 {}) };
+            10 -> { v: uint32 <- peek(m, :gpio10) impl Register32 {}; poke(m, :gpio10, ((v band clear) bor set_bits) impl Register32 {}) };
+            11 -> { v: uint32 <- peek(m, :gpio11) impl Register32 {}; poke(m, :gpio11, ((v band clear) bor set_bits) impl Register32 {}) };
+            21 -> { v: uint32 <- peek(m, :gpio21) impl Register32 {}; poke(m, :gpio21, ((v band clear) bor set_bits) impl Register32 {}) };
+            45 -> { v: uint32 <- peek(m, :gpio45) impl Register32 {}; poke(m, :gpio45, ((v band clear) bor set_bits) impl Register32 {}) };
+            46 -> { v: uint32 <- peek(m, :gpio46) impl Register32 {}; poke(m, :gpio46, ((v band clear) bor set_bits) impl Register32 {}) };
+            47 -> { v: uint32 <- peek(m, :gpio47) impl Register32 {}; poke(m, :gpio47, ((v band clear) bor set_bits) impl Register32 {}) };
+            48 -> { v: uint32 <- peek(m, :gpio48) impl Register32 {}; poke(m, :gpio48, ((v band clear) bor set_bits) impl Register32 {}) };
+            _: uint32 -> :ok
+        }
+    produces
+        pure m
+    end
+}
+
+fn read_level(g: device_window(L, (:esp32s3_gpio)), pin: uint32) -> (device_window(L, (:esp32s3_gpio)), uint32) {
+    sequence proc[register_rwr]
+        word: uint32 <- case in_bank1(pin) of {
+            false -> peek(g, :in) impl Register32 {};
+            true -> peek(g, :in1) impl Register32 {}
+        };
+        one: uint32 <- 1;
+        level: uint32 <- (word shr (pin band 31)) band one
+    produces
+        pure (g, level)
+    end
+}
+
+// One poll of Left (21), Right (10), Down (47) and Up (11): the LED (GPIO6) is high while any of them
+// is pressed (board_pack: these buttons idle low).
+// The pads are read straight from GPIO_IN / GPIO_IN1 (GPIO47 is bit 15 of IN1) so a poll allocates nothing.
+fn poll_buttons_once(g: device_window(L, (:esp32s3_gpio))) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        low: uint32 <- peek(g, :in) impl Register32 {};
+        high: uint32 <- peek(g, :in1) impl Register32 {};
+        one: uint32 <- 1;
+        bank: uint32 <- 31;
+        left: uint32 <- board_pack@button_pin(0);
+        right: uint32 <- board_pack@button_pin(1);
+        down: uint32 <- board_pack@button_pin(2);
+        up: uint32 <- board_pack@button_pin(3);
+        led: uint32 <- board_pack@pin_led();
+        any: uint32 <- ((low shr left) bor (low shr right) bor (low shr up) bor (high shr (down band bank))) band one;
+        g1: device_window(L, (:esp32s3_gpio)) <- write_level(g, led, any)
+    produces
+        pure g1
+    end
+}
+
+// n polls about 10 ms apart. The recursion is not in tail position inside the sequence, so callers keep n small.
+fn watch_buttons_inner(g: device_window(L, (:esp32s3_gpio)), n: uint32) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        r: device_window(L, (:esp32s3_gpio)) <- case n == 0 of {
+            true -> g;
+            false -> {
+                g1: device_window(L, (:esp32s3_gpio)) <- poll_buttons_once(g);
+                _: int64 <- hold_ticks(10);
+                watch_buttons_inner(g1, n - 1)
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+// n rounds of 50 polls (about half a second each); the LED is left off at the end.
+fn watch_buttons(g: device_window(L, (:esp32s3_gpio)), n: uint32) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        led: uint32 <- board_pack@pin_led();
+        r: device_window(L, (:esp32s3_gpio)) <- case n == 0 of {
+            true -> write_level(g, led, 0);
+            false -> {
+                g1: device_window(L, (:esp32s3_gpio)) <- watch_buttons_inner(g, 50);
+                watch_buttons(g1, n - 1)
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+// A pad as a push-pull output driven low: the display and LED drivers share it.
+fn make_output(g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), pin: uint32) -> (device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux))) {
+    sequence proc[register_rwr]
+        g1: device_window(L, (:esp32s3_gpio)) <- route_output(g, pin);
+        g2: device_window(L, (:esp32s3_gpio)) <- push_pull(g1, pin);
+        g3: device_window(L, (:esp32s3_gpio)) <- write_level(g2, pin, 0);
+        g4: device_window(L, (:esp32s3_gpio)) <- enable_output(g3, pin, true);
+        m1: device_window(L, (:esp32s3_io_mux)) <- mux_config(m, pin, false)
+    produces
+        pure (g4, m1)
+    end
+}
+
+// One message, both windows in hand. Order for :output: route, push-pull, low, enable, then the pad.
+fn serve(g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), msg: { op: atom, pin: uint32, level: uint32, reply_to: actor_ref }) -> (device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux))) {
+    sequence proc[register_rwr, concurrency]
+        r: (device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux))) <- case msg.op of {
+            :output -> make_output(g, m, msg.pin);
+            :input_pullup -> {
+                g1: device_window(L, (:esp32s3_gpio)) <- enable_output(g, msg.pin, false);
+                m1: device_window(L, (:esp32s3_io_mux)) <- mux_config(m, msg.pin, true);
+                (g1, m1)
+            };
+            :write -> {
+                g1: device_window(L, (:esp32s3_gpio)) <- write_level(g, msg.pin, msg.level);
+                (g1, m)
+            };
+            :read -> {
+                (g1, level) <- read_level(g, msg.pin);
+                _: boolean <- cast(msg.reply_to, level impl ActorMessage {});
+                (g1, m)
+            };
+            :hold -> {
+                _: int64 <- hold_ticks(msg.level);
+                (g, m)
+            };
+            :watch -> {
+                g1: device_window(L, (:esp32s3_gpio)) <- watch_buttons(g, msg.level);
+                (g1, m)
+            };
+            :notify -> {
+                level: uint32 <- msg.level;
+                _: boolean <- cast(msg.reply_to, level impl ActorMessage {});
+                (g, m)
+            };
+            _: atom -> (g, m)
+        }
+    produces
+        pure r
+    end
+}
+
+fn gpio_worker(msg: { op: atom, pin: uint32, level: uint32, reply_to: actor_ref }, state: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)))) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)))) {
+    sequence proc[register_rwr]
+        next: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux))) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    g: device_window(L, (:esp32s3_gpio)) <- map_device((:esp32s3_gpio), 0x60004000); // board_pack window 1
+                    m: device_window(L, (:esp32s3_io_mux)) <- map_device((:esp32s3_io_mux), 0x60009000); // board_pack window 3
+                    (:mapped, g, m)
+                };
+                _: atom -> :unmapped
+            };
+            (:mapped, g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux))) -> {
+                (g1, m1) <- serve(g, m, msg);
+                (:mapped, g1, m1)
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}

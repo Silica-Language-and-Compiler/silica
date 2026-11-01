@@ -1,0 +1,136 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Narrow int prim emission: int32, int16, int8, uint32, uint16, uint8
+// W registers. Signed vs unsigned from operand type (inner) for comparison, result type for div/rem.
+
+use arithmetic;
+use comparison;
+use logical;
+use reg_conventions;
+use bitwise;
+
+export emit_prim_op/2;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+// shl and bnot on uint8 / uint16 are 32-bit operations in W registers; the result is cut back to
+// its width the way the hardware would have wrapped it.
+fn narrow_mask(dest: string, type_name: string) -> string {
+    case type_name of {
+        "uint8" -> concat("\n    UXTB ", concat(dest, concat(", ", dest)));
+        "uint16" -> concat("\n    UXTH ", concat(dest, concat(", ", dest)));
+        _: string -> ""
+    }
+}
+
+fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    operand_type: string <- sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name;
+    is_unsigned: boolean <- reg_conventions@is_unsigned_type(operand_type);
+    reg_prefix: string <- "W";
+    dest_w: string <- case length_bytes(dest) > 0 of {
+        true -> concat(reg_prefix, substring(dest, 1, length_bytes(dest)));
+        false -> dest
+    };
+    case sir_term_root_node(term).name of {
+        "neg" -> arithmetic@emit_neg_op(dest_w, reg_prefix);
+        "add" -> arithmetic@emit_add_op(dest_w, reg_prefix);
+        "sub" -> arithmetic@emit_sub_op(dest_w, reg_prefix);
+        "mul" -> arithmetic@emit_mul_op(dest_w, reg_prefix);
+        "div" -> case reg_conventions@is_unsigned_type(sir_term_root_node(term).type_name) of {
+            true -> arithmetic@emit_udiv_op(dest_w, reg_prefix);
+            false -> arithmetic@emit_div_op(dest_w, reg_prefix)
+        };
+        "rem" -> case reg_conventions@is_unsigned_type(sir_term_root_node(term).type_name) of {
+            true -> arithmetic@emit_urem_op(dest_w, reg_prefix);
+            false -> arithmetic@emit_rem_op(dest_w, reg_prefix)
+        };
+        "lt" -> case is_unsigned of {
+            true -> comparison@emit_ult_op(dest_w, reg_prefix);
+            false -> comparison@emit_lt_op(dest_w, reg_prefix)
+        };
+        "gt" -> case is_unsigned of {
+            true -> comparison@emit_ugt_op(dest_w, reg_prefix);
+            false -> comparison@emit_gt_op(dest_w, reg_prefix)
+        };
+        "le" -> case is_unsigned of {
+            true -> comparison@emit_ule_op(dest_w, reg_prefix);
+            false -> comparison@emit_le_op(dest_w, reg_prefix)
+        };
+        "ge" -> case is_unsigned of {
+            true -> comparison@emit_uge_op(dest_w, reg_prefix);
+            false -> comparison@emit_ge_op(dest_w, reg_prefix)
+        };
+        "eq" -> comparison@emit_eq_op(dest_w, reg_prefix);
+        "nq" -> comparison@emit_ne_op(dest_w, reg_prefix);
+        "and" -> logical@emit_and_op(dest_w, reg_prefix);
+        "or" -> logical@emit_or_op(dest_w, reg_prefix);
+        "bor" -> bitwise@emit_bor_op(dest_w, reg_prefix);
+        "band" -> bitwise@emit_band_op(dest_w, reg_prefix);
+        "shr" -> bitwise@emit_shr_op(dest_w, reg_prefix);
+        "shl" -> concat(bitwise@emit_shl_op(dest_w, reg_prefix), narrow_mask(dest_w, sir_term_root_node(term).type_name));
+        "bnot" -> concat(bitwise@emit_bnot_op(dest_w, reg_prefix), narrow_mask(dest_w, sir_term_root_node(term).type_name));
+        _: string -> concat(".error \"unsupported narrow prim: ", concat(sir_term_root_node(term).name, "\"\n"))
+    }
+}

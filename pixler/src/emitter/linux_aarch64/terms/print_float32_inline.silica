@@ -1,0 +1,106 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Inline emission for print_float32 built-in.
+// Always uses L_pf32_helper: const loads from L_f32_N, var has arg in S0.
+
+use atom_table;
+use emitter_effects;
+
+export emit_print_float32_var/3;
+export emit_print_float32_helper/0;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn emit_print_float32_var(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    call_effects: string <- sir_term_root_node(term).value;
+    eff_comment: string <- emitter_effects@effect_annotation(call_effects);
+    pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
+    post_barrier: string <- emitter_effects@barrier_after_call(call_effects);
+    comment_line: string <- case length_bytes(eff_comment) > 0 of {
+        true -> concat(eff_comment, "\n");
+        false -> ""
+    };
+    bl_line: string <- "    BL L_pf32_helper\n";
+    ok_index: int64 <- atom_table@ok_atom_index(table);
+    ok_index_str: string <- atom_table@int64_to_decimal_string(ok_index);
+    mov_ret: string <- concat(concat("    MOV ", dest), concat(", #", concat(ok_index_str, "\n")));
+    with_comment: string <- concat(comment_line, bl_line);
+    with_ret: string <- concat(with_comment, mov_ret);
+    with_post: string <- case length_bytes(post_barrier) > 0 of {
+        true -> concat(with_ret, concat(concat("\n", post_barrier), "\n"));
+        false -> with_ret
+    };
+    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
+        true -> concat(pre_barrier, concat("\n", with_post));
+        false -> with_post
+    };
+    with_pre
+}
+
+// L_pf32_helper: S0 = float32 to print. Converts to string on stack, write(2).
+// Integer part: FCVTZS, digit loop. Fractional part: frac*=10 loop (up to 7 digits for float32).
+fn emit_print_float32_helper() -> string {
+    "L_pf32_helper:\n    SUB SP, SP, #64\n    STR S0, [SP, #0]\n    FCMP S0, #0.0\n    B.ge L_pf32_pos\n    MOV X0, #1\n    ADRP X1, L_pf32_minus\n    ADD X1, X1, :lo12:L_pf32_minus\n    MOV X2, #1\n    STR X8, [SP, #-16]!\n    MOV X8, #64\n    SVC #0\n    LDR X8, [SP], #16\n    LDR S0, [SP, #0]\n    FNEG S0, S0\n    STR S0, [SP, #0]\nL_pf32_pos:\n    FCVTZS W0, S0\n    MOV X10, SP\n    ADD X10, X10, #48\n    MOV X11, #0\n    CMP X0, #0\n    B.ge L_pf32_ipos\n    MOV X11, #1\n    NEG X0, X0\nL_pf32_ipos:\n    MOV X8, X10\n    CMP X0, #0\n    B.eq L_pf32_izero\n    MOV X9, #10\nL_pf32_iloop:\n    UDIV X1, X0, X9\n    MSUB X2, X1, X9, X0\n    ADD X2, X2, #48\n    SUB X8, X8, #1\n    STRB W2, [X8]\n    MOV X0, X1\n    CBNZ X0, L_pf32_iloop\n    B L_pf32_imaybe_neg\nL_pf32_izero:\n    SUB X8, X8, #1\n    MOV X1, #48\n    STRB W1, [X8]\nL_pf32_imaybe_neg:\n    CBNZ X11, L_pf32_iprepend_minus\n    B L_pf32_ido_int\nL_pf32_iprepend_minus:\n    SUB X8, X8, #1\n    MOV X1, #45\n    STRB W1, [X8]\nL_pf32_ido_int:\n    SUB X2, X10, X8\n    MOV X0, #1\n    MOV X1, X8\n    STR X8, [SP, #-16]!\n    MOV X8, #64\n    SVC #0\n    LDR X8, [SP], #16\n    LDR S0, [SP, #0]\n    FRINTZ S1, S0\n    FSUB S2, S0, S1\n    ADRP X8, L_pf32_10\n    LDR S3, [X8, :lo12:L_pf32_10]\n    MOV X12, #7\n    MOV X9, X10\n    SUB X9, X9, #7\n    MOV X8, X9\nL_pf32_frac_loop:\n    CBZ X12, L_pf32_frac_done\n    FMUL S2, S2, S3\n    FCVTZS W0, S2\n    ADD X2, X0, #48\n    STRB W2, [X8]\n    ADD X8, X8, #1\n    SCVTF S4, W0\n    FSUB S2, S2, S4\n    SUB X12, X12, #1\n    FCMP S2, #0.0\n    B.eq L_pf32_frac_done\n    B L_pf32_frac_loop\nL_pf32_frac_done:\n    SUB X9, X9, #1\n    MOV X1, #46\n    STRB W1, [X9]\n    SUB X2, X8, X9\n    MOV X0, #1\n    MOV X1, X9\n    STR X8, [SP, #-16]!\n    MOV X8, #64\n    SVC #0\n    LDR X8, [SP], #16\n    ADD SP, SP, #64\n    RET"
+}

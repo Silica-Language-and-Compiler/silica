@@ -1,0 +1,239 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Guarded FFI boundary helpers (Phase 11), Linux x86-64. Linked via __silica_runtime.sams.
+// Per-thread state (pthread key -> 512-byte block):
+//   [+0]  depth (int64)
+//   [+8]  current actor ACB at outermost enter
+//   [+16] call generation (monotonic, incremented on each depth 0->1)
+//   [+24] inside flag (1 while depth > 0)
+//   [+32] fault_signal, [+40] fault_addr, [+48] fault_code, [+56] fault_in_arena
+//   [+64] sigjmp_buf (448 B slot; glibc x86-64 sigjmp_buf is 200 B) for Phase 13 recovery boundary
+//   [+448] caller's rbx, [+464] caller's frame pointer, [+472] caller's return address: the
+//          guarded_setjmp frame link, stashed because the foreign call overwrites the frame.
+// Routines take X0.. in rdi rsi and answer in rdi; C results arrive in rax; X19/X20 live in
+// frame slots [rbp-8]/[rbp-16].
+
+export emit_guarded_ffi_runtime_asm/0;
+
+fn emit_guarded_ffi_runtime_asm() -> string {
+    bss: string <- "	.bss
+	.p2align	3
+silica_guarded_ffi_pthread_key:
+	.zero	8
+silica_guarded_ffi_tls_init_lock:
+	.zero	4
+silica_guarded_ffi_tls_key_ready:
+	.zero	1
+";
+    text: string <- "	.text
+	.globl	silica_rt_ensure_guarded_ffi_tls_key
+	.p2align	4
+silica_rt_ensure_guarded_ffi_tls_key:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	lea	rax, [rip + silica_guarded_ffi_tls_key_ready]
+	movzx	r10d, BYTE PTR [rax]
+	test	r10d, r10d
+	jnz	L_gffi_tls_done
+	lea	rdi, [rip + silica_guarded_ffi_tls_init_lock]
+	call	silica_rt_lock_lock
+	lea	rax, [rip + silica_guarded_ffi_tls_key_ready]
+	movzx	r10d, BYTE PTR [rax]
+	test	r10d, r10d
+	jnz	L_gffi_tls_unlock
+	lea	rdi, [rip + silica_guarded_ffi_pthread_key]
+	xor	esi, esi
+	call	pthread_key_create
+	test	eax, eax
+	jnz	L_gffi_tls_unlock
+	lea	rax, [rip + silica_guarded_ffi_tls_key_ready]
+	mov	BYTE PTR [rax], 1
+L_gffi_tls_unlock:
+	lea	rdi, [rip + silica_guarded_ffi_tls_init_lock]
+	call	silica_rt_lock_unlock
+L_gffi_tls_done:
+	leave
+	ret
+	.globl	silica_rt_guarded_ffi_state_get_or_create
+	.p2align	4
+silica_rt_guarded_ffi_state_get_or_create:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	call	silica_rt_ensure_guarded_ffi_tls_key
+	lea	rax, [rip + silica_guarded_ffi_pthread_key]
+	mov	rdi, QWORD PTR [rax]
+	call	pthread_getspecific
+	mov	rdi, rax
+	test	rdi, rdi
+	jnz	L_gffi_state_have
+# calloc(count, size): both arguments must be set. This site passed only the size in X0 and
+# left X1 holding whatever the previous call returned, so the per-thread guarded state was
+# allocated at an unpredictable size. A short block makes the depth field read garbage,
+# which skips the sigsetjmp below and leaves the guarded region with no recovery point.
+	mov	edi, 1
+	mov	esi, 512
+	call	calloc
+	test	rax, rax
+	jz	L_gffi_state_fail
+# The block pointer must survive pthread_setspecific, which may clobber any caller-saved
+# register; a garbage pointer returned here would take the depth writes while the real
+# block sits in thread-local storage, and the guarded region would be left without a
+# recovery point. Keep it in this frame ([rbp-16], the X20 slot).
+	mov	QWORD PTR [rbp - 16], rax
+	lea	rax, [rip + silica_guarded_ffi_pthread_key]
+	mov	rdi, QWORD PTR [rax]
+	mov	rsi, QWORD PTR [rbp - 16]
+	call	pthread_setspecific
+	mov	rdi, QWORD PTR [rbp - 16]
+L_gffi_state_have:
+	leave
+	ret
+L_gffi_state_fail:
+	xor	edi, edi
+	leave
+	ret
+	.globl	silica_rt_ffi_guarded_enter
+	.p2align	4
+silica_rt_ffi_guarded_enter:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	call	silica_rt_guarded_ffi_state_get_or_create
+	test	rdi, rdi
+	jz	L_gffi_enter_abort
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	r10, QWORD PTR [rdi]
+	inc	r10
+	mov	QWORD PTR [rdi], r10
+	cmp	r10, 1
+	jne	L_gffi_enter_flag
+	call	silica_rt_tls_current_actor_get
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 8], rdi
+	test	rdi, rdi
+	jz	L_gffi_enter_gen
+	mov	QWORD PTR [rbp - 16], rdi
+	call	silica_rt_ffi_arena_ensure
+L_gffi_enter_gen:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r11, QWORD PTR [rax + 16]
+	inc	r11
+	mov	QWORD PTR [rax + 16], r11
+L_gffi_enter_flag:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 24], 1
+	leave
+	ret
+L_gffi_enter_abort:
+	call	silica_rt_abort_guarded_ffi_state
+	.globl	silica_rt_ffi_guarded_setjmp
+	.p2align	4
+silica_rt_ffi_guarded_setjmp:
+# -> rdi = 0 armed (or nothing to arm), 1 when a fault longjmp'd back here.
+# rbx holds the state block across __sigsetjmp because siglongjmp restores it (it is in the
+# sigjmp_buf, like X19 on AArch64); the caller's rbx is kept in [rbp-16] for the plain returns.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 16], rbx
+	call	silica_rt_guarded_ffi_state_get_or_create
+	test	rdi, rdi
+	jz	L_gffi_sj_zero
+	mov	rbx, rdi
+	mov	r10, QWORD PTR [rbx]
+	cmp	r10, 1
+	jne	L_gffi_sj_zero
+	call	silica_rt_install_sync_fault_handlers
+# Stash this frame's link -- the caller's rbx, the caller's frame pointer at [rbp] and the
+# return address at [rbp+8] -- in the state block before arming the recovery point. The
+# foreign call runs at the stack depth this frame occupies, so it overwrites these slots; by
+# the time a fault longjmps back here they hold the foreign call's frame. Reloading them from
+# the stack returned into the middle of the guarded block, past the fault branch, and the actor
+# walked away from a fault it should have died on.
+	mov	r10, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rbx + 448], r10
+	mov	QWORD PTR [rbx + 456], 0
+	mov	r10, QWORD PTR [rbp]
+	mov	QWORD PTR [rbx + 464], r10
+	mov	r10, QWORD PTR [rbp + 8]
+	mov	QWORD PTR [rbx + 472], r10
+	lea	rdi, [rbx + 64]
+	xor	esi, esi
+	call	__sigsetjmp
+	test	eax, eax
+	jz	L_gffi_sj_done
+# Longjmp return. siglongjmp has restored rbx (the state block), rbp (this frame) and rsp, so
+# the frame link is rebuilt from the state block and this returns straight into the guarded
+# block with rdi set to 1, which is the caller's signal to take the fault branch.
+	mov	rax, QWORD PTR [rbx + 472]
+	mov	r10, QWORD PTR [rbx + 464]
+	mov	rbx, QWORD PTR [rbx + 448]
+	mov	rsp, rbp
+	mov	QWORD PTR [rsp + 8], rax
+	mov	rbp, r10
+	add	rsp, 8
+	mov	edi, 1
+	ret
+L_gffi_sj_zero:
+# Not a longjmp return: every path that skips the setjmp must report 0, or the caller's
+# branch takes the fault path on a healthy call. Two exits reach here (no TLS state, and
+# depth != 1) and both used to fall through carrying whatever X0 happened to hold.
+	xor	edi, edi
+	mov	rbx, QWORD PTR [rbp - 16]
+	leave
+	ret
+L_gffi_sj_done:
+	xor	edi, edi
+	mov	rbx, QWORD PTR [rbp - 16]
+	leave
+	ret
+	.globl	silica_rt_ffi_guarded_exit
+	.p2align	4
+silica_rt_ffi_guarded_exit:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	call	silica_rt_ensure_guarded_ffi_tls_key
+	lea	rax, [rip + silica_guarded_ffi_pthread_key]
+	mov	rdi, QWORD PTR [rax]
+	call	pthread_getspecific
+	test	rax, rax
+	jz	L_gffi_exit_done
+	mov	QWORD PTR [rbp - 8], rax
+	mov	r10, QWORD PTR [rax]
+	test	r10, r10
+	jz	L_gffi_exit_done
+	sub	r10, 1
+	jl	L_gffi_exit_done
+	mov	QWORD PTR [rax], r10
+	test	r10, r10
+	jnz	L_gffi_exit_done
+	mov	rdi, QWORD PTR [rax + 8]
+	mov	QWORD PTR [rax + 8], 0
+	mov	QWORD PTR [rax + 24], 0
+	test	rdi, rdi
+	jz	L_gffi_exit_done
+	call	silica_rt_ffi_arena_reset
+L_gffi_exit_done:
+	leave
+	ret
+";
+    concat(bss, text)
+}

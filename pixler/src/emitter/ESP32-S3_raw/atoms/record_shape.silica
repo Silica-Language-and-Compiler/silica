@@ -1,0 +1,227 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Record shapes (silica-specification §3.4.2 / §3.7). Every record value starts with a SHAPE WORD:
+// the build-wide number of its shape, which is its field names in declared order. Shapes are
+// numbered in the build's atom table in their own index space (atom_table@shape_index_base, 65536,
+// plus the shape's position; written to silica.shapes beside silica.atoms): a shape's lexeme
+// starts with `{`, atoms keep their indices whatever shapes a build adds, a shape word can never
+// equal a tuple's tag atom, and a case arm over a sum compares the word behind a record pointer
+// with the arm's shape number exactly as a tuple arm compares its tag atom.
+//
+// The lexeme is the field names only (`{x,y}`), spaces dropped, never the field types: a generic
+// unit is compiled once with placeholder types (`{ item: ItemType }`), and a record it builds must
+// reach the same number as the concrete record (`{ item: int64 }`) a case arm elsewhere compares
+// against. Names are enough to tell apart the record variants of every legal sum, because E2009
+// forbids two variants of one sum from giving a field name different types; a shape does not
+// identify a record's full type. A record-typed field holds a pointer to a record that carries
+// its own shape word, so only one level of names is ever spelled.
+//
+// The records the actor runtime builds by hand (child info, cpu topology, memory usage) carry
+// reserved shape numbers 65536..65543: fixed entries at the head of every build's shape list
+// (atom_table@seed_actor_runtime_atoms), matched by their field names here and written as
+// constants by the runtime (prims_actors_*_asm, the board's rt_*.S).
+
+use prims_record;
+
+export record_shape_lexeme/1;
+export runtime_shape_lexemes/0;
+export record_lexemes_in_type/2;
+export shape_word_bytes/0;
+
+fn shape_word_bytes() -> int64 {
+    8
+}
+
+fn nil_strings() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn cons_string(s: string, t: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- prepend[string, mem(normal)](s, t)
+    produces
+        pure result
+    end
+}
+
+// Reserved shapes, in table order (numbers 65536..65543).
+fn runtime_shape_lexemes() -> List[string, mem(normal)] {
+    cons_string("{child_info}",
+        cons_string("{core_info}",
+            cons_string("{cpu_topology}",
+                cons_string("{numa_node}",
+                    cons_string("{memory_range}",
+                        cons_string("{cache_hierarchy}",
+                            cons_string("{cache_level}",
+                                cons_string("{actor_memory_usage}", nil_strings()))))))))
+}
+
+fn has_field(R: string, name: string) -> boolean {
+    length_bytes(prims_record@find_field_type_in_record(R, name)) > 0
+}
+
+fn runtime_shape_lexeme_for(R: string) -> string {
+    n: int64 <- prims_record@count_record_fields(R);
+    case n of {
+        1 -> case has_field(R, "levels") of {
+            true -> "{cache_hierarchy}";
+            false -> ""
+        };
+        3 -> case has_field(R, "cores") and has_field(R, "numa_nodes") and has_field(R, "cache_hierarchy") of {
+            true -> "{cpu_topology}";
+            false -> case has_field(R, "id") and has_field(R, "cores") and has_field(R, "memory_ranges") of {
+                true -> "{numa_node}";
+                false -> case has_field(R, "start_address") and has_field(R, "size") and has_field(R, "latency") of {
+                    true -> "{memory_range}";
+                    false -> ""
+                }
+            }
+        };
+        4 -> case has_field(R, "id") and has_field(R, "agent_type") and has_field(R, "child") and has_field(R, "restart") of {
+            true -> "{child_info}";
+            false -> case has_field(R, "id") and has_field(R, "core_type") and has_field(R, "capabilities") and has_field(R, "frequency_mhz") of {
+                true -> "{core_info}";
+                false -> case has_field(R, "reserved") and has_field(R, "committed") and has_field(R, "retained") and has_field(R, "high_water") of {
+                    true -> "{actor_memory_usage}";
+                    false -> ""
+                }
+            }
+        };
+        5 -> case has_field(R, "level") and has_field(R, "size_kb") and has_field(R, "line_size") and has_field(R, "associativity") and has_field(R, "shared_cores") of {
+            true -> "{cache_level}";
+            false -> ""
+        };
+        _: int64 -> ""
+    }
+}
+
+// The atom-table lexeme of a record type: a reserved runtime shape, else the canonical spelling.
+fn record_shape_lexeme(record_str: string) -> string {
+    R: string <- prims_record@strip_spaces_rt(record_str);
+    reserved: string <- runtime_shape_lexeme_for(R);
+    case length_bytes(reserved) > 0 of {
+        true -> reserved;
+        false -> shape_key(R)
+    }
+}
+
+fn shape_key(R: string) -> string {
+    concat("{", concat(field_names_key(prims_record@record_case_inner_body(R)), "}"))
+}
+
+fn field_names_key(rem: string) -> string {
+    rin: string <- prims_record@strip_spaces_rt(rem);
+    case length_bytes(rin) == 0 of {
+        true -> "";
+        false -> {
+            (seg: string, rest: string) <- prims_record@record_case_field_step(rin);
+            (fname: string, fty: string) <- prims_record@record_field_segment_name_sub(seg);
+            tail_key: string <- field_names_key(rest);
+            case length_bytes(fname) == 0 of {
+                true -> tail_key;
+                false -> case length_bytes(tail_key) == 0 of {
+                    true -> fname;
+                    false -> concat(fname, concat(",", tail_key))
+                }
+            }
+        }
+    }
+}
+
+fn depth_step(c: string, depth: int64) -> int64 {
+    case c == "(" or c == "[" or c == "{" of {
+        true -> depth + 1;
+        false -> case c == ")" or c == "]" or c == "}" of {
+            true -> depth - 1;
+            false -> depth
+        }
+    }
+}
+
+fn depth0_index_of(t: string, needle: string, i: int64, depth: int64) -> int64 {
+    n: int64 <- length_bytes(needle);
+    case i + n > length_bytes(t) of {
+        true -> -1;
+        false -> case depth == 0 and substring(t, i, i + n) == needle of {
+            true -> i;
+            false -> depth0_index_of(t, needle, i + 1, depth_step(substring(t, i, i + 1), depth))
+        }
+    }
+}
+
+// Every record type reachable in a type string (sum variants, tuple elements, list elements,
+// nested record fields), as shape lexemes prepended to acc: what a case pattern over the type may
+// compare against, collected into the atom table before emission.
+fn record_lexemes_in_type(type_str: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    t: string <- prims_record@strip_spaces_rt(type_str);
+    case length_bytes(t) == 0 of {
+        true -> acc;
+        false -> case depth0_index_of(t, "->", 0, 0) >= 0 of {
+            true -> acc;
+            false -> {
+                bar: int64 <- depth0_index_of(t, "|", 0, 0);
+                case bar >= 0 of {
+                    true -> record_lexemes_in_type(substring(t, bar + 1, length_bytes(t)), record_lexemes_in_type(substring(t, 0, bar), acc));
+                    false -> case substring(t, 0, 1) == "{" of {
+                        true -> record_lexemes_in_fields(prims_record@record_case_inner_body(t), cons_string(record_shape_lexeme(t), acc));
+                        false -> case substring(t, 0, 1) == "(" of {
+                            true -> record_lexemes_in_elems(substring(t, 1, length_bytes(t) - 1), acc);
+                            false -> {
+                                open: int64 <- depth0_index_of(t, "[", 0, 0);
+                                case open > 0 and substring(t, length_bytes(t) - 1, length_bytes(t)) == "]" of {
+                                    true -> record_lexemes_in_elems(substring(t, open + 1, length_bytes(t) - 1), acc);
+                                    false -> acc
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn record_lexemes_in_fields(rem: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    rin: string <- prims_record@strip_spaces_rt(rem);
+    case length_bytes(rin) == 0 of {
+        true -> acc;
+        false -> {
+            (seg: string, rest: string) <- prims_record@record_case_field_step(rin);
+            (fname: string, fty: string) <- prims_record@record_field_segment_name_sub(seg);
+            case length_bytes(fname) == 0 of {
+                true -> record_lexemes_in_fields(rest, acc);
+                false -> record_lexemes_in_fields(rest, record_lexemes_in_type(fty, acc))
+            }
+        }
+    }
+}
+
+fn record_lexemes_in_elems(rem: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    rin: string <- prims_record@strip_spaces_rt(rem);
+    case length_bytes(rin) == 0 of {
+        true -> acc;
+        false -> {
+            (seg: string, rest: string) <- prims_record@record_case_field_step(rin);
+            record_lexemes_in_elems(rest, record_lexemes_in_type(seg, acc))
+        }
+    }
+}

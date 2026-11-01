@@ -1,0 +1,390 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Device prims (device spec §4.7, §4.9; peek/poke plan item 9). map_device, peek and poke each lower to
+// one kind-6 prim carrying "[register_rwr]" and the resolved offset, width and window size, so no
+// emitter sees a register name. A description -- `impl fn registers(device: (:tag))`, a list literal of
+// record literals -- is read as data from this unit's declarations into env rows before lowering:
+//   "__silica_devreg:<tag>:<name>"  ->  "<offset>,<width>,<access>"
+//   "__silica_devsize:<tag>"        ->  "<size>"
+// `add_description_rows` is the one boundary a checker-side table can feed later; a description in a
+// used module is not visible here yet (a parse-skipped unit carries only its .iface).
+
+use parser_ast;
+use sir_ast;
+use string_parse;
+use type_checker_expressions_helpers;
+use terms_helpers;
+use literals;
+
+export is_device_prim_call/2;
+export is_description_decl/1;
+export build_device_prim/4;
+export add_description_rows/2;
+export add_description_rows_from_world/2;
+export no_description_world/0;
+export marker_expected/2;
+export marker_type/1;
+export register_row/3;
+export row_offset/1;
+export row_width/1;
+export row_access/1;
+export window_size/2;
+export window_tag_of_type/1;
+
+fn is_device_prim_name(name: string) -> boolean {
+    case name of {
+        "map_device" -> true;
+        "peek" -> true;
+        "poke" -> true;
+        _: string -> false
+    }
+}
+
+// The prim only when the call is unqualified and no user function of that name is in scope (device
+// spec §4.7 "Names are not reserved"); the checker rejects such a call outside a device_* module.
+fn is_device_prim_call(context: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    n: string <- type_checker_expressions_helpers@expr_name(expr);
+    case is_device_prim_name(n) of {
+        false -> false;
+        true -> terms_helpers@sir_identifier_is_function(context, n) == false
+    }
+}
+
+fn marker_type(v: string) -> string {
+    case v of {
+        "R8" -> "uint8";
+        "R16" -> "uint16";
+        "R32" -> "uint32";
+        "R64" -> "uint64";
+        _: string -> ""
+    }
+}
+
+// A register marker on a parenthesised node states the width the wrapped expression is read at.
+fn marker_expected(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, expected_type: string) -> string {
+    m: string <- marker_type(type_checker_expressions_helpers@expr_value(expr));
+    case m == "" of {
+        true -> expected_type;
+        false -> m
+    }
+}
+
+fn is_width_type(t: string) -> boolean {
+    case t of {
+        "uint8" -> true;
+        "uint16" -> true;
+        "uint32" -> true;
+        "uint64" -> true;
+        _: string -> false
+    }
+}
+
+fn width_type_of_bits(bits: int64) -> string {
+    case bits of {
+        8 -> "uint8";
+        16 -> "uint16";
+        64 -> "uint64";
+        _: int64 -> "uint32"
+    }
+}
+
+fn strip_spaces_from(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == " " of {
+                true -> strip_spaces_from(s, i + 1, acc);
+                false -> strip_spaces_from(s, i + 1, concat(acc, c))
+            }
+        }
+    }
+}
+
+fn strip_spaces(s: string) -> string {
+    strip_spaces_from(s, 0, "")
+}
+
+fn find_comma(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + 1) == "," of {
+            true -> i;
+            false -> find_comma(s, i + 1)
+        }
+    }
+}
+
+// --- descriptions as data ------------------------------------------------------------------------
+
+fn is_description_decl(d: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> boolean {
+    case d.tag == 0 and d.name == "registers" of {
+        false -> false;
+        true -> case d.parameters.is_nil of {
+            true -> false;
+            false -> starts_with(strip_spaces(d.parameters.head.type_name), "(:")
+        }
+    }
+}
+
+fn description_list(body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    case type_checker_expressions_helpers@expr_kind(body) of {
+        2 -> description_list(type_checker_expressions_helpers@expr_child_inner(body));
+        _: int64 -> body
+    }
+}
+
+fn field_atom(elem: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, field: string) -> string {
+    (found: boolean, e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) <- terms_helpers@find_struct_field_expr(elem, field);
+    case found of {
+        true -> type_checker_expressions_helpers@expr_value(e);
+        false -> ""
+    }
+}
+
+fn field_int(elem: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, field: string) -> int64 {
+    (found: boolean, e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) <- terms_helpers@find_struct_field_expr(elem, field);
+    case found of {
+        true -> string_parse@string_to_int64(type_checker_expressions_helpers@expr_value(e));
+        false -> 0
+    }
+}
+
+fn add_register_row(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], tag: string, elem: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, size: int64) -> (List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], int64) {
+    case type_checker_expressions_helpers@expr_kind(elem) == 21 of {
+        false -> (env, size);
+        true -> {
+            reg_name: string <- field_atom(elem, "name");
+            offset: int64 <- field_int(elem, "offset");
+            width: int64 <- field_int(elem, "width");
+            access: string <- field_atom(elem, "access");
+            key: string <- concat("__silica_devreg:", concat(tag, concat(":", reg_name)));
+            row: string <- concat(literals@int64_to_decimal_string(offset), concat(",", concat(literals@int64_to_decimal_string(width), concat(",", access))));
+            end_b: int64 <- offset + width / 8;
+            size2: int64 <- case end_b > size of {
+                true -> end_b;
+                false -> size
+            };
+            (terms_helpers@sir_env_add_symbol(env, key, row), size2)
+        }
+    }
+}
+
+// A list literal is its root (name "") or a spine node (name ","): inner = the element, right = the rest.
+fn add_register_rows(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], tag: string, list_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, size: int64) -> (List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], int64) {
+    case type_checker_expressions_helpers@expr_kind(list_e) == 20 of {
+        false -> (env, size);
+        true -> {
+            (env2: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], size2: int64) <- add_register_row(env, tag, type_checker_expressions_helpers@expr_child_inner(list_e), size);
+            rest: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- type_checker_expressions_helpers@expr_child_right(list_e);
+            case type_checker_expressions_helpers@expr_kind(rest) == 20 and type_checker_expressions_helpers@expr_name(rest) == "," of {
+                true -> add_register_rows(env2, tag, rest, size2);
+                false -> add_register_row(env2, tag, rest, size2)
+            }
+        }
+    }
+}
+
+fn add_rows_from_decl(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], d: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] {
+    case is_description_decl(d) of {
+        false -> env;
+        true -> {
+            tag: string <- strip_spaces(d.parameters.head.type_name);
+            (env2: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], size: int64) <- add_register_rows(env, tag, description_list(d.body), 0);
+            size_key: string <- concat("__silica_devsize:", tag);
+            size_text: string <- literals@int64_to_decimal_string(size);
+            terms_helpers@sir_env_add_symbol(env2, size_key, size_text)
+        }
+    }
+}
+
+fn add_rows_from_decls(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]) -> List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] {
+    case decls.is_nil of {
+        true -> env;
+        false -> add_rows_from_decls(add_rows_from_decl(env, decls.head), decls.tail)
+    }
+}
+
+fn add_description_rows(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] {
+    add_rows_from_decls(env, program.declarations)
+}
+
+fn register_row(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], tag: string, reg_name: string) -> (boolean, string) {
+    key: string <- concat("__silica_devreg:", concat(tag, concat(":", reg_name)));
+    terms_helpers@sir_lookup_symbol_found(env, key)
+}
+
+fn row_offset(row: string) -> int64 {
+    c1: int64 <- find_comma(row, 0);
+    case c1 < 0 of {
+        true -> 0;
+        false -> string_parse@string_to_int64(substring(row, 0, c1))
+    }
+}
+
+fn row_width(row: string) -> int64 {
+    c1: int64 <- find_comma(row, 0);
+    c2: int64 <- find_comma(row, c1 + 1);
+    case c1 < 0 or c2 < 0 of {
+        true -> 32;
+        false -> string_parse@string_to_int64(substring(row, c1 + 1, c2))
+    }
+}
+
+fn row_access(row: string) -> string {
+    c1: int64 <- find_comma(row, 0);
+    c2: int64 <- find_comma(row, c1 + 1);
+    case c1 < 0 or c2 < 0 of {
+        true -> "";
+        false -> substring(row, c2 + 1, length_bytes(row))
+    }
+}
+
+fn window_size(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], tag: string) -> int64 {
+    size_key: string <- concat("__silica_devsize:", tag);
+    (found: boolean, v: string) <- terms_helpers@sir_lookup_symbol_found(env, size_key);
+    case found of {
+        true -> string_parse@string_to_int64(v);
+        false -> 0
+    }
+}
+
+// "device_window(R, (:tag))" -> "(:tag)"
+fn window_tag_of_type(t: string) -> string {
+    s: string <- strip_spaces(t);
+    c: int64 <- find_comma(s, 0);
+    case starts_with(s, "device_window(") and c > 0 of {
+        true -> substring(s, c + 1, length_bytes(s) - 1);
+        false -> ""
+    }
+}
+
+// map_device's first argument: `(:tag)` as a one-atom tuple, a parenthesised atom, or a bare atom.
+fn tag_literal_text(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> string {
+    case type_checker_expressions_helpers@expr_kind(e) of {
+        5 -> concat("(", concat(type_checker_expressions_helpers@expr_value(e), ")"));
+        2 -> tag_literal_text(type_checker_expressions_helpers@expr_child_inner(e));
+        9 -> tag_literal_text(type_checker_expressions_helpers@expr_child_inner(e));
+        _: int64 -> ""
+    }
+}
+
+// The marker of a call's third argument sits on the argument pair that holds it.
+fn third_arg_marker(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> string {
+    r1: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- type_checker_expressions_helpers@expr_child_right(expr);
+    case type_checker_expressions_helpers@expr_kind(r1) == 4 and type_checker_expressions_helpers@expr_name(r1) == "" of {
+        false -> "";
+        true -> {
+            r2: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- type_checker_expressions_helpers@expr_child_right(r1);
+            case type_checker_expressions_helpers@expr_kind(r2) == 4 and type_checker_expressions_helpers@expr_name(r2) == "" of {
+                true -> type_checker_expressions_helpers@expr_value(r2);
+                false -> type_checker_expressions_helpers@expr_value(r1)
+            }
+        }
+    }
+}
+
+fn int_const(n: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    text: string <- literals@int64_to_decimal_string(n);
+    d: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- sir_ast@dummy_sir_term();
+    sir_ast@make_sir_term(0, "int64", text, "", d, d)
+}
+
+// --- the prims -----------------------------------------------------------------------------------
+
+fn build_device_prim(context: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, expected_type: string, lower: fn({ env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, string) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    case type_checker_expressions_helpers@expr_name(expr) of {
+        "map_device" -> build_map_device(context, expr, expected_type, lower);
+        "peek" -> build_peek(context, expr, expected_type, lower);
+        "poke" -> build_poke(context, expr, lower);
+        _: string -> sir_ast@dummy_sir_term()
+    }
+}
+
+// map_device((:tag), base) -> prim(map_device, base, size) typed as the window.
+fn build_map_device(context: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, expected_type: string, lower: fn({ env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, string) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    tag: string <- tag_literal_text(type_checker_expressions_helpers@expr_child_inner(expr));
+    base_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- lower(context, type_checker_expressions_helpers@call_second_arg_expr(expr), "uint64");
+    wtype: string <- case starts_with(expected_type, "device_window(") of {
+        true -> expected_type;
+        false -> concat("device_window(R, ", concat(tag, ")"))
+    };
+    size: int64 <- window_size(context.env, tag);
+    size_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- int_const(size);
+    sir_ast@make_sir_term(6, wtype, "[register_rwr]", "map_device", base_sir, size_sir)
+}
+
+// peek(w, :r) -> prim(peek, w, offset) typed by the marker (else the described width).
+fn build_peek(context: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, expected_type: string, lower: fn({ env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, string) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    w_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- type_checker_expressions_helpers@expr_child_inner(expr);
+    wtype: string <- terms_helpers@sir_infer_expr_type(context, w_e);
+    reg_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- type_checker_expressions_helpers@call_second_arg_expr(expr);
+    reg: string <- type_checker_expressions_helpers@expr_value(reg_e);
+    (found: boolean, row: string) <- register_row(context.env, window_tag_of_type(wtype), reg);
+    offset: int64 <- case found of {
+        true -> row_offset(row);
+        false -> 0
+    };
+    width_t: string <- case is_width_type(expected_type) of {
+        true -> expected_type;
+        false -> width_type_of_bits(row_width(row))
+    };
+    w_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- lower(context, w_e, wtype);
+    off_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- int_const(offset);
+    sir_ast@make_sir_term(6, width_t, "[register_rwr]", "peek", w_sir, off_sir)
+}
+
+// poke(w, :r, v impl RegisterN {}) -> prim(poke, w, tuple_make(offset, v)) : atom.
+fn build_poke(context: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, lower: fn({ env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, string) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    w_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- type_checker_expressions_helpers@expr_child_inner(expr);
+    wtype: string <- terms_helpers@sir_infer_expr_type(context, w_e);
+    reg_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- type_checker_expressions_helpers@call_second_arg_expr(expr);
+    reg: string <- type_checker_expressions_helpers@expr_value(reg_e);
+    (found: boolean, row: string) <- register_row(context.env, window_tag_of_type(wtype), reg);
+    offset: int64 <- case found of {
+        true -> row_offset(row);
+        false -> 0
+    };
+    m: string <- marker_type(third_arg_marker(expr));
+    vtype: string <- case m == "" of {
+        true -> width_type_of_bits(row_width(row));
+        false -> m
+    };
+    w_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- lower(context, w_e, wtype);
+    v_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- lower(context, type_checker_expressions_helpers@call_third_arg_expr(expr), vtype);
+    off_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- int_const(offset);
+    right: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- sir_ast@make_sir_term(6, "unit", "", "tuple_make", off_sir, v_sir);
+    sir_ast@make_sir_term(6, "atom", "[register_rwr]", "poke", w_sir, right)
+}
+
+// Descriptions visible to this unit also live in the modules it uses (device spec §4.9 rule 4), which
+// reach the SIR generator as the batch's world.
+fn add_description_rows_from_world(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] {
+    case world.is_nil of {
+        true -> env;
+        false -> add_description_rows_from_world(add_description_rows(env, world.head.program), world.tail)
+    }
+}
+
+fn no_description_world() -> List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)] {
+    sequence proc[mem(normal)]
+        w: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)] <- empty[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]()
+    produces
+        pure w
+    end
+}

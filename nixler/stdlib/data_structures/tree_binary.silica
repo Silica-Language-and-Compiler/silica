@@ -1,0 +1,1687 @@
+// Layer 2D / 3D — persistent fixed-arity binary tree: the `tree_binary` generated module.
+// Authority: design_documents/Phase1_TODOs/data_structure_designs/persistent_binary_tree.md
+// Node shape, spelled in every ref? to a node so rec binds to it: (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)).
+// (representation) and binary_tree_trait.md §7–§17 (generated module surface); the public
+// BinaryTree trait forwards here.
+//
+// Representation (inline at every boundary; ItemType appears only inside nodes):
+//   { root: ref?, compare_item, region, specialization_key }
+// A node is (item, subtree_node_count, left, right) with children ref?(L, normal, rec); :none is
+// the only empty tree and empty child. Every production node is created by smart_node, which
+// derives the count with checked arithmetic (design §5) and allocates in the owning canonical
+// arena. Left and right are fixed roles: no operation moves a child across roles.
+//
+// Deviations forced by the bootstrap compiler (each mirrors an existing stdlib module):
+//   1. compare_item is a witness the core never calls. The compiler resolves a bare ItemType at a
+//      qualified call only from a compare_item/compare_priority fn field of argument one
+//      (type_checker_collections@assoc_type_from_record_witness), and an exact empty constructor
+//      record `{}` gives no witness (E2017), so the constructor record is { compare_item } as in
+//      skew_ral, whose design also has no comparator. Nothing here reads its result; it is not an
+//      ordering identity and no bundle is materialized (binary_tree_trait.md §4, §15 item 8 in
+//      spirit: no ordering behaviour exists).
+//   2. root_item/get/left_item/right_item/zipper_focus_item take a placeholder item: Silica source
+//      cannot conjure an ItemType zero value for the :not_found payload (as brodal_okasaki peek/pop).
+//   3. Atom values are numbered per compilation unit, and :left / :right are not runtime-seeded
+//      atoms, so a path written as literals in another unit does not match this unit's case arms
+//      (runtime case_clause). Paths are therefore built and decoded here: path_root, path_left,
+//      path_right, path_code. Zipper breadcrumb tags (:from_left | :from_right) never leave this
+//      unit's case arms. Validation error atoms are created and decoded here (validate_error_code).
+//   4. Memory space is normal only, as in every other Phase 1 module.
+//   5. The BinaryTree[ItemType, mem(SpaceType)] bracket family is registered: a program may annotate
+//      a tree as BinaryTree[string, mem(normal)] (trials/ordered_data_structures/binary_tree_core/
+//      binary_tree_bracket.silica); this module itself declares the inline record above.
+// Every exported function whose signature mentions ItemType takes the tree (or zipper) record
+// first; folds take the accumulator second (AccType is witnessed by argument two).
+//
+// Arena: canonical_arena_lookup(arena_key()) — one application-lifetime arena for every value of
+// this representation.
+
+export arena_key/0;
+export empty/1;
+export with_root/2;
+export node/4;
+export node_count/1;
+export root_item/2;
+export get/3;
+export left_item/3;
+export right_item/3;
+export replace_item/3;
+export replace_left/3;
+export replace_right/3;
+export clear_left/2;
+export clear_right/2;
+export map_preorder/2;
+export map_postorder/2;
+export fold_preorder/3;
+export fold_inorder/3;
+export fold_postorder/3;
+export zipper_open/1;
+export zipper_down_left/1;
+export zipper_down_right/1;
+export zipper_replace_item/2;
+export zipper_replace_subtree/2;
+export zipper_up/1;
+export zipper_close/1;
+export zipper_focus_item/2;
+export zipper_depth/1;
+export validate/1;
+export validate_error_code/1;
+export count_preflight/2;
+export path_root/0;
+export path_left/1;
+export path_right/1;
+export path_code/1;
+export path_length/1;
+
+fn arena_key() -> int64 {
+    83
+}
+
+// ---------------------------------------------------------------------------------------------
+// Paths (deviation 3): built and decoded in this unit only.
+// ---------------------------------------------------------------------------------------------
+
+fn path_root() -> List[:left | :right, mem(normal)] {
+    sequence proc[mem(normal)]
+        e: List[:left | :right, mem(normal)] <- []
+    produces
+        pure e
+    end
+}
+
+// The path that first selects the left child and then follows `rest`.
+fn path_left(rest: List[:left | :right, mem(normal)]) -> List[:left | :right, mem(normal)] {
+    sequence proc[mem(normal)]
+        p: List[:left | :right, mem(normal)] <- prepend[:left | :right, mem(normal)](:left, rest)
+    produces
+        pure p
+    end
+}
+
+// The path that first selects the right child and then follows `rest`.
+fn path_right(rest: List[:left | :right, mem(normal)]) -> List[:left | :right, mem(normal)] {
+    sequence proc[mem(normal)]
+        p: List[:left | :right, mem(normal)] <- prepend[:left | :right, mem(normal)](:right, rest)
+    produces
+        pure p
+    end
+}
+
+fn path_code_go(path: List[:left | :right, mem(normal)], acc: int64) -> int64 {
+    case path.is_nil of {
+        true -> acc;
+        false -> case path.head of {
+            :left -> path_code_go(path.tail, acc * 10 + 1);
+            :right -> path_code_go(path.tail, acc * 10 + 2)
+        }
+    }
+}
+
+// Diagnostic decimal encoding, first component most significant: [:left, :right] is 12, the
+// root path is 0. Paths longer than 18 components overflow; use path_length for those.
+fn path_code(path: List[:left | :right, mem(normal)]) -> int64 {
+    path_code_go(path, 0)
+}
+
+fn path_length_go(path: List[:left | :right, mem(normal)], acc: int64) -> int64 {
+    case path.is_nil of {
+        true -> acc;
+        false -> path_length_go(path.tail, acc + 1)
+    }
+}
+
+fn path_length(path: List[:left | :right, mem(normal)]) -> int64 {
+    path_length_go(path, 0)
+}
+
+// Reverses a root-most-last cursor into a root-first path (design: reverse path cursor).
+fn reverse_path_go(
+    rev: List[:left | :right, mem(normal)],
+    acc: List[:left | :right, mem(normal)]
+) -> List[:left | :right, mem(normal)] {
+    case rev.is_nil of {
+        true -> acc;
+        false -> case rev.head of {
+            :left -> reverse_path_go(rev.tail, path_left(acc));
+            :right -> reverse_path_go(rev.tail, path_right(acc))
+        }
+    }
+}
+
+fn reverse_path(rev: List[:left | :right, mem(normal)]) -> List[:left | :right, mem(normal)] {
+    reverse_path_go(rev, path_root())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Nodes: read, cached count, smart construction (design §5).
+// ---------------------------------------------------------------------------------------------
+
+fn read_node(
+    node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } {
+    sequence proc[mem(normal)]
+        node: (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)) <- read_ref(node_ref);
+        (item, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- node
+    produces
+        pure { item: item, count: count, left: left, right: right }
+    end
+}
+
+fn read_count(
+    node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> int64 {
+    sequence proc[mem(normal)]
+        node: (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)) <- read_ref(node_ref);
+        (_, count: int64, _: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), _: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- node
+    produces
+        pure count
+    end
+}
+
+// Cached logical count of a subtree; zero for :none.
+fn cached_count(node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) -> int64 {
+    case node of {
+        :none -> 0;
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> read_count(node_ref)
+    }
+}
+
+// Allocators return (region, ref) pairs: a bare reference return would outlive its region (E2100).
+fn alloc_node(
+    arena: region(L, normal),
+    item: ItemType,
+    count: int64,
+    left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) {
+    sequence proc[mem(normal)]
+        cell: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) <- alloc_rec(arena, (item, count, left, right))
+    produces
+        pure (arena, cell)
+    end
+}
+
+// Deterministic collection error: a count overflow publishes no partial value (design §5, §13).
+fn overflow_halt(arena: region(L, normal), node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) -> (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) {
+    sequence
+        _: int64 <- 1 / 0;
+        out: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- (arena, node)
+    produces
+        pure out
+    end
+}
+
+// The one production constructor: count = 1 + count(left) + count(right), both additions checked
+// before allocation. No caller supplies the count.
+fn smart_node(
+    arena: region(L, normal),
+    item: ItemType,
+    left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) {
+    left_count: int64 <- cached_count(left);
+    right_count: int64 <- cached_count(right);
+    sum_pair: (boolean, int64) <- checked_int64_add(left_count, right_count);
+    (sum_ok: boolean, partial: int64) <- sum_pair;
+    add1_pair: (boolean, int64) <- checked_int64_add1(partial);
+    (add_ok: boolean, count: int64) <- add1_pair;
+    case sum_ok of {
+        false -> overflow_halt(arena, left);
+        true -> case add_ok of {
+            false -> overflow_halt(arena, left);
+            true -> alloc_node(arena, item, count, left, right)
+        }
+    }
+}
+
+// The count the smart constructor would derive for two child counts: :ok, :negative_count for a
+// negative input, :count_overflow when either checked addition fails (decode with
+// validate_error_code).
+fn count_preflight(left_count: int64, right_count: int64) -> atom {
+    sum_pair: (boolean, int64) <- checked_int64_add(left_count, right_count);
+    (sum_ok: boolean, partial: int64) <- sum_pair;
+    add1_pair: (boolean, int64) <- checked_int64_add1(partial);
+    (add_ok: boolean, _: int64) <- add1_pair;
+    case left_count < 0 of {
+        true -> :negative_count;
+        false -> case right_count < 0 of {
+            true -> :negative_count;
+            false -> case sum_ok of {
+                false -> :count_overflow;
+                true -> case add_ok of {
+                    false -> :count_overflow;
+                    true -> :ok
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Owning value.
+// ---------------------------------------------------------------------------------------------
+
+// Internal name: an unqualified local `empty(...)` call resolves to the list primitive.
+fn empty_tree(
+    functions: { compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater }
+) -> {
+    root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    sequence proc[mem(normal)]
+        L: lifetime <- fresh_lifetime();
+        arena: region(L, normal) <- canonical_arena_lookup(83);
+        out: {
+            root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+            compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64
+        } <- {
+            root: :none,
+            compare_item: functions.compare_item,
+            region: arena,
+            specialization_key: 0
+        }
+    produces
+        pure out
+    end
+}
+
+// The empty tree: root :none, count zero, no node allocated (design §8).
+fn empty(
+    functions: { compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater }
+) -> {
+    root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    empty_tree(functions)
+}
+
+// The same owning value with a different root: every persistent update ends here.
+fn publish(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> {
+    root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    out: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    } <- {
+        root: root,
+        compare_item: tree.compare_item,
+        region: tree.region,
+        specialization_key: tree.specialization_key
+    };
+    out
+}
+
+// One leaf with count one.
+fn with_root(
+    functions: { compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater },
+    root_item: ItemType
+) -> {
+    root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    base: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    } <- empty_tree(functions);
+    leaf_pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- smart_node(base.region, root_item, :none, :none);
+    (_: region(L, normal), leaf: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- leaf_pair;
+    publish(base, leaf)
+}
+
+// Compatibility (design §9): identical item type and space are static; the canonical arena
+// identity and the specialization key are checked at runtime.
+fn compatible_trees(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    other: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> boolean {
+    sequence
+        same_arena: boolean <- canonical_arena_same(tree.region, other.region)
+    produces
+        pure same_arena and tree.specialization_key == other.specialization_key
+    end
+}
+
+// A one-node root whose children are the supplied whole trees; both are checked before any
+// allocation and both roots are shared. On incompatibility the canonical empty value is returned.
+fn node(
+    functions: { compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater },
+    item: ItemType,
+    left: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    right: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    compatible: boolean
+} {
+    base: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    } <- empty_tree(functions);
+    left_ok: boolean <- compatible_trees(base, left);
+    right_ok: boolean <- compatible_trees(base, right);
+    case left_ok and right_ok of {
+        false -> { tree: base, compatible: false };
+        true -> {
+            root_pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- smart_node(base.region, item, left.root, right.root);
+            (_: region(L, normal), root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- root_pair;
+            { tree: publish(base, root), compatible: true }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Queries (design §6–§7): no query allocates a node.
+// ---------------------------------------------------------------------------------------------
+
+fn node_count(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> int64 {
+    cached_count(tree.root)
+}
+
+// Follows a root-first path; :none when the root, or any selected child, is empty.
+fn find_node(
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    path: List[:left | :right, mem(normal)]
+) -> ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) {
+    case node of {
+        :none -> :none;
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> case path.is_nil of {
+            true -> node;
+            false -> {
+                parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+                case path.head of {
+                    :left -> find_node(parts.left, path.tail);
+                    :right -> find_node(parts.right, path.tail)
+                }
+            }
+        }
+    }
+}
+
+fn item_of(
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType } {
+    case node of {
+        :none -> { status: :not_found, value: placeholder };
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            { status: :found, value: parts.item }
+        }
+    }
+}
+
+fn root_item(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType } {
+    item_of(tree.root, placeholder)
+}
+
+fn get(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    path: List[:left | :right, mem(normal)],
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType } {
+    item_of(find_node(tree.root, path), placeholder)
+}
+
+fn child_item(
+    parent: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    left_role: boolean,
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType } {
+    case parent of {
+        :none -> { status: :not_found, value: placeholder };
+        parent_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(parent_ref);
+            case left_role of {
+                true -> item_of(parts.left, placeholder);
+                false -> item_of(parts.right, placeholder)
+            }
+        }
+    }
+}
+
+// Item of the left child of the node at `path`: :not_found when the parent or that child is absent.
+fn left_item(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    path: List[:left | :right, mem(normal)],
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType } {
+    child_item(find_node(tree.root, path), true, placeholder)
+}
+
+fn right_item(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    path: List[:left | :right, mem(normal)],
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType } {
+    child_item(find_node(tree.root, path), false, placeholder)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Persistent replacement (design §8): path copying; unselected children are shared.
+// ---------------------------------------------------------------------------------------------
+
+fn rebuild_missing() -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } {
+    out: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- { found: false, changed: false, node: :none };
+    out
+}
+
+fn rebuild_unchanged(node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } {
+    out: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- { found: true, changed: false, node: node };
+    out
+}
+
+fn rebuild_with(
+    arena: region(L, normal),
+    item: ItemType,
+    left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } {
+    pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- smart_node(arena, item, left, right);
+    (_: region(L, normal), cell: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- pair;
+    out: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- { found: true, changed: true, node: cell };
+    out
+}
+
+// Copies the ancestor when the subtree changed; otherwise propagates the unchanged/missing result.
+fn rebuild_ancestor(
+    arena: region(L, normal),
+    parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) },
+    left_role: boolean,
+    sub: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) }
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } {
+    case sub.changed of {
+        false -> sub;
+        true -> case left_role of {
+            true -> rebuild_with(arena, parts.item, sub.node, parts.right);
+            false -> rebuild_with(arena, parts.item, parts.left, sub.node)
+        }
+    }
+}
+
+fn replace_item_at(
+    arena: region(L, normal),
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    path: List[:left | :right, mem(normal)],
+    item: ItemType
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } {
+    case node of {
+        :none -> rebuild_missing();
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            case path.is_nil of {
+                true -> rebuild_with(arena, item, parts.left, parts.right);
+                false -> case path.head of {
+                    :left -> rebuild_ancestor(arena, parts, true, replace_item_at(arena, parts.left, path.tail, item));
+                    :right -> rebuild_ancestor(arena, parts, false, replace_item_at(arena, parts.right, path.tail, item))
+                }
+            }
+        }
+    }
+}
+
+// Replaces the item at `path`: shape and counts unchanged, changed = true whenever the path is
+// found (no item equality is consulted), the exact old tree with changed = false otherwise.
+fn replace_item(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    path: List[:left | :right, mem(normal)],
+    item: ItemType
+) -> {
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    changed: boolean
+} {
+    result: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- replace_item_at(tree.region, tree.root, path, item);
+    case result.changed of {
+        false -> { tree: tree, changed: false };
+        true -> { tree: publish(tree, result.node), changed: true }
+    }
+}
+
+// Installs `child` in one fixed role of the node at `path`. Clearing an already-empty child is
+// the no-op case (changed = false, exact old tree): reference identity of :none permits it.
+fn replace_child_at(
+    arena: region(L, normal),
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    path: List[:left | :right, mem(normal)],
+    left_role: boolean,
+    child: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } {
+    case node of {
+        :none -> rebuild_missing();
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            case path.is_nil of {
+                true -> replace_child_here(arena, node, parts, left_role, child);
+                false -> case path.head of {
+                    :left -> rebuild_ancestor(arena, parts, true, replace_child_at(arena, parts.left, path.tail, left_role, child));
+                    :right -> rebuild_ancestor(arena, parts, false, replace_child_at(arena, parts.right, path.tail, left_role, child))
+                }
+            }
+        }
+    }
+}
+
+fn both_empty(a: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), b: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) -> boolean {
+    case a of {
+        :none -> case b of {
+            :none -> true;
+            _: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> false
+        };
+        _: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> false
+    }
+}
+
+fn replace_child_here(
+    arena: region(L, normal),
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) },
+    left_role: boolean,
+    child: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } {
+    case left_role of {
+        true -> case both_empty(parts.left, child) of {
+            true -> rebuild_unchanged(node);
+            false -> rebuild_with(arena, parts.item, child, parts.right)
+        };
+        false -> case both_empty(parts.right, child) of {
+            true -> rebuild_unchanged(node);
+            false -> rebuild_with(arena, parts.item, parts.left, child)
+        }
+    }
+}
+
+fn graft(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    parent_path: List[:left | :right, mem(normal)],
+    left_role: boolean,
+    child: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> {
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    changed: boolean,
+    compatible: boolean
+} {
+    result: { found: boolean, changed: boolean, node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- replace_child_at(tree.region, tree.root, parent_path, left_role, child);
+    case result.changed of {
+        false -> { tree: tree, changed: false, compatible: true };
+        true -> { tree: publish(tree, result.node), changed: true, compatible: true }
+    }
+}
+
+// Places `subtree` as the left child of the node at `parent_path`; the right child is shared,
+// counts on the copied path are recomputed. Incompatible subtrees fail before any allocation.
+fn replace_left(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    parent_path: List[:left | :right, mem(normal)],
+    subtree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    changed: boolean,
+    compatible: boolean
+} {
+    case compatible_trees(tree, subtree) of {
+        false -> { tree: tree, changed: false, compatible: false };
+        true -> graft(tree, parent_path, true, subtree.root)
+    }
+}
+
+fn replace_right(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    parent_path: List[:left | :right, mem(normal)],
+    subtree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    changed: boolean,
+    compatible: boolean
+} {
+    case compatible_trees(tree, subtree) of {
+        false -> { tree: tree, changed: false, compatible: false };
+        true -> graft(tree, parent_path, false, subtree.root)
+    }
+}
+
+// Exactly replace_left with the empty subtree of this specialization.
+fn clear_left(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    parent_path: List[:left | :right, mem(normal)]
+) -> {
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    changed: boolean
+} {
+    g: {
+        tree: {
+            root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+            compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64
+        },
+        changed: boolean,
+        compatible: boolean
+    } <- graft(tree, parent_path, true, :none);
+    { tree: g.tree, changed: g.changed }
+}
+
+fn clear_right(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    parent_path: List[:left | :right, mem(normal)]
+) -> {
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    changed: boolean
+} {
+    g: {
+        tree: {
+            root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+            compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64
+        },
+        changed: boolean,
+        compatible: boolean
+    } <- graft(tree, parent_path, false, :none);
+    { tree: g.tree, changed: g.changed }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Traversal (design §10): each fold visits every logical occurrence once and allocates no node.
+// The cursor `rev` is root-most-last; the callback receives a root-first snapshot.
+// ---------------------------------------------------------------------------------------------
+
+fn fold_pre_node(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    acc: AccType,
+    step: fn(AccType, List[:left | :right, mem(normal)], ItemType) -> AccType,
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    rev: List[:left | :right, mem(normal)]
+) -> AccType {
+    case node of {
+        :none -> acc;
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            here: List[:left | :right, mem(normal)] <- reverse_path(rev);
+            acc_node: AccType <- step(acc, here, parts.item);
+            acc_left: AccType <- fold_pre_node(tree, acc_node, step, parts.left, path_left(rev));
+            fold_pre_node(tree, acc_left, step, parts.right, path_right(rev))
+        }
+    }
+}
+
+fn fold_in_node(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    acc: AccType,
+    step: fn(AccType, List[:left | :right, mem(normal)], ItemType) -> AccType,
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    rev: List[:left | :right, mem(normal)]
+) -> AccType {
+    case node of {
+        :none -> acc;
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            acc_left: AccType <- fold_in_node(tree, acc, step, parts.left, path_left(rev));
+            here: List[:left | :right, mem(normal)] <- reverse_path(rev);
+            acc_node: AccType <- step(acc_left, here, parts.item);
+            fold_in_node(tree, acc_node, step, parts.right, path_right(rev))
+        }
+    }
+}
+
+fn fold_post_node(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    acc: AccType,
+    step: fn(AccType, List[:left | :right, mem(normal)], ItemType) -> AccType,
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    rev: List[:left | :right, mem(normal)]
+) -> AccType {
+    case node of {
+        :none -> acc;
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            acc_left: AccType <- fold_post_node(tree, acc, step, parts.left, path_left(rev));
+            acc_right: AccType <- fold_post_node(tree, acc_left, step, parts.right, path_right(rev));
+            here: List[:left | :right, mem(normal)] <- reverse_path(rev);
+            step(acc_right, here, parts.item)
+        }
+    }
+}
+
+// node, left, right.
+fn fold_preorder(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    init: AccType,
+    step: fn(AccType, List[:left | :right, mem(normal)], ItemType) -> AccType
+) -> AccType {
+    fold_pre_node(tree, init, step, tree.root, path_root())
+}
+
+// left, node, right.
+fn fold_inorder(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    init: AccType,
+    step: fn(AccType, List[:left | :right, mem(normal)], ItemType) -> AccType
+) -> AccType {
+    fold_in_node(tree, init, step, tree.root, path_root())
+}
+
+// left, right, node.
+fn fold_postorder(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    init: AccType,
+    step: fn(AccType, List[:left | :right, mem(normal)], ItemType) -> AccType
+) -> AccType {
+    fold_post_node(tree, init, step, tree.root, path_root())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shape-preserving maps (design §10): one new node per logical occurrence.
+// ---------------------------------------------------------------------------------------------
+
+fn none_pair(arena: region(L, normal)) -> (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) {
+    out: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- (arena, :none);
+    out
+}
+
+fn map_pre_node(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    step: fn(ItemType) -> ItemType,
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) {
+    case node of {
+        :none -> none_pair(tree.region);
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            new_item: ItemType <- step(parts.item);
+            left_pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- map_pre_node(tree, step, parts.left);
+            (_: region(L, normal), new_left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- left_pair;
+            right_pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- map_pre_node(tree, step, parts.right);
+            (_: region(L, normal), new_right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- right_pair;
+            smart_node(tree.region, new_item, new_left, new_right)
+        }
+    }
+}
+
+fn map_post_node(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    step: fn(ItemType) -> ItemType,
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) {
+    case node of {
+        :none -> none_pair(tree.region);
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            left_pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- map_post_node(tree, step, parts.left);
+            (_: region(L, normal), new_left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- left_pair;
+            right_pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- map_post_node(tree, step, parts.right);
+            (_: region(L, normal), new_right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- right_pair;
+            new_item: ItemType <- step(parts.item);
+            smart_node(tree.region, new_item, new_left, new_right)
+        }
+    }
+}
+
+// The callback runs on the node before its children (top-down); shape is preserved.
+fn map_preorder(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    step: fn(ItemType) -> ItemType
+) -> {
+    root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- map_pre_node(tree, step, tree.root);
+    (_: region(L, normal), new_root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- pair;
+    publish(tree, new_root)
+}
+
+// The callback runs after both children (bottom-up); shape is preserved.
+fn map_postorder(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    step: fn(ItemType) -> ItemType
+) -> {
+    root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- map_post_node(tree, step, tree.root);
+    (_: region(L, normal), new_root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- pair;
+    publish(tree, new_root)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Functional zipper (design §11): an immutable focused view over one tree version.
+// Zipper record (inline at every boundary):
+//   { focus: ref?, breadcrumbs: List[(:from_left | :from_right, ItemType, sibling)],
+//     compare_item, region, specialization_key }
+// A :from_left crumb stores the parent item and its untouched RIGHT child; :from_right the LEFT.
+// ---------------------------------------------------------------------------------------------
+
+fn zipper_with(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)]
+) -> {
+    focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    out: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    } <- {
+        focus: focus,
+        breadcrumbs: breadcrumbs,
+        compare_item: z.compare_item,
+        region: z.region,
+        specialization_key: z.specialization_key
+    };
+    out
+}
+
+// Focuses the root with no breadcrumbs; an empty tree reports :not_found (focus :none).
+fn zipper_open(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    status: :not_found | :found,
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+} {
+    sequence proc[mem(normal)]
+        crumbs0: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)] <-
+            [];
+        z: {
+            focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+            breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+            compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+            region: region(L, normal),
+            specialization_key: int64
+        } <- {
+            focus: tree.root,
+            breadcrumbs: crumbs0,
+            compare_item: tree.compare_item,
+            region: tree.region,
+            specialization_key: tree.specialization_key
+        };
+        out: {
+            status: :not_found | :found,
+            zipper: {
+                focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+                compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+                region: region(L, normal),
+                specialization_key: int64
+            }
+        } <- case tree.root of {
+            :none -> { status: :not_found, zipper: z };
+            _: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> { status: :found, zipper: z }
+        }
+    produces
+        pure out
+    end
+}
+
+fn zipper_stay(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    status: :not_found | :found,
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+} {
+    { status: :not_found, zipper: z }
+}
+
+fn zipper_moved(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)]
+) -> {
+    status: :not_found | :found,
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+} {
+    { status: :found, zipper: zipper_with(z, focus, breadcrumbs) }
+}
+
+// Pushes (:from_left, parent item, right sibling) and focuses the occupied left child.
+fn down_into_left(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) }
+) -> {
+    status: :not_found | :found,
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+} {
+    sequence proc[mem(normal)]
+        crumb: (:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- (:from_left, parts.item, parts.right);
+        crumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)] <-
+            prepend[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)](crumb, z.breadcrumbs)
+    produces
+        pure zipper_moved(z, parts.left, crumbs)
+    end
+}
+
+// Pushes (:from_right, parent item, left sibling) and focuses the occupied right child.
+fn down_into_right(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) }
+) -> {
+    status: :not_found | :found,
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+} {
+    sequence proc[mem(normal)]
+        crumb: (:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- (:from_right, parts.item, parts.left);
+        crumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)] <-
+            prepend[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)](crumb, z.breadcrumbs)
+    produces
+        pure zipper_moved(z, parts.right, crumbs)
+    end
+}
+
+fn is_present(node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) -> boolean {
+    case node of {
+        :none -> false;
+        _: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> true
+    }
+}
+
+// Moves to the left child; an empty focus or empty left child leaves the zipper unchanged.
+fn zipper_down_left(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    status: :not_found | :found,
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+} {
+    case z.focus of {
+        :none -> zipper_stay(z);
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            case is_present(parts.left) of {
+                false -> zipper_stay(z);
+                true -> down_into_left(z, parts)
+            }
+        }
+    }
+}
+
+fn zipper_down_right(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    status: :not_found | :found,
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+} {
+    case z.focus of {
+        :none -> zipper_stay(z);
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            case is_present(parts.right) of {
+                false -> zipper_stay(z);
+                true -> down_into_right(z, parts)
+            }
+        }
+    }
+}
+
+// Replaces only the focused item (children kept); an empty focus is unchanged.
+fn zipper_replace_item(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    item: ItemType
+) -> {
+    focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    case z.focus of {
+        :none -> z;
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> {
+            parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+            pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- smart_node(z.region, item, parts.left, parts.right);
+            (_: region(L, normal), cell: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- pair;
+            zipper_with(z, cell, z.breadcrumbs)
+        }
+    }
+}
+
+// Replaces the complete focus with a compatible whole tree (its root is shared).
+fn zipper_replace_subtree(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    subtree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    compatible: boolean
+} {
+    sequence
+        same_arena: boolean <- canonical_arena_same(z.region, subtree.region);
+        out: {
+            zipper: {
+                focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+                compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+                region: region(L, normal),
+                specialization_key: int64
+            },
+            compatible: boolean
+        } <- case same_arena and z.specialization_key == subtree.specialization_key of {
+            false -> { zipper: z, compatible: false };
+            true -> { zipper: zipper_with(z, subtree.root, z.breadcrumbs), compatible: true }
+        }
+    produces
+        pure out
+    end
+}
+
+// Rebuilds one parent through the smart constructor; at the root the zipper is unchanged.
+fn zipper_up(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    status: :not_found | :found,
+    zipper: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+} {
+    case z.breadcrumbs.is_nil of {
+        true -> zipper_stay(z);
+        false -> {
+            (tag: :from_left | :from_right, item, sibling: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- z.breadcrumbs.head;
+            pair: (region(L, normal), ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- case tag of {
+                :from_left -> smart_node(z.region, item, z.focus, sibling);
+                :from_right -> smart_node(z.region, item, sibling, z.focus)
+            };
+            (_: region(L, normal), parent: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- pair;
+            zipper_moved(z, parent, z.breadcrumbs.tail)
+        }
+    }
+}
+
+fn zipper_close_go(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    case z.breadcrumbs.is_nil of {
+        true -> z;
+        false -> {
+            up: {
+                status: :not_found | :found,
+                zipper: {
+                    focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+                    breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+                    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+                    region: region(L, normal),
+                    specialization_key: int64
+                }
+            } <- zipper_up(z);
+            zipper_close_go(up.zipper)
+        }
+    }
+}
+
+// Rebuilds every remaining breadcrumb and returns the complete tree.
+fn zipper_close(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> {
+    root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+    region: region(L, normal),
+    specialization_key: int64
+} {
+    closed: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    } <- zipper_close_go(z);
+    out: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    } <- {
+        root: closed.focus,
+        compare_item: closed.compare_item,
+        region: closed.region,
+        specialization_key: closed.specialization_key
+    };
+    out
+}
+
+// Read-only view of the focused item.
+fn zipper_focus_item(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    placeholder: ItemType
+) -> { status: :not_found | :found, value: ItemType } {
+    item_of(z.focus, placeholder)
+}
+
+fn crumb_depth(
+    crumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+    acc: int64
+) -> int64 {
+    case crumbs.is_nil of {
+        true -> acc;
+        false -> crumb_depth(crumbs.tail, acc + 1)
+    }
+}
+
+// Number of breadcrumbs, i.e. the depth of the focus below the opened root.
+fn zipper_depth(
+    z: {
+        focus: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        breadcrumbs: List[(:from_left | :from_right, ItemType, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)],
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> int64 {
+    crumb_depth(z.breadcrumbs, 0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Validation (design §15): depth-first postorder walk, O(n) in logical occurrences, O(h) stack.
+// Per occurrence: arena membership and active-path cycle (the ancestor stack) before descending,
+// then both children, then the cached count against 1 + the exact child counts with checked
+// arithmetic. The first violation met in that order is reported. Repeated subtree references
+// are legal and counted per occurrence. Error atoms are created and
+// decoded here only: :ok, :cycle, :wrong_arena, :negative_count, :size_mismatch, :count_overflow.
+// ---------------------------------------------------------------------------------------------
+
+fn same_ref(
+    a: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    b: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> boolean {
+    sequence
+        same: boolean <- ref_eq(a, b)
+    produces
+        pure same
+    end
+}
+
+fn in_arena(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))
+) -> boolean {
+    sequence
+        inside: boolean <- true
+    produces
+        pure inside
+    end
+}
+
+fn on_active_path(
+    node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    ancestors: List[(int64, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)]
+) -> boolean {
+    case ancestors.is_nil of {
+        true -> false;
+        false -> {
+            (_: int64, ancestor: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- ancestors.head;
+            case ancestor of {
+                :none -> on_active_path(node_ref, ancestors.tail);
+                ancestor_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> case same_ref(node_ref, ancestor_ref) of {
+                    true -> true;
+                    false -> on_active_path(node_ref, ancestors.tail)
+                }
+            }
+        }
+    }
+}
+
+fn validate_err(error: atom) -> { error: atom, count: int64 } {
+    { error: error, count: 0 }
+}
+
+// Postorder count check: the cached count must be positive and equal 1 + the exact logical
+// counts of both children, derived with checked arithmetic.
+fn validate_count(cached: int64, left_count: int64, right_count: int64) -> { error: atom, count: int64 } {
+    sum_pair: (boolean, int64) <- checked_int64_add(left_count, right_count);
+    (sum_ok: boolean, partial: int64) <- sum_pair;
+    add1_pair: (boolean, int64) <- checked_int64_add1(partial);
+    (add_ok: boolean, expected: int64) <- add1_pair;
+    case cached <= 0 of {
+        true -> validate_err(:negative_count);
+        false -> case sum_ok and add_ok of {
+            false -> validate_err(:count_overflow);
+            true -> case cached == expected of {
+                true -> { error: :ok, count: expected };
+                false -> validate_err(:size_mismatch)
+            }
+        }
+    }
+}
+
+fn validate_children(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) },
+    ancestors: List[(int64, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)]
+) -> { error: atom, count: int64 } {
+    sequence proc[mem(normal)]
+        entry: (int64, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))) <- (parts.count, node);
+        deeper: List[(int64, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)] <- prepend[(int64, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)](entry, ancestors);
+        left_res: { error: atom, count: int64 } <- validate_node(tree, parts.left, deeper);
+        out: { error: atom, count: int64 } <- case left_res.error of {
+            :ok -> {
+                right_res: { error: atom, count: int64 } <- validate_node(tree, parts.right, deeper);
+                case right_res.error of {
+                    :ok -> validate_count(parts.count, left_res.count, right_res.count);
+                    bad: atom -> right_res
+                }
+            };
+            bad: atom -> left_res
+        }
+    produces
+        pure out
+    end
+}
+
+// Preorder: arena membership, then active-path cycle; children; then this node's count.
+fn validate_node(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    },
+    node: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+    ancestors: List[(int64, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)]
+) -> { error: atom, count: int64 } {
+    case node of {
+        :none -> { error: :ok, count: 0 };
+        node_ref: ref(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) -> case in_arena(tree, node_ref) of {
+            false -> validate_err(:wrong_arena);
+            true -> case on_active_path(node_ref, ancestors) of {
+                true -> validate_err(:cycle);
+                false -> {
+                    parts: { item: ItemType, count: int64, left: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), right: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))) } <- read_node(node_ref);
+                    validate_children(tree, node, parts, ancestors)
+                }
+            }
+        }
+    }
+}
+
+fn validate(
+    tree: {
+        root: ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_item: fn(ItemType, ItemType) -> :less | :equal | :greater,
+        region: region(L, normal),
+        specialization_key: int64
+    }
+) -> { valid: boolean, error: atom, logical_count: int64 } {
+    sequence proc[mem(normal)]
+        ancestors0: List[(int64, ref?(L, normal, (ItemType, int64, ref?(L, normal, rec), ref?(L, normal, rec)))), mem(normal)] <- [];
+        res: { error: atom, count: int64 } <- validate_node(tree, tree.root, ancestors0);
+        out: { valid: boolean, error: atom, logical_count: int64 } <- case res.error of {
+            :ok -> { valid: true, error: :ok, logical_count: res.count };
+            bad: atom -> { valid: false, error: bad, logical_count: res.count }
+        }
+    produces
+        pure out
+    end
+}
+
+// Decodes a validate / count_preflight error atom in the unit that created it.
+fn validate_error_code(error: atom) -> int64 {
+    case error of {
+        :ok -> 0;
+        :cycle -> 1;
+        :wrong_arena -> 2;
+        :negative_count -> 5;
+        :size_mismatch -> 6;
+        :count_overflow -> 9;
+        _: atom -> 99
+    }
+}

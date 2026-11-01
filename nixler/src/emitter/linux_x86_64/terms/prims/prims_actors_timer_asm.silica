@@ -1,0 +1,639 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Clocks and timers (spec §22.14, §4.5.2; ROADMAP chunk 11): the hosted runtime's part, x86-64
+// assembly text for Linux (GNU/ELF Intel syntax; the linux_x86_64 port of linux_aarch64: silica_rt_*
+// routines take rdi rsi rdx rcx and answer in rdi, C results arrive in rax, values live across calls
+// sit in frame slots), emitted into __silica_runtime with the rest of the actor runtime
+// (prims_actors_runtime_asm emit_actor_runtime_helpers).
+//
+// Design. One timer service thread per process, started by the first send_after, owns the wait: a
+// carrier never blocks for time (actor_memory_budget_plan.md item N; §15.1.2 has no sleep). The
+// pending timers are in ONE table under ONE lock: a binary min-heap of records ordered by deadline
+// (push, pop-min and remove-at-index, each record keeping its heap index) and a map from the timer
+// number to its record (two levels: 2^22 page pointers, pages of 4096 slots, a page freed once every
+// number in it has been handed out and its last live timer is gone). Numbers are never reused
+// (§15.1.4's rule for identities, applied to timer_ref), so a stale reference is :not_found and
+// never cancels another timer.
+//
+//   send_after    computes the deadline on the monotonic clock (now + delay_ms, saturating), takes
+//                 a number, and inserts; a timer that becomes the heap's head wakes the service
+//                 thread (the cv word, silica_rt_cv_signal, bumped under the lock). delay 0 casts
+//                 at once from the caller (§22.14.2 "enqueues the message at once"), so it is ordered
+//                 before anything the caller sends next. A target that has already ended is a timer
+//                 cancelled already: the message is released, the number never found.
+//   the thread    sleeps on the cv word until the head's deadline (a futex wait with a relative timeout, silica_rt_timer_cv_wait_ns) or
+//                 a signal, re-reads the head on every wake, and fires only when deadline <= now:
+//                 never earlier, possibly later (§22.14.2). A due timer is taken out of the heap and
+//                 the map under the lock and cast with the lock released, through silica_rt_ref_call
+//                 and silica_rt_actor_cast_flagged like any cast from another thread: the target's
+//                 mailbox is signalled and its carrier woken (silica_rt_actor_mail_signal). An ended
+//                 target drops the message silently.
+//   cancel_timer  looks the number up under the lock: present means pending, and it is removed
+//                 there and then (:cancelled, 0); absent means fired or cancelled (:not_found, 1).
+//                 The pop and the cancel both happen under the lock, so a cancel racing a firing
+//                 timer yields exactly one of delivered / :cancelled. A pending timer whose target
+//                 has ended is "cancelled automatically" (§22.14.2): removed, and :not_found.
+//   the message   follows the cast's ownership rules at the send_after call (copied into fresh
+//                 owned regions, or moved on a last use, term_message_copy). A timer that will not
+//                 deliver runs the site's release thunk (prims_actors timer_release_thunk_asm: the
+//                 message record's top-level region fields are destroyed, as the receiver's dispatch
+//                 would have done, term_message_regions) and frees its record.
+//
+// Clocks: monotonic_time is CLOCK_MONOTONIC in nanoseconds (silica_rt_stack_now_ns, the clock the
+// deadlines and the idle sweep already use); current_time is CLOCK_REALTIME in milliseconds.
+//
+// Lock order: the table's lock is a leaf. It is taken by send_after and cancel_timer from a
+// behaviour (nothing else held) and by the service thread (nothing else held); every call out of
+// it (the clock, calloc/realloc/free, the identity table in silica_rt_ref_alive, the cast) is made
+// with it released, except the allocations of the heap array and the map pages.
+//
+// Not here: call_with_timeout; proactive release of a pending timer when its target ends (such a
+// timer keeps its message until its deadline, when the drop releases it, or until a cancel).
+
+export emit_actor_timer_runtime_asm/0;
+
+fn emit_actor_timer_runtime_asm() -> string {
+    "	.bss
+	.p2align 3
+# The timer table (spec §22.14.2; prims_actors_timer_asm.silica): +0 its lock (silica_rt_lock_*),
+# +4 the condition word the service thread waits on (a futex seq word, silica_rt_cv_signal),
+# +8 the heap (an array of timer records ordered by deadline, a binary min-heap), +16 its length,
+# +24 its capacity, +32 the next timer number (never reused; 1 first), +40 the service thread
+# started flag, +48 the identity map's first level (2^22 page pointers; a page is a live count and
+# 4096 record pointers, indexed by the timer number's low 12 bits).
+	.globl silica_rt_timers
+.comm silica_rt_timers,64,8
+	.text
+# monotonic_time() -> int64: nanoseconds of CLOCK_MONOTONIC, the clock the deadlines use.
+	.globl silica_rt_monotonic_time
+	.p2align 4
+silica_rt_monotonic_time:
+	jmp silica_rt_stack_now_ns
+# current_time() -> int64: milliseconds since the Unix epoch (CLOCK_REALTIME).
+	.globl silica_rt_current_time
+	.p2align 4
+silica_rt_current_time:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 16
+	xor edi, edi
+	mov rsi, rsp
+	call clock_gettime
+	mov rdi, QWORD PTR [rsp]
+	imul rdi, rdi, 1000
+	mov rax, QWORD PTR [rsp + 8]
+	xor edx, edx
+	mov ecx, 1000000
+	div rcx
+	add rdi, rax
+	leave
+	ret
+# silica_rt_timer_prepare(rdi = the target's identity, rsi = the message, rdx = the release thunk or 0)
+# -> rdi = a timer record (64 B: +0 number, +8 deadline, +16 target, +24 message, +32 thunk, +40 heap
+# index), or 0 when there is no memory. The inner half of send_after (emitter timer_cast).
+	.globl silica_rt_timer_prepare
+	.p2align 4
+silica_rt_timer_prepare:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 32
+	mov QWORD PTR [rbp - 8], rdi
+	mov QWORD PTR [rbp - 16], rsi
+	mov QWORD PTR [rbp - 24], rdx
+	mov edi, 1
+	mov esi, 64
+	call calloc
+	test rax, rax
+	jz Ltp_none
+	mov rcx, QWORD PTR [rbp - 8]
+	mov QWORD PTR [rax + 16], rcx
+	mov rcx, QWORD PTR [rbp - 16]
+	mov QWORD PTR [rax + 24], rcx
+	mov rcx, QWORD PTR [rbp - 24]
+	mov QWORD PTR [rax + 32], rcx
+	mov rdi, rax
+	leave
+	ret
+Ltp_none:
+	xor edi, edi
+	leave
+	ret
+# silica_rt_timer_release(rdi = record): a timer that will not be delivered gives its message back
+# (the release thunk destroys the message's owned regions, as the receiver's dispatch would have)
+# and frees the record.
+	.globl silica_rt_timer_release
+	.p2align 4
+silica_rt_timer_release:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 16
+	mov QWORD PTR [rbp - 8], rdi
+	mov rax, QWORD PTR [rdi + 32]
+	test rax, rax
+	jz Ltr_free
+	mov rdi, QWORD PTR [rdi + 24]
+	call rax
+Ltr_free:
+	mov rdi, QWORD PTR [rbp - 8]
+	call free
+	leave
+	ret
+# silica_rt_timer_fire(rdi = record): the cast. An ended (or unknown) target, or a call-only one,
+# drops the message silently (§22.14.2); the record is freed either way.
+	.globl silica_rt_timer_fire
+	.p2align 4
+silica_rt_timer_fire:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 16
+	mov QWORD PTR [rbp - 8], rdi
+	mov rsi, QWORD PTR [rdi + 24]
+	mov rdi, QWORD PTR [rdi + 16]
+	xor edx, edx
+	lea r10, [rip + silica_rt_actor_cast_flagged]
+	call silica_rt_ref_call
+	cmp rdi, 1
+	je Ltf_delivered
+	mov rdi, QWORD PTR [rbp - 8]
+	call silica_rt_timer_release
+	leave
+	ret
+Ltf_delivered:
+	mov rdi, QWORD PTR [rbp - 8]
+	call free
+	leave
+	ret
+# The heap. Leaves; the table's lock is held by the caller.
+	.p2align 4
+silica_rt_timer_sift_up:
+	lea r8, [rip + silica_rt_timers]
+	mov r9, QWORD PTR [r8 + 8]
+Ltsu_loop:
+	test rdi, rdi
+	jz Ltsu_done
+	lea rcx, [rdi - 1]
+	shr rcx, 1
+	mov rax, QWORD PTR [r9 + rdi*8]
+	mov rdx, QWORD PTR [r9 + rcx*8]
+	mov rsi, QWORD PTR [rax + 8]
+	mov r10, QWORD PTR [rdx + 8]
+	cmp r10, rsi
+	jle Ltsu_done
+	mov QWORD PTR [r9 + rdi*8], rdx
+	mov QWORD PTR [rdx + 40], rdi
+	mov QWORD PTR [r9 + rcx*8], rax
+	mov QWORD PTR [rax + 40], rcx
+	mov rdi, rcx
+	jmp Ltsu_loop
+Ltsu_done:
+	ret
+	.p2align 4
+silica_rt_timer_sift_down:
+	lea r8, [rip + silica_rt_timers]
+	mov r9, QWORD PTR [r8 + 8]
+	mov r11, QWORD PTR [r8 + 16]
+Ltsd_loop:
+	lea rcx, [rdi + rdi + 1]
+	cmp rcx, r11
+	jae Ltsd_done
+	mov rdx, rcx
+	lea rsi, [rcx + 1]
+	cmp rsi, r11
+	jae Ltsd_pick
+	mov rax, QWORD PTR [r9 + rcx*8]
+	mov rax, QWORD PTR [rax + 8]
+	mov r10, QWORD PTR [r9 + rsi*8]
+	mov r10, QWORD PTR [r10 + 8]
+	cmp r10, rax
+	jge Ltsd_pick
+	mov rdx, rsi
+Ltsd_pick:
+	mov rax, QWORD PTR [r9 + rdi*8]
+	mov r10, QWORD PTR [r9 + rdx*8]
+	mov rsi, QWORD PTR [rax + 8]
+	mov rcx, QWORD PTR [r10 + 8]
+	cmp rcx, rsi
+	jge Ltsd_done
+	mov QWORD PTR [r9 + rdi*8], r10
+	mov QWORD PTR [r10 + 40], rdi
+	mov QWORD PTR [r9 + rdx*8], rax
+	mov QWORD PTR [rax + 40], rdx
+	mov rdi, rdx
+	jmp Ltsd_loop
+Ltsd_done:
+	ret
+# silica_rt_timer_heap_remove(rdi = index): takes the record at that index out; the heap property
+# is restored around the record moved into its place. Lock held.
+	.p2align 4
+silica_rt_timer_heap_remove:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 16
+	mov QWORD PTR [rbp - 8], rdi
+	lea r8, [rip + silica_rt_timers]
+	mov r9, QWORD PTR [r8 + 8]
+	mov r11, QWORD PTR [r8 + 16]
+	dec r11
+	mov QWORD PTR [r8 + 16], r11
+	cmp rdi, r11
+	je Lthr_done
+	mov rax, QWORD PTR [r9 + r11*8]
+	mov QWORD PTR [r9 + rdi*8], rax
+	mov QWORD PTR [rax + 40], rdi
+	call silica_rt_timer_sift_down
+	mov rdi, QWORD PTR [rbp - 8]
+	call silica_rt_timer_sift_up
+Lthr_done:
+	leave
+	ret
+# silica_rt_timer_map_slot(rdi = timer number, esi = 1 to create the page, 0 to find only) -> rdi =
+# the address of the number's slot, or 0 (no such page, a number beyond the map, no memory). Lock held.
+	.p2align 4
+silica_rt_timer_map_slot:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 32
+	mov QWORD PTR [rbp - 8], rdi
+	mov QWORD PTR [rbp - 16], rsi
+	mov rax, rdi
+	shr rax, 34
+	jnz Ltms_none
+	mov rcx, rdi
+	shr rcx, 12
+	mov QWORD PTR [rbp - 24], rcx
+	lea r8, [rip + silica_rt_timers]
+	mov r9, QWORD PTR [r8 + 48]
+	test r9, r9
+	jnz Ltms_l1
+	test esi, esi
+	jz Ltms_none
+	mov edi, 4194304
+	mov esi, 8
+	call calloc
+	test rax, rax
+	jz Ltms_none
+	lea r8, [rip + silica_rt_timers]
+	mov QWORD PTR [r8 + 48], rax
+	mov r9, rax
+Ltms_l1:
+	mov rcx, QWORD PTR [rbp - 24]
+	mov r10, QWORD PTR [r9 + rcx*8]
+	test r10, r10
+	jnz Ltms_page
+	cmp QWORD PTR [rbp - 16], 0
+	je Ltms_none
+	mov edi, 4097
+	mov esi, 8
+	call calloc
+	test rax, rax
+	jz Ltms_none
+	lea r8, [rip + silica_rt_timers]
+	mov r9, QWORD PTR [r8 + 48]
+	mov rcx, QWORD PTR [rbp - 24]
+	mov QWORD PTR [r9 + rcx*8], rax
+	mov r10, rax
+Ltms_page:
+	mov rax, QWORD PTR [rbp - 8]
+	and rax, 4095
+	lea rdi, [r10 + rax*8 + 8]
+	leave
+	ret
+Ltms_none:
+	xor edi, edi
+	leave
+	ret
+# silica_rt_timer_map_insert(rdi = timer number, rsi = record) -> rdi = 1 done, 0 no memory. Lock held.
+	.p2align 4
+silica_rt_timer_map_insert:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 16
+	mov QWORD PTR [rbp - 8], rdi
+	mov QWORD PTR [rbp - 16], rsi
+	mov esi, 1
+	call silica_rt_timer_map_slot
+	test rdi, rdi
+	jz Ltmi_ret
+	mov rax, QWORD PTR [rbp - 16]
+	mov QWORD PTR [rdi], rax
+	lea r8, [rip + silica_rt_timers]
+	mov r9, QWORD PTR [r8 + 48]
+	mov rcx, QWORD PTR [rbp - 8]
+	shr rcx, 12
+	mov r9, QWORD PTR [r9 + rcx*8]
+	inc QWORD PTR [r9]
+	mov edi, 1
+Ltmi_ret:
+	leave
+	ret
+# silica_rt_timer_map_remove(rdi = timer number): clears its slot; a page whose numbers have all
+# been handed out and whose last live timer this was goes back. Lock held.
+	.p2align 4
+silica_rt_timer_map_remove:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 16
+	mov QWORD PTR [rbp - 8], rdi
+	xor esi, esi
+	call silica_rt_timer_map_slot
+	test rdi, rdi
+	jz Ltmr_ret
+	mov QWORD PTR [rdi], 0
+	lea r8, [rip + silica_rt_timers]
+	mov r9, QWORD PTR [r8 + 48]
+	mov rcx, QWORD PTR [rbp - 8]
+	shr rcx, 12
+	mov r10, QWORD PTR [r9 + rcx*8]
+	dec QWORD PTR [r10]
+	jnz Ltmr_ret
+	lea rax, [rcx + 1]
+	shl rax, 12
+	cmp rax, QWORD PTR [r8 + 32]
+	ja Ltmr_ret
+	mov QWORD PTR [r9 + rcx*8], 0
+	mov rdi, r10
+	call free
+Ltmr_ret:
+	leave
+	ret
+# silica_rt_timer_cv_wait_ns(rdi = cv word, rsi = lock, rdx = nanoseconds): silica_rt_cv_wait with a
+# timeout: futex(cv, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, snapshot, &relative timespec); the waiter
+# re-reads the heap on every wake, so a spurious or early return costs one more loop.
+	.p2align 4
+silica_rt_timer_cv_wait_ns:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 48
+	mov QWORD PTR [rbp - 8], rdi
+	mov QWORD PTR [rbp - 16], rsi
+	mov rax, rdx
+	xor edx, edx
+	mov ecx, 1000000000
+	div rcx
+	mov QWORD PTR [rbp - 32], rax
+	mov QWORD PTR [rbp - 24], rdx
+	mov eax, DWORD PTR [rdi]
+	mov QWORD PTR [rbp - 40], rax
+	mov rdi, rsi
+	call silica_rt_lock_unlock
+	mov rdi, QWORD PTR [rbp - 8]
+	mov esi, 128
+	mov rdx, QWORD PTR [rbp - 40]
+	lea r10, [rbp - 32]
+	xor r8d, r8d
+	xor r9d, r9d
+	mov eax, 202
+	syscall
+	mov rdi, QWORD PTR [rbp - 16]
+	call silica_rt_lock_lock
+	leave
+	ret
+# The service thread: one per process, started by the first send_after. It sleeps on the condition
+# word until the earliest deadline (or until a send_after puts an earlier timer at the head of the
+# heap and signals), takes every due timer out under the lock, and casts with the lock released.
+# It never blocks a carrier: the carriers only ever take the table's lock for the heap operations.
+	.p2align 4
+silica_rt_timer_thread_main:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 16
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_lock
+Ltt_loop:
+	lea r8, [rip + silica_rt_timers]
+	cmp QWORD PTR [r8 + 16], 0
+	jne Ltt_have
+	lea rdi, [r8 + 4]
+	mov rsi, r8
+	call silica_rt_cv_wait
+	jmp Ltt_loop
+Ltt_have:
+	mov r9, QWORD PTR [r8 + 8]
+	mov rax, QWORD PTR [r9]
+	mov QWORD PTR [rbp - 8], rax
+	call silica_rt_stack_now_ns
+	mov rax, QWORD PTR [rbp - 8]
+	mov rcx, QWORD PTR [rax + 8]
+	cmp rcx, rdi
+	jle Ltt_fire
+	mov rdx, rcx
+	sub rdx, rdi
+	lea r8, [rip + silica_rt_timers]
+	lea rdi, [r8 + 4]
+	mov rsi, r8
+	call silica_rt_timer_cv_wait_ns
+	jmp Ltt_loop
+Ltt_fire:
+	xor edi, edi
+	call silica_rt_timer_heap_remove
+	mov rax, QWORD PTR [rbp - 8]
+	mov rdi, QWORD PTR [rax]
+	call silica_rt_timer_map_remove
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_unlock
+	mov rdi, QWORD PTR [rbp - 8]
+	call silica_rt_timer_fire
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_lock
+	jmp Ltt_loop
+# silica_rt_send_after(rdi = delay_ms, rsi = the prepared record or 0) -> rdi = the timer number.
+# The deadline is now + delay on the monotonic clock (saturating). A delay of 0 casts at once from
+# the caller, so the message is ordered before anything the caller sends afterwards (§22.14.2); its
+# number is already fired. A target that has ended means a timer cancelled already: the message is
+# released and the number is never found. Otherwise the record enters the map and the heap, the
+# service thread is started if it is not yet, and is woken when the new timer is the earliest.
+# Frame: [rbp-8] delay, [rbp-16] record, [rbp-24] now, [rbp-32] deadline, [rbp-40] number, [rbp-48] tid.
+	.globl silica_rt_send_after
+	.p2align 4
+silica_rt_send_after:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 48
+	mov QWORD PTR [rbp - 8], rdi
+	mov QWORD PTR [rbp - 16], rsi
+	call silica_rt_stack_now_ns
+	mov QWORD PTR [rbp - 24], rdi
+	mov rax, QWORD PTR [rbp - 8]
+	mov rcx, 9000000000000
+	cmp rax, rcx
+	ja Lsa_sat
+	imul rax, rax, 1000000
+	add rax, QWORD PTR [rbp - 24]
+	jo Lsa_sat
+	jmp Lsa_deadline
+Lsa_sat:
+	mov rax, 0x7FFFFFFFFFFFFFFF
+Lsa_deadline:
+	mov QWORD PTR [rbp - 32], rax
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_lock
+	lea r8, [rip + silica_rt_timers]
+	mov rax, QWORD PTR [r8 + 32]
+	test rax, rax
+	jnz Lsa_numbered
+	mov eax, 1
+Lsa_numbered:
+	mov QWORD PTR [rbp - 40], rax
+	lea rcx, [rax + 1]
+	mov QWORD PTR [r8 + 32], rcx
+	mov rsi, QWORD PTR [rbp - 16]
+	test rsi, rsi
+	jz Lsa_unlock_ret
+	mov QWORD PTR [rsi], rax
+	mov rcx, QWORD PTR [rbp - 32]
+	mov QWORD PTR [rsi + 8], rcx
+	cmp QWORD PTR [rbp - 8], 0
+	je Lsa_now
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_unlock
+	mov rax, QWORD PTR [rbp - 16]
+	mov rdi, QWORD PTR [rax + 16]
+	call silica_rt_ref_alive
+	test rdi, rdi
+	jz Lsa_drop
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_lock
+	mov rdi, QWORD PTR [rbp - 40]
+	mov rsi, QWORD PTR [rbp - 16]
+	call silica_rt_timer_map_insert
+	test rdi, rdi
+	jz Lsa_unlock_drop
+	lea r8, [rip + silica_rt_timers]
+	mov rcx, QWORD PTR [r8 + 16]
+	mov rdx, QWORD PTR [r8 + 24]
+	cmp rcx, rdx
+	jb Lsa_room
+	add rdx, rdx
+	test rdx, rdx
+	jnz Lsa_cap
+	mov edx, 64
+Lsa_cap:
+	mov QWORD PTR [r8 + 24], rdx
+	mov rdi, QWORD PTR [r8 + 8]
+	mov rsi, rdx
+	shl rsi, 3
+	call realloc
+	test rax, rax
+	jz Lsa_heap_oom
+	lea r8, [rip + silica_rt_timers]
+	mov QWORD PTR [r8 + 8], rax
+Lsa_room:
+	lea r8, [rip + silica_rt_timers]
+	mov r9, QWORD PTR [r8 + 8]
+	mov rcx, QWORD PTR [r8 + 16]
+	mov rax, QWORD PTR [rbp - 16]
+	mov QWORD PTR [r9 + rcx*8], rax
+	mov QWORD PTR [rax + 40], rcx
+	lea rdx, [rcx + 1]
+	mov QWORD PTR [r8 + 16], rdx
+	mov rdi, rcx
+	call silica_rt_timer_sift_up
+	lea r8, [rip + silica_rt_timers]
+	cmp QWORD PTR [r8 + 40], 0
+	jne Lsa_started
+	lea rdi, [rbp - 48]
+	xor esi, esi
+	lea rdx, [rip + silica_rt_timer_thread_main]
+	xor ecx, ecx
+	call pthread_create
+	test eax, eax
+	jnz Lsa_started
+	lea r8, [rip + silica_rt_timers]
+	mov QWORD PTR [r8 + 40], 1
+	mov rdi, QWORD PTR [rbp - 48]
+	call pthread_detach
+Lsa_started:
+	mov rax, QWORD PTR [rbp - 16]
+	cmp QWORD PTR [rax + 40], 0
+	jne Lsa_unlock_ret
+	lea rdi, [rip + silica_rt_timers + 4]
+	call silica_rt_cv_signal
+Lsa_unlock_ret:
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_unlock
+Lsa_ret:
+	mov rdi, QWORD PTR [rbp - 40]
+	leave
+	ret
+Lsa_heap_oom:
+	lea r8, [rip + silica_rt_timers]
+	mov rax, QWORD PTR [r8 + 16]
+	mov QWORD PTR [r8 + 24], rax
+	mov rdi, QWORD PTR [rbp - 40]
+	call silica_rt_timer_map_remove
+Lsa_unlock_drop:
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_unlock
+Lsa_drop:
+	mov rdi, QWORD PTR [rbp - 16]
+	call silica_rt_timer_release
+	jmp Lsa_ret
+Lsa_now:
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_unlock
+	mov rdi, QWORD PTR [rbp - 16]
+	call silica_rt_timer_fire
+	jmp Lsa_ret
+# silica_rt_cancel_timer(rdi = timer number) -> rdi = 0 :cancelled (the timer was pending and is
+# now released, never delivered), 1 :not_found (it has fired, been cancelled, or its target has
+# ended: such a timer is cancelled automatically, §22.14.2). Under the one lock a timer is either
+# in the heap or not, so a cancel racing the service thread's pop yields exactly one of the two.
+	.globl silica_rt_cancel_timer
+	.p2align 4
+silica_rt_cancel_timer:
+	push rbp
+	mov rbp, rsp
+	sub rsp, 32
+	mov QWORD PTR [rbp - 8], rdi
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_lock
+	mov rdi, QWORD PTR [rbp - 8]
+	xor esi, esi
+	call silica_rt_timer_map_slot
+	test rdi, rdi
+	jz Lct_nf_unlock
+	mov rax, QWORD PTR [rdi]
+	test rax, rax
+	jz Lct_nf_unlock
+	mov QWORD PTR [rbp - 16], rax
+	mov rdi, QWORD PTR [rbp - 8]
+	call silica_rt_timer_map_remove
+	mov rax, QWORD PTR [rbp - 16]
+	mov rdi, QWORD PTR [rax + 40]
+	call silica_rt_timer_heap_remove
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_unlock
+	mov rax, QWORD PTR [rbp - 16]
+	mov rdi, QWORD PTR [rax + 16]
+	call silica_rt_ref_alive
+	mov QWORD PTR [rbp - 24], rdi
+	mov rdi, QWORD PTR [rbp - 16]
+	call silica_rt_timer_release
+	cmp QWORD PTR [rbp - 24], 0
+	sete al
+	movzx edi, al
+	leave
+	ret
+Lct_nf_unlock:
+	lea rdi, [rip + silica_rt_timers]
+	call silica_rt_lock_unlock
+	mov edi, 1
+	leave
+	ret
+"
+}

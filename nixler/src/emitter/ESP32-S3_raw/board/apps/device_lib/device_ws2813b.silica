@@ -1,0 +1,323 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The port test board's row of 24 WS2813B-2121 addressable LEDs (board_pack: GPIO7 through J4
+// 9-10, GRB byte order, 24 bits per LED most significant bit first) as a device worker that keeps
+// a colour per LED and streams the whole row through RMT transmit channel 0 (device_esp32s3_rmt),
+// where asm_11_addressable_leds bit-banged the pulses with nop counts tuned to the CPU clock.
+//
+// Pulses: a WS2813B reads each bit from its high time (0: 220-380 ns, 1: 580-1000 ns) and latches
+// the colours after a low of more than 280 us; the low time inside a bit only has to stay well
+// under that latch. At the RMT's 50 ns tick a 0 is 6 ticks high (300 ns) and a 1 is 16 ticks high
+// (800 ns); each is followed by enough low ticks to make the bit period bit_period_ticks(), 1000
+// ticks = 50 us. The period is longer than the chip's 1.25 us minimum because the row is 576
+// words and the channel RAM holds 192: the stream is fed in halves of 96 words (device_esp32s3_rmt's
+// ping-pong through the FIFO) and a half must be refilled before the transmitter comes back round
+// to it. Measured 2026-10-06: a half refills in 1.31 ms, a half transmits in 4.8 ms at this period
+// (3.7x margin; 15 us per bit still kept every half on time, 10 us did not), and 50 us is 5.6x
+// under the latch. A frame is 24 x 24 x 50 us = 28.8 ms (measured 28.9), then the end marker
+// stops the channel and the line idles low, which latches the frame.
+//
+// This worker owns four windows: GPIO and IO_MUX for the pad (make_output, then RMT_SIG_OUT0
+// routed to it through the GPIO matrix), SYSTEM for RMT's clock gate, and RMT. Two workers must
+// not share a controller (spec §5.1), so an app that drives this row does its other GPIO work
+// through this worker or not at all.
+//
+// State: `:unmapped` until :init; then (:mapped, gpio, mux, system, rmt, c0, ..., c23), one flat
+// tuple with the colour of LED i in slot c_i, 0xRRGGBB (8 bits per channel; the board's current
+// budget wants about 0x18 per channel). The row is flat, not a list, because the board runtime
+// gives back exactly two things at each dispatch, the actor's previous state block and the
+// message copy; nothing else a behaviour allocates is ever reclaimed (rt_heap.S
+// silica_rt_state_release, rt_actors.S silica_rt_actor_main; the hosted runtime's per-actor arena
+// is the same until the actor ends). A 24-cell list rebuilt per :set cost 47 B (LED 0) to 1.7 KB
+// (LED 23) a message and a :show 803 B in (window, flag) tuples, measured 2026-10-06, and the
+// 111 KB heap ran out at the end of one chase. Now a message costs the 232-byte state tuple it
+// returns, freed at the next dispatch, and :show allocates nothing: the colour lookup is one flat
+// case over the index (colour_at), :set selects each slot between its old colour and the new one
+// (a 24-arm case of whole-row literals cost 58 KB of code, measured), and the RMT waits hand back
+// only the window. The row's length is fixed at led_count().
+//
+// Messages: { op: :init | :set_all | :set | :show | :hold | :notify, index: int64, colour: uint32,
+// reply_to: actor_ref }. :set_all gives every LED `colour`; :set gives LED `index` the colour (out of
+// range: unchanged); neither touches the row until :show streams the frame. :hold busy-waits
+// `index` ticks of about a millisecond in message order (no delay builtin); :notify casts `colour`
+// to reply_to so an app can print in the worker's order.
+
+use device_esp32s3_gpio;
+use device_esp32s3_rmt;
+use device_esp32s3_gpio_registers;
+use device_esp32s3_io_mux_registers;
+use device_esp32s3_rmt_registers;
+use device_esp32s3_system_registers;
+use board_pack;
+use board_pack_gpio_signals;
+
+export ws2813b_worker/2;
+
+fn led_count() -> int64 {
+    24
+}
+
+// Ticks per bit (50 ns each): 50 us, see the header.
+fn bit_period_ticks() -> uint32 {
+    1000
+}
+
+fn zero_high_ticks() -> uint32 {
+    6
+}
+
+fn one_high_ticks() -> uint32 {
+    16
+}
+
+fn zero_word() -> uint32 {
+    device_esp32s3_rmt@rmt_pulse_word(zero_high_ticks(), bit_period_ticks() - zero_high_ticks())
+}
+
+fn one_word() -> uint32 {
+    device_esp32s3_rmt@rmt_pulse_word(one_high_ticks(), bit_period_ticks() - one_high_ticks())
+}
+
+// Poll budget for one event, in device_esp32s3_rmt's blocks of 256 polls (about 25 ms in all at
+// 6 us per poll): several times the longest wait, a half of the frame (4.8 ms).
+fn poll_blocks() -> uint32 {
+    16
+}
+
+fn spin(n: int64) -> int64 {
+    case n == 0 of { true -> 0; false -> spin(n - 1) }
+}
+
+// About a millisecond per tick at the 40 MHz hand-off clock (device_esp32s3_gpio's count).
+fn hold_ticks(n: int64) -> int64 {
+    case n <= 0 of {
+        true -> 0;
+        false -> {
+            _: int64 <- spin(400);
+            hold_ticks(n - 1)
+        }
+    }
+}
+
+// The colour of LED i (0 when unmapped or out of range).
+fn colour_at(st: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32), i: int64) -> uint32 {
+    zero: uint32 <- 0;
+    case st of {
+        :unmapped -> zero;
+        (:mapped, g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), r: device_window(L, (:esp32s3_rmt)), c0: uint32, c1: uint32, c2: uint32, c3: uint32, c4: uint32, c5: uint32, c6: uint32, c7: uint32, c8: uint32, c9: uint32, c10: uint32, c11: uint32, c12: uint32, c13: uint32, c14: uint32, c15: uint32, c16: uint32, c17: uint32, c18: uint32, c19: uint32, c20: uint32, c21: uint32, c22: uint32, c23: uint32) -> case i of {
+            0 -> c0;
+            1 -> c1;
+            2 -> c2;
+            3 -> c3;
+            4 -> c4;
+            5 -> c5;
+            6 -> c6;
+            7 -> c7;
+            8 -> c8;
+            9 -> c9;
+            10 -> c10;
+            11 -> c11;
+            12 -> c12;
+            13 -> c13;
+            14 -> c14;
+            15 -> c15;
+            16 -> c16;
+            17 -> c17;
+            18 -> c18;
+            19 -> c19;
+            20 -> c20;
+            21 -> c21;
+            22 -> c22;
+            23 -> c23;
+            _: int64 -> zero
+        }
+    }
+}
+
+// Slot k of the row with LED i set to c: c when i == k, else the old colour.
+fn pick_at(st: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32), i: int64, k: int64, c: uint32) -> uint32 {
+    case i == k of {
+        true -> c;
+        false -> colour_at(st, k)
+    }
+}
+
+// The row with LED i set to c (unchanged when i is out of range or the row is unmapped). Each
+// slot selects between its old colour and c through pick_at, inside the literal: every call or
+// case boundary copies every live binding, so the 24 colours are never bound here (bound, with a
+// select per slot beside them, this function was 13,600 lines of assembly; 2,400 this way).
+fn set_at(st: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32), i: int64, c: uint32) -> :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32) {
+    case st of {
+        :unmapped -> :unmapped;
+        (:mapped, g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), r: device_window(L, (:esp32s3_rmt)), _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) -> (:mapped, g, m, s, r, pick_at(st, i, 0, c), pick_at(st, i, 1, c), pick_at(st, i, 2, c), pick_at(st, i, 3, c), pick_at(st, i, 4, c), pick_at(st, i, 5, c), pick_at(st, i, 6, c), pick_at(st, i, 7, c), pick_at(st, i, 8, c), pick_at(st, i, 9, c), pick_at(st, i, 10, c), pick_at(st, i, 11, c), pick_at(st, i, 12, c), pick_at(st, i, 13, c), pick_at(st, i, 14, c), pick_at(st, i, 15, c), pick_at(st, i, 16, c), pick_at(st, i, 17, c), pick_at(st, i, 18, c), pick_at(st, i, 19, c), pick_at(st, i, 20, c), pick_at(st, i, 21, c), pick_at(st, i, 22, c), pick_at(st, i, 23, c))
+    }
+}
+
+// Every LED c.
+fn set_all(st: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32), c: uint32) -> :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32) {
+    case st of {
+        :unmapped -> :unmapped;
+        (:mapped, g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), r: device_window(L, (:esp32s3_rmt)), c0: uint32, c1: uint32, c2: uint32, c3: uint32, c4: uint32, c5: uint32, c6: uint32, c7: uint32, c8: uint32, c9: uint32, c10: uint32, c11: uint32, c12: uint32, c13: uint32, c14: uint32, c15: uint32, c16: uint32, c17: uint32, c18: uint32, c19: uint32, c20: uint32, c21: uint32, c22: uint32, c23: uint32) -> (:mapped, g, m, s, r, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c, c)
+    }
+}
+
+// The low `n` bits of `bits`, most significant first, one pulse word each, into the FIFO.
+fn push_bits(r: device_window(L, (:esp32s3_rmt)), bits: uint32, n: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        one: uint32 <- 1;
+        res: device_window(L, (:esp32s3_rmt)) <- case n == 0 of {
+            true -> r;
+            false -> {
+                bit: uint32 <- (bits shr (n - one)) band one;
+                word: uint32 <- case bit == 0 of { true -> zero_word(); false -> one_word() };
+                push_bits(device_esp32s3_rmt@rmt_tx0_push(r, word), bits, n - one)
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+// One LED: its green, red and blue bytes, 8 bits each (24 words).
+fn push_led(r: device_window(L, (:esp32s3_rmt)), colour: uint32) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        byte: uint32 <- 255;
+        eight: uint32 <- 8;
+        red: uint32 <- (colour shr 16) band byte;
+        green: uint32 <- (colour shr 8) band byte;
+        blue: uint32 <- colour band byte;
+        r1: device_window(L, (:esp32s3_rmt)) <- push_bits(r, green, eight);
+        r2: device_window(L, (:esp32s3_rmt)) <- push_bits(r1, red, eight);
+        r3: device_window(L, (:esp32s3_rmt)) <- push_bits(r2, blue, eight)
+    produces
+        pure r3
+    end
+}
+
+// n LEDs from `led` of the row.
+fn push_leds(r: device_window(L, (:esp32s3_rmt)), st: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32), led: int64, n: int64) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        res: device_window(L, (:esp32s3_rmt)) <- case n <= 0 of {
+            true -> r;
+            false -> push_leds(push_led(r, colour_at(st, led)), st, led + 1, n - 1)
+        }
+    produces
+        pure res
+    end
+}
+
+// The rest of the stream after the first 192 words are on their way: at each threshold event the
+// half just sent is free and takes the next four LEDs or, after the last LED, the end marker.
+// When an event misses its poll budget the frame is abandoned: the end wait and clear in show
+// resynchronise the channel for the next one.
+fn stream_rest(r: device_window(L, (:esp32s3_rmt)), st: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32), led: int64, count: int64) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        zero: uint32 <- 0;
+        r1: device_window(L, (:esp32s3_rmt)) <- device_esp32s3_rmt@rmt_tx0_wait_threshold(r, poll_blocks());
+        seen: uint32 <- device_esp32s3_rmt@rmt_tx0_threshold_seen(r1);
+        r2: device_window(L, (:esp32s3_rmt)) <- device_esp32s3_rmt@rmt_tx0_clear_threshold(r1);
+        res: device_window(L, (:esp32s3_rmt)) <- case seen == 0 of {
+            true -> r2;
+            false -> case led >= count of {
+                true -> device_esp32s3_rmt@rmt_tx0_push(r2, zero);
+                false -> stream_rest(push_leds(r2, st, led, 4), st, led + 4, count)
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+// One frame: the FIFO pointer rewound, the first eight LEDs fill the RAM, the channel starts, the
+// rest is fed in halves, then the end marker stops it. The LED count must be a multiple of four
+// and at least eight.
+fn show(r: device_window(L, (:esp32s3_rmt)), st: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32)) -> device_window(L, (:esp32s3_rmt)) {
+    sequence proc[register_rwr]
+        count: int64 <- led_count();
+        r1: device_window(L, (:esp32s3_rmt)) <- device_esp32s3_rmt@rmt_tx0_rewind(r);
+        r2: device_window(L, (:esp32s3_rmt)) <- push_leds(r1, st, 0, 8);
+        r3: device_window(L, (:esp32s3_rmt)) <- device_esp32s3_rmt@rmt_tx0_start(r2);
+        r4: device_window(L, (:esp32s3_rmt)) <- stream_rest(r3, st, 8, count);
+        r5: device_window(L, (:esp32s3_rmt)) <- device_esp32s3_rmt@rmt_tx0_wait_end(r4, poll_blocks());
+        r6: device_window(L, (:esp32s3_rmt)) <- device_esp32s3_rmt@rmt_tx0_clear_events(r5)
+    produces
+        pure r6
+    end
+}
+
+// The row streamed, with the RMT window show hands back (an unmapped row stays unmapped).
+fn show_row(st: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32)) -> :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32) {
+    sequence proc[register_rwr]
+        res: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32) <- case st of {
+            :unmapped -> :unmapped;
+            (:mapped, g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), r: device_window(L, (:esp32s3_rmt)), c0: uint32, c1: uint32, c2: uint32, c3: uint32, c4: uint32, c5: uint32, c6: uint32, c7: uint32, c8: uint32, c9: uint32, c10: uint32, c11: uint32, c12: uint32, c13: uint32, c14: uint32, c15: uint32, c16: uint32, c17: uint32, c18: uint32, c19: uint32, c20: uint32, c21: uint32, c22: uint32, c23: uint32) -> (:mapped, g, m, s, show(r, st), c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17, c18, c19, c20, c21, c22, c23)
+        }
+    produces
+        pure res
+    end
+}
+
+// The data pad as a push-pull output driven low, then handed to RMT channel 0's output signal.
+fn configure_pin(g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux))) -> (device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux))) {
+    sequence proc[register_rwr]
+        pin: uint32 <- board_pack@pin_addressable_leds();
+        rmt_out0: uint32 <- board_pack_gpio_signals@gpio_signal_rmt_sig_out0();
+        (g1, m1) <- device_esp32s3_gpio@make_output(g, m, pin);
+        g2: device_window(L, (:esp32s3_gpio)) <- device_esp32s3_gpio@route_signal(g1, pin, rmt_out0)
+    produces
+        pure (g2, m1)
+    end
+}
+
+fn ws2813b_worker(msg: { op: atom, index: int64, colour: uint32, reply_to: actor_ref }, state: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32)) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32)) {
+    sequence proc[register_rwr, concurrency]
+        next: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    g: device_window(L, (:esp32s3_gpio)) <- map_device((:esp32s3_gpio), 0x60004000); // board_pack window 1
+                    m: device_window(L, (:esp32s3_io_mux)) <- map_device((:esp32s3_io_mux), 0x60009000); // board_pack window 3
+                    s: device_window(L, (:esp32s3_system)) <- map_device((:esp32s3_system), 0x600C0000); // board_pack window 8
+                    r: device_window(L, (:esp32s3_rmt)) <- map_device((:esp32s3_rmt), 0x60016000); // board_pack window 10
+                    s1: device_window(L, (:esp32s3_system)) <- device_esp32s3_rmt@rmt_enable(s);
+                    (g1, m1) <- configure_pin(g, m);
+                    r1: device_window(L, (:esp32s3_rmt)) <- device_esp32s3_rmt@rmt_tx0_init(r);
+                    off: uint32 <- 0;
+                    (:mapped, g1, m1, s1, r1, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off, off)
+                };
+                _: atom -> :unmapped
+            };
+            _: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_rmt)), uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32, uint32) -> case msg.op of {
+                :set_all -> set_all(state, msg.colour);
+                :set -> set_at(state, msg.index, msg.colour);
+                :show -> show_row(state);
+                :hold -> {
+                    _: int64 <- hold_ticks(msg.index);
+                    state
+                };
+                :notify -> {
+                    code: uint32 <- msg.colour;
+                    _: boolean <- cast(msg.reply_to, code impl ActorMessage {});
+                    state
+                };
+                _: atom -> state
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}

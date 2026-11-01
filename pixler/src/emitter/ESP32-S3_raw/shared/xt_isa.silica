@@ -1,0 +1,840 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Xtensa LX7 instruction selection over virtual registers (see xt_vr).
+//
+// Every emitter site that used to build an AArch64 line calls one of these instead. The operations keep
+// AArch64 meaning -- operand order, width taken from the destination (X = 64-bit, W = 32-bit), a W write
+// zeroing the high word, compares combined with their consumer -- so converting a site is mechanical.
+//
+// 64-bit values are (lo, hi) word pairs. Operands are read into a8:a9 (first) and a2:a3 (second) unless
+// they already live in registers; results are built in scratch and then stored to the destination, so a
+// destination may alias either source. Carry and borrow follow GCC's own int64 sequences (saltu); 64-bit
+// compares are branch-free (salt/saltu + movnez, nsau for equality).
+//
+// Numeric labels 90-99 are private to these expansions: each expansion defines and uses them within
+// itself, so they can never capture an emitter label such as "1f".
+
+use string_parse;
+use xt_vr;
+
+export xt_imm_value/1;
+export xt_is_imm/1;
+export xt_movi/2;
+export xt_movi_u32/2;
+export xt_movi_text/2;
+export xt_mov/2;
+export xt_adr/2;
+export xt_add/3;
+export xt_sub/3;
+export xt_mul/3;
+export xt_and/3;
+export xt_orr/3;
+export xt_eor/3;
+export xt_bic/3;
+export xt_neg/2;
+export xt_mvn/2;
+export xt_lsl/3;
+export xt_lsr/3;
+export xt_asr/3;
+export xt_sdiv/3;
+export xt_udiv/3;
+export xt_srem/3;
+export xt_urem/3;
+export xt_cmp_flag/3;
+export xt_cmp_set/4;
+export xt_cmp_branch/4;
+export xt_branch_below_frame/2;
+export xt_cmp_select/6;
+export xt_cbz/2;
+export xt_cbnz/2;
+export xt_b/1;
+export xt_call/1;
+export xt_callr/1;
+export xt_sym/1;
+export xt_ext/3;
+
+// --- immediates ------------------------------------------------------------------------------
+
+fn xt_is_imm(s: string) -> boolean {
+    length_bytes(s) >= 2 and substring(s, 0, 1) == "#"
+}
+
+fn hex_digit_value(c: string) -> int64 {
+    case c of {
+        "0" -> 0; "1" -> 1; "2" -> 2; "3" -> 3; "4" -> 4; "5" -> 5; "6" -> 6; "7" -> 7;
+        "8" -> 8; "9" -> 9; "a" -> 10; "b" -> 11; "c" -> 12; "d" -> 13; "e" -> 14; "f" -> 15;
+        "A" -> 10; "B" -> 11; "C" -> 12; "D" -> 13; "E" -> 14; "F" -> 15;
+        _: string -> 0
+    }
+}
+
+fn hex_value_from(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> hex_value_from(s, i + 1, acc * 16 + hex_digit_value(substring(s, i, i + 1)))
+    }
+}
+
+fn unsigned_text_value(t: string) -> int64 {
+    case length_bytes(t) > 2 and (substring(t, 0, 2) == "0x" or substring(t, 0, 2) == "0X") of {
+        true -> hex_value_from(t, 2, 0);
+        false -> string_parse@string_to_int64(t)
+    }
+}
+
+// "#42", "#-7", "#0x1F" -> value.
+fn xt_imm_value(s: string) -> int64 {
+    t: string <- substring(s, 1, length_bytes(s));
+    case length_bytes(t) > 1 and substring(t, 0, 1) == "-" of {
+        true -> 0 - unsigned_text_value(substring(t, 1, length_bytes(t)));
+        false -> unsigned_text_value(t)
+    }
+}
+
+// Low word as an unsigned value 0 .. 2^32-1.
+fn lo32u(n: int64) -> int64 {
+    r: int64 <- n % 4294967296;
+    case r < 0 of {
+        true -> r + 4294967296;
+        false -> r
+    }
+}
+
+// Low word as a signed 32-bit value (what MOVI's literal takes).
+fn lo32s(n: int64) -> int64 {
+    u: int64 <- lo32u(n);
+    case u >= 2147483648 of {
+        true -> u - 4294967296;
+        false -> u
+    }
+}
+
+// High word, signed. n - lo32u(n) is a multiple of 2^32 no smaller than INT64_MIN, so this cannot overflow.
+fn hi32s(n: int64) -> int64 {
+    (n - lo32u(n)) / 4294967296
+}
+
+fn movi_line(reg: string, value: int64) -> string {
+    movi_line_text(reg, xt_vr@xt_itos(value))
+}
+
+fn movi_line_text(reg: string, value: string) -> string {
+    xt_vr@xt_ins("movi", concat(reg, concat(", ", value)))
+}
+
+fn u32_digit(d: uint32) -> string {
+    case d of {
+        0 -> "0";
+        1 -> "1";
+        2 -> "2";
+        3 -> "3";
+        4 -> "4";
+        5 -> "5";
+        6 -> "6";
+        7 -> "7";
+        8 -> "8";
+        9 -> "9";
+        _: uint32 -> "?"
+    }
+}
+
+fn u32_text(n: uint32) -> string {
+    case n < 10 of {
+        true -> u32_digit(n);
+        false -> concat(u32_text(n / 10), u32_digit(n % 10))
+    }
+}
+
+// --- small emit helpers ----------------------------------------------------------------------
+
+fn op3(op: string, d: string, a: string, b: string) -> string {
+    xt_vr@xt_ins(op, concat(d, concat(", ", concat(a, concat(", ", b)))))
+}
+
+fn op2(op: string, d: string, a: string) -> string {
+    xt_vr@xt_ins(op, concat(d, concat(", ", a)))
+}
+
+fn mov_if_needed(d: string, s: string) -> string {
+    case d == s of {
+        true -> "";
+        false -> op2("mov", d, s)
+    }
+}
+
+// Store scratch words lo/hi into the destination VR (W: low word, high word zeroed).
+fn put_result(dst: string, lo: string, hi: string) -> string {
+    xt_vr@vr_put(dst, lo, hi)
+}
+
+// Load operand `v` (VR or immediate) so its words are in (rlo, rhi) = the registers returned by
+// lo_of / hi_of with the same scratch pair.
+fn opnd_load(v: string, slo: string, shi: string) -> string {
+    case xt_is_imm(v) of {
+        true -> {
+            n: int64 <- xt_imm_value(v);
+            concat(movi_line(slo, lo32s(n)), movi_line(shi, hi32s(n)))
+        };
+        false -> concat(xt_vr@vr_lo_load(v, slo), xt_vr@vr_hi_load(v, shi))
+    }
+}
+
+fn lo_of(v: string, slo: string) -> string {
+    case xt_is_imm(v) of {
+        true -> slo;
+        false -> xt_vr@vr_lo_reg(v, slo)
+    }
+}
+
+fn hi_of(v: string, shi: string) -> string {
+    case xt_is_imm(v) of {
+        true -> shi;
+        false -> xt_vr@vr_hi_reg(v, shi)
+    }
+}
+
+// Low word only (32-bit operations).
+fn opnd_load_lo(v: string, slo: string) -> string {
+    case xt_is_imm(v) of {
+        true -> movi_line(slo, lo32s(xt_imm_value(v)));
+        false -> xt_vr@vr_lo_load(v, slo)
+    }
+}
+
+fn is_w(dst: string) -> boolean {
+    xt_vr@vr_class(dst) == "W"
+}
+
+// --- moves and constants ---------------------------------------------------------------------
+
+fn xt_movi(dst: string, n: int64) -> string {
+    movi_words(dst, lo32s(n), hi32s(n))
+}
+
+// A uint32 constant: the low word is the value itself, the high word zero.
+fn xt_movi_u32(dst: string, n: uint32) -> string {
+    movi_words_text(dst, u32_text(n), "0")
+}
+
+// Constant given as its two signed 32-bit words.
+fn movi_words(dst: string, lo: int64, hi: int64) -> string {
+    movi_words_text(dst, xt_vr@xt_itos(lo), xt_vr@xt_itos(hi))
+}
+
+// Constant given as the assembler text of its two 32-bit words.
+fn movi_words_text(dst: string, lo: string, hi: string) -> string {
+    c: string <- xt_vr@vr_class(dst);
+    case c == "ZR" of {
+        true -> "";
+        false -> case xt_vr@vr_is_phys(dst) of {
+            true -> case c == "W" of {
+                true -> concat(movi_line_text(xt_vr@vr_phys_lo(dst), lo), movi_line_text(xt_vr@vr_phys_hi(dst), "0"));
+                false -> concat(movi_line_text(xt_vr@vr_phys_lo(dst), lo), movi_line_text(xt_vr@vr_phys_hi(dst), hi))
+            };
+            false -> concat(concat(movi_line_text("a8", lo), movi_line_text("a9", hi)), xt_vr@vr_put(dst, "a8", "a9"))
+        }
+    }
+}
+
+// A constant given as decimal text, which may exceed INT64_MAX (uint64 literals up to 2^64-1). The two
+// 32-bit words come from long division of the digit string by 2^32: every intermediate stays below
+// 2^36, so nothing overflows. Signed and in-range text takes the ordinary path.
+fn decimal_words_from(t: string, i: int64, q: int64, r: int64, want_hi: boolean) -> int64 {
+    case i >= length_bytes(t) of {
+        true -> case want_hi of { true -> q; false -> r };
+        false -> {
+            cur: int64 <- r * 10 + string_parse@string_to_int64(substring(t, i, i + 1));
+            decimal_words_from(t, i + 1, q * 10 + cur / 4294967296, cur % 4294967296, want_hi)
+        }
+    }
+}
+
+fn fits_int64_text(t: string) -> boolean {
+    n: int64 <- length_bytes(t);
+    n < 19 or (length_bytes(t) > 0 and substring(t, 0, 1) == "-")
+}
+
+fn xt_movi_text(dst: string, t: string) -> string {
+    case fits_int64_text(t) of {
+        true -> xt_movi(dst, string_parse@string_to_int64(t));
+        false -> {
+            // Unsigned 32-bit words, passed on as signed words so no 64-bit value is ever rebuilt.
+            movi_words(dst, lo32s(decimal_words_from(t, 0, 0, 0, false)), lo32s(decimal_words_from(t, 0, 0, 0, true)))
+        }
+    }
+}
+
+// MOV/FMOV between VRs of any class, or from an immediate. Bits are copied; a W or S destination takes
+// the low word, an X or D destination both words.
+fn xt_mov(dst: string, src: string) -> string {
+    case xt_is_imm(src) of {
+        true -> xt_movi(dst, xt_imm_value(src));
+        false -> case dst == src of {
+            true -> "";
+            false -> {
+                lo: string <- xt_vr@vr_lo_reg(src, "a8");
+                hi: string <- xt_vr@vr_hi_reg(src, "a9");
+                load: string <- concat(xt_vr@vr_lo_load(src, "a8"), xt_vr@vr_hi_load(src, "a9"));
+                concat(load, put_result(dst, lo, hi))
+            }
+        }
+    }
+}
+
+// Address of a symbol (ADRP+ADD on AArch64).
+fn xt_adr(dst: string, sym: string) -> string {
+    case xt_vr@vr_is_phys(dst) of {
+        true -> concat(xt_vr@xt_ins("movi", concat(xt_vr@vr_phys_lo(dst), concat(", ", xt_sym(sym)))), movi_line(xt_vr@vr_phys_hi(dst), 0));
+        false -> concat(concat(xt_vr@xt_ins("movi", concat("a8, ", xt_sym(sym))), movi_line("a9", 0)), xt_vr@vr_put(dst, "a8", "a9"))
+    }
+}
+
+// SXTW/UXTW/SXTB/SXTH/UXTB/UXTH dst, src: extend the low 8/16/32 bits of src into dst (a W destination
+// keeps only the low word, as on AArch64).
+fn xt_ext(kind: string, dst: string, src: string) -> string {
+    load: string <- opnd_load_lo(src, "a8");
+    x: string <- lo_of(src, "a8");
+    lo: string <- case kind of {
+        "SXTB" -> xt_vr@xt_ins("sext", concat("a8, ", concat(x, ", 7")));
+        "SXTH" -> xt_vr@xt_ins("sext", concat("a8, ", concat(x, ", 15")));
+        "UXTB" -> xt_vr@xt_ins("extui", concat("a8, ", concat(x, ", 0, 8")));
+        "UXTH" -> xt_vr@xt_ins("extui", concat("a8, ", concat(x, ", 0, 16")));
+        _: string -> mov_if_needed("a8", x)
+    };
+    hi: string <- case kind == "UXTW" or kind == "UXTB" or kind == "UXTH" of {
+        true -> movi_line("a9", 0);
+        false -> op3("srai", "a9", "a8", "31")
+    };
+    concat(concat(load, lo), concat(hi, put_result(dst, "a8", "a9")))
+}
+
+// --- 64/32-bit arithmetic --------------------------------------------------------------------
+
+fn binop32(op: string, dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load_lo(a, "a8"), opnd_load_lo(b, "a2"));
+    concat(concat(load, op3(op, "a8", lo_of(a, "a8"), lo_of(b, "a2"))), put_result(dst, "a8", "a9"))
+}
+
+// Word-wise operation on both halves (and, or, xor).
+fn binop64_wordwise(op: string, dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load(a, "a8", "a9"), opnd_load(b, "a2", "a3"));
+    body: string <- concat(op3(op, "a9", hi_of(a, "a9"), hi_of(b, "a3")), op3(op, "a8", lo_of(a, "a8"), lo_of(b, "a2")));
+    concat(concat(load, body), put_result(dst, "a8", "a9"))
+}
+
+// hi first (it does not depend on the carry), then lo, then the carry out of lo into hi.
+fn add64(dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load(a, "a8", "a9"), opnd_load(b, "a2", "a3"));
+    blo: string <- lo_of(b, "a2");
+    s1: string <- op3("add", "a9", hi_of(a, "a9"), hi_of(b, "a3"));
+    s2: string <- op3("add", "a8", lo_of(a, "a8"), blo);
+    s3: string <- op3("saltu", "a3", "a8", blo);
+    s4: string <- op3("add", "a9", "a9", "a3");
+    concat(concat(load, concat(concat(s1, s2), concat(s3, s4))), put_result(dst, "a8", "a9"))
+}
+
+// hi first, then the borrow from the original low words, then lo, then hi -= borrow.
+fn sub64(dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load(a, "a8", "a9"), opnd_load(b, "a2", "a3"));
+    alo: string <- lo_of(a, "a8");
+    blo: string <- lo_of(b, "a2");
+    s1: string <- op3("sub", "a9", hi_of(a, "a9"), hi_of(b, "a3"));
+    s2: string <- op3("saltu", "a3", alo, blo);
+    s3: string <- op3("sub", "a8", alo, blo);
+    s4: string <- op3("sub", "a9", "a9", "a3");
+    concat(concat(load, concat(concat(s1, s2), concat(s3, s4))), put_result(dst, "a8", "a9"))
+}
+
+// Operands copied into a8:a9 and a2:a3 so the sequence can work in place:
+// hi = ahi*blo + alo*bhi + umulh(alo, blo); lo = alo*blo.
+fn mul64(dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load(a, "a8", "a9"), opnd_load(b, "a2", "a3"));
+    copy: string <- concat(concat(mov_if_needed("a8", lo_of(a, "a8")), mov_if_needed("a9", hi_of(a, "a9"))), concat(mov_if_needed("a2", lo_of(b, "a2")), mov_if_needed("a3", hi_of(b, "a3"))));
+    s1: string <- op3("mull", "a9", "a9", "a2");
+    s2: string <- op3("mull", "a3", "a8", "a3");
+    s3: string <- op3("add", "a9", "a9", "a3");
+    s4: string <- op3("muluh", "a3", "a8", "a2");
+    s5: string <- op3("add", "a9", "a9", "a3");
+    s6: string <- op3("mull", "a8", "a8", "a2");
+    concat(concat(concat(load, copy), concat(concat(s1, s2), concat(concat(s3, s4), concat(s5, s6)))), put_result(dst, "a8", "a9"))
+}
+
+// ADD/SUB SP, SP, #n: the auxiliary stack's reservation and release, through xt_vr vsp_adjust so a
+// release can pop a stack chunk and a reservation can grow one (every SP arithmetic the emitter
+// produces has this shape; a value moved into SP goes through vr_put as a restore).
+fn is_sp_imm_adjust(dst: string, a: string, b: string) -> boolean {
+    dst == "SP" and a == "SP" and xt_is_imm(b)
+}
+
+fn xt_add(dst: string, a: string, b: string) -> string {
+    case is_sp_imm_adjust(dst, a, b) of {
+        true -> xt_vr@vsp_adjust(xt_imm_value(b));
+        false -> case is_w(dst) of {
+            true -> binop32("add", dst, a, b);
+            false -> add64(dst, a, b)
+        }
+    }
+}
+
+fn xt_sub(dst: string, a: string, b: string) -> string {
+    case is_sp_imm_adjust(dst, a, b) of {
+        true -> xt_vr@vsp_adjust(0 - xt_imm_value(b));
+        false -> case is_w(dst) of {
+            true -> binop32("sub", dst, a, b);
+            false -> sub64(dst, a, b)
+        }
+    }
+}
+
+fn xt_mul(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> binop32("mull", dst, a, b);
+        false -> mul64(dst, a, b)
+    }
+}
+
+fn xt_and(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> binop32("and", dst, a, b);
+        false -> binop64_wordwise("and", dst, a, b)
+    }
+}
+
+fn xt_orr(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> binop32("or", dst, a, b);
+        false -> binop64_wordwise("or", dst, a, b)
+    }
+}
+
+fn xt_eor(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> binop32("xor", dst, a, b);
+        false -> binop64_wordwise("xor", dst, a, b)
+    }
+}
+
+// a AND NOT b, computed as a XOR (a AND b) so no register is needed for the inverted mask.
+fn xt_bic(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> {
+            load: string <- concat(opnd_load_lo(a, "a8"), opnd_load_lo(b, "a2"));
+            alo: string <- lo_of(a, "a8");
+            concat(concat(load, concat(op3("and", "a2", alo, lo_of(b, "a2")), op3("xor", "a8", alo, "a2"))), put_result(dst, "a8", "a9"))
+        };
+        false -> {
+            load: string <- concat(opnd_load(a, "a8", "a9"), opnd_load(b, "a2", "a3"));
+            alo: string <- lo_of(a, "a8");
+            ahi: string <- hi_of(a, "a9");
+            lo: string <- concat(op3("and", "a2", alo, lo_of(b, "a2")), op3("xor", "a8", alo, "a2"));
+            hi: string <- concat(op3("and", "a3", ahi, hi_of(b, "a3")), op3("xor", "a9", ahi, "a3"));
+            concat(concat(load, concat(lo, hi)), put_result(dst, "a8", "a9"))
+        }
+    }
+}
+
+// 0 - a: hi = -ahi - (alo != 0), lo = -alo.
+fn xt_neg(dst: string, a: string) -> string {
+    case is_w(dst) of {
+        true -> concat(concat(opnd_load_lo(a, "a8"), op2("neg", "a8", lo_of(a, "a8"))), put_result(dst, "a8", "a9"));
+        false -> {
+            load: string <- opnd_load(a, "a8", "a9");
+            alo: string <- lo_of(a, "a8");
+            s1: string <- op2("neg", "a9", hi_of(a, "a9"));
+            s2: string <- movi_line("a2", 1);
+            s3: string <- op3("moveqz", "a2", alo, alo);
+            s4: string <- op2("neg", "a8", alo);
+            s5: string <- op3("sub", "a9", "a9", "a2");
+            concat(concat(load, concat(concat(s1, s2), concat(s3, concat(s4, s5)))), put_result(dst, "a8", "a9"))
+        }
+    }
+}
+
+fn xt_mvn(dst: string, a: string) -> string {
+    xt_eor(dst, a, "#-1")
+}
+
+// --- shifts by an immediate ------------------------------------------------------------------
+
+fn shift_amount(b: string, width: int64) -> int64 {
+    n: int64 <- xt_imm_value(b) % width;
+    case n < 0 of {
+        true -> n + width;
+        false -> n
+    }
+}
+
+fn lsl64_imm(dst: string, a: string, k: int64) -> string {
+    load: string <- opnd_load(a, "a8", "a9");
+    alo: string <- lo_of(a, "a8");
+    ahi: string <- hi_of(a, "a9");
+    body: string <- case k == 0 of {
+        true -> concat(mov_if_needed("a8", alo), mov_if_needed("a9", ahi));
+        false -> case k < 32 of {
+            true -> concat(concat(xt_vr@xt_ins("ssai", xt_vr@xt_itos(32 - k)), op3("src", "a9", ahi, alo)), op3("slli", "a8", alo, xt_vr@xt_itos(k)));
+            false -> case k == 32 of {
+                true -> concat(op2("mov", "a9", alo), movi_line("a8", 0));
+                false -> concat(op3("slli", "a9", alo, xt_vr@xt_itos(k - 32)), movi_line("a8", 0))
+            }
+        }
+    };
+    concat(concat(load, body), put_result(dst, "a8", "a9"))
+}
+
+fn lsr64_imm(dst: string, a: string, k: int64, arith: boolean) -> string {
+    load: string <- opnd_load(a, "a8", "a9");
+    alo: string <- lo_of(a, "a8");
+    ahi: string <- hi_of(a, "a9");
+    hi_op: string <- case arith of { true -> "sra"; false -> "srl" };
+    body: string <- case k == 0 of {
+        true -> concat(mov_if_needed("a8", alo), mov_if_needed("a9", ahi));
+        false -> case k < 32 of {
+            true -> concat(xt_vr@xt_ins("ssai", xt_vr@xt_itos(k)), concat(op3("src", "a8", ahi, alo), op2(hi_op, "a9", ahi)));
+            false -> {
+                lo_part: string <- case k == 32 of {
+                    true -> op2("mov", "a8", ahi);
+                    false -> concat(xt_vr@xt_ins("ssai", xt_vr@xt_itos(k - 32)), op2(hi_op, "a8", ahi))
+                };
+                hi_part: string <- case arith of {
+                    true -> op3("srai", "a9", ahi, "31");
+                    false -> movi_line("a9", 0)
+                };
+                // hi_part reads ahi, lo_part may have consumed a8 only: order lo then hi is safe
+                // because ahi is never a8.
+                concat(lo_part, hi_part)
+            }
+        }
+    };
+    concat(concat(load, body), put_result(dst, "a8", "a9"))
+}
+
+fn shift32_imm(op: string, dst: string, a: string, k: int64) -> string {
+    load: string <- opnd_load_lo(a, "a8");
+    alo: string <- lo_of(a, "a8");
+    body: string <- case k == 0 of {
+        true -> mov_if_needed("a8", alo);
+        false -> case op of {
+            "lsl" -> op3("slli", "a8", alo, xt_vr@xt_itos(k));
+            "asr" -> op3("srai", "a8", alo, xt_vr@xt_itos(k));
+            _: string -> concat(xt_vr@xt_ins("ssai", xt_vr@xt_itos(k)), op2("srl", "a8", alo))
+        }
+    };
+    concat(concat(load, body), put_result(dst, "a8", "a9"))
+}
+
+// Shift by a register amount: 32-bit inline through SAR; 64-bit through libgcc (see xt_libcall).
+fn shift32_reg(op: string, dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load_lo(a, "a8"), opnd_load_lo(b, "a2"));
+    alo: string <- lo_of(a, "a8");
+    amt: string <- lo_of(b, "a2");
+    body: string <- case op of {
+        "lsl" -> concat(xt_vr@xt_ins("ssl", amt), op2("sll", "a8", alo));
+        "asr" -> concat(xt_vr@xt_ins("ssr", amt), op2("sra", "a8", alo));
+        _: string -> concat(xt_vr@xt_ins("ssr", amt), op2("srl", "a8", alo))
+    };
+    concat(concat(load, body), put_result(dst, "a8", "a9"))
+}
+
+fn xt_lsl(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> case xt_is_imm(b) of {
+            true -> shift32_imm("lsl", dst, a, shift_amount(b, 32));
+            false -> shift32_reg("lsl", dst, a, b)
+        };
+        false -> case xt_is_imm(b) of {
+            true -> lsl64_imm(dst, a, shift_amount(b, 64));
+            false -> xt_libcall_shift("__ashldi3", dst, a, b)
+        }
+    }
+}
+
+fn xt_lsr(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> case xt_is_imm(b) of {
+            true -> shift32_imm("lsr", dst, a, shift_amount(b, 32));
+            false -> shift32_reg("lsr", dst, a, b)
+        };
+        false -> case xt_is_imm(b) of {
+            true -> lsr64_imm(dst, a, shift_amount(b, 64), false);
+            false -> xt_libcall_shift("__lshrdi3", dst, a, b)
+        }
+    }
+}
+
+fn xt_asr(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> case xt_is_imm(b) of {
+            true -> shift32_imm("asr", dst, a, shift_amount(b, 32));
+            false -> shift32_reg("asr", dst, a, b)
+        };
+        false -> case xt_is_imm(b) of {
+            true -> lsr64_imm(dst, a, shift_amount(b, 64), true);
+            false -> xt_libcall_shift("__ashrdi3", dst, a, b)
+        }
+    }
+}
+
+// --- libgcc calls inside an expression ---------------------------------------------------------
+//
+// CALL8 clobbers a8-a15, which hold X0-X2. An AArch64 instruction like SDIV clobbers nothing, so the
+// expansion saves X0-X2 in the frame's libcall area (SVR_LC, 24 bytes, allocated by emitter_core when a
+// body uses it), stages the operands through scratch (an operand may itself be X0-X2), calls, keeps the
+// result in a8:a9, restores X0-X2 and only then writes the destination (which may be X0-X2).
+
+fn lc_save() -> string {
+    concat(concat(concat(xt_vr@xt_ins("s32i", "a10, a1, SVR_LC"), xt_vr@xt_ins("s32i", "a11, a1, SVR_LC+4")), concat(xt_vr@xt_ins("s32i", "a12, a1, SVR_LC+8"), xt_vr@xt_ins("s32i", "a13, a1, SVR_LC+12"))), concat(xt_vr@xt_ins("s32i", "a14, a1, SVR_LC+16"), xt_vr@xt_ins("s32i", "a15, a1, SVR_LC+20")))
+}
+
+fn lc_restore() -> string {
+    concat(concat(concat(xt_vr@xt_ins("l32i", "a10, a1, SVR_LC"), xt_vr@xt_ins("l32i", "a11, a1, SVR_LC+4")), concat(xt_vr@xt_ins("l32i", "a12, a1, SVR_LC+8"), xt_vr@xt_ins("l32i", "a13, a1, SVR_LC+12"))), concat(xt_vr@xt_ins("l32i", "a14, a1, SVR_LC+16"), xt_vr@xt_ins("l32i", "a15, a1, SVR_LC+20")))
+}
+
+// 64-bit binary libgcc function: fn(a: i64, b: i64) -> i64.
+fn xt_libcall64(fname: string, dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load(a, "a8", "a9"), opnd_load(b, "a2", "a3"));
+    stage: string <- concat(concat(mov_if_needed("a8", lo_of(a, "a8")), mov_if_needed("a9", hi_of(a, "a9"))), concat(mov_if_needed("a2", lo_of(b, "a2")), mov_if_needed("a3", hi_of(b, "a3"))));
+    args: string <- concat(concat(op2("mov", "a10", "a8"), op2("mov", "a11", "a9")), concat(op2("mov", "a12", "a2"), op2("mov", "a13", "a3")));
+    call: string <- concat(xt_vr@xt_ins("call8", fname), concat(op2("mov", "a8", "a10"), op2("mov", "a9", "a11")));
+    concat(concat(concat(load, stage), concat(lc_save(), concat(args, call))), concat(lc_restore(), put_result(dst, "a8", "a9")))
+}
+
+// libgcc 64-bit shift: fn(a: i64, amount: int) -> i64. AArch64 takes the amount modulo 64.
+fn xt_libcall_shift(fname: string, dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load(a, "a8", "a9"), opnd_load_lo(b, "a2"));
+    stage: string <- concat(concat(mov_if_needed("a8", lo_of(a, "a8")), mov_if_needed("a9", hi_of(a, "a9"))), concat(mov_if_needed("a2", lo_of(b, "a2")), xt_vr@xt_ins("extui", "a2, a2, 0, 6")));
+    args: string <- concat(concat(op2("mov", "a10", "a8"), op2("mov", "a11", "a9")), op2("mov", "a12", "a2"));
+    call: string <- concat(xt_vr@xt_ins("call8", fname), concat(op2("mov", "a8", "a10"), op2("mov", "a9", "a11")));
+    concat(concat(concat(load, stage), concat(lc_save(), concat(args, call))), concat(lc_restore(), put_result(dst, "a8", "a9")))
+}
+
+// --- division --------------------------------------------------------------------------------
+//
+// AArch64 SDIV/UDIV by zero give 0; Xtensa QUOS/REMS raise an exception and libgcc's __divdi3 is
+// undefined for it, so a zero divisor branches round the operation and produces 0. (The emitter still
+// emits its own explicit check that calls silica_rt_badarith first; this only keeps the semantics
+// exact when a division is reached without one.)
+
+fn div32(op: string, dst: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load_lo(a, "a8"), opnd_load_lo(b, "a2"));
+    y: string <- lo_of(b, "a2");
+    body: string <- concat(concat(movi_line("a9", 0), xt_vr@xt_ins("beqz", concat(y, ", 90f"))), concat(op3(op, "a9", lo_of(a, "a8"), y), "90:\n"));
+    concat(concat(load, body), put_result(dst, "a9", "a9"))
+}
+
+fn div64(fname: string, dst: string, a: string, b: string) -> string {
+    test: string <- concat(opnd_load(b, "a2", "a3"), op3("or", "a8", lo_of(b, "a2"), hi_of(b, "a3")));
+    zero: string <- concat(concat(movi_line("a8", 0), movi_line("a9", 0)), put_result(dst, "a8", "a9"));
+    concat(concat(test, xt_vr@xt_ins("bnez", "a8, 90f")), concat(concat(zero, xt_vr@xt_ins("j", "91f")), concat(concat("90:\n", xt_libcall64(fname, dst, a, b)), "91:\n")))
+}
+
+fn xt_sdiv(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> div32("quos", dst, a, b);
+        false -> div64("__divdi3", dst, a, b)
+    }
+}
+
+fn xt_udiv(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> div32("quou", dst, a, b);
+        false -> div64("__udivdi3", dst, a, b)
+    }
+}
+
+fn xt_srem(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> div32("rems", dst, a, b);
+        false -> div64("__moddi3", dst, a, b)
+    }
+}
+
+fn xt_urem(dst: string, a: string, b: string) -> string {
+    case is_w(dst) of {
+        true -> div32("remu", dst, a, b);
+        false -> div64("__umoddi3", dst, a, b)
+    }
+}
+
+// --- compares --------------------------------------------------------------------------------
+
+// Flag (0/1) for `a <cond> b` in a8. Width from a's class (W/S: 32-bit, otherwise 64-bit).
+fn xt_cmp_flag(cond: string, a: string, b: string) -> string {
+    case xt_vr@vr_class(a) == "W" of {
+        true -> cmp_flag32(cond, a, b);
+        false -> cmp_flag64(cond, a, b)
+    }
+}
+
+fn invert_a8() -> string {
+    concat(movi_line("a2", 1), op3("xor", "a8", "a8", "a2"))
+}
+
+// signed or unsigned x < y over (xlo, xhi) and (ylo, yhi), result in a8. Register roles are chosen so
+// every register is read before it is overwritten (see the module comment).
+fn lt64(xlo: string, xhi: string, ylo: string, yhi: string, unsigned: boolean) -> string {
+    hi_op: string <- case unsigned of { true -> "saltu"; false -> "salt" };
+    s1: string <- op3("saltu", "a8", xlo, ylo);
+    s2: string <- op3(hi_op, "a2", xhi, yhi);
+    s3: string <- op3("xor", "a9", xhi, yhi);
+    s4: string <- op3("movnez", "a8", "a2", "a9");
+    concat(concat(s1, s2), concat(s3, s4))
+}
+
+fn eq64(alo: string, ahi: string, blo: string, bhi: string) -> string {
+    s1: string <- op3("xor", "a8", alo, blo);
+    s2: string <- op3("xor", "a9", ahi, bhi);
+    s3: string <- op3("or", "a8", "a8", "a9");
+    s4: string <- op2("nsau", "a8", "a8");
+    s5: string <- op3("srli", "a8", "a8", "5");
+    concat(concat(s1, s2), concat(s3, concat(s4, s5)))
+}
+
+fn cmp_flag64(cond: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load(a, "a8", "a9"), opnd_load(b, "a2", "a3"));
+    alo: string <- lo_of(a, "a8");
+    ahi: string <- hi_of(a, "a9");
+    blo: string <- lo_of(b, "a2");
+    bhi: string <- hi_of(b, "a3");
+    body: string <- case cond of {
+        "EQ" -> eq64(alo, ahi, blo, bhi);
+        "NE" -> concat(eq64(alo, ahi, blo, bhi), invert_a8());
+        "LT" -> lt64(alo, ahi, blo, bhi, false);
+        "GE" -> concat(lt64(alo, ahi, blo, bhi, false), invert_a8());
+        "GT" -> lt64(blo, bhi, alo, ahi, false);
+        "LE" -> concat(lt64(blo, bhi, alo, ahi, false), invert_a8());
+        "LO" -> lt64(alo, ahi, blo, bhi, true);
+        "CC" -> lt64(alo, ahi, blo, bhi, true);
+        "HS" -> concat(lt64(alo, ahi, blo, bhi, true), invert_a8());
+        "CS" -> concat(lt64(alo, ahi, blo, bhi, true), invert_a8());
+        "HI" -> lt64(blo, bhi, alo, ahi, true);
+        "LS" -> concat(lt64(blo, bhi, alo, ahi, true), invert_a8());
+        _: string -> concat(xt_vr@xt_ins("ill", ""), movi_line("a8", 0))
+    };
+    concat(load, body)
+}
+
+fn cmp_flag32(cond: string, a: string, b: string) -> string {
+    load: string <- concat(opnd_load_lo(a, "a8"), opnd_load_lo(b, "a2"));
+    x: string <- lo_of(a, "a8");
+    y: string <- lo_of(b, "a2");
+    eq: string <- concat(op3("sub", "a8", x, y), concat(op2("nsau", "a8", "a8"), op3("srli", "a8", "a8", "5")));
+    body: string <- case cond of {
+        "EQ" -> eq;
+        "NE" -> concat(eq, invert_a8());
+        "LT" -> op3("salt", "a8", x, y);
+        "GE" -> concat(op3("salt", "a8", x, y), invert_a8());
+        "GT" -> op3("salt", "a8", y, x);
+        "LE" -> concat(op3("salt", "a8", y, x), invert_a8());
+        "LO" -> op3("saltu", "a8", x, y);
+        "CC" -> op3("saltu", "a8", x, y);
+        "HS" -> concat(op3("saltu", "a8", x, y), invert_a8());
+        "CS" -> concat(op3("saltu", "a8", x, y), invert_a8());
+        "HI" -> op3("saltu", "a8", y, x);
+        "LS" -> concat(op3("saltu", "a8", y, x), invert_a8());
+        _: string -> concat(xt_vr@xt_ins("ill", ""), movi_line("a8", 0))
+    };
+    concat(load, body)
+}
+
+// CMP a, b; CSET dst, cond
+fn xt_cmp_set(dst: string, cond: string, a: string, b: string) -> string {
+    concat(xt_cmp_flag(cond, a, b), concat(movi_line("a9", 0), xt_vr@vr_put(dst, "a8", "a9")))
+}
+
+// CMP a, b; B.cond label
+fn xt_cmp_branch(cond: string, a: string, b: string, label: string) -> string {
+    concat(xt_cmp_flag(cond, a, b), xt_vr@xt_ins("bnez", concat("a8, ", label)))
+}
+
+// Branch when pointer v is below this function's frame: its low word unsigned below a1, the
+// bottom of the [a1, X29) slot area. Frame regions live on the machine stack here, not under SP
+// (the auxiliary stack), so `CMP v, SP; B.LO` is no frame bound on this target: in an actor the
+// two stacks are separate heap chunks in either order.
+fn xt_branch_below_frame(v: string, label: string) -> string {
+    concat(xt_vr@vr_lo_load(v, "a8"), xt_vr@xt_ins("bltu", concat(xt_vr@vr_lo_reg(v, "a8"), concat(", a1, ", label))))
+}
+
+// CMP a, b; CSEL dst, t, f, cond. Flag in a8; the selected low word is built in a2, the high word in a3.
+fn xt_cmp_select(dst: string, t: string, f: string, cond: string, a: string, b: string) -> string {
+    flag: string <- xt_cmp_flag(cond, a, b);
+    lo: string <- concat(concat(opnd_load_lo(f, "a2"), mov_if_needed("a2", lo_of(f, "a2"))), concat(opnd_load_lo(t, "a3"), op3("movnez", "a2", lo_of(t, "a3"), "a8")));
+    hi: string <- concat(concat(fhi_load(f), mov_if_needed("a3", hi_of(f, "a3"))), concat(fhi_load_t(t), op3("movnez", "a3", hi_of(t, "a9"), "a8")));
+    concat(flag, concat(concat(lo, hi), xt_vr@vr_put(dst, "a2", "a3")))
+}
+
+fn fhi_load(f: string) -> string {
+    case xt_is_imm(f) of {
+        true -> movi_line("a3", hi32s(xt_imm_value(f)));
+        false -> xt_vr@vr_hi_load(f, "a3")
+    }
+}
+
+fn fhi_load_t(t: string) -> string {
+    case xt_is_imm(t) of {
+        true -> movi_line("a9", hi32s(xt_imm_value(t)));
+        false -> xt_vr@vr_hi_load(t, "a9")
+    }
+}
+
+// CBZ / CBNZ: 64-bit for X, 32-bit for W.
+fn zero_test(v: string) -> string {
+    case xt_vr@vr_class(v) == "W" of {
+        true -> concat(xt_vr@vr_lo_load(v, "a8"), mov_if_needed("a8", xt_vr@vr_lo_reg(v, "a8")));
+        false -> concat(concat(xt_vr@vr_lo_load(v, "a8"), xt_vr@vr_hi_load(v, "a9")), op3("or", "a8", xt_vr@vr_lo_reg(v, "a8"), xt_vr@vr_hi_reg(v, "a9")))
+    }
+}
+
+fn xt_cbz(v: string, label: string) -> string {
+    concat(zero_test(v), xt_vr@xt_ins("beqz", concat("a8, ", label)))
+}
+
+fn xt_cbnz(v: string, label: string) -> string {
+    concat(zero_test(v), xt_vr@xt_ins("bnez", concat("a8, ", label)))
+}
+
+fn xt_b(label: string) -> string {
+    xt_vr@xt_ins("j", label)
+}
+
+// --- calls -----------------------------------------------------------------------------------
+
+// Runtime and C symbols carried Mach-O's leading underscore in the Apple emitter; ELF has none. Silica
+// symbols that start with L or a digit keep the underscore module_linkage gives them (their definitions
+// are spelled with it).
+fn xt_sym(s: string) -> string {
+    case length_bytes(s) > 1 and substring(s, 0, 1) == "_" of {
+        true -> {
+            c: string <- substring(s, 1, 2);
+            // libgcc names (__fixdfsi ...) keep both underscores
+            case c == "_" or c == "L" or c == "0" or c == "1" or c == "2" or c == "3" or c == "4" or c == "5" or c == "6" or c == "7" or c == "8" or c == "9" of {
+                true -> s;
+                false -> substring(s, 1, length_bytes(s))
+            }
+        };
+        false -> s
+    }
+}
+
+fn xt_call(sym: string) -> string {
+    xt_vr@xt_ins("call8", xt_sym(sym))
+}
+
+// BLR Xn: target in Xn's low word.
+fn xt_callr(v: string) -> string {
+    concat(concat(xt_vr@vr_lo_load(v, "a8"), mov_if_needed("a8", xt_vr@vr_lo_reg(v, "a8"))), xt_vr@xt_ins("callx8", "a8"))
+}

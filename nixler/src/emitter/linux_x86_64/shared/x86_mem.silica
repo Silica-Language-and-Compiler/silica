@@ -1,0 +1,560 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Loads and stores over virtual registers (see x86_vr, x86_isa).
+//
+// Memory operands arrive in the AArch64 spelling the emitter already builds, and every form the
+// linux_aarch64 emitter produces is accepted:
+//   [Xn]            [Xn, #imm]        [Xn, Xm]          [Xn, :lo12:sym]   (the ADRP already gave the
+//   [Xn, Xm, LSL #k]  (index scaled by 2^k)                                full address: offset 0)
+//   [SP, #imm]!     [SP], #imm        [Xn], #imm        [Xn, #imm]!
+// Bases:
+//   X29  -> the frame: [X29, #-N] is [rbp - SVR_AREA - N] (x86_vr@x86_frame_slot)
+//   SP   -> [rsp + imm]; pre-/post-index move rsp with lea (real pushes and pops)
+//   other X VRs -> the register, or the slot value loaded into r12
+// Width comes from the register: X/D 8 bytes, W/S 4, H 2; the byte/half helpers are separate.
+//
+// Every helper here is flag-transparent (mov / lea / movzx / movsx / movq / movd only), so a load or
+// store may sit between a CMP and its consumer as it does on AArch64.
+//
+// Scratch use: rax = data, r12 = base address, r13 = index. A slot-homed data VR passes through rax; a
+// slot-homed base through r12; a slot-homed index through r13, so none can clobber another.
+
+use string_parse;
+use x86_vr;
+
+export x86_ldr/2;
+export x86_str/2;
+export x86_ldrb/2;
+export x86_ldrsb/2;
+export x86_ldrh/2;
+export x86_ldrsh/2;
+export x86_ldrsw/2;
+export x86_strb/2;
+export x86_strh/2;
+export x86_ldp/3;
+export x86_stp/3;
+export x86_mem_opnd/1;
+export x86_mem_setup/1;
+export x86_mem_finish/1;
+export x86_push/1;
+export x86_pop/1;
+export x86_c_csave/0;
+export x86_c_crestore/0;
+
+fn ins2(op: string, a: string, b: string) -> string {
+    x86_vr@x86_ins(op, concat(a, concat(", ", b)))
+}
+
+fn itos(n: int64) -> string {
+    x86_vr@x86_itos(n)
+}
+
+fn find_char(s: string, c: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + 1) == c of {
+            true -> i;
+            false -> find_char(s, c, i + 1)
+        }
+    }
+}
+
+fn trim_spaces(s: string) -> string {
+    n: int64 <- length_bytes(s);
+    case n > 0 and substring(s, 0, 1) == " " of {
+        true -> trim_spaces(substring(s, 1, n));
+        false -> case n > 0 and substring(s, n - 1, n) == " " of {
+            true -> trim_spaces(substring(s, 0, n - 1));
+            false -> s
+        }
+    }
+}
+
+// --- operand parsing -------------------------------------------------------------------------
+
+fn mem_inner(m: string) -> string {
+    e: int64 <- find_char(m, "]", 0);
+    case e < 0 of {
+        true -> "";
+        false -> substring(m, 1, e)
+    }
+}
+
+fn mem_after(m: string) -> string {
+    e: int64 <- find_char(m, "]", 0);
+    case e < 0 of {
+        true -> "";
+        false -> trim_spaces(substring(m, e + 1, length_bytes(m)))
+    }
+}
+
+fn mem_base(m: string) -> string {
+    inner: string <- mem_inner(m);
+    c: int64 <- find_char(inner, ",", 0);
+    case c < 0 of {
+        true -> trim_spaces(inner);
+        false -> trim_spaces(substring(inner, 0, c))
+    }
+}
+
+fn mem_second(m: string) -> string {
+    inner: string <- mem_inner(m);
+    c: int64 <- find_char(inner, ",", 0);
+    case c < 0 of {
+        true -> "";
+        false -> trim_spaces(substring(inner, c + 1, length_bytes(inner)))
+    }
+}
+
+fn imm_of(t: string) -> int64 {
+    u: string <- substring(t, 1, length_bytes(t));
+    case length_bytes(u) > 1 and substring(u, 0, 1) == "-" of {
+        true -> 0 - string_parse@string_to_int64(substring(u, 1, length_bytes(u)));
+        false -> string_parse@string_to_int64(u)
+    }
+}
+
+// Offset applied to the access itself (0 for post-index and for register / symbol offsets).
+fn mem_disp(m: string) -> int64 {
+    sec: string <- mem_second(m);
+    case length_bytes(sec) > 0 and substring(sec, 0, 1) == "#" of {
+        true -> imm_of(sec);
+        false -> 0
+    }
+}
+
+fn mem_is_pre(m: string) -> boolean {
+    mem_after(m) == "!"
+}
+
+fn mem_post(m: string) -> int64 {
+    a: string <- mem_after(m);
+    case length_bytes(a) > 2 and substring(a, 0, 1) == "," of {
+        true -> imm_of(trim_spaces(substring(a, 1, length_bytes(a))));
+        false -> 0
+    }
+}
+
+// [Xn, Xm] or [Xn, Xm, LSL #k]: the index register, and the scale applied to it.
+fn mem_index_reg(m: string) -> string {
+    sec: string <- mem_second(m);
+    c: int64 <- find_char(sec, ",", 0);
+    reg: string <- case c < 0 of {
+        true -> sec;
+        false -> trim_spaces(substring(sec, 0, c))
+    };
+    case length_bytes(reg) > 0 and x86_vr@vr_is_int(reg) of {
+        true -> reg;
+        false -> ""
+    }
+}
+
+fn mem_index_shift(m: string) -> int64 {
+    sec: string <- mem_second(m);
+    c: int64 <- find_char(sec, ",", 0);
+    case c < 0 of {
+        true -> 0;
+        false -> {
+            rest: string <- trim_spaces(substring(sec, c + 1, length_bytes(sec)));
+            h: int64 <- find_char(rest, "#", 0);
+            case h < 0 of {
+                true -> 0;
+                false -> string_parse@string_to_int64(trim_spaces(substring(rest, h + 1, length_bytes(rest))))
+            }
+        }
+    }
+}
+
+fn scale_of(sh: int64) -> string {
+    case sh of {
+        0 -> "1"; 1 -> "2"; 2 -> "4"; _: int64 -> "8"
+    }
+}
+
+fn is_frame(m: string) -> boolean {
+    x86_vr@vr_is_fp(mem_base(m))
+}
+
+fn is_sp(m: string) -> boolean {
+    x86_vr@vr_is_sp(mem_base(m))
+}
+
+// --- address formation -----------------------------------------------------------------------
+
+// Register holding the base after x86_mem_setup: the VR's register, r12 for a slot-homed base.
+fn base_reg(base: string) -> string {
+    case x86_vr@vr_is_reg(base) of {
+        true -> x86_vr@vr_reg64(base);
+        false -> "r12"
+    }
+}
+
+fn base_load(base: string) -> string {
+    case x86_vr@vr_is_reg(base) of {
+        true -> "";
+        false -> x86_vr@x86_load64(base, "r12")
+    }
+}
+
+fn index_reg(idx: string) -> string {
+    case x86_vr@vr_is_reg(idx) of {
+        true -> x86_vr@vr_reg64(idx);
+        false -> "r13"
+    }
+}
+
+fn index_load(idx: string) -> string {
+    case length_bytes(idx) == 0 or x86_vr@vr_is_reg(idx) of {
+        true -> "";
+        false -> x86_vr@x86_load64(idx, "r13")
+    }
+}
+
+// Writeback of a non-SP base by `off` (pre-index before the access, post-index after it).
+fn base_writeback(base: string, off: int64) -> string {
+    case off == 0 of {
+        true -> "";
+        false -> case x86_vr@vr_is_reg(base) of {
+            true -> ins2("lea", x86_vr@vr_reg64(base), concat("[", concat(x86_vr@vr_reg64(base), concat(" + ", concat(itos(off), "]")))));
+            false -> concat(concat(x86_vr@x86_load64(base, "r12"), ins2("lea", "r12", concat("[r12 + ", concat(itos(off), "]")))), x86_vr@x86_put64(base, "r12"))
+        }
+    }
+}
+
+fn disp_text(d: int64) -> string {
+    case d == 0 of {
+        true -> "";
+        false -> case d < 0 of {
+            true -> concat(" - ", itos(0 - d));
+            false -> concat(" + ", itos(d))
+        }
+    }
+}
+
+// Code that runs before the access: loads a slot-homed base / index, applies an SP pre-index (a real
+// push: lea rsp), or a base pre-index.
+fn x86_mem_setup(m: string) -> string {
+    base: string <- mem_base(m);
+    idx: string <- mem_index_reg(m);
+    case is_frame(m) of {
+        true -> "";
+        false -> case is_sp(m) of {
+            true -> case mem_is_pre(m) of {
+                true -> ins2("lea", "rsp", concat("[rsp", concat(disp_text(mem_disp(m)), "]")));
+                false -> ""
+            };
+            false -> case mem_is_pre(m) of {
+                true -> concat(base_writeback(base, mem_disp(m)), base_load(base));
+                false -> concat(base_load(base), index_load(idx))
+            }
+        }
+    }
+}
+
+// The x86 memory operand "[...]" for m (after x86_mem_setup ran).
+fn x86_mem_opnd(m: string) -> string {
+    base: string <- mem_base(m);
+    idx: string <- mem_index_reg(m);
+    case is_frame(m) of {
+        true -> x86_vr@x86_frame_slot(mem_disp(m));
+        false -> case is_sp(m) of {
+            true -> case mem_is_pre(m) of {
+                true -> "[rsp]";
+                false -> concat("[rsp", concat(disp_text(mem_disp(m)), "]"))
+            };
+            false -> case mem_is_pre(m) of {
+                true -> concat("[", concat(base_reg(base), "]"));
+                false -> case length_bytes(idx) > 0 of {
+                    true -> concat("[", concat(base_reg(base), concat(" + ", concat(index_reg(idx), concat("*", concat(scale_of(mem_index_shift(m)), "]"))))));
+                    false -> concat("[", concat(base_reg(base), concat(disp_text(mem_disp(m)), "]")))
+                }
+            }
+        }
+    }
+}
+
+// Post-index writeback after the access.
+fn x86_mem_finish(m: string) -> string {
+    case is_frame(m) of {
+        true -> "";
+        false -> case is_sp(m) of {
+            true -> case mem_post(m) == 0 of {
+                true -> "";
+                false -> ins2("lea", "rsp", concat("[rsp", concat(disp_text(mem_post(m)), "]")))
+            };
+            false -> base_writeback(mem_base(m), mem_post(m))
+        }
+    }
+}
+
+// Operand with an extra byte offset (the second half of a pair).
+fn opnd_plus(m: string, plus: int64) -> string {
+    o: string <- x86_mem_opnd(m);
+    case plus == 0 of {
+        true -> o;
+        false -> concat(substring(o, 0, length_bytes(o) - 1), concat(disp_text(plus), "]"))
+    }
+}
+
+fn sized(kw: string, o: string) -> string {
+    concat(kw, concat(" PTR ", o))
+}
+
+// --- loads -----------------------------------------------------------------------------------
+
+fn load_into(dst: string, m: string, plus: int64) -> string {
+    c: string <- x86_vr@vr_class(dst);
+    o: string <- opnd_plus(m, plus);
+    case c == "ZR" or c == "" of {
+        true -> "";
+        false -> case c == "X" of {
+            true -> case x86_vr@vr_is_reg(dst) of {
+                true -> ins2("mov", x86_vr@vr_reg64(dst), sized("QWORD", o));
+                false -> concat(ins2("mov", "rax", sized("QWORD", o)), x86_vr@x86_put64(dst, "rax"))
+            };
+            false -> case c == "W" of {
+                true -> case x86_vr@vr_is_reg(dst) of {
+                    true -> ins2("mov", x86_vr@vr_reg32(dst), sized("DWORD", o));
+                    false -> concat(ins2("mov", "eax", sized("DWORD", o)), x86_vr@x86_put32(dst, "eax"))
+                };
+                false -> case c == "D" of {
+                    true -> case x86_vr@vr_is_reg(dst) of {
+                        true -> ins2("movq", x86_vr@vr_xmm(dst), sized("QWORD", o));
+                        false -> concat(ins2("mov", "rax", sized("QWORD", o)), ins2("mov", x86_vr@vr_slot_mem_sized(dst, "QWORD"), "rax"))
+                    };
+                    false -> case c == "S" of {
+                        true -> case x86_vr@vr_is_reg(dst) of {
+                            true -> ins2("movd", x86_vr@vr_xmm(dst), sized("DWORD", o));
+                            false -> concat(ins2("mov", "eax", sized("DWORD", o)), ins2("mov", x86_vr@vr_slot_mem_sized(dst, "QWORD"), "rax"))
+                        };
+                        false -> case c == "H" of {
+                            true -> case x86_vr@vr_is_reg(dst) of {
+                                true -> concat(ins2("movzx", "eax", sized("WORD", o)), ins2("movd", x86_vr@vr_xmm(dst), "eax"));
+                                false -> concat(ins2("movzx", "eax", sized("WORD", o)), ins2("mov", x86_vr@vr_slot_mem_sized(dst, "QWORD"), "rax"))
+                            };
+                            false -> case c == "SP" of {
+                                true -> ins2("mov", "rsp", sized("QWORD", o));
+                                false -> ""
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn x86_ldr(dst: string, m: string) -> string {
+    concat(concat(x86_mem_setup(m), load_into(dst, m, 0)), x86_mem_finish(m))
+}
+
+// Zero / sign extending narrow loads. A W destination gets a 32-bit value, an X one 64 bits.
+fn ext_load(op: string, kw: string, dst: string, m: string) -> string {
+    wide: boolean <- x86_vr@vr_class(dst) == "X";
+    r: string <- case wide and (op == "movsx" or op == "movsxd") of { true -> "rax"; false -> "eax" };
+    case x86_vr@vr_is_zero(dst) of {
+        true -> "";
+        false -> concat(concat(x86_mem_setup(m), concat(ins2(op, r, sized(kw, x86_mem_opnd(m))), x86_vr@x86_put64(dst, "rax"))), x86_mem_finish(m))
+    }
+}
+
+fn x86_ldrb(dst: string, m: string) -> string {
+    ext_load("movzx", "BYTE", dst, m)
+}
+
+fn x86_ldrsb(dst: string, m: string) -> string {
+    ext_load("movsx", "BYTE", dst, m)
+}
+
+fn x86_ldrh(dst: string, m: string) -> string {
+    ext_load("movzx", "WORD", dst, m)
+}
+
+fn x86_ldrsh(dst: string, m: string) -> string {
+    ext_load("movsx", "WORD", dst, m)
+}
+
+fn x86_ldrsw(dst: string, m: string) -> string {
+    ext_load("movsxd", "DWORD", dst, m)
+}
+
+// --- stores ----------------------------------------------------------------------------------
+
+// Bring the data of src into a register the store can use; returns the code. store_reg gives the name.
+fn store_load(src: string) -> string {
+    c: string <- x86_vr@vr_class(src);
+    case x86_vr@vr_is_reg(src) or c == "ZR" or c == "SP" of {
+        true -> "";
+        false -> case x86_vr@vr_is_fp(src) of {
+            true -> x86_vr@x86_fp_lea("rax");
+            false -> case c == "H" of {
+                true -> ins2("movzx", "eax", x86_vr@vr_slot_mem_sized(src, "WORD"));
+                false -> case c == "W" or c == "S" of {
+                    true -> ins2("mov", "eax", x86_vr@vr_slot_mem_sized(src, "DWORD"));
+                    false -> ins2("mov", "rax", x86_vr@vr_slot_mem_sized(src, "QWORD"))
+                }
+            }
+        }
+    }
+}
+
+fn store_into(src: string, m: string, plus: int64) -> string {
+    c: string <- x86_vr@vr_class(src);
+    o: string <- opnd_plus(m, plus);
+    case c == "ZR" of {
+        true -> ins2("mov", sized("QWORD", o), "0");
+        false -> case c == "SP" of {
+            true -> ins2("mov", sized("QWORD", o), "rsp");
+            false -> case c == "X" of {
+                true -> case x86_vr@vr_is_reg(src) of {
+                    true -> ins2("mov", sized("QWORD", o), x86_vr@vr_reg64(src));
+                    false -> ins2("mov", sized("QWORD", o), "rax")
+                };
+                false -> case c == "W" of {
+                    true -> case x86_vr@vr_is_reg(src) of {
+                        true -> ins2("mov", sized("DWORD", o), x86_vr@vr_reg32(src));
+                        false -> ins2("mov", sized("DWORD", o), "eax")
+                    };
+                    false -> case c == "D" of {
+                        true -> case x86_vr@vr_is_reg(src) of {
+                            true -> ins2("movq", sized("QWORD", o), x86_vr@vr_xmm(src));
+                            false -> ins2("mov", sized("QWORD", o), "rax")
+                        };
+                        false -> case c == "S" of {
+                            true -> case x86_vr@vr_is_reg(src) of {
+                                true -> ins2("movd", sized("DWORD", o), x86_vr@vr_xmm(src));
+                                false -> ins2("mov", sized("DWORD", o), "eax")
+                            };
+                            false -> case c == "H" of {
+                                true -> case x86_vr@vr_is_reg(src) of {
+                                    true -> concat(ins2("movd", "eax", x86_vr@vr_xmm(src)), ins2("mov", sized("WORD", o), "ax"));
+                                    false -> ins2("mov", sized("WORD", o), "ax")
+                                };
+                                false -> ""
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A W store of WZR is a 32-bit zero; STR WZR arrives as the class ZR with no width, so it takes the
+// width of the mnemonic: x86_str stores 8 bytes for XZR and the callers pass "WZR" for a 4-byte zero.
+fn zr_store(src: string, m: string, plus: int64) -> string {
+    kw: string <- case src == "WZR" or src == "wzr" of { true -> "DWORD"; false -> "QWORD" };
+    ins2("mov", sized(kw, opnd_plus(m, plus)), "0")
+}
+
+fn x86_str(src: string, m: string) -> string {
+    body: string <- case x86_vr@vr_is_zero(src) of {
+        true -> zr_store(src, m, 0);
+        false -> store_into(src, m, 0)
+    };
+    concat(concat(concat(concat(store_load(src), x86_mem_setup(m)), body), x86_mem_finish(m)), x86_mem_err_marker(m))
+}
+
+// term_aggregate_helpers@tuple_flat_memref poisons an unresolved record field offset as
+// "[SP, #0]\n    // silica internal error: ...\n    .err" so the AArch64 assemblers reject the unit.
+// The operand parser here reads only the bracketed part, which dropped the `.err`: the store went to
+// [rsp] over a saved register pair and the build succeeded (ordered_data_structures faulted with exit
+// 70 on nix only). Keep the poison as an assembler error.
+fn x86_mem_err_marker(m: string) -> string {
+    case length_bytes(m) > 4 and substring(m, length_bytes(m) - 4, length_bytes(m)) == ".err" of {
+        true -> "    .error \"silica internal error: unresolved record field offset (field not in record type)\"\n";
+        false -> ""
+    }
+}
+
+fn narrow_store(kw: string, src: string, m: string) -> string {
+    data: string <- case x86_vr@vr_is_reg(src) of {
+        true -> case kw == "BYTE" of {
+            true -> x86_vr@reg8_of(x86_vr@vr_reg64(src));
+            false -> x86_vr@reg16_of(x86_vr@vr_reg64(src))
+        };
+        false -> case kw == "BYTE" of { true -> "al"; false -> "ax" }
+    };
+    body: string <- case x86_vr@vr_is_zero(src) of {
+        true -> ins2("mov", sized(kw, x86_mem_opnd(m)), "0");
+        false -> ins2("mov", sized(kw, x86_mem_opnd(m)), data)
+    };
+    concat(concat(concat(store_load(src), x86_mem_setup(m)), body), x86_mem_finish(m))
+}
+
+fn x86_strb(src: string, m: string) -> string {
+    narrow_store("BYTE", src, m)
+}
+
+fn x86_strh(src: string, m: string) -> string {
+    narrow_store("WORD", src, m)
+}
+
+// --- pairs -----------------------------------------------------------------------------------
+//
+// LDP/STP are two accesses at disp and disp + width. The SP push/pop forms keep their meaning: the
+// pre-index adjustment happens once before both accesses, the post-index one after both. The two
+// data registers may both be slot-homed: the second is loaded after the first is stored.
+
+fn width_of(r: string) -> int64 {
+    c: string <- x86_vr@vr_class(r);
+    case c == "X" or c == "D" or c == "ZR" or c == "SP" of {
+        true -> 8;
+        false -> case c == "H" of {
+            true -> 2;
+            false -> 4
+        }
+    }
+}
+
+fn x86_ldp(r1: string, r2: string, m: string) -> string {
+    w: int64 <- width_of(r1);
+    case r1 == "X30" or r2 == "X30" of {
+        true -> "    .error \"x86_mem: LDP of X30 outside control\"\n";
+        false -> concat(concat(x86_mem_setup(m), concat(load_into(r1, m, 0), load_into(r2, m, w))), x86_mem_finish(m))
+    }
+}
+
+fn x86_stp(r1: string, r2: string, m: string) -> string {
+    w: int64 <- width_of(r1);
+    s1: string <- case x86_vr@vr_is_zero(r1) of { true -> zr_store(r1, m, 0); false -> concat(store_load(r1), store_into(r1, m, 0)) };
+    s2: string <- case x86_vr@vr_is_zero(r2) of { true -> zr_store(r2, m, w); false -> concat(store_load(r2), store_into(r2, m, w)) };
+    case r1 == "X30" or r2 == "X30" of {
+        true -> "    .error \"x86_mem: STP of X30 outside control\"\n";
+        false -> concat(concat(x86_mem_setup(m), concat(s1, s2)), x86_mem_finish(m))
+    }
+}
+
+// STR v, [SP, #-16]!  and  LDR v, [SP], #16  (the emitter's 16-byte push and pop of one value).
+fn x86_push(v: string) -> string {
+    x86_str(v, "[SP, #-16]!")
+}
+
+fn x86_pop(v: string) -> string {
+    x86_ldr(v, "[SP], #16")
+}
+
+// A function that C calls (program main) must preserve rbx and r12-r15, which are VR homes and
+// scratch here. They are parked in five home slots x86_frame_header reserves when it sees SVR_CS0.
+fn x86_c_csave() -> string {
+    concat(concat(concat(ins2("mov", "QWORD PTR [rbp - SVR_CS0]", "rbx"), ins2("mov", "QWORD PTR [rbp - SVR_CS1]", "r12")), concat(ins2("mov", "QWORD PTR [rbp - SVR_CS2]", "r13"), ins2("mov", "QWORD PTR [rbp - SVR_CS3]", "r14"))), ins2("mov", "QWORD PTR [rbp - SVR_CS4]", "r15"))
+}
+
+fn x86_c_crestore() -> string {
+    concat(concat(concat(ins2("mov", "rbx", "QWORD PTR [rbp - SVR_CS0]"), ins2("mov", "r12", "QWORD PTR [rbp - SVR_CS1]")), concat(ins2("mov", "r13", "QWORD PTR [rbp - SVR_CS2]"), ins2("mov", "r14", "QWORD PTR [rbp - SVR_CS3]"))), ins2("mov", "r15", "QWORD PTR [rbp - SVR_CS4]"))
+}

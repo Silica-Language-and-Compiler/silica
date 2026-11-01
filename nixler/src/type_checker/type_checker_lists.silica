@@ -1,0 +1,916 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// List[T, S] typing helpers for the type checker (list_implementation_design.md §3.5, §7).
+// Parsing surface strings; compatibility with legacy List[T]; generic call value "T S" or "T".
+
+use parser_ast;
+use type_checker_core;
+use type_checker_traits;
+use type_checker_record_types;
+
+export parse_list_empty_case_pattern/1;
+export parse_list_cons_case_pattern/1;
+export is_list_primitive_name/1;
+export format_list_type_from_parts/2;
+export parse_generic_ts/1;
+export parse_list_type_params/1;
+export list_types_compatible/2;
+export list_element_type_from_list_type/1;
+export infer_list_primitive_return/1;
+export count_call_args_list/1;
+export list_empty_effective_arg_count/1;
+export types_equal_strip/2;
+export validate_list_type_declaration/2;
+export is_collectable_element_placeholder/1;
+export collectable_types_compatible/3;
+export formal_type_accepts_actual/3;
+export resolve_list_type_from_collectable_generic/3;
+export list_field_access_type/2;
+
+// ListEmptyPat / ListConsPat are anonymous records (spec §3.4.2).
+
+fn strip_spaces_list(s: string) -> string {
+    strip_spaces_list_from(s, 0, length_bytes(s) - 1)
+}
+
+fn strip_spaces_list_from(s: string, start: int64, end_inclusive: int64) -> string {
+    case start > end_inclusive of {
+        true -> "";
+        false -> case substring(s, start, start + 1) == " " of {
+            true -> strip_spaces_list_from(s, start + 1, end_inclusive);
+            false -> case substring(s, end_inclusive, end_inclusive + 1) == " " of {
+                true -> strip_spaces_list_from(s, start, end_inclusive - 1);
+                false -> substring(s, start, end_inclusive + 1)
+            }
+        }
+    }
+}
+
+// { source: string, position: int64, line: int64, column: int64, file: string }/parser may join tokens with spaces anywhere ("int64 , mem ( normal )"). Match spec tuple types_equal.
+fn strip_all_spaces_list(s: string) -> string {
+    strip_all_spaces_list_from(s, 0, "")
+}
+
+fn strip_all_spaces_list_from_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case substring(s, j, j + 1) == " " of {
+            true -> j;
+            false -> strip_all_spaces_list_from_run_end(s, j + 1, n)
+        }
+    }
+}
+
+fn strip_all_spaces_list_from(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> strip_all_spaces_list_from(s, i + 1, acc);
+            false -> {
+                n: int64 <- length_bytes(s);
+                e: int64 <- strip_all_spaces_list_from_run_end(s, i, n);
+                strip_all_spaces_list_from(s, e, concat(acc, substring(s, i, e)))
+            }
+        }
+    }
+}
+
+fn starts_with_list(s: string, prefix: string) -> boolean {
+    case length_bytes(s) < length_bytes(prefix) of {
+        true -> false;
+        false -> substring(s, 0, length_bytes(prefix)) == prefix
+    }
+}
+
+// slot_lexemes_join may produce "List [int64, normal]" (space after List). parse_list_type_params requires "List[".
+fn skip_spaces_index_list(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> skip_spaces_index_list(s, i + 1);
+            false -> i
+        }
+    }
+}
+
+fn normalize_list_type_bracket(s: string) -> string {
+    case length_bytes(s) < 6 of {
+        true -> s;
+        false -> case substring(s, 0, 4) == "List" of {
+            true -> {
+                j: int64 <- skip_spaces_index_list(s, 4);
+                case j >= length_bytes(s) of {
+                    true -> s;
+                    false -> case substring(s, j, j + 1) == "[" of {
+                        true -> concat("List[", substring(s, j + 1, length_bytes(s)));
+                        false -> s
+                    }
+                }
+            };
+            false -> s
+        }
+    }
+}
+
+// "List[int64, mem(normal)]" -> (true, "int64", "mem(normal)"); "List[int64]" -> (true, "int64", "")
+fn parse_list_type_params(full: string) -> (boolean, string, string) {
+    t: string <- normalize_list_type_bracket(strip_all_spaces_list(full));
+    case length_bytes(t) < 6 of {
+        true -> (false, "", "");
+        false -> case starts_with_list(t, "List[") of {
+            false -> (false, "", "");
+            true -> case substring(t, length_bytes(t) - 1, length_bytes(t)) == "]" of {
+                false -> (false, "", "");
+                true -> {
+                    inner: string <- substring(t, 5, length_bytes(t) - 1);
+                    inner_trim: string <- strip_spaces_list(inner);
+                    comma_pos: int64 <- find_first_comma_depth0_list(inner_trim, 0, 0);
+                    case comma_pos >= length_bytes(inner_trim) of {
+                        true -> (true, inner_trim, "");
+                        false -> {
+                            elem: string <- strip_spaces_list(substring(inner_trim, 0, comma_pos));
+                            space: string <- strip_spaces_list(substring(inner_trim, comma_pos + 1, length_bytes(inner_trim)));
+                            (true, elem, space)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Comma at depth 0; depth increases for [, (, {; decreases for ], ), }.
+fn find_first_comma_depth0_list(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> find_first_comma_depth0_list(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> find_first_comma_depth0_list(s, i + 1, depth - 1);
+                    false -> case c == "," of {
+                        true -> case depth == 0 of {
+                            true -> i;
+                            false -> find_first_comma_depth0_list(s, i + 1, depth)
+                        };
+                        false -> find_first_comma_depth0_list(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn unwrap_atom_union_parens_list(s: string) -> string {
+    t: string <- strip_all_spaces_list(s);
+    case length_bytes(t) >= 2 and substring(t, 0, 1) == "(" and substring(t, length_bytes(t) - 1, length_bytes(t)) == ")" of {
+        false -> t;
+        true -> {
+            inner: string <- substring(t, 1, length_bytes(t) - 1);
+            case length_bytes(inner) > 0 and substring(inner, 0, 1) == ":" of {
+                true -> inner;
+                false -> t
+            }
+        }
+    }
+}
+
+fn types_equal_strip(a: string, b: string) -> boolean {
+    unwrap_atom_union_parens_list(a) == unwrap_atom_union_parens_list(b)
+}
+
+fn is_atom_option_type_list(t: string) -> boolean {
+    s: string <- unwrap_atom_union_parens_list(t);
+    length_bytes(s) > 0 and substring(s, 0, 1) == ":"
+}
+
+// Surface memory space is mem(<space>); compare after stripping so mem(normal) matches the inner token form.
+fn normalize_memory_space_for_list(s: string) -> string {
+    t: string <- strip_spaces_list(s);
+    case length_bytes(t) < 6 of {
+        true -> t;
+        false -> case substring(t, 0, 4) == "mem(" of {
+            false -> t;
+            true -> case substring(t, length_bytes(t) - 1, length_bytes(t)) == ")" of {
+                false -> t;
+                true -> strip_spaces_list(substring(t, 4, length_bytes(t) - 1))
+            }
+        }
+    }
+}
+
+fn memory_spaces_equivalent_for_list(a: string, b: string) -> boolean {
+    types_equal_strip(normalize_memory_space_for_list(a), normalize_memory_space_for_list(b))
+}
+
+fn is_collectable_element_placeholder(elem: string) -> boolean {
+    strip_all_spaces_list(elem) == "Collectable"
+}
+
+// Legacy List[T] matches List[T, S] when element types match. List[Collectable, S] matches List[T, S] when T is Collectable (silica-spec §8.2.4).
+fn list_types_compatible(a: string, b: string) -> boolean {
+    case strip_all_spaces_list(a) == strip_all_spaces_list(b) of {
+        true -> true;
+        false -> {
+            (ok_a: boolean, ea: string, sa: string) <- parse_list_type_params(a);
+            (ok_b: boolean, eb: string, sb: string) <- parse_list_type_params(b);
+            case ok_a of {
+                false -> false;
+                true -> case ok_b of {
+                    false -> false;
+                    true -> {
+                        elem_ok: boolean <- case types_equal_strip(ea, eb) of {
+                            true -> true;
+                            false -> case is_collectable_element_placeholder(ea) of {
+                                true -> type_checker_traits@is_builtin_collectable_instance(eb);
+                                false -> case is_collectable_element_placeholder(eb) of {
+                                    true -> type_checker_traits@is_builtin_collectable_instance(ea);
+                                    false -> false
+                                }
+                            }
+                        };
+                        case elem_ok of {
+                            false -> false;
+                            true -> case length_bytes(sa) == 0 of {
+                                true -> true;
+                                false -> case length_bytes(sb) == 0 of {
+                                    true -> true;
+                                    false -> memory_spaces_equivalent_for_list(sa, sb)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Phase 0.4: structural match allowing Collectable placeholders in formal types (lists, structs, top-level Collectable).
+fn collectable_types_compatible(actual: string, formal: string, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> boolean {
+    act: string <- strip_all_spaces_list(actual);
+    frm: string <- strip_all_spaces_list(formal);
+    case act == frm of {
+        true -> true;
+        false -> case function_type_texts_compatible_list(act, frm) of {
+            true -> true;
+            false -> case frm == "atom" and is_atom_option_type_list(act) of {
+                true -> true;
+                false -> case frm == "Collectable" of {
+                    true -> type_checker_traits@is_builtin_collectable_instance(act);
+                    false -> case starts_with_list(frm, "List[") of {
+                    true -> case starts_with_list(act, "List[") of {
+                        false -> false;
+                        true -> {
+                            (ok_f: boolean, ef: string, sf: string) <- parse_list_type_params(frm);
+                            (ok_a: boolean, ea: string, sa: string) <- parse_list_type_params(act);
+                            case ok_f of {
+                                false -> false;
+                                true -> case ok_a of {
+                                    false -> false;
+                                    true -> case is_collectable_element_placeholder(ef) of {
+                                        false -> false;
+                                        true -> case type_checker_traits@is_builtin_collectable_instance(ea) of {
+                                            false -> false;
+                                            true -> case length_bytes(sf) == 0 of {
+                                                true -> true;
+                                                false -> case length_bytes(sa) == 0 of {
+                                                    true -> true;
+                                                    false -> memory_spaces_equivalent_for_list(sf, sa)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    false -> case substring(frm, 0, 1) == "{" of {
+                        true -> case substring(act, 0, 1) == "{" of {
+                            false -> false;
+                            true -> struct_collectable_types_compatible(act, frm, world)
+                        };
+                        false -> false
+                    }
+                }
+            }
+        }
+    }
+}
+}
+
+fn function_type_texts_compatible_list(actual: string, formal: string) -> boolean {
+    case starts_with_list(formal, "fn(") of {
+        true -> case length_bytes(formal) > 2 of {
+            true -> actual == substring(formal, 2, length_bytes(formal));
+            false -> false
+        };
+        false -> case starts_with_list(actual, "fn(") of {
+            true -> case length_bytes(actual) > 2 of {
+                true -> substring(actual, 2, length_bytes(actual)) == formal;
+                false -> false
+            };
+            false -> false
+        }
+    }
+}
+
+fn struct_collectable_types_compatible(actual: string, formal: string, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> boolean {
+    struct_formal_fields_all_match(actual, formal, 1, world)
+}
+
+fn struct_formal_fields_all_match(actual: string, formal: string, fi: int64, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> boolean {
+    case fi >= length_bytes(formal) - 1 of {
+        true -> true;
+        false -> {
+            (ok_f: boolean, fname_f: string, ftype_f: string, fi2: int64) <- struct_read_field(formal, fi);
+            case ok_f of {
+                false -> false;
+                true -> {
+                    ftype_a: string <- type_checker_record_types@find_field_type_in_record(actual, fname_f);
+                    case length_bytes(ftype_a) == 0 of {
+                        true -> false;
+                        false -> case collectable_types_compatible(ftype_a, ftype_f, world) of {
+                            false -> false;
+                            true -> struct_formal_fields_all_match(actual, formal, fi2, world)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn struct_field_pair_collectable_compatible(actual: string, formal: string, ai: int64, fi: int64, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> boolean {
+    (ok_f: boolean, fname_f: string, ftype_f: string, fi2: int64) <- struct_read_field(formal, fi);
+    case ok_f of {
+        false -> false;
+        true -> struct_field_pair_collectable_compatible_actual(actual, formal, ai, fname_f, ftype_f, fi2, world)
+    }
+}
+
+fn struct_field_pair_collectable_compatible_actual(actual: string, formal: string, ai: int64, fname_f: string, ftype_f: string, fi2: int64, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> boolean {
+    (ok_a: boolean, fname_a: string, ftype_a: string, ai2: int64) <- struct_read_field(actual, ai);
+    case ok_a of {
+        false -> false;
+        true -> case fname_f == fname_a of {
+            false -> false;
+            true -> case collectable_types_compatible(ftype_a, ftype_f, world) of {
+                false -> false;
+                true -> struct_fields_compatible_loop(actual, formal, ai2, fi2, world)
+            }
+        }
+    }
+}
+
+fn struct_fields_compatible_loop(actual: string, formal: string, ai: int64, fi: int64, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> boolean {
+    case ai >= length_bytes(actual) - 1 of {
+        true -> fi >= length_bytes(formal) - 1;
+        false -> case fi >= length_bytes(formal) - 1 of {
+            true -> false;
+            false -> struct_field_pair_collectable_compatible(actual, formal, ai, fi, world)
+        }
+    }
+}
+
+// Single compile-time gate for formal-vs-actual (qualified calls, returns): structural Collectable
+// placeholders plus marker traits. SIR mangling must call this via type_checker_expressions only.
+fn formal_type_accepts_actual(actual: string, formal: string, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> boolean {
+    case collectable_types_compatible(actual, formal, world) of {
+        true -> true;
+        false -> type_checker_traits@actual_type_satisfies_trait_expectation(actual, formal, world)
+    }
+}
+
+fn struct_skip_ws(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> struct_skip_ws(s, i + 1);
+            false -> i
+        }
+    }
+}
+
+fn struct_read_field(s: string, i: int64) -> (boolean, string, string, int64) {
+    start: int64 <- struct_skip_ws(s, i);
+    colon: int64 <- struct_find_colon_depth0(s, start, 0);
+    case colon < 0 of {
+        true -> (false, "", "", start);
+        false -> {
+            name: string <- strip_spaces_list(substring(s, start, colon));
+            tstart: int64 <- struct_skip_ws(s, colon + 1);
+            (tend: int64, next_i: int64) <- struct_type_end(s, tstart, 0);
+            typ: string <- strip_spaces_list(substring(s, tstart, tend));
+            (true, name, typ, next_i)
+        }
+    }
+}
+
+fn struct_find_colon_depth0(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == ":" of {
+                true -> case depth == 0 of {
+                    true -> i;
+                    false -> struct_find_colon_depth0(s, i + 1, depth)
+                };
+                false -> case c == "(" or c == "[" or c == "{" of {
+                    true -> struct_find_colon_depth0(s, i + 1, depth + 1);
+                    false -> case c == ")" or c == "]" or c == "}" of {
+                        true -> struct_find_colon_depth0(s, i + 1, depth - 1);
+                        false -> struct_find_colon_depth0(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn struct_type_end(s: string, i: int64, depth: int64) -> (int64, int64) {
+    case i >= length_bytes(s) of {
+        true -> (i, i);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "," of {
+                true -> case depth == 0 of {
+                    true -> (i, struct_skip_ws(s, i + 1));
+                    false -> struct_type_end(s, i + 1, depth)
+                };
+                false -> case c == "}" of {
+                    true -> case depth == 0 of {
+                        true -> (i, i + 1);
+                        false -> struct_type_end(s, i + 1, depth - 1)
+                    };
+                    false -> case c == "(" or c == "[" or c == "{" of {
+                        true -> struct_type_end(s, i + 1, depth + 1);
+                        false -> case c == ")" or c == "]" of {
+                            true -> struct_type_end(s, i + 1, depth - 1);
+                            false -> struct_type_end(s, i + 1, depth)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// list primitive generic `Collectable` or `Collectable, mem(S)` with expected `List[T,S]` at the call site.
+fn resolve_list_type_from_collectable_generic(elem: string, space: string, list_context_type: string) -> (boolean, string, string, string) {
+    case is_collectable_element_placeholder(elem) of {
+        false -> {
+            list_t: string <- format_list_type_from_parts(elem, space);
+            (true, elem, space, list_t)
+        };
+        true -> case strip_all_spaces_list(list_context_type) == "discard" of {
+            true -> (false, "", "", "");
+            false -> {
+                (ok_e: boolean, ee: string, es: string) <- parse_list_type_params(list_context_type);
+                case ok_e of {
+                    false -> (false, "", "", "");
+                    true -> case is_collectable_element_placeholder(ee) of {
+                        true -> (false, "", "", "");
+                        false -> {
+                            use_space: string <- case length_bytes(strip_spaces_list(space)) == 0 of {
+                                true -> es;
+                                false -> space
+                            };
+                            list_t: string <- format_list_type_from_parts(ee, use_space);
+                            (true, ee, use_space, list_t)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn format_list_type_from_parts(elem: string, space: string) -> string {
+    case length_bytes(strip_spaces_list(space)) == 0 of {
+        true -> concat("List[", concat(strip_spaces_list(elem), "]"));
+        false -> concat("List[", concat(strip_spaces_list(elem), concat(", ", concat(strip_spaces_list(space), "]"))))
+    }
+}
+
+// slot_lexemes_join for `[int64, normal]` yields "int64 , normal" (comma is its own token). First-space split
+// then leaves ", normal" as the mem param; strip a leading comma so format_list does not emit ", , ".
+fn strip_leading_comma_spaces(s: string) -> string {
+    t: string <- strip_spaces_list(s);
+    case length_bytes(t) == 0 of {
+        true -> t;
+        false -> case substring(t, 0, 1) == "," of {
+            true -> strip_spaces_list(substring(t, 1, length_bytes(t)));
+            false -> t
+        }
+    }
+}
+
+// Generic call `[T, S]` text may begin with `,` after slot_lexemes_join (lexeme boundaries). A depth-0 comma at
+// position 0 makes find_first_comma_depth0_list split into ("", "…") and triggers a false E2005 for list primitives.
+fn strip_leading_commas_spaces_loop(s: string) -> string {
+    t: string <- strip_spaces_list(s);
+    case length_bytes(t) == 0 of {
+        true -> t;
+        false -> case substring(t, 0, 1) == "," of {
+            true -> strip_leading_commas_spaces_loop(substring(t, 1, length_bytes(t)));
+            false -> t
+        }
+    }
+}
+
+// Generic call value: "int64 normal", "int64 , mem ( normal )", "{ x : int64 , y : int64 } , mem ( normal )", or single "int64"
+// Split at top-level comma (depth-aware for {}, (), []) to separate element type from memory space.
+fn parse_generic_ts(value: string) -> (string, string) {
+    v: string <- strip_leading_commas_spaces_loop(strip_spaces_list(value));
+    case length_bytes(v) == 0 of {
+        true -> ("", "");
+        false -> {
+            comma_pos: int64 <- find_first_comma_depth0_list(v, 0, 0);
+            case comma_pos >= length_bytes(v) of {
+                true -> {
+                    sp: int64 <- find_first_space_depth0_list(v, 0, 0);
+                    case sp >= length_bytes(v) of {
+                        true -> (v, "");
+                        false -> (strip_spaces_list(substring(v, 0, sp)), strip_leading_comma_spaces(substring(v, sp + 1, length_bytes(v))))
+                    }
+                };
+                false -> (strip_spaces_list(substring(v, 0, comma_pos)), strip_leading_comma_spaces(substring(v, comma_pos + 1, length_bytes(v))))
+            }
+        }
+    }
+}
+
+// Find first space at depth 0; depth increases for (, [, {; decreases for ), ], }.
+fn find_first_space_depth0_list(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> find_first_space_depth0_list(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> find_first_space_depth0_list(s, i + 1, depth - 1);
+                    false -> case c == " " of {
+                        true -> case depth == 0 of {
+                            true -> i;
+                            false -> find_first_space_depth0_list(s, i + 1, depth)
+                        };
+                        false -> find_first_space_depth0_list(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn find_first_space_list(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> i;
+            false -> find_first_space_list(s, i + 1)
+        }
+    }
+}
+
+fn is_list_primitive_name(name: string) -> boolean {
+    name == "empty" or name == "length" or name == "prepend" or name == "remove_head" or name == "head" or name == "list_at" or name == "list_nth"
+}
+
+fn list_element_type_from_list_type(list_t: string) -> string {
+    (ok: boolean, elem: string, _: string) <- parse_list_type_params(list_t);
+    case ok of { true -> elem; false -> "" }
+}
+
+// Surface fields on List[T, S] values: is_nil : boolean, head : T, tail : List[T, S].
+fn list_field_access_type(list_t: string, field: string) -> string {
+    (ok: boolean, elem: string, space: string) <- parse_list_type_params(list_t);
+    case ok of {
+        false -> "";
+        true -> case field of {
+            "is_nil" -> "boolean";
+            "head" -> elem;
+            "tail" -> format_list_type_from_parts(elem, space);
+            _: string -> ""
+        }
+    }
+}
+
+fn infer_list_primitive_return(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> string {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    case node.kind == 4 of {
+        false -> "";
+        true -> {
+            (elem: string, space: string) <- parse_generic_ts(node.value);
+            list_t: string <- format_list_type_from_parts(elem, space);
+            case node.name == "list_at" of {
+                    true -> elem;
+                    false -> case node.name == "empty" of {
+                true -> list_t;
+                false -> case node.name == "length" of {
+                    true -> "int64";
+                    false -> case node.name == "prepend" of {
+                        true -> list_t;
+                        false -> case node.name == "remove_head" of {
+                            true -> list_t;
+                            false -> case node.name == "head" of {
+                                true -> elem;
+                                false -> ""
+                            }
+                        }
+                    }
+                }
+            }
+                }
+        }
+    }
+}
+
+fn count_call_args_list(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> int64 {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.inner);
+    right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.right_expr);
+    inner_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(inner_e);
+    right_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(right_e);
+    case inner_node.kind == -1 of {
+        true -> 0;
+        false -> case right_node.kind == -1 of {
+            true -> 1;
+            false -> case right_node.kind == 4 of {
+                true -> 1 + count_call_args_list(right_e);
+                false -> 2
+            }
+        }
+    }
+}
+
+// Case-branch RHS calls parse `(` with extract_case_rhs_with_precedence; empty `()` becomes a stray ")" encoded as kind 0 (see type_checker_expressions_literals). Treat that as zero value arguments so `empty[T, S]()` matches sequence calls (extract_body + extract_call_rest).
+fn list_empty_effective_arg_count(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> int64 {
+    ac: int64 <- count_call_args_list(expr);
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    inner_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(expr, node.inner);
+    inner_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(inner_e);
+    case ac == 1 of {
+        true -> case inner_node.kind == 0 and inner_node.value == ")" of {
+            true -> 0;
+            false -> ac
+        };
+        false -> ac
+    }
+}
+
+// `[]` alone (scrutinee supplies the List type) or `[]: List[...]` / `[ ] : List[...]`.
+fn is_bare_empty_list_brackets(t: string) -> boolean {
+    s: string <- strip_spaces_list(t);
+    case length_bytes(s) < 2 of {
+        true -> false;
+        false -> case substring(s, 0, 1) == "[" of {
+            false -> false;
+            true -> case substring(s, length_bytes(s) - 1, length_bytes(s)) == "]" of {
+                false -> false;
+                true -> {
+                    inner: string <- substring(s, 1, length_bytes(s) - 1);
+                    inner_nw: string <- strip_all_spaces_list(inner);
+                    length_bytes(inner_nw) == 0
+                }
+            }
+        }
+    }
+}
+
+// []: List[...]
+// slot_lexemes_join may produce "[ ] : List [ int64 , normal ]" (spaces between tokens).
+// Handle both "[]" and "[ ]" for the empty-bracket prefix, and normalize the List type.
+fn parse_list_empty_case_pattern(pat_str: string) -> { ok: boolean, list_type: string } {
+    t: string <- strip_spaces_list(pat_str);
+    case is_bare_empty_list_brackets(t) of {
+        true -> { ok: true, list_type: "" };
+        false -> case length_bytes(t) < 4 of {
+            true -> { ok: false, list_type: "" };
+            false -> case substring(t, 0, 1) == "[" of {
+                false -> { ok: false, list_type: "" };
+                true -> {
+                    j_rb: int64 <- skip_spaces_index_list(t, 1);
+                    case j_rb >= length_bytes(t) of {
+                        true -> { ok: false, list_type: "" };
+                        false -> case substring(t, j_rb, j_rb + 1) == "]" of {
+                            false -> { ok: false, list_type: "" };
+                            true -> {
+                                j_col: int64 <- skip_spaces_index_list(t, j_rb + 1);
+                                case j_col >= length_bytes(t) of {
+                                    true -> { ok: false, list_type: "" };
+                                    false -> case substring(t, j_col, j_col + 1) == ":" of {
+                                        false -> { ok: false, list_type: "" };
+                                        true -> {
+                                            rest: string <- normalize_list_type_bracket(strip_all_spaces_list(substring(t, j_col + 1, length_bytes(t))));
+                                            case starts_with_list(rest, "List[") of {
+                                                false -> { ok: false, list_type: "" };
+                                                true -> { ok: true, list_type: rest }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_colon_binding_list(s: string) -> (boolean, string, string) {
+    colon: int64 <- case_find_colon_outside_string_list(s, 0, false);
+    case colon < 0 of {
+        true -> (false, "", "");
+        false -> {
+            name_raw: string <- strip_spaces_list(substring(s, 0, colon));
+            typ_raw: string <- strip_spaces_list(substring(s, colon + 1, length_bytes(s)));
+            case length_bytes(name_raw) == 0 or length_bytes(typ_raw) == 0 of {
+                true -> (false, "", "");
+                false -> (true, name_raw, typ_raw)
+            }
+        }
+    }
+}
+
+fn case_flip_string_in(s: boolean) -> boolean {
+    case s of { true -> false; false -> true }
+}
+
+fn case_find_colon_outside_string_list(s: string, i: int64, in_string: boolean) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 1) == "\"" of {
+            true -> case_find_colon_outside_string_list(s, i + 1, case_flip_string_in(in_string));
+            false -> case in_string of {
+                true -> case_find_colon_outside_string_list(s, i + 1, in_string);
+                false -> case substring(s, i, i + 1) == ":" of {
+                    true -> i;
+                    false -> case_find_colon_outside_string_list(s, i + 1, false)
+                }
+            }
+        }
+    }
+}
+
+fn not_list_empty_prefix(t: string) -> boolean {
+    case length_bytes(t) < 2 of {
+        true -> true;
+        false -> substring(t, 0, 2) != "[]"
+    }
+}
+
+// List type declarations must use mem(Space) as the second parameter (spec §4.2.4; list_implementation_design.md §3.5).
+fn list_type_space_has_mem_form(space: string) -> boolean {
+    t: string <- strip_spaces_list(space);
+    case length_bytes(t) < 5 of {
+        true -> false;
+        false -> case substring(t, 0, 4) == "mem(" of {
+            false -> false;
+            true -> substring(t, length_bytes(t) - 1, length_bytes(t)) == ")"
+        }
+    }
+}
+
+fn find_list_keyword_index(s: string, i: int64) -> int64 {
+    case i + 4 > length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 4) == "List" of {
+            true -> i;
+            false -> find_list_keyword_index(s, i + 1)
+        }
+    }
+}
+
+// s[i] must be '['. Returns index of matching ']' at bracket depth 0, or length_bytes(s) if unbalanced.
+fn find_matching_closing_bracket_list(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "[" or c == "(" or c == "{" of {
+                true -> find_matching_closing_bracket_list(s, i + 1, depth + 1);
+                false -> case c == "]" or c == ")" or c == "}" of {
+                    true -> case depth == 1 of {
+                        true -> i;
+                        false -> find_matching_closing_bracket_list(s, i + 1, depth - 1)
+                    };
+                    false -> find_matching_closing_bracket_list(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+fn validate_one_list_type_surface(list_type: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    (ok: boolean, elem: string, space: string) <- parse_list_type_params(list_type);
+    case ok of {
+        false -> type_checker_core@type_check_ok();
+        true -> case list_type_space_has_mem_form(space) of {
+            false -> type_checker_core@type_check_err("E2015", location, concat(concat("List type requires an explicit memory space: use List[ElementType, mem(Space)] (got ", list_type), ")"), "sect4.2.4");
+            true -> validate_list_type_declaration(elem, location)
+        }
+    }
+}
+
+fn validate_list_type_declaration_from(s: string, location: { file: string, line: int64, column: int64, offset: int64 }, i: int64) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case i >= length_bytes(s) of {
+        true -> type_checker_core@type_check_ok();
+        false -> {
+            pos: int64 <- find_list_keyword_index(s, i);
+            case pos < 0 of {
+                true -> type_checker_core@type_check_ok();
+                false -> {
+                    j: int64 <- skip_spaces_index_list(s, pos + 4);
+                    case j >= length_bytes(s) of {
+                        true -> validate_list_type_declaration_from(s, location, pos + 4);
+                        false -> case substring(s, j, j + 1) == "[" of {
+                            false -> validate_list_type_declaration_from(s, location, pos + 4);
+                            true -> {
+                                end_j: int64 <- find_matching_closing_bracket_list(s, j, 0);
+                                case end_j >= length_bytes(s) of {
+                                    true -> validate_list_type_declaration_from(s, location, pos + 4);
+                                    false -> {
+                                        list_ty: string <- substring(s, pos, end_j + 1);
+                                        one_r: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- validate_one_list_type_surface(list_ty, location);
+                                        case one_r.is_ok of {
+                                            false -> one_r;
+                                            true -> validate_list_type_declaration_from(s, location, end_j + 1)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_list_type_declaration(type_str: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    validate_list_type_declaration_from(type_str, location, 0)
+}
+
+// [h: T, tail: List[...]] — not []: ...
+fn parse_list_cons_case_pattern(pat_str: string) -> { ok: boolean, head_name: string, head_type: string, tail_name: string, tail_list_type: string } {
+    t: string <- strip_spaces_list(pat_str);
+    case length_bytes(t) < 5 of {
+        true -> { ok: false, head_name: "", head_type: "", tail_name: "", tail_list_type: "" };
+        false -> case substring(t, 0, 1) == "[" of {
+            false -> { ok: false, head_name: "", head_type: "", tail_name: "", tail_list_type: "" };
+            true -> case not_list_empty_prefix(t) of {
+                false -> { ok: false, head_name: "", head_type: "", tail_name: "", tail_list_type: "" };
+                true -> case substring(t, length_bytes(t) - 1, length_bytes(t)) == "]" of {
+                    false -> { ok: false, head_name: "", head_type: "", tail_name: "", tail_list_type: "" };
+                    true -> {
+                        inner: string <- substring(t, 1, length_bytes(t) - 1);
+                        inner_trim: string <- strip_spaces_list(inner);
+                        comma_pos: int64 <- find_first_comma_depth0_list(inner_trim, 0, 0);
+                        case comma_pos >= length_bytes(inner_trim) of {
+                            true -> { ok: false, head_name: "", head_type: "", tail_name: "", tail_list_type: "" };
+                            false -> {
+                                left: string <- strip_spaces_list(substring(inner_trim, 0, comma_pos));
+                                right: string <- strip_spaces_list(substring(inner_trim, comma_pos + 1, length_bytes(inner_trim)));
+                                (ok_l: boolean, hn: string, ht: string) <- parse_colon_binding_list(left);
+                                (ok_r: boolean, tn: string, tt: string) <- parse_colon_binding_list(right);
+                                case ok_l of {
+                                    false -> { ok: false, head_name: "", head_type: "", tail_name: "", tail_list_type: "" };
+                                    true -> case ok_r of {
+                                        false -> { ok: false, head_name: "", head_type: "", tail_name: "", tail_list_type: "" };
+                                        true -> {
+                                            tt_n: string <- normalize_list_type_bracket(strip_all_spaces_list(tt));
+                                            case starts_with_list(tt_n, "List[") of {
+                                                false -> { ok: false, head_name: "", head_type: "", tail_name: "", tail_list_type: "" };
+                                                true -> { ok: true, head_name: hn, head_type: ht, tail_name: tn, tail_list_type: tt_n }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,461 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Virtual registers (VRs) for the Linux x86-64 emitter (System V AMD64, Intel syntax).
+//
+// The emitter names values X0-X30, W<n>, D/S/H<n>, SP, XZR/WZR -- on this target those are VRs, not
+// machine registers (design_documents/ports/esp32s3_xtensa_port.md section 2 introduced the method;
+// emitter/linux_x86_64/regs/README.md holds this target's table). This module maps a VR to its home
+// and produces the operand text and the moves that bring a VR in and out of the scratch registers.
+//
+// Homes (see regs/README.md):
+//   X0..X5  -> rdi rsi rdx rcx r8 r9   the SysV argument registers: a Silica call stages nothing
+//   X6, X7  -> r14, r15                the 7th and 8th arguments (SysV passes them on the stack; not here)
+//   X8      -> rbx                     the aggregate-return (sret) pointer
+//   X9, X10 -> r10, r11                the binary-prim operand temps
+//   X11-X28 -> frame slot SVR_X<nn>    8 bytes at [rbp - SVR_X<nn>]; callee-saved semantics come free
+//   X29     -> the frame pointer: its VALUE is rbp - SVR_AREA (the top of the [X29, #-N] slot area);
+//              [X29, #-N] is [rbp - SVR_AREA - N]. Read-only.
+//   X30     -> no home (the return address lives at [rbp + 8]); control.silica owns it
+//   SP      -> rsp, moved by real pushes and pops
+//   XZR/WZR -> reads 0, writes are discarded
+//   D0-D7   -> xmm0-xmm7 (S and H alias the low 32 / 16 bits)
+//   D8-D31  -> frame slot SVR_D<nn>
+// The result of every call travels in X0 = rdi (NOT rax): internal calls are SysV for the arguments
+// and rdi for the result; x86_isa@x86_call_c moves rax into rdi after a C call.
+//
+// Scratch registers rax, r12, r13 and xmm8-xmm11 belong to the helpers; nothing is live in them
+// between helpers. A W write zero-extends into the X home, as it does on AArch64. No helper in this
+// module changes the flags (mov / lea / movzx / movsx / setcc only), so a CMP and its consumer may
+// have VR moves between them.
+//
+// SVR_AREA and the SVR_* slot offsets are assembler symbols emitter_core defines in front of each
+// function once its body is known (x86_frame_header), so only the homes a body references get a slot.
+
+use string_parse;
+
+export x86_ins/2;
+export x86_itos/1;
+export x86_two_digits/1;
+export vr_class/1;
+export vr_num/1;
+export vr_is_int/1;
+export vr_is_float/1;
+export vr_is_reg/1;
+export vr_is_slot/1;
+export vr_is_fp/1;
+export vr_is_zero/1;
+export vr_is_sp/1;
+export vr_reg64/1;
+export vr_reg32/1;
+export vr_xmm/1;
+export vr_home/1;
+export vr_slot_mem/1;
+export vr_slot_mem_sized/2;
+export vr_x_home_name/1;
+export vr_d_home_name/1;
+export reg32_of/1;
+export reg16_of/1;
+export reg8_of/1;
+export x86_load64/2;
+export x86_load32/2;
+export x86_put64/2;
+export x86_put32/2;
+export x86_opnd64/1;
+export x86_opnd32/1;
+export x86_fp_lea/1;
+export x86_frame_slot/1;
+export x86_frame_slot_sized/2;
+export x86_fload/2;
+export x86_fput/2;
+export x86_fopnd/1;
+
+// One instruction line.
+fn x86_ins(op: string, args: string) -> string {
+    case length_bytes(args) == 0 of {
+        true -> concat("    ", concat(op, "\n"));
+        false -> concat("    ", concat(op, concat(" ", concat(args, "\n"))))
+    }
+}
+
+fn x86_digit(d: int64) -> string {
+    case d of {
+        0 -> "0"; 1 -> "1"; 2 -> "2"; 3 -> "3"; 4 -> "4";
+        5 -> "5"; 6 -> "6"; 7 -> "7"; 8 -> "8"; _: int64 -> "9"
+    }
+}
+
+fn x86_utos(n: int64) -> string {
+    case n < 10 of {
+        true -> x86_digit(n);
+        false -> concat(x86_utos(n / 10), x86_digit(n % 10))
+    }
+}
+
+// Decimal text of an int64. INT64_MIN has no positive counterpart, so it is spelled out.
+fn x86_itos(n: int64) -> string {
+    case n < 0 of {
+        false -> x86_utos(n);
+        true -> case n == 0 - 9223372036854775807 - 1 of {
+            true -> "-9223372036854775808";
+            false -> concat("-", x86_utos(0 - n))
+        }
+    }
+}
+
+fn x86_two_digits(n: int64) -> string {
+    case n < 10 of {
+        true -> concat("0", x86_utos(n));
+        false -> x86_utos(n)
+    }
+}
+
+fn is_digit_char(c: string) -> boolean {
+    case c of {
+        "0" -> true; "1" -> true; "2" -> true; "3" -> true; "4" -> true;
+        "5" -> true; "6" -> true; "7" -> true; "8" -> true; "9" -> true;
+        _: string -> false
+    }
+}
+
+fn all_digits_from(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> true;
+        false -> case is_digit_char(substring(s, i, i + 1)) of {
+            true -> all_digits_from(s, i + 1);
+            false -> false
+        }
+    }
+}
+
+// "X", "W", "D", "S", "H", "SP", "ZR" (XZR/WZR), or "" when v is not a register name.
+fn vr_class(v: string) -> string {
+    n: int64 <- length_bytes(v);
+    case v == "SP" or v == "sp" of {
+        true -> "SP";
+        false -> case v == "XZR" or v == "WZR" or v == "xzr" or v == "wzr" of {
+            true -> "ZR";
+            false -> case n >= 2 and n <= 3 and all_digits_from(v, 1) of {
+                false -> "";
+                true -> {
+                    c: string <- substring(v, 0, 1);
+                    case c == "X" or c == "W" or c == "D" or c == "S" or c == "H" of {
+                        true -> c;
+                        false -> ""
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn vr_num(v: string) -> int64 {
+    string_parse@string_to_int64(substring(v, 1, length_bytes(v)))
+}
+
+fn vr_is_int(v: string) -> boolean {
+    c: string <- vr_class(v);
+    c == "X" or c == "W"
+}
+
+fn vr_is_float(v: string) -> boolean {
+    c: string <- vr_class(v);
+    c == "D" or c == "S" or c == "H"
+}
+
+fn vr_is_fp(v: string) -> boolean {
+    v == "X29" or v == "W29"
+}
+
+fn vr_is_zero(v: string) -> boolean {
+    vr_class(v) == "ZR"
+}
+
+fn vr_is_sp(v: string) -> boolean {
+    vr_class(v) == "SP"
+}
+
+// 64-bit machine register of an int VR, or "" when the VR lives in a frame slot (or is not a VR).
+fn reg64_of_num(n: int64) -> string {
+    case n of {
+        0 -> "rdi"; 1 -> "rsi"; 2 -> "rdx"; 3 -> "rcx"; 4 -> "r8"; 5 -> "r9";
+        6 -> "r14"; 7 -> "r15"; 8 -> "rbx"; 9 -> "r10"; 10 -> "r11";
+        _: int64 -> ""
+    }
+}
+
+// Register-homed: X0-X10 (and their W views), D0-D7 (and S/H views).
+fn vr_is_reg(v: string) -> boolean {
+    case vr_is_int(v) of {
+        true -> length_bytes(reg64_of_num(vr_num(v))) > 0;
+        false -> vr_is_float(v) and vr_num(v) <= 7
+    }
+}
+
+// Frame-slot homed: X11-X28 (not X29/X30), D8-D31.
+fn vr_is_slot(v: string) -> boolean {
+    case vr_is_int(v) of {
+        true -> vr_num(v) >= 11 and vr_num(v) <= 28;
+        false -> vr_is_float(v) and vr_num(v) >= 8 and vr_num(v) <= 31
+    }
+}
+
+fn vr_reg64(v: string) -> string {
+    reg64_of_num(vr_num(v))
+}
+
+fn vr_reg32(v: string) -> string {
+    reg32_of(reg64_of_num(vr_num(v)))
+}
+
+fn vr_xmm(v: string) -> string {
+    concat("xmm", x86_utos(vr_num(v)))
+}
+
+// 32-bit / 16-bit / 8-bit views of any of the fourteen GPR names the helpers use.
+fn reg32_of(r: string) -> string {
+    case r of {
+        "rax" -> "eax"; "rdi" -> "edi"; "rsi" -> "esi"; "rdx" -> "edx"; "rcx" -> "ecx";
+        "rbx" -> "ebx"; "rsp" -> "esp"; "rbp" -> "ebp";
+        "r8" -> "r8d"; "r9" -> "r9d"; "r10" -> "r10d"; "r11" -> "r11d";
+        "r12" -> "r12d"; "r13" -> "r13d"; "r14" -> "r14d"; "r15" -> "r15d";
+        _: string -> r
+    }
+}
+
+fn reg16_of(r: string) -> string {
+    case r of {
+        "rax" -> "ax"; "rdi" -> "di"; "rsi" -> "si"; "rdx" -> "dx"; "rcx" -> "cx"; "rbx" -> "bx";
+        "r8" -> "r8w"; "r9" -> "r9w"; "r10" -> "r10w"; "r11" -> "r11w";
+        "r12" -> "r12w"; "r13" -> "r13w"; "r14" -> "r14w"; "r15" -> "r15w";
+        _: string -> r
+    }
+}
+
+fn reg8_of(r: string) -> string {
+    case r of {
+        "rax" -> "al"; "rdi" -> "dil"; "rsi" -> "sil"; "rdx" -> "dl"; "rcx" -> "cl"; "rbx" -> "bl";
+        "r8" -> "r8b"; "r9" -> "r9b"; "r10" -> "r10b"; "r11" -> "r11b";
+        "r12" -> "r12b"; "r13" -> "r13b"; "r14" -> "r14b"; "r15" -> "r15b";
+        _: string -> r
+    }
+}
+
+// Frame-home symbol of a slot-homed VR ("SVR_X19", "SVR_D09").
+fn vr_home(v: string) -> string {
+    case vr_is_float(v) of {
+        true -> concat("SVR_D", x86_two_digits(vr_num(v)));
+        false -> concat("SVR_X", x86_two_digits(vr_num(v)))
+    }
+}
+
+fn vr_x_home_name(n: int64) -> string {
+    concat("SVR_X", x86_two_digits(n))
+}
+
+fn vr_d_home_name(n: int64) -> string {
+    concat("SVR_D", x86_two_digits(n))
+}
+
+// "[rbp - SVR_X19]"
+fn vr_slot_mem(v: string) -> string {
+    concat("[rbp - ", concat(vr_home(v), "]"))
+}
+
+fn vr_slot_mem_sized(v: string, size_kw: string) -> string {
+    concat(size_kw, concat(" PTR ", vr_slot_mem(v)))
+}
+
+// [X29, #off] as an x86 memory operand: "[rbp - SVR_AREA - N]" (off is normally negative).
+fn x86_frame_slot(off: int64) -> string {
+    case off < 0 of {
+        true -> concat("[rbp - SVR_AREA - ", concat(x86_itos(0 - off), "]"));
+        false -> case off == 0 of {
+            true -> "[rbp - SVR_AREA]";
+            false -> concat("[rbp - SVR_AREA + ", concat(x86_itos(off), "]"))
+        }
+    }
+}
+
+fn x86_frame_slot_sized(off: int64, size_kw: string) -> string {
+    concat(size_kw, concat(" PTR ", x86_frame_slot(off)))
+}
+
+// The value of X29 into a register: the top of the emitter's frame-slot area.
+fn x86_fp_lea(r: string) -> string {
+    x86_ins("lea", concat(r, ", [rbp - SVR_AREA]"))
+}
+
+// --- integer VR in / out -------------------------------------------------------------------------
+
+// r/m64 (or immediate 0) text that reads v directly. "" for X29 (needs x86_fp_lea) and non-VRs.
+fn x86_opnd64(v: string) -> string {
+    c: string <- vr_class(v);
+    case c == "ZR" of {
+        true -> "0";
+        false -> case c == "SP" of {
+            true -> "rsp";
+            false -> case vr_is_fp(v) of {
+                true -> "";
+                false -> case vr_is_int(v) of {
+                    false -> "";
+                    true -> case vr_is_reg(v) of {
+                        true -> vr_reg64(v);
+                        false -> case vr_is_slot(v) of {
+                            true -> vr_slot_mem_sized(v, "QWORD");
+                            false -> ""
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// r/m32 (or immediate 0) text reading the low 32 bits of v.
+fn x86_opnd32(v: string) -> string {
+    c: string <- vr_class(v);
+    case c == "ZR" of {
+        true -> "0";
+        false -> case c == "SP" of {
+            true -> "esp";
+            false -> case vr_is_int(v) and vr_is_fp(v) == false of {
+                false -> "";
+                true -> case vr_is_reg(v) of {
+                    true -> vr_reg32(v);
+                    false -> case vr_is_slot(v) of {
+                        true -> vr_slot_mem_sized(v, "DWORD");
+                        false -> ""
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Code that puts the 64-bit value of v into scratch register r (a W VR reads its X home: the high
+// word is zero by construction). An unknown name stops the assembly with its text.
+fn x86_load64(v: string, r: string) -> string {
+    case vr_is_fp(v) of {
+        true -> x86_fp_lea(r);
+        false -> {
+            o: string <- x86_opnd64(v);
+            case length_bytes(o) == 0 of {
+                true -> concat("    .error \"x86_vr: no 64-bit home for ", concat(v, "\"\n"));
+                false -> case o == r of {
+                    true -> "";
+                    false -> x86_ins("mov", concat(r, concat(", ", o)))
+                }
+            }
+        }
+    }
+}
+
+// Low 32 bits of v into the 32-bit view of scratch r (zero-extending into r).
+fn x86_load32(v: string, r: string) -> string {
+    case vr_is_fp(v) of {
+        true -> x86_fp_lea(r);
+        false -> {
+            o: string <- x86_opnd32(v);
+            case length_bytes(o) == 0 of {
+                true -> concat("    .error \"x86_vr: no 32-bit home for ", concat(v, "\"\n"));
+                false -> case o == reg32_of(r) of {
+                    true -> "";
+                    false -> x86_ins("mov", concat(reg32_of(r), concat(", ", o)))
+                }
+            }
+        }
+    }
+}
+
+// Write the 64-bit register r to VR dst. A W destination takes the low 32 bits and zero-extends
+// (the 32-bit mov into a register zero-extends; a slot gets the zero-extended 64-bit value).
+fn x86_put64(dst: string, r: string) -> string {
+    c: string <- vr_class(dst);
+    case c == "ZR" or c == "" or vr_is_fp(dst) of {
+        true -> "";
+        false -> case c == "SP" of {
+            true -> x86_ins("mov", concat("rsp, ", r));
+            false -> case c == "W" of {
+                true -> x86_put32(dst, reg32_of(r));
+                false -> case vr_is_reg(dst) of {
+                    true -> case vr_reg64(dst) == r of {
+                        true -> "";
+                        false -> x86_ins("mov", concat(vr_reg64(dst), concat(", ", r)))
+                    };
+                    false -> x86_ins("mov", concat(vr_slot_mem_sized(dst, "QWORD"), concat(", ", r)))
+                }
+            }
+        }
+    }
+}
+
+// Write the 32-bit register r32 to VR dst, zero-extending into the 64-bit home.
+fn x86_put32(dst: string, r32: string) -> string {
+    c: string <- vr_class(dst);
+    case c == "ZR" or c == "" or vr_is_fp(dst) of {
+        true -> "";
+        false -> case c == "SP" of {
+            true -> x86_ins("mov", concat("esp, ", r32));
+            false -> case vr_is_reg(dst) of {
+                true -> x86_ins("mov", concat(vr_reg32(dst), concat(", ", r32)));
+                false -> {
+                    // the slot takes all 8 bytes so the X view reads a zero-extended value
+                    z: string <- case r32 == "eax" of { true -> ""; false -> x86_ins("mov", concat("eax, ", r32)) };
+                    concat(z, x86_ins("mov", concat(vr_slot_mem_sized(dst, "QWORD"), ", rax")))
+                }
+            }
+        }
+    }
+}
+
+// --- float VR in / out ---------------------------------------------------------------------------
+
+// Memory or xmm operand reading a float VR's home: "xmm3" or "QWORD PTR [rbp - SVR_D09]" (the D
+// width; S and H helpers narrow the size keyword themselves).
+fn x86_fopnd(v: string) -> string {
+    case vr_is_reg(v) of {
+        true -> vr_xmm(v);
+        false -> vr_slot_mem_sized(v, "QWORD")
+    }
+}
+
+// The 64 home bits of float VR v into scratch xmm register x (movq zeroes the upper lanes).
+fn x86_fload(v: string, x: string) -> string {
+    case vr_is_reg(v) of {
+        true -> case vr_xmm(v) == x of {
+            true -> "";
+            false -> x86_ins("movq", concat(x, concat(", ", vr_xmm(v))))
+        };
+        false -> x86_ins("movq", concat(x, concat(", ", vr_slot_mem_sized(v, "QWORD"))))
+    }
+}
+
+// Write scratch xmm register x to float VR dst: all 64 bits of the home (a D write; S/H writers
+// narrow before calling so the upper bits are already zero).
+fn x86_fput(dst: string, x: string) -> string {
+    case vr_is_float(dst) == false of {
+        true -> "";
+        false -> case vr_is_reg(dst) of {
+            true -> case vr_xmm(dst) == x of {
+                true -> "";
+                false -> x86_ins("movq", concat(vr_xmm(dst), concat(", ", x)))
+            };
+            false -> x86_ins("movq", concat(vr_slot_mem_sized(dst, "QWORD"), concat(", ", x)))
+        }
+    }
+}

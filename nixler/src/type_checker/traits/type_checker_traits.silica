@@ -1,0 +1,356 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Trait-based polymorphism (silica-specification §3.4.8, §8.2.3): concrete types used where a trait
+// type is expected when the trait module lists a matching `impl` or marker `impl Type;`, or for
+// built-in Collectable and ActorMessage coverage (§CollectableTrait, §16.3.2 in language spec).
+
+use parser_ast;
+
+export actual_type_satisfies_trait_expectation/3;
+export trait_program_accepts_concrete/2;
+export is_builtin_collectable_instance/1;
+export is_builtin_actor_message_instance/1;
+export check_trait/0;
+export trim_type_text/1;
+export find_program_declaring_trait/2;
+
+fn check_trait() -> boolean {
+    true
+}
+
+fn is_space_char(c: string) -> boolean {
+    c == " " or c == "\t"
+}
+
+fn trim_leading_spaces(s: string) -> string {
+    case length_bytes(s) == 0 of {
+        true -> "";
+        false -> case is_space_char(substring(s, 0, 1)) of {
+            true -> trim_leading_spaces(substring(s, 1, length_bytes(s)));
+            false -> s
+        }
+    }
+}
+
+fn trim_trailing_spaces(s: string) -> string {
+    case length_bytes(s) == 0 of {
+        true -> "";
+        false -> {
+            last: int64 <- length_bytes(s) - 1;
+            case is_space_char(substring(s, last, length_bytes(s))) of {
+                true -> trim_trailing_spaces(substring(s, 0, last));
+                false -> s
+            }
+        }
+    }
+}
+
+fn trim_type_text(s: string) -> string {
+    trim_trailing_spaces(trim_leading_spaces(s))
+}
+
+// Iface stubs reprint impl param types with parser spacing (e.g. `fn ( string , string )`,
+// `field : ty`) while local bindings keep source spacing (`fn(string, string)`, `field: ty`).
+// Exact trim equality then fails under process-per-unit reclaim when the trait module is
+// loaded only as an iface stub. Space-normalized compare keeps coverage stable.
+fn strip_type_spaces_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case is_space_char(substring(s, j, j + 1)) of {
+            true -> j;
+            false -> strip_type_spaces_run_end(s, j + 1, n)
+        }
+    }
+}
+
+fn strip_type_spaces_from(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> case is_space_char(substring(s, i, i + 1)) of {
+            true -> strip_type_spaces_from(s, i + 1, acc);
+            false -> {
+                n: int64 <- length_bytes(s);
+                e: int64 <- strip_type_spaces_run_end(s, i, n);
+                strip_type_spaces_from(s, e, concat(acc, substring(s, i, e)))
+            }
+        }
+    }
+}
+
+fn strip_type_spaces(s: string) -> string {
+    strip_type_spaces_from(s, 0, "")
+}
+
+// Interner prints function types as `(T) -> R`; source/iface often keep `fn (T) -> R`.
+fn erase_fn_keywords_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case j + 2 < n and substring(s, j, j + 2) == "fn" and substring(s, j + 2, j + 3) == "(" of {
+            true -> j;
+            false -> erase_fn_keywords_run_end(s, j + 1, n)
+        }
+    }
+}
+
+fn erase_fn_keywords_from(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> case i + 2 < length_bytes(s) and substring(s, i, i + 2) == "fn" and substring(s, i + 2, i + 3) == "(" of {
+            true -> erase_fn_keywords_from(s, i + 2, acc);
+            false -> {
+                n: int64 <- length_bytes(s);
+                e: int64 <- erase_fn_keywords_run_end(s, i, n);
+                erase_fn_keywords_from(s, e, concat(acc, substring(s, i, e)))
+            }
+        }
+    }
+}
+
+fn normalize_type_text_for_impl_match(s: string) -> string {
+    erase_fn_keywords_from(strip_type_spaces(trim_type_text(s)), 0, "")
+}
+
+// Integer literals infer as int64; an impl may take int32/int16/int8 (or the unsigned
+// counterparts). Without this, Shape@double_area(5) is checked as a literal against
+// expected Shape and E2001s even though impl fn area(side: int32) covers it.
+fn int64_literal_fits_impl_int(a: string, b: string) -> boolean {
+    case a == "int64" of {
+        true -> b == "int8" or b == "int16" or b == "int32" or b == "uint8" or b == "uint16" or b == "uint32";
+        false -> b == "int64" and (a == "int8" or a == "int16" or a == "int32" or a == "uint8" or a == "uint16" or a == "uint32")
+    }
+}
+
+fn type_text_matches_impl(a: string, b: string) -> boolean {
+    ta: string <- trim_type_text(a);
+    tb: string <- trim_type_text(b);
+    case ta == tb of {
+        true -> true;
+        false -> case normalize_type_text_for_impl_match(ta) == normalize_type_text_for_impl_match(tb) of {
+            true -> true;
+            false -> int64_literal_fits_impl_int(ta, tb)
+        }
+    }
+}
+
+fn program_has_export_trait_named(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], trait_id: string) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 5 and decls.head.name == trait_id of {
+            true -> true;
+            false -> program_has_export_trait_named(decls.tail, trait_id)
+        }
+    }
+}
+
+fn find_program_declaring_trait(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], trait_id: string) -> (boolean, { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) {
+    case world.is_nil of {
+        true -> (false, { declarations: parser_ast@empty_list_decl(), location: parser_ast@zero_location() });
+        false -> case program_has_export_trait_named(world.head.program.declarations, trait_id) of {
+            true -> (true, world.head.program);
+            false -> find_program_declaring_trait(world.tail, trait_id)
+        }
+    }
+}
+
+// §3.4.9: "The concrete type of the first parameter determines which type this implementation covers."
+fn first_param_type_matches_impl(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], concrete: string) -> boolean {
+    case params.is_nil of {
+        true -> false;
+        false -> {
+            src: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- parser_ast@list_param_reverse_with_acc(params, parser_ast@nil_list_param());
+            type_text_matches_impl(src.head.type_name, concrete)
+        }
+    }
+}
+
+fn marker_impl_covers_concrete(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], concrete: string) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 6 of {
+            true -> case type_text_matches_impl(decls.head.return_type_name, concrete) of {
+                true -> true;
+                false -> marker_impl_covers_concrete(decls.tail, concrete)
+            };
+            false -> marker_impl_covers_concrete(decls.tail, concrete)
+        }
+    }
+}
+
+fn impl_fn_covers_concrete(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], concrete: string) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 0 of {
+            true -> case first_param_type_matches_impl(decls.head.parameters, concrete) of {
+                true -> true;
+                false -> impl_fn_covers_concrete(decls.tail, concrete)
+            };
+            false -> impl_fn_covers_concrete(decls.tail, concrete)
+        }
+    }
+}
+
+fn trait_program_accepts_concrete(trait_prog: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }, concrete: string) -> boolean {
+    case marker_impl_covers_concrete(trait_prog.declarations, concrete) of {
+        true -> true;
+        false -> impl_fn_covers_concrete(trait_prog.declarations, concrete)
+    }
+}
+
+fn starts_with_prefix(s: string, prefix: string) -> boolean {
+    case length_bytes(s) < length_bytes(prefix) of {
+        true -> false;
+        false -> substring(s, 0, length_bytes(prefix)) == prefix
+    }
+}
+
+// Top-level `A | B | …` (§4.2.5, §8.2.4): index of first ` | ` at nesting depth 0, or -1.
+fn scan_top_level_sum_bar(s: string, i: int64, depth: int64) -> int64 {
+    case i + 3 > length_bytes(s) of {
+        true -> -1;
+        false -> case depth == 0 and substring(s, i, i + 3) == " | " of {
+            true -> i;
+            false -> {
+                c: string <- substring(s, i, i + 1);
+                d2: int64 <- case c == "(" of {
+                    true -> depth + 1;
+                    false -> case c == ")" of {
+                        true -> depth - 1;
+                        false -> case c == "{" of {
+                            true -> depth + 1;
+                            false -> case c == "}" of {
+                                true -> depth - 1;
+                                false -> case c == "[" of {
+                                    true -> depth + 1;
+                                    false -> case c == "]" of {
+                                        true -> depth - 1;
+                                        false -> depth
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                scan_top_level_sum_bar(s, i + 1, d2)
+            }
+        }
+    }
+}
+
+// Primitives, List[…], tuples, records, function/proc shapes — but not top-level sum (handled by collectable_inline_sum_or_shape).
+// Primitives (silica-spec §8.2.4): unit, boolean, int8–int64, uint8–uint64, floats, char, string, atom.
+fn collectable_non_sum_shape(concrete: string) -> boolean {
+    case concrete of {
+        "unit" -> true;
+        "boolean" -> true;
+        "int8" -> true;
+        "int16" -> true;
+        "int32" -> true;
+        "int64" -> true;
+        "uint8" -> true;
+        "uint16" -> true;
+        "uint32" -> true;
+        "uint64" -> true;
+        "float16" -> true;
+        "float32" -> true;
+        "float64" -> true;
+        "char" -> true;
+        "string" -> true;
+        "atom" -> true;
+        "failure_reason" -> true;
+        "monitor_ref" -> true;
+        "supervisor_flags" -> true;
+        "child_spec" -> true;
+        _: string -> case starts_with_prefix(concrete, "List[") of {
+            true -> true;
+            false -> case length_bytes(concrete) >= 1 of {
+                true -> case substring(concrete, 0, 1) of {
+                    "(" -> true;
+                    "{" -> true;
+                    _: string -> case find_arrow_in_type(concrete, 0) >= 0 of {
+                        true -> true;
+                        false -> false
+                    }
+                };
+                false -> false
+            }
+        }
+    }
+}
+
+// §8.2.4: inline sum types whose alternatives each satisfy Collectable rules.
+fn collectable_inline_sum_or_shape(concrete: string) -> boolean {
+    t: string <- trim_type_text(concrete);
+    case length_bytes(t) == 0 of {
+        true -> false;
+        false -> {
+            bar: int64 <- scan_top_level_sum_bar(t, 0, 0);
+            case bar >= 0 of {
+                true -> {
+                    left: string <- trim_type_text(substring(t, 0, bar));
+                    right: string <- trim_type_text(substring(t, bar + 3, length_bytes(t)));
+                    case collectable_inline_sum_or_shape(left) of {
+                        false -> false;
+                        true -> collectable_inline_sum_or_shape(right)
+                    }
+                };
+                false -> collectable_non_sum_shape(t)
+            }
+        }
+    }
+}
+
+// Built-in Collectable instances (silica-specification §8.2.4, CollectableTrait).
+fn is_builtin_collectable_instance(concrete: string) -> boolean {
+    collectable_inline_sum_or_shape(concrete)
+}
+
+// Built-in ActorMessage instances (silica-specification §16.3.2): marker trait, compile-time only.
+// Same inline shapes as Collectable — no runtime wrapper / link symbol.
+fn is_builtin_actor_message_instance(concrete: string) -> boolean {
+    is_builtin_collectable_instance(concrete)
+}
+
+fn find_arrow_in_type(s: string, i: int64) -> int64 {
+    case i + 4 > length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 4) == " -> " of {
+            true -> i;
+            false -> find_arrow_in_type(s, i + 1)
+        }
+    }
+}
+
+// Phase 0.4 (shallow Collectable): marker only at this layer — no emitter hooks (same as ActorMessage).
+fn actual_type_satisfies_trait_expectation(actual: string, expected: string, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> boolean {
+    case actual == expected of {
+        true -> true;
+        false -> case expected == "Collectable" of {
+            true -> is_builtin_collectable_instance(actual);
+            false -> case expected == "ActorMessage" of {
+                true -> is_builtin_actor_message_instance(actual);
+                false -> {
+                    (found: boolean, prog: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) <- find_program_declaring_trait(world, expected);
+                    case found of {
+                        false -> false;
+                        true -> trait_program_accepts_concrete(prog, actual)
+                    }
+                }
+            }
+        }
+    }
+}

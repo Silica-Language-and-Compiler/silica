@@ -1,0 +1,131 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// First-pass batch: parse all, topo-sort, write compile order / compile last unit.
+
+use module_checker_core;
+use ffi_link_manifest;
+use main_lists;
+use main_parse;
+use main_topo;
+use main_unit;
+use main_hygiene;
+use main_crash;
+
+export first_compile/1;
+
+// In-process path for small configs (matches error-enforcement goldens): compile all units,
+// then write/validate the link manifest so E4034 lands after "Finished compiling".
+fn compile_all_parsed(sorted_files: List[string, mem(normal)], parsed_all: List[{ path: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], all_config_files: List[string, mem(normal)]) -> int64 {
+    sequence proc[DeviceIO]
+        result: int64 <- {
+            case sorted_files.is_nil of {
+                true -> {
+                    _: int8 <- println("Compilation complete.");
+                    0
+                };
+                false -> {
+                    compile_code: int64 <- main_unit@compile_parsed_list(sorted_files, parsed_all, all_config_files, false);
+                    // Units the compiler crashed on (main_crash) make the batch fail even when the rest compiled.
+                    crashed: int64 <- main_crash@crashed_status();
+                    case compile_code != 0 of {
+                        true -> compile_code;
+                        false -> case crashed != 0 of {
+                            true -> crashed;
+                            false -> {
+                                link_st: int64 <- ffi_link_manifest@write_link_manifest_for_parsed(parsed_all);
+                                _: int8 <- println("Compilation complete.");
+                                link_st
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+fn prepare_compile_order(sorted_files: List[string, mem(normal)], parsed_all: List[{ path: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], all_config_files: List[string, mem(normal)]) -> int64 {
+    sequence proc[DeviceIO]
+        result: int64 <- {
+            case sorted_files.is_nil of {
+                true -> main_hygiene@finish_batch_artifacts();
+                false -> case main_lists@use_process_per_unit(sorted_files) of {
+                    false -> compile_all_parsed(sorted_files, parsed_all, all_config_files);
+                    true -> {
+                        link_st: int64 <- ffi_link_manifest@write_link_manifest_for_parsed(parsed_all);
+                        case link_st != 0 of {
+                            true -> link_st;
+                            false -> case sorted_files.tail.is_nil of {
+                                // One unit: compile it unless the compiler already crashed on it (main_crash).
+                                true -> case main_crash@is_crashed(sorted_files.head) of {
+                                    true -> main_hygiene@after_unit_compiled(module_checker_core@empty_list_string(), false);
+                                    false -> {
+                                        (code: int64, unit_rt: boolean) <- main_unit@compile_one_sorted_unit(sorted_files.head, parsed_all, all_config_files);
+                                        case code != 0 of {
+                                            true -> code;
+                                            false -> main_hygiene@after_unit_compiled(module_checker_core@empty_list_string(), unit_rt)
+                                        }
+                                    }
+                                };
+                                false -> {
+                                    _: int64 <- main_lists@write_paths_file(main_lists@compile_order_path(), sorted_files);
+                                    _: int8 <- println("Compile order ready; exiting to reclaim memory before unit compiles...");
+                                    main_lists@continue_exit_code()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+
+fn first_compile(files: List[string, mem(normal)]) -> int64 {
+    sequence proc[DeviceIO]
+        result: int64 <- {
+            empty_parsed: List[{ path: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)] <- module_checker_core@empty_parsed_files();
+            (ok_parse: boolean, parsed_all: List[{ path: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) <- main_parse@parse_all_files_recursive(files, empty_parsed);
+            case ok_parse of {
+                false -> 1;
+                true -> {
+                    (sort_ok: boolean, sorted_files: List[string, mem(normal)]) <- main_topo@topological_sort_from_parsed(files, parsed_all);
+                    case sort_ok of {
+                        false -> {
+                            cycle_text: string <- main_topo@join_paths_arrow(sorted_files);
+                            msg: string <- case length_bytes(cycle_text) == 0 of {
+                                true -> "Error: cyclic module dependencies among files in silica.config";
+                                false -> concat("Error: cyclic module dependencies among files in silica.config: ", cycle_text)
+                            };
+                            _: int8 <- println(msg);
+                            1
+                        };
+                        true -> prepare_compile_order(sorted_files, parsed_all, files)
+                    }
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}

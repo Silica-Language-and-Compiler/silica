@@ -1,0 +1,560 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Tuple prim emission: flat tuple layout
+// sir_design_spec §7.6: tuple_make (T1, T2, ...) | (v1, v2, ...) | []
+// Flat layout: single stack allocation, elements at [SP, #0], [SP, #8], ...
+// SIR chain: tuple_make(e0, tuple_make(e1, ... tuple_make(eN-2, eN-1)))
+// Emitter flattens this chain into one contiguous allocation.
+
+use reg_conventions;
+use atom_table;
+use string_parse;
+use prims_record;
+
+export emit_prim_op/2;
+export count_tuple_allocations/1;
+export count_flat_elements/1;
+export count_type_elements/1;
+export flat_alloc_size/1;
+export is_sret_aggregate_type/1;
+export sret_aggregate_bytes/1;
+export sret_aggregate_copy_bytes/1;
+export flat_alloc_size_str/1;
+export emit_flat_store/3;
+export emit_flat_mov_dest/1;
+export index_to_offset/1;
+export ldr_prefix_for_type/1;
+export tuple_field_start_byte_offset/2;
+export tuple_type_nth_element/2;
+export tuple_pattern_named_count/1;
+export tuple_pattern_strip_spaces/3;
+export tuple_pattern_next_comma/4;
+export tuple_pattern_elem_binds_name/1;
+export tuple_pattern_float_literals/3;
+export tuple_pattern_is_number/1;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn strip_ty_leading(s: string) -> string {
+    case length_bytes(s) == 0 of {
+        true -> "";
+        false -> case substring(s, 0, 1) == " " of {
+            true -> strip_ty_leading(substring(s, 1, length_bytes(s)));
+            false -> s
+        }
+    }
+}
+
+fn strip_ty_trailing(s: string) -> string {
+    case length_bytes(s) == 0 of {
+        true -> "";
+        false -> case substring(s, length_bytes(s) - 1, length_bytes(s)) == " " of {
+            true -> strip_ty_trailing(substring(s, 0, length_bytes(s) - 1));
+            false -> s
+        }
+    }
+}
+
+fn strip_ty(s: string) -> string {
+    strip_ty_trailing(strip_ty_leading(s))
+}
+
+fn tuple_inner_content(type_name: string) -> string {
+    substring(type_name, 1, length_bytes(type_name) - 1)
+}
+
+fn next_comma_top_level(inner: string, start: int64, paren_depth: int64, brace_depth: int64, bracket_depth: int64) -> int64 {
+    case start >= length_bytes(inner) of {
+        true -> -1;
+        false -> case substring(inner, start, start + 1) of {
+            "(" -> next_comma_top_level(inner, start + 1, paren_depth + 1, brace_depth, bracket_depth);
+            ")" -> next_comma_top_level(inner, start + 1, paren_depth - 1, brace_depth, bracket_depth);
+            "{" -> next_comma_top_level(inner, start + 1, paren_depth, brace_depth + 1, bracket_depth);
+            "}" -> next_comma_top_level(inner, start + 1, paren_depth, brace_depth - 1, bracket_depth);
+            "[" -> next_comma_top_level(inner, start + 1, paren_depth, brace_depth, bracket_depth + 1);
+            "]" -> next_comma_top_level(inner, start + 1, paren_depth, brace_depth, bracket_depth - 1);
+            "," -> case paren_depth == 0 and brace_depth == 0 and bracket_depth == 0 of {
+                true -> start;
+                false -> next_comma_top_level(inner, start + 1, paren_depth, brace_depth, bracket_depth)
+            };
+            _: string -> next_comma_top_level(inner, start + 1, paren_depth, brace_depth, bracket_depth)
+        }
+    }
+}
+
+fn tuple_type_segment_at(inner: string, idx: int64) -> string {
+    case idx == 0 of {
+        true -> {
+            c: int64 <- next_comma_top_level(inner, 0, 0, 0, 0);
+            case c < 0 of {
+                true -> inner;
+                false -> substring(inner, 0, c)
+            }
+        };
+        false -> {
+            c: int64 <- next_comma_top_level(inner, 0, 0, 0, 0);
+            case c < 0 of {
+                true -> "";
+                false -> tuple_type_segment_at(substring(inner, c + 1, length_bytes(inner)), idx - 1)
+            }
+        }
+    }
+}
+
+fn tuple_type_nth_element(type_name: string, idx: int64) -> string {
+    tuple_type_segment_at(tuple_inner_content(type_name), idx)
+}
+
+fn nested_tuple_span_accum(tuple_ty: string, i: int64, cnt: int64) -> int64 {
+    case i >= cnt of {
+        true -> 0;
+        false -> {
+            seg_i: string <- tuple_type_nth_element(tuple_ty, i);
+            tuple_segment_stride_bytes(seg_i, cnt) + nested_tuple_span_accum(tuple_ty, i + 1, cnt)
+        }
+    }
+}
+
+fn nested_tuple_span_bytes(tuple_ty: string) -> int64 {
+    cnt: int64 <- count_type_elements(tuple_ty);
+    nested_tuple_span_accum(tuple_ty, 0, cnt)
+}
+
+// Byte span of one tuple slot: every element is one word. A scalar (float32 and float16 included)
+// is stored in its slot; a record, list or nested tuple is a pointer to it. A float32 used to be
+// boxed (a pointer to a value parked in the next word): that pointer aimed into the frame region
+// the tuple was built in, the region was sized one word per element, and the box overran it.
+fn tuple_segment_stride_bytes(seg_raw: string, parent_tuple_elem_count: int64) -> int64 {
+    8
+}
+
+fn field_stride_for_tuple_elem(type_name: string, i: int64, total_elems: int64) -> int64 {
+    seg: string <- strip_ty(tuple_type_nth_element(type_name, i));
+    tuple_segment_stride_bytes(seg, total_elems)
+}
+
+fn accum_field_start_bytes(type_name: string, i: int64, target_idx: int64, total_elems: int64) -> int64 {
+    case i >= target_idx of {
+        true -> 0;
+        false -> {
+            st: int64 <- field_stride_for_tuple_elem(type_name, i, total_elems);
+            st + accum_field_start_bytes(type_name, i + 1, target_idx, total_elems)
+        }
+    }
+}
+
+// Byte offset of field `field_idx` (0-based), matching emit_flat_tuple_stores (one word per element).
+fn tuple_field_start_byte_offset(type_name: string, field_idx: int64) -> int64 {
+    total_elems: int64 <- count_type_elements(type_name);
+    accum_field_start_bytes(type_name, 0, field_idx, total_elems)
+}
+
+fn count_flat_elements(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
+    type_count: int64 <- count_type_elements(sir_term_root_node(term).type_name);
+    case type_count < 2 and sir_term_root_node(term).kind == 6 and sir_term_root_node(term).name == "tuple_make" of {
+        true -> count_chain_elements(term);
+        false -> type_count
+    }
+}
+
+fn count_chain_elements(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
+    case sir_term_root_node(term).kind == 6 and sir_term_root_node(term).name == "tuple_make" of {
+        true -> 1 + count_chain_elements(sir_term_at(term, sir_term_root_node(term).right_expr));
+        false -> 1
+    }
+}
+
+fn count_type_elements(type_name: string) -> int64 {
+    case length_bytes(type_name) < 2 of {
+        true -> 1;
+        false -> case substring(type_name, 0, 1) == "(" of {
+            true -> 1 + count_top_level_commas(substring(type_name, 1, length_bytes(type_name) - 1), 0, 0, 0, 0);
+            false -> 1
+        }
+    }
+}
+
+// Tuple arity from surface `(a, b, ...)`: commas inside nested `(...)`, `{ ... }`, or `[ ... ]` do not separate tuple slots.
+fn count_top_level_commas(s: string, i: int64, paren_depth: int64, brace_depth: int64, bracket_depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0;
+        false -> case substring(s, i, i + 1) of {
+            "(" -> count_top_level_commas(s, i + 1, paren_depth + 1, brace_depth, bracket_depth);
+            ")" -> count_top_level_commas(s, i + 1, paren_depth - 1, brace_depth, bracket_depth);
+            "{" -> count_top_level_commas(s, i + 1, paren_depth, brace_depth + 1, bracket_depth);
+            "}" -> count_top_level_commas(s, i + 1, paren_depth, brace_depth - 1, bracket_depth);
+            "[" -> count_top_level_commas(s, i + 1, paren_depth, brace_depth, bracket_depth + 1);
+            "]" -> count_top_level_commas(s, i + 1, paren_depth, brace_depth, bracket_depth - 1);
+            "," -> case paren_depth == 0 and brace_depth == 0 and bracket_depth == 0 of {
+                true -> 1 + count_top_level_commas(s, i + 1, paren_depth, brace_depth, bracket_depth);
+                false -> count_top_level_commas(s, i + 1, paren_depth, brace_depth, bracket_depth)
+            };
+            _: string -> count_top_level_commas(s, i + 1, paren_depth, brace_depth, bracket_depth)
+        }
+    }
+}
+
+fn flat_alloc_size(count: int64) -> int64 {
+    (count + 1) / 2 * 16
+}
+
+fn flat_alloc_size_str(count: int64) -> string {
+    atom_table@int64_to_decimal_string(flat_alloc_size(count))
+}
+
+// Flat layout: one allocation per tuple chain
+fn count_tuple_allocations(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
+    case sir_term_root_node(term).kind == 6 and sir_term_root_node(term).name == "tuple_make" of {
+        true -> 1;
+        false -> 0
+    }
+}
+
+fn store_for_type(type_name: string, reg_num: string, offset: string) -> string {
+    prefix: string <- case reg_conventions@is_float64_type(type_name) of {
+        true -> "D";
+        false -> case reg_conventions@is_float32_type(type_name) of {
+            true -> "S";
+            false -> case reg_conventions@is_narrow_type(type_name) of {
+                true -> "W";
+                false -> "X"
+            }
+        }
+    };
+    reg: string <- concat(prefix, reg_num);
+    concat(concat(concat(concat(concat("    STR ", reg), ", [SP, "), offset), "]"), "")
+}
+
+fn emit_flat_store(type_name: string, reg_num: string, idx: int64) -> string {
+    store_for_type(type_name, reg_num, index_to_offset_int(idx))
+}
+
+fn emit_flat_mov_dest(dest: string) -> string {
+    dest_ptr: string <- case length_bytes(dest) > 0 and substring(dest, 0, 1) == "W" of {
+        true -> concat("X", substring(dest, 1, length_bytes(dest)));
+        false -> dest
+    };
+    case dest == "SP" of {
+        true -> "";
+        false -> concat(concat("    MOV ", dest_ptr), ", SP")
+    }
+}
+
+fn index_to_offset(idx_str: string) -> string {
+    concat("#", atom_table@int64_to_decimal_string(string_parse@string_to_int64(idx_str) * 8))
+}
+
+fn index_to_offset_int(idx: int64) -> string {
+    concat("#", atom_table@int64_to_decimal_string(idx * 8))
+}
+
+// A float16 element loads into H: an X load left the value in X<n> while the binding read H<n>.
+fn ldr_prefix_for_type(type_name: string) -> string {
+    case reg_conventions@is_float64_type(type_name) of {
+        true -> "D";
+        false -> case reg_conventions@is_float32_type(type_name) of {
+            true -> "S";
+            false -> case reg_conventions@is_float16_type(type_name) of {
+                true -> "H";
+                false -> case reg_conventions@is_narrow_type(type_name) of {
+                    true -> "W";
+                    false -> "X"
+                }
+            }
+        }
+    }
+}
+
+fn emit_tuple_proj(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    offset_str: string <- index_to_offset(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).value);
+    prefix: string <- ldr_prefix_for_type(sir_term_root_node(term).type_name);
+    dest_num: string <- case length_bytes(dest) > 0 of {
+        true -> substring(dest, 1, length_bytes(dest));
+        false -> "0"
+    };
+    ldr_reg: string <- concat(prefix, dest_num);
+    concat(concat(concat(concat("    LDR ", ldr_reg), ", [SP, "), offset_str), "]")
+}
+
+fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    case sir_term_root_node(term).name of {
+        "tuple_proj" -> emit_tuple_proj(term, dest);
+        _: string -> concat(concat(".error \"unsupported tuple prim: ", concat(sir_term_root_node(term).name, "\"\n")), "")
+    }
+}
+
+// --- tuple case patterns -------------------------------------------------------
+// How many elements of a tuple case pattern (the raw SIR branch text, e.g. "( :ok , n : int64 )")
+// bind a name, nested tuples included. Each one is parked in a frame slot by
+// term_case_patterns@emit_tuple_case_pattern_asm, so emitter_core@case_bind_slots reserves this
+// many. Must classify elements exactly as that emitter does (tuple_pattern_elem_binds_name).
+fn tuple_pattern_named_count(raw: string) -> int64 {
+    t: string <- tuple_pattern_strip_spaces(raw, 0, "");
+    case length_bytes(t) >= 2 and substring(t, 0, 1) == "(" and substring(t, length_bytes(t) - 1, length_bytes(t)) == ")" of {
+        false -> 0;
+        true -> tuple_pattern_named_count_from(substring(t, 1, length_bytes(t) - 1))
+    }
+}
+
+fn tuple_pattern_named_count_from(inner: string) -> int64 {
+    case length_bytes(inner) == 0 of {
+        true -> 0;
+        false -> {
+            c: int64 <- tuple_pattern_next_comma(inner, 0, false, 0);
+            el: string <- substring(inner, 0, c);
+            rest: string <- case c < length_bytes(inner) of { true -> substring(inner, c + 1, length_bytes(inner)); false -> "" };
+            here: int64 <- case length_bytes(el) > 0 and substring(el, 0, 1) == "(" of {
+                true -> tuple_pattern_named_count(el);
+                false -> case tuple_pattern_elem_binds_name(el) of { true -> 1; false -> 0 }
+            };
+            here + tuple_pattern_named_count_from(rest)
+        }
+    }
+}
+
+// A pattern element (spaces stripped) that binds a name: not `_`/`_: T`, not a literal (string,
+// atom, number, boolean), not a nested tuple or record sub-pattern.
+fn tuple_pattern_elem_binds_name(el: string) -> boolean {
+    case length_bytes(el) == 0 of {
+        true -> false;
+        false -> {
+            c0: string <- substring(el, 0, 1);
+            case el == "_" or c0 == "(" or c0 == "{" or c0 == "\"" or c0 == ":" or c0 == "-" or el == "true" or el == "false" of {
+                true -> false;
+                false -> case length_bytes(el) >= 2 and substring(el, 0, 2) == "_:" of {
+                    true -> false;
+                    false -> (c0 == "0" or c0 == "1" or c0 == "2" or c0 == "3" or c0 == "4" or c0 == "5" or c0 == "6" or c0 == "7" or c0 == "8" or c0 == "9") == false
+                }
+            }
+        }
+    }
+}
+
+// Spaces are dropped everywhere except inside a string literal (the SIR text joins tokens with
+// spaces; a string pattern's own spaces are part of its value).
+fn tuple_pattern_strip_spaces(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == "\"" of {
+                true -> {
+                    e: int64 <- tuple_pattern_string_end(s, i + 1);
+                    tuple_pattern_strip_spaces(s, e, concat(acc, substring(s, i, e)))
+                };
+                false -> case ch == " " of {
+                    true -> tuple_pattern_strip_spaces(s, i + 1, acc);
+                    false -> tuple_pattern_strip_spaces(s, i + 1, concat(acc, ch))
+                }
+            }
+        }
+    }
+}
+
+// Index just past the closing quote of a string literal whose body starts at i.
+fn tuple_pattern_string_end(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> case substring(s, i, i + 1) == "\\" of {
+            true -> tuple_pattern_string_end(s, i + 2);
+            false -> case substring(s, i, i + 1) == "\"" of {
+                true -> i + 1;
+                false -> tuple_pattern_string_end(s, i + 1)
+            }
+        }
+    }
+}
+
+// Index of the next element-separating comma (or the length): commas inside a string literal or
+// inside ( ), { } or [ ] belong to the element.
+fn tuple_pattern_next_comma(s: string, i: int64, in_string: boolean, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case in_string of {
+                true -> case ch == "\\" of {
+                    true -> tuple_pattern_next_comma(s, i + 2, true, depth);
+                    false -> tuple_pattern_next_comma(s, i + 1, ch != "\"", depth)
+                };
+                false -> case ch == "\"" of {
+                    true -> tuple_pattern_next_comma(s, i + 1, true, depth);
+                    false -> case ch == "(" or ch == "{" or ch == "[" of {
+                        true -> tuple_pattern_next_comma(s, i + 1, false, depth + 1);
+                        false -> case ch == ")" or ch == "}" or ch == "]" of {
+                            true -> tuple_pattern_next_comma(s, i + 1, false, depth - 1);
+                            false -> case ch == "," and depth == 0 of {
+                                true -> i;
+                                false -> tuple_pattern_next_comma(s, i + 1, false, depth)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// "|lit|lit|": the numeric literal elements of a tuple case pattern (nested tuples included) whose
+// element type is float64 (want64) or float32 / float16 (not want64). The float literal pools add
+// them, because pattern text is not a SIR constant and a pattern's literal would otherwise have no
+// pool entry to load from.
+fn tuple_pattern_float_literals(raw: string, tup_t: string, want64: boolean) -> string {
+    t: string <- tuple_pattern_strip_spaces(raw, 0, "");
+    case length_bytes(t) >= 2 and substring(t, 0, 1) == "(" and substring(t, length_bytes(t) - 1, length_bytes(t)) == ")" of {
+        false -> "";
+        true -> tuple_pattern_float_literals_from(substring(t, 1, length_bytes(t) - 1), tup_t, 0, want64)
+    }
+}
+
+fn tuple_pattern_float_literals_from(inner: string, tup_t: string, idx: int64, want64: boolean) -> string {
+    case length_bytes(inner) == 0 of {
+        true -> "";
+        false -> {
+            c: int64 <- tuple_pattern_next_comma(inner, 0, false, 0);
+            el: string <- substring(inner, 0, c);
+            rest: string <- case c < length_bytes(inner) of { true -> substring(inner, c + 1, length_bytes(inner)); false -> "" };
+            et: string <- strip_ty(tuple_type_nth_element(tup_t, idx));
+            here: string <- case length_bytes(el) > 0 and substring(el, 0, 1) == "(" of {
+                true -> tuple_pattern_float_literals(el, et, want64);
+                false -> {
+                    wanted: boolean <- case want64 of {
+                        true -> reg_conventions@is_float64_type(et);
+                        false -> reg_conventions@is_float32_type(et) or reg_conventions@is_float16_type(et)
+                    };
+                    case wanted and tuple_pattern_is_number(el) of {
+                        true -> concat("|", concat(el, "|"));
+                        false -> ""
+                    }
+                }
+            };
+            concat(here, case length_bytes(rest) > 0 of {
+                true -> tuple_pattern_float_literals_from(rest, tup_t, idx + 1, want64);
+                false -> ""
+            })
+        }
+    }
+}
+
+// Optional minus, digits, at most one '.' with a digit before it.
+fn tuple_pattern_is_number(s: string) -> boolean {
+    case length_bytes(s) > 1 and substring(s, 0, 1) == "-" of {
+        true -> tuple_pattern_number_from(s, 1, false, false);
+        false -> tuple_pattern_number_from(s, 0, false, false)
+    }
+}
+
+fn tuple_pattern_number_from(s: string, i: int64, seen_dot: boolean, seen_digit: boolean) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> seen_digit;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == "0" or ch == "1" or ch == "2" or ch == "3" or ch == "4" or ch == "5" or ch == "6" or ch == "7" or ch == "8" or ch == "9" of {
+                true -> tuple_pattern_number_from(s, i + 1, seen_dot, true);
+                false -> case ch == "." and seen_dot == false and seen_digit of {
+                    true -> tuple_pattern_number_from(s, i + 1, true, seen_digit);
+                    false -> false
+                }
+            }
+        }
+    }
+}
+
+// Results returned through the caller's buffer in X8 (call@sret_x8_setup, emitter_core@
+// fn_returns_sret_tuple): plain tuples (reg_conventions@is_sret_tuple_type) and records with the boxed
+// layout -- one word per field after the shape word. The runtime-laid-out records (child specs,
+// supervisor replies) keep their own return path.
+fn is_sret_aggregate_type(t: string) -> boolean {
+    case reg_conventions@is_sret_tuple_type(t) of {
+        true -> true;
+        false -> reg_conventions@is_inline_struct_type(t) and prims_record@record_type_keeps_inline_layout(t) == false
+    }
+}
+
+// Bytes of the shell the caller's home holds for the result (and a promoted copy is allocated
+// with), a multiple of 16. The callee copies sret_aggregate_copy_bytes of the value into it.
+fn sret_aggregate_bytes(t: string) -> int64 {
+    case reg_conventions@is_sret_tuple_type(t) of {
+        true -> flat_alloc_size(count_type_elements(t));
+        false -> (prims_record@record_type_value_flat_byte_size(t) + 15) / 16 * 16
+    }
+}
+
+// Bytes the callee copies out of the value in X0 (emitter_core@sret_tuple_epilogue_copy): the
+// value's own flat size, never the rounded shell. A record value reaching the epilogue may be a
+// region box of exactly record_type_value_flat_byte_size bytes -- a list head boxed by prims_list
+// emit_list_head_box, a nested-record field copied by term_aggregate_helpers aggregate_type_flat_bytes
+// -- so copying the 16-byte-rounded shell read one word past every record with an even field count.
+// The word is harmless until the box is the last allocation of a 64 MB arena block and the next
+// block was not placed adjacently: the read then touches an unmapped page and the actor faults
+// (found on apple_silicon_mac in the compiler's own constraint_core narrow_slot_backward;
+// trials/carriers_addition/workers_two_field_record_return_at_arena_block_end). Tuples are boxed at
+// flat_alloc_size, so their shell is their size.
+fn sret_aggregate_copy_bytes(t: string) -> int64 {
+    case reg_conventions@is_sret_tuple_type(t) of {
+        true -> flat_alloc_size(count_type_elements(t));
+        false -> prims_record@record_type_value_flat_byte_size(t)
+    }
+}

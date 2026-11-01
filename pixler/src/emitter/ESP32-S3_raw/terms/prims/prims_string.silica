@@ -1,0 +1,149 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// String prim emission: string_concat, string_substring, string_substring_until_char,
+// string predicates (starts_with/ends_with/contains), and content compares via L_string_cmp_helper.
+// Compare operands arrive in X9/X10 (term_emitter is_cmp branch), same as int64.
+// string_concat: X0 (arg1), X1 (arg2). BL L_concat_helper; result in X0.
+// string predicates: X0 (haystack), X1 (needle). BL L_string_*_helper; result in W0.
+// string_substring: X0 (s), X1 (start_char), X2 (end_char). Character-based indices. BL L_substring_helper; result in X0.
+// string_substring_until_char: X0 (s), X1 (start), X2 (encoded char: len<<56|packed). BL L_substring_until_char_helper; result in X0.
+// Helpers emitted by string_concat_mmap_nomte / string_substring_mmap_nomte / string_eq_mmap_nomte / string_predicates_mmap_nomte when module uses them.
+// sir_design_spec §7.10, sir_emitter_pattern_spec §9
+
+
+use xt_isa;
+use xt_mem;
+
+export emit_prim_op/2;
+export is_string_predicate_prim/1;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn is_string_predicate_prim(name: string) -> boolean {
+    name == "string_starts_with" or name == "string_ends_with" or name == "string_contains"
+}
+
+fn emit_string_concat(dest: string) -> string {
+    concat(xt_isa@xt_call("silica_rt_string_concat"), xt_isa@xt_mov(dest, "X0"))
+}
+
+fn emit_string_substring(dest: string) -> string {
+    concat(xt_isa@xt_call("silica_rt_string_substring"), xt_isa@xt_mov(dest, "X0"))
+}
+
+fn emit_string_substring_until_char(dest: string) -> string {
+    concat(xt_isa@xt_call("silica_rt_string_substring_until_char"), xt_isa@xt_mov(dest, "X0"))
+}
+
+// AArch64: MOV Wn, Wm only — never MOV Xn, Wm (assembler rejects mixed widths).
+fn w_reg_from_dest(dest: string) -> string {
+    case length_bytes(dest) > 0 of {
+        true -> case substring(dest, 0, 1) == "X" of {
+            true -> concat("W", substring(dest, 1, length_bytes(dest)));
+            false -> dest
+        };
+        false -> dest
+    }
+}
+
+// Predicate: args already in X0/X1; helper returns W0. Move bool result to dest as Wn.
+fn emit_string_predicate(dest: string, helper: string) -> string {
+    concat(xt_isa@xt_call(helper), xt_isa@xt_mov(w_reg_from_dest(dest), "W0"))
+}
+
+// Content compare: operands in X9/X10; helper uses X0/X1. Preserve live X0/X1 (e.g. fold
+// step args acc/item) across BL — same discipline as string_length_* in prims_int64.
+// Result via W12 then MOV to dest so LDP does not wipe a dest of X0/X1.
+fn emit_string_rel_op(dest: string, cond: string) -> string {
+    save: string <- xt_mem@xt_stp("X0", "X1", "[SP, #-16]!");
+    setup: string <- concat(concat(xt_isa@xt_mov("X0", "X9"), xt_isa@xt_mov("X1", "X10")), xt_isa@xt_call("silica_rt_string_cmp"));
+    cset_tmp: string <- xt_isa@xt_cmp_set("W12", cond, "W0", "#0");
+    restore: string <- xt_mem@xt_ldp("X0", "X1", "[SP], #16");
+    to_dest: string <- case dest == "X12" or dest == "W12" of {
+        true -> "";
+        false -> xt_isa@xt_mov(dest, "X12")
+    };
+    part1: string <- concat(save, setup);
+    part2: string <- concat(cset_tmp, restore);
+    concat(concat(part1, part2), to_dest)
+}
+
+fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    case sir_term_root_node(term).name of {
+        "lt" -> emit_string_rel_op(dest, "LT");
+        "gt" -> emit_string_rel_op(dest, "GT");
+        "le" -> emit_string_rel_op(dest, "LE");
+        "ge" -> emit_string_rel_op(dest, "GE");
+        "eq" -> emit_string_rel_op(dest, "EQ");
+        "nq" -> emit_string_rel_op(dest, "NE");
+        "string_concat" -> emit_string_concat(dest);
+        "string_substring" -> emit_string_substring(dest);
+        "string_substring_until_char" -> emit_string_substring_until_char(dest);
+        "string_starts_with" -> emit_string_predicate(dest, "silica_rt_string_starts_with");
+        "string_ends_with" -> emit_string_predicate(dest, "silica_rt_string_ends_with");
+        "string_contains" -> emit_string_predicate(dest, "silica_rt_string_contains");
+        _: string -> concat(".error \"unsupported string prim: ", concat(sir_term_root_node(term).name, "\"\n"))
+    }
+}

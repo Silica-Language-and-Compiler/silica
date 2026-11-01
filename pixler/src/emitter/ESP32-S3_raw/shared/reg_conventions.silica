@@ -1,0 +1,317 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Register conventions: type_name -> reg prefix, dest mapping
+// Shared by const, let, prims, call - centralizes AArch64 register allocation by type
+
+export reg_prefix_for_type/1;
+export is_narrow_type/1;
+export is_unsigned_type/1;
+export is_float64_type/1;
+export is_float32_type/1;
+export is_float16_type/1;
+export is_tuple_type/1;
+export is_sret_tuple_type/1;
+export is_atom_option_type/1;
+export is_inline_struct_type/1;
+export is_aggregate_struct_or_tuple_return_type/1;
+export float_scalar_literal_pool_ptr_reg/1;
+
+fn is_narrow_type(type_name: string) -> boolean {
+    type_name == "int32" or type_name == "int16" or type_name == "int8" or type_name == "uint32" or type_name == "uint16" or type_name == "uint8"
+}
+
+fn is_unsigned_type(type_name: string) -> boolean {
+    type_name == "uint64" or type_name == "uint32" or type_name == "uint16" or type_name == "uint8"
+}
+
+fn is_float64_type(type_name: string) -> boolean {
+    type_name == "float64"
+}
+
+fn is_float32_type(type_name: string) -> boolean {
+    type_name == "float32"
+}
+
+fn is_float16_type(type_name: string) -> boolean {
+    type_name == "float16"
+}
+
+// Same O(n^2)-allocation hazard as prims_record:strip_spaces_rt, and the same reason it almost never
+// needs to do any work: return an already-stripped string untouched.
+fn strip_spaces_regcv(s: string) -> string {
+    case string_has_space_regcv(s, 0) of {
+        true -> strip_spaces_regcv_from(s, 0, "");
+        false -> s
+    }
+}
+
+fn string_has_space_regcv(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> false;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> true;
+            false -> string_has_space_regcv(s, i + 1)
+        }
+    }
+}
+
+fn strip_spaces_regcv_from_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case substring(s, j, j + 1) == " " of {
+            true -> j;
+            false -> strip_spaces_regcv_from_run_end(s, j + 1, n)
+        }
+    }
+}
+
+fn strip_spaces_regcv_from(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> strip_spaces_regcv_from(s, i + 1, acc);
+            false -> {
+                n: int64 <- length_bytes(s);
+                e: int64 <- strip_spaces_regcv_from_run_end(s, i, n);
+                strip_spaces_regcv_from(s, e, concat(acc, substring(s, i, e)))
+            }
+        }
+    }
+}
+
+fn unwrap_atom_option_parens_regcv(type_name: string) -> string {
+    t: string <- strip_spaces_regcv(type_name);
+    case length_bytes(t) >= 2 and substring(t, 0, 1) == "(" and substring(t, length_bytes(t) - 1, length_bytes(t)) == ")" of {
+        false -> t;
+        true -> {
+            inner: string <- substring(t, 1, length_bytes(t) - 1);
+            case length_bytes(inner) > 0 and substring(inner, 0, 1) == ":" of {
+                true -> inner;
+                false -> t
+            }
+        }
+    }
+}
+
+// True for a top-level comma (outside (), [], {}). A type body that starts with an atom AND has a
+// top-level comma is a tuple whose first element is an atom -- an actor reply `(:reply, T, S)` --
+// not an atom option `:a | :b`. Mirrors the seed fix.
+fn has_top_level_comma_regcv(s: string, i: int64, depth: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> false;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> has_top_level_comma_regcv(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> has_top_level_comma_regcv(s, i + 1, depth - 1);
+                    false -> case c == "," and depth == 0 of {
+                        true -> true;
+                        false -> has_top_level_comma_regcv(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_atom_option_type_regcv(type_name: string) -> boolean {
+    t: string <- unwrap_atom_option_parens_regcv(type_name);
+    case length_bytes(t) > 0 and substring(t, 0, 1) == ":" and has_top_level_comma_regcv(t, 0, 0) == false of {
+        true -> true;
+        false -> tagged_tuple_heads_sum_regcv(t) or record_heads_sum_regcv(t)
+    }
+}
+
+// The same sum written record first, `{ id: uint32 } | :none` (silica-specification §3.4.2,
+// §15.4.8): an inline record followed by a top-level `|`.
+fn record_heads_sum_regcv(t: string) -> boolean {
+    length_bytes(t) > 1 and substring(t, 0, 1) == "{" and find_top_bar_regcv(t, 0, 0) >= 0
+}
+
+// The same sum written tuple first, `(:found, uint32) | :none` (silica-specification §16.1,
+// `(:reply, Reply) | :timeout`): a tagged tuple followed by a top-level `|`, and not a function type.
+fn tagged_tuple_heads_sum_regcv(t: string) -> boolean {
+    length_bytes(t) > 2 and substring(t, 0, 2) == "(:" and find_top_bar_regcv(t, 0, 0) >= 0 and find_top_arrow_from_regcv(t, 1, 1) < 0
+}
+
+fn find_top_bar_regcv(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> find_top_bar_regcv(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> find_top_bar_regcv(s, i + 1, depth - 1);
+                    false -> case c == "|" and depth == 0 of {
+                        true -> i;
+                        false -> find_top_bar_regcv(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_atom_option_type(type_name: string) -> boolean {
+    is_atom_option_type_regcv(type_name)
+}
+
+// Top-level `->` in parenthesized types: distinguishes `(T1,...,Tn) -> R` (function) from `(T1, T2)` (tuple).
+// Mirrors sir_generator / var emitter arrow scanning so tuple vs function classification stays aligned.
+fn find_top_arrow_from_regcv(s: string, i: int64, depth: int64) -> int64 {
+    case i + 1 >= length_bytes(s) of {
+        true -> -1;
+        false -> case depth == 0 and substring(s, i, i + 2) == "->" of {
+            true -> i;
+            false -> {
+                c: string <- substring(s, i, i + 1);
+                d2: int64 <- case c == "(" or c == "[" or c == "{" of {
+                    true -> depth + 1;
+                    false -> case c == ")" or c == "]" or c == "}" of {
+                        true -> depth - 1;
+                        false -> depth
+                    }
+                };
+                find_top_arrow_from_regcv(s, i + 1, d2)
+            }
+        }
+    }
+}
+
+// Tuple type: (T1, T2, ...). Parenthesized function types `(params) -> R` also start with "(" — exclude them.
+fn is_tuple_type(type_name: string) -> boolean {
+    case is_atom_option_type_regcv(type_name) of {
+        true -> false;
+        false -> case length_bytes(type_name) < 2 of {
+            true -> false;
+            false -> case substring(type_name, 0, 1) == "(" of {
+                false -> false;
+                true -> find_top_arrow_from_regcv(type_name, 1, 1) < 0
+            }
+        }
+    }
+}
+
+// A tuple returned through the caller's result buffer: the caller passes X8 = where the tuple
+// goes (a frame home of its own, its own incoming X8, or 0 for "allocate it"), and the callee
+// copies its result there in the epilogue (emitter_core@sret_tuple_epilogue_copy). Before this the
+// callee always copied its result to the heap, and inside an actor nothing frees those copies until
+// the actor ends: every call of a tuple-returning function grew the actor's region by a block.
+// Behaviour results, (:reply, ..) and (:no_reply, ..), keep the actor reply buffer (X2) instead,
+// and sums are not tuples. Callers and callees both decide by this predicate on the type they see,
+// so it must stay a function of the type string alone.
+fn is_sret_tuple_type(type_name: string) -> boolean {
+    case is_tuple_type(type_name) of {
+        false -> false;
+        true -> find_top_bar_regcv(type_name, 0, 0) < 0 and tuple_type_is_behaviour_result_regcv(type_name, 1) == false
+    }
+}
+
+// True when the first element of the tuple type text starts with :reply or :no_reply.
+fn tuple_type_is_behaviour_result_regcv(t: string, i: int64) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> false;
+        false -> case substring(t, i, i + 1) == " " of {
+            true -> tuple_type_is_behaviour_result_regcv(t, i + 1);
+            false -> (i + 6 <= length_bytes(t) and substring(t, i, i + 6) == ":reply")
+                or (i + 9 <= length_bytes(t) and substring(t, i, i + 9) == ":no_reply")
+        }
+    }
+}
+
+// Inline struct: { f1: T1, f2: T2, ... } — same pointer/flat return path as tuples in the emitter.
+// A record-headed sum (`{ id: uint32 } | :none`) is a sum, not a record.
+fn is_inline_struct_type(type_name: string) -> boolean {
+    case length_bytes(type_name) >= 1 of {
+        true -> substring(type_name, 0, 1) == "{" and find_top_bar_regcv(type_name, 0, 0) < 0;
+        false -> false
+    }
+}
+
+// A tagged sum whose selected alternative is a tuple, `:none | (:some, int64)`, returns an
+// aggregate even though is_tuple_type excludes atom-option types: that exclusion was written when
+// such a type could only be a bare atom, which is a scalar. Without this the callee built the tuple
+// in its own frame and returned a pointer into it, which the caller read after the frame had died
+// (case_addition/tagged_optional_type printed a stack address on linux_x86_64, and survived on
+// AArch64 only because nothing had overwritten the bytes yet).
+// A record variant (`:none | { id: uint32 }`) is returned the same way, a pointer to the promoted record.
+fn atom_option_carries_tuple_regcv(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> false;
+        false -> case substring(s, i, i + 1) == "(" or substring(s, i, i + 1) == "{" of {
+            true -> true;
+            false -> atom_option_carries_tuple_regcv(s, i + 1)
+        }
+    }
+}
+
+fn is_aggregate_struct_or_tuple_return_type(type_name: string) -> boolean {
+    case is_tuple_type(type_name) of {
+        true -> true;
+        false -> case is_inline_struct_type(type_name) of {
+            true -> true;
+            false -> case is_atom_option_type_regcv(type_name) of {
+                false -> false;
+                true -> atom_option_carries_tuple_regcv(type_name, 0)
+            }
+        }
+    }
+}
+
+// Reg prefix: "X" (int64/uint64/pointer/tuple), "W" (narrow), "D" (float64), "S" (float32), "H" (float16)
+// Tuple types are pointers; must use X (64-bit), not W
+// ADRP base for float literal loads: X0 for low-index scalar temps (functions goldens); X10 for reg 9+ and multi-digit (tuple temps like D9).
+fn float_scalar_literal_pool_ptr_reg(dest: string) -> string {
+    case length_bytes(dest) < 2 of {
+        true -> "X10";
+        false -> {
+            p: string <- substring(dest, 0, 1);
+            case p == "S" or p == "D" or p == "H" of {
+                false -> "X10";
+                true -> case length_bytes(dest) > 2 of {
+                    true -> "X10";
+                    false -> case substring(dest, 1, 2) == "9" of {
+                        true -> "X10";
+                        false -> "X0"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn reg_prefix_for_type(type_name: string) -> string {
+    case type_name == "float64" of {
+        true -> "D";
+        false -> case type_name == "float32" of {
+            true -> "S";
+            false -> case type_name == "float16" of {
+                true -> "H";
+                false -> case is_tuple_type(type_name) of {
+                true -> "X";
+                false -> case is_narrow_type(type_name) of {
+                    true -> "W";
+                    false -> "X"
+                }
+            }
+            }
+        }
+    }
+}

@@ -1,0 +1,556 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+{- Core effect checking infrastructure.
+   Provides EffectCheckResult, EffectEntry environment, and helper functions
+   for effect comparison, validation, and built-in effect recognition.
+   Implements spec §9.1 (Effect Types), §9.1.2 (Effect Aliases).
+
+   Supervisors — design_documents/supervisors_implementation_development_plan.md:
+   Phase B (§15.4.9, §16.2.7): ingress vs standard mailbox ordering is runtime-only — no extra
+   compile-time effect for “ingress”.
+   Phase C (§15.4.10–§15.4.11): exit notifications and failure_reason payloads are constructed
+   in the runtime; no separate user-visible effect for delivering to supervisor ingress.
+   Phase D (§15.4.8.3, §15.4.13): behavior-only spawn_linked / link are enforced in the type
+   checker (E2091), not here; when they appear in an effect-checked body they still require
+   proc[concurrency] like other actor intrinsics.
+   Phase E (§15.4.12.1, §15.4.12.3, §15.4.13.1–§15.4.13.2, §15.4.13.3): static child_spec table,
+   automatic restart, restart caps / escalation, and dynamic children (spawn_linked only, no
+   auto-restart row) are applied by the runtime; there is no additional compile-time effect.
+   Module-level Supervisor init return shape (flags + List[child_spec, normal]) is validated
+   in module_checker (E2092), not here; dynamic child spawn in behavior still uses the same
+   proc[concurrency] classification as Phase D.
+   Phase F (§15.4.11.4, §15.4.13.4–§15.4.13.6): unwind reports go to the root FailureReporter via
+   runtime-invoked handle_report; that path is independent of supervisor ingress and does not
+   introduce a separate compile-time effect—implementations of region_dump_limit / handle_report
+   are ordinary functions: declare proc[device_io], proc[concurrency], etc. only for what the
+   body actually uses (stderr fallback when no reporter is runtime-only).
+   Phase G (§15.4.8.4–§15.4.8.7): `link` / `monitor` / `demonitor`, linked-exit to supervisor
+   ingress vs `DOWN` to standard mailbox, and cascading shutdown on supervisor death are all
+   runtime routing and scheduling concerns. The effect checker still classifies `link`, `monitor`,
+   and `demonitor` (and recv/cast/send for matching `DOWN` / messages) as proc[concurrency] only
+   (§15.4.8.3 behavior-only rules for `link` / `spawn_linked` remain in the type checker as E2091;
+   there is no separate `mailbox` or `ingress` effect in this layer).
+   User-facing actor intrinsics (including spawn_linked, link, monitor, demonitor, call, cast,
+   send, self, recv) are classified as proc[concurrency] here (is_builtin_fn / builtin_fn_effects).
+   Note: user code cannot call recv today (§15.1.2; type checker), but recv is listed for parity
+   with the actor-runtime surface and module_checker intrinsics.
+-}
+
+use parser_ast;
+use lexer_core;
+
+export effect_check_ok/0;
+export effect_check_err/4;
+export effects_equal/2;
+export effect_list_contains/2;
+export effect_list_length/1;
+export effect_name_to_string/1;
+export normalize_effect/1;
+export empty_effect_entry_list/0;
+export add_effect_entry/3;
+export lookup_fn_effects/2;
+export create_effect_context/4;
+export effect_context_with_type_env/2;
+export empty_type_entry_list/0;
+export add_type_entry/3;
+export lookup_type_entry/2;
+export is_builtin_effect/1;
+export is_empty_param/1;
+export is_valid_mem_parameter/1;
+export is_builtin_alias_name/1;
+export is_builtin_fn/1;
+export fn_effective_effects/1;
+export expand_builtin_alias/1;
+export builtin_fn_effects/1;
+
+// --- Record constructors / env helpers (inline records + List; no named structs) ---
+
+fn effect_check_ok() -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    result: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- {
+        is_ok: true,
+        error_code: "",
+        error_location: parser_ast@zero_location(),
+        error_message: "",
+        spec_section: ""
+    };
+    result
+}
+
+fn effect_check_err(error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    result: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- {
+        is_ok: false,
+        error_code: error_code,
+        error_location: error_location,
+        error_message: error_message,
+        spec_section: spec_section
+    };
+    result
+}
+
+fn empty_effect_entry_list() -> List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] <- empty[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn add_effect_entry(env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] {
+    sequence proc[mem(normal)]
+        entry: { name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- { name: name, effects: effects };
+        result: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] <- prepend[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)](entry, env)
+    produces
+        pure result
+    end
+}
+
+fn lookup_fn_effects(env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], name: string) -> (boolean, List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) {
+    sequence
+        result: (boolean, List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) <- case env of {
+            []: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] -> (false, parser_ast@empty_effect_name_list());
+            [head: { name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, tail: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)]] -> case head.name == name of {
+                true -> (true, head.effects);
+                false -> lookup_fn_effects(tail, name)
+            };
+            _: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)] -> (false, parser_ast@empty_effect_name_list())
+        }
+    produces
+        pure result
+    end
+}
+
+fn create_effect_context(fn_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], foreign_c_wrapper_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], alias_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> { fn_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], foreign_c_wrapper_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], alias_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], type_env: List[{ name: string, type_name: string }, mem(normal)], world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)] } {
+    sequence
+        type_env_t: List[{ name: string, type_name: string }, mem(normal)] <- empty_type_entry_list();
+        result: { fn_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], foreign_c_wrapper_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], alias_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], type_env: List[{ name: string, type_name: string }, mem(normal)], world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)] } <- {
+            fn_env: fn_env,
+            foreign_c_wrapper_env: foreign_c_wrapper_env,
+            alias_env: alias_env,
+            type_env: type_env_t,
+            world: world
+        }
+    produces
+        pure result
+    end
+}
+
+fn effect_context_with_type_env(ctx: { fn_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], foreign_c_wrapper_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], alias_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], type_env: List[{ name: string, type_name: string }, mem(normal)], world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)] }, type_env: List[{ name: string, type_name: string }, mem(normal)]) -> { fn_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], foreign_c_wrapper_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], alias_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], type_env: List[{ name: string, type_name: string }, mem(normal)], world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)] } {
+    result: { fn_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], foreign_c_wrapper_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], alias_env: List[{ name: string, effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], type_env: List[{ name: string, type_name: string }, mem(normal)], world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)] } <- {
+        fn_env: ctx.fn_env,
+        foreign_c_wrapper_env: ctx.foreign_c_wrapper_env,
+        alias_env: ctx.alias_env,
+        type_env: type_env,
+        world: ctx.world
+    };
+    result
+}
+
+fn empty_type_entry_list() -> List[{ name: string, type_name: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ name: string, type_name: string }, mem(normal)] <- empty[{ name: string, type_name: string }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn add_type_entry(env: List[{ name: string, type_name: string }, mem(normal)], name: string, type_name: string) -> List[{ name: string, type_name: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        entry: { name: string, type_name: string } <- { name: name, type_name: type_name };
+        result: List[{ name: string, type_name: string }, mem(normal)] <- prepend[{ name: string, type_name: string }, mem(normal)](entry, env)
+    produces
+        pure result
+    end
+}
+
+fn lookup_type_entry(env: List[{ name: string, type_name: string }, mem(normal)], name: string) -> (boolean, string) {
+    sequence
+        result: (boolean, string) <- case env of {
+            []: List[{ name: string, type_name: string }, mem(normal)] -> (false, "");
+            [head: { name: string, type_name: string }, tail: List[{ name: string, type_name: string }, mem(normal)]] -> case head.name == name of {
+                true -> (true, head.type_name);
+                false -> lookup_type_entry(tail, name)
+            };
+            _: List[{ name: string, type_name: string }, mem(normal)] -> (false, "")
+        }
+    produces
+        pure result
+    end
+}
+
+// --- Effect comparison ---
+
+fn effects_equal(a: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, b: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> boolean {
+    case a.name == b.name of {
+        true -> a.parameter == b.parameter;
+        false -> false
+    }
+}
+
+fn effect_list_contains(list: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> boolean {
+    case list.is_nil of {
+        true -> false;
+        false -> case effects_equal(list.head, eff) of {
+            true -> true;
+            false -> effect_list_contains(list.tail, eff)
+        }
+    }
+}
+
+fn effect_list_length(list: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> int64 {
+    case list.is_nil of {
+        true -> 0;
+        false -> 1 + effect_list_length(list.tail)
+    }
+}
+
+// --- Display ---
+
+fn effect_name_to_string(eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> string {
+    case eff.parameter == "" of {
+        true -> eff.name;
+        false -> concat(eff.name, concat("(", concat(eff.parameter, ")")))
+    }
+}
+
+{- Normalize legacy effect names to spec-standard forms.
+   DeviceIO -> device_io per spec §9.1.1. -}
+fn normalize_effect(eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } {
+    case eff.name of {
+        "DeviceIO" -> { name: "device_io", parameter: "", location: eff.location };
+        _: string -> eff
+    }
+}
+
+// --- Built-in effect validation (§9.1.1) ---
+// Use param == "" instead of length_bytes(param) == 0: bootstrap compiler length_bytes("") bug (returns non-zero)
+
+fn is_empty_param(param: string) -> boolean {
+    param == ""
+}
+
+fn is_builtin_effect(eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> boolean {
+    norm: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- normalize_effect(eff);
+    case norm.name of {
+        "mem" -> is_valid_mem_parameter(norm.parameter);
+        "concurrency" -> is_empty_param(norm.parameter);
+        "atomic" -> is_empty_param(norm.parameter);
+        "device_io" -> is_empty_param(norm.parameter);
+        "external_danger" -> is_empty_param(norm.parameter);
+        "register_rwr" -> is_empty_param(norm.parameter);
+        _: string -> false
+    }
+}
+
+fn is_valid_mem_parameter(param: string) -> boolean {
+    case param of {
+        "normal" -> true;
+        "normal_writeback" -> true;
+        "normal_writethrough" -> true;
+        "normal_noncacheable" -> true;
+        "atomic" -> true;
+        "device" -> true;
+        _: string -> false
+    }
+}
+
+// --- Built-in alias checks (§9.1.2) ---
+
+fn is_builtin_alias_name(name: string) -> boolean {
+    case name of {
+        "actor_eff" -> true;
+        "io_eff" -> true;
+        "atomic_eff" -> true;
+        _: string -> false
+    }
+}
+
+{- Expand a built-in alias to its constituent effects.
+   actor_eff = [concurrency] per spec §9.1.2
+   io_eff = [mem(normal), device_io]
+   atomic_eff = [mem(atomic), atomic]  -}
+fn expand_builtin_alias(name: string) -> (boolean, List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) {
+    zero: { file: string, line: int64, column: int64, offset: int64 } <- parser_ast@zero_location();
+    case name of {
+        "actor_eff" -> {
+            e1: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "concurrency", parameter: "", location: zero };
+            (true, parser_ast@cons_effect_name(e1, parser_ast@empty_effect_name_list()))
+        };
+        "io_eff" -> {
+            e1: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "mem", parameter: "normal", location: zero };
+            e2: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "device_io", parameter: "", location: zero };
+            (true, parser_ast@cons_effect_name(e1, parser_ast@cons_effect_name(e2, parser_ast@empty_effect_name_list())))
+        };
+        "atomic_eff" -> {
+            e1: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "mem", parameter: "atomic", location: zero };
+            e2: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "atomic", parameter: "", location: zero };
+            (true, parser_ast@cons_effect_name(e1, parser_ast@cons_effect_name(e2, parser_ast@empty_effect_name_list())))
+        };
+        _: string -> (false, parser_ast@empty_effect_name_list())
+    }
+}
+
+// --- Built-in function effect knowledge ---
+// Supervisors (supervisors_implementation_development_plan.md): Phase B ingress ordering;
+// Phase C exit/failure payloads (runtime); Phase D behavior-only spawn_linked/link (type check);
+// Phase E automatic restart / child_spec + escalation (runtime only—no extra builtin);
+// Phase F FailureReporter.handle_report / unwind (runtime delivery, §15.4.13.4)—no extra builtin here;
+// Phase G link/monitor/demonitor / DOWN / cascading shutdown (§15.4.8.4–§15.4.8.7)—runtime only.
+// All of: spawn, spawn_linked, link, monitor, demonitor, call, cast, send, self, recv — same
+// concurrency classification (no separate compile-time effect for ingress, standard mailbox, DOWN, or failure payload delivery).
+
+// register_rwr is the one effect a `sequence proc[...] produces pure ... end` does not discharge: a
+// function whose body holds a register_rwr sequence reaches a device, so every caller must declare
+// register_rwr (silica_device_actor_specification.md §4.4), which keeps device code out of main and
+// of ordinary behaviours transitively. All other effects stay encapsulated by the block.
+fn expr_declares_register_rwr(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    case expr.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+            case node.kind < 0 of {
+                true -> false;
+                false -> case node.kind == 11 and effects_name_register_rwr(node.sequence_effects) of {
+                    true -> true;
+                    false -> case expr_declares_register_rwr(parser_ast@expr_at(expr, node.inner)) of {
+                        true -> true;
+                        false -> expr_declares_register_rwr(parser_ast@expr_at(expr, node.right_expr))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn effects_name_register_rwr(effs: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> boolean {
+    case effs.is_nil of {
+        true -> false;
+        false -> case normalize_effect(effs.head).name == "register_rwr" of {
+            true -> true;
+            false -> effects_name_register_rwr(effs.tail)
+        }
+    }
+}
+
+// The effects a caller must account for: the signature's, plus register_rwr when the body declares it.
+fn fn_effective_effects(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case effects_name_register_rwr(decl.declared_effects) == false and expr_declares_register_rwr(decl.body) of {
+        true -> parser_ast@cons_effect_name({ name: "register_rwr", parameter: "", location: decl.location }, decl.declared_effects);
+        false -> decl.declared_effects
+    }
+}
+
+fn is_builtin_fn(name: string) -> boolean {
+    case name of {
+        "println" -> true;
+        "print_string_stderr" -> true;
+        "println_stderr" -> true;
+        "print" -> true;
+        "print_string" -> true;
+        "print_int64" -> true;
+        "print_int32" -> true;
+        "print_int16" -> true;
+        "print_int8" -> true;
+        "print_float64" -> true;
+        "print_float16" -> true;
+        "print_float32" -> true;
+        "print_boolean" -> true;
+        "print_char" -> true;
+        "print_atom" -> true;
+        "read_lines" -> true;
+        "file_exists" -> true;
+        "append_file" -> true;
+        "delete_file" -> true;
+        "spawn" -> true;
+        "spawn_dangerous" -> true;
+        "spawn_dangerous_registered" -> true;
+        "spawn_device" -> true;
+        "spawn_device_registered" -> true;
+        "cast_device" -> true;
+        "cast_device_registered" -> true;
+        "map_device" -> true;
+        "peek" -> true;
+        "poke" -> true;
+        "spawn_registered" -> true;
+        "spawn_registered_supervisor" -> true;
+        "spawn_linked" -> true;
+        "add_child" -> true;
+        "link" -> true;
+        "monitor" -> true;
+        "demonitor" -> true;
+        "supervision_ingress_enqueue" -> true;
+        "supervision_wait_and_drain_one" -> true;
+        "failure_reason_tag" -> true;
+        "failure_reason_atom" -> true;
+        "failure_agent_type" -> true;
+        "failure_release" -> true;
+        "kill_abnormal" -> true;
+        "stop_self" -> true;
+        "fail_self" -> true;
+        "monotonic_time" -> true;
+        "current_time" -> true;
+        "send_after" -> true;
+        "cancel_timer" -> true;
+        "wait_for_exit" -> true;
+        "cast_exit" -> true;
+        "heap_used" -> true;
+        "actor_carrier_index" -> true;
+        "call" -> true;
+        "call_registered" -> true;
+        "cast" -> true;
+        "cast_registered" -> true;
+        "cast_dangerous_registered" -> true;
+        "send" -> true;
+        "self" -> true;
+        "recv" -> true;
+        "pin_actor_to_core" -> true;
+        "pin_actor_to_efficiency_core" -> true;
+        "pin_actor_to_performance_core" -> true;
+        "pin_actor_realtime" -> true;
+        "unpin_actor" -> true;
+        "remove_actor" -> true;
+        "register_actor" -> true;
+        "get_registry_actor" -> true;
+        "get_pid_registry" -> true;
+        "set_actor_priority" -> true;
+        // migrate_actor was missing here until 2026-10-19: a sequence whose only concurrency call
+        // was a migrate_actor was rejected with E3010, and one without proc[concurrency] accepted.
+        "migrate_actor" -> true;
+        "set_scheduler_policy" -> true;
+        "pin_actor_to_numa_node" -> true;
+        "get_cpu_topology" -> true;
+        "get_efficiency_cores" -> true;
+        "get_performance_cores" -> true;
+        "get_core_capabilities" -> true;
+        _: string -> false
+    }
+}
+
+{- Returns the effects required by known built-in functions.
+   I/O built-ins require device_io per spec §9.1.1.
+   Actor primitives (including §15.4.8.5–§15.4.8.7 link, monitor, demonitor; recv for runtime/surface parity),
+   pinning, removal, priority, and §22.10 CPU Affinity Functions
+   (get_cpu_topology, get_efficiency_cores, get_performance_cores, get_core_capabilities, etc.)
+   require concurrency per spec §22.4, §16.1, §15.2, and §22.10 (not pure). -}
+fn builtin_fn_effects(name: string) -> (boolean, List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) {
+    zero: { file: string, line: int64, column: int64, offset: int64 } <- parser_ast@zero_location();
+    dev_io: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "device_io", parameter: "", location: zero };
+    dev_io_list: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- parser_ast@cons_effect_name(dev_io, parser_ast@empty_effect_name_list());
+    conc: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "concurrency", parameter: "", location: zero };
+    conc_list: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- parser_ast@cons_effect_name(conc, parser_ast@empty_effect_name_list());
+    rwr: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "register_rwr", parameter: "", location: zero };
+    rwr_list: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- parser_ast@cons_effect_name(rwr, parser_ast@empty_effect_name_list());
+    conc_then_dev_io: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- parser_ast@cons_effect_name(conc, dev_io_list);
+    mem_normal: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "mem", parameter: "normal", location: zero };
+    mem_normal_list: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- parser_ast@cons_effect_name(mem_normal, parser_ast@empty_effect_name_list());
+    case name of {
+        "println" -> (true, dev_io_list);
+        "print_string_stderr" -> (true, dev_io_list);
+        "println_stderr" -> (true, dev_io_list);
+        "print" -> (true, dev_io_list);
+        "print_string" -> (true, dev_io_list);
+        "print_int64" -> (true, dev_io_list);
+        "print_int32" -> (true, dev_io_list);
+        "print_int16" -> (true, dev_io_list);
+        "print_int8" -> (true, dev_io_list);
+        "print_uint64" -> (true, dev_io_list);
+        "print_uint32" -> (true, dev_io_list);
+        "print_uint16" -> (true, dev_io_list);
+        "print_uint8" -> (true, dev_io_list);
+        "print_float64" -> (true, dev_io_list);
+        "print_float16" -> (true, dev_io_list);
+        "print_float32" -> (true, dev_io_list);
+        "print_boolean" -> (true, dev_io_list);
+        "print_char" -> (true, dev_io_list);
+        "print_atom" -> (true, dev_io_list);
+        "atom_bits" -> (true, parser_ast@empty_effect_name_list());
+        "actor_ref_bits" -> (true, parser_ast@empty_effect_name_list());
+        "actor_ref_of_word" -> (true, parser_ast@empty_effect_name_list());
+        "actor_ref_equal" -> (true, parser_ast@empty_effect_name_list());
+        "actor_ref_not_equal" -> (true, parser_ast@empty_effect_name_list());
+        "actor_id" -> (true, conc_list);
+        "read_lines" -> (true, dev_io_list);
+        "file_exists" -> (true, dev_io_list);
+        "append_file" -> (true, dev_io_list);
+        "delete_file" -> (true, dev_io_list);
+        "spawn" -> (true, conc_list);
+        "spawn_dangerous" -> (true, conc_list);
+        "spawn_dangerous_registered" -> (true, conc_list);
+        "spawn_device" -> (true, conc_list);
+        "spawn_device_registered" -> (true, conc_list);
+        "cast_device" -> (true, conc_list);
+        "cast_device_registered" -> (true, conc_list);
+        "map_device" -> (true, rwr_list);
+        "peek" -> (true, rwr_list);
+        "poke" -> (true, rwr_list);
+        "spawn_registered" -> (true, conc_list);
+        "spawn_registered_supervisor" -> (true, conc_list);
+        "spawn_linked" -> (true, conc_list);
+        "add_child" -> (true, conc_list);
+        "link" -> (true, conc_list);
+        "monitor" -> (true, conc_list);
+        "demonitor" -> (true, conc_list);
+        "supervision_ingress_enqueue" -> (true, conc_list);
+        "supervision_wait_and_drain_one" -> (true, conc_list);
+        "failure_reason_tag" -> (true, conc_list);
+        "failure_reason_atom" -> (true, conc_list);
+        "failure_agent_type" -> (true, conc_list);
+        "failure_release" -> (true, conc_list);
+        "kill_abnormal" -> (true, conc_list);
+        "stop_self" -> (true, conc_list);
+        "fail_self" -> (true, conc_list);
+        // Clocks and timers (spec §22.14): both read state outside the actor, so both need concurrency.
+        "monotonic_time" -> (true, conc_list);
+        "current_time" -> (true, conc_list);
+        "send_after" -> (true, conc_list);
+        "cancel_timer" -> (true, conc_list);
+        "wait_for_exit" -> (true, conc_then_dev_io);
+        "cast_exit" -> (true, conc_list);
+        // heap_used reads the allocator's bookkeeping: a memory effect, not a concurrency one.
+        "heap_used" -> (true, mem_normal_list);
+        // actor_carrier_index observes an actor's placement: a concurrency operation (test-only).
+        "actor_carrier_index" -> (true, conc_list);
+        "call" -> (true, conc_list);
+        "call_registered" -> (true, conc_list);
+        "cast" -> (true, conc_list);
+        "cast_registered" -> (true, conc_list);
+        "cast_dangerous_registered" -> (true, conc_list);
+        "send" -> (true, conc_list);
+        "self" -> (true, conc_list);
+        // §22.4: observing an actor's stack is a concurrency operation.
+        "get_actor_memory_usage" -> (true, conc_list);
+        "recv" -> (true, conc_list);
+        "pin_actor_to_core" -> (true, conc_list);
+        "pin_actor_to_efficiency_core" -> (true, conc_list);
+        "pin_actor_to_performance_core" -> (true, conc_list);
+        "pin_actor_realtime" -> (true, conc_list);
+        "unpin_actor" -> (true, conc_list);
+        "remove_actor" -> (true, conc_list);
+        "register_actor" -> (true, conc_list);
+        "get_registry_actor" -> (true, conc_list);
+        "get_pid_registry" -> (true, conc_list);
+        "set_actor_priority" -> (true, conc_list);
+        "migrate_actor" -> (true, conc_list);
+        "set_scheduler_policy" -> (true, conc_list);
+        "pin_actor_to_numa_node" -> (true, conc_list);
+        "get_cpu_topology" -> (true, conc_list);
+        "get_efficiency_cores" -> (true, conc_list);
+        "get_performance_cores" -> (true, conc_list);
+        "get_core_capabilities" -> (true, conc_list);
+        _: string -> (false, parser_ast@empty_effect_name_list())
+    }
+}

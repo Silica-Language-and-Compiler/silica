@@ -1,0 +1,90 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Hand-written x86-64 (Intel syntax) translation of the linux_aarch64 helper of the same name.
+// Internal convention: arguments X0.. in rdi rsi rdx rcx r8 r9, result X0 in rdi (W0 in edi); a
+// helper may clobber any register except rbp/rsp (rbp comes back as it went in).
+
+// String substring and substring_until_char helpers: non-MTE fallback for Apple Silicon (macOS ARM64).
+// Per silica-specification §21.3: software-based bounds checking when MTE unavailable.
+//
+// L_substring_helper: X0 = ptr (literal or SilicaString), X1 = start_char (int64), X2 = end_char (int64).
+// X8 = UTF-8 payload base (rodata or heap data ptr). Character-based indices.
+// Returns X0 = ptr to substring [start_char, end_char). Clamps to valid range.
+//
+// Empty and 1-byte results are interned (no allocation). Longer results are a block of the CALLER's
+// frame (chunk 15 phase 2): L_dyn_alloc runs with rbp set to the calling function's frame ([rbp] of
+// this helper's), and this helper's own saved registers and return address, which are transient
+// pushes of the caller, move down with the allocation, so the helper's rbp is moved by the same
+// amount; L_str_forget drops the new block's address from the caches (a frame address is reused).
+// The caches and the lock are process-wide (silica_ss_cache: ascii key/flag +0/+8, key2/flag2 +16/+24,
+// victim +32, cached length +40, cursor key/char/byte +48/+56/+64; silica_ss_lock).
+// C-string length and an ASCII classification are cached per source pointer, in
+// two entries (ascii key/flag and key2/flag2, filled in turn): a scan that peeks
+// one character of a haystack and then one of a needle, as the emitter's find_str_at does, hit
+// a one-entry cache on neither string and reclassified the whole haystack per character (O(n^2)
+// per scan; registry_many_names took 883 s to emit).
+// A file with any UTF-8 (type_interner comments contain § — →) cannot use the ASCII fast path;
+// sequential peeks then store an exclusive (char,byte) cursor so the next substring resumes
+// there instead of walking from byte 0 (O(n²) lex hang). A backward step (L_ss_bwd) skips 80-BF
+// bytes to the previous lead and accepts it only when that lead's forward length (the split
+// L_ss_find_start uses) lands on the old position and no lead in the three bytes before it
+// reaches it; ill-formed UTF-8, where the two splits can differ,
+// restarts from byte 0 (before this check the cursor drifted and the lexer never reached the end).
+//
+// L_substring_until_char_helper: X0 = ptr, X1 = start (int64), X2 = encoded char (len<<56|packed).
+// Returns X0 = ptr to substring from start until (exclusive) first occurrence of char, or rest of string.
+// Full UTF-8 code-point matching: len=1..4 bytes, packed=byte0|(byte1<<8)|(byte2<<16)|(byte3<<24).
+//
+// Target: Linux x86-64. Register map in both helpers: X19-X23 -> rbx r12 r13 r14 r15, X8 -> r8,
+// X9/X10 -> r10/r11, X11 -> rax, X12 -> rcx, X13 -> r8 (once the base is consumed), X14 -> r9,
+// X15 -> rdx (W15 -> edx), X17 -> rcx, X18 -> rdi, X1/X2 address temps -> rsi/rdx.
+
+export emit_string_substring_helper/0;
+export emit_string_substring_until_char_helper/0;
+
+fn ss_helper_resolve() -> string {
+    "L_substring_helper:\n    push rbp\n    mov rbp, rsp\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    sub rsp, 8\n    mov rbx, rdi\n    mov r12, rsi\n    mov r13, rdx\n    xor eax, eax\n    cmp r12, 0\n    cmovl r12, rax\n    cmp r13, 0\n    cmovl r13, rax\n    mov r11, QWORD PTR [rbx]\n    not r11\n    cmp r11, 1\n    ja L_ss_bad\n    mov r8, QWORD PTR [rbx + 8]\n    mov r14, QWORD PTR [rbx + 16]\n    jmp L_ss_have_base\nL_ss_bad:\n    ud2\nL_ss_have_base:\n    cmp r12, r13\n    jge L_ss_empty\nL_ss_lk_cls_spin:\n    mov edx, 1\n    xchg DWORD PTR [rip + silica_ss_lock], edx\n    test edx, edx\n    jz L_ss_lk_cls_held\n    pause\n    jmp L_ss_lk_cls_spin\nL_ss_lk_cls_held:\n    mov rax, QWORD PTR [rip + silica_ss_cache]\n    mov rsi, QWORD PTR [rip + silica_ss_cache + 8]\n    mov r10, QWORD PTR [rip + silica_ss_cache + 16]\n    mov r11, QWORD PTR [rip + silica_ss_cache + 24]\n    mov DWORD PTR [rip + silica_ss_lock], 0\n    cmp rax, rbx\n    je L_ss_ascii_hit\n    mov rsi, r11\n    cmp r10, rbx\n    jne L_ss_ascii_classify\nL_ss_ascii_hit:\n    test rsi, rsi\n    jnz L_ss_ascii_fast\n    jmp L_ss_utf8_slow\nL_ss_ascii_classify:\n    xor r10d, r10d\n    mov r9d, 1\n    xor ecx, ecx\nL_ss_cls:\n    cmp r10, r14\n    jge L_ss_cls_done\n    movzx r11d, BYTE PTR [r8 + r10]\n    cmp r11d, 0x80\n    cmovae r9, rcx\n    add r10, 1\n    jmp L_ss_cls\nL_ss_cls_done:\nL_ss_lk_clw_spin:\n    mov edx, 1\n    xchg DWORD PTR [rip + silica_ss_lock], edx\n    test edx, edx\n    jz L_ss_lk_clw_held\n    pause\n    jmp L_ss_lk_clw_spin\nL_ss_lk_clw_held:\n    mov rax, QWORD PTR [rip + silica_ss_cache + 32]\n    lea rsi, [rip + silica_ss_cache]\n    shl rax, 4\n    add rsi, rax\n    mov QWORD PTR [rsi], rbx\n    mov QWORD PTR [rsi + 8], r9\n    shr rax, 4\n    xor rax, 1\n    mov QWORD PTR [rip + silica_ss_cache + 32], rax\n    lea rsi, [rip + silica_ss_cache + 40]\n    mov QWORD PTR [rsi], r14\n    mov DWORD PTR [rip + silica_ss_lock], 0\n    test r9, r9\n    jnz L_ss_ascii_fast\n    jmp L_ss_utf8_slow\nL_ss_ascii_fast:\n    mov r15, r12\n    cmp r12, r14\n    cmova r15, r14\n    mov r10, r13\n    cmp r13, r14\n    cmova r10, r14\n    cmp r15, r10\n    cmova r15, r10\n    mov rax, r10\n    sub rax, r15\n    jmp L_ss_materialize\n"
+}
+
+fn ss_helper_utf8_scan() -> string {
+    "L_ss_utf8_slow:\nL_ss_lk_cur_spin:\n    mov edx, 1\n    xchg DWORD PTR [rip + silica_ss_lock], edx\n    test edx, edx\n    jz L_ss_lk_cur_held\n    pause\n    jmp L_ss_lk_cur_spin\nL_ss_lk_cur_held:\n    mov rax, QWORD PTR [rip + silica_ss_cache + 48]\n    mov r9, QWORD PTR [rip + silica_ss_cache + 56]\n    mov r10, QWORD PTR [rip + silica_ss_cache + 64]\n    mov DWORD PTR [rip + silica_ss_lock], 0\n    cmp rax, rbx\n    jne L_ss_from_zero\n    cmp r10, r14\n    cmova r10, r14\n    cmp r12, r9\n    jb L_ss_bwd\n    jmp L_ss_find_start\nL_ss_from_zero:\n    xor r10d, r10d\n    xor r9d, r9d\n    jmp L_ss_find_start\nL_ss_bwd:\n    cmp r9, r12\n    jle L_ss_start_found\n    test r10, r10\n    jz L_ss_start_found\n    mov rdi, r10\n    sub r10, 1\nL_ss_bwd_cont:\n    movzx r11d, BYTE PTR [r8 + r10]\n    mov eax, r11d\n    shr eax, 6\n    cmp eax, 2\n    jne L_ss_bwd_lead\n    test r10, r10\n    jz L_ss_bwd_lead\n    sub r10, 1\n    jmp L_ss_bwd_cont\nL_ss_bwd_lead:\n    mov ecx, 1\n    cmp r11d, 0xC2\n    jb L_ss_bwd_len\n    mov ecx, 2\n    cmp r11d, 0xE0\n    jb L_ss_bwd_len\n    mov ecx, 3\n    cmp r11d, 0xF0\n    jb L_ss_bwd_len\n    mov ecx, 4\n    cmp r11d, 0xF8\n    jb L_ss_bwd_len\n    mov ecx, 1\nL_ss_bwd_len:\n    add rcx, r10\n    cmp rcx, r14\n    cmova rcx, r14\n    cmp rcx, rdi\n    jne L_ss_from_zero\n    test r10, r10\n    jz L_ss_bwd_ok\n    lea rdi, [r10 - 1]\n    movzx r11d, BYTE PTR [r8 + rdi]\n    cmp r11d, 0xC2\n    jb L_ss_bwd_p2\n    cmp r11d, 0xF8\n    jb L_ss_from_zero\nL_ss_bwd_p2:\n    test rdi, rdi\n    jz L_ss_bwd_ok\n    sub rdi, 1\n    movzx r11d, BYTE PTR [r8 + rdi]\n    cmp r11d, 0xE0\n    jb L_ss_bwd_p3\n    cmp r11d, 0xF8\n    jb L_ss_from_zero\nL_ss_bwd_p3:\n    test rdi, rdi\n    jz L_ss_bwd_ok\n    sub rdi, 1\n    movzx r11d, BYTE PTR [r8 + rdi]\n    cmp r11d, 0xF0\n    jb L_ss_bwd_ok\n    cmp r11d, 0xF8\n    jb L_ss_from_zero\nL_ss_bwd_ok:\n    sub r9, 1\n    jmp L_ss_bwd\nL_ss_find_start:\n    cmp r9, r12\n    jge L_ss_start_found\n    cmp r10, r14\n    jge L_ss_start_found\n    movzx r11d, BYTE PTR [r8 + r10]\n    cmp r11d, 0x80\n    jb L_ss_adv1\n    cmp r11d, 0xC2\n    jb L_ss_adv1\n    cmp r11d, 0xE0\n    jb L_ss_adv2\n    cmp r11d, 0xF0\n    jb L_ss_adv3\n    cmp r11d, 0xF8\n    jb L_ss_adv4\nL_ss_adv1:\n    add r10, 1\n    add r9, 1\n    jmp L_ss_find_start\nL_ss_adv2:\n    mov rdi, r14\n    sub rdi, r10\n    mov ecx, 2\n    cmp rdi, 2\n    cmovb rcx, rdi\n    add r10, rcx\n    add r9, 1\n    jmp L_ss_find_start\nL_ss_adv3:\n    mov rdi, r14\n    sub rdi, r10\n    mov ecx, 3\n    cmp rdi, 3\n    cmovb rcx, rdi\n    add r10, rcx\n    add r9, 1\n    jmp L_ss_find_start\nL_ss_adv4:\n    mov rdi, r14\n    sub rdi, r10\n    mov ecx, 4\n    cmp rdi, 4\n    cmovb rcx, rdi\n    add r10, rcx\n    add r9, 1\n    jmp L_ss_find_start\nL_ss_start_found:\n    mov r15, r10\nL_ss_find_end:\n    cmp r9, r13\n    jge L_ss_end_found\n    cmp r10, r14\n    jge L_ss_end_found\n    movzx r11d, BYTE PTR [r8 + r10]\n    cmp r11d, 0x80\n    jb L_ss_eadv1\n    cmp r11d, 0xC2\n    jb L_ss_eadv1\n    cmp r11d, 0xE0\n    jb L_ss_eadv2\n    cmp r11d, 0xF0\n    jb L_ss_eadv3\n    cmp r11d, 0xF8\n    jb L_ss_eadv4\nL_ss_eadv1:\n    add r10, 1\n    add r9, 1\n    jmp L_ss_find_end\nL_ss_eadv2:\n    mov rdi, r14\n    sub rdi, r10\n    mov ecx, 2\n    cmp rdi, 2\n    cmovb rcx, rdi\n    add r10, rcx\n    add r9, 1\n    jmp L_ss_find_end\nL_ss_eadv3:\n    mov rdi, r14\n    sub rdi, r10\n    mov ecx, 3\n    cmp rdi, 3\n    cmovb rcx, rdi\n    add r10, rcx\n    add r9, 1\n    jmp L_ss_find_end\nL_ss_eadv4:\n    mov rdi, r14\n    sub rdi, r10\n    mov ecx, 4\n    cmp rdi, 4\n    cmovb rcx, rdi\n    add r10, rcx\n    add r9, 1\n    jmp L_ss_find_end\nL_ss_end_found:\n    cmp r15, r14\n    cmovg r15, r14\n    cmp r10, r15\n    cmovb r10, r15\n    cmp r10, r14\n    cmovg r10, r14\n    mov rax, r10\n    sub rax, r15\nL_ss_lk_cuw_spin:\n    mov edx, 1\n    xchg DWORD PTR [rip + silica_ss_lock], edx\n    test edx, edx\n    jz L_ss_lk_cuw_held\n    pause\n    jmp L_ss_lk_cuw_spin\nL_ss_lk_cuw_held:\n    lea rsi, [rip + silica_ss_cache + 48]\n    mov QWORD PTR [rsi], rbx\n    lea rsi, [rip + silica_ss_cache + 56]\n    mov QWORD PTR [rsi], r9\n    lea rsi, [rip + silica_ss_cache + 64]\n    mov QWORD PTR [rsi], r10\n    mov DWORD PTR [rip + silica_ss_lock], 0\n    jmp L_ss_materialize\n"
+}
+
+fn ss_helper_materialize() -> string {
+    "L_ss_materialize:\n    test rax, rax\n    jz L_ss_empty\n    cmp rax, 1\n    jne L_ss_heap\n    movzx r8d, BYTE PTR [r8 + r15]\nL_ss_lk_one_spin:\n    mov edx, 1\n    xchg DWORD PTR [rip + silica_ss_lock], edx\n    test edx, edx\n    jz L_ss_lk_one_held\n    pause\n    jmp L_ss_lk_one_spin\nL_ss_lk_one_held:\n    lea rdi, [rip + L_ss_1char_ready]\n    mov rsi, QWORD PTR [rdi]\n    test rsi, rsi\n    jnz L_ss_1char_ok\n    lea rdx, [rip + L_ss_1char_table]\n    xor ecx, ecx\n    mov r9, -1\nL_ss_1char_init:\n    mov QWORD PTR [rdx], r9\n    lea r10, [rdx + 24]\n    mov QWORD PTR [rdx + 8], r10\n    mov r11d, 1\n    mov QWORD PTR [rdx + 16], r11\n    mov BYTE PTR [rdx + 24], cl\n    mov BYTE PTR [rdx + 25], 0\n    add rdx, 32\n    add rcx, 1\n    cmp rcx, 256\n    jb L_ss_1char_init\n    mov esi, 1\n    mov QWORD PTR [rdi], rsi\nL_ss_1char_ok:\n    mov DWORD PTR [rip + silica_ss_lock], 0\n    lea rdi, [rip + L_ss_1char_table]\n    shl r8, 5\n    add rdi, r8\n    jmp L_ss_ret\nL_ss_empty:\n    lea rdi, [rip + L_ss_empty_str]\n    jmp L_ss_ret\nL_ss_heap:\n    mov r9, rax\n    lea rax, [rax + 40]\n    and rax, -16\n    mov r10, rax\n    mov r11, rbp\n    mov rbp, QWORD PTR [rbp]\n    call L_dyn_alloc\n    sub r11, r10\n    mov rbp, r11\n    mov rdx, rax\n    mov r10, rdx\n    call L_str_forget\n    mov rax, r9\n    mov r10, -1\n    mov QWORD PTR [rdx], r10\n    lea r10, [rdx + 24]\n    mov QWORD PTR [rdx + 8], r10\n    mov QWORD PTR [rdx + 16], rax\n    lea r11, [r8 + r15]\n    mov rcx, rax\nL_ss_cp:\n    test rcx, rcx\n    jz L_ss_cp_done\n    movzx r8d, BYTE PTR [r11]\n    mov BYTE PTR [r10], r8b\n    add r10, 1\n    add r11, 1\n    sub rcx, 1\n    jmp L_ss_cp\nL_ss_cp_done:\n    mov BYTE PTR [r10], 0\n    mov rdi, rdx\nL_ss_ret:\n    add rsp, 8\n    pop r15\n    pop r14\n    pop r13\n    pop r12\n    pop rbx\n    pop rbp\n    ret\n"
+}
+
+fn ss_helper_bump_data() -> string {
+    "    .comm silica_ss_cache, 80, 16\n    .comm silica_ss_lock, 8, 8\n    .bss\n    .p2align 3\nL_ss_1char_ready:\n    .space 8\nL_ss_1char_table:\n    .space 8192\n    .data\n    .p2align 3\nL_ss_empty_str:\n    .quad -1\n    .quad L_ss_empty_bytes\n    .quad 0\nL_ss_empty_bytes:\n    .byte 0\n    .text\n    .p2align 2\n"
+}
+
+fn emit_string_substring_helper() -> string {
+    concat(concat(ss_helper_resolve(), ss_helper_utf8_scan()), concat(ss_helper_materialize(), ss_helper_bump_data()))
+}
+
+fn suc_helper_scan() -> string {
+    concat("L_substring_until_char_helper:\n    push rbp\n    mov rbp, rsp\n    push rbx\n    push r12\n    push r13\n    push r14\n    push r15\n    sub rsp, 8\n    mov rbx, rdi\n    mov r12, rsi\n    mov r13, rdx\n    mov r9, r13\n    shr r9, 56\n    mov edx, r13d\n    mov ecx, 1\n    cmp r9, 0\n    cmove r9, rcx\n    mov r10, QWORD PTR [rbx]\n    not r10\n    cmp r10, 1\n    ja L_suc_bad\n    mov r14, QWORD PTR [rbx + 16]\n    mov rbx, QWORD PTR [rbx + 8]\nL_suc_len_done:\n    xor eax, eax\n    cmp r12, 0\n    cmovl r12, rax\n    cmp r12, r14\n    cmovg r12, r14\n    mov r15, r12\n    lea r10, [rbx + r12]\nL_suc_scan:\n    cmp r12, r14\n    jge L_suc_scan_done\n    movzx r11d, BYTE PTR [r10]\n    lea rcx, [r12 + r9]\n    cmp rcx, r14\n    jg L_suc_no_match\n    cmp r9, 1\n    je L_suc_cmp1\n    cmp r9, 2\n    je L_suc_cmp2\n    cmp r9, 3\n    je L_suc_cmp3\n    mov r8d, DWORD PTR [r10]\n    cmp r8d, edx\n    je L_suc_scan_done\n    jmp L_suc_no_match\nL_suc_cmp1:\n    movzx r8d, BYTE PTR [r10]\n    movzx eax, dl\n    cmp r8d, eax\n    je L_suc_scan_done\n    jmp L_suc_no_match\nL_suc_cmp2:\n    movzx r8d, WORD PTR [r10]\n    movzx eax, dx\n    cmp r8d, eax\n    je L_suc_scan_done\n    jmp L_suc_no_match\nL_suc_cmp3:\n    mov r8d, DWORD PTR [r10]\n    and r8d, 0xFFFFFF\n    mov eax, edx\n    and eax, 0xFFFFFF\n    cmp r8d, eax\n    je L_suc_scan_done\nL_suc_no_match:\n    cmp r11d, 0x80\n    jb L_suc_adv1\n    cmp r11d, 0xC2\n    jb L_suc_adv1\n", "    cmp r11d, 0xE0\n    jb L_suc_adv2\n    cmp r11d, 0xF0\n    jb L_suc_adv3\n    cmp r11d, 0xF8\n    jb L_suc_adv4\nL_suc_adv1:\n    add r10, 1\n    add r12, 1\n    jmp L_suc_scan\nL_suc_adv2:\n    mov rdi, r14\n    sub rdi, r12\n    mov ecx, 2\n    cmp rdi, 2\n    cmovb rcx, rdi\n    add r10, rcx\n    add r12, rcx\n    jmp L_suc_scan\nL_suc_adv3:\n    mov rdi, r14\n    sub rdi, r12\n    mov ecx, 3\n    cmp rdi, 3\n    cmovb rcx, rdi\n    add r10, rcx\n    add r12, rcx\n    jmp L_suc_scan\nL_suc_adv4:\n    mov rdi, r14\n    sub rdi, r12\n    mov ecx, 4\n    cmp rdi, 4\n    cmovb rcx, rdi\n    add r10, rcx\n    add r12, rcx\n    jmp L_suc_scan\n")
+}
+
+fn suc_helper_materialize() -> string {
+    "L_suc_scan_done:\n    mov rax, r12\n    sub rax, r15\n    test rax, rax\n    jz L_suc_empty\n    lea r11, [rbx + r15]\n    mov r9, rax\n    lea rax, [rax + 40]\n    and rax, -16\n    mov r10, rax\n    mov rcx, rbp\n    mov rbp, QWORD PTR [rbp]\n    call L_dyn_alloc\n    sub rcx, r10\n    mov rbp, rcx\n    mov r15, rax\n    mov r10, r15\n    call L_str_forget\n    mov rax, r9\n    mov r10, -1\n    mov QWORD PTR [r15], r10\n    lea r10, [r15 + 24]\n    mov QWORD PTR [r15 + 8], r10\n    mov QWORD PTR [r15 + 16], rax\n    mov rcx, rax\nL_suc_cp:\n    test rcx, rcx\n    jz L_suc_cp_done\n    movzx r8d, BYTE PTR [r11]\n    mov BYTE PTR [r10], r8b\n    add r10, 1\n    add r11, 1\n    sub rcx, 1\n    jmp L_suc_cp\nL_suc_cp_done:\n    mov BYTE PTR [r10], 0\n    mov rdi, r15\n    jmp L_suc_ret\nL_suc_empty:\n    lea rdi, [rip + L_suc_empty_str]\nL_suc_ret:\n    add rsp, 8\n    pop r15\n    pop r14\n    pop r13\n    pop r12\n    pop rbx\n    pop rbp\n    ret\n    .bss\n    .p2align 3\n    .data\n    .p2align 3\nL_suc_empty_str:\n    .quad -1\n    .quad L_suc_empty_bytes\n    .quad 0\nL_suc_empty_bytes:\n    .byte 0\n    .text\n    .p2align 2\n\nL_suc_bad:\n    ud2"
+}
+
+fn emit_string_substring_until_char_helper() -> string {
+    concat(suc_helper_scan(), suc_helper_materialize())
+}

@@ -1,0 +1,506 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Phase 8: lower foreign c_wrapper calls to direct AAPCS64 BL symbols; string in/out marshaling.
+
+use var;
+use emitter_effects;
+use reg_conventions;
+use atom_table;
+use ffi_foreign_runtime_asm;
+
+export encode_bindings_for_outer/1;
+export lookup_from_outer/2;
+export emit_extern_directives/1;
+export module_uses_foreign_calls/1;
+export emit_foreign_runtime_helpers/0;
+export emit_foreign_user_call/3;
+export foreign_call_sret_bytes/1;
+export emit_foreign_sret_setup/1;
+export emit_foreign_scratch_setup_string_in_only/0;
+export foreign_call_uses_heap_scratch/3;
+export needs_string_in_marshal/2;
+export emit_foreign_tail_call/4;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn binding_field_sep() -> string {
+    "~"
+}
+
+fn binding_entry_sep() -> string {
+    ";"
+}
+
+fn param_type_sep() -> string {
+    ","
+}
+
+// SIR stores param_types as "int64|int64", but outer_reg bindings use "|" as field delimiters.
+fn replace_pipe_with_comma_loop(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            next: string <- case ch == "|" of {
+                true -> ",";
+                false -> ch
+            };
+            replace_pipe_with_comma_loop(s, i + 1, concat(acc, next))
+        }
+    }
+}
+
+fn param_types_for_outer_encoding(param_types: string) -> string {
+    replace_pipe_with_comma_loop(param_types, 0, "")
+}
+
+fn encode_one_binding(b: { local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }) -> string {
+    pt_enc: string <- param_types_for_outer_encoding(b.param_types);
+    concat(
+        concat(
+            concat(
+                concat(b.local_name, binding_field_sep()),
+                b.c_symbol
+            ),
+            binding_field_sep()
+        ),
+        pt_enc
+    )
+}
+
+fn encode_bindings_loop(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], acc: string) -> string {
+    case bindings.is_nil of {
+        true -> acc;
+        false -> case length_bytes(acc) == 0 of {
+            true -> encode_bindings_loop(bindings.tail, encode_one_binding(bindings.head));
+            false -> encode_bindings_loop(bindings.tail, concat(concat(acc, binding_entry_sep()), encode_one_binding(bindings.head)))
+        }
+    }
+}
+
+fn encode_bindings_for_outer(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> string {
+    encode_bindings_loop(bindings, "")
+}
+
+fn find_field_sep(s: string, sep: string, start: int64) -> int64 {
+    case start >= length_bytes(s) of {
+        true -> -1;
+        false -> case length_bytes(sep) == 0 of {
+            true -> -1;
+            false -> case length_bytes(s) - start < length_bytes(sep) of {
+                true -> find_field_sep(s, sep, start + 1);
+                false -> case substring(s, start, start + length_bytes(sep)) == sep of {
+                    true -> start;
+                    false -> find_field_sep(s, sep, start + 1)
+                }
+            }
+        }
+    }
+}
+
+fn substring_to_end(s: string, start: int64) -> string {
+    case start >= length_bytes(s) of {
+        true -> "";
+        false -> substring(s, start, length_bytes(s))
+    }
+}
+
+fn parse_binding_entry(entry: string) -> (string, string, string, string) {
+    s1: int64 <- find_field_sep(entry, binding_field_sep(), 0);
+    case s1 < 0 of {
+        true -> ("", "", "", "");
+        false -> {
+            local: string <- substring(entry, 0, s1);
+            rest1: string <- substring_to_end(entry, s1 + length_bytes(binding_field_sep()));
+            s2: int64 <- find_field_sep(rest1, binding_field_sep(), 0);
+            case s2 < 0 of {
+                true -> ("", "", "", "");
+                false -> {
+                    c_sym: string <- substring(rest1, 0, s2);
+                    pt: string <- substring_to_end(rest1, s2 + length_bytes(binding_field_sep()));
+                    rt: string <- inferred_return_type_from_param_types(pt);
+                    (local, c_sym, pt, rt)
+                }
+            }
+        }
+    }
+}
+
+fn lookup_in_encoded(encoded: string, local_name: string) -> (boolean, string, string, string) {
+    case length_bytes(encoded) == 0 of {
+        true -> (false, "", "", "");
+        false -> {
+            sep_at: int64 <- find_field_sep(encoded, binding_entry_sep(), 0);
+            case sep_at < 0 of {
+                true -> {
+                    (ln: string, cs: string, pt: string, rt: string) <- parse_binding_entry(encoded);
+                    case ln == local_name of {
+                        true -> (true, cs, pt, rt);
+                        false -> (false, "", "", "")
+                    }
+                };
+                false -> {
+                    head: string <- substring(encoded, 0, sep_at);
+                    tail: string <- substring_to_end(encoded, sep_at + length_bytes(binding_entry_sep()));
+                    (ln: string, cs: string, pt: string, rt: string) <- parse_binding_entry(head);
+                    case ln == local_name of {
+                        true -> (true, cs, pt, rt);
+                        false -> lookup_in_encoded(tail, local_name)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn lookup_from_outer(outer_reg: string, local_name: string) -> (boolean, string, string, string) {
+    enc: string <- var@find_sp_binding(outer_reg, "_ffi");
+    lookup_in_encoded(enc, local_name)
+}
+
+fn mach_o_c_symbol(c_symbol: string) -> string {
+    concat("_", c_symbol)
+}
+
+fn emit_one_extern(c_symbol: string) -> string {
+    concat(concat(".extern ", mach_o_c_symbol(c_symbol)), "\n")
+}
+
+fn emit_extern_loop(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], acc: string) -> string {
+    case bindings.is_nil of {
+        true -> acc;
+        false -> emit_extern_loop(bindings.tail, concat(acc, emit_one_extern(bindings.head.c_symbol)))
+    }
+}
+
+fn emit_extern_directives(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> string {
+    guarded: string <- ".extern _silica_rt_ffi_guarded_enter\n.extern _silica_rt_ffi_guarded_exit\n.extern _silica_rt_ffi_guarded_setjmp\n.extern _silica_rt_ffi_guarded_fault_finish\n";
+    arena: string <- ".extern _silica_rt_ffi_arena_bump\n";
+    concat(concat(guarded, arena), emit_extern_loop(bindings, ""))
+}
+
+fn module_uses_foreign_calls(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> boolean {
+    case bindings.is_nil of {
+        true -> false;
+        false -> true
+    }
+}
+
+fn emit_foreign_runtime_helpers() -> string {
+    ffi_foreign_runtime_asm@emit_ffi_foreign_runtime_helpers()
+}
+
+fn param_types_are_ptr_len_pair(param_types: string) -> boolean {
+    sep: int64 <- find_field_sep(param_types, param_type_sep(), 0);
+    case sep < 0 of {
+        true -> false;
+        false -> {
+            p1: string <- substring(param_types, 0, sep);
+            p2: string <- substring_to_end(param_types, sep + length_bytes(param_type_sep()));
+            case find_field_sep(p2, param_type_sep(), 0) >= 0 of {
+                true -> false;
+                false -> p1 == "uint8" and p2 == "uint64"
+            }
+        }
+    }
+}
+
+fn type_text_contains_at(s: string, needle: string, i: int64, n: int64, m: int64) -> boolean {
+    case i + m > n of {
+        true -> false;
+        false -> case substring(s, i, i + m) == needle of {
+            true -> true;
+            false -> type_text_contains_at(s, needle, i + 1, n, m)
+        }
+    }
+}
+
+fn type_text_contains(s: string, needle: string) -> boolean {
+    m: int64 <- length_bytes(needle);
+    n: int64 <- length_bytes(s);
+    case m == 0 of {
+        true -> true;
+        false -> type_text_contains_at(s, needle, 0, n, m)
+    }
+}
+
+fn inferred_return_type_from_param_types(param_types: string) -> string {
+    case param_types_are_ptr_len_pair(param_types) of {
+        true -> "ptr_len_struct";
+        false -> "int64"
+    }
+}
+
+fn return_type_has_ptr_len_out_fields(return_type: string) -> boolean {
+    case return_type == "ptr_len_struct" of {
+        true -> true;
+        false -> case type_text_contains(return_type, "text_ptr") of {
+            true -> type_text_contains(return_type, "text_len");
+            false -> case type_text_contains(return_type, "_ptr") of {
+                true -> type_text_contains(return_type, "_len");
+                false -> false
+            }
+        }
+    }
+}
+
+fn foreign_return_uses_sret(return_type: string) -> boolean {
+    reg_conventions@is_aggregate_struct_or_tuple_return_type(return_type)
+}
+
+fn needs_string_in_marshal(param_types: string, arg1_type: string) -> boolean {
+    param_types_are_ptr_len_pair(param_types) and arg1_type == "string"
+}
+
+fn needs_string_out_unmarshal(return_type: string, expected_type: string) -> boolean {
+    expected_type == "string" and return_type_has_ptr_len_out_fields(return_type)
+}
+
+fn foreign_call_expects_string(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, return_type: string, outer_reg: string) -> boolean {
+    fn_ret: string <- var@find_sp_binding(outer_reg, "_fnret");
+    case needs_string_out_unmarshal(return_type, sir_term_root_node(term).type_name) of {
+        true -> true;
+        false -> needs_string_out_unmarshal(return_type, fn_ret)
+    }
+}
+
+fn emit_foreign_bl_line(c_symbol: string) -> string {
+    concat(concat("    BL ", mach_o_c_symbol(c_symbol)), "\n")
+}
+
+fn emit_guarded_preserver_save() -> string {
+    "    SUB SP, SP, #80\n    STP X0, X1, [SP, #0]\n    STP X2, X3, [SP, #16]\n    STP X4, X5, [SP, #32]\n    STP X6, X7, [SP, #48]\n    STR X8, [SP, #64]\n"
+}
+
+fn emit_guarded_preserver_restore_args() -> string {
+    "    LDR X8, [SP, #64]\n    LDP X6, X7, [SP, #48]\n    LDP X4, X5, [SP, #32]\n    LDP X2, X3, [SP, #16]\n    LDP X0, X1, [SP, #0]\n"
+}
+
+fn emit_guarded_preserver_restore_result() -> string {
+    "    LDR X0, [SP, #0]\n    ADD SP, SP, #80\n"
+}
+
+fn emit_guarded_foreign_call_lines(c_symbol: string) -> string {
+    save: string <- emit_guarded_preserver_save();
+    enter_line: string <- "    BL _silica_rt_ffi_guarded_enter\n";
+    setjmp_line: string <- "    BL _silica_rt_ffi_guarded_setjmp\n    CBNZ X0, 1f\n";
+    restore_args: string <- emit_guarded_preserver_restore_args();
+    call_line: string <- emit_foreign_bl_line(c_symbol);
+    stash_result: string <- "    STR X0, [SP, #0]\n";
+    exit_line: string <- "    BL _silica_rt_ffi_guarded_exit\n";
+    restore_result: string <- emit_guarded_preserver_restore_result();
+    skip_fault: string <- "    B 2f\n";
+    fault_line: string <- "1:\n    BL _silica_rt_ffi_guarded_fault_finish\n2:\n";
+    part1: string <- concat(save, enter_line);
+    part2: string <- concat(setjmp_line, restore_args);
+    part3: string <- concat(call_line, stash_result);
+    part4: string <- concat(exit_line, restore_result);
+    part5: string <- concat(concat(part4, skip_fault), fault_line);
+    concat(concat(part1, part2), concat(part3, part5))
+}
+
+fn emit_result_mov(dest: string) -> string {
+    case dest == "X0" or dest == "W0" or dest == "D0" or dest == "S0" or dest == "H0" of {
+        true -> "";
+        false -> case length_bytes(dest) > 0 of {
+            true -> {
+                prefix: string <- substring(dest, 0, 1);
+                src: string <- case prefix == "D" or prefix == "S" or prefix == "H" of {
+                    true -> concat(prefix, "0");
+                    false -> case prefix == "W" of {
+                        true -> "W0";
+                        false -> "X0"
+                    }
+                };
+                op: string <- case prefix == "D" or prefix == "S" or prefix == "H" of {
+                    true -> "FMOV";
+                    false -> "MOV"
+                };
+                concat(concat(concat(concat("\n    ", op), " "), dest), concat(", ", src))
+            };
+            false -> ""
+        }
+    }
+}
+
+fn emit_string_in_marshal() -> string {
+    // Copies Silica string into the per-actor FFI arena (X0=ptr, X1=len, X2=0).
+    "    BL _silica_rt_ffi_string_in\n"
+}
+
+fn emit_string_in_cleanup() -> string {
+    ""
+}
+
+fn emit_string_out_unmarshal_heap() -> string {
+    // sret struct lives in the FFI arena at scratch[+0]. Helper copies C bytes into a Silica
+    // string handle and leaves arena/sret storage for the next guarded-call reset.
+    "    LDR X0, [SP, #0]\n    BL _silica_rt_ffi_string_out_and_free\n    STR X0, [SP, #16]\n    STR XZR, [SP, #0]\n"
+}
+
+// Returns true when this FFI call needs the 32-byte scratch frame (string and/or sret).
+fn foreign_call_uses_heap_scratch(param_types: string, return_type: string, arg1_type: string) -> boolean {
+    needs_string_in_marshal(param_types, arg1_type) or (foreign_call_sret_bytes(return_type) > 0)
+}
+
+fn emit_foreign_user_call(
+    term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
+    dest: string,
+    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string }
+) -> string {
+    pre_barrier: string <- emitter_effects@barrier_before_call(ctx.call_effects);
+    post_barrier: string <- emitter_effects@barrier_after_call(ctx.call_effects);
+    eff_comment: string <- emitter_effects@effect_annotation(ctx.call_effects);
+    expects_string_out: boolean <- foreign_call_expects_string(term, ctx.return_type, ctx.outer_reg);
+    uses_heap: boolean <- foreign_call_uses_heap_scratch(ctx.param_types, ctx.return_type, ctx.arg1_type);
+    string_in: string <- case needs_string_in_marshal(ctx.param_types, ctx.arg1_type) of {
+        true -> emit_string_in_marshal();
+        false -> ""
+    };
+    // After string_in (which BLs into a runtime helper), X8 may have been clobbered.
+    // Reload from the heap-alloc'd sret pointer stored at scratch[+0].
+    reload_x8: string <- case ctx.sret_bytes > 0 of {
+        true -> "    LDR X8, [SP, #0]\n";
+        false -> ""
+    };
+    bl: string <- emit_guarded_foreign_call_lines(ctx.c_symbol);
+    string_out: string <- case expects_string_out of {
+        true -> emit_string_out_unmarshal_heap();
+        false -> ""
+    };
+    // Load result (string handle) back into X0 before the destination move. For non-string
+    // returns the C call leaves the result in X0 already.
+    load_result: string <- case expects_string_out of {
+        true -> "    LDR X0, [SP, #16]\n";
+        false -> ""
+    };
+    sret_cleanup: string <- case uses_heap of {
+        true -> "    ADD SP, SP, #32\n";
+        false -> ""
+    };
+    result_mov: string <- emit_result_mov(dest);
+    with_comment: string <- case length_bytes(eff_comment) > 0 of {
+        true -> concat(eff_comment, "\n");
+        false -> ""
+    };
+    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
+        true -> concat(with_comment, concat(pre_barrier, "\n"));
+        false -> with_comment
+    };
+    // sret_setup was emitted by the caller (emit_generic_user_call_asm_inner) before args_asm,
+    // matching the non-FFI path; do not re-emit here.
+    _: string <- ctx.sret_setup;
+    body: string <- concat(concat(concat(concat(concat(string_in, reload_x8), bl), string_out), load_result), concat(sret_cleanup, result_mov));
+    concat(concat(with_pre, body), concat("\n", post_barrier))
+}
+
+fn foreign_call_sret_bytes(return_type: string) -> int64 {
+    case return_type == "ptr_len_struct" of {
+        true -> 32;
+        false -> case return_type_has_ptr_len_out_fields(return_type) of {
+            true -> 32;
+            false -> case foreign_return_uses_sret(return_type) of {
+                true -> 32;
+                false -> 0
+            }
+        }
+    }
+}
+
+// Pre-call setup: reserves a 32-byte scratch frame and, when sret_bytes > 0, bumps 32 bytes
+// from the per-actor FFI arena and stores the pointer at scratch[+0].
+// Scratch layout:
+//   [SP+0]  = sret arena ptr (0 when no sret)
+//   [SP+8]  = reserved
+//   [SP+16] = result Silica string handle (filled in by string-out helper)
+//   [SP+24] = padding (reserved for keeping 16-byte alignment)
+fn emit_foreign_sret_setup(sret_bytes: int64) -> string {
+    case sret_bytes > 0 of {
+        true -> "    SUB SP, SP, #32\n    STR XZR, [SP, #8]\n    STR XZR, [SP, #16]\n    STR XZR, [SP, #24]\n    MOV X0, #32\n    BL _silica_rt_ffi_arena_bump\n    STR X0, [SP, #0]\n    MOV X8, X0\n";
+        false -> ""
+    }
+}
+
+// Variant for the string-in/scalar-out case (no sret): reserves the scratch frame.
+fn emit_foreign_scratch_setup_string_in_only() -> string {
+    "    SUB SP, SP, #32\n    STR XZR, [SP, #0]\n    STR XZR, [SP, #8]\n    STR XZR, [SP, #16]\n    STR XZR, [SP, #24]\n"
+}
+
+fn emit_foreign_tail_call(c_symbol: string, call_effects: string, fn_effects: string, frame_release: string) -> string {
+    pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
+    eff_comment: string <- emitter_effects@effect_annotation(call_effects);
+    bl: string <- emit_guarded_foreign_call_lines(c_symbol);
+    // BL returns from C; unlike Silica tail BR, we must RET to our caller (kind-5 epilogue is omitted).
+    ret_line: string <- "    RET\n";
+    with_comment: string <- case length_bytes(eff_comment) > 0 of {
+        true -> concat(eff_comment, "\n");
+        false -> ""
+    };
+    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
+        true -> concat(with_comment, concat(pre_barrier, concat("\n", frame_release)));
+        false -> concat(with_comment, frame_release)
+    };
+    concat(concat(with_pre, bl), ret_line)
+}

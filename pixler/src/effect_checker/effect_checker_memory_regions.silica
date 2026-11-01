@@ -1,0 +1,294 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+{- Memory region effect support for the effect checker.
+   Extracts mem(Space) effects from region operations: alloc_region, alloc_ref,
+   alloc_buf, read_ref, write_ref, read_buf, write_buf,
+   buf_load, buf_store, alloc_rec, build, alloc_region_on_numa_node.
+   Implements spec §4.4 (region types), §9.1.1 (mem effects), §9.3.1 (effect propagation),
+   §17.1.2 (alloc_ref/alloc_buf/alloc_rec into atomic space: mem(atomic)+atomic), §22.1-22.3 (region/buffer ops).
+   Space extraction from type strings (no dependency on type_checker_memory_regions).
+-}
+
+use parser_ast;
+
+export is_region_builtin_fn/1;
+export get_region_call_effects/5;
+export extract_space_from_region_type/1;
+
+// Valid memory spaces per spec §4.4.1, §9.1.1
+fn is_valid_memory_space(space: string) -> boolean {
+    space == "normal" or space == "normal_writeback" or space == "normal_writethrough" or space == "normal_noncacheable" or space == "atomic" or space == "device"
+}
+
+// Trim leading/trailing whitespace
+fn trim_space(s: string) -> string {
+    trim_space_from(s, 0, length_bytes(s) - 1)
+}
+
+fn trim_space_from(s: string, start: int64, last_idx: int64) -> string {
+    case start > last_idx of {
+        true -> "";
+        false -> case substring(s, start, start + 1) == " " of {
+            true -> trim_space_from(s, start + 1, last_idx);
+            false -> case substring(s, last_idx, last_idx + 1) == " " of {
+                true -> trim_space_from(s, start, last_idx - 1);
+                false -> substring(s, start, last_idx + 1)
+            }
+        }
+    }
+}
+
+// Split by top-level commas (respecting nested parens). Returns list of strings.
+fn nil_list_string() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn cons_string(s: string, rest: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- prepend[string, mem(normal)](s, rest)
+    produces
+        pure result
+    end
+}
+
+fn split_params_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case substring(s, j, j + 1) == "(" of {
+            true -> j;
+            false -> case substring(s, j, j + 1) == ")" of {
+                true -> j;
+                false -> case substring(s, j, j + 1) == "," of {
+                    true -> j;
+                    false -> split_params_run_end(s, j + 1, n)
+                }
+            }
+        }
+    }
+}
+
+fn split_params_loop(s: string, i: int64, depth: int64, acc: string, result: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence
+        out: List[string, mem(normal)] <- case i >= length_bytes(s) of {
+            true -> case length_bytes(acc) > 0 of {
+                true -> cons_string(trim_space(acc), result);
+                false -> result
+            };
+            false -> case substring(s, i, i + 1) == "(" of {
+                true -> split_params_loop(s, i + 1, depth + 1, concat(acc, "("), result);
+                false -> case substring(s, i, i + 1) == ")" of {
+                    true -> split_params_loop(s, i + 1, depth - 1, concat(acc, ")"), result);
+                    false -> case substring(s, i, i + 1) == "," of {
+                        true -> case depth == 0 of {
+                            true -> {
+                                trimmed: string <- trim_space(acc);
+                                new_result: List[string, mem(normal)] <- cons_string(trimmed, result);
+                                split_params_loop(s, i + 1, 0, "", new_result)
+                            };
+                            false -> split_params_loop(s, i + 1, depth, concat(acc, ","), result)
+                        };
+                        false -> {
+                            n: int64 <- length_bytes(s);
+                            e: int64 <- split_params_run_end(s, i, n);
+                            split_params_loop(s, e, depth, concat(acc, substring(s, i, e)), result)
+                        }
+                    }
+                }
+            }
+        }
+    produces
+        pure out
+    end
+}
+
+fn reverse_list_string(lst: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence
+        result: List[string, mem(normal)] <- reverse_list_string_acc(lst, nil_list_string())
+    produces
+        pure result
+    end
+}
+
+fn reverse_list_string_acc(lst: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence
+        result: List[string, mem(normal)] <- case lst of {
+            []: List[string, mem(normal)] -> acc;
+            [head: string, tail: List[string, mem(normal)]] -> reverse_list_string_acc(tail, cons_string(head, acc));
+            _: List[string, mem(normal)] -> acc
+        }
+    produces
+        pure result
+    end
+}
+
+fn list_string_nth(lst: List[string, mem(normal)], n: int64) -> string {
+    sequence
+        result: string <- case lst of {
+            []: List[string, mem(normal)] -> "";
+            [head: string, tail: List[string, mem(normal)]] -> case n == 0 of {
+                true -> head;
+                false -> list_string_nth(tail, n - 1)
+            };
+            _: List[string, mem(normal)] -> ""
+        }
+    produces
+        pure result
+    end
+}
+
+// True if fn_name is a region built-in per spec §4.4, §22.1-22.3
+fn is_region_builtin_fn(fn_name: string) -> boolean {
+    fn_name == "alloc_region" or fn_name == "alloc_region_on_numa_node" or fn_name == "alloc_ref" or fn_name == "alloc_buf" or fn_name == "read_ref" or fn_name == "write_ref" or fn_name == "read_buf" or fn_name == "write_buf" or fn_name == "buf_load" or fn_name == "buf_store" or fn_name == "alloc_rec" or fn_name == "build" or fn_name == "canonical_arena_lookup" or fn_name == "canonical_arena_same" or fn_name == "ref_eq"
+}
+
+// Extract Space from memory region type string.
+// region(R, Space) -> Space; ref(R, Space, T) -> Space; buf(R, Space, T, N) -> Space.
+// Returns (true, space) if type is a region type with valid space, (false, "") otherwise.
+fn extract_space_from_region_type(type_str: string) -> (boolean, string) {
+    sequence
+        (has_type: boolean, inner: string) <- extract_region_type_inner(type_str);
+        result: (boolean, string) <- case has_type of {
+            true -> {
+                params: List[string, mem(normal)] <- reverse_list_string(split_params_loop(inner, 0, 0, "", nil_list_string()));
+                space: string <- trim_space(list_string_nth(params, 1));
+                case is_valid_memory_space(space) of {
+                    true -> (true, space);
+                    false -> (false, "")
+                }
+            };
+            false -> (false, "")
+        }
+    produces
+        pure result
+    end
+}
+
+// Extract inner content of region type: "region(R, normal)" -> "R, normal"
+fn extract_region_type_inner(type_str: string) -> (boolean, string) {
+    case length_bytes(type_str) >= 10 and substring(type_str, 0, 10) == "atomic_ref" of {
+        true -> case length_bytes(type_str) >= 11 and substring(type_str, 10, 11) == "(" of {
+            true -> (true, substring(type_str, 11, length_bytes(type_str) - 1));
+            false -> (false, "")
+        };
+        false -> case length_bytes(type_str) >= 6 and substring(type_str, 0, 6) == "region" of {
+            true -> case length_bytes(type_str) >= 7 and substring(type_str, 6, 7) == "(" of {
+                true -> (true, substring(type_str, 7, length_bytes(type_str) - 1));
+                false -> (false, "")
+            };
+            false -> case length_bytes(type_str) >= 3 and substring(type_str, 0, 3) == "buf" of {
+                true -> case length_bytes(type_str) >= 4 and substring(type_str, 3, 4) == "(" of {
+                    true -> (true, substring(type_str, 4, length_bytes(type_str) - 1));
+                    false -> (false, "")
+                };
+                false -> case length_bytes(type_str) >= 3 and substring(type_str, 0, 3) == "ref" of {
+                    true -> case length_bytes(type_str) >= 4 and substring(type_str, 3, 4) == "(" of {
+                        true -> (true, substring(type_str, 4, length_bytes(type_str) - 1));
+                        false -> (false, "")
+                    };
+                    false -> (false, "")
+                }
+            }
+        }
+    }
+}
+
+// Extract Space from alloc_region's first argument. alloc_region(Space) - Space is identifier.
+// first_arg: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } handle; for identifier (kind 1), use the root node's name.
+fn space_from_alloc_region_arg(first_arg: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> (boolean, string) {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(first_arg);
+    case node.kind == 1 of {
+        true -> {
+            space: string <- node.name;
+            case is_valid_memory_space(space) of {
+                true -> (true, space);
+                false -> (false, "")
+            }
+        };
+        false -> (false, "")
+    }
+}
+
+{- Get effects for a region built-in call.
+   alloc_region: Space from first arg (expr.inner).
+   alloc_region_on_numa_node: Space from second arg (not available here); fallback mem(normal).
+   alloc_ref, alloc_buf, alloc_rec, build: Space from binding_type (result type); if Space is atomic, also atomic (§17.1.2).
+   read_ref, write_ref, read_buf, write_buf, buf_load, buf_store: Space from first_arg_type if ref/buf; else binding_type if ref/buf; else mem(normal).
+   Returns (true, effects) if handled, (false, empty) if not a region op or Space unknown. -}
+fn get_region_call_effects(fn_name: string, first_arg: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, first_arg_type: string, binding_type: string, location: { file: string, line: int64, column: int64, offset: int64 }) -> (boolean, List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) {
+    sequence
+        zero: { file: string, line: int64, column: int64, offset: int64 } <- parser_ast@zero_location();
+        loc: { file: string, line: int64, column: int64, offset: int64 } <- case length_bytes(location.file) > 0 of { true -> location; false -> zero };
+        result: (boolean, List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) <- case fn_name == "alloc_region" of {
+            true -> {
+                (ok: boolean, space: string) <- space_from_alloc_region_arg(first_arg);
+                space_to_use: string <- case ok of { true -> space; false -> "normal" };
+                eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "mem", parameter: space_to_use, location: loc };
+                (true, parser_ast@cons_effect_name(eff, parser_ast@empty_effect_name_list()))
+            };
+            false -> case fn_name == "alloc_region_on_numa_node" of {
+                true -> {
+                    // First arg is numa_node (int); Space is second arg. Fallback to mem(normal).
+                    eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "mem", parameter: "normal", location: loc };
+                    (true, parser_ast@cons_effect_name(eff, parser_ast@empty_effect_name_list()))
+                };
+                false -> case fn_name == "alloc_ref" or fn_name == "alloc_buf" or fn_name == "alloc_rec" or fn_name == "build" or fn_name == "canonical_arena_lookup" of {
+                    true -> {
+                        (ok: boolean, space: string) <- extract_space_from_region_type(binding_type);
+                        space_to_use: string <- case ok of { true -> space; false -> "normal" };
+                        mem_eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "mem", parameter: space_to_use, location: loc };
+                        case space_to_use == "atomic" of {
+                            true -> {
+                                atomic_eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "atomic", parameter: "", location: loc };
+                                (true, parser_ast@cons_effect_name(mem_eff, parser_ast@cons_effect_name(atomic_eff, parser_ast@empty_effect_name_list())))
+                            };
+                            false -> (true, parser_ast@cons_effect_name(mem_eff, parser_ast@empty_effect_name_list()))
+                        }
+                    };
+                    false -> case fn_name == "read_ref" or fn_name == "write_ref" or fn_name == "read_buf" or fn_name == "write_buf" or fn_name == "buf_load" or fn_name == "buf_store" of {
+                            true -> {
+                                (ok_arg: boolean, space_arg: string) <- extract_space_from_region_type(first_arg_type);
+                                source_type: string <- case ok_arg of { true -> first_arg_type; false -> binding_type };
+                                (ok: boolean, space: string) <- extract_space_from_region_type(source_type);
+                                case ok of {
+                                    true -> {
+                                        eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "mem", parameter: space, location: loc };
+                                        (true, parser_ast@cons_effect_name(eff, parser_ast@empty_effect_name_list()))
+                                    };
+                                    false -> {
+                                        // binding_type is typically T or atom, not ref/buf. Use mem(normal) as fallback.
+                                        eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- { name: "mem", parameter: "normal", location: loc };
+                                        (true, parser_ast@cons_effect_name(eff, parser_ast@empty_effect_name_list()))
+                                    }
+                                }
+                            };
+                            false -> case fn_name == "canonical_arena_same" or fn_name == "ref_eq" of {
+                                true -> (true, parser_ast@empty_effect_name_list());
+                                false -> (false, parser_ast@empty_effect_name_list())
+                            }
+                    }
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}

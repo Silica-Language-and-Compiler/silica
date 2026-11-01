@@ -1,0 +1,370 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Inline record type strings `{ f1: T1, f2: T2 }` (silica-specification §3.4.2, §3.3.7).
+// No structural subtyping — comparison uses normalized (space-stripped) text via types_equal from tuple helpers at call sites.
+
+export record_type_starts/1;
+export strip_spaces_rt/1;
+export find_field_type_in_record/2;
+export count_record_fields/1;
+export record_type_braces_balanced/1;
+export record_case_inner_body/1;
+export record_case_field_step/1;
+export record_field_segment_name_sub/1;
+export expand_named_topology_type/1;
+
+fn strip_spaces_rt(s: string) -> string {
+    case string_has_space_rt(s, 0) of {
+        true -> strip_spaces_rt_from(s, 0, "");
+        false -> s
+    }
+}
+
+fn string_has_space_rt(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> false;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> true;
+            false -> string_has_space_rt(s, i + 1)
+        }
+    }
+}
+
+fn strip_spaces_rt_from_run_end(s: string, j: int64, n: int64) -> int64 {
+    case j >= n of {
+        true -> j;
+        false -> case substring(s, j, j + 1) == " " of {
+            true -> j;
+            false -> strip_spaces_rt_from_run_end(s, j + 1, n)
+        }
+    }
+}
+
+// Divide-and-conquer strip (same fix as type_interner): the per-character concat(acc, ch)
+// loop copied O(n^2) bytes of growing prefixes into the never-released concat arena for every
+// 8-10 KB signature; splitting ranges and concatenating halves copies O(n log n).
+fn strip_spaces_rt_from(s: string, i: int64, acc: string) -> string {
+    concat(acc, strip_spaces_rt_range(s, i, length_bytes(s)))
+}
+
+fn strip_spaces_rt_range(s: string, lo: int64, hi: int64) -> string {
+    case hi - lo <= 48 of {
+        true -> strip_spaces_rt_small(s, lo, hi, "");
+        false -> {
+            mid: int64 <- lo + (hi - lo) / 2;
+            concat(strip_spaces_rt_range(s, lo, mid), strip_spaces_rt_range(s, mid, hi))
+        }
+    }
+}
+
+fn strip_spaces_rt_small(s: string, i: int64, hi: int64, acc: string) -> string {
+    case i >= hi of {
+        true -> acc;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == " " of {
+                true -> strip_spaces_rt_small(s, i + 1, hi, acc);
+                false -> strip_spaces_rt_small(s, i + 1, hi, concat(acc, ch))
+            }
+        }
+    }
+}
+
+fn first_non_space_index_rt(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> first_non_space_index_rt(s, i + 1);
+            false -> i
+        }
+    }
+}
+
+fn record_type_starts(s: string) -> boolean {
+    i: int64 <- first_non_space_index_rt(s, 0);
+    i < length_bytes(s) and substring(s, i, i + 1) == "{"
+}
+
+// Content inside outer `{` ... `}` for a record type string (balanced braces).
+fn extract_braced_body(t: string) -> string {
+    case length_bytes(t) < 2 of {
+        true -> "";
+        false -> extract_inner_from_brace(t, 1, 1)
+    }
+}
+
+fn extract_inner_from_brace(t: string, i: int64, depth: int64) -> string {
+    case i >= length_bytes(t) of {
+        true -> "";
+        false -> {
+            c: string <- substring(t, i, i + 1);
+            case c == "{" of {
+                true -> extract_inner_from_brace(t, i + 1, depth + 1);
+                false -> case c == "}" of {
+                    true -> case depth == 1 of {
+                        true -> substring(t, 1, i);
+                        false -> extract_inner_from_brace(t, i + 1, depth - 1)
+                    };
+                    false -> extract_inner_from_brace(t, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+// Commas that separate record fields are only at brace_depth==0, bracket_depth==0 and paren_depth==0,
+// so commas inside `List[T, mem(...)]`, `fn(a, b) -> (:ok, int64)` tuples, and other `[...]`/`(...)` groups
+// (§3.3, §15.4.13.2 field types that may themselves be tuple or fn types) are ignored.
+fn first_top_comma_or_end(content: string, i: int64, brace_depth: int64, bracket_depth: int64, paren_depth: int64) -> int64 {
+    case i >= length_bytes(content) of {
+        true -> length_bytes(content);
+        false -> {
+            c: string <- substring(content, i, i + 1);
+            case c == "{" of {
+                true -> first_top_comma_or_end(content, i + 1, brace_depth + 1, bracket_depth, paren_depth);
+                false -> case c == "}" of {
+                    true -> first_top_comma_or_end(content, i + 1, brace_depth - 1, bracket_depth, paren_depth);
+                    false -> case c == "[" of {
+                        true -> first_top_comma_or_end(content, i + 1, brace_depth, bracket_depth + 1, paren_depth);
+                        false -> case c == "]" of {
+                            true -> first_top_comma_or_end(content, i + 1, brace_depth, bracket_depth - 1, paren_depth);
+                            false -> case c == "(" of {
+                                true -> first_top_comma_or_end(content, i + 1, brace_depth, bracket_depth, paren_depth + 1);
+                                false -> case c == ")" of {
+                                    true -> first_top_comma_or_end(content, i + 1, brace_depth, bracket_depth, paren_depth - 1);
+                                    false -> case c == "," and brace_depth == 0 and bracket_depth == 0 and paren_depth == 0 of {
+                                        true -> i;
+                                        false -> first_top_comma_or_end(content, i + 1, brace_depth, bracket_depth, paren_depth)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn colon_at_depth0_seg(seg: string, i: int64, brace_depth: int64, bracket_depth: int64, paren_depth: int64) -> int64 {
+    case i >= length_bytes(seg) of {
+        true -> -1;
+        false -> {
+            c: string <- substring(seg, i, i + 1);
+            case c == "{" of {
+                true -> colon_at_depth0_seg(seg, i + 1, brace_depth + 1, bracket_depth, paren_depth);
+                false -> case c == "}" of {
+                    true -> colon_at_depth0_seg(seg, i + 1, brace_depth - 1, bracket_depth, paren_depth);
+                    false -> case c == "[" of {
+                        true -> colon_at_depth0_seg(seg, i + 1, brace_depth, bracket_depth + 1, paren_depth);
+                        false -> case c == "]" of {
+                            true -> colon_at_depth0_seg(seg, i + 1, brace_depth, bracket_depth - 1, paren_depth);
+                            false -> case c == "(" of {
+                                true -> colon_at_depth0_seg(seg, i + 1, brace_depth, bracket_depth, paren_depth + 1);
+                                false -> case c == ")" of {
+                                    true -> colon_at_depth0_seg(seg, i + 1, brace_depth, bracket_depth, paren_depth - 1);
+                                    false -> case c == ":" and brace_depth == 0 and bracket_depth == 0 and paren_depth == 0 of {
+                                        true -> i;
+                                        false -> colon_at_depth0_seg(seg, i + 1, brace_depth, bracket_depth, paren_depth)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn scan_field_in_content(content: string, field: string, start: int64) -> string {
+    case start > length_bytes(content) of {
+        true -> "";
+        false -> {
+            seg_end: int64 <- first_top_comma_or_end(content, start, 0, 0, 0);
+            seg: string <- strip_spaces_rt(substring(content, start, seg_end));
+            case length_bytes(seg) == 0 of {
+                true -> "";
+                false -> {
+                    colon: int64 <- colon_at_depth0_seg(seg, 0, 0, 0, 0);
+                    case colon < 0 of {
+                        true -> scan_after_comma(content, field, seg_end);
+                        false -> {
+                            fname: string <- strip_spaces_rt(substring(seg, 0, colon));
+                            fty: string <- strip_spaces_rt(substring(seg, colon + 1, length_bytes(seg)));
+                            case fname == field of {
+                                true -> fty;
+                                false -> scan_after_comma(content, field, seg_end)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn scan_after_comma(content: string, field: string, seg_end: int64) -> string {
+    case seg_end >= length_bytes(content) of {
+        true -> "";
+        false -> case substring(content, seg_end, seg_end + 1) == "," of {
+            true -> scan_field_in_content(content, field, seg_end + 1);
+            false -> ""
+        }
+    }
+}
+
+fn find_field_type_in_record(record_str: string, field: string) -> string {
+    t: string <- strip_spaces_rt(record_str);
+    case length_bytes(t) < 2 of {
+        true -> "";
+        false -> case substring(t, 0, 1) == "{" of {
+            false -> "";
+            true -> {
+                content: string <- extract_braced_body(t);
+                scan_field_in_content(content, field, 0)
+            }
+        }
+    }
+}
+
+// Inline record type `{ f: T, ... }` (§3.4.2, §4.2): braces must balance for semantic analysis.
+fn record_type_braces_balanced(s: string) -> boolean {
+    t: string <- strip_spaces_rt(s);
+    case length_bytes(t) < 2 of {
+        true -> false;
+        false -> case substring(t, 0, 1) == "{" of {
+            false -> true;
+            true -> brace_walk(t, 0, 0)
+        }
+    }
+}
+
+fn brace_walk(s: string, i: int64, depth: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> depth == 0;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "{" of {
+                true -> brace_walk(s, i + 1, depth + 1);
+                false -> case c == "}" of {
+                    true -> case depth == 0 of {
+                        true -> false;
+                        false -> brace_walk(s, i + 1, depth - 1)
+                    };
+                    false -> brace_walk(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+// Body inside `{` ... `}` for case patterns and inline record types (strip outer whitespace first).
+fn record_case_inner_body(full_pat: string) -> string {
+    t: string <- strip_spaces_rt(full_pat);
+    extract_braced_body(t)
+}
+
+// One top-level `field: subpat` segment from remaining inner content; rest is after optional comma.
+fn record_case_field_step(remaining_inner: string) -> (string, string) {
+    seg_end: int64 <- first_top_comma_or_end(remaining_inner, 0, 0, 0, 0);
+    first: string <- strip_spaces_rt(substring(remaining_inner, 0, seg_end));
+    rest: string <- case seg_end >= length_bytes(remaining_inner) of {
+        true -> "";
+        false -> case substring(remaining_inner, seg_end, seg_end + 1) == "," of {
+            true -> strip_spaces_rt(substring(remaining_inner, seg_end + 1, length_bytes(remaining_inner)));
+            false -> ""
+        }
+    };
+    (first, rest)
+}
+
+// Count `field: type` segments at brace depth 0 (same splits as record_case_field_step).
+// Trailing comma after the last field does not add a field — unlike naive "commas + 1".
+fn count_record_field_segments(remaining: string, acc: int64) -> int64 {
+    rem_t: string <- strip_spaces_rt(remaining);
+    case length_bytes(rem_t) == 0 of {
+        true -> acc;
+        false -> {
+            (seg: string, rest: string) <- record_case_field_step(rem_t);
+            seg_t: string <- strip_spaces_rt(seg);
+            case length_bytes(seg_t) == 0 of {
+                true -> acc;
+                false -> {
+                    rest_t: string <- strip_spaces_rt(rest);
+                    case length_bytes(rest_t) == 0 of {
+                        true -> acc + 1;
+                        false -> count_record_field_segments(rest, acc + 1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn count_record_fields(record_str: string) -> int64 {
+    t: string <- strip_spaces_rt(record_str);
+    content: string <- extract_braced_body(t);
+    inner: string <- strip_spaces_rt(content);
+    case length_bytes(inner) == 0 of {
+        true -> 0;
+        false -> count_record_field_segments(inner, 0)
+    }
+}
+
+fn record_field_segment_name_sub(seg: string) -> (string, string) {
+    colon: int64 <- colon_at_depth0_seg(seg, 0, 0, 0, 0);
+    case colon < 0 of {
+        true -> ("", "");
+        false -> (strip_spaces_rt(substring(seg, 0, colon)), strip_spaces_rt(substring(seg, colon + 1, length_bytes(seg))))
+    }
+}
+
+// Phase A / cpu_topology_implementation_plan: canonical appendix layout as inline `{ ... }` for field access
+// and struct literals when the surface type is the named `cpu_topology` (fully expanded) / `core_info` / nested records.
+fn expand_named_topology_type(type_name: string) -> string {
+    // Longest named topology is `cpu_topology` (12). wbt_map record types are
+    // thousands of characters; stripping them here was the type-check hot path.
+    case length_bytes(type_name) > 32 of {
+        true -> "";
+        false -> expand_named_topology_type_short(type_name)
+    }
+}
+
+fn expand_named_topology_type_short(type_name: string) -> string {
+    // The named topologies are short identifiers. This ran strip_spaces_rt on EVERY type surface
+    // that reached the identifier check, copying 8-10 KB signatures into the never-released
+    // string arena just to compare them against six short names. Anything longer than the
+    // longest name (with room for stray spaces) cannot match.
+    case length_bytes(type_name) > 24 of {
+        true -> "";
+        false -> expand_named_topology_type_short_stripped(strip_spaces_rt(type_name))
+    }
+}
+
+fn expand_named_topology_type_short_stripped(t: string) -> string {
+    case t of {
+        "cpu_topology" -> "{ cores: List[{ id: int64, core_type: atom, capabilities: List[string,normal], frequency_mhz: int64 },normal], numa_nodes: List[{ id: int64, cores: List[int64,normal], memory_ranges: List[{ start_address: int64, size: int64, latency: int64 },normal] },normal], cache_hierarchy: { levels: List[{ level: int64, size_kb: int64, line_size: int64, associativity: int64, shared_cores: List[int64,normal] },normal] } }";
+        "core_info" -> "{ id: int64, core_type: atom, capabilities: List[string,normal], frequency_mhz: int64 }";
+        "numa_info" -> "{ id: int64, cores: List[int64,normal], memory_ranges: List[{ start_address: int64, size: int64, latency: int64 },normal] }";
+        "memory_range" -> "{ start_address: int64, size: int64, latency: int64 }";
+        "cache_info" -> "{ levels: List[{ level: int64, size_kb: int64, line_size: int64, associativity: int64, shared_cores: List[int64,normal] },normal] }";
+        "cache_level" -> "{ level: int64, size_kb: int64, line_size: int64, associativity: int64, shared_cores: List[int64,normal] }";
+        _: string -> ""
+    }
+}

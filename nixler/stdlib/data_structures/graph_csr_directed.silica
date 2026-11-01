@@ -1,0 +1,268 @@
+// Layer 6 — graph_csr_directed: the CSR snapshot of a live directed graph (graph_wbt_directed).
+// Authority: csr_graph_snapshot.md; directed_graph_trait.md §3, §7; csr_dense_representation_contract.md.
+// A snapshot is built only by freeze_from_wbt and is never updated (design §1): there is no add or
+// remove; re-freeze an updated live graph for a new snapshot (CSR-D7 rule 4). It implements the
+// DirectedGraph query trait.
+// Representation (CSR-D1: compiler-version-private inline layout; only this module's functions and
+// the graph traits are source-level access paths):
+//   { node_ids, offsets, targets, values (runtime-sized buffers V, V + 1, A, A), slot_root
+//     (node_to_slot WBT map), <the live record's functions>, region, specialization_key, counts,
+//     <ordering fields> }
+// See graph_csr_core for the buffer invariants, the freeze and the node-ID / slot separation.
+//
+// Deviations forced by the compiler / the generic live module (each mirrors graph_wbt_directed):
+//   1. Placeholders KeyType (NodeIdType) and ValueType (EdgePayloadType).
+//   2. The snapshot keeps the payload buffer (values) beside the neighbor buffer (targets) for every
+//      EdgePayloadType, because the one generic module cannot tell the unweighted specialization
+//      apart at run time; for EdgePayloadType = NodeIdType the payload repeats the target
+//      (CSR-D4 asks the unweighted form to omit edge data).
+//   3. fold_neighbors takes the accumulator second; out_degree, has_edge, reachable are module
+//      functions and required trait methods.
+//   4. mem(normal) only; validation error atoms are created and decoded in graph_csr_core.
+// Q19 node shapes (spelled at every use): slot_root is a wbt_map node (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec)).
+
+use graph_csr_core;
+
+export freeze_from_wbt/1;
+export has_vertex/2;
+export has_edge/3;
+export neighbors/2;
+export fold_neighbors/4;
+export fold_vertices/3;
+export fold_edges/3;
+export vertices/1;
+export node_count/1;
+export edge_count/1;
+export out_degree/2;
+export reachable/3;
+export compare_node/3;
+export compare_edge/3;
+export edge_target/2;
+export validate/1;
+export validate_error_code/1;
+
+fn compare_raw(
+    compare: fn(KeyType, KeyType) -> atom,
+    a: KeyType,
+    b: KeyType
+) -> atom {
+    sequence
+        result: atom <- comparator_result_validate(compare(a, b))
+    produces
+        pure result
+    end
+}
+
+fn compare_value_raw(
+    compare: fn(ValueType, ValueType) -> atom,
+    a: ValueType,
+    b: ValueType
+) -> atom {
+    sequence
+        result: atom <- comparator_result_validate(compare(a, b))
+    produces
+        pure result
+    end
+}
+
+// Deterministic collection error for an invalid comparator atom (common_contract.md §4).
+fn invalid_halt(_: atom) -> :less | :equal | :greater {
+    sequence
+        _: int64 <- 1 / 0
+    produces
+        pure :equal
+    end
+}
+
+// Deterministic collection error: count overflow or a malformed graph found by an update; nothing
+// is published (common_contract.md §9).
+fn update_halt(n: int64) -> int64 {
+    sequence
+        _: int64 <- 1 / 0
+    produces
+        pure n
+    end
+}
+
+fn b2i(b: boolean) -> int64 {
+    case b of {
+        true -> 1;
+        false -> 0
+    }
+}
+
+// Checked non-negative count addition (delta may be negative).
+fn count_add(count: int64, delta: int64) -> int64 {
+    case delta > 0 and count > 9223372036854775807 - delta of {
+        true -> update_halt(count);
+        false -> count + delta
+    }
+}
+
+fn apply_target(f: fn(ValueType) -> KeyType, v: ValueType) -> KeyType {
+    f(v)
+}
+
+// Compares two vertex IDs with the captured node comparator.
+fn compare_node(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, a: KeyType, b: KeyType) -> :less | :equal | :greater {
+    sequence
+        result: atom <- compare_raw(g.compare_node, a, b)
+    produces
+        pure case result of {
+            :less -> :less;
+            :equal -> :equal;
+            :greater -> :greater;
+            bad: atom -> invalid_halt(bad)
+        }
+    end
+}
+
+// Compares two edge payloads with the captured edge comparator.
+fn compare_edge(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, a: ValueType, b: ValueType) -> :less | :equal | :greater {
+    sequence
+        result: atom <- compare_value_raw(g.compare_edge, a, b)
+    produces
+        pure case result of {
+            :less -> :less;
+            :equal -> :equal;
+            :greater -> :greater;
+            bad: atom -> invalid_halt(bad)
+        }
+    end
+}
+
+// Extracts the target vertex ID from an edge payload with the captured extractor.
+fn edge_target(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, edge: ValueType) -> KeyType {
+    apply_target(g.edge_target, edge)
+}
+
+// The snapshot record graph_csr_core works on.
+fn cs_of(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }) -> { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } {
+    out: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- {
+        node_ids: g.node_ids,
+        offsets: g.offsets,
+        targets: g.targets,
+        values: g.values,
+        slot_root: g.slot_root,
+        compare_key: g.compare_node,
+        compare_value: g.compare_edge,
+        region: g.region,
+        specialization_key: g.specialization_key,
+        node_count: g.node_count,
+        entry_count: g.edge_count
+    };
+    out
+}
+
+// The live graph's adjacency record (graph_wbt_core's shape), read by the freeze.
+fn live_adj_of(g: { root: ref?(L, normal, (KeyType, ref?(L, normal, (KeyType, ValueType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }) -> { root: ref?(L, normal, (KeyType, ref?(L, normal, (KeyType, ValueType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 } {
+    out: { root: ref?(L, normal, (KeyType, ref?(L, normal, (KeyType, ValueType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 } <- {
+        root: g.root,
+        compare_key: g.compare_node,
+        compare_value: g.compare_edge,
+        region: g.region,
+        specialization_key: g.specialization_key,
+        compare_key_ordering_bundle: g.compare_node_ordering_bundle,
+        compare_value_ordering_bundle: g.compare_edge_ordering_bundle
+    };
+    out
+}
+
+// Freezes one live graph version into an immutable snapshot (design §1, §4): O(V + A), no
+// comparison sort, the live graph unchanged; functions, counts and ordering identity are copied.
+fn freeze_from_wbt(g: { root: ref?(L, normal, (KeyType, ref?(L, normal, (KeyType, ValueType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }) -> { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 } {
+    sequence
+        adj: { root: ref?(L, normal, (KeyType, ref?(L, normal, (KeyType, ValueType, int64, ref?(L, normal, rec), ref?(L, normal, rec))), int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 } <- live_adj_of(g);
+        cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- graph_csr_core@freeze(adj, g.node_count, g.edge_count);
+        out: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 } <- {
+            node_ids: cs.node_ids,
+            offsets: cs.offsets,
+            targets: cs.targets,
+            values: cs.values,
+            slot_root: cs.slot_root,
+            compare_node: g.compare_node,
+            compare_edge: g.compare_edge,
+            edge_target: g.edge_target,
+            region: cs.region,
+            specialization_key: g.specialization_key,
+            node_count: g.node_count,
+            edge_count: g.edge_count,
+            compare_node_ordering_bundle: g.compare_node_ordering_bundle,
+            compare_edge_ordering_bundle: g.compare_edge_ordering_bundle,
+            edge_target_ordering_bundle: g.edge_target_ordering_bundle
+        }
+    produces
+        pure out
+    end
+}
+
+// Reports whether id is a vertex: node_to_slot lookup, O(log V).
+fn has_vertex(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, id: KeyType) -> boolean {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@has_vertex(cs, id)
+}
+
+// Reports whether the entry (from, to) is stored: slot lookup plus row binary search.
+fn has_edge(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, from: KeyType, to: KeyType) -> boolean {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@has_entry(cs, from, to)
+}
+
+// Visits every vertex once in ascending node (slot) order.
+fn fold_vertices(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, init: AccType, step: fn(AccType, KeyType) -> AccType) -> AccType {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@fold_vertices(cs, init, step)
+}
+
+// Every vertex in ascending node order (a fresh list).
+fn vertices(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }) -> List[KeyType, mem(normal)] {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@vertices(cs)
+}
+
+fn node_count(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }) -> int64 {
+    g.node_count
+}
+
+fn edge_count(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }) -> int64 {
+    g.edge_count
+}
+
+// Row length: stored adjacency entries at id; zero for a missing or isolated vertex.
+fn out_degree(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, id: KeyType) -> int64 {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@degree(cs, id)
+}
+
+fn validate_error_code(error: atom) -> int64 {
+    graph_csr_core@validate_error_code(error)
+}
+
+// Outgoing payloads of id in stored (ascending target) order; empty for a missing or isolated vertex.
+fn neighbors(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, id: KeyType) -> List[ValueType, mem(normal)] {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@values(cs, id)
+}
+
+// Streams id's contiguous row without allocation.
+fn fold_neighbors(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, init: AccType, step: fn(AccType, ValueType) -> AccType, id: KeyType) -> AccType {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@fold_values(cs, init, step, id)
+}
+
+// Every directed edge once as (from, payload), in row order.
+fn fold_edges(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, init: AccType, step: fn(AccType, KeyType, ValueType) -> AccType) -> AccType {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@fold_entries(cs, init, step)
+}
+
+fn reachable(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }, from: KeyType, to: KeyType) -> boolean {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@reachable(cs, from, to)
+}
+
+// Extents, offsets, node order, node_to_slot bijection, rows, payload targets, edge count (§10).
+fn validate(g: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_node: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_edge: fn(ValueType, ValueType) -> :less | :equal | :greater, edge_target: fn(ValueType) -> KeyType, region: region(L, normal), specialization_key: int64, node_count: int64, edge_count: int64, compare_node_ordering_bundle: int64, compare_edge_ordering_bundle: int64, edge_target_ordering_bundle: int64 }) -> { valid: boolean, error: atom, logical_count: int64 } {
+    cs: { node_ids: buf(L, normal, KeyType, nv), offsets: buf(L, normal, int64, nv1), targets: buf(L, normal, KeyType, na), values: buf(L, normal, ValueType, na), slot_root: ref?(L, normal, (KeyType, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(KeyType, KeyType) -> :less | :equal | :greater, compare_value: fn(ValueType, ValueType) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, node_count: int64, entry_count: int64 } <- cs_of(g);
+    graph_csr_core@validate_directed(cs, g.edge_target, g.edge_count)
+}

@@ -1,0 +1,1060 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Phase 13 — Linux (glibc, x86-64) sigaltstack / sigaction guarded-FFI fault bridge.
+// Ported from linux_aarch64: stack_t, struct sigaction, ucontext_t and siginfo_t use the Linux x86-64
+// layouts (struct sigaction 152 B: handler @0, mask @8, flags @136, restorer @144; siginfo si_addr @16;
+// ucontext gregs @40 with RSP @160 and RIP @168); SIGBUS is 7; sa_flags = SA_SIGINFO (4) |
+// SA_ONSTACK (0x08000000) | SA_NODEFER (0x40000000).
+// Register model: routines called from Silica code take X0.. in rdi rsi rdx rcx r8 r9 and answer in
+// rdi; C library results arrive in rax; the AArch64 callee-saved X19..X24 live in frame slots
+// [rbp-8]..[rbp-48]. The signal handler is C-called (rdi signo, rsi siginfo*, rdx ucontext*) and
+// preserves rbx r12-r15 in its frame.
+// Per-thread guarded TLS block layout (512 B, see ffi_guarded_runtime_asm.silica):
+//   +0 depth, +8 actor ACB, +16 call_gen, +24 inside,
+//   +32 fault_signal, +40 fault_addr, +48 fault_code, +56 fault_in_arena,
+//   +64 sigjmp_buf (448 B slot; glibc x86-64 sigjmp_buf is 200 B).
+
+export emit_ffi_fault_runtime_asm/0;
+
+// Runtime abort (spec §15.4.5.5; design_documents/runtime_failure_reporting.md). Every runtime check
+// that cannot continue calls one of the per-site entries below (or silica_rt_abort_with with its own
+// reason); the report is the line "[silica] abort: <reason> at 0x<pc>", followed by " in
+// <symbol>+0x<offset>" when dladdr names the address, on stderr, and the process exits with status 71.
+// The pc is the call instruction of the site. Nothing is allocated, and the report does not run on the
+// caller's stack: the first caller claims the report and moves onto a static 32 KB stack (the caller
+// may be an actor at the end of its reservation, or the signal handler on its alternate stack); any
+// later caller, on any thread, parks until the process has gone. The exit is C _exit (async-signal-safe,
+// no atexit handlers), which is what the C abort() it replaces also skipped.
+fn emit_abort_runtime_asm() -> string {
+    "	.section .rodata
+Lrta_pre:
+	.asciz	\"[silica] abort: \"
+Lrta_at:
+	.asciz	\" at 0x\"
+Lrta_r_region_overflow:
+	.asciz	\"region allocation failed\"
+Lrta_r_buf_invalid:
+	.asciz	\"invalid buffer size\"
+Lrta_r_buf_bounds:
+	.asciz	\"buffer index out of bounds\"
+Lrta_r_list_index:
+	.asciz	\"list index out of range\"
+Lrta_r_arena_key:
+	.asciz	\"canonical arena key is zero\"
+Lrta_r_arena_full:
+	.asciz	\"canonical arena table is full\"
+Lrta_r_arena_nomem:
+	.asciz	\"canonical arena allocation failed\"
+Lrta_r_guarded_ffi_state:
+	.asciz	\"guarded FFI state could not be allocated\"
+Lrta_r_ingress_full:
+	.asciz	\"supervision ingress queue is full\"
+Lrta_r_exit_queue_full:
+	.asciz	\"supervisor ingress queue is full (exit delivery)\"
+Lrta_r_stack_commit:
+	.asciz	\"cannot commit memory for a growing actor stack\"
+Lrta_r_stack_reserve:
+	.asciz	\"stack reservation failed\"
+Lrta_r_dangerous_thread:
+	.asciz	\"the thread of a dangerous actor could not be created\"
+	.text
+	.globl	silica_rt_abort_with
+	.p2align	4
+silica_rt_abort_with:
+# rdi = NUL-terminated reason. The reported address is the call that got here: the return address
+# minus 5 (call rel32). Never returns.
+	mov	rsi, QWORD PTR [rsp]
+	sub	rsi, 5
+	jmp	silica_rt_abort_with_pc
+	.globl	silica_rt_abort_with_pc
+	.p2align	4
+silica_rt_abort_with_pc:
+# rdi = reason, rsi = the address to report. Never returns. r12/r13/r14 survive the C calls below.
+	mov	r12, rdi
+	mov	r13, rsi
+	mov	eax, 1
+	xchg	eax, DWORD PTR [rip + silica_rt_abort_claimed]
+	test	eax, eax
+	jnz	Lrta_park
+	lea	rsp, [rip + silica_rt_abort_stack_top]
+	xor	ebp, ebp
+	lea	rdi, [rip + Lrta_pre]
+	call	silica_rt_fault_puts
+	mov	rdi, r12
+	call	silica_rt_fault_puts
+	lea	rdi, [rip + Lrta_at]
+	call	silica_rt_fault_puts
+	mov	rdi, r13
+	call	silica_rt_fault_puthex
+	mov	rdi, r13
+	lea	rsi, [rip + silica_rt_fault_dlinfo]
+	call	dladdr
+	test	eax, eax
+	jz	Lrta_eol
+	lea	rax, [rip + silica_rt_fault_dlinfo]
+	mov	r14, QWORD PTR [rax + 16]
+	test	r14, r14
+	jz	Lrta_eol
+	lea	rdi, [rip + Lpfs_in]
+	call	silica_rt_fault_puts
+	mov	rdi, r14
+	call	silica_rt_fault_puts
+	lea	rax, [rip + silica_rt_fault_dlinfo]
+	mov	rsi, QWORD PTR [rax + 24]
+	test	rsi, rsi
+	jz	Lrta_eol
+	mov	r14, r13
+	sub	r14, rsi
+	lea	rdi, [rip + Lpfs_plus]
+	call	silica_rt_fault_puts
+	mov	rdi, r14
+	call	silica_rt_fault_puthex
+Lrta_eol:
+	lea	rdi, [rip + Lpfs_eol]
+	call	silica_rt_fault_puts
+	mov	edi, 71
+	call	_exit
+Lrta_park:
+	pause
+	jmp	Lrta_park
+# Per-site entries: the reason in rdi, then a jump to silica_rt_abort_with with the site's return
+# address still on top of the stack, so the reported address is still the site's call.
+	.globl	silica_rt_abort_region_overflow
+	.p2align	4
+silica_rt_abort_region_overflow:
+	lea	rdi, [rip + Lrta_r_region_overflow]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_buf_invalid
+	.p2align	4
+silica_rt_abort_buf_invalid:
+	lea	rdi, [rip + Lrta_r_buf_invalid]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_buf_bounds
+	.p2align	4
+silica_rt_abort_buf_bounds:
+	lea	rdi, [rip + Lrta_r_buf_bounds]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_list_index
+	.p2align	4
+silica_rt_abort_list_index:
+	lea	rdi, [rip + Lrta_r_list_index]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_arena_key
+	.p2align	4
+silica_rt_abort_arena_key:
+	lea	rdi, [rip + Lrta_r_arena_key]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_arena_full
+	.p2align	4
+silica_rt_abort_arena_full:
+	lea	rdi, [rip + Lrta_r_arena_full]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_arena_nomem
+	.p2align	4
+silica_rt_abort_arena_nomem:
+	lea	rdi, [rip + Lrta_r_arena_nomem]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_guarded_ffi_state
+	.p2align	4
+silica_rt_abort_guarded_ffi_state:
+	lea	rdi, [rip + Lrta_r_guarded_ffi_state]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_ingress_full
+	.p2align	4
+silica_rt_abort_ingress_full:
+	lea	rdi, [rip + Lrta_r_ingress_full]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_exit_queue_full
+	.p2align	4
+silica_rt_abort_exit_queue_full:
+	lea	rdi, [rip + Lrta_r_exit_queue_full]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_stack_reserve
+	.p2align	4
+silica_rt_abort_stack_reserve:
+	lea	rdi, [rip + Lrta_r_stack_reserve]
+	jmp	silica_rt_abort_with
+	.globl	silica_rt_abort_dangerous_thread
+	.p2align	4
+silica_rt_abort_dangerous_thread:
+	lea	rdi, [rip + Lrta_r_dangerous_thread]
+	jmp	silica_rt_abort_with
+"
+}
+
+fn emit_ffi_fault_runtime_asm() -> string {
+    bss: string <- "	.bss
+	.p2align	3
+silica_rt_ffi_altstack_mem:
+	.zero	65536
+silica_rt_sync_fault_handlers_installed:
+	.zero	4
+	.globl	silica_rt_fault_pc
+silica_rt_fault_pc:
+	.zero	8
+silica_rt_fault_dlinfo:
+	.zero	48
+silica_rt_fault_hexbuf:
+	.zero	32
+silica_rt_fault_addr:
+	.zero	8
+silica_rt_fault_actor:
+	.zero	8
+silica_rt_fault_sbase:
+	.zero	8
+silica_rt_fault_ssize:
+	.zero	8
+	.globl	silica_rt_own_image_base
+silica_rt_own_image_base:
+	.zero	8
+silica_rt_ffi_altstack_active:
+	.zero	4
+silica_rt_abort_claimed:
+	.zero	4
+	.p2align	4
+silica_rt_abort_stack:
+	.zero	32768
+silica_rt_abort_stack_top:
+";
+    text: string <- "	.text
+	.globl	silica_rt_install_sync_fault_handlers
+	.p2align	4
+silica_rt_install_sync_fault_handlers:
+	push	rbp
+	mov	rbp, rsp
+	lea	rax, [rip + silica_rt_sync_fault_handlers_installed]
+	mov	r10d, DWORD PTR [rax]
+	test	r10d, r10d
+	jnz	L_ifh_done
+	mov	DWORD PTR [rax], 1
+	sub	rsp, 192
+# Linux stack_t at [rsp]: ss_sp @0, ss_flags (int) @8, ss_size @16.
+	lea	r10, [rip + silica_rt_ffi_altstack_mem]
+	mov	QWORD PTR [rsp], r10
+	mov	DWORD PTR [rsp + 8], 0
+	mov	QWORD PTR [rsp + 16], 65536
+	mov	rdi, rsp
+	xor	esi, esi
+	call	sigaltstack
+	lea	r10, [rip + silica_rt_ffi_altstack_active]
+	mov	DWORD PTR [r10], 1
+# Linux/glibc x86-64 struct sigaction (152 B at rsp+32): sa_handler @0, sa_mask @8 (128 B),
+# sa_flags @136, sa_restorer @144. Zero it, then set handler + SA_SIGINFO|SA_ONSTACK.
+	lea	rax, [rsp + 32]
+	mov	r10d, 152
+L_ifh_zero:
+	mov	QWORD PTR [rax], 0
+	add	rax, 8
+	sub	r10, 8
+	jne	L_ifh_zero
+	lea	rax, [rip + silica_rt_sync_fault_handler]
+	mov	QWORD PTR [rsp + 32], rax
+# SA_NODEFER keeps the signal deliverable while its handler runs: a fault inside the handler must
+# reach silica_rt_fault_last_resort, and a synchronous fault on a blocked signal is the default action
+# (status 139) instead (spec 15.4.5.5).
+	mov	DWORD PTR [rsp + 168], 0x48000004
+	mov	edi, 11
+	lea	rsi, [rsp + 32]
+	xor	edx, edx
+	call	sigaction
+	mov	edi, 7
+	lea	rsi, [rsp + 32]
+	xor	edx, edx
+	call	sigaction
+	mov	edi, 4
+	lea	rsi, [rsp + 32]
+	xor	edx, edx
+	call	sigaction
+	mov	edi, 8
+	lea	rsi, [rsp + 32]
+	xor	edx, edx
+	call	sigaction
+	add	rsp, 192
+L_ifh_done:
+	pop	rbp
+	ret
+# The startup code installs the handlers before main runs (spec 15.4.5.5): the C runtime calls every
+# .init_array entry before main, so a fault in main's prologue, or in anything else that runs before
+# main's body, is reported like any other. The calls from spawn and from main's prologue remain and
+# return at once (the installed flag).
+	.section .init_array, \"aw\"
+	.p2align	3
+	.quad	silica_rt_install_sync_fault_handlers
+	.text
+	.globl	silica_rt_ffi_fault_altstack_probed
+	.p2align	4
+silica_rt_ffi_fault_altstack_probed:
+	lea	rax, [rip + silica_rt_ffi_altstack_active]
+	mov	edi, DWORD PTR [rax]
+	ret
+	.globl	silica_rt_ffi_trial_arena_base
+	.p2align	4
+silica_rt_ffi_trial_arena_base:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	L_tab_zero
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_ffi_arena_ensure
+	test	rdi, rdi
+	jz	L_tab_zero
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rdi, QWORD PTR [rax + 248]
+	leave
+	ret
+L_tab_zero:
+	xor	edi, edi
+	leave
+	ret
+	.globl	silica_rt_sync_fault_handler
+	.p2align	4
+silica_rt_sync_fault_handler:
+# C-called: rdi = signo, rsi = siginfo*, rdx = ucontext*. Frame slots: [rbp-8] x19 fault address,
+# [rbp-16] x20 actor, [rbp-24] x21 stack base, [rbp-32] x22 signo, [rbp-40] x23 siginfo,
+# [rbp-48] x24 ucontext, [rbp-56..-88] the caller's rbx r12 r13 r14 r15.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 96
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	QWORD PTR [rbp - 64], r12
+	mov	QWORD PTR [rbp - 72], r13
+	mov	QWORD PTR [rbp - 80], r14
+	mov	QWORD PTR [rbp - 88], r15
+	mov	QWORD PTR [rbp - 32], rdi
+	mov	QWORD PTR [rbp - 40], rsi
+	mov	QWORD PTR [rbp - 48], rdx
+# A fault raised while a handler runs on this thread (the handler itself, or the runtime code it calls)
+# takes the last-resort path and never re-enters the decision below (spec 15.4.5.5).
+	mov	rdi, rdx
+	call	silica_rt_fault_in_handler
+	test	eax, eax
+	jnz	L_sfh_last_resort
+# Stack growth is established first (spec §15.1.2.2): a fault at an address inside the current
+# actor's reservation is growth, and only afterwards is a guarded foreign fault considered.
+# Linux siginfo_t: si_addr @16.
+	call	silica_rt_tls_current_actor_get
+	mov	QWORD PTR [rbp - 16], rdi
+	test	rdi, rdi
+	jz	Lsfh_not_stack
+	mov	r10, QWORD PTR [rdi + 272]
+	mov	QWORD PTR [rbp - 24], r10
+	test	r10, r10
+	jz	Lsfh_not_stack
+	mov	rax, QWORD PTR [rbp - 40]
+	mov	r11, QWORD PTR [rax + 16]
+	mov	QWORD PTR [rbp - 8], r11
+	cmp	r11, r10
+	jb	Lsfh_not_stack
+	mov	rax, QWORD PTR [rdi + 280]
+	add	rax, r10
+	cmp	r11, rax
+	jae	Lsfh_not_stack
+	mov	rsi, r11
+	call	silica_rt_stack_grow_to
+	test	rdi, rdi
+	jz	L_sfh_done
+	cmp	rdi, 1
+	je	L_sfh_exhausted
+	cmp	rdi, 2
+	je	L_sfh_unrecoverable
+Lsfh_not_stack:
+# The report fields are process-wide, so they are recorded only once the fault is known not to be
+# stack growth: an actor taking growth faults on another thread must not overwrite them while a fatal
+# fault is being reported (spec 15.4.5.5). rsi / rdx are reloaded: the growth check made calls.
+	mov	rsi, QWORD PTR [rbp - 40]
+	mov	rdx, QWORD PTR [rbp - 48]
+	lea	rax, [rip + silica_rt_fault_pc]
+	test	rdx, rdx
+	jz	Lsfh_pc_done
+# Linux x86-64 ucontext_t: uc_mcontext.gregs @40; REG_RIP = gregs[16] @168. siginfo_t si_addr @16.
+	mov	r10, QWORD PTR [rdx + 168]
+	mov	QWORD PTR [rax], r10
+	mov	r10, QWORD PTR [rsi + 16]
+	lea	rax, [rip + silica_rt_fault_addr]
+	mov	QWORD PTR [rax], r10
+	call	silica_rt_tls_current_actor_get
+	lea	rax, [rip + silica_rt_fault_actor]
+	mov	QWORD PTR [rax], rdi
+	lea	rax, [rip + silica_rt_fault_sbase]
+	mov	QWORD PTR [rax], 0
+	lea	rax, [rip + silica_rt_fault_ssize]
+	mov	QWORD PTR [rax], 0
+	test	rdi, rdi
+	jz	Lsfh_no_actor
+	mov	r10, QWORD PTR [rdi + 272]
+	lea	rax, [rip + silica_rt_fault_sbase]
+	mov	QWORD PTR [rax], r10
+	mov	r10, QWORD PTR [rdi + 280]
+	lea	rax, [rip + silica_rt_fault_ssize]
+	mov	QWORD PTR [rax], r10
+Lsfh_no_actor:
+	lea	rdi, [rip + silica_rt_sync_fault_handler]
+	lea	rsi, [rip + silica_rt_fault_dlinfo]
+	call	dladdr
+	lea	rsi, [rip + silica_rt_fault_dlinfo]
+	mov	rdx, QWORD PTR [rsi + 8]
+	lea	rcx, [rip + silica_rt_own_image_base]
+	mov	QWORD PTR [rcx], rdx
+# No diagnostic here: a fault inside a guarded FFI region is recovered just below and
+# reported as an actor failure, so printing the site first would add a line that the
+# caller never sees on a healthy recovery. The unrecoverable paths below still print it.
+Lsfh_pc_done:
+	mov	rdi, QWORD PTR [rbp - 32]
+	mov	rsi, QWORD PTR [rbp - 40]
+	call	silica_rt_ffi_guarded_fault_handler_try
+	test	edi, edi
+	jnz	L_sfh_done
+	jmp	L_sfh_crash
+L_sfh_exhausted:
+# The end of the reservation, for this actor only (decision 39, chunk15_stack_memory_design.md §10):
+# (:explicit, :reservation_exceeded) when the program lowered it (#376 = 1), (:explicit, :out_of_memory)
+# when the default reservation, the machine's memory plus swap, is used up. r8 = the reason atom.
+	mov	rdi, QWORD PTR [rbp - 16]
+	cmp	QWORD PTR [rdi + 376], 0
+	je	L_sfh_exhausted_default
+	mov	r8, QWORD PTR [rip + silica_rt_reservation_exceeded_atom]
+	jmp	L_sfh_exhausted_reason
+L_sfh_exhausted_default:
+	mov	r8, QWORD PTR [rip + silica_rt_out_of_memory_atom]
+L_sfh_exhausted_reason:
+	mov	r10, QWORD PTR [rdi + 440]
+	test	r10, r10
+	jz	L_sfh_exhausted_thread
+# A carrier actor (item N): the exit runs on the carrier's stack, reached by returning from this
+# handler into silica_rt_actor_fail_current(ACB, atom) with the signal frame unwound by the
+# kernel, so the carrier thread's alternate-stack state and signal mask are those of a thread
+# outside a handler when the next actor on it faults. Linux x86-64 ucontext_t gregs: RDI +104,
+# RSI +112, RSP +160, RIP +168 (the handler reads RIP from +168 above). RSP is the carrier's base
+# less 8, the state of a function just called, so fail_current's frame is aligned as any other.
+	mov	rdx, QWORD PTR [rbp - 48]
+	mov	QWORD PTR [rdx + 104], rdi
+	mov	QWORD PTR [rdx + 112], r8
+	mov	r11, QWORD PTR [r10 + 48]
+	sub	r11, 8
+	mov	QWORD PTR [rdx + 160], r11
+	lea	rax, [rip + silica_rt_actor_fail_current]
+	mov	QWORD PTR [rdx + 168], rax
+	jmp	L_sfh_done
+L_sfh_exhausted_thread:
+	mov	rdi, QWORD PTR [rbp - 16]
+	mov	rsi, r8
+	call	silica_rt_actor_fail_current
+	jmp	L_sfh_crash
+L_sfh_unrecoverable:
+# The host refused to commit memory for a growing actor stack. That is a runtime abort, not a
+# fault (spec 15.4.10.2, 15.4.5.5): status 71, reported at the instruction that touched the stack.
+	lea	rdi, [rip + Lrta_r_stack_commit]
+	xor	esi, esi
+	mov	rdx, QWORD PTR [rbp - 48]
+	test	rdx, rdx
+	jz	Lsfh_unrec_pc
+	mov	rsi, QWORD PTR [rdx + 168]
+Lsfh_unrec_pc:
+	jmp	silica_rt_abort_with_pc
+L_sfh_crash:
+# Process-fatal: the report line, then C _exit, never exit(), which would run atexit handlers and
+# flush stdio from inside the signal handler (spec 15.4.5.5).
+	call	silica_rt_print_fault_site
+	mov	edi, 70
+	call	_exit
+L_sfh_last_resort:
+	mov	rdi, QWORD PTR [rbp - 40]
+	mov	rsi, QWORD PTR [rbp - 48]
+	jmp	silica_rt_fault_last_resort
+L_sfh_done:
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	r12, QWORD PTR [rbp - 64]
+	mov	r13, QWORD PTR [rbp - 72]
+	mov	r14, QWORD PTR [rbp - 80]
+	mov	r15, QWORD PTR [rbp - 88]
+	leave
+	ret
+	.globl	silica_rt_ffi_guarded_fault_handler_try
+	.p2align	4
+silica_rt_ffi_guarded_fault_handler_try:
+# rdi = signum, rsi = siginfo* -> edi = 1 recovered (never returns then), 0 declined.
+# Frame slots: [rbp-8] x19 siginfo, [rbp-16] x20 guarded state, [rbp-24] x21 signum.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 24], rdi
+	mov	QWORD PTR [rbp - 8], rsi
+	lea	rax, [rip + silica_guarded_ffi_pthread_key]
+	mov	rdi, QWORD PTR [rax]
+# The key is zero until the first guarded region creates it. Reading a thread-specific
+# value for key zero does NOT fail: on Darwin it returns a live pointer from a slot the C
+# library reserves for itself. Without this check a fault raised before any guarded call
+# took that pointer for the per-thread guarded state, wrote the fault record over the
+# library's memory, and jumped through a sigjmp_buf made of unrelated bytes, which hung
+# the process inside longjmp instead of reporting the fault and exiting.
+	test	rdi, rdi
+	jz	L_gft_no
+	call	pthread_getspecific
+	test	rax, rax
+	jz	L_gft_no
+	mov	QWORD PTR [rbp - 16], rax
+	mov	r10, QWORD PTR [rax + 24]
+	test	r10, r10
+	jz	L_gft_no
+	mov	r10, QWORD PTR [rbp - 24]
+	movsxd	r10, r10d
+	mov	QWORD PTR [rax + 32], r10
+	mov	r11, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [r11 + 16]
+	mov	QWORD PTR [rax + 40], r10
+	movsxd	rcx, DWORD PTR [r11 + 8]
+	mov	QWORD PTR [rax + 48], rcx
+	xor	ecx, ecx
+	mov	r8, QWORD PTR [rax + 8]
+	test	r8, r8
+	jz	L_gft_store_arena
+	mov	r9, QWORD PTR [r8 + 248]
+	mov	rdx, QWORD PTR [r8 + 256]
+	test	r9, r9
+	jz	L_gft_store_arena
+	cmp	r10, r9
+	jb	L_gft_store_arena
+	cmp	r10, rdx
+	jae	L_gft_store_arena
+	mov	ecx, 1
+L_gft_store_arena:
+	mov	QWORD PTR [rax + 56], rcx
+	lea	rdi, [rip + silica_rt_fault_pc]
+	mov	rdi, QWORD PTR [rdi]
+	test	rdi, rdi
+	jz	Lgft_do_jmp
+	lea	rsi, [rip + silica_rt_fault_dlinfo]
+	call	dladdr
+	test	eax, eax
+	jz	Lgft_do_jmp
+	lea	rsi, [rip + silica_rt_fault_dlinfo]
+	mov	rdx, QWORD PTR [rsi + 8]
+	lea	rcx, [rip + silica_rt_own_image_base]
+	mov	rcx, QWORD PTR [rcx]
+	test	rcx, rcx
+	jz	Lgft_do_jmp
+# The fault image used to be compared against our own image, and a fault inside it was
+# treated as not-a-foreign-fault and left unrecovered. That only distinguishes anything
+# when the dangerous library is a separate shared object. The trials, and any static archive,
+# link the foreign code into this image, so every guarded fault was declined and the
+# process died instead of reporting reason_tag 5. Being inside the guarded window,
+# which the depth and inside flags above establish, is what makes a fault ours.
+	cmp	rdx, rcx
+Lgft_do_jmp:
+	mov	rdi, QWORD PTR [rbp - 16]
+	add	rdi, 64
+	mov	esi, 1
+	call	siglongjmp
+L_gft_no:
+	xor	edi, edi
+	leave
+	ret
+	.globl	silica_rt_ffi_guarded_fault_finish
+	.p2align	4
+silica_rt_ffi_guarded_fault_finish:
+# Frame slots: [rbp-8] x19 actor, [rbp-16] x20 guarded state / exit payload, [rbp-24] x21 ACB flag,
+# [rbp-32] the actor's carrier (0 for a dangerous actor's thread, the only kind that reaches here).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	lea	rax, [rip + silica_guarded_ffi_pthread_key]
+	mov	rdi, QWORD PTR [rax]
+# The key is zero until the first guarded region creates it. Reading a thread-specific
+# value for key zero does NOT fail: on Darwin it returns a live pointer from a slot the C
+# library reserves for itself. Without this check a fault raised before any guarded call
+# took that pointer for the per-thread guarded state, wrote the fault record over the
+# library's memory, and jumped through a sigjmp_buf made of unrelated bytes, which hung
+# the process inside longjmp instead of reporting the fault and exiting.
+	test	rdi, rdi
+	jz	L_gff_actor
+	call	pthread_getspecific
+	mov	QWORD PTR [rbp - 16], rax
+	test	rax, rax
+	jz	L_gff_actor
+	mov	QWORD PTR [rax], 0
+	mov	QWORD PTR [rax + 8], 0
+	mov	QWORD PTR [rax + 24], 0
+L_gff_actor:
+	call	silica_rt_tls_current_actor_get
+	mov	QWORD PTR [rbp - 8], rdi
+	test	rdi, rdi
+	jnz	L_gff_have_actor
+	jmp	L_gff_process
+L_gff_have_actor:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_ffi_arena_reset
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 232], 5
+	mov	DWORD PTR [rax + 152], 0
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_mail_signal
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rax, QWORD PTR [rax + 216]
+	test	rax, rax
+	jz	Lsbg_5
+	mov	rax, QWORD PTR [rax + 40]
+Lsbg_5:
+	test	rax, rax
+	jnz	L_gff_report_done
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_deliver_exit
+	mov	QWORD PTR [rbp - 16], rdi
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_deliver_unwind_report
+	jmp	L_gff_after_report
+L_gff_report_done:
+	mov	QWORD PTR [rbp - 16], 0
+L_gff_after_report:
+# The started word (#224) is set after the report so a spawner spinning on it (actor_spawn /
+# spawn_linked, while this actor's start trampoline ran) proceeds: 2 = a guarded foreign call in the init trampoline faulted. The ACB is
+# not freed under the spawner: it goes with its last holder (silica_rt_acb_release); a row child's
+# exit notice is parked at #400 until its spawner has committed it to the row.
+	mov	r10, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [r10 + 224], 0
+	jne	L_gff_started_set
+	mov	rdi, r10
+	mov	esi, 2
+	call	silica_rt_started_store
+L_gff_started_set:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_signal_pending_call_deaths
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 208]
+	mov	QWORD PTR [rbp - 16], r10
+	mov	r10, QWORD PTR [rax + 192]
+	mov	QWORD PTR [rbp - 24], r10
+# The recovery siglongjmp'd back onto the actor stack; this thread ends here, so move onto its alt
+# stack (top; nothing there is needed again) before that stack is unmapped, as fail_current does;
+# the thread itself ends through silica_rt_thread_actor_end, back on its own stack.
+# The three live values sit in this frame, which is on the stack about to go, so they ride across
+# in registers and a fresh frame holding them is built on the alt stack.
+# A carrier actor is not reachable here (the FFI is confined to dangerous actors, which keep a
+# thread each; prims_actors_carrier_asm.silica header); the branch would move onto its carrier's
+# stack (a fresh frame there, [rbp - 32] = the carrier) and end in the carrier loop.
+	mov	r11, QWORD PTR [rax + 440]
+	mov	QWORD PTR [rbp - 32], r11
+	test	r11, r11
+	jz	L_gff_thread_actor
+	mov	rdi, rax
+	mov	rsp, QWORD PTR [r11 + 48]
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 32], r11
+	xor	esi, esi
+	call	silica_rt_actor_stack_free
+	jmp	L_gff_keep_stack
+L_gff_thread_actor:
+	mov	QWORD PTR [rbp - 32], 0
+	mov	r10, QWORD PTR [rax + 352]
+	test	r10, r10
+	jz	L_gff_keep_stack
+	add	r10, 65536
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 24]
+	mov	rsp, r10
+	sub	rsp, 16
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	mov	QWORD PTR [rbp - 24], rdx
+	mov	esi, 1
+	call	silica_rt_actor_stack_free
+L_gff_keep_stack:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_ffi_arena_teardown
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_child_table_free
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_dealloc_region
+	cmp	QWORD PTR [rbp - 32], 0
+	je	L_gff_thread_end
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_actor_final_release
+	mov	rdi, QWORD PTR [rbp - 32]
+	jmp	silica_rt_carrier_loop_enter
+L_gff_thread_end:
+	mov	rdi, QWORD PTR [rbp - 8]
+	jmp	silica_rt_thread_actor_end
+L_gff_process:
+# A guarded foreign fault with no current actor has no supervisor to deliver it to: a fatal fault
+# (spec 15.4.5.5), reported from the fields the handler recorded before it jumped back here.
+	call	silica_rt_print_fault_site
+	mov	edi, 70
+	call	_exit
+	jmp	L_gff_process
+	.section .rodata
+	.p2align	2
+Lpfs_pre:
+	.asciz	\"[silica] fault at 0x\"
+Lpfs_in:
+	.asciz	\" in \"
+Lpfs_plus:
+	.asciz	\"+0x\"
+Lpfs_eol:
+	.asciz	\"\\n\"
+Lpfs_nib:
+	.asciz	\"0123456789abcdef\"
+Lfss_pre:
+	.asciz	\"  fault_pc: 0x\"
+Lpfs_ad:
+	.asciz	\"  addr=0x\"
+Lpfs_ac:
+	.asciz	\"  actor=0x\"
+Lpfs_sb:
+	.asciz	\"  sbase=0x\"
+Lpfs_ss:
+	.asciz	\"  ssize=0x\"
+	.text
+	.p2align	4
+silica_rt_fault_puts:
+# rdi = NUL-terminated string (or 0): write(2, s, strlen(s)).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	test	rdi, rdi
+	jz	Lfp_out
+	xor	esi, esi
+Lfp_len:
+	movzx	edx, BYTE PTR [rdi + rsi]
+	test	edx, edx
+	jz	Lfp_w
+	inc	rsi
+	jmp	Lfp_len
+Lfp_w:
+	test	rsi, rsi
+	jz	Lfp_out
+	mov	rdx, rsi
+	mov	rsi, rdi
+	mov	edi, 2
+	call	write
+Lfp_out:
+	leave
+	ret
+	.p2align	4
+silica_rt_fault_puthex:
+# rdi = value: write(2, 16 hex digits).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	lea	r10, [rip + silica_rt_fault_hexbuf]
+	lea	r11, [rip + Lpfs_nib]
+	xor	eax, eax
+Lph_loop:
+	cmp	rax, 16
+	jae	Lph_w
+	mov	r8, rax
+	shl	r8, 2
+	mov	ecx, 60
+	sub	ecx, r8d
+	mov	rdx, rdi
+	shr	rdx, cl
+	and	edx, 15
+	movzx	r8d, BYTE PTR [r11 + rdx]
+	mov	BYTE PTR [r10 + rax], r8b
+	inc	rax
+	jmp	Lph_loop
+Lph_w:
+	mov	edi, 2
+	mov	rsi, r10
+	mov	edx, 16
+	call	write
+	leave
+	ret
+	.globl	silica_rt_print_fault_site
+	.p2align	4
+silica_rt_print_fault_site:
+# Frame slots: [rbp-16] x20 fault pc, [rbp-32] x22 symbol name / offset.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	lea	rax, [rip + silica_rt_fault_pc]
+	mov	r10, QWORD PTR [rax]
+	mov	QWORD PTR [rbp - 16], r10
+	test	r10, r10
+	jz	Lpfs_done
+	lea	rdi, [rip + Lpfs_pre]
+	call	silica_rt_fault_puts
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_fault_puthex
+	mov	rdi, QWORD PTR [rbp - 16]
+	lea	rsi, [rip + silica_rt_fault_dlinfo]
+	call	dladdr
+	test	eax, eax
+	jz	Lpfs_nl
+	lea	rax, [rip + silica_rt_fault_dlinfo]
+	mov	r10, QWORD PTR [rax + 16]
+	mov	QWORD PTR [rbp - 32], r10
+	test	r10, r10
+	jz	Lpfs_nl
+	lea	rdi, [rip + Lpfs_in]
+	call	silica_rt_fault_puts
+	mov	rdi, QWORD PTR [rbp - 32]
+	call	silica_rt_fault_puts
+	lea	rax, [rip + silica_rt_fault_dlinfo]
+	mov	rsi, QWORD PTR [rax + 24]
+	test	rsi, rsi
+	jz	Lpfs_nl
+	mov	r10, QWORD PTR [rbp - 16]
+	sub	r10, rsi
+	mov	QWORD PTR [rbp - 32], r10
+	lea	rdi, [rip + Lpfs_plus]
+	call	silica_rt_fault_puts
+	mov	rdi, QWORD PTR [rbp - 32]
+	call	silica_rt_fault_puthex
+Lpfs_nl:
+	lea	rdi, [rip + Lpfs_ad]
+	call	silica_rt_fault_puts
+	lea	rax, [rip + silica_rt_fault_addr]
+	mov	rdi, QWORD PTR [rax]
+	call	silica_rt_fault_puthex
+	lea	rdi, [rip + Lpfs_ac]
+	call	silica_rt_fault_puts
+	lea	rax, [rip + silica_rt_fault_actor]
+	mov	rdi, QWORD PTR [rax]
+	call	silica_rt_fault_puthex
+	lea	rdi, [rip + Lpfs_sb]
+	call	silica_rt_fault_puts
+	lea	rax, [rip + silica_rt_fault_sbase]
+	mov	rdi, QWORD PTR [rax]
+	call	silica_rt_fault_puthex
+	lea	rdi, [rip + Lpfs_ss]
+	call	silica_rt_fault_puts
+	lea	rax, [rip + silica_rt_fault_ssize]
+	mov	rdi, QWORD PTR [rax]
+	call	silica_rt_fault_puthex
+	lea	rdi, [rip + Lpfs_eol]
+	call	silica_rt_fault_puts
+Lpfs_done:
+	leave
+	ret
+# rdi = ucontext -> eax = 1 when the fault interrupted code running on this thread's alternate signal
+# stack. Only the signal handler, and the runtime code it calls or leaves the thread in, runs there, so
+# that is a fault inside the handler. The test keeps no state: a per-thread in-handler flag would stay
+# set after the handler leaves by siglongjmp (guarded FFI recovery, an actor failing) and would need
+# TLS. sigaltstack(NULL, &ss) is a plain system call. A thread without an alternate stack
+# (SS_DISABLE) answers 0; every thread the runtime creates has one. The bounds are strict at both
+# ends: an actor's execution stack can be mapped directly below the alternate stack, so its top is
+# the alternate stack's base, and the growth fault of the first push of a behavior interrupts code
+# whose SP is exactly that base (a whole trial of idle actors reported a fault instead of running).
+# Frame: [rbp-8] the interrupted
+# rsp, [rbp-32..-8) the Linux stack_t (ss_sp @0, ss_flags (int) @8, ss_size @16).
+	.p2align	4
+silica_rt_fault_in_handler:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 48
+	test	rdi, rdi
+	jz	Lfih_no
+# Linux x86-64 ucontext_t: uc_mcontext.gregs @40; REG_RSP = gregs[15] @160.
+	mov	rax, QWORD PTR [rdi + 160]
+	mov	QWORD PTR [rbp - 8], rax
+	xor	edi, edi
+	lea	rsi, [rbp - 32]
+	call	sigaltstack
+	test	eax, eax
+	jnz	Lfih_no
+	test	DWORD PTR [rbp - 24], 2
+	jnz	Lfih_no
+	mov	rcx, QWORD PTR [rbp - 32]
+	mov	rdx, QWORD PTR [rbp - 16]
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	rax, rcx
+	jbe	Lfih_no
+	add	rdx, rcx
+	cmp	rax, rdx
+	jae	Lfih_no
+	mov	eax, 1
+	leave
+	ret
+Lfih_no:
+	xor	eax, eax
+	leave
+	ret
+# Last-resort fault report (spec 15.4.5.5): rdi = siginfo, rsi = ucontext of the fault raised inside
+# the handler. Writes the line [silica] fault at 0x<pc>  addr=0x<fault address> and ends with
+# _exit(70). It uses only write(2) and _exit: no dladdr (it takes the loader's lock, which the faulting
+# handler may hold, and it may be what faulted), no TLS, no actor fields. The first handler may have
+# written part of its own line; the report tools fold everything after the first fault banner on a
+# line. Reached by a jump from the handler's 16-byte aligned frame. r12/r13 survive the calls below.
+# Never returns.
+	.p2align	4
+silica_rt_fault_last_resort:
+	xor	r12d, r12d
+	xor	r13d, r13d
+	test	rsi, rsi
+	jz	Llr_addr
+	mov	r12, QWORD PTR [rsi + 168]
+Llr_addr:
+	test	rdi, rdi
+	jz	Llr_write
+	mov	r13, QWORD PTR [rdi + 16]
+Llr_write:
+	lea	rdi, [rip + Lpfs_pre]
+	call	silica_rt_fault_puts
+	mov	rdi, r12
+	call	silica_rt_fault_puthex
+	lea	rdi, [rip + Lpfs_ad]
+	call	silica_rt_fault_puts
+	mov	rdi, r13
+	call	silica_rt_fault_puthex
+	lea	rdi, [rip + Lpfs_eol]
+	call	silica_rt_fault_puts
+	mov	edi, 70
+	call	_exit
+Llr_hang:
+	jmp	Llr_hang
+	.p2align	4
+silica_rt_fault_bufcat:
+# rdi = buf, rsi = cap, rdx = pos, rcx = NUL-terminated src -> rdi = new pos.
+	mov	r8, rdx
+Lbc_loop:
+	movzx	r9d, BYTE PTR [rcx]
+	inc	rcx
+	test	r9d, r9d
+	jz	Lbc_out
+	cmp	r8, rsi
+	jae	Lbc_out
+	mov	BYTE PTR [rdi + r8], r9b
+	inc	r8
+	jmp	Lbc_loop
+Lbc_out:
+	mov	rdi, r8
+	ret
+	.p2align	4
+silica_rt_fault_bufhex:
+# rdi = buf, rsi = cap, rdx = pos, rcx = value -> rdi = new pos (16 hex digits appended).
+	mov	r8, rdx
+	lea	r10, [rip + Lpfs_nib]
+	mov	r11, rcx
+	xor	r9d, r9d
+Lbh_loop:
+	cmp	r9, 16
+	jae	Lbh_out
+	cmp	r8, rsi
+	jae	Lbh_out
+	mov	eax, r9d
+	shl	eax, 2
+	mov	ecx, 60
+	sub	ecx, eax
+	mov	rax, r11
+	shr	rax, cl
+	and	eax, 15
+	movzx	eax, BYTE PTR [r10 + rax]
+	mov	BYTE PTR [rdi + r8], al
+	inc	r8
+	inc	r9
+	jmp	Lbh_loop
+Lbh_out:
+	mov	rdi, r8
+	ret
+	.globl	silica_rt_fault_site_snprint
+	.p2align	4
+silica_rt_fault_site_snprint:
+# rdi = buf, rsi = cap -> rdi = bytes written. Frame slots: [rbp-8] x19 buf, [rbp-16] x20 cap,
+# [rbp-32] x22 fault pc / offset, [rbp-40] x23 position.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 80
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 16], rsi
+	lea	rax, [rip + silica_rt_fault_pc]
+	mov	r10, QWORD PTR [rax]
+	mov	QWORD PTR [rbp - 32], r10
+	test	r10, r10
+	jz	Lfss_zero
+	mov	QWORD PTR [rbp - 40], 0
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 40]
+	lea	rcx, [rip + Lfss_pre]
+	call	silica_rt_fault_bufcat
+	mov	QWORD PTR [rbp - 40], rdi
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 40]
+	mov	rcx, QWORD PTR [rbp - 32]
+	call	silica_rt_fault_bufhex
+	mov	QWORD PTR [rbp - 40], rdi
+	mov	rdi, QWORD PTR [rbp - 32]
+	lea	rsi, [rip + silica_rt_fault_dlinfo]
+	call	dladdr
+	test	eax, eax
+	jz	Lfss_eol
+	lea	rax, [rip + silica_rt_fault_dlinfo]
+	mov	rdx, QWORD PTR [rax + 16]
+	test	rdx, rdx
+	jz	Lfss_eol
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 40]
+	lea	rcx, [rip + Lpfs_in]
+	call	silica_rt_fault_bufcat
+	mov	QWORD PTR [rbp - 40], rdi
+	lea	rax, [rip + silica_rt_fault_dlinfo]
+	mov	rcx, QWORD PTR [rax + 16]
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 40]
+	call	silica_rt_fault_bufcat
+	mov	QWORD PTR [rbp - 40], rdi
+	lea	rax, [rip + silica_rt_fault_dlinfo]
+	mov	rcx, QWORD PTR [rax + 24]
+	test	rcx, rcx
+	jz	Lfss_eol
+	mov	r10, QWORD PTR [rbp - 32]
+	sub	r10, rcx
+	mov	QWORD PTR [rbp - 32], r10
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 40]
+	lea	rcx, [rip + Lpfs_plus]
+	call	silica_rt_fault_bufcat
+	mov	QWORD PTR [rbp - 40], rdi
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 40]
+	mov	rcx, QWORD PTR [rbp - 32]
+	call	silica_rt_fault_bufhex
+	mov	QWORD PTR [rbp - 40], rdi
+Lfss_eol:
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 40]
+	lea	rcx, [rip + Lpfs_eol]
+	call	silica_rt_fault_bufcat
+	jmp	Lfss_out
+Lfss_zero:
+	xor	edi, edi
+Lfss_out:
+	leave
+	ret
+";
+    concat(bss, concat(text, emit_abort_runtime_asm()))
+}

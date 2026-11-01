@@ -1,0 +1,166 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Crash bookkeeping for the compiler's batch (main.silica; actor_memory_budget_plan.md item L). When
+// the compiler itself dies inside a unit (a fault, `badarith`, `case_clause`), the root supervisor
+// fails and the FailureReporter ends the process with status 76 (`root_failure_status`). The batch
+// loop that reruns the compiler on 75 reruns it on 76 too, and the next process reports the crashed
+// unit, skips it and compiles the rest. Two small files carry what the next process needs to know:
+//
+//   silica.compile.inprogress   the unit being compiled right now, written just before a unit's
+//                               compile starts and deleted as soon as it returns, so it exists at the
+//                               start of a run only when the previous process died inside that unit;
+//   silica.compile.crashed      one line per unit the compiler crashed on during this batch, read by
+//                               the unit loops (skip it) and by the batch end (status 1).
+//
+// Both are batch state like silica.compile.order: they survive the exits 75 and 76 between the
+// processes of one batch, and the Makefile's `assembly` recipe removes them when a new batch starts,
+// so a marker left by a killed earlier build is never taken for a crash.
+
+export mark_unit_started/1;
+export mark_unit_finished/0;
+export note_crashed_unit/0;
+export forget_crashed_if_fresh/1;
+export is_crashed/1;
+export crashed_status/0;
+export root_failure_status/0;
+
+fn inprogress_path() -> string {
+    "silica.compile.inprogress"
+}
+
+fn crashed_path() -> string {
+    "silica.compile.crashed"
+}
+
+// Written without a newline, so the file's content is exactly the unit path.
+fn mark_unit_started(path: string) -> int64 {
+    sequence proc[DeviceIO]
+        result: int64 <- {
+            delete_file(inprogress_path());
+            _: boolean <- append_file(inprogress_path(), path);
+            0
+        }
+    produces
+        pure result
+    end
+}
+
+fn mark_unit_finished() -> int64 {
+    sequence proc[DeviceIO]
+        result: int64 <- {
+            delete_file(inprogress_path());
+            0
+        }
+    produces
+        pure result
+    end
+}
+
+// The process status when the root supervisor fails: 76 ("crashed in a unit, continue") when the
+// crash happened inside a unit's compile, so the batch loop runs the next process; 1 otherwise.
+fn root_failure_status() -> int64 {
+    sequence proc[DeviceIO]
+        in_unit: boolean <- file_exists(inprogress_path());
+        result: int64 <- case in_unit of {
+            true -> 76;
+            false -> 1
+        }
+    produces
+        pure result
+    end
+}
+
+// The first thing a run does. A marker left by the previous process means the compiler crashed
+// inside that unit: say so, record the unit as crashed, and consume the marker. True when it did.
+fn note_crashed_unit() -> boolean {
+    sequence proc[DeviceIO]
+        result: boolean <- {
+            exists: boolean <- file_exists(inprogress_path());
+            case exists of {
+                false -> false;
+                true -> {
+                    crashed_unit: string <- read_lines(inprogress_path());
+                    _: int8 <- println(concat(concat("Error: the compiler crashed while compiling ", crashed_unit), "; the unit is recorded as failed and skipped"));
+                    _: boolean <- append_file(crashed_path(), concat(crashed_unit, "\n"));
+                    delete_file(inprogress_path());
+                    true
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+// A run that found neither a marker nor a compile order is a fresh batch (a small config outside the
+// Makefile, or the first run of a batch). A crashed list it finds is a leftover of an earlier run that
+// never reached its end, and would make this batch's status 1 for a crash that is not its own.
+fn forget_crashed_if_fresh(resumed: boolean) -> int64 {
+    sequence proc[DeviceIO]
+        result: int64 <- {
+            case resumed of {
+                true -> 0;
+                false -> {
+                    delete_file(crashed_path());
+                    0
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+fn is_crashed(path: string) -> boolean {
+    sequence proc[DeviceIO]
+        result: boolean <- {
+            exists: boolean <- file_exists(crashed_path());
+            case exists of {
+                false -> false;
+                true -> {
+                    listed: string <- read_lines(crashed_path());
+                    contains(concat("\n", listed), concat(concat("\n", path), "\n"))
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+// The batch's last word on crashes: 1, with the crashed units listed, when there were any; else 0.
+// Consumes the list, so the next batch starts clean.
+fn crashed_status() -> int64 {
+    sequence proc[DeviceIO]
+        result: int64 <- {
+            exists: boolean <- file_exists(crashed_path());
+            case exists of {
+                false -> 0;
+                true -> {
+                    listed: string <- read_lines(crashed_path());
+                    _: int8 <- println("Error: the compiler crashed while compiling these units (recorded as failed):");
+                    _: int8 <- print(listed);
+                    delete_file(crashed_path());
+                    1
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}

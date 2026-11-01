@@ -1,0 +1,664 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// List prim emission: list_nil, list_cons, list_length, list_head, list_remove_head
+// list_implementation_design.md §4–§9: chunk-based spine; immutable handles, mutable chunks.
+//
+// List handle (24 bytes, heap-allocated; pointer = 0 for nil):
+//   [0..8)   = length  (int64, total list length)
+//   [8..16)  = chunk_ptr (pointer to first data chunk)
+//   [16..24) = cursor   (byte offset of first element within chunk data area)
+//
+// Data chunk (CDATA + 8 bytes, heap-allocated):
+//   [0..CDATA)          = element slots (filled back-to-front per §9.5)
+//   [CDATA..CDATA+8)    = next chunk pointer (0 = end of spine)
+//
+// CDATA = max(16, elem_slot_bytes).  Capacity = CDATA / elem_slot_bytes.
+// Empty list: register value 0.  Chunks are mutable (new slots filled in place);
+// elements once written are immutable.  Handles are immutable once created.
+
+use reg_conventions;
+use var;
+use prims_tuple;
+use prims_record;
+use atom_table;
+use x86_isa;
+use x86_mem;
+
+export is_list_prim/1;
+export emit_prim_op/2;
+export module_uses_list_prims/1;
+export emit_list_helpers/0;
+export emit_list_at_helper/0;
+export module_uses_list_at/1;
+export emit_region_alloc_stub/0;
+export list_element_payload_bytes/1;
+export chunk_elem_slot_bytes/1;
+export chunk_data_bytes/1;
+export chunk_elem_slot_bytes_from_list_t/1;
+export list_elem_type_from_list_t/1;
+export chunk_data_bytes_from_list_t/1;
+export list_elem_is_inline_aggregate/1;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn is_list_prim(name: string) -> boolean {
+    name == "list_nil" or name == "list_cons" or name == "list_length" or name == "list_head" or name == "list_remove_head" or name == "list_at"
+}
+
+fn term_has_list_prim(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> case sir_term_root_node(term).kind of {
+            6 -> case is_list_prim(sir_term_root_node(term).name) of {
+                true -> true;
+                false -> case term_has_list_prim(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                    true -> true;
+                    false -> term_has_list_prim(sir_term_at(term, sir_term_root_node(term).right_expr))
+                }
+            };
+            2 -> case term_has_list_prim(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_prim(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            3 -> case term_has_list_prim(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_prim(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            4 -> case term_has_list_prim(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_prim(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            5 -> case term_has_list_prim(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_prim(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            7 -> case term_has_list_prim(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_prim(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            8 -> case term_has_list_prim(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_prim(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            _: int64 -> false
+        }
+    }
+}
+
+// L_list_at_helper is emitted only for modules that actually use list_at, so adding the
+// builtin leaves every other list-using module byte-identical. Cloned verbatim from
+// term_has_list_prim / list_prim_in_functions so the record element types match exactly.
+fn term_has_list_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> case sir_term_root_node(term).kind of {
+            6 -> case sir_term_root_node(term).name == "list_at" of {
+                true -> true;
+                false -> case term_has_list_at(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                    true -> true;
+                    false -> term_has_list_at(sir_term_at(term, sir_term_root_node(term).right_expr))
+                }
+            };
+            2 -> case term_has_list_at(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_at(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            3 -> case term_has_list_at(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_at(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            4 -> case term_has_list_at(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_at(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            5 -> case term_has_list_at(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_at(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            7 -> case term_has_list_at(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_at(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            8 -> case term_has_list_at(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_at(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            _: int64 -> false
+        }
+    }
+}
+
+
+fn list_at_in_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> boolean {
+    case fns.is_nil of {
+        true -> false;
+        false -> case term_has_list_at(fns.head.body) of {
+            true -> true;
+            false -> list_at_in_functions(fns.tail)
+        }
+    }
+}
+
+
+fn list_prim_in_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> boolean {
+    case fns.is_nil of {
+        true -> false;
+        false -> case term_has_list_prim(fns.head.body) of {
+            true -> true;
+            false -> list_prim_in_functions(fns.tail)
+        }
+    }
+}
+
+fn term_has_list_cons_pattern(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> case sir_term_root_node(term).kind of {
+            8 -> case sir_term_root_node(term).value == "list_cons" of {
+                true -> true;
+                false -> case term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                    true -> true;
+                    false -> term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).right_expr))
+                }
+            };
+            2 -> case term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            3 -> case term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            4 -> case term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            5 -> case term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            6 -> case term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            7 -> case term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_list_cons_pattern(sir_term_at(term, sir_term_root_node(term).right_expr))
+            };
+            _: int64 -> false
+        }
+    }
+}
+
+fn list_cons_pattern_in_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> boolean {
+    case fns.is_nil of {
+        true -> false;
+        false -> case term_has_list_cons_pattern(fns.head.body) of {
+            true -> true;
+            false -> list_cons_pattern_in_functions(fns.tail)
+        }
+    }
+}
+
+fn module_uses_list_prims(sir_module: { module_name: string, used_modules: List[string, mem(normal)], exports: List[{ fn_name: string, arity: string }, mem(normal)], export_trait_names: List[string, mem(normal)], marker_impl_types: List[string, mem(normal)], supervisor_impl_types: List[string, mem(normal)], supervisor_phase_e: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], failure_reporter_impl_types: List[string, mem(normal)], required_method_sigs: List[{ name: string, param_names: string, param_types: string, return_type: string, effects: string }, mem(normal)], runtime_dependencies: List[string, mem(normal)], is_dangerous_module: boolean, wrapper_meta_paths: List[string, mem(normal)], foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], link_libraries: List[string, mem(normal)], functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] }) -> boolean {
+    case list_prim_in_functions(sir_module.functions) of {
+        true -> true;
+        false -> list_cons_pattern_in_functions(sir_module.functions)
+    }
+}
+
+fn module_uses_list_at(sir_module: { module_name: string, used_modules: List[string, mem(normal)], exports: List[{ fn_name: string, arity: string }, mem(normal)], export_trait_names: List[string, mem(normal)], marker_impl_types: List[string, mem(normal)], supervisor_impl_types: List[string, mem(normal)], supervisor_phase_e: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], failure_reporter_impl_types: List[string, mem(normal)], required_method_sigs: List[{ name: string, param_names: string, param_types: string, return_type: string, effects: string }, mem(normal)], runtime_dependencies: List[string, mem(normal)], is_dangerous_module: boolean, wrapper_meta_paths: List[string, mem(normal)], foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], link_libraries: List[string, mem(normal)], functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] }) -> boolean {
+    list_at_in_functions(sir_module.functions)
+}
+
+// Comma at depth 0; depth increases for [, (, {; decreases for ], ), }.
+fn find_first_comma_depth0_pb(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> find_first_comma_depth0_pb(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> find_first_comma_depth0_pb(s, i + 1, depth - 1);
+                    false -> case c == "," of {
+                        true -> case depth == 0 of {
+                            true -> i;
+                            false -> find_first_comma_depth0_pb(s, i + 1, depth)
+                        };
+                        false -> find_first_comma_depth0_pb(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Strips spaces so "List [ T , mem ]" becomes "List[T,mem]".
+fn list_elem_type_from_list_t(list_t: string) -> string {
+    t: string <- prims_record@strip_spaces_rt(list_t);
+    case length_bytes(t) < 6 of {
+        true -> "";
+        false -> case substring(t, 0, 5) == "List[" of {
+            false -> "";
+            true -> case substring(t, length_bytes(t) - 1, length_bytes(t)) == "]" of {
+                false -> "";
+                true -> {
+                    inner: string <- substring(t, 5, length_bytes(t) - 1);
+                    inner_trim: string <- prims_record@strip_spaces_rt(inner);
+                    comma: int64 <- find_first_comma_depth0_pb(inner_trim, 0, 0);
+                    case comma >= length_bytes(inner_trim) of {
+                        true -> inner_trim;
+                        false -> prims_record@strip_spaces_rt(substring(inner_trim, 0, comma))
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Byte size of one element slot in a chunk.  Narrow scalars use their natural width
+// so that multiple elements pack into the 128-bit data area.
+fn element_type_is_child_spec_record(elem_t: string) -> boolean {
+    length_bytes(prims_record@find_field_type_in_record(elem_t, "id")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(elem_t, "agent_type")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(elem_t, "initial_state")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(elem_t, "behavior")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(elem_t, "restart")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(elem_t, "shutdown")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(elem_t, "flavor")) > 0
+}
+
+fn chunk_elem_slot_bytes(elem_t: string) -> int64 {
+    case reg_conventions@is_inline_struct_type(elem_t) of {
+        true -> {
+            // Boxed layout (prims_record header): a record element is one pointer word to the
+            // region copy emit_list_cons makes, the same word a generic List[ItemType] cell holds.
+            // The lists the actor runtime reads or builds itself are the exception and keep the
+            // record spliced into the cell: child-spec lists (+8 for the hidden trampoline word in
+            // the initial_state form) and the supervisor's which_children list of child-info
+            // records (_silica_rt_supervisor_which_children writes 32-byte cells).
+            visible_bytes: int64 <- prims_record@record_type_list_cons_payload_bytes(elem_t);
+            case element_type_is_child_spec_record(elem_t) of {
+                true -> visible_bytes + 8;
+                false -> case element_type_is_runtime_inline_record(elem_t) of {
+                    true -> visible_bytes;
+                    false -> 8
+                }
+            }
+        };
+        false -> case reg_conventions@is_tuple_type(elem_t) of {
+            true -> 8;
+            false -> case elem_t of {
+                "int8"  -> 1;
+                "uint8" -> 1;
+                "int16" -> 2;
+                "uint16" -> 2;
+                "int32" -> 4;
+                "uint32" -> 4;
+                "float32" -> 4;
+                _: string -> 8
+            }
+        }
+    }
+}
+
+// Total data area per chunk (128-bit minimum, or elem_slot_bytes if element is larger).
+fn chunk_data_bytes(elem_t: string) -> int64 {
+    es: int64 <- chunk_elem_slot_bytes(elem_t);
+    case es > 16 of {
+        true -> es;
+        false -> 16
+    }
+}
+
+fn list_elem_or_int64(list_t: string) -> string {
+    em: string <- list_elem_type_from_list_t(list_t);
+    case length_bytes(em) == 0 of {
+        true -> "int64";
+        false -> em
+    }
+}
+
+fn chunk_elem_slot_bytes_from_list_t(list_t: string) -> int64 {
+    chunk_elem_slot_bytes(list_elem_or_int64(list_t))
+}
+
+fn chunk_data_bytes_from_list_t(list_t: string) -> int64 {
+    chunk_data_bytes(list_elem_or_int64(list_t))
+}
+
+// Legacy export: flat byte size of one list element.
+fn list_element_payload_bytes(elem_t: string) -> int64 {
+    chunk_elem_slot_bytes(elem_t)
+}
+
+
+// Only a record whose list the actor runtime reads or builds is spliced into its cell (child
+// specs, supervisor child info); every other aggregate element is a pointer word, so `.head`, `list_at` and `[h | t]`
+// load it like a scalar. See chunk_elem_slot_bytes.
+fn list_elem_is_inline_aggregate(elem_t: string) -> boolean {
+    reg_conventions@is_aggregate_struct_or_tuple_return_type(elem_t)
+        and (element_type_is_child_spec_record(elem_t) or element_type_is_runtime_inline_record(elem_t))
+}
+
+// Element records whose list cells the actor runtime lays out itself (besides the initial_state
+// child spec above): the `start:`-form child spec, and the supervisor child-info record
+// { id, agent_type, child, restart } of which_children replies.
+fn element_type_is_runtime_inline_record(elem_t: string) -> boolean {
+    prims_record@record_type_is_start_child_spec(elem_t)
+        or (prims_record@count_record_fields(elem_t) == 4
+            and length_bytes(prims_record@find_field_type_in_record(elem_t, "id")) > 0
+            and length_bytes(prims_record@find_field_type_in_record(elem_t, "agent_type")) > 0
+            and length_bytes(prims_record@find_field_type_in_record(elem_t, "child")) > 0
+            and length_bytes(prims_record@find_field_type_in_record(elem_t, "restart")) > 0)
+}
+
+// Bytes the region copy of one boxed element carries: the element's own flat size.
+fn list_elem_box_bytes(elem_t: string) -> int64 {
+    case reg_conventions@is_inline_struct_type(elem_t) of {
+        true -> prims_record@record_type_value_flat_byte_size(elem_t);
+        false -> case reg_conventions@is_tuple_type(elem_t) of {
+            true -> prims_tuple@flat_alloc_size(prims_tuple@count_type_elements(elem_t));
+            false -> 0
+        }
+    }
+}
+
+fn list_head_box_copy_words(i: int64, words: int64) -> string {
+    case i >= words of {
+        true -> "";
+        false -> {
+            off: string <- atom_table@int64_to_decimal_string(i * 8);
+            one: string <- concat(x86_mem@x86_ldr("X3", concat("[X1, #", concat(off, "]"))), x86_mem@x86_str("X3", concat("[X0, #", concat(off, "]"))));
+            concat(one, list_head_box_copy_words(i + 1, words))
+        }
+    }
+}
+
+// Box the aggregate head in X1 before the prepend: copy it to the region and leave the copy's
+// pointer in X1, keeping X2 (the tail). The cell then stores that word. Copying (rather than
+// storing the pointer we were handed) is what keeps a let-bound, frame-resident record safe in
+// the list after the frame is gone, exactly as the old inline memcpy did.
+fn emit_list_head_box(nbytes: int64) -> string {
+    case nbytes <= 0 of {
+        true -> "";
+        false -> {
+            // A frame copy (chunk 15 phase 2): L_dyn_alloc keeps X1 (the head) and X2 (the tail).
+            n16: int64 <- (nbytes + 15) / 16 * 16;
+            alloc: string <- concat("    mov eax, ", concat(atom_table@int64_to_decimal_string(n16), "\n    call L_dyn_alloc\n    mov rdi, rax\n"));
+            copy: string <- list_head_box_copy_words(0, nbytes / 8);
+            concat(alloc, concat(copy, x86_isa@x86_mov("X1", "X0")))
+        }
+    }
+}
+
+fn emit_list_nil(dest: string) -> string {
+    x86_isa@x86_mov(dest, "#0")
+}
+
+// X1 = head value (or ptr to aggregate), X2 = tail list handle (or 0).
+// Emits: set up X3=elem_size, X4=chunk_data_size, BL L_list_prepend_helper.
+fn emit_list_cons(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    et: string <- sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name;
+    es: int64 <- chunk_elem_slot_bytes(et);
+    cd: int64 <- chunk_data_bytes(et);
+    es_s: string <- atom_table@int64_to_decimal_string(es);
+    cd_s: string <- atom_table@int64_to_decimal_string(cd);
+    is_agg: boolean <- reg_conventions@is_aggregate_struct_or_tuple_return_type(et);
+    // Boxed layout: an aggregate head is copied to the region here and its pointer is stored as
+    // a plain word (X5 = 0); only a child-spec head is still memcpy'd into the cell (X5 = 1).
+    inline_agg: boolean <- list_elem_is_inline_aggregate(et);
+    box_asm: string <- case is_agg and inline_agg == false of {
+        true -> emit_list_head_box(list_elem_box_bytes(et));
+        false -> ""
+    };
+    mov_es: string <- x86_isa@x86_movi_text("X3", es_s);
+    mov_cd: string <- x86_isa@x86_movi_text("X4", cd_s);
+    agg_flag: string <- case inline_agg of {
+        true -> x86_isa@x86_movi("X5", 1);
+        false -> x86_isa@x86_movi("X5", 0)
+    };
+    // Chunk 15 phase 2 (design §3.7): the handle (32 bytes) and a chunk (CDATA + 16) are one frame
+    // block allocated here and passed in X0 = rdi, its low bit saying whether an element can be a
+    // pointer (the block is 16-aligned), which decides whether a free slot of an older chunk may take
+    // it (L_list_prepend_helper).
+    block: int64 <- (32 + cd + 16 + 15) / 16 * 16;
+    ptr_bit: string <- case reg_conventions@is_frame_free_scalar_type(et) of {
+        true -> "0";
+        false -> "1"
+    };
+    frame: string <- concat("    mov eax, ", concat(atom_table@int64_to_decimal_string(block), concat("\n    call L_dyn_alloc\n    lea rdi, [rax + ", concat(ptr_bit, "]\n"))));
+    bl: string <- x86_isa@x86_call("L_list_prepend_helper");
+    mov_d: string <- case dest == "X0" of {
+        true -> "";
+        false -> x86_isa@x86_mov(dest, "X0")
+    };
+    concat(box_asm, concat(concat(concat(concat(concat(frame, mov_es), mov_cd), agg_flag), bl), mov_d))
+}
+
+// X9 = list handle pointer.  Dereference handle → chunk → cursor → element.
+fn emit_list_head(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    load_chunk: string <- x86_mem@x86_ldr("X10", "[X9, #8]");
+    load_cursor: string <- x86_mem@x86_ldr("X11", "[X9, #16]");
+    addr: string <- x86_isa@x86_add("X10", "X10", "X11");
+    case list_elem_is_inline_aggregate(sir_term_root_node(term).type_name) of {
+        true -> concat(concat(load_chunk, load_cursor), concat(addr, x86_isa@x86_mov(dest, "X10")));
+        false -> {
+            ed: string <- case reg_conventions@is_narrow_type(sir_term_root_node(term).type_name) of {
+                true -> case length_bytes(dest) > 0 of {
+                    true -> case substring(dest, 0, 1) == "X" of {
+                        true -> concat("W", substring(dest, 1, length_bytes(dest)));
+                        false -> dest
+                    };
+                    false -> dest
+                };
+                false -> dest
+            };
+            ld: string <- case reg_conventions@is_narrow_type(sir_term_root_node(term).type_name) of {
+                true -> case sir_term_root_node(term).type_name of {
+                    "int8" -> x86_mem@x86_ldrsb(ed, "[X10]");
+                    "uint8" -> x86_mem@x86_ldrb(ed, "[X10]");
+                    "int16" -> x86_mem@x86_ldrsh(ed, "[X10]");
+                    "uint16" -> x86_mem@x86_ldrh(ed, "[X10]");
+                    _: string -> x86_mem@x86_ldr(ed, "[X10]")
+                };
+                false -> x86_mem@x86_ldr(dest, "[X10]")
+            };
+            concat(concat(load_chunk, load_cursor), concat(addr, ld))
+        }
+    }
+}
+
+// X9 = list handle, X10 = index.  L_list_at_helper walks chunks in registers and returns the
+// element address in X0 -- no handle is allocated per step, unlike a .tail walk. Out of range
+// aborts, like a buf bounds failure. The element is then produced exactly as list_head does.
+fn emit_list_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    em: string <- list_elem_type_from_list_t(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name);
+    et: string <- case length_bytes(em) == 0 of { true -> "int64"; false -> em };
+    es: int64 <- chunk_elem_slot_bytes(et);
+    cd: int64 <- chunk_data_bytes(et);
+    setup: string <- concat(concat(x86_isa@x86_mov("X0", "X9"), x86_isa@x86_mov("X1", "X10")), concat(x86_isa@x86_movi("X2", es), x86_isa@x86_movi("X3", cd)));
+    bl: string <- concat(x86_isa@x86_call("L_list_at_helper"), x86_isa@x86_mov("X10", "X0"));
+    case list_elem_is_inline_aggregate(sir_term_root_node(term).type_name) of {
+        true -> concat(concat(setup, bl), x86_isa@x86_mov(dest, "X10"));
+        false -> {
+            ed: string <- case reg_conventions@is_narrow_type(sir_term_root_node(term).type_name) of {
+                true -> case length_bytes(dest) > 0 of {
+                    true -> case substring(dest, 0, 1) == "X" of {
+                        true -> concat("W", substring(dest, 1, length_bytes(dest)));
+                        false -> dest
+                    };
+                    false -> dest
+                };
+                false -> dest
+            };
+            ld: string <- case reg_conventions@is_narrow_type(sir_term_root_node(term).type_name) of {
+                true -> case sir_term_root_node(term).type_name of {
+                    "int8" -> x86_mem@x86_ldrsb(ed, "[X10]");
+                    "uint8" -> x86_mem@x86_ldrb(ed, "[X10]");
+                    "int16" -> x86_mem@x86_ldrsh(ed, "[X10]");
+                    "uint16" -> x86_mem@x86_ldrh(ed, "[X10]");
+                    _: string -> x86_mem@x86_ldr(ed, "[X10]")
+                };
+                false -> x86_mem@x86_ldr(dest, "[X10]")
+            };
+            concat(concat(setup, bl), ld)
+        }
+    }
+}
+
+// X9 = list handle.  Produce tail handle via helper.
+fn emit_list_remove_head(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    em: string <- list_elem_type_from_list_t(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name);
+    et: string <- case length_bytes(em) == 0 of { true -> "int64"; false -> em };
+    es: int64 <- chunk_elem_slot_bytes(et);
+    cd: int64 <- chunk_data_bytes(et);
+    es_s: string <- atom_table@int64_to_decimal_string(es);
+    cd_s: string <- atom_table@int64_to_decimal_string(cd);
+    setup: string <- concat(x86_isa@x86_mov("X0", "X9"), concat(x86_isa@x86_movi_text("X1", es_s), x86_isa@x86_movi_text("X2", cd_s)));
+    // The tail handle is a 32-byte frame block passed in rax (chunk 15 phase 2).
+    bl: string <- concat("    mov eax, 32\n    call L_dyn_alloc\n", x86_isa@x86_call("L_list_tail_helper"));
+    mov_d: string <- case dest == "X0" of {
+        true -> "";
+        false -> x86_isa@x86_mov(dest, "X0")
+    };
+    concat(concat(setup, bl), mov_d)
+}
+
+// X9 = list handle.  Length is memoized at handle[0].  O(1).
+// Call helper: X0=handle → X0=length.  Helper returns 0 for nil handle.
+fn emit_list_length(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    mov_arg: string <- x86_isa@x86_mov("X0", "X9");
+    bl: string <- x86_isa@x86_call("L_list_length_helper");
+    mov_out: string <- case dest == "X0" of {
+        true -> "";
+        false -> x86_isa@x86_mov(dest, "X0")
+    };
+    concat(concat(mov_arg, bl), mov_out)
+}
+
+// O(1) length helper (hand-written x86-64, leaf): X0 = rdi = handle (or 0 for nil). Returns X0 = rdi = length.
+fn emit_list_length_helper() -> string {
+    "L_list_length_helper:\n    test rdi, rdi\n    jz L_list_len_nil\n    mov rdi, QWORD PTR [rdi]\n    ret\nL_list_len_nil:\n    xor edi, edi\n    ret\n"
+}
+
+fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    case sir_term_root_node(term).name of {
+        "list_nil" -> emit_list_nil(dest);
+        "list_cons" -> emit_list_cons(term, dest);
+        "list_length" -> emit_list_length(term, dest);
+        "list_at" -> emit_list_at(term, dest);
+        "list_head" -> emit_list_head(term, dest);
+        "list_remove_head" -> emit_list_remove_head(term, dest);
+        _: string -> concat(concat(".error \"unsupported list prim: ", concat(sir_term_root_node(term).name, "\"\n")), "\n")
+    }
+}
+
+// Module-level helper: L_list_prepend_helper (hand-written x86-64; internal convention:
+// X1 = rsi head value (or pointer to aggregate), X2 = rdx old handle (0=nil),
+// X3 = rcx elem_slot_bytes, X4 = r8 chunk_data_bytes, X5 = r9 is_aggregate (0 or 1),
+// X0 = rdi = a frame block of the caller's with bit 0 set when the element can be a pointer (chunk 15
+// phase 2): the new handle is block + 0 and a new or copied chunk block + 32, so nothing is allocated
+// here. A free slot of an older chunk takes a pointer element only when that chunk lies in the
+// caller's own frame ([rsp, caller's rbp)); otherwise the prepend copies on write (see the AArch64 helper).
+// Returns X0 = rdi = new list handle. Temps: X6 r14, X7 r15, X8 rbx, X9 r10, X10 r11, X11 r12,
+// X12 r13, X13 rax. Every value live across silica_rt_region_alloc (which returns in rdi and may
+// clobber anything but rbp/rsp) sits in the 16-byte stack slots the AArch64 code already used.
+// Chunk: [data][next chunk][claim]; see the AArch64 helper (apple_silicon_mac prims_list) for the
+// claim word that keeps a second prepend onto the same list from overwriting the first one's head.
+fn emit_list_prepend_helper() -> string {
+    concat(concat("L_list_prepend_helper:\n    push rbp\n    mov rbp, rsp\n    sub rsp, 16\n    mov QWORD PTR [rsp], rdi\n    sub rsp, 16\n    mov QWORD PTR [rsp], rsi\n    mov QWORD PTR [rsp + 8], rdx\n    sub rsp, 16\n    mov QWORD PTR [rsp], rcx\n    mov QWORD PTR [rsp + 8], r8\n    sub rsp, 16\n    mov QWORD PTR [rsp], r9\n    test rdx, rdx\n    jz L_lph_new_chunk\n    mov r14, QWORD PTR [rdx + 16]\n    test r14, r14\n    jz L_lph_new_chunk\n    mov r15, QWORD PTR [rdx + 8]\n    mov rax, QWORD PTR [rbp - 16]\n    test rax, 1\n    jz L_lph_frame_ok\n    cmp r15, rsp\n    jb L_lph_cow\n    cmp r15, QWORD PTR [rbp]\n    jae L_lph_cow\nL_lph_frame_ok:\n    lea rbx, [r15 + r8]\n    mov rax, QWORD PTR [rbx + 8]\n    cmp rax, r14\n    jne L_lph_cow\n    mov rbx, r14\n    sub rbx, rcx\n    mov QWORD PTR [r15 + r8 + 8], rbx\n    lea r11, [r15 + rbx]\n    mov r12, QWORD PTR [rsp]\n    test r12, r12\n    jz L_lph_room_scalar\n    xor r13d, r13d\nL_lph_room_agg:\n    cmp r13, rcx\n    jge L_lph_room_stored\n    mov rax, QWORD PTR [rsi + r13]\n    mov QWORD PTR [r11 + r13], rax\n    add r13, 8\n    jmp L_lph_room_agg\n    jmp L_lph_room_stored\nL_lph_room_scalar:\n    cmp rcx, 8\n    je L_lph_rs8\n    cmp rcx, 4\n    je L_lph_rs4\n    cmp rcx, 2\n    je L_lph_rs2\n    mov BYTE PTR [r11], sil\n    jmp L_lph_room_stored\nL_lph_rs2:\n    mov WORD PTR [r11], si\n    jmp L_lph_room_stored\nL_lph_rs4:\n    mov DWORD PTR [r11], esi\n    jmp L_lph_room_stored\nL_lph_rs8:\n    mov QWORD PTR [r11], rsi\nL_lph_room_stored:\n    mov rdi, QWORD PTR [rbp - 16]\n    and rdi, -16\n    mov r9, QWORD PTR [rsp]\n    add rsp, 16\n    mov rcx, QWORD PTR [rsp]\n    mov r8, QWORD PTR [rsp + 8]\n    add rsp, 16\n    mov rsi, QWORD PTR [rsp]\n    mov rdx, QWORD PTR [rsp + 8]\n    add rsp, 16\n    mov r14, QWORD PTR [rdx]\n    add r14, 1\n", "    mov QWORD PTR [rdi], r14\n    mov r15, QWORD PTR [rdx + 8]\n    mov QWORD PTR [rdi + 8], r15\n    mov rbx, QWORD PTR [rdx + 16]\n    sub rbx, rcx\n    mov QWORD PTR [rdi + 16], rbx\n    leave\n    ret\nL_lph_cow:\n    mov r14, QWORD PTR [rbp - 16]\n    and r14, -16\n    lea r14, [r14 + 32]\n    mov r9, QWORD PTR [rsp]\n    mov rcx, QWORD PTR [rsp + 16]\n    mov r8, QWORD PTR [rsp + 24]\n    mov rsi, QWORD PTR [rsp + 32]\n    mov rdx, QWORD PTR [rsp + 40]\n    mov r15, QWORD PTR [rdx + 8]\n    mov r10, QWORD PTR [rdx + 16]\n    mov r13, r10\nL_lph_cow_copy:\n    cmp r13, r8\n    jge L_lph_cow_copied\n    mov rax, QWORD PTR [r15 + r13]\n    mov QWORD PTR [r14 + r13], rax\n    add r13, 8\n    jmp L_lph_cow_copy\nL_lph_cow_copied:\n    mov rax, QWORD PTR [r15 + r8]\n    mov QWORD PTR [r14 + r8], rax\n    mov rbx, r10\n    sub rbx, rcx\n    lea r11, [r14 + rbx]\n    test r9, r9\n    jz L_lph_cow_scalar\n    xor r13d, r13d\nL_lph_cow_agg:\n    cmp r13, rcx\n    jge L_lph_alloc_handle\n    mov rax, QWORD PTR [rsi + r13]\n    mov QWORD PTR [r11 + r13], rax\n    add r13, 8\n    jmp L_lph_cow_agg\nL_lph_cow_scalar:\n    cmp rcx, 8\n    je L_lph_cs8\n    cmp rcx, 4\n    je L_lph_cs4\n    cmp rcx, 2\n    je L_lph_cs2\n    mov BYTE PTR [r11], sil\n    jmp L_lph_alloc_handle\nL_lph_cs2:\n    mov WORD PTR [r11], si\n    jmp L_lph_alloc_handle\nL_lph_cs4:\n    mov DWORD PTR [r11], esi\n    jmp L_lph_alloc_handle\nL_lph_cs8:\n    mov QWORD PTR [r11], rsi\n    jmp L_lph_alloc_handle\nL_lph_new_chunk:\n    mov r14, QWORD PTR [rbp - 16]\n    and r14, -16\n    lea r14, [r14 + 32]\n    mov r9, QWORD PTR [rsp]\n    mov rcx, QWORD PTR [rsp + 16]\n    mov r8, QWORD PTR [rsp + 24]\n    mov rsi, QWORD PTR [rsp + 32]\n    mov rdx, QWORD PTR [rsp + 40]\n    mov rbx, r8\n    sub rbx, rcx\n    lea r11, [r14 + rbx]\n    test r9, r9\n    jz L_lph_new_scalar\n    xor r13d, r13d\nL_lph_new_agg:\n    cmp r13, rcx\n    jge L_lph_new_stored\n    mov rax, QWORD PTR [rsi + r13]\n    mov QWORD PTR [r11 + r13], rax\n    add r13, 8\n    jmp L_lph_new_agg\n    jmp L_lph_new_stored\nL_lph_new_scalar:\n    cmp rcx, 8\n    je L_lph_ns8\n    cmp rcx, 4\n    je L_lph_ns4\n    cmp rcx, 2\n    je L_lph_ns2\n    mov BYTE PTR [r11], sil\n    jmp L_lph_new_stored\nL_lph_ns2:\n    mov WORD PTR [r11], si\n    jmp L_lph_new_stored\nL_lph_ns4:\n    mov DWORD PTR [r11], esi\n    jmp L_lph_new_stored\nL_lph_ns8:\n    mov QWORD PTR [r11], rsi\nL_lph_new_stored:\n    test rdx, rdx\n    jz L_lph_next_nil\n    mov r10, QWORD PTR [rdx + 8]\n    mov QWORD PTR [r14 + r8], r10\n    jmp L_lph_alloc_handle\nL_lph_next_nil:\n    mov QWORD PTR [r14 + r8], 0\nL_lph_alloc_handle:\n    mov QWORD PTR [r14 + r8 + 8], rbx\n    sub rsp, 16\n    mov QWORD PTR [rsp], r14\n    mov QWORD PTR [rsp + 8], rbx\n"), "    mov rdi, QWORD PTR [rbp - 16]\n    and rdi, -16\n    mov r14, QWORD PTR [rsp]\n    mov rbx, QWORD PTR [rsp + 8]\n    add rsp, 16\n    mov r9, QWORD PTR [rsp]\n    add rsp, 16\n    mov rcx, QWORD PTR [rsp]\n    mov r8, QWORD PTR [rsp + 8]\n    add rsp, 16\n    mov rsi, QWORD PTR [rsp]\n    mov rdx, QWORD PTR [rsp + 8]\n    add rsp, 16\n    test rdx, rdx\n    jz L_lph_len1\n    mov r10, QWORD PTR [rdx]\n    add r10, 1\n    jmp L_lph_setlen\nL_lph_len1:\n    mov r10d, 1\nL_lph_setlen:\n    mov QWORD PTR [rdi], r10\n    mov QWORD PTR [rdi + 8], r14\n    mov QWORD PTR [rdi + 16], rbx\n    leave\n    ret\n")
+}
+
+// Module-level helper: L_list_tail_helper (hand-written x86-64)
+// X0 = rdi handle, X1 = rsi elem_slot_bytes, X2 = rdx chunk_data_bytes, rax = a 32-byte frame block of
+// the caller's that becomes the tail handle (chunk 15 phase 2: the call site's L_dyn_alloc result).
+// Returns X0 = rdi = tail handle (or 0 for nil tail). X3..X7 = rcx r8 r9 r14 r15.
+fn emit_list_tail_helper() -> string {
+    "L_list_tail_helper:\n    push rbp\n    mov rbp, rsp\n    sub rsp, 16\n    mov QWORD PTR [rsp], rax\n    mov rcx, QWORD PTR [rdi]\n    mov r8, QWORD PTR [rdi + 8]\n    mov r9, QWORD PTR [rdi + 16]\n    lea r14, [r9 + rsi]\n    cmp r14, rdx\n    jge L_lth_next_chunk\n    sub rcx, 1\n    test rcx, rcx\n    jz L_lth_nil\n    sub rsp, 16\n    mov QWORD PTR [rsp], rcx\n    mov QWORD PTR [rsp + 8], r8\n    sub rsp, 16\n    mov QWORD PTR [rsp], r14\n    mov QWORD PTR [rsp + 8], 0\n    mov rdi, QWORD PTR [rbp - 16]\n    mov r14, QWORD PTR [rsp]\n    add rsp, 16\n    mov rcx, QWORD PTR [rsp]\n    mov r8, QWORD PTR [rsp + 8]\n    add rsp, 16\n    mov QWORD PTR [rdi], rcx\n    mov QWORD PTR [rdi + 8], r8\n    mov QWORD PTR [rdi + 16], r14\n    leave\n    ret\nL_lth_next_chunk:\n    mov r15, QWORD PTR [r8 + rdx]\n    test r15, r15\n    jz L_lth_nil\n    sub rcx, 1\n    test rcx, rcx\n    jz L_lth_nil\n    sub rsp, 16\n    mov QWORD PTR [rsp], rcx\n    mov QWORD PTR [rsp + 8], r15\n    mov rdi, QWORD PTR [rbp - 16]\n    mov rcx, QWORD PTR [rsp]\n    mov r15, QWORD PTR [rsp + 8]\n    add rsp, 16\n    mov QWORD PTR [rdi], rcx\n    mov QWORD PTR [rdi + 8], r15\n    mov QWORD PTR [rdi + 16], 0\n    leave\n    ret\nL_lth_nil:\n    xor edi, edi\n    leave\n    ret\n"
+}
+
+// Module-level helper: L_list_at_helper (hand-written x86-64, leaf)
+// X0 = rdi handle, X1 = rsi index, X2 = rdx elem_slot_bytes, X3 = rcx chunk_data_bytes -> X0 = rdi = element address.
+// Same chunk arithmetic as L_list_tail_helper (cursor advances by the slot size; a chunk's
+// successor pointer sits at chunk + chunk_data_bytes), but held in registers: a walk of k
+// steps allocates nothing. Out of range (or nil) aborts.
+fn emit_list_at_helper() -> string {
+    "L_list_at_helper:\n    test rdi, rdi\n    jz L_lat_oob\n    mov r8, QWORD PTR [rdi]\n    cmp rsi, r8\n    jae L_lat_oob\n    mov r9, QWORD PTR [rdi + 8]\n    mov r14, QWORD PTR [rdi + 16]\nL_lat_loop:\n    test rsi, rsi\n    jz L_lat_done\n    add r14, rdx\n    cmp r14, rcx\n    jl L_lat_step\n    mov r9, QWORD PTR [r9 + rcx]\n    xor r14d, r14d\nL_lat_step:\n    sub rsi, 1\n    jmp L_lat_loop\nL_lat_done:\n    lea rdi, [r9 + r14]\n    ret\nL_lat_oob:\n    push rbp\n    mov rbp, rsp\n    call silica_rt_list_index_failed\n"
+}
+fn emit_list_helpers() -> string {
+    concat(emit_list_prepend_helper(), concat("\n", concat(emit_list_tail_helper(), concat("\n", emit_list_length_helper()))))
+}
+
+// Lightweight silica_rt_region_alloc that just forwards to malloc (SysV call; rax -> rdi).
+// Used when actors are absent (the actor runtime provides its own
+// region-aware implementation that supersedes this stub). rdi = bytes -> rdi = block (0 on OOM).
+// silica_rt_region_mark answers in rax and silica_rt_region_release_to reads rax (the AArch64
+// X16 mark register has no register home in the x86 VR layer; the scope-release path that would
+// use them is disabled in every tree). rbx is saved like a SysV callee-saved register.
+fn emit_region_alloc_stub() -> string {
+    ".globl silica_rt_region_alloc\n.p2align 2\nsilica_rt_region_alloc:\n    push rbp\n    mov rbp, rsp\n    push rbx\n    sub rsp, 8\n    mov rbx, rdi\n    lea rdi, [rbx + 16]\n    call malloc\n    mov rdi, rax\n    test rdi, rdi\n    jz L_ras_oom\n    lea r10, [rip + silica_rt_region_list]\n    mov r11, QWORD PTR [r10]\n    mov QWORD PTR [rdi], r11\n    mov QWORD PTR [rdi + 8], rbx\n    mov QWORD PTR [r10], rdi\n    add rdi, 16\nL_ras_oom:\n    add rsp, 8\n    pop rbx\n    pop rbp\n    ret\n.globl silica_rt_region_mark\nsilica_rt_region_mark:\n    mov rax, QWORD PTR [rip + silica_rt_region_list]\n    ret\n.globl silica_rt_region_release_to\nsilica_rt_region_release_to:\n    push rbp\n    mov rbp, rsp\n    push rdi\n    push rsi\n    push rbx\n    push r12\n    push r13\n    sub rsp, 8\n    mov r13, rax\n    lea rbx, [rip + silica_rt_region_list]\n    mov r12, QWORD PTR [rbx]\nL_ras_loop:\n    cmp r12, r13\n    je L_ras_done\n    test r12, r12\n    jz L_ras_done\n    mov rsi, QWORD PTR [r12]\n    mov QWORD PTR [rbx], rsi\n    mov rdi, r12\n    mov r12, rsi\n    call free\n    jmp L_ras_loop\nL_ras_done:\n    mov QWORD PTR [rbx], r13\n    add rsp, 8\n    pop r13\n    pop r12\n    pop rbx\n    pop rsi\n    pop rdi\n    pop rbp\n    ret\n.globl silica_rt_region_list\n.comm silica_rt_region_list,8,8\n"
+}

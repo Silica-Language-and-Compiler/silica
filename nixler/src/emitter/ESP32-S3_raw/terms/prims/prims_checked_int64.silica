@@ -1,0 +1,97 @@
+// Checked int64 arithmetic (Layer 1 §7.8).
+
+
+use xt_isa;
+use xt_mem;
+
+export is_checked_int64_prim/1;
+export is_checked_int64_unary_prim/1;
+export emit_prim_op/2;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn is_checked_int64_prim(name: string) -> boolean {
+    name == "checked_int64_add" or name == "checked_int64_mul" or name == "checked_int64_add1" or name == "checked_int64_byte_size"
+}
+
+fn is_checked_int64_unary_prim(name: string) -> boolean {
+    name == "checked_int64_add1"
+}
+
+// Materialize (ok, value) as a heap pair pointer in dest: ok at +0, value at +8 (16 bytes from
+// silica_rt_region_alloc). The value is parked on the aux stack across the allocation; ok_reg is X9,
+// which CALL8 preserves (a4:a5).
+fn emit_checked_pair_from_regs(dest: string, ok_reg: string, val_reg: string) -> string {
+    park: string <- xt_mem@xt_str(val_reg, "[SP, #-16]!");
+    alloc: string <- concat(xt_isa@xt_movi("X0", 16), xt_isa@xt_call("_silica_rt_region_alloc"));
+    fill: string <- concat(concat(xt_mem@xt_ldr("X1", "[SP], #16"), xt_mem@xt_str(ok_reg, "[X0, #0]")), xt_mem@xt_str("X1", "[X0, #8]"));
+    concat(concat(park, alloc), concat(fill, xt_isa@xt_mov(dest, "X0")))
+}
+
+// The runtime returns ok (32-bit) in X0 and the value in X1 (the callee's a4:a5).
+fn emit_checked_int64_binary_rt(rt_name: string, dest: string) -> string {
+    call: string <- concat(concat(xt_isa@xt_mov("X0", "X1"), xt_isa@xt_mov("X1", "X2")), xt_isa@xt_call(rt_name));
+    concat(concat(call, xt_isa@xt_mov("W9", "W0")), emit_checked_pair_from_regs(dest, "X9", "X1"))
+}
+
+fn emit_checked_int64_unary_rt(rt_name: string, dest: string) -> string {
+    call: string <- concat(xt_isa@xt_mov("X0", "X1"), xt_isa@xt_call(rt_name));
+    concat(concat(call, xt_isa@xt_mov("W9", "W0")), emit_checked_pair_from_regs(dest, "X9", "X1"))
+}
+
+fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    case sir_term_root_node(term).name of {
+        "checked_int64_add" -> emit_checked_int64_binary_rt("_silica_rt_checked_i64_add", dest);
+        "checked_int64_mul" -> emit_checked_int64_binary_rt("_silica_rt_checked_i64_mul", dest);
+        "checked_int64_byte_size" -> emit_checked_int64_binary_rt("_silica_rt_checked_i64_mul", dest);
+        "checked_int64_add1" -> emit_checked_int64_unary_rt("_silica_rt_checked_i64_add1", dest);
+        _: string -> concat(".error \"unsupported checked int64 prim: ", concat(sir_term_root_node(term).name, "\"\n"))
+    }
+}
