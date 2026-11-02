@@ -240,3 +240,4 @@ Each point was checked against the repo on 2026-10-31.
 5. Baselines: the stage-2 tables have no commit or `data/*.tsv`; the source file and date are stated. Footprint profiles with their `git_head` listed as Baseline B.
 6. Roles: section 6 rewritten to the three roles in `silica_building/SKILL.md`; "spec/doc text" removed from Sonnet because the rule does not give docs to any role.
 7. Section 13 claims: removed "confirmed" for 13.8 and 13.12 (13 records the design's reading, not a Lee confirmation); "accepted" for 13.9 reworded; "needs Lee: K" for 13.6 corrected; the phase 6 timing attributed to 13.4 now cites design 11.1 row 6. 13.6 (pre-commit, `reply_set = 4`, caller fails) and 13.9 and 13.12 content were supported.
+2026-11-01: superseded: alloc_region is a frame area (Lee's decision); see chunk15 section 3.8.

@@ -237,8 +237,7 @@ fn emit_extern_loop(bindings: List[{ local_name: string, c_symbol: string, meta_
 
 fn emit_extern_directives(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> string {
     guarded: string <- ".extern _silica_rt_ffi_guarded_enter\n.extern _silica_rt_ffi_guarded_exit\n.extern _silica_rt_ffi_guarded_setjmp\n.extern _silica_rt_ffi_guarded_fault_finish\n";
-    arena: string <- ".extern _silica_rt_ffi_arena_bump\n";
-    concat(concat(guarded, arena), emit_extern_loop(bindings, ""))
+    concat(guarded, emit_extern_loop(bindings, ""))
 }
 
 fn module_uses_foreign_calls(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> boolean {
@@ -314,6 +313,19 @@ fn needs_string_in_marshal(param_types: string, arg1_type: string) -> boolean {
     param_types_are_ptr_len_pair(param_types) and arg1_type == "string"
 }
 
+// A buf(L, Space, uint8, N) argument for a pointer-plus-length pair (wrapper spec §6.1, §6.2). The buffer
+// crosses into C only as pointer and length, for the call (Lee 2026-11-01).
+fn needs_buf_in_marshal(param_types: string, arg1_type: string) -> boolean {
+    param_types_are_ptr_len_pair(param_types) and is_uint8_buf_type(arg1_type)
+}
+
+fn is_uint8_buf_type(t: string) -> boolean {
+    case length_bytes(t) >= 4 of {
+        true -> substring(t, 0, 4) == "buf(" and type_text_contains(t, "uint8");
+        false -> false
+    }
+}
+
 fn needs_string_out_unmarshal(return_type: string, expected_type: string) -> boolean {
     expected_type == "string" and return_type_has_ptr_len_out_fields(return_type)
 }
@@ -386,8 +398,20 @@ fn emit_result_mov(dest: string) -> string {
 }
 
 fn emit_string_in_marshal() -> string {
-    // Copies Silica string into the per-actor FFI arena (X0=ptr, X1=len, X2=0).
-    "    BL _silica_rt_ffi_string_in\n"
+    // Per-call scratch is held in the caller's frame (chunk 15 phase 7, the FFI arena's removal, as the
+    // other arenas went in phase 5d): a block of len + 1 bytes rounded to 16 is taken from the frame's
+    // dynamic part (L_dyn_alloc moves the transient area, so the scratch frame's SP-relative words move
+    // with it; X0-X8 are kept), and the helper copies the string's bytes and a NUL into it (X3 = the
+    // block -> X0 = ptr, X1 = len, X2 = 0). The block pops with the frame, after the call returned.
+    "    MOV X16, #16\n    CBZ X0, 3f\n    LDR X16, [X0, #16]\n    ADD X16, X16, #16\n    AND X16, X16, #0xfffffffffffffff0\n3:\n    BL L_dyn_alloc\n    MOV X3, X16\n    BL _silica_rt_ffi_string_in\n"
+}
+
+// X0 = the buffer value, which points at the data with the count word just below it (prims_memory
+// emit_alloc_buf; alloc_buf_retained's node has the same shape). The data pointer stays in X0 (the
+// uint8 slot) and the count, the byte length for uint8 elements, goes to X1 (the uint64 slot). No
+// scratch, no copy, no runtime call; the guarded call's preserver keeps X0-X8 for the BL.
+fn emit_buf_in_marshal() -> string {
+    "    LDR X1, [X0, #-8]\n"
 }
 
 fn emit_string_in_cleanup() -> string {
@@ -395,9 +419,10 @@ fn emit_string_in_cleanup() -> string {
 }
 
 fn emit_string_out_unmarshal_heap() -> string {
-    // sret struct lives in the FFI arena at scratch[+0]. Helper copies C bytes into a Silica
-    // string handle and leaves arena/sret storage for the next guarded-call reset.
-    "    LDR X0, [SP, #0]\n    BL _silica_rt_ffi_string_out_and_free\n    STR X0, [SP, #16]\n    STR XZR, [SP, #0]\n"
+    // The sret struct lives in the scratch frame at [SP+32, SP+64) (the caller's frame; chunk 15 phase 7).
+    // The helper copies the C bytes into a Silica string handle and frees the C wrapper's malloc'd span;
+    // the sret storage pops with the scratch frame.
+    "    ADD X0, SP, #32\n    BL _silica_rt_ffi_string_out_and_free\n    STR X0, [SP, #16]\n"
 }
 
 // Returns true when this FFI call needs the 32-byte scratch frame (string and/or sret).
@@ -417,16 +442,19 @@ fn emit_foreign_user_call(
     uses_heap: boolean <- foreign_call_uses_heap_scratch(ctx.param_types, ctx.return_type, ctx.arg1_type);
     string_in: string <- case needs_string_in_marshal(ctx.param_types, ctx.arg1_type) of {
         true -> emit_string_in_marshal();
-        false -> ""
+        false -> case needs_buf_in_marshal(ctx.param_types, ctx.arg1_type) of {
+            true -> emit_buf_in_marshal();
+            false -> ""
+        }
     };
-    // After string_in (which BLs into a runtime helper), X8 may have been clobbered.
-    // Reload from the heap-alloc'd sret pointer stored at scratch[+0].
+    // After string_in (which BLs into a runtime helper), X8 may have been clobbered: the sret struct
+    // is at [SP+32] of the scratch frame (SP-relative, so a frame block taken meanwhile moved it with SP).
     reload_x8: string <- case ctx.sret_bytes > 0 of {
-        true -> "    LDR X8, [SP, #0]\n";
+        true -> "    ADD X8, SP, #32\n";
         false -> ""
     };
     bl: string <- emit_guarded_foreign_call_lines(ctx.c_symbol);
-    string_out: string <- case expects_string_out of {
+    string_out: string <- case expects_string_out and ctx.sret_bytes > 0 of {
         true -> emit_string_out_unmarshal_heap();
         false -> ""
     };
@@ -437,7 +465,10 @@ fn emit_foreign_user_call(
         false -> ""
     };
     sret_cleanup: string <- case uses_heap of {
-        true -> "    ADD SP, SP, #32\n";
+        true -> case ctx.sret_bytes > 0 of {
+            true -> "    ADD SP, SP, #64\n";
+            false -> "    ADD SP, SP, #32\n"
+        };
         false -> ""
     };
     result_mov: string <- emit_result_mov(dest);
@@ -469,16 +500,17 @@ fn foreign_call_sret_bytes(return_type: string) -> int64 {
     }
 }
 
-// Pre-call setup: reserves a 32-byte scratch frame and, when sret_bytes > 0, bumps 32 bytes
-// from the per-actor FFI arena and stores the pointer at scratch[+0].
-// Scratch layout:
-//   [SP+0]  = sret arena ptr (0 when no sret)
+// Pre-call setup: reserves the scratch frame in the caller's frame (chunk 15 phase 7: the FFI arena is
+// gone; per-call scratch lives where the call does). With sret_bytes > 0 it is 64 bytes and holds the
+// 32-byte sret struct itself. Scratch layout:
+//   [SP+0]  = reserved (0)
 //   [SP+8]  = reserved
 //   [SP+16] = result Silica string handle (filled in by string-out helper)
 //   [SP+24] = padding (reserved for keeping 16-byte alignment)
+//   [SP+32, SP+64) = the sret struct (sret calls only); X8 points at it
 fn emit_foreign_sret_setup(sret_bytes: int64) -> string {
     case sret_bytes > 0 of {
-        true -> "    SUB SP, SP, #32\n    STR XZR, [SP, #8]\n    STR XZR, [SP, #16]\n    STR XZR, [SP, #24]\n    MOV X0, #32\n    BL _silica_rt_ffi_arena_bump\n    STR X0, [SP, #0]\n    MOV X8, X0\n";
+        true -> "    SUB SP, SP, #64\n    STR XZR, [SP, #0]\n    STR XZR, [SP, #8]\n    STR XZR, [SP, #16]\n    STR XZR, [SP, #24]\n    STP XZR, XZR, [SP, #32]\n    STP XZR, XZR, [SP, #48]\n    ADD X8, SP, #32\n";
         false -> ""
     }
 }

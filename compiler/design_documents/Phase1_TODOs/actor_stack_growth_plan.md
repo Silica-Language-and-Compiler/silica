@@ -92,7 +92,7 @@ thread-loop, arena and fault-handler changes in `prims_actors_runtime_asm.silica
   is that message's depth; the scan touches only the pages about to be released.
 - `:release_when_idle` has no carrier thread to sweep for it: the actor's own mailbox wait carries a
   one-second timeout while it holds committed stack, and releases on expiry.
-- The implicit heap that `region_alloc` served from a fault-grown 1 GB arena is now a chain of 64 MB
+- (Old design: removed on the hosted Mac targets by chunk 15 phase 4e, Lee 2026-11-01; Linux and ESP32-S3 keep it until phases 8 and 9.) The implicit heap that `region_alloc` served from a fault-grown 1 GB arena is now a chain of 64 MB
   anonymous blocks with a bounds-checked bump pointer: no third mapping and no cap.
 - Children started from child specs inherit the spawning supervisor's stack policy; the child-spec
   record has no policy field in the specification.

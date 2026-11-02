@@ -48,7 +48,10 @@
 //        type), is answered as given. A proven behaviour (#560 = 1) without a compaction request has its
 //        new nodes evacuated (_silica_rt_state_evacuate), the old root shell freed when the root changed,
 //        and its release log drained into the free lists (§4.3, the order of §4.3: holes freed by this
-//        dispatch serve the next). An unproven behaviour, or a dispatch that called compact_state() under
+//        dispatch serve the next). The log holds the stdlib updaters' retires and the old buffers the
+//        new state no longer keeps (retired by the behaviour epilogue, prims_actors@
+//        bmv_state_buffer_retire_asm, §4.2). A proven behaviour whose described state became a scalar has
+//        its old root shell freed and its log drained the same way. An unproven behaviour, or a dispatch that called compact_state() under
 //        :compact_on_request (#584), has its whole live state copied into a fresh area laid over the old
 //        one (_silica_rt_state_copy_all, §4.4); the log is then dropped (every retired node is unreachable
 //        by the proof and the copy walks reachable nodes only; the free lists are empty afterwards). After
@@ -113,6 +116,22 @@
 //   +32 old-node range high = top (mode 1)                      +40 edge-bound bytes E (mode 1, running)
 //   +48 the lowest committed address, kept current (mode 1)     +56 relocation delta of a bumped node
 // Lstc_bump(X7 = bytes) -> X0 = where the node's bytes are written, X1 = the node's final address.
+//   _silica_rt_message_measure / _silica_rt_message_copy (chunk 15 phase 4a, design §5.1): the same two
+//        routines with the spine flag OFF at the root, so the table is never emptied: ONE table for the whole
+//        value, every node once (the message copy keeps the sharing between any two parts of a message, R4.2;
+//        a state copy keeps it only within a slot).
+//   _silica_rt_message_buffer(X0 = message, X1 = root descriptor) -> X0 = the copy's root, X1 = bytes, X2 =
+//        the malloc'd block (X1 = X2 = 0 and X0 = the message when it is a scalar, an atom or measures 0: it
+//        stays inline). The mailbox buffer of a cast-family send: the emitter (prims_actors@send_buffer_copy_asm)
+//        calls it before _silica_rt_actor_cast, which stores the words at the node's +40/+48; the receiver's
+//        dispatch end frees the block (prims_actors_runtime_asm LBB1_free_user). Also the row spec buffer of
+//        a supervised child (phase 4d, design §5.4 Q14): materialize and start_child copy a described
+//        start.0 through it into a block the row owns (row +144, root at +24; prims_actors_child_table_asm).
+//   _silica_rt_message_forward(X0 = message, X1 = root descriptor, X2 = the sending function's entry) -> the
+//        same results (chunk 15 phase 4b, design §5.2, decision 32): at a forwarding site ("|_mvs") the
+//        serving node's own buffer is handed on (its +40/+48 zeroed) when X2 is the behaviour being
+//        dispatched (ACB #8), the node is a plain user cast node whose buffer root is X0 and ACB #600 is
+//        clear; otherwise the message is copied by _silica_rt_message_buffer.
 //   _silica_rt_state_install(X0 = ACB, X1 = value, X2 = root descriptor or 0) -> X0 = 0, or 1 when the
 //        child's reservation cannot hold the state. Stores the value at ACB #0; when the descriptor is not 0
 //        and the value is a pointer, measures, takes one block of the measured size rounded to 16 from the
@@ -276,6 +295,76 @@ Lstfr_push:
 	sub	x10, x10, x2
 	str	x10, [x0, #568]
 	ret
+	.globl	_silica_rt_state_retain_node
+	.p2align	2
+_silica_rt_state_retain_node:
+; alloc_buf_retained's runtime half (chunk 15 phase 7, the pin rule; design §7). X0 = a 16-aligned block of
+; X1 bytes in the running behaviour's own frame (L_dyn_alloc), X2 = the element count -> X0 = the element
+; pointer, or 0 when there is no current actor or the state header cannot be committed.
+; Block (X1 = round16(n + 24) bytes): the buffer NODE is the block's last round8(n + 8) bytes, laid out as
+; every buffer's (the count, then the bytes, zeroed; the value points past the count), so that once
+; placed it is exactly the node an alloc_buf buffer of n bytes is and the epilogue's retire
+; (prims_actors@bmv_state_buffer_retire_asm: node buf - 8, length word plus elements rounded to 8) frees
+; all of it. The block's first G = X1 - round8(n + 8) bytes (16 or 24) are the front gap: +0 the pending
+; link, +8 G. An exact-size hole of the state area is taken when one is free (it is a state node already,
+; counted by _silica_rt_state_alloc's Lsta_live): its front gap is pushed back on the free lists at once
+; and the frame block is simply left to the frame. Otherwise the frame block is pushed on the PENDING
+; list, whose head is the spare word of the state header at top - 8 (the 129 free-list heads end at
+; top - 16), and _silica_rt_state_dispatch_end makes its node a state node in place and its front gap a
+; hole. Blocks of one dispatch are taken from one frame's dynamic part, whose floor only goes down, so
+; the list runs from the lowest block (the head) upwards.
+	stp	x29, x30, [sp, #-48]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
+	mov	x20, x0
+	mov	x21, x1
+	mov	x22, x2
+	bl	_silica_rt_tls_current_actor_get
+	cbz	x0, Lstrn_fail
+	mov	x19, x0
+	mov	x1, x21
+	bl	_silica_rt_state_hole_pop
+	ldr	x9, [x19, #288]
+	cmp	x9, #1040
+	b.lo	Lstrn_fail
+	add	x11, x22, #15
+	and	x11, x11, #0xfffffffffffffff8
+	sub	x11, x21, x11
+	cbz	x0, Lstrn_pending
+	mov	x20, x0
+; The hole's front gap goes back on its free list (a leaf: X8-X10 only, so X11 survives).
+	mov	x0, x19
+	mov	x1, x20
+	mov	x2, x11
+	bl	_silica_rt_state_free
+	b	Lstrn_fill
+Lstrn_pending:
+	ldr	x8, [x19, #272]
+	ldr	x9, [x19, #280]
+	add	x9, x8, x9
+	ldr	x10, [x9, #-8]
+	str	x10, [x20]
+	str	x20, [x9, #-8]
+	str	x11, [x20, #8]
+Lstrn_fill:
+	add	x12, x20, x11
+	str	x22, [x12]
+	add	x0, x12, #8
+	add	x10, x20, x21
+	mov	x9, x0
+Lstrn_zero:
+	cmp	x9, x10
+	b.hs	Lstrn_ret
+	str	xzr, [x9], #8
+	b	Lstrn_zero
+Lstrn_fail:
+	mov	x0, xzr
+Lstrn_ret:
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #48
+	ret
 "
 }
 
@@ -346,6 +435,194 @@ _silica_rt_spawn_state_too_large:
 Lstl_main:
 	ldp	x29, x30, [sp], #16
 	b	_silica_rt_abort_state_too_large
+	.globl	_silica_rt_message_buffer
+	.p2align	2
+_silica_rt_message_buffer:
+; The mailbox buffer (chunk 15 phase 4a, design §5.1). X0 = the message, X1 = the root-word descriptor of
+; its type -> X0 = the root of the copy, X1 = the buffer's bytes, X2 = the buffer block (malloc'd, freed by
+; the receiver's dispatch end, by a failed send, or by the end-of-actor drain). A scalar or atom (below
+; 65536), or a value whose measure is 0 (a literal string, a function value), is answered as given with
+; X1 = X2 = 0: the message stays inline in the node, as today. The copy is _silica_rt_message_copy: one
+; table for the whole message, every node once, so the root is the first node bumped and lies at the
+; block's start for every kind but a bare buffer (whose root is its element pointer, block + 8; the node
+; keeps the block in a word of its own for the free). No memory for the block or the table fails the
+; sender as an arena growth failure does (_silica_rt_region_alloc_failed; main aborts).
+	stp	x29, x30, [sp, #-48]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
+	mov	x19, x0
+	mov	x20, x1
+	cmp	x19, #65536
+	b.lo	Lmbf_inline
+	mov	x0, x19
+	mov	x1, x20
+	bl	_silica_rt_message_measure
+	tbnz	x0, #63, Lmbf_fail
+	cbz	x0, Lmbf_inline
+	mov	x21, x0
+	bl	_malloc
+	cbz	x0, Lmbf_fail
+	mov	x22, x0
+	mov	x0, x19
+	mov	x1, x20
+	mov	x2, x22
+	add	x3, x22, x21
+	mov	x4, xzr
+	bl	_silica_rt_message_copy
+	cbnz	x1, Lmbf_fail
+	mov	x1, x21
+	mov	x2, x22
+	b	Lmbf_ret
+Lmbf_inline:
+	mov	x0, x19
+	mov	x1, xzr
+	mov	x2, xzr
+Lmbf_ret:
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #48
+	ret
+Lmbf_fail:
+	bl	_silica_rt_region_alloc_failed
+	.globl	_silica_rt_message_forward
+	.p2align	2
+_silica_rt_message_forward:
+; Forwarding-only elision (chunk 15 phase 4b, design §5.2, decision 32). The arguments and results of
+; _silica_rt_message_buffer, plus X2 = the entry of the function sending; called in its place at a
+; cast-family site the emitter marked with the |_mvs marker (term_message_copy fn_copy_markers: the operand is the
+; behaviour's whole message parameter, used for the last time, no part of it reaching the new state).
+; When X2 is the behaviour this actor is dispatching (ACB #8: not a behaviour-shaped helper it called,
+; whose caller may still use the message), the node being served (ACB #240) is a plain user cast node
+; (+32 = 0, +16 = 0) holding a mailbox buffer (+48) whose root is the message (+8 = X0), and no shallow
+; copy has run in this dispatch (ACB #600 = 0: one may hold a pointer into the buffer), the buffer itself
+; is handed on: X0 = the root, X1 = the bytes (+40), X2 = the block (+48), and the node's +40/+48 are
+; zeroed so that its dispatch end (LBB1_free_user) and the teardown (LBBsigpend_active_user) skip it; the
+; new node takes the words through _silica_rt_actor_cast as for a fresh copy, and a dropped send frees
+; the block there (LBB3_dropped). In every other case (main, an inline or runtime-cast message, a call
+; node, a retained buffer) the message is copied as at any other site.
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	mov	x19, x0
+	mov	x20, x1
+	str	x2, [sp, #-16]!
+	bl	_silica_rt_tls_current_actor_get
+	ldr	x10, [sp], #16
+	cbz	x0, Lmfw_copy
+	ldr	x9, [x0, #8]
+	cmp	x9, x10
+	b.ne	Lmfw_copy
+	ldr	x9, [x0, #600]
+	cbnz	x9, Lmfw_copy
+	ldr	x8, [x0, #240]
+	cbz	x8, Lmfw_copy
+	ldr	w9, [x8, #32]
+	cbnz	w9, Lmfw_copy
+	ldr	w9, [x8, #16]
+	cbnz	w9, Lmfw_copy
+	ldr	x2, [x8, #48]
+	cbz	x2, Lmfw_copy
+	ldr	x9, [x8, #8]
+	cmp	x9, x19
+	b.ne	Lmfw_copy
+	ldr	x1, [x8, #40]
+	str	xzr, [x8, #40]
+	str	xzr, [x8, #48]
+	mov	x0, x19
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	ret
+Lmfw_copy:
+	mov	x0, x19
+	mov	x1, x20
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	b	_silica_rt_message_buffer
+	.globl	_silica_rt_reply_place
+	.p2align	2
+_silica_rt_reply_place:
+; The reply into the blocked caller's stack (chunk 15 phase 4c, design §5.3, decision 33). Called by the
+; behaviour epilogue (prims_actors@bmv_reply_stack_asm) with X0 = the reply and X1 = the root-word descriptor
+; of its type -> X0 = the root of its copy in the CALLER's stack, or the reply as given when nothing is
+; copied: a scalar or atom (below 65536), no current actor, no node being served (ACB #240), a node that
+; needs no reply (+16 = 0: a cast that reached a call-style behaviour), or a measure of 0 (a literal string).
+; Otherwise the copy goes to [dest, dest + bytes), dest = (the SP the caller published at the call record's
+; +152, less the bytes) rounded down to 16. When the published SP lies in the caller's managed reservation
+; (node +56 names the caller; main and a path on a carrier thread's own stack need no growth) the
+; reservation is grown to dest first (_silica_rt_stack_grow_to, with the caller's ACB: a foreign stack is
+; committed here, never faulted in); a reply the reservation cannot take (dest below its base, or grow_to
+; answering 1 exhausted or 2 refused) sets reply_set (+136) to 4 and leaves the reply as given, and the
+; caller fails with (:explicit, :reservation_exceeded) on waking (LBB4_8). The bytes go to +160. Sources are
+; read where they lie (the behaviour's frame, live during the epilogue; the state area; the message
+; buffer) with ONE table, so sharing inside the reply is kept (R4.2). No table or an overrun fails this
+; actor as a mailbox buffer's does (_silica_rt_region_alloc_failed).
+	stp	x29, x30, [sp, #-64]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	stp	x21, x22, [sp, #32]
+	stp	x23, x24, [sp, #48]
+	mov	x19, x0
+	mov	x20, x1
+	cmp	x19, #65536
+	b.lo	Lrpl_as_is
+	bl	_silica_rt_tls_current_actor_get
+	cbz	x0, Lrpl_as_is
+	ldr	x21, [x0, #240]
+	cbz	x21, Lrpl_as_is
+	ldr	w9, [x21, #16]
+	cbz	w9, Lrpl_as_is
+	mov	x0, x19
+	mov	x1, x20
+	bl	_silica_rt_message_measure
+	tbnz	x0, #63, Lrpl_fail
+	cbz	x0, Lrpl_as_is
+	mov	x22, x0
+	ldr	x9, [x21, #152]
+	sub	x23, x9, x22
+	and	x23, x23, #0xfffffffffffffff0
+	ldr	x24, [x21, #56]
+	cbz	x24, Lrpl_copy
+	ldr	x10, [x24, #272]
+	cbz	x10, Lrpl_copy
+	ldr	x11, [x24, #280]
+	add	x11, x10, x11
+	cmp	x9, x10
+	b.lo	Lrpl_copy
+	cmp	x9, x11
+	b.hs	Lrpl_copy
+	cmp	x23, x10
+	b.lo	Lrpl_too_large
+	mov	x0, x24
+	mov	x1, x23
+	bl	_silica_rt_stack_grow_to
+	cmp	x0, #1
+	b.eq	Lrpl_too_large
+	cmp	x0, #2
+	b.eq	Lrpl_too_large
+Lrpl_copy:
+	mov	x0, x19
+	mov	x1, x20
+	mov	x2, x23
+	add	x3, x23, x22
+	mov	x4, xzr
+	bl	_silica_rt_message_copy
+	cbnz	x1, Lrpl_fail
+	str	x22, [x21, #160]
+	b	Lrpl_ret
+Lrpl_too_large:
+	mov	w9, #4
+	str	w9, [x21, #136]
+Lrpl_as_is:
+	mov	x0, x19
+Lrpl_ret:
+	ldp	x23, x24, [sp, #48]
+	ldp	x21, x22, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #64
+	ret
+Lrpl_fail:
+	bl	_silica_rt_region_alloc_failed
 "
 }
 
@@ -471,7 +748,17 @@ fn state_asm_measure_root() -> string {
     "	.globl	_silica_rt_state_measure
 	.p2align	2
 _silica_rt_state_measure:
-; X0 = value, X1 = root descriptor -> X0 = bytes (-1: no table).
+; X0 = value, X1 = root descriptor -> X0 = bytes (-1: no table). One table per state slot (X21 = 1 at the root).
+	mov	x5, #1
+	b	Lstm_root_entry
+	.globl	_silica_rt_message_measure
+	.p2align	2
+_silica_rt_message_measure:
+; X0 = value, X1 = root descriptor -> X0 = bytes (-1: no table): the same walk with ONE table for the whole
+; value (the spine flag off at the root, so nothing empties it): the size of a message copy, in which two
+; parts of one message that share a node share its copy (chunk 15 phase 4a, design §5.1; R4.2).
+	mov	x5, xzr
+Lstm_root_entry:
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #-16]!
@@ -481,7 +768,7 @@ _silica_rt_state_measure:
 	stp	x27, x28, [sp, #-16]!
 	mov	x19, x0
 	mov	x20, x1
-	mov	x21, #1
+	mov	x21, x5
 	mov	x25, #0
 	mov	x0, #64
 	mov	x1, #16
@@ -795,7 +1082,17 @@ fn state_asm_copy_root() -> string {
 	.p2align	2
 _silica_rt_state_copy:
 ; X0 = value, X1 = root descriptor, X2 = destination, X3 = destination end, X4 = relocation delta -> X0 =
-; the copy's root, X1 = 0 (1: no table, X0 = the value as given).
+; the copy's root, X1 = 0 (1: no table, X0 = the value as given). One table per state slot.
+	mov	x5, #1
+	b	Lstc_copy_entry
+	.globl	_silica_rt_message_copy
+	.p2align	2
+_silica_rt_message_copy:
+; The same arguments and answers with ONE table for the whole value (the spine flag off at the root): the
+; copy of a message into its mailbox buffer (chunk 15 phase 4a, design §5.1), sized by
+; _silica_rt_message_measure. Sharing between any two parts of the message is kept (R4.2).
+	mov	x5, xzr
+Lstc_copy_entry:
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #-16]!
@@ -814,7 +1111,12 @@ _silica_rt_state_copy:
 	str	x4, [x20, #56]
 	mov	x26, x0
 	mov	x27, x1
+	cbz	x5, Lstc_copy_flat
 	bl	Lstc_run
+	b	Lstc_copy_ran
+Lstc_copy_flat:
+	bl	Lstc_run_flat
+Lstc_copy_ran:
 	add	sp, sp, #64
 	ldp	x27, x28, [sp], #16
 	ldp	x25, x26, [sp], #16
@@ -825,10 +1127,17 @@ _silica_rt_state_copy:
 	ret
 Lstc_run:
 ; X26 = value, X27 = root descriptor, X19 = the cursor, X20 = the copy control block -> X0 = the root,
-; X1 = 0 (1: no table). The table is this copy's; X21 = 1 (on the spine) at the root.
+; X1 = 0 (1: no table). The table is this copy's; X21 = 1 (on the spine) at the root. Lstc_run_flat is
+; the same walk with the spine flag off at the root (one table for the whole value: the message copy).
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
 	mov	x21, #1
+	b	Lstc_run_go
+Lstc_run_flat:
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	mov	x21, xzr
+Lstc_run_go:
 	mov	x0, #64
 	mov	x1, #16
 	bl	_calloc
@@ -1037,10 +1346,35 @@ fn state_asm_copy_ref() -> string {
 	cbz	x9, Lstc_ref_new
 	ldr	x10, [x20, #24]
 	cmp	x0, x10
-	b.lo	Lstc_ref_new
+	b.lo	Lstc_ref_retained
 	ldr	x10, [x20, #32]
 	cmp	x0, x10
 	b.lo	Lstc_ref_asis
+	b	Lstc_ref_new
+; Below the old range: a buffer whose node is on this dispatch's pending retained list (alloc_buf_retained,
+; design §7) is kept where it is, like an old node; dispatch_end has lowered the edge to it. Exact: the
+; element pointer is compared with every pending node's (+24); the list holds the dispatch's retained
+; buffers only.
+Lstc_ref_retained:
+	cmp	x1, #6
+	b.ne	Lstc_ref_new
+	ldr	x10, [x20, #16]
+	ldr	x9, [x10, #288]
+	cmp	x9, #1040
+	b.lo	Lstc_ref_new
+	ldr	x9, [x10, #272]
+	ldr	x10, [x10, #280]
+	add	x10, x9, x10
+	ldr	x10, [x10, #-8]
+Lstc_ref_rt_loop:
+	cbz	x10, Lstc_ref_new
+	ldr	x9, [x10, #8]
+	add	x9, x10, x9
+	add	x9, x9, #8
+	cmp	x9, x0
+	b.eq	Lstc_ref_asis
+	ldr	x10, [x10]
+	b	Lstc_ref_rt_loop
 Lstc_ref_new:
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
@@ -1361,7 +1695,8 @@ fn state_asm_evacuate_copy_all() -> string {
     "	.globl	_silica_rt_state_evacuate
 	.p2align	2
 _silica_rt_state_evacuate:
-; X0 = ACB, X1 = root, X2 = root descriptor -> X0 = the root's final address, X1 = 0 (1: no table). The
+; X0 = ACB, X1 = root, X2 = root descriptor, X3 = the low end of the old-node range (the entry edge)
+; -> X0 = the root's final address, X1 = 0 (1: no table). The
 ; scratch cursor X19 starts at the bottom of the committed run and goes down; a scratch node's final address
 ; is its scratch address + (edge - run bottom), so the edge-bound block is moved to [edge - E, edge) by one
 ; memmove (the two ranges overlap when the dead frames are shallower than E). The new edge is edge - E
@@ -1389,7 +1724,9 @@ _silica_rt_state_evacuate:
 	mov	x12, #1
 	str	x12, [x20, #8]
 	str	x25, [x20, #16]
-	stp	x10, x9, [x20, #24]
+; The OLD range is [X3, top): X3 is the entry edge, which is #528 except after a dispatch that took
+; retained buffers, where #528 is already the lowest retained block (dispatch_end, design §7).
+	stp	x3, x9, [x20, #24]
 	str	xzr, [x20, #40]
 	str	x11, [x20, #48]
 	sub	x12, x10, x11
@@ -1611,6 +1948,22 @@ _silica_rt_state_dispatch_end:
 	ldr	x23, [x19]
 	mov	x24, xzr
 	mov	x25, x20
+; Retained buffers (alloc_buf_retained, design §7, the pin rule): X26 = the pending list (top - 8; read only
+; when the header is committed), lowest block first. The edge goes down to that block now, so the blocks
+; are inside [edge, top) when the walk and the next dispatch see them; the evacuation is told the entry
+; edge (X3 = X22) as the low end of the OLD range, so the frame nodes between the blocks are still copied
+; (their gaps become holes at Lsde_policy), and its edge-bound block goes below the lowest retained one.
+	mov	x26, xzr
+	ldr	x9, [x19, #288]
+	cmp	x9, #1040
+	b.lo	Lsde_no_retained
+	ldr	x8, [x19, #272]
+	ldr	x9, [x19, #280]
+	add	x9, x8, x9
+	ldr	x26, [x9, #-8]
+	cbz	x26, Lsde_no_retained
+	str	x26, [x19, #528]
+Lsde_no_retained:
 	cbz	x21, Lsde_scalar
 	cmp	x20, #65536
 	b.lo	Lsde_scalar
@@ -1625,11 +1978,13 @@ _silica_rt_state_dispatch_end:
 	mov	x0, x19
 	mov	x1, x20
 	mov	x2, x21
+	mov	x3, x22
 	bl	_silica_rt_state_evacuate
 	cbnz	x1, Lsde_no_room
 	mov	x25, x0
 	cmp	x23, x25
 	b.eq	Lsde_drain
+Lsde_old_shell:
 	cmp	x23, x22
 	b.lo	Lsde_drain
 	ldr	x8, [x19, #272]
@@ -1655,10 +2010,26 @@ Lsde_root_agg:
 	mov	x1, x23
 	bl	_silica_rt_state_free
 Lsde_drain:
+; Discarded retires free nothing (Lee 2026-11-01): under the proof an update whose version reaches the
+; new state makes the behaviour unproven, so every retire() logged in a proven dispatch is of an old
+; node whose updated version was discarded, and the new state may still hold it. The log is drained
+; only when the behaviour epilogue's buffer retire wrote it (#560 = 2: it emptied the log first and
+; then logged the old buffers the new state does not keep, prims_actors@bmv_state_buffer_retire_asm);
+; with #560 = 1 it is dropped.
+	ldr	x9, [x19, #560]
+	cmp	x9, #2
+	b.eq	Lsde_drain_go
+	str	xzr, [x19, #544]
+	b	Lsde_policy
+Lsde_drain_go:
 	mov	x0, x19
 	bl	_silica_rt_state_log_drain
 	b	Lsde_policy
 Lsde_copy_all:
+; No retained-buffer test here (the pin rule): a retained buffer exists only in the behaviour
+; spawn_dangerous installs (E4041), that behaviour is proven (E4037) and returns to the runtime through
+; its own epilogue's flag, and its spawn's state_policy(:keep_state_area) (E4036) makes compact_state()
+; a no-op, so a pinned actor never reaches the fallback.
 	mov	x0, x19
 	mov	x1, x20
 	mov	x2, x21
@@ -1669,11 +2040,65 @@ Lsde_copy_all:
 	str	xzr, [x19, #544]
 	b	Lsde_policy
 Lsde_scalar:
+; A scalar new state of a DESCRIBED type (an atom replacing a record or a buffer) reaches no node. An
+; unproven behaviour, or a compaction request, takes the fallback as a pointer state does: copy_all of a
+; scalar root measures 0, copies nothing and leaves an empty area (every old node, buffers included, is
+; dropped; the state policy then applies as after any compaction). A proven one frees the old root shell
+; as on the evacuating path, then drains the log (which holds the old buffers the epilogue retired). A
+; state type with no descriptor has no nodes: only the log is drained.
+	cbz	x21, Lsde_scalar_undescribed
+	ldr	x9, [x19, #560]
+	cbz	x9, Lsde_copy_all
+	ldr	x9, [x19, #584]
+	cbnz	x9, Lsde_copy_all
+	cmp	x23, x25
+	b.ne	Lsde_old_shell
+	b	Lsde_drain
+Lsde_scalar_undescribed:
 	ldr	x9, [x19, #560]
 	cbz	x9, Lsde_policy
-	mov	x0, x19
-	bl	_silica_rt_state_log_drain
+	b	Lsde_drain
 Lsde_policy:
+	cbz	x26, Lsde_policy_go
+; The pending blocks are state nodes now; the dead frame bytes between them, and between the highest one
+; and the entry edge, become holes (each piece a multiple of 16: the blocks and the entry edge are
+; 16-aligned). #568 grows by the whole [lowest block, entry edge) and each hole's push takes its piece
+; off again, so it ends up counting the retained bytes. Then the pending list is emptied.
+	ldr	x8, [x19, #568]
+	sub	x9, x22, x26
+	add	x8, x8, x9
+	str	x8, [x19, #568]
+	mov	x20, x26
+Lsde_rt_loop:
+; Each block's front gap G ([x20, x20 + G), the pending link and G itself, both read first) becomes a hole;
+; its node [x20 + G, + round8(count + 8)) stays; the block ends where the node does.
+	ldr	x21, [x20]
+	ldr	x11, [x20, #8]
+	add	x12, x20, x11
+	ldr	x13, [x12]
+	add	x13, x13, #15
+	and	x13, x13, #0xfffffffffffffff8
+	mov	x0, x19
+	mov	x1, x20
+	mov	x2, x11
+	bl	_silica_rt_state_free
+	add	x1, x12, x13
+	sub	x2, x22, x1
+	cbz	x21, Lsde_rt_piece
+	sub	x2, x21, x1
+Lsde_rt_piece:
+	cmp	x2, #16
+	b.lt	Lsde_rt_next
+	mov	x0, x19
+	bl	_silica_rt_state_free
+Lsde_rt_next:
+	mov	x20, x21
+	cbnz	x20, Lsde_rt_loop
+	ldr	x8, [x19, #272]
+	ldr	x9, [x19, #280]
+	add	x9, x8, x9
+	str	xzr, [x9, #-8]
+Lsde_policy_go:
 	cbz	x24, Lsde_done
 	ldr	x9, [x19, #576]
 	cbnz	x9, Lsde_shrink

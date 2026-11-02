@@ -257,6 +257,17 @@ wrapper_meta and meta paths must be located under dangerous_exposure_source at t
 
 A foreign declaration binds a C wrapper symbol to a Silica function name in the current module.
 
+**Declared retention (sidecar `retains`, Lee 2026-11-01).** A sidecar `wrapper <symbol> { ... }` entry may name the parameters its C wrapper keeps after the call returns:
+
+```text
+wrapper silica_db_open {
+    ...
+    retains: [config_buf];
+}
+```
+
+Each name must be a parameter of the foreign declaration, of pointer or buffer type (`buf`, `ref`, `ref?`, or the `uint8` pointer of a pointer-plus-length pair). The check is one of the sidecar wrapper-entry checks and fails with **E4033** SidecarWrapperIncomplete. A buffer passed to a retained parameter must be allocated with `alloc_buf_retained(n)` (§7.5); a frame buffer passed there is **E2300** (chunk15_stack_memory_design.md §6.4 case (a)).
+
 ### 3.3 Export rule
 
 **Rule**: Every exported function from a `dangerous_*` module must be a Silica adapter wrapper.
@@ -719,10 +730,13 @@ If the external library needs to retain the string data after the wrapper return
 Mutable buffers must be represented explicitly as pointer-plus-length pairs.
 
 Silica buffers use the canonical form `buf(L, Space, T, N)`: region lifetime `L`, memory space `Space`, element
-type `T`, and length `N`. A buffer crosses the boundary as a typed pointer plus a `uint64_t` element count.
-**`buf(L, Space, uint8, N)` is the byte-payload form**: raw bytes cross as `uint8_t *` plus a `uint64_t` byte
-length. This is the form for binary data such as network payloads, digests and encoded records, and binary data
-does not have to be carried as `string`.
+type `T`, and length `N`. **At the boundary the only form is `buf(L, Space, uint8, N)`** (Lee, 2026-11-01): raw
+bytes cross as `uint8_t *` plus a `uint64_t` byte length. This is the form for binary data such as network
+payloads, digests and encoded records, and binary data does not have to be carried as `string`.
+
+A buffer passed to a wrapper is valid for the call only, unless the sidecar declares the parameter in `retains`
+(§3.2); a retained buffer is allocated with `alloc_buf_retained(n)` in the dangerous actor's state area and is
+valid while the actor's state holds it (§7.5).
 
 A wrapper that writes into a buffer must document:
 
@@ -959,7 +973,7 @@ Before the sequence block completes, every external-danger-touched value inside 
 Re-creation (§7.7) is the one permitted way to turn external-danger-touched data into a pure value. Destructuring,
 copying and user-defined helpers remain ineffective, as stated above.
 
-The sequence boundary is a taint boundary for `produces pure`. External-danger-touched data may exist inside the dynamic and lexical extent of the `external_danger` sequence block, and may appear only in FFI result casts executed from that block, except for region values explicitly converted into actor-state-owned region references under §7.5.
+The sequence boundary is a taint boundary for `produces pure`. External-danger-touched data may exist inside the dynamic and lexical extent of the `external_danger` sequence block, and may appear only in FFI result casts executed from that block. A memory region or buffer created or used inside the block is never part of such a cast (§7.5, §7.6).
 
 The result of the `produces pure` expression must be checked structurally. If any field, tuple element, list element, sum payload, or nested value contains external-danger-touched data, compilation fails.
 
@@ -974,7 +988,7 @@ sequence proc[external_danger] must produce only pure Silica values; external_da
 
 Any memory region modified, created, or used within a sequence block tagged with `external_danger` is actor-local to the FFI worker behavior function in which that sequence block appears.
 
-Such a memory region must never be moved out of the FFI worker behavior, except that it may be explicitly converted into an actor-state-owned region reference and stored in the actor state returned by that behavior invocation, or delivered through an FFI result cast under §7.6.
+Such a memory region, including a buffer, must never be moved out of the FFI worker behavior. A buffer may be actor state. A region or buffer must not cross a message boundary: it is not part of a message, a reply, or a spawn's initial state. Bytes may leave only as a copied non-buffer value (a string or list).
 
 This rule applies to:
 
@@ -983,29 +997,39 @@ This rule applies to:
 - memory regions allocated, initialized, mutated, borrowed, or consumed within an `external_danger` sequence block;
 - records, tuples, lists, or sum values containing any such memory-region reference.
 
-Actor state is the only permitted long-lived destination for such memory regions. These regions must not cross actor message boundaries.
+Actor state is the only permitted long-lived destination for such memory regions and buffers. These regions and buffers must not cross actor message boundaries. A spawn whose initial state contains a buffer fails with **E4038** BufferInSpawnInitialState: a child creates its own buffers inside its own dangerous sequence.
 
-The parser must reject any program that attempts to move an external-danger-touched memory region out of the FFI worker behavior, except when the region is explicitly converted into an actor-state-owned region reference and placed into the actor state returned by that same behavior invocation, or delivered through an FFI result cast under §7.6.
+**Buffers in actor state (Lee, 2026-11-01).** Any buffer may be actor state, as the whole state or inside a state record; this is permitted, never required. A buffer that is not stored as state is released with its frame. A buffer that is state is freed when the state holding it is replaced by a new value that no longer reaches it; a buffer still reachable from the new state is kept. Every remaining buffer is freed when the actor ends.
+
+**Retained buffers and the pin rule (Lee, 2026-11-01).** A buffer the C wrapper keeps after the call (a `retains` parameter, §3.2) is allocated with `alloc_buf_retained(n)`: type `buf(L, S, uint8, N)`, effect `external_danger`, legal only inside the dangerous actor's guarded sequence. It is a node of the actor's state area, and the actor is pinned so that the node never moves:
+
+- the actor must be spawned with `state_policy(:keep_state_area)` written at the spawn; another choice fails with **E4036** RetainedBufferActorNotPinned;
+- a behaviour that allocates a retained buffer must have a proven state release; the case that would take the fallback whole-state copy (W2300 for other behaviours) fails with **E4037** RetainedBufferFallbackBehaviour;
+- such a behaviour must not call `compact_state()`; it fails with **E4039** PinnedActorCompactsState.
+
+Under these rules the buffer's address is stable for the actor's life. It is freed by the rule above; the program must not drop it from the state while the C library still holds it. Retention the sidecar does not declare is a library bug, contained by the guarded region.
+
+The parser must reject any program that attempts to move an external-danger-touched memory region or buffer across a message boundary (a message, a reply, or a spawn's initial state).
 
 **Parser failure**:
 
 ```text
 ExternalDangerRegionEscapeError:
-Memory regions created, modified, or used inside sequence proc[external_danger] cannot move out of the FFI worker behavior function, except when explicitly converted into actor-state-owned region references returned as actor state, or delivered through an FFI result cast under §7.6.
+Memory regions created, modified, or used inside sequence proc[external_danger] cannot cross a message boundary. A buffer may be actor state; bytes may leave only as a copied non-buffer value.
 ```
 
 ### 7.6 Actor call and cast boundary rule
 
-An external-danger-touched memory region must not be included at any depth in:
+An external-danger-touched memory region or buffer must not be included at any depth in:
 
 - a return value produced for an ordinary actor `call`;
 - an ordinary actor `cast` payload.
 
 This prohibition is structural. Wrapping the region inside records, tuples, lists, or sum variants does not make it valid.
 
-**FFI result cast exception**: An FFI worker actor may include external-danger-touched data, including memory-region references, in a cast payload sent to the receiver named in a foreign-call request, provided the cast is executed inside the requesting worker's `external_danger` sequence block. No other cast or call path may carry external-danger-touched memory regions.
+**FFI result cast**: An FFI worker actor may include external-danger-touched non-buffer data (a copied string or list, a scalar) in a cast payload sent to the receiver named in a foreign-call request, provided the cast is executed inside the requesting worker's `external_danger` sequence block. A memory-region reference or buffer never leaves by this cast; there is no exception for it.
 
-A client actor that receives an FFI result cast must consume, discard, or re-create any external-danger-touched payload within that cast handler. It must not place external-danger-touched data, memory regions included, into actor state, ordinary outbound casts, or `call` replies. The only way for a result to leave the handler is re-creation (§7.7): the pure value that `recreate` returns may go into actor state, ordinary casts and `call` replies.
+A client actor that receives an FFI result cast must consume, discard, or re-create any external-danger-touched payload within that cast handler. It must not place external-danger-touched data into actor state, ordinary outbound casts, or `call` replies. The only way for a result to leave the handler is re-creation (§7.7): the pure value that `recreate` returns may go into actor state, ordinary casts and `call` replies.
 
 **Type-check failure**:
 
@@ -1103,7 +1127,7 @@ When Silica calls a C wrapper function, Silica values are lowered into the wrapp
 | `boolean`          | `uint8_t`, where `0 = false` and `1 = true`                          |
 | `string` (adapter) | adapter parameter only; lowered at raw call to actor-stack copy as `const uint8_t *` plus `uint64_t` length |
 | `string` (raw foreign binding) | not permitted; raw bindings use pointer-plus-length arguments |
-| `buf(L, Space, T, N)` | typed pointer plus `uint64_t` element count; `buf(L, Space, uint8, N)` is the byte-payload form (§6.2) |
+| `buf(L, Space, uint8, N)` | `uint8_t *` plus `uint64_t` byte length; the only buffer form at the boundary (§6.2) |
 | inline record      | C struct with matching field order and verified layout               |
 | inline sum         | C struct with explicit `tag` and payload fields                      |
 
@@ -2101,7 +2125,7 @@ Required parser failure:
 
 ```text
 ExternalDangerRegionEscapeError:
-Memory regions created, modified, or used inside sequence proc[external_danger] cannot move out of the FFI worker behavior function, except when explicitly converted into actor-state-owned region references returned as actor state, or delivered through an FFI result cast under §7.6.
+Memory regions created, modified, or used inside sequence proc[external_danger] cannot cross a message boundary. A buffer may be actor state; bytes may leave only as a copied non-buffer value.
 ```
 
 Required type-check failure:

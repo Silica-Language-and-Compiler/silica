@@ -16,23 +16,18 @@
 -}
 
 // Memory region prim emission: alloc_region, alloc_ref, alloc_rec, read_ref, write_ref,
-// alloc_buf, buf_load, buf_store, read_buf, write_buf, fresh_lifetime,
-// canonical_arena_lookup, canonical_arena_same, ref_eq, ref_in_region
+// alloc_buf, alloc_buf_retained, buf_load, buf_store, read_buf, write_buf, fresh_lifetime, ref_eq, retire
 // sir_design_spec §7.4, §7.5; silica-specification §12.1.2
 // Heap-based allocation per spec: regions are heap-allocated with scope-tied deallocation.
 // Arena layout: [0:8]=bump, [8:16]=end of the block being filled, [16:24]=head of the chain of
 // extension blocks, [24:32]=this block's own data end; data at offset 32. First block is 4096
 // bytes of data, so 4128 in total.
 //
-// A region is not a fixed-size buffer. When the current block cannot satisfy an allocation,
-// L_region_grow attaches another block and the allocation retries against it, so the only hard
-// failure left is the underlying allocator returning nothing. This matters because the region
-// holds whatever the program puts in it: the compiler's own atom table filled 4096 bytes after
-// eleven atoms, and a fixed arena aborted there.
-//
-// The region handle is the address of the first block and never moves, so refs handed out before
-// a growth stay valid. Each block records its own span at [24:32] and the next block at [16:24],
-// which is what lets ref_in_region still answer for a ref allocated from an earlier block.
+// A region is not a fixed-size buffer. When the current block cannot satisfy an allocation, the
+// allocation is a frame allocation of the function that executes the prim (L_dyn_alloc), of any
+// size, as an allocation into a normal region always is (Lee 2026-11-01: heap is not to be used,
+// only stack). Nothing is chained and the heap is never reached; the block's bump is not moved.
+// The extension chain word [16:24] stays 0.
 
 use prims_tuple;
 use atom_table;
@@ -46,8 +41,6 @@ export module_uses_alloc_region/1;
 export emit_region_helpers/0;
 export emit_frame_helpers/0;
 export emit_evacuation_helper/0;
-export emit_stack_top_helper/0;
-export emit_ev_region_alloc/1;
 
 
 // Local SIRTerm arena helpers (sir_ast node accessors are not exported).
@@ -99,7 +92,7 @@ fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: stri
 }
 
 fn is_memory_prim(name: string) -> boolean {
-    name == "alloc_region" or name == "alloc_ref" or name == "alloc_rec" or name == "read_ref" or name == "write_ref" or name == "alloc_buf" or name == "buf_load" or name == "buf_store" or name == "read_buf" or name == "write_buf" or name == "fresh_lifetime" or name == "canonical_arena_lookup" or name == "canonical_arena_same" or name == "ref_eq" or name == "retire"
+    name == "alloc_region" or name == "alloc_ref" or name == "alloc_rec" or name == "read_ref" or name == "write_ref" or name == "alloc_buf" or name == "alloc_buf_retained" or name == "buf_load" or name == "buf_store" or name == "read_buf" or name == "write_buf" or name == "fresh_lifetime" or name == "ref_eq" or name == "retire"
 }
 
 // ref_eq(a, b): X1 = ref A, X2 = ref B -> boolean in dest (pointer identity).
@@ -110,43 +103,29 @@ fn emit_ref_eq(dest: string) -> string {
     concat(concat(cmp, cset), mov_dest)
 }
 
-// canonical_arena_lookup(key): X1 = int64 specialization key -> region base in dest.
-fn emit_canonical_arena_lookup(dest: string) -> string {
-    mov_key: string <- "    MOV X0, X1\n";
-    bl_lookup: string <- "    BL _silica_rt_canonical_arena_lookup\n";
-    mov_dest: string <- concat(concat("    MOV ", dest), ", X0");
-    concat(concat(mov_key, bl_lookup), mov_dest)
-}
-
-// canonical_arena_same(r1, r2): X1 = region A, X2 = region B -> boolean in dest.
-fn emit_canonical_arena_same(dest: string) -> string {
-    mov_a: string <- "    MOV X0, X1\n";
-    mov_b: string <- "    MOV X1, X2\n";
-    bl_same: string <- "    BL _silica_rt_canonical_arena_same\n";
-    mov_dest: string <- concat(concat("    MOV ", dest), ", X0");
-    concat(concat(concat(concat(mov_a, mov_b), bl_same), "\n"), mov_dest)
-}
-
-// alloc_region(space): allocate arena on heap via malloc, return region base.
-// Region layout: [base+0]=bump (starts at base+32), [base+8]=end, [base+16]=extensions, [base+24]=span end.
-// Operands: X1 = space (unused; memory space would configure MAIR at runtime)
+// alloc_region(space) in an atomic or device space (a normal space gets the witness, emit_prim_op):
+// the region's block is a frame allocation of the function that executes the prim (chunk 15 design
+// §3.8, Lee 2026-11-01: alloc_region is in the stack), so it is released with that frame and
+// nothing is malloc'd or checked for failure (a frame allocation that touches a new page is stack
+// growth, design §3.2). The block is the 4128 bytes the heap form used: a 32-byte header and 4096
+// bytes of cells, a multiple of 16 as L_dyn_alloc requires.
+// Region layout, unchanged: [base+0]=bump (starts at base+32), [base+8]=end, [base+16]=extensions,
+// [base+24]=span end; emit_region_bump_check and L_region_contains read these words.
+// Operands: X1 = space (unused; memory space would configure MAIR at runtime). L_dyn_alloc keeps
+// X0-X15; X4 and X5 are the scratch the heap form already used.
 fn emit_alloc_region(dest: string) -> string {
-    mov_size: string <- "    MOV X0, #4128\n";
-    bl_malloc: string <- "    BL _silica_rt_raw_alloc\n";
-    // No block: the current actor ends with (:explicit, :region_alloc_failed), main aborts (H5).
-    null_check: string <- "    CBNZ X0, 1f\n    BL _silica_rt_region_alloc_failed\n1:\n";
-    add_bump: string <- "    ADD X4, X0, #32\n";
-    str_bump: string <- "    STR X4, [X0]\n";
-    // 4128 > 4095: cannot use single ADD #imm; use reg + reg (Apple clang rejects ADD X4, X0, #4128).
+    alloc: string <- "    MOV X16, #4128\n    BL L_dyn_alloc\n    MOV X4, X16\n";
+    add_bump: string <- "    ADD X5, X4, #32\n";
+    str_bump: string <- "    STR X5, [X4]\n";
+    // 4128 > 4095: cannot use single ADD #imm; use reg + reg (Apple clang rejects ADD X5, X4, #4128).
     mov_arena_sz: string <- "    MOV X5, #4128\n";
-    add_end: string <- "    ADD X4, X0, X5\n";
-    str_end: string <- "    STR X4, [X0, #8]\n";
+    add_end: string <- "    ADD X5, X4, X5\n";
+    str_end: string <- "    STR X5, [X4, #8]\n";
     // No extension blocks yet, and the first block's span ends where its bump limit does.
-    str_no_ext: string <- "    STR XZR, [X0, #16]\n";
-    str_span_end: string <- "    STR X4, [X0, #24]\n";
-    mov_dest: string <- concat(concat("    MOV ", dest), ", X0");
-    part1: string <- concat(mov_size, concat(bl_malloc, null_check));
-    part2: string <- concat(part1, concat(add_bump, str_bump));
+    str_no_ext: string <- "    STR XZR, [X4, #16]\n";
+    str_span_end: string <- "    STR X5, [X4, #24]\n";
+    mov_dest: string <- concat(concat("    MOV ", dest), ", X4");
+    part2: string <- concat(alloc, concat(add_bump, str_bump));
     part3: string <- concat(part2, concat(mov_arena_sz, concat(add_end, str_end)));
     part4: string <- concat(part3, concat(str_no_ext, str_span_end));
     concat(part4, mov_dest)
@@ -161,23 +140,22 @@ fn emit_alloc_region(dest: string) -> string {
 // canonical arena is process-shared, and two actors allocating in the same arena from two threads
 // used to read one bump, each write bump+size, and hand out the same cell. LDAXR/STXR costs the
 // uncontended path a monitor set and a store-exclusive, nothing more; the LSE LDADD would not do,
-// because the bound against the block's end has to hold before the bump moves. The pair also makes
-// a growth safe: L_region_grow (below) parks a sentinel in the bump before it publishes the new
-// block, so a reservation that read the old bump either sees a request that cannot fit or finds the
-// word changed under its STXR and starts over, and the end is read after the bump so the acquire
-// orders it (the grow publishes the end before the bump with a release store).
+// because the bound against the block's end has to hold before the bump moves.
 //
-// Nothing is moved into place for the grow call: L_region_grow reads the region from X1 and the
-// request from X7, both of which the site set up for the reservation. Setting up argument registers
-// instead would corrupt the caller on exactly the rare path that is hardest to notice -- the emitter
-// stages call arguments in X0-X7, so a `MOV X6, X1` here destroys a staged argument, but only in
-// the runs where the region happened to fill up.
+// A request the block cannot hold (path 3) is a frame allocation of the executing function, of any
+// size: X7 rounded up to 16 is taken with L_dyn_alloc and X3 is its start, so the site continues as
+// after a reservation. The bump is left alone, so no concurrent reservation is affected. L_dyn_alloc
+// keeps X0-X15 and X17 (only X16 and the flags change) and moves the transient area with SP, so the
+// staged call arguments in X0-X7 and the SP-relative pushes survive. The heap path through
+// L_region_grow and _silica_rt_raw_alloc is gone (Lee 2026-11-01: heap is not to be used, only stack).
+// Such a block lives with the executing frame and reaches the caller only by return (evacuation),
+// as an allocation into a normal region does (chunk15_stack_memory_design.md §3.8).
 //
-// Numeric local labels, so the sites need no unique names: 2 is the retry, 3 the grow, 1 the exit.
+// Numeric local labels, so the sites need no unique names: 2 is the retry, 3 the frame block, 1 the exit.
 fn emit_region_bump_check(size_math: string) -> string {
     reserve: string <- "2:\n    LDAXR X3, [X1]\n    LDR X4, [X1, #8]\n    ADD X5, X3, X7\n    CMP X5, X4\n    B.HI 3f\n    STXR W17, X5, [X1]\n    CBNZ W17, 2b\n    B 1f\n";
-    grow: string <- "3:\n    BL L_region_grow\n    B 2b\n1:\n";
-    concat(size_math, concat(reserve, grow))
+    frame_block: string <- "3:\n    CLREX\n    ADD X16, X7, #15\n    AND X16, X16, #0xfffffffffffffff0\n    BL L_dyn_alloc\n    MOV X3, X16\n1:\n";
+    concat(size_math, concat(reserve, frame_block))
 }
 
 fn memory_type_is_tuple(type_name: string) -> boolean {
@@ -205,7 +183,8 @@ fn memory_tuple_word_count(value: { nodes: List[{ kind: int64, type_name: string
 // The reservation grows the region when bump+8 > end and publishes the bump itself.
 // Chunk 15 phase 2 (design §3.2): an allocation into a region in a normal memory space is a frame
 // allocation (prims_memory L_dyn_alloc), the region handle a lifetime witness that is not read. An
-// atomic or device region keeps the shared block it has today (§2.7).
+// atomic or device region keeps its block and bump words; since 2026-11-01 that block is itself a
+// frame allocation of the function that executes alloc_region (emit_alloc_region, design §3.8).
 fn alloc_in_frame(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
     v: string <- sir_term_root_node(term).value;
     memory_type_contains(v, "atomic") == false and memory_type_contains(v, "device") == false
@@ -279,7 +258,8 @@ fn emit_write_ref(term: { nodes: List[{ kind: int64, type_name: string, value: s
 }
 
 // alloc_buf(region, N): bump-allocate buffer of N elements within region.
-// Operands: X1 = region, X2 = N (element count). Rejects negative N, byte-size overflow, and arena overflow.
+// Operands: X1 = region, X2 = N (element count). Rejects negative N and byte-size overflow; a buffer of
+// any size is a frame allocation (a full atomic/device block hands it to L_dyn_alloc, emit_region_bump_check).
 fn elem_size_shift_from_buf_type(buf_type: string) -> int64 {
     case memory_type_contains(buf_type, "int8") of {
         true -> 0;
@@ -345,6 +325,33 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
             concat(check, alloc)
         }
     }
+}
+
+// alloc_buf_retained(n) (chunk 15 phase 7, the pin rule of Lee 2026-11-01; chunk15_stack_memory_design.md
+// §7): a uint8 buffer for a foreign parameter the sidecar declares `retains`. It is a node of the dangerous
+// actor's STATE AREA, so its address is stable for the actor's life: the actor is pinned (spawned with
+// state_policy(:keep_state_area), E4036, and no behaviour of it takes the fallback copy, E4037), and
+// nodes never move under :keep_state_area for proven behaviours (decision 21, §4.3). The behaviour runs
+// with SP at the state edge, so the edge cannot be extended during the dispatch; the node is therefore
+// taken as a block of the behaviour's own frame (L_dyn_alloc; external_danger sequences are only directly
+// inside the behaviour, E4041, so the block is in the behaviour's frame and lives to dispatch end) and
+// handed to _silica_rt_state_retain_node, which gives back an exact-size hole of the state area instead
+// when one is free, else records the block as pending; _silica_rt_state_dispatch_end lowers the edge to
+// the lowest pending block, so the block becomes a state node in place, never copied.
+// Block layout (16-aligned, round16(n + 24) bytes): the buffer node is the block's last round8(n + 8)
+// bytes, the count then the bytes, exactly an alloc_buf buffer's node (the value points past the count,
+// so the count is at [buf, #-8]); the front gap G (16 or 24 bytes) holds +0 the pending link and +8 G
+// and becomes a hole once the node is placed (_silica_rt_state_retain_node, dispatch end). Operands as alloc_buf's
+// region-less form: X1 = the lifetime witness (unused), X2 = n. L_dyn_alloc keeps X0-X8; the runtime call
+// clobbers X0-X18 as every memory prim is assumed to (body_has_bl_producing_prim). A 0 answer (no current
+// actor, or the state header cannot be committed) ends the actor through L_region_overflow.
+fn emit_alloc_buf_retained(dest: string) -> string {
+    neg_check: string <- "    CMP X2, #0\n    B.LT L_buf_invalid\n";
+    size: string <- "    ADD X16, X2, #39\n    AND X16, X16, #0xfffffffffffffff0\n    MOV X7, X16\n";
+    frame_block: string <- "    BL L_dyn_alloc\n    MOV X0, X16\n    MOV X1, X7\n";
+    retain: string <- "    BL _silica_rt_state_retain_node\n    CBZ X0, L_region_overflow\n";
+    mov_dest: string <- concat(concat("    MOV ", dest), ", X0");
+    concat(concat(neg_check, size), concat(frame_block, concat(retain, mov_dest)))
 }
 
 fn int64_to_str(n: int64) -> string {
@@ -532,7 +539,7 @@ fn is_buf_access_prim(name: string) -> boolean {
 fn term_has_region_allocation(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
     case term.root < 0 of {
         true -> false;
-        false -> case sir_term_root_node(term).kind == 6 and (sir_term_root_node(term).name == "alloc_ref" or sir_term_root_node(term).name == "alloc_buf" or sir_term_root_node(term).name == "alloc_rec" or is_buf_access_prim(sir_term_root_node(term).name)) of {
+        false -> case sir_term_root_node(term).kind == 6 and (sir_term_root_node(term).name == "alloc_ref" or sir_term_root_node(term).name == "alloc_buf" or sir_term_root_node(term).name == "alloc_buf_retained" or sir_term_root_node(term).name == "alloc_rec" or is_buf_access_prim(sir_term_root_node(term).name)) of {
             true -> true;
             false -> case term_has_region_allocation(sir_term_at(term, sir_term_root_node(term).inner)) of {
                 true -> true;
@@ -556,8 +563,8 @@ fn module_uses_region_allocation(sir_module: { module_name: string, used_modules
     region_allocation_in_functions(sir_module.functions)
 }
 
-// True when emitted code calls _silica_rt_region_alloc (alloc_region prim only).
-// Used to append the malloc stub; separate from module_uses_region_allocation (arena bump overflow).
+// True when some function has an alloc_region prim (no caller since chunk 15 stage 4e removed the
+// malloc stub it used to gate; kept for the linux twins until phase 8).
 fn term_has_alloc_region(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
     case term.root < 0 of {
         true -> false;
@@ -585,27 +592,6 @@ fn module_uses_alloc_region(sir_module: { module_name: string, used_modules: Lis
     alloc_region_in_functions(sir_module.functions)
 }
 
-// L_region_grow(X1 = region, X7 = bytes wanted): attach a block that can hold the request and point
-// the region's bump/end at it. Preserves every general register, because it is called from the
-// middle of an allocation sequence that still holds the value being stored: the caller only
-// retries its reservation afterwards. X19/X20 are saved for the same reason and are safe to use
-// across _silica_rt_raw_alloc, which preserves them.
-//
-// A block is at least 4096 data bytes so ordinary allocation keeps amortizing over one call, and
-// exactly the (16-byte rounded) request when that is larger, which is what makes a buffer bigger
-// than a block work at all. L_region_overflow remains for the one failure that is still fatal:
-// the allocator handing back nothing.
-//
-// Growth is serialized by _silica_rt_region_lock (one process-wide word in the runtime module,
-// canonical_arena_runtime_asm; growth is one call per block, so one lock for every region costs
-// nothing measurable). Under the lock the request is checked again, because the grower that got
-// there first may already have attached a block this request fits; then a sentinel (2^62, above
-// every user address, and bump + request cannot wrap) is parked in the bump so no concurrent
-// reservation can land in the old block while the new one is being published, the block is
-// chained and its end stored, and the bump is published last with a release store. The reservation
-// loop's acquire load of the bump therefore sees the matching end. The lock is released before
-// the overflow branch so an allocation failure that ends only the current actor leaves the lock
-// free; the sentinel stays, and the next reservation in that region tries to grow again.
 // Region release (silica-specification 12.1.2): free a region and every extension
 // block chained off [base+16]. A region is a discrete malloc'd pool, so releasing
 // one is independent of every other region -- no arena rewind, no ordering
@@ -615,32 +601,10 @@ fn emit_region_free_helper() -> string {
     "    .globl _silica_rt_region_free\n_silica_rt_region_free:\n    CBZ X0, L_rf_null\n    STP X29, X30, [SP, #-16]!\n    STP X19, X20, [SP, #-16]!\n    MOV X19, X0\n    LDR X20, [X19, #16]\nL_rf_loop:\n    CBZ X20, L_rf_root\n    LDR X1, [X20, #16]\n    MOV X0, X20\n    MOV X20, X1\n    BL _free\n    B L_rf_loop\nL_rf_root:\n    STR XZR, [X19, #16]\n    MOV X0, X19\n    BL _free\n    LDP X19, X20, [SP], #16\n    LDP X29, X30, [SP], #16\nL_rf_null:\n    RET\n"
 }
 
-fn emit_region_grow_helper() -> string {
-    save1: string <- "L_region_grow:\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    STP X19, X20, [SP, #-16]!\n";
-    save2: string <- "    STP X0, X1, [SP, #-16]!\n    STP X2, X3, [SP, #-16]!\n    STP X4, X5, [SP, #-16]!\n    STP X6, X7, [SP, #-16]!\n";
-    save3: string <- "    STP X8, X9, [SP, #-16]!\n    STP X10, X11, [SP, #-16]!\n    STP X12, X13, [SP, #-16]!\n    STP X14, X15, [SP, #-16]!\n";
-    save4: string <- "    STP X16, X17, [SP, #-16]!\n    STR X18, [SP, #-16]!\n";
-    size: string <- "    MOV X19, X1\n    ADD X20, X7, #15\n    BIC X20, X20, #15\n    MOV X9, #4096\n    CMP X20, X9\n    B.HS 1f\n    MOV X20, X9\n1:\n";
-    lock: string <- "    ADRP X9, _silica_rt_region_lock@PAGE\n    ADD X9, X9, _silica_rt_region_lock@PAGEOFF\n    MOV W11, #1\n2:\n    LDAXR W10, [X9]\n    CBNZ W10, 2b\n    STXR W12, W11, [X9]\n    CBNZ W12, 2b\n";
-    recheck: string <- "    LDR X3, [X19]\n    LDR X4, [X19, #8]\n    ADD X5, X3, X7\n    CMP X5, X4\n    B.LS 4f\n    MOV X10, #1\n    LSL X10, X10, #62\n    STLR X10, [X19]\n";
-    alloc: string <- "    ADD X0, X20, #32\n    BL _silica_rt_raw_alloc\n    CBZ X0, 5f\n";
-    span: string <- "    ADD X1, X0, #32\n    ADD X2, X1, X20\n    STR X2, [X0, #24]\n";
-    chain: string <- "    LDR X3, [X19, #16]\n    STR X3, [X0, #16]\n    ADD X11, X19, #16\n    STLR X0, [X11]\n";
-    publish: string <- "    STR X2, [X19, #8]\n    STLR X1, [X19]\n4:\n    ADRP X9, _silica_rt_region_lock@PAGE\n    ADD X9, X9, _silica_rt_region_lock@PAGEOFF\n    STLR WZR, [X9]\n";
-    restore1: string <- "    LDR X18, [SP], #16\n    LDP X16, X17, [SP], #16\n";
-    restore2: string <- "    LDP X14, X15, [SP], #16\n    LDP X12, X13, [SP], #16\n    LDP X10, X11, [SP], #16\n    LDP X8, X9, [SP], #16\n";
-    restore3: string <- "    LDP X6, X7, [SP], #16\n    LDP X4, X5, [SP], #16\n    LDP X2, X3, [SP], #16\n    LDP X0, X1, [SP], #16\n";
-    restore4: string <- "    LDP X19, X20, [SP], #16\n    LDP X29, X30, [SP], #16\n    RET\n";
-    failed: string <- "5:\n    ADRP X9, _silica_rt_region_lock@PAGE\n    ADD X9, X9, _silica_rt_region_lock@PAGEOFF\n    STLR WZR, [X9]\n    B L_region_overflow\n";
-    saves: string <- concat(save1, concat(save2, concat(save3, save4)));
-    work: string <- concat(size, concat(lock, concat(recheck, concat(alloc, concat(span, concat(chain, publish))))));
-    restores: string <- concat(restore1, concat(restore2, concat(restore3, restore4)));
-    concat(saves, concat(work, concat(restores, failed)))
-}
-
 // L_region_contains(X1 = ref, X2 = region) -> X5 = 0 or 1: is the ref one this region handed out?
-// The first block's data starts at region+32 and the rest hang off [region+16], each carrying its
-// own end at [block+24], so a ref from a block filled before the region grew still answers true.
+// The block's data starts at region+32 and ends at [region+24]. [region+16] is always 0 since the
+// region stopped growing by chained heap blocks (2026-11-01), so the chain walk finds nothing; a
+// block taken in the frame after the region filled (emit_region_bump_check path 3) answers false.
 //
 // X5 is the only register this leaves changed. The walk needs two scratch registers and borrows
 // X6/X7, but restores them: ref_in_region runs on every operation of a region-backed map, and the
@@ -698,35 +662,33 @@ fn emit_frame_helpers() -> string {
 // the copies, and X0 = the value, X1 = the new floor, SP = the new SP come back. Nodes elsewhere
 // (older frames, the heap, literals, mailbox regions) are left where they are.
 //
-// L_ev_heap_shell: as L_ev_heap, but an aggregate root is left where it is and only its words are
-// evacuated (a behaviour's state and reply, whose shells the result move copies itself).
+// The heap mode of phase 2 (L_ev_heap, L_ev_heap_shell: the same walk copying into _silica_rt_region_alloc
+// blocks for a behaviour's state, a send and a spawn) went with the implicit heap in chunk 15 stage 4e;
+// those values are copied by the runtime copier into the state area, the mailbox buffer and the child's
+// base (phases 3 and 4).
 //
-// L_ev_heap(X0, X1, X2, X3 = the upper bound): the same walk, but each node in [entry SP, X3) is
-// copied into a _silica_rt_region_alloc block (the implicit heap stays in phase 2 for state, replies
-// and spawn: phases 3 and 4 replace it); SP is unchanged.
-//
-// The walk is Cheney's: copies (frame mode) or their headers (heap mode) are laid out in a scratch
+// The walk is Cheney's: copies are laid out in a scratch
 // block that grows down from the routine's own frame, and a scan over that block evacuates the
 // pointer words of each copy in turn, so no recursion and no side table are needed. A node reached
 // twice is found by its forwarding word (bit 63 over the copy's final address): a ref cell's word, a
 // one-word cell's second word, a buffer's count, a list handle's length, a chunk's claim, a run-time
 // string's marker. Records, tuples and sums are copied each time they are reached (they are values;
 // the message copier treats them the same way). Final addresses are assigned during the scan pass,
-// so the second pass (frame mode) only moves bytes: the transient area first, then each copy.
+// so the second pass only moves bytes: the transient area first, then each copy.
 //
 // Kinds are the copier's (term_message_copy): 2 REF1 (16-byte frame cell), 3 REFTUP, 4 AGG, 5 SUM,
 // 6 BUF, 7 LIST handle, 8 STRING, and 17, internal, a list chunk (AUX = the list descriptor).
 fn emit_evacuation_helper() -> string {
-    ev0: string <- "L_ev_heap_shell:\n    MOV X5, #1\n    MOV X6, #1\n    B L_ev_common\nL_ev_heap:\n    MOV X5, #1\n    MOV X6, #0\n    B L_ev_common\nL_ev_frame:\n    MOV X5, #0\n    MOV X6, #0\nL_ev_common:\n    STP X29, X30, [SP, #-192]!\n    MOV X29, SP\n    STP X19, X20, [SP, #16]\n    STP X21, X22, [SP, #32]\n    STP X23, X24, [SP, #48]\n    STP X25, X26, [SP, #64]\n    STP X27, X28, [SP, #80]\n    ADD X19, X29, #192\n    MOV X20, X3\n    MOV X26, X4\n    MOV X21, X4\n    MOV X22, X5\n    MOV X24, SP\n    STP X0, X1, [X29, #144]\n    STR X2, [X29, #160]\n    CBNZ X6, Lev_root_shell\n    BL L_evw\n    STR X0, [X29, #128]\n";
-    ev1: string <- "    B Lev_root_done\nLev_root_shell:\n    STR X0, [X29, #128]\n    LDP X9, X1, [X29, #144]\n    LDR X2, [X29, #160]\n    CMP X0, X9\n    B.NE Lev_root_done\n    MOV X10, #65536\n    CMP X9, X10\n    B.LO Lev_root_done\n    CMP X1, #5\n    B.NE Lev_root_agg\n    LDR X10, [X9]\n    LDR X11, [X2]\n    MVN X11, X11\n    ADD X12, X2, #8\nLev_root_sum:\n    CBZ X11, Lev_root_done\n    LDP X13, X14, [X12], #16\n    SUB X11, X11, #1\n    CMP X13, X10\n    B.NE Lev_root_sum\n    MOV X1, #4\n    MOV X2, X14\nLev_root_agg:\n    CMP X1, #4\n    B.NE Lev_root_done\n    MOV X0, X9\n    MOV X1, X2\n    BL Lev_words\n";
+    ev0: string <- "L_ev_frame:\n    STP X29, X30, [SP, #-192]!\n    MOV X29, SP\n    STP X19, X20, [SP, #16]\n    STP X21, X22, [SP, #32]\n    STP X23, X24, [SP, #48]\n    STP X25, X26, [SP, #64]\n    STP X27, X28, [SP, #80]\n    ADD X19, X29, #192\n    MOV X20, X3\n    MOV X26, X4\n    MOV X21, X4\n    MOV X22, XZR\n    MOV X24, SP\n    STP X0, X1, [X29, #144]\n    STR X2, [X29, #160]\n    BL L_evw\n    STR X0, [X29, #128]\n";
+    ev1: string <- "";
     ev2: string <- "Lev_root_done:\n    MOV X23, X24\nLev_scan:\n    MOV X9, SP\n    CMP X23, X9\n    B.LS Lev_scan_done\n    LDP X10, X11, [X23, #-48]\n    LDP X12, X13, [X23, #-32]\n    LDP X14, X15, [X23, #-16]\n    SUB X16, X23, #48\n    SUB X16, X16, X15\n    CMP X15, #0\n    CSEL X16, X16, X11, NE\n    SUB X23, X23, #48\n    SUB X23, X23, X15\n    CMP X12, #4\n    B.EQ Lev_s_agg\n    CMP X12, #3\n    B.EQ Lev_s_reftup\n    CMP X12, #2\n    B.EQ Lev_s_ref1\n    CMP X12, #7\n    B.EQ Lev_s_handle\n    CMP X12, #17\n    B.EQ Lev_s_chunk\n    B Lev_scan\nLev_s_agg:\n    MOV X0, X16\n    MOV X1, X13\n    BL Lev_words\n";
     ev3: string <- "    B Lev_scan\nLev_s_reftup:\n    ADD X0, X16, #8\n    MOV X1, X13\n    BL Lev_words\n    B Lev_scan\nLev_s_ref1:\n    MOV X0, X16\n    MOV X1, X13\n    BL Lev_words\n    B Lev_scan\nLev_s_handle:\n    STR X16, [X29, #144]\n    LDR X0, [X16, #8]\n    MOV X1, #17\n    MOV X2, X13\n    BL L_evw\n    LDR X16, [X29, #144]\n    STR X0, [X16, #8]\n    B Lev_scan\nLev_s_chunk:\n    STR X16, [X29, #144]\n    STR X13, [X29, #152]\n    LDR X9, [X13, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X10, X9, X10, HI\n    STR X10, [X29, #168]\n    ADD X11, X16, X10\n    LDR X12, [X11, #8]\n";
     ev4: string <- "    STR X12, [X29, #160]\n    LDP X1, X2, [X13, #16]\n    CMP X1, #0\n    B.EQ Lev_sc_next\n    CMP X1, #1\n    B.EQ Lev_sc_next\n    CMP X1, #9\n    B.EQ Lev_sc_next\nLev_sc_loop:\n    LDR X9, [X29, #160]\n    LDR X10, [X29, #168]\n    CMP X9, X10\n    B.HS Lev_sc_next\n    LDR X13, [X29, #152]\n    LDR X11, [X13, #8]\n    ADD X12, X9, X11\n    STR X12, [X29, #160]\n    STR X9, [X29, #176]\n    LDR X16, [X29, #144]\n    LDP X1, X2, [X13, #16]\n    CMP X11, #8\n    B.HI Lev_sc_inline\n    LDR X0, [X16, X9]\n    BL L_evw\n    LDR X16, [X29, #144]\n    LDR X9, [X29, #176]\n    STR X0, [X16, X9]\n    B Lev_sc_loop\nLev_sc_inline:\n    CMP X1, #4\n";
-    ev5: string <- "    B.NE Lev_sc_loop\n    ADD X0, X16, X9\n    MOV X1, X2\n    BL Lev_words\n    B Lev_sc_loop\nLev_sc_next:\n    LDR X16, [X29, #144]\n    LDR X10, [X29, #168]\n    LDR X0, [X16, X10]\n    MOV X1, #17\n    LDR X2, [X29, #152]\n    BL L_evw\n    LDR X16, [X29, #144]\n    LDR X10, [X29, #168]\n    STR X0, [X16, X10]\n    B Lev_scan\nLev_scan_done:\n    LDR X0, [X29, #128]\n    CBNZ X22, Lev_heap_done\n    SUB X9, X26, X21\n    MOV X10, X20\n    MOV X11, X26\n    MOV X12, X24\n    MOV X13, SP\n    SUB X14, X10, X9\n    CMP X12, X14\n    B.LS Lev_f_noshift\n    SUB X15, X12, X14\n    ADD X15, X15, #15\n    AND X15, X15, #0xfffffffffffffff0\n";
+    ev5: string <- "    B.NE Lev_sc_loop\n    ADD X0, X16, X9\n    MOV X1, X2\n    BL Lev_words\n    B Lev_sc_loop\nLev_sc_next:\n    LDR X16, [X29, #144]\n    LDR X10, [X29, #168]\n    LDR X0, [X16, X10]\n    MOV X1, #17\n    LDR X2, [X29, #152]\n    BL L_evw\n    LDR X16, [X29, #144]\n    LDR X10, [X29, #168]\n    STR X0, [X16, X10]\n    B Lev_scan\nLev_scan_done:\n    LDR X0, [X29, #128]\n    SUB X9, X26, X21\n    MOV X10, X20\n    MOV X11, X26\n    MOV X12, X24\n    MOV X13, SP\n    SUB X14, X10, X9\n    CMP X12, X14\n    B.LS Lev_f_noshift\n    SUB X15, X12, X14\n    ADD X15, X15, #15\n    AND X15, X15, #0xfffffffffffffff0\n";
     ev6: string <- "    SUB X16, X13, X15\n    MOV SP, X16\n    MOV X17, X13\nLev_f_shift:\n    CMP X17, X12\n    B.HS Lev_f_shifted\n    LDR X8, [X17], #8\n    STR X8, [X16], #8\n    B Lev_f_shift\nLev_f_shifted:\n    SUB X12, X12, X15\n    SUB X13, X13, X15\nLev_f_noshift:\n    LDP X19, X20, [X29, #16]\n    LDP X21, X22, [X29, #32]\n    LDP X23, X24, [X29, #48]\n    LDP X25, X26, [X29, #64]\n    LDP X27, X28, [X29, #80]\n    LDP X29, X30, [X29]\n    MOV X15, X10\n    MOV X16, X14\nLev_f_tmove:\n    CMP X15, X11\n    B.HS Lev_f_tmoved\n    LDR X17, [X15], #8\n    STR X17, [X16], #8\n    B Lev_f_tmove\nLev_f_tmoved:\n    MOV X15, X12\nLev_f_body:\n";
-    ev7: string <- "    CMP X15, X13\n    B.LS Lev_f_done\n    LDP X1, X2, [X15, #-48]\n    LDP X3, X4, [X15, #-16]\n    SUB X15, X15, #48\n    SUB X15, X15, X4\n    ADD X3, X3, #7\n    AND X3, X3, #0xfffffffffffffff8\n    MOV X5, #0\nLev_f_copy:\n    CMP X5, X3\n    B.HS Lev_f_body\n    LDR X6, [X15, X5]\n    STR X6, [X2, X5]\n    ADD X5, X5, #8\n    B Lev_f_copy\nLev_f_done:\n    MOV SP, X14\n    SUB X1, X11, X9\n    RET\nLev_heap_done:\n    MOV X23, X24\nLev_hr_loop:\n    MOV X9, SP\n    CMP X23, X9\n    B.LS Lev_hr_done\n    LDP X10, X11, [X23, #-48]\n    LDP X12, X13, [X23, #-32]\n    LDR X15, [X23, #-8]\n    SUB X23, X23, #48\n";
-    ev8: string <- "    SUB X23, X23, X15\n    CMP X10, X11\n    B.EQ Lev_hr_loop\n    CMP X12, #3\n    B.EQ Lev_hr_reftup\n    CMP X12, #2\n    B.EQ Lev_hr_ref1\n    CMP X12, #17\n    B.EQ Lev_hr_chunk\n    CMP X12, #6\n    B.EQ Lev_hr_w0\n    CMP X12, #7\n    B.EQ Lev_hr_w0\n    CMP X12, #8\n    B.EQ Lev_hr_w0\n    B Lev_hr_loop\nLev_hr_w0:\n    LDR X9, [X11]\n    STR X9, [X10]\n    B Lev_hr_loop\nLev_hr_reftup:\n    ADD X9, X10, #8\n    STR X9, [X10]\n    B Lev_hr_loop\nLev_hr_ref1:\n    STR XZR, [X10, #8]\n    B Lev_hr_loop\nLev_hr_chunk:\n    LDR X9, [X13, #8]\n    MOV X14, #16\n";
-    ev9: string <- "    CMP X9, X14\n    CSEL X14, X9, X14, HI\n    ADD X14, X14, #8\n    LDR X9, [X11, X14]\n    STR X9, [X10, X14]\n    B Lev_hr_loop\nLev_hr_done:\n    MOV X9, X29\n    LDP X19, X20, [X9, #16]\n    LDP X21, X22, [X9, #32]\n    LDP X23, X24, [X9, #48]\n    LDP X25, X26, [X9, #64]\n    LDP X27, X28, [X9, #80]\n    LDP X29, X30, [X9]\n    ADD X9, X9, #192\n    MOV SP, X9\n    RET\nLev_words:\n    STR X30, [X29, #136]\n    STR X0, [X29, #96]\n    STR X1, [X29, #104]\n    LDR X9, [X1]\n    STR X9, [X29, #120]\n    STR XZR, [X29, #112]\nLev_w_loop:\n    LDR X9, [X29, #112]\n    LDR X10, [X29, #120]\n    CMP X9, X10\n    B.HS Lev_w_done\n    LDR X11, [X29, #104]\n";
+    ev7: string <- "    CMP X15, X13\n    B.LS Lev_f_done\n    LDP X1, X2, [X15, #-48]\n    LDP X3, X4, [X15, #-16]\n    SUB X15, X15, #48\n    SUB X15, X15, X4\n    ADD X3, X3, #7\n    AND X3, X3, #0xfffffffffffffff8\n    MOV X5, #0\nLev_f_copy:\n    CMP X5, X3\n    B.HS Lev_f_body\n    LDR X6, [X15, X5]\n    STR X6, [X2, X5]\n    ADD X5, X5, #8\n    B Lev_f_copy\nLev_f_done:\n    MOV SP, X14\n    SUB X1, X11, X9\n    RET\n";
+    ev8: string <- "";
+    ev9: string <- "Lev_words:\n    STR X30, [X29, #136]\n    STR X0, [X29, #96]\n    STR X1, [X29, #104]\n    LDR X9, [X1]\n    STR X9, [X29, #120]\n    STR XZR, [X29, #112]\nLev_w_loop:\n    LDR X9, [X29, #112]\n    LDR X10, [X29, #120]\n    CMP X9, X10\n    B.HS Lev_w_done\n    LDR X11, [X29, #104]\n";
     ev10: string <- "    ADD X11, X11, #16\n    ADD X11, X11, X9, LSL #4\n    LDP X1, X2, [X11]\n    ADD X12, X9, #1\n    STR X12, [X29, #112]\n    CMP X1, #0\n    B.EQ Lev_w_loop\n    CMP X1, #1\n    B.EQ Lev_w_loop\n    CMP X1, #9\n    B.EQ Lev_w_loop\n    LDR X12, [X29, #96]\n    LDR X0, [X12, X9, LSL #3]\n    BL L_evw\n    LDR X12, [X29, #96]\n    LDR X9, [X29, #112]\n    SUB X9, X9, #1\n    LDR X10, [X12, X9, LSL #3]\n    CMP X10, X0\n    B.EQ Lev_w_loop\n    STR X0, [X12, X9, LSL #3]\n    B Lev_w_loop\nLev_w_done:\n    LDR X30, [X29, #136]\n    RET\nL_evw:\n    MOV X28, X30\n    CMP X1, #0\n    B.EQ Lw_ret\n    CMP X1, #1\n";
     ev11: string <- "    B.EQ Lw_ret\n    CMP X1, #9\n    B.EQ Lw_ret\n    MOV X9, #65536\n    CMP X0, X9\n    B.LO Lw_ret\n    CMP X0, X19\n    B.LO Lw_old\n    CMP X0, X20\n    B.HS Lw_old\n    CMP X1, #5\n    B.NE Lw_kind\n    LDR X9, [X0]\n    LDR X10, [X2]\n    MVN X10, X10\n    ADD X11, X2, #8\nLw_sum:\n    CBZ X10, Lw_ret\n    LDP X12, X13, [X11], #16\n    SUB X10, X10, #1\n    CMP X12, X9\n    B.NE Lw_sum\n    MOV X1, #4\n    MOV X2, X13\nLw_kind:\n    CMP X1, #4\n    B.EQ Lw_agg\n    CMP X1, #3\n    B.EQ Lw_reftup\n    CMP X1, #2\n";
     ev12: string <- "    B.EQ Lw_ref1\n    CMP X1, #6\n    B.EQ Lw_buf\n    CMP X1, #7\n    B.EQ Lw_handle\n    CMP X1, #17\n    B.EQ Lw_chunk\n    CMP X1, #8\n    B.EQ Lw_string\nLw_ret:\n    RET X28\nLw_old:\n    MOV X9, SP\n    CMP X0, X9\n    B.LO Lw_old_ok\n    CMP X0, X19\n    B.LO Lw_ret\nLw_old_ok:\n    CMP X1, #4\n    B.EQ Lw_old_agg\n    CMP X1, #5\n    B.NE Lw_ret\n    LDR X9, [X0]\n    LDR X10, [X2]\n    MVN X10, X10\n    ADD X11, X2, #8\nLw_old_sum:\n    CBZ X10, Lw_ret\n    LDP X12, X13, [X11], #16\n    SUB X10, X10, #1\n";
@@ -734,28 +696,10 @@ fn emit_evacuation_helper() -> string {
     ev14: string <- "    LDR X3, [X2]\n    LSL X3, X3, #3\n    BL Lw_copy\n    MOV X0, X5\n    RET X28\nLw_reftup:\n    LDR X9, [X0]\n    TBNZ X9, #63, Lw_fwd\n    LDR X3, [X2]\n    LSL X3, X3, #3\n    ADD X3, X3, #8\n    BL Lw_copy\n    ADD X9, X5, #8\n    STR X9, [X6]\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_ref1:\n    LDR X9, [X0, #8]\n    TBNZ X9, #63, Lw_fwd\n    MOV X3, #16\n    BL Lw_copy\n    STR XZR, [X6, #8]\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0, #8]\n    MOV X0, X5\n    RET X28\nLw_buf:\n    LDR X9, [X0, #-8]\n";
     ev15: string <- "    TBZ X9, #63, Lw_buf_copy\n    AND X9, X9, #0x7fffffffffffffff\n    ADD X0, X9, #8\n    RET X28\nLw_buf_copy:\n    MUL X3, X9, X2\n    ADD X3, X3, #15\n    AND X3, X3, #0xfffffffffffffff8\n    SUB X0, X0, #8\n    BL Lw_copy\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    ADD X0, X5, #8\n    RET X28\nLw_handle:\n    LDR X9, [X0]\n    TBNZ X9, #63, Lw_fwd\n    MOV X3, #24\n    BL Lw_copy\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_chunk:\n    LDR X9, [X2, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X10, X9, X10, HI\n    ADD X11, X0, X10\n    LDR X9, [X11, #8]\n";
     ev16: string <- "    TBNZ X9, #63, Lw_fwd\n    ADD X3, X10, #16\n    BL Lw_copy\n    LDR X9, [X2, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X10, X9, X10, HI\n    ADD X11, X0, X10\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X11, #8]\n    MOV X0, X5\n    RET X28\nLw_string:\n    LDR X9, [X0]\n    CMN X9, #1\n    B.EQ Lw_str_copy\n    TBZ X9, #63, Lw_ret\n    CMN X9, #2\n    B.EQ Lw_ret\n    B Lw_fwd\nLw_str_copy:\n    LDR X3, [X0, #16]\n    ADD X3, X3, #25\n    BL Lw_copy\n    LDR X9, [X0, #8]\n    ADD X10, X0, #24\n    CMP X9, X10\n    B.EQ Lw_str_fix\n    LDR X11, [X0, #16]\n    ADD X11, X11, #1\n";
-    ev17: string <- "    ADD X12, X6, #24\nLw_str_bytes:\n    CBZ X11, Lw_str_fix\n    LDRB W13, [X9], #1\n    STRB W13, [X12], #1\n    SUB X11, X11, #1\n    B Lw_str_bytes\nLw_str_fix:\n    MOV X9, X5\n    BL L_str_forget\n    ADD X9, X5, #24\n    STR X9, [X6, #8]\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_copy:\n    MOV X27, X30\n    ADD X7, X3, #7\n    AND X7, X7, #0xfffffffffffffff8\n    CBNZ X22, Lw_copy_heap\n    ADD X8, X3, #15\n    AND X8, X8, #0xfffffffffffffff0\n    SUB X21, X21, X8\n    MOV X5, X21\n    ADD X9, X8, #48\n    MOV X10, SP\n    SUB X10, X10, X9\n    MOV SP, X10\n    MOV X6, X10\n";
-    ev18: string <- "    ADD X11, X10, X8\n    STP X0, X5, [X11]\n    STP X1, X2, [X11, #16]\n    STP X3, X8, [X11, #32]\n    B Lw_copy_bytes\nLw_copy_heap:\n    STP X0, X1, [SP, #-48]!\n    STP X2, X3, [SP, #16]\n    STR X7, [SP, #32]\n    MOV X0, X7\n    BL L_ev_region_alloc\n    MOV X5, X0\n    LDR X7, [SP, #32]\n    LDP X2, X3, [SP, #16]\n    LDP X0, X1, [SP], #48\n    MOV X6, X5\n    SUB SP, SP, #48\n    MOV X11, SP\n    STP X0, X5, [X11]\n    STP X1, X2, [X11, #16]\n    STP X3, XZR, [X11, #32]\nLw_copy_bytes:\n    MOV X12, #0\nLw_copy_loop:\n    CMP X12, X7\n    B.HS Lw_copy_done\n    LDR X13, [X0, X12]\n    STR X13, [X6, X12]\n    ADD X12, X12, #8\n    B Lw_copy_loop\n";
+    ev17: string <- "    ADD X12, X6, #24\nLw_str_bytes:\n    CBZ X11, Lw_str_fix\n    LDRB W13, [X9], #1\n    STRB W13, [X12], #1\n    SUB X11, X11, #1\n    B Lw_str_bytes\nLw_str_fix:\n    MOV X9, X5\n    BL L_str_forget\n    ADD X9, X5, #24\n    STR X9, [X6, #8]\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_copy:\n    MOV X27, X30\n    ADD X7, X3, #7\n    AND X7, X7, #0xfffffffffffffff8\n    ADD X8, X3, #15\n    AND X8, X8, #0xfffffffffffffff0\n    SUB X21, X21, X8\n    MOV X5, X21\n    ADD X9, X8, #48\n    MOV X10, SP\n    SUB X10, X10, X9\n    MOV SP, X10\n    MOV X6, X10\n";
+    ev18: string <- "    ADD X11, X10, X8\n    STP X0, X5, [X11]\n    STP X1, X2, [X11, #16]\n    STP X3, X8, [X11, #32]\nLw_copy_bytes:\n    MOV X12, #0\nLw_copy_loop:\n    CMP X12, X7\n    B.HS Lw_copy_done\n    LDR X13, [X0, X12]\n    STR X13, [X6, X12]\n    ADD X12, X12, #8\n    B Lw_copy_loop\n";
     ev19: string <- "Lw_copy_done:\n    RET X27\n";
     concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(ev0, ev1), ev2), ev3), ev4), ev5), ev6), ev7), ev8), ev9), ev10), ev11), ev12), ev13), ev14), ev15), ev16), ev17), ev18), ev19)
-}
-
-// L_ev_heap's allocator: the actor runtime's _silica_rt_region_alloc where the module uses actors
-// (only behaviours, sends and spawns evacuate into the heap); elsewhere the label exists so the
-// evacuation routine assembles, and is never reached.
-fn emit_ev_region_alloc(with_runtime: boolean) -> string {
-    case with_runtime of {
-        true -> "L_ev_region_alloc:\n    B _silica_rt_region_alloc\n";
-        false -> "L_ev_region_alloc:\n    BRK #1\n"
-    }
-}
-
-// L_stack_top -> X0 = the top of the stack this code runs on: the current actor's reservation
-// (ACB #272 base + #280 bytes), or the thread's own stack (main, a dangerous actor's thread, an
-// actor that has no reservation). Everything a send, a spawn or a reply may hand to another actor
-// that lies in [SP, top) is frame memory and is copied out first (phase 2 interim, phases 3/4).
-fn emit_stack_top_helper() -> string {
-    "L_stack_top:\n    STP X29, X30, [SP, #-16]!\n    MOV X29, SP\n    BL _silica_rt_tls_current_actor_get\n    CBZ X0, 1f\n    LDR X1, [X0, #272]\n    CBZ X1, 1f\n    LDR X2, [X0, #280]\n    ADD X0, X1, X2\n    B 2f\n1:\n    BL _pthread_self\n    BL _pthread_get_stackaddr_np\n2:\n    LDP X29, X30, [SP], #16\n    RET\n"
 }
 
 // The three failure labels end the current actor with (:explicit, :region_alloc_failed / :buf_invalid /
@@ -763,7 +707,7 @@ fn emit_stack_top_helper() -> string {
 // runtime entries in prims_actors_stack_asm); the access or allocation was never performed.
 fn emit_region_helpers() -> string {
     aborts: string <- "L_region_overflow:\n    BL _silica_rt_region_alloc_failed\nL_buf_invalid:\n    BL _silica_rt_buf_invalid_failed\nL_buf_bounds:\n    BL _silica_rt_buf_bounds_failed\n";
-    concat(aborts, concat(emit_region_grow_helper(), emit_region_contains_helper()))
+    concat(aborts, emit_region_contains_helper())
 }
 
 fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
@@ -778,13 +722,12 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "read_ref" -> emit_read_ref(dest);
         "write_ref" -> emit_write_ref(term, dest);
         "alloc_buf" -> emit_alloc_buf(term, dest);
+        "alloc_buf_retained" -> emit_alloc_buf_retained(dest);
         "buf_load" -> emit_buf_load(term, dest);
         "buf_store" -> emit_buf_store(term, dest, "");
         "read_buf" -> emit_buf_load(term, dest);
         "write_buf" -> emit_buf_store(term, dest, "");
         "fresh_lifetime" -> emit_fresh_lifetime(dest);
-        "canonical_arena_lookup" -> emit_canonical_arena_lookup(dest);
-        "canonical_arena_same" -> emit_canonical_arena_same(dest);
         "ref_eq" -> emit_ref_eq(dest);
         "retire" -> emit_retire(term);
         _: string -> concat(concat(".error \"unsupported memory prim: ", concat(sir_term_root_node(term).name, "\"\n")), "")

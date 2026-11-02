@@ -7,6 +7,8 @@ document says how much of it the ESP32-S3 path has, how each part was verified, 
 different behaviour on the board, and what is missing — ordered so the next addition to port is easy to pick.
 It is updated by hand when a suite is run on the board or a gap closes.
 
+*[2026-11-01: the heap and region wording below describes the ESP32-S3 board, which keeps the heap until chunk 15 phase 9. The Apple Silicon column describes the state before chunk 15 phase 4e, which removed the implicit heap on the hosted Mac targets and made `alloc_region` allocate in the current stack frame (Lee, 2026-11-01).]*
+
 ## Related documents
 
 | Document | Role here |

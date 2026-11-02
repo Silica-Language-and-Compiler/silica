@@ -1,11 +1,10 @@
-// Layer 1 §7.5/§7.9: canonical arena injection and ordering-bundle materialization at collection constructor let-bindings.
+// Layer 1 §7.5/§7.9: specialization-key injection and ordering-bundle materialization at collection constructor let-bindings.
 
 use parser_ast;
 use sir_ast;
 use types;
 use type_checker_collections;
 use type_checker_record_types;
-use memory_region_calls;
 use struct_terms;
 use literals;
 use ordering_identity_calls;
@@ -40,28 +39,24 @@ fn ctor_base_ok_i(call_name: string) -> int64 {
     }
 }
 
+// Chunk 15 stage 5a: the family-arena field is gone from every stdlib record, so the
+// specialization key alone marks a collection record.
 fn bind_has_runtime_fields_i(bind_type: string) -> int64 {
     key_ty: string <- type_checker_record_types@find_field_type_in_record(bind_type, "specialization_key");
-    region_ty: string <- type_checker_record_types@find_field_type_in_record(bind_type, "region");
     case length_bytes(key_ty) of {
         0 -> 0;
-        _: int64 -> case length_bytes(region_ty) of {
-            0 -> 0;
-            _: int64 -> 1
-        }
+        _: int64 -> 1
     }
 }
 
-// The call-site lowering below re-anchors a constructor's record: its `region` becomes the
-// canonical arena of the binding's specialization key and its `specialization_key` that key
-// (value_for_merge_field). That is the contract of a representation whose constructor publishes a
-// PLACEHOLDER (wbt_set, wbt_map: `region: canonical_arena_lookup(1)`, `specialization_key: 0`)
-// and allocates from the record's region afterwards. A representation that owns ONE fixed arena
-// for every value (tree_rose, tree_binary: `canonical_arena_lookup(arena_key())`, and every read
-// validates a node with ref_in_region against the record's region) must keep the region it
-// published: re-anchoring it made every validated read miss, so tree_binary@get returned its
-// default and bt_generic_payloads printed empty strings. Such a module exports `arena_key/0`;
-// that export is the mark, and the lowering leaves its constructor calls as plain lets.
+// The call-site lowering below re-anchors a constructor's record: its `specialization_key`
+// becomes the binding's key (value_for_merge_field). That is the contract of a representation
+// whose constructor publishes a PLACEHOLDER (wbt_set, wbt_map: `specialization_key: 0`). A
+// representation that owns ONE fixed key for every value (tree_rose, tree_binary) must keep the
+// key it published; such a module exports `arena_key/0`, that export is the mark, and the
+// lowering leaves its constructor calls as plain lets. (The family-arena `region` field this
+// lowering also re-anchored, through a synthesized `canonical_arena_lookup(key)` let, went with
+// the field in chunk 15 stage 5a; the let went in 5d.)
 fn module_owns_fixed_arena_i(env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], mod_name: string) -> int64 {
     case length_bytes(env_lookup_type_name_in_module(env, "arena_key", mod_name)) > 0 of {
         true -> 1;
@@ -107,26 +102,8 @@ fn spec_key_binding_name(bind_name: string) -> string {
     concat(bind_name, ".__spec_key")
 }
 
-fn arena_binding_name(bind_name: string) -> string {
-    concat(bind_name, ".__arena")
-}
-
 fn raw_binding_name(bind_name: string) -> string {
     concat(bind_name, ".__raw")
-}
-
-fn region_type_for_bind(bind_type: string) -> string {
-    space: string <- type_checker_collections@collection_space_from_type(bind_type);
-    case length_bytes(space) == 0 of {
-        true -> "region(L, normal)";
-        false -> {
-            inner: string <- case length_bytes(space) >= 5 and substring(space, 0, 4) == "mem(" of {
-                true -> substring(space, 4, length_bytes(space) - 1);
-                false -> "normal"
-            };
-            concat(concat("region(L, ", inner), ")")
-        }
-    }
 }
 
 // A module-qualified call denotes the callee module's declaration. env is keyed by bare
@@ -228,10 +205,6 @@ fn atom_const_sir(lexeme: string) -> { nodes: List[{ kind: int64, type_name: str
 
 fn var_ref_sir(prefixed: string, sir_type: string) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
     sir_ast@make_sir_term(1, sir_type, "", prefixed, sir_ast@dummy_sir_term(), sir_ast@dummy_sir_term())
-}
-
-fn build_arena_lookup_sir(key_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, region_type: string) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
-    memory_region_calls@build_region_prim_from_sir("canonical_arena_lookup", key_sir, sir_ast@dummy_sir_term(), region_type)
 }
 
 fn field_type_from_segment(seg: string) -> string {
@@ -420,16 +393,11 @@ fn value_for_merge_field(
     field_type: string,
     raw_ast_type: string,
     raw_var: string,
-    arena_var: string,
-    key_var: string,
-    region_type: string
+    key_var: string
 ) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
-    case field_name == "region" of {
-        true -> var_ref_sir(arena_var, types@type_name_to_sir(region_type));
-        false -> case field_name == "specialization_key" of {
-            true -> var_ref_sir(key_var, "i64");
-            false -> fn_field_projection(field_name, field_type, raw_ast_type, raw_var)
-        }
+    case field_name == "specialization_key" of {
+        true -> var_ref_sir(key_var, "i64");
+        false -> fn_field_projection(field_name, field_type, raw_ast_type, raw_var)
     }
 }
 
@@ -438,14 +406,12 @@ fn build_merge_layers(
     raw_ast_type: string,
     merged_ast_type: string,
     raw_var: string,
-    arena_var: string,
     key_var: string,
-    region_type: string,
     acc: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }
 ) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
     case length_bytes(remaining) == 0 of {
         true -> acc;
-        false -> build_merge_layers_step(remaining, raw_ast_type, merged_ast_type, raw_var, arena_var, key_var, region_type, acc)
+        false -> build_merge_layers_step(remaining, raw_ast_type, merged_ast_type, raw_var, key_var, acc)
     }
 }
 
@@ -454,23 +420,21 @@ fn build_merge_layers_step(
     raw_ast_type: string,
     merged_ast_type: string,
     raw_var: string,
-    arena_var: string,
     key_var: string,
-    region_type: string,
     acc: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }
 ) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
     (seg: string, rest: string) <- type_checker_record_types@record_case_field_step(rem);
     (fname: string, _: string) <- type_checker_record_types@record_field_segment_name_sub(seg);
     ftype: string <- field_type_from_segment(seg);
-    val: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- value_for_merge_field(fname, ftype, raw_ast_type, raw_var, arena_var, key_var, region_type);
+    val: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- value_for_merge_field(fname, ftype, raw_ast_type, raw_var, key_var);
     sir_rt: string <- types@type_name_to_sir(merged_ast_type);
     next: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- struct_terms@build_record_make_layer(sir_rt, fname, val, acc);
-    build_merge_layers(rest, raw_ast_type, merged_ast_type, raw_var, arena_var, key_var, region_type, next)
+    build_merge_layers(rest, raw_ast_type, merged_ast_type, raw_var, key_var, next)
 }
 
 // Packed cfg keeps arity ≤8 (E3010 / AArch64 register args).
 fn build_merged_record(
-    cfg: { bind_name: string, bind_type: string, mod_name: string, raw_ast_type: string, raw_var: string, arena_var: string, key_var: string, region_type: string },
+    cfg: { bind_name: string, bind_type: string, mod_name: string, raw_ast_type: string, raw_var: string, key_var: string },
     field_count: int64
 ) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
     inner: string <- type_checker_record_types@record_case_inner_body(cfg.raw_ast_type);
@@ -491,14 +455,13 @@ fn build_merged_record(
         merged_ast_type,
         sir_ast@dummy_sir_term()
     );
-    build_merge_layers(inner, cfg.raw_ast_type, merged_ast_type, cfg.raw_var, cfg.arena_var, cfg.key_var, cfg.region_type, bundle_overrides)
+    build_merge_layers(inner, cfg.raw_ast_type, merged_ast_type, cfg.raw_var, cfg.key_var, bundle_overrides)
 }
 
 fn build_collection_constructor_lets(context: { env: List[{ name: string, type_name: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)] }, bind_name: string, bind_type: string, rhs_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, rhs_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, inner_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
     rhs_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(rhs_expr);
     mod_name: string <- type_checker_collections@module_name_from_qualified_call(rhs_node.name);
     key: int64 <- type_checker_collections@collection_specialization_key(bind_type, mod_name);
-    region_type: string <- region_type_for_bind(bind_type);
     bind_type_sir: string <- types@type_name_to_sir(bind_type);
     raw_looked_up: string <- return_type_from_call(context, rhs_expr);
     bind_trim: string <- case length_bytes(bind_type) > 0 and substring(bind_type, 0, 1) == " " of {
@@ -520,14 +483,11 @@ fn build_collection_constructor_lets(context: { env: List[{ name: string, type_n
         };
         false -> {
             key_name: string <- spec_key_binding_name(bind_name);
-            arena_name: string <- arena_binding_name(bind_name);
             raw_name: string <- raw_binding_name(bind_name);
             key_prefixed: string <- concat("%", key_name);
-            arena_prefixed: string <- concat("%", arena_name);
             raw_prefixed: string <- concat("%", raw_name);
             bind_prefixed: string <- concat("%", bind_name);
             key_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- int64_const_sir(key);
-            arena_sir: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- build_arena_lookup_sir(var_ref_sir(key_prefixed, "i64"), region_type);
             inject_bundles: int64 <- should_inject_ordering_bundles_i(bind_name);
             field_count_total: int64 <- ordering_field_count_for_merge(bind_type, mod_name);
             field_count: int64 <- case inject_bundles of {
@@ -548,7 +508,7 @@ fn build_collection_constructor_lets(context: { env: List[{ name: string, type_n
                 };
                 _: int64 -> key_prefixed
             };
-            merge_cfg: { bind_name: string, bind_type: string, mod_name: string, raw_ast_type: string, raw_var: string, arena_var: string, key_var: string, region_type: string } <- { bind_name: bind_name, bind_type: bind_type, mod_name: mod_name, raw_ast_type: raw_ast_type, raw_var: merge_raw_var, arena_var: arena_prefixed, key_var: merge_key_var, region_type: region_type };
+            merge_cfg: { bind_name: string, bind_type: string, mod_name: string, raw_ast_type: string, raw_var: string, key_var: string } <- { bind_name: bind_name, bind_type: bind_type, mod_name: mod_name, raw_ast_type: raw_ast_type, raw_var: merge_raw_var, key_var: merge_key_var };
             merged: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- build_merged_record(merge_cfg, field_count);
             bind_let: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- sir_ast@make_sir_term(2, bind_type_sir, "", bind_prefixed, merged, inner_sir);
             bundle_cfg: { bind_name: string, bind_type: string, mod_name: string, raw_ast_type: string, raw_var: string, orient_lexeme: string, field_count: int64 } <- { bind_name: bind_name, bind_type: bind_type, mod_name: mod_name, raw_ast_type: raw_ast_type, raw_var: merge_raw_var, orient_lexeme: orient_lexeme, field_count: field_count };
@@ -572,8 +532,7 @@ fn build_collection_constructor_lets(context: { env: List[{ name: string, type_n
                 _: int64 -> sir_ast@make_sir_term(2, types@type_name_to_sir(raw_ast_type), "", raw_prefixed, rhs_sir, bind_for_bundles)
             };
             raw_let: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- raw_body;
-            arena_let: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- sir_ast@make_sir_term(2, types@type_name_to_sir(region_type), "", arena_prefixed, arena_sir, raw_let);
-            sir_ast@make_sir_term(2, "i64", "", key_prefixed, key_sir, arena_let)
+            sir_ast@make_sir_term(2, "i64", "", key_prefixed, key_sir, raw_let)
         }
     }
 }

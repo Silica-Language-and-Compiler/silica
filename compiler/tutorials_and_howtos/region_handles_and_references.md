@@ -29,7 +29,7 @@ Without the region handle, you cannot allocate. Without region references, you c
 
 ### What They Are
 
-A region handle has type `region(L, Space)`. It represents the memory region (arena) itself. You obtain one from `alloc_region`:
+A region handle has type `region(L, Space)`. It represents a memory region: an area in the stack frame of the function that calls `alloc_region` (not a heap block; the Linux and ESP32-S3 targets still use a heap until chunk 15 phases 8 and 9). You obtain one from `alloc_region`:
 
 ```silica
 sequence proc[mem(normal)]

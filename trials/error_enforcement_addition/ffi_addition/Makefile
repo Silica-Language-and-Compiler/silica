@@ -40,6 +40,8 @@ FAIL_CASES := \
 	error_app_sidecar_metadata/dangerous_sidecar_missing_file \
 	error_app_sidecar_metadata/dangerous_sidecar_missing_entry \
 	error_app_sidecar_metadata/dangerous_sidecar_missing_link_library \
+	error_app_sidecar_metadata/dangerous_retains_unknown_param \
+	error_app_sidecar_metadata/dangerous_frame_buf_to_retaining_wrapper \
 	error_app_sidecar_metadata/dangerous_sidecar_missing_archive \
 	error_app_cast_worker/dangerous_external_danger_in_main \
 	error_app_cast_worker/dangerous_nested_external_danger \
@@ -197,6 +199,8 @@ compile-fail-goldens:
 		ln -s "$(THIS_DIR)error_app_sidecar_metadata/dangerous_exposure_source/bad_no_link_library.meta" "$$tmpdir/dangerous_exposure_source/bad_no_link_library.meta"; \
 		ln -s "$(THIS_DIR)error_app_sidecar_metadata/dangerous_exposure_source/bad_link_only_symbol.meta" "$$tmpdir/dangerous_exposure_source/bad_link_only_symbol.meta"; \
 		ln -s "$(THIS_DIR)error_app_sidecar_metadata/dangerous_exposure_source/bad_missing_archive.meta" "$$tmpdir/dangerous_exposure_source/bad_missing_archive.meta"; \
+		ln -s "$(THIS_DIR)error_app_sidecar_metadata/dangerous_exposure_source/bad_retains_unknown_param.meta" "$$tmpdir/dangerous_exposure_source/bad_retains_unknown_param.meta"; \
+		ln -s "$(THIS_DIR)error_app_sidecar_metadata/dangerous_exposure_source/good_retains_data_ptr.meta" "$$tmpdir/dangerous_exposure_source/good_retains_data_ptr.meta"; \
 		case "$$case" in \
 			module_addition/dangerous_dependency_naming_fail_trial/app_uses_dangerous) \
 				ln -s "$(THIS_DIR)module_addition/dangerous_dependency_naming_fail_trial/dangerous_legacy_stub.silica" "$$tmpdir/dangerous_legacy_stub.silica"; \

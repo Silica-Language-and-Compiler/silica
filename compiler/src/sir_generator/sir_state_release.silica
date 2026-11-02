@@ -44,6 +44,11 @@
 // A write_ref anywhere in the body is unproven too: a frame value written into an old state cell is
 // not reached by the evacuation (§4.3 step 1 leaves old nodes alone); §6.3's E2302 takes this over in
 // phase 6. The `|_upd=` update-call rules of §4.1 are not needed until a logging updater exists.
+// Buffers in state (Lee 2026-11-01, design §4.2): when S is one of the buffer shapes of
+// state_buffer_variant, a buffer-valued operand of the new state is accepted whatever it is, and an atom
+// literal new state is accepted when nothing but buffers and the root shell can be dropped by it; the
+// behaviour's epilogue (prims_actors@bmv_state_buffer_retire_asm) retires each old buffer that is not one
+// of the new state's buffer words, so a replaced buffer is freed on the proven path.
 //
 // SIR shapes read here (sir_generator/terms): a user call is kind 4 / 5 with `inner` the first argument
 // and `right_expr` a `user_call_rest` chain; tuple_make(inner = e1, right = e2 | tuple_make(...));
@@ -54,6 +59,9 @@
 
 export behaviour_release_reason/1;
 export is_behaviour_return_type/1;
+export behaviour_pin_error/1;
+export state_buffer_variant/1;
+export state_buffer_field_names/1;
 
 fn sr_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
     sequence proc[mem(normal)]
@@ -235,6 +243,232 @@ fn sr_type_may_point(t0: string) -> boolean {
     }
 }
 
+// ---- buffers in state (Lee 2026-11-01; design §4.2) ---------------------------------------------
+//
+// A state shape whose buffers sit only where the behaviour epilogue can compare them word for word
+// (prims_actors@bmv_state_buffer_retire_asm): S is a buffer, a record whose every field is a buffer or a
+// type with no buffer anywhere in it, or a sum of atom literals and exactly one such buffer or record.
+// In such an S a buffer value can only be stored in one of those buffer positions (the type rules), so an
+// old buffer is reachable from the new state iff it is one of the new state's buffer words; the
+// epilogue retires every other old buffer and the dispatch end frees it after the evacuation.
+
+// The first `ch` at bracket depth 0 of s at or after i, or -1.
+fn sr_top_find(s: string, ch: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case depth == 0 and c == ch of {
+                true -> i;
+                false -> case c == "(" or c == "[" or c == "{" of {
+                    true -> sr_top_find(s, ch, i + 1, depth + 1);
+                    false -> case c == ")" or c == "]" or c == "}" of {
+                        true -> sr_top_find(s, ch, i + 1, depth - 1);
+                        false -> sr_top_find(s, ch, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sr_is_atom_alt(alt: string) -> boolean {
+    sr_starts_with(alt, ":") and sr_find_from(alt, "(", 0) < 0 and sr_find_from(alt, "[", 0) < 0 and sr_find_from(alt, "{", 0) < 0 and sr_find_from(alt, ",", 0) < 0
+}
+
+// The one alternative of a (space-stripped) sum that is not an atom literal: "" when there is none,
+// "?" when there are two or more.
+fn sr_nonatom_alt(s: string, acc: string) -> string {
+    bar: int64 <- sr_top_find(s, "|", 0, 0);
+    alt: string <- case bar < 0 of { true -> s; false -> substring(s, 0, bar) };
+    acc1: string <- case sr_is_atom_alt(alt) of {
+        true -> acc;
+        false -> case length_bytes(acc) == 0 of { true -> alt; false -> "?" }
+    };
+    case bar < 0 of {
+        true -> acc1;
+        false -> sr_nonatom_alt(substring(s, bar + 1, length_bytes(s)), acc1)
+    }
+}
+
+fn sr_is_buf_type(t: string) -> boolean {
+    sr_starts_with(sr_strip_spaces(t), "buf(")
+}
+
+// The record body's fields from i: the number that are buffers, or -1 when a field holds a buffer
+// inside another type (a List of buffers, a ref to one, a nested record with one).
+fn sr_record_buf_count(body: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(body) of {
+        true -> acc;
+        false -> {
+            comma: int64 <- sr_top_find(body, ",", i, 0);
+            seg_end: int64 <- case comma < 0 of { true -> length_bytes(body); false -> comma };
+            seg: string <- substring(body, i, seg_end);
+            colon: int64 <- sr_find_from(seg, ":", 0);
+            fty: string <- case colon < 0 of { true -> seg; false -> substring(seg, colon + 1, length_bytes(seg)) };
+            acc1: int64 <- case sr_is_buf_type(fty) of {
+                true -> acc + 1;
+                false -> case sr_find_from(fty, "buf(", 0) >= 0 of { true -> -1; false -> acc }
+            };
+            case acc1 < 0 of {
+                true -> -1;
+                false -> sr_record_buf_count(body, seg_end + 1, acc1)
+            }
+        }
+    }
+}
+
+// The names of the record body's buffer fields from i, each followed by a comma ("b,c,").
+fn sr_record_buf_names(body: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(body) of {
+        true -> acc;
+        false -> {
+            comma: int64 <- sr_top_find(body, ",", i, 0);
+            seg_end: int64 <- case comma < 0 of { true -> length_bytes(body); false -> comma };
+            seg: string <- substring(body, i, seg_end);
+            colon: int64 <- sr_find_from(seg, ":", 0);
+            acc1: string <- case colon > 0 and sr_is_buf_type(substring(seg, colon + 1, length_bytes(seg))) of {
+                true -> concat(acc, concat(substring(seg, 0, colon), ","));
+                false -> acc
+            };
+            sr_record_buf_names(body, seg_end + 1, acc1)
+        }
+    }
+}
+
+// The buffer field names of a state_buffer_variant record ("b,c,"); "" for a buffer variant.
+fn state_buffer_field_names(variant: string) -> string {
+    sr_record_buf_names(sr_record_body(sr_strip_spaces(variant)), 0, "")
+}
+
+// Every field of the record body from i that is not a buffer is pointer-free.
+fn sr_record_rest_scalar(body: string, i: int64) -> boolean {
+    case i >= length_bytes(body) of {
+        true -> true;
+        false -> {
+            comma: int64 <- sr_top_find(body, ",", i, 0);
+            seg_end: int64 <- case comma < 0 of { true -> length_bytes(body); false -> comma };
+            seg: string <- substring(body, i, seg_end);
+            colon: int64 <- sr_find_from(seg, ":", 0);
+            fty: string <- case colon < 0 of { true -> seg; false -> substring(seg, colon + 1, length_bytes(seg)) };
+            case sr_is_buf_type(fty) or sr_type_may_point(fty) == false of {
+                true -> sr_record_rest_scalar(body, seg_end + 1);
+                false -> false
+            }
+        }
+    }
+}
+
+// A sum written in parentheses, `(:none|{...})`, without them; anything else (a tuple included) as given.
+fn sr_unparen_sum(s: string) -> string {
+    case length_bytes(s) >= 2 and sr_starts_with(s, "(") and sr_top_find(s, ")", 1, 0) == length_bytes(s) - 1 of {
+        false -> s;
+        true -> {
+            inner: string <- substring(s, 1, length_bytes(s) - 1);
+            case sr_top_find(inner, "|", 0, 0) >= 0 and sr_top_find(inner, ",", 0, 0) < 0 of {
+                true -> inner;
+                false -> s
+            }
+        }
+    }
+}
+
+fn sr_record_body(t: string) -> string {
+    case length_bytes(t) >= 2 and sr_starts_with(t, "{") and substring(t, length_bytes(t) - 1, length_bytes(t)) == "}" of {
+        true -> substring(t, 1, length_bytes(t) - 1);
+        false -> ""
+    }
+}
+
+// The buffer-bearing part of a behaviour's state type: the buffer type itself, or the record type
+// (space-stripped) whose buffer fields the epilogue compares; "" when S is not such a shape (no buffer,
+// or a buffer the epilogue cannot reach by one field offset: those stay live, the conservative choice).
+// The tuple buffer shape (sr_region_buffer_tuple) answers "#tuplebuf," followed by its buffer type: the
+// epilogue retire then compares element 1 of the old and new root tuples (prims_actors@bmv_state_buffer_retire_asm).
+fn state_buffer_variant(return_type: string) -> string {
+    tb: string <- sr_region_buffer_tuple_buf(return_type);
+    case length_bytes(tb) > 0 of {
+        true -> concat("#tuplebuf,", tb);
+        false -> sr_state_buffer_variant_plain(return_type)
+    }
+}
+
+fn sr_state_buffer_variant_plain(return_type: string) -> string {
+    s: string <- sr_unparen_sum(sr_state_type(sr_strip_spaces(return_type)));
+    alt: string <- sr_nonatom_alt(s, "");
+    case length_bytes(alt) == 0 or alt == "?" of {
+        true -> "";
+        false -> case sr_is_buf_type(alt) of {
+            true -> alt;
+            false -> {
+                body: string <- sr_record_body(alt);
+                case length_bytes(body) > 0 and sr_record_buf_count(body, 0, 0) > 0 of {
+                    true -> alt;
+                    false -> ""
+                }
+            }
+        }
+    }
+}
+
+// The tuple buffer shape (Lee 2026-11-01: a buffer in actor state comes with its region): S is exactly
+// `(region(L, m), A)` with A a sum of atom literals and one buffer. The region member is carried: being
+// pointer-carrying, the proof accepts it only as an Old projection (the old state's region; a fresh
+// region is "replaced without an update"). The buffer member is accepted as a buffer at the root is
+// ("#bufstate"). state_buffer_variant answers "#tuplebuf,<buf type>" for it, and the epilogue retire
+// (prims_actors@bmv_state_buffer_retire_asm, tuple branch) compares element 1 (offset 8; a tuple has no
+// shape word) of the old and new root tuples.
+fn sr_region_buffer_tuple(return_type: string) -> boolean {
+    length_bytes(sr_region_buffer_tuple_buf(return_type)) > 0
+}
+
+// The buffer type of the tuple buffer shape; "" when S is not that shape.
+fn sr_region_buffer_tuple_buf(return_type: string) -> string {
+    s: string <- sr_state_type(sr_strip_spaces(return_type));
+    n: int64 <- length_bytes(s);
+    case n >= 2 and sr_starts_with(s, "(") and sr_top_find(s, ")", 1, 0) == n - 1 of {
+        false -> "";
+        true -> {
+            inner: string <- substring(s, 1, n - 1);
+            c: int64 <- sr_top_find(inner, ",", 0, 0);
+            case c > 0 and sr_top_find(inner, ",", c + 1, 0) < 0 of {
+                false -> "";
+                true -> {
+                    m1: string <- sr_unparen_sum(substring(inner, c + 1, length_bytes(inner)));
+                    alt: string <- sr_nonatom_alt(m1, "");
+                    case sr_starts_with(substring(inner, 0, c), "region(") and sr_top_find(m1, "|", 0, 0) >= 0 and sr_is_buf_type(alt) of {
+                        true -> alt;
+                        false -> ""
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The state may become an atom literal and lose nothing but buffers and the root shell: S has an atom
+// alternative and its buffer part is a buffer or a record whose other fields are pointer-free.
+fn sr_literal_state_ok(return_type: string, variant: string) -> boolean {
+    s: string <- sr_unparen_sum(sr_state_type(sr_strip_spaces(return_type)));
+    sr_top_find(s, "|", 0, 0) >= 0 and (sr_is_buf_type(variant) or sr_record_rest_scalar(sr_record_body(variant), 0))
+}
+
+// Under a buffer shape (the "#bufstate" marker in the Old set) a buffer-valued operand of the new state
+// is accepted whatever it is: a fresh alloc_buf / alloc_buf_retained, a buffer a call returned, or an
+// old buffer moved to another field. The epilogue keeps every old buffer that is one of the new state's
+// buffer words and retires the others, so no alias of an old buffer can be freed. Under "#litstate" an
+// atom literal new state is accepted: it reaches nothing.
+fn sr_buffer_operand_ok(n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, old: string) -> boolean {
+    case sr_in_set(old, "#bufstate") of {
+        false -> false;
+        true -> sr_is_buf_type(n.type_name) or (n.kind == 6 and (n.name == "alloc_buf" or n.name == "alloc_buf_retained"))
+    }
+}
+
+fn sr_literal_operand_ok(n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, old: string) -> boolean {
+    sr_in_set(old, "#litstate") and n.kind == 0 and (sr_starts_with(n.value, ":") or sr_type_may_point(n.type_name) == false)
+}
+
 // ---- the Old set: the state and its projections --------------------------------------------------
 
 // The node is an Old name or a record_proj / tuple_proj chain over one.
@@ -249,24 +483,6 @@ fn sr_is_old_proj(nodes: List[{ kind: int64, type_name: string, value: string, n
                     true -> sr_is_old_proj(nodes, a.inner, old);
                     false -> false
                 }
-            }
-        }
-    }
-}
-
-// The projection's path, "state.items" / "state.0", for the one-slot rule (P2).
-fn sr_proj_key(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> string {
-    a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
-    case a.kind == 1 of {
-        true -> case sr_starts_with(a.name, "%") of {
-            true -> substring(a.name, 1, length_bytes(a.name));
-            false -> a.name
-        };
-        false -> case a.kind == 6 and a.name == "record_proj" of {
-            true -> concat(sr_proj_key(nodes, a.inner), concat(".", a.value));
-            false -> case a.kind == 6 and a.name == "tuple_proj" of {
-                true -> concat(sr_proj_key(nodes, a.inner), concat(".", sr_node_at(nodes, a.right_expr).value));
-                false -> "?"
             }
         }
     }
@@ -417,13 +633,14 @@ fn sr_check_result_arms(nodes: List[{ kind: int64, type_name: string, value: str
 // The new state: an Old projection, or an aggregate whose pointer-carrying operands are each an Old
 // projection, kept once.
 fn sr_check_state(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, old: string, depth: int64) -> string {
-    case sr_is_old_proj(nodes, idx, old) of {
+    n0: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+    case sr_is_old_proj(nodes, idx, old) or (idx >= 0 and (sr_buffer_operand_ok(n0, old) or sr_literal_operand_ok(n0, old))) of {
         true -> "";
         false -> {
             r: string <- sr_check_operands(nodes, idx, old, depth);
             case length_bytes(r) > 0 of {
                 true -> r;
-                false -> sr_first_dup(sr_state_keys(nodes, idx, old, depth, ","))
+                false -> sr_first_overlap(sr_state_keys(nodes, idx, old, depth, ","))
             }
         }
     }
@@ -442,6 +659,16 @@ fn sr_check_operands(nodes: List[{ kind: int64, type_name: string, value: string
                         false -> sr_check_state(nodes, v, old, depth + 1)
                     }
                 };
+                // Under the tuple buffer shape the new state may be a let chain or a case: each arm's
+                // value is checked as a new state of its own (as sr_check_result follows result arms).
+                2 -> case sr_in_set(old, "#tuplebuf") of {
+                    true -> sr_check_state(nodes, n.right_expr, old, depth + 1);
+                    false -> "the new state is not analysed"
+                };
+                3 -> case sr_in_set(old, "#tuplebuf") of {
+                    true -> sr_check_state_arms(nodes, n.right_expr, old, depth + 1);
+                    false -> "the new state is not analysed"
+                };
                 4 -> concat("'", concat(n.name, "' is not a logging updater"));
                 5 -> concat("'", concat(n.name, "' is not a logging updater"));
                 6 -> case n.name == "record_make" of {
@@ -458,6 +685,29 @@ fn sr_check_operands(nodes: List[{ kind: int64, type_name: string, value: string
                     }
                 };
                 _: int64 -> "the new state is not analysed"
+            }
+        }
+    }
+}
+
+fn sr_check_state_arms(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, old: string, depth: int64) -> string {
+    case idx < 0 of {
+        true -> "";
+        false -> case depth > 64 of {
+            true -> "the new state is not analysed";
+            false -> {
+                a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+                case a.kind of {
+                    7 -> {
+                        r: string <- sr_check_state_arms(nodes, a.inner, old, depth + 1);
+                        case length_bytes(r) > 0 of {
+                            true -> r;
+                            false -> sr_check_state_arms(nodes, a.right_expr, old, depth + 1)
+                        }
+                    };
+                    8 -> sr_check_state(nodes, a.right_expr, old, depth + 1);
+                    _: int64 -> "the new state is not analysed"
+                }
             }
         }
     }
@@ -489,7 +739,7 @@ fn sr_check_operand(nodes: List[{ kind: int64, type_name: string, value: string,
         true -> "";
         false -> {
             o: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
-            case sr_type_may_point(o.type_name) == false of {
+            case sr_type_may_point(o.type_name) == false or sr_buffer_operand_ok(o, old) of {
                 true -> "";
                 false -> case sr_is_old_proj(nodes, idx, old) of {
                     true -> "";
@@ -524,7 +774,7 @@ fn sr_state_keys(nodes: List[{ kind: int64, type_name: string, value: string, na
             case sr_type_may_point(n.type_name) == false of {
                 true -> acc;
                 false -> case sr_is_old_proj(nodes, idx, old) of {
-                    true -> concat(acc, concat(sr_proj_key(nodes, idx), ","));
+                    true -> concat(acc, concat(sr_norm_key(nodes, idx, 0), ","));
                     false -> case n.kind == 1 of {
                         true -> {
                             v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), n.name);
@@ -544,8 +794,120 @@ fn sr_state_keys(nodes: List[{ kind: int64, type_name: string, value: string, na
     }
 }
 
-// ",a,b,a," -> "version 'a' is kept twice in the new state"; "" when no key repeats.
-fn sr_first_dup(keys: string) -> string {
+// All state buffers (Lee 2026-11-01, design §4.2): a proven behaviour must keep every old node a buffer
+// can hide in, because nothing but the fallback copy frees a buffer outside the buffer shapes. Under
+// P2 with keys that are disjoint positions of the old state, the kept operands of a same-typed new
+// state cover every old position (each new position takes one old position of its type, injectively,
+// without nesting), so no old buffer is dropped. Two spellings of one position (`s.p` for a bind arm
+// `s` over the state, `x` for `x <- state.p`) and a position kept beside one inside it (`state.p` and
+// `state.p.x`) broke that: the keys are therefore normalised to the parameter's spelling, and a key
+// that is a prefix of another counts as kept twice.
+
+// The scrutinee of the case one of whose `bind` arms binds name, or -1.
+fn sr_bind_scrutinee(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], i: int64, n: int64, name: string) -> int64 {
+    case i >= n of {
+        true -> -1;
+        false -> {
+            e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, i);
+            case e.kind == 3 and sr_arms_bind(nodes, e.right_expr, name, 0) of {
+                true -> e.inner;
+                false -> sr_bind_scrutinee(nodes, i + 1, n, name)
+            }
+        }
+    }
+}
+
+fn sr_arms_bind(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, name: string, depth: int64) -> boolean {
+    case idx < 0 or depth > 256 of {
+        true -> false;
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case a.kind of {
+                7 -> sr_arms_bind(nodes, a.inner, name, depth + 1) or sr_arms_bind(nodes, a.right_expr, name, depth + 1);
+                8 -> a.value == "bind" and (a.name == name or concat("%", a.name) == name or a.name == concat("%", name));
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+fn sr_strip_pct(name: string) -> string {
+    case sr_starts_with(name, "%") of {
+        true -> substring(name, 1, length_bytes(name));
+        false -> name
+    }
+}
+
+// The key of an Old name: the key of the projection a let binds it to, else of the scrutinee a bind arm
+// binds it to, else the name itself (the parameter).
+fn sr_norm_root(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], name: string, depth: int64) -> string {
+    case depth > 16 of {
+        true -> "?";
+        false -> {
+            v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), name);
+            case v >= 0 of {
+                true -> sr_norm_key(nodes, v, depth + 1);
+                false -> {
+                    s: int64 <- sr_bind_scrutinee(nodes, 0, sr_nodes_len(nodes), name);
+                    case s >= 0 of {
+                        true -> sr_norm_key(nodes, s, depth + 1);
+                        false -> sr_strip_pct(name)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The projection's path for the one-slot rule (P2), "state.items" / "state.0", with every Old name
+// replaced by its normalised key; "?" for a shape not followed.
+fn sr_norm_key(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, depth: int64) -> string {
+    case idx < 0 or depth > 16 of {
+        true -> "?";
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case a.kind == 1 of {
+                true -> sr_norm_root(nodes, a.name, depth);
+                false -> case a.kind == 6 and a.name == "record_proj" of {
+                    true -> concat(sr_norm_key(nodes, a.inner, depth + 1), concat(".", a.value));
+                    false -> case a.kind == 6 and a.name == "tuple_proj" of {
+                        true -> concat(sr_norm_key(nodes, a.inner, depth + 1), concat(".", sr_node_at(nodes, a.right_expr).value));
+                        false -> "?"
+                    }
+                }
+            }
+        }
+    }
+}
+
+// k and k2 name the same position or one inside the other.
+fn sr_keys_overlap(k: string, k2: string) -> boolean {
+    k == k2 or sr_starts_with(k2, concat(k, ".")) or sr_starts_with(k, concat(k2, ".")) or k == "?" or k2 == "?"
+}
+
+// The first key of keys (",a,b,") that overlaps k, or "".
+fn sr_overlap_in(keys: string, k: string) -> string {
+    case length_bytes(keys) <= 1 of {
+        true -> "";
+        false -> {
+            rest: string <- substring(keys, 1, length_bytes(keys));
+            e: int64 <- sr_find_from(rest, ",", 0);
+            case e < 0 of {
+                true -> "";
+                false -> {
+                    k2: string <- substring(rest, 0, e);
+                    case sr_keys_overlap(k, k2) of {
+                        true -> k2;
+                        false -> sr_overlap_in(substring(rest, e, length_bytes(rest)), k)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ",a,b,a," (or a key inside another): "version 'k' is kept twice in the new state" (W2300's existing reason).
+fn sr_first_overlap(keys: string) -> string {
     case length_bytes(keys) <= 1 of {
         true -> "";
         false -> {
@@ -556,9 +918,9 @@ fn sr_first_dup(keys: string) -> string {
                 false -> {
                     k: string <- substring(rest, 0, e);
                     tail: string <- substring(rest, e, length_bytes(rest));
-                    case sr_in_set(tail, k) of {
+                    case length_bytes(sr_overlap_in(tail, k)) > 0 of {
                         true -> concat("version '", concat(k, "' is kept twice in the new state"));
-                        false -> sr_first_dup(tail)
+                        false -> sr_first_overlap(tail)
                     }
                 }
             }
@@ -578,7 +940,21 @@ fn behaviour_release_reason(fn_val: { name: string, return_type: string, effects
                 false -> case sr_type_may_point(sr_state_type(rt)) == false of {
                     true -> "";
                     false -> {
-                        old: string <- sr_old_closure(fn_val.body.nodes, fn_val.body.root, sr_add_both(",", pname), 8);
+                        // The buffer shapes of §4.2 (state_buffer_variant) mark the Old set: "#bufstate"
+                        // accepts buffer-valued operands, "#litstate" an atom literal new state. No SIR
+                        // name starts with '#'.
+                        variant: string <- state_buffer_variant(rt);
+                        old0: string <- case sr_region_buffer_tuple(rt) of {
+                            true -> sr_add(sr_add(sr_add_both(",", pname), "#bufstate"), "#tuplebuf");
+                            false -> case length_bytes(variant) == 0 of {
+                                true -> sr_add_both(",", pname);
+                                false -> case sr_literal_state_ok(rt, variant) of {
+                                    true -> sr_add(sr_add(sr_add_both(",", pname), "#bufstate"), "#litstate");
+                                    false -> sr_add(sr_add_both(",", pname), "#bufstate")
+                                }
+                            }
+                        };
+                        old: string <- sr_old_closure(fn_val.body.nodes, fn_val.body.root, old0, 8);
                         case sr_in_set(old, "!") of {
                             true -> concat("a pattern on '", concat(pname, "' hides its parts"));
                             false -> case sr_has_prim(fn_val.body.nodes, 0, sr_nodes_len(fn_val.body.nodes), "write_ref") of {
@@ -587,6 +963,39 @@ fn behaviour_release_reason(fn_val: { name: string, return_type: string, effects
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+// A SIR node named `name`, of any kind, at index i or later.
+fn sr_has_name(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], i: int64, n: int64, name: string) -> boolean {
+    case i >= n of {
+        true -> false;
+        false -> case sr_node_at(nodes, i).name == name of {
+            true -> true;
+            false -> sr_has_name(nodes, i + 1, n, name)
+        }
+    }
+}
+
+// The pin rule (chunk15_stack_memory_design.md §7, Lee 2026-11-01): a behaviour that allocates a buffer C
+// keeps (alloc_buf_retained) holds it as a node of its state area, which must never move. "" when the
+// function allocates no such buffer; else "E4037:<reason>" when its state release is not proven (the
+// fallback copy, §4.4, would move the buffer), or "E4039:" when it calls compact_state() (§4.7). The
+// pipeline reports these as errors instead of W2300.
+fn behaviour_pin_error(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    n: int64 <- sr_nodes_len(fn_val.body.nodes);
+    case sr_has_name(fn_val.body.nodes, 0, n, "alloc_buf_retained") of {
+        false -> "";
+        true -> case sr_has_name(fn_val.body.nodes, 0, n, "compact_state") of {
+            true -> "E4039:";
+            false -> {
+                reason: string <- behaviour_release_reason(fn_val);
+                case length_bytes(reason) > 0 of {
+                    true -> concat("E4037:", reason);
+                    false -> ""
                 }
             }
         }

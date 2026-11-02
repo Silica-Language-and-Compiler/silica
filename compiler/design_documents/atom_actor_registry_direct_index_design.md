@@ -71,7 +71,7 @@ Suggested shapes:
 | Shape | Resize | Lookup |
 |-------|--------|--------|
 | **`buf(R, S, Cell, Capacity)`** (if grammar supports fixed capacity) | Realloc/migrate explicitly | **`load buf[id]`** after bounds check |
-| **`ref`** to heap bump under **`region(R, S)`** | Grow by **allocate larger + copy + swap handle** rare path | Indexed load after bounds |
+| **`ref`** to a bump inside **`region(R, S)`** (an area in the stack frame on the hosted Mac targets since chunk 15 phase 4e; a heap arena on Linux and ESP32-S3 until phases 8 and 9) | Grow by **allocate larger + copy + swap handle** rare path | Indexed load after bounds |
 | Allocator helper (runtime C stub) exposing indexed buffer | Matches existing **`_silica_rt_region_alloc`**‑style heaps | Emitter load/store at **`base + id * stride`** |
 
 **Growth**

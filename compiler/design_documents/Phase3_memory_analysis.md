@@ -170,3 +170,4 @@ exit $ec
 5. Do not run stage 2 in this pass; do not edit any file under compiler/src.
 
 Report back: the three tables of step 3 for 999939 and stage 1, side by side, and anything that could not be sampled.
+2026-11-01: superseded: alloc_region is a frame area (Lee's decision); see chunk15 section 3.8.

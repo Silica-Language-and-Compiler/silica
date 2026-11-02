@@ -24,7 +24,7 @@
 
 A **complete OS-free port** is a Silica program that boots on a named board **without a general-purpose OS**, owns its memory map, talks to **device registers** (UART, GPIO, timers, …) in typed Silica, and can run the actor runtime with board time and interrupts.
 
-That is more than “the compiler emits AArch64.” Today the compiler targets **Apple Silicon macOS**: Darwin syscalls, `malloc` arenas, Mach-O via assembly text. The language already *names* OS-free behavior (`device`, `register_rwr`, MAIR). Most of the hardware path is missing.
+That is more than “the compiler emits AArch64.” Today the compiler targets **Apple Silicon macOS**: Darwin syscalls, `malloc` arenas (on the Mac these are removed by chunk 15 phase 4e, Lee 2026-11-01: `alloc_region` is a frame area; Linux and ESP32-S3 keep them until phases 8 and 9), Mach-O via assembly text. The language already *names* OS-free behavior (`device`, `register_rwr`, MAIR). Most of the hardware path is missing.
 
 This document:
 
@@ -75,7 +75,7 @@ Raw-metal *applications* need device MMIO. Raw-metal *runtimes* also need privil
 | --- | --- | --- |
 | Language names | `mem(device)`, `region(R, device)`, `device_window`, `register_rwr`, `spawn_device`, `device_actor_ref`, `DeviceDescription`, `Register8`…`Register64` in the spec | ESP32-S3_raw: the checker enforces the device-worker rules (E2201-family, status above). Other targets: shared checks only |
 | Device actors | Spec: [silica_device_actor_specification.md](silica_device_actor_specification.md) | ESP32-S3_raw: none of these is missing (third registry in `rt_actors.S`, descriptions, checks). Hosted runtimes carry the third registry; no hosted target maps a device |
-| `alloc_region(device)` | Type-checks; trial exists | Still a **heap arena** (`malloc`). Space operand **unused** on emit |
+| `alloc_region(device)` | Type-checks; trial exists | A **heap arena** (`malloc`) on Linux and ESP32-S3 until chunk 15 phases 8 and 9; on the hosted Mac targets a frame area (Lee 2026-11-01, phase 4e; chunk15_stack_memory_design.md §3.8). Space operand **unused** on emit |
 | `register_rwr` | Emitter can emit `DSB SY` / `ISB` around calls if the effect string contains the name; FFI taint forbids mixing with `external_danger` data | ESP32-S3_raw: `map_device`, `peek`, `poke` exist; the checker rejects the effect and the prims in `main` (E2219) |
 | Volatile MMIO load/store | — | ESP32-S3_raw: done, 32-bit only (§5.2). Other widths, and any other OS-free target, remain |
 | Bind physical/bus range | — | ESP32-S3_raw: done (§5.1, §10). Other OS-free targets remain |
@@ -177,7 +177,7 @@ These belong in the **runtime / board pack**, in a tightly reviewed stub, not in
 
 Follow [memory-effects-aarch64-implementation-plan.md](memory-effects-aarch64-implementation-plan.md). Gaps that block a port even after MMIO prims exist:
 
-1. Pass `Space` from `alloc_region` into `_silica_rt_region_alloc` (today unused).
+1. Pass `Space` from `alloc_region` into `_silica_rt_region_alloc` (today unused; on the hosted Mac targets `alloc_region` is a frame area after chunk 15 phase 4e, Lee 2026-11-01, so the per-space routing applies to the targets that keep the heap).
 2. Per-`Space` pools: cached RAM, non-cacheable/DMA, atomic-capable, **device windows**.
 3. Atomic lowering (`LDAR`/`STLR` or Xtensa).
 4. Capability flags when a `Space` is emulated (e.g. no true write-through on ESP32-S3).

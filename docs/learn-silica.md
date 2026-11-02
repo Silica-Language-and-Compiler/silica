@@ -667,7 +667,7 @@ produces
 end
 ```
 
-`fresh_lifetime()` gives you a unique `L1`. `alloc_region` creates the arena. `alloc_ref` puts a cell in that arena. `write_ref` updates the cell. The effect is `mem(normal)` because that is the space you named. `(r, cell)` keeps the arena alive in the caller; `cell` remains valid because `r` is still owned.
+`fresh_lifetime()` gives you a unique `L1`. `alloc_region` creates an area in the current stack frame (on the hosted Mac targets; the Linux and ESP32-S3 targets still use a heap until chunk 15 phases 8 and 9). `alloc_ref` puts a cell in that arena. `write_ref` updates the cell. The effect is `mem(normal)` because that is the space you named. `(r, cell)` keeps the arena alive in the caller; `cell` remains valid because `r` is still owned.
 
 This is rejected with E2100 (reference outlives region) — `cell` would dangle after `r` is freed at `end`:
 
@@ -1071,7 +1071,7 @@ $B/tools/run_app.sh --send 'exit\n' --send-delay 65 --timeout 120 silica_20_devi
 
 It needs the Xtensa toolchain and the ESP-IDF Python environment (esptool, pyserial) from [Required software]({{ '/required-software/' | relative_url }}); `BOARD_PYTHON`, `XTENSA_BIN`, `ESPTOOL` and `BOARD_PORT` point it elsewhere, and `SILICA_COMPILER` names the cross compiler. `run_app.sh --help` lists every option and exit status. Programs follow the same small-`main` shape as on the hosts: the board has one console, so the FailureReporter’s report appears in the program output, `exit` typed (or `--send`) on the console ends a waiting `main`, and a fault ends the program with status 70 and a runtime abort with 71.
 
-Actors run on both LX7 cores, one cooperative scheduler per core, and an actor’s stack is a chain of heap chunks that grows on demand. The design target is 1,000 actors and supervisors on the board, against millions on a hosted machine ([actor memory budget plan](https://github.com/yenrab/silica/blob/main/compiler/design_documents/actor_memory_budget_plan.md)); [the port status](https://github.com/yenrab/silica/blob/main/compiler/design_documents/ports/esp32s3_port_status.md) lists what is verified on the board and where it differs from the hosts.
+Actors run on both LX7 cores, one cooperative scheduler per core, and an actor’s stack is a chain of heap chunks (the board keeps the heap until chunk 15 phase 9) that grows on demand. The design target is 1,000 actors and supervisors on the board, against millions on a hosted machine ([actor memory budget plan](https://github.com/yenrab/silica/blob/main/compiler/design_documents/actor_memory_budget_plan.md)); [the port status](https://github.com/yenrab/silica/blob/main/compiler/design_documents/ports/esp32s3_port_status.md) lists what is verified on the board and where it differs from the hosts.
 
 ## 16. Next
 

@@ -17,6 +17,7 @@
 
 // Sidecar `.meta` loader (silica_ffi_wrapper_specification.md §13): parse link_library / wrapper entries,
 // associate foreign c_wrapper bindings with referenced sidecar files. Phase 4 — compile-time validation only.
+// Chunk 15 phase 7: the optional retains: [p, ...] field (validated with the other wrapper-entry checks, E4033 SidecarWrapperIncomplete; read by the region checker).
 
 use parser_ast;
 use sir_ast;
@@ -30,6 +31,7 @@ export sidecar_paths_for_foreign_decl/2;
 export collect_module_default_sidecar_lexemes_from_program/1;
 export lookup_sidecar_wrapper_result_kind/2;
 export first_foreign_or_meta_location_from_program/1;
+export collect_program_retained_params/1;
 
 fn nil_sidecar_wrappers() -> List[{ symbol: string, result: string, error_domain: string, has_result: int64, has_error_domain: int64 }, mem(normal)] {
     sequence proc[mem(normal)]
@@ -460,7 +462,14 @@ fn validate_foreign_binding_sidecar_loop(decls: List[{ tag: int64, name: string,
                 st: int64 <- validate_symbol_in_sidecar_paths(paths, sym, decls.head.location);
                 case st == 0 of {
                     false -> st;
-                    true -> validate_foreign_binding_sidecar_loop(decls.tail, default_paths)
+                    true -> {
+                        // The wrapper's retains: names (chunk 15 design §7, E4033).
+                        rt: int64 <- validate_retains_names(lookup_sidecar_retains(paths, sym), decls.head, sym);
+                        case rt == 0 of {
+                            false -> rt;
+                            true -> validate_foreign_binding_sidecar_loop(decls.tail, default_paths)
+                        }
+                    }
                 }
             };
             false -> validate_foreign_binding_sidecar_loop(decls.tail, default_paths)
@@ -643,6 +652,258 @@ fn lookup_sidecar_wrapper_result_kind(paths: List[string, mem(normal)], sym: str
     produces
         pure result
     end
+}
+
+// --- retains: [p, ...] (chunk 15 phase 7, chunk15_stack_memory_design.md §7; wrapper spec §3.2) ---------
+// A wrapper entry may name the parameters its C wrapper keeps past the call:
+//     retains: [config_buf];
+// Each name must be a parameter of the foreign declaration, of buffer or pointer type (E4033); the
+// region checker (§6.4 case (a), E2300) rejects a frame value passed to one. The entry is read by its own
+// scan so the wrapper record above keeps its shape.
+
+// The names between `[` and `]` of one `retains:` line, comma-separated; quotes and spaces dropped.
+fn parse_retains_names(trimmed: string) -> List[string, mem(normal)] {
+    open: int64 <- find_char_from(trimmed, 0, "[");
+    case open < 0 of {
+        true -> sir_ast@nil_sir_strings();
+        false -> {
+            close: int64 <- find_char_from(trimmed, open + 1, "]");
+            case close < 0 of {
+                true -> sir_ast@nil_sir_strings();
+                false -> split_retains_names(substring(trimmed, open + 1, close), 0, 0, sir_ast@nil_sir_strings())
+            }
+        }
+    }
+}
+
+fn split_retains_names(s: string, start: int64, i: int64, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= length_bytes(s) of {
+        true -> append_sir_strings_unique(acc, strip_string_literal_quotes(trim_line(substring(s, start, i))));
+        false -> case substring(s, i, i + 1) == "," of {
+            true -> split_retains_names(s, i + 1, i + 1, append_sir_strings_unique(acc, strip_string_literal_quotes(trim_line(substring(s, start, i)))));
+            false -> split_retains_names(s, start, i + 1, acc)
+        }
+    }
+}
+
+// One wrapper block from the line after `wrapper ... {` to its closing `}`: its symbol: value and its
+// retains: names, and the position after the block. An arguments: list is skipped up to the line
+// that ends it with `]` (or the arguments: line itself when it closes there).
+fn scan_retains_block(content: string, pos: int64, in_arguments: boolean, acc: { symbol: string, names: List[string, mem(normal)], next: int64 }) -> { symbol: string, names: List[string, mem(normal)], next: int64 } {
+    case pos >= length_bytes(content) of {
+        true -> { symbol: acc.symbol, names: acc.names, next: pos };
+        false -> {
+            line: string <- substring_until_char(content, pos, '\n');
+            next_pos: int64 <- pos + length_bytes(line) + 1;
+            trimmed: string <- trim_line(line);
+            case in_arguments of {
+                true -> scan_retains_block(content, next_pos, string_ends_with(trimmed, "]") == false, acc);
+                false -> case trimmed == "}" of {
+                    true -> { symbol: acc.symbol, names: acc.names, next: next_pos };
+                    false -> case string_starts_with(trimmed, "arguments:") of {
+                        true -> scan_retains_block(content, next_pos, string_ends_with(trimmed, "]") == false, acc);
+                        false -> case string_starts_with(trimmed, "retains:") of {
+                            true -> scan_retains_block(content, next_pos, false, { symbol: acc.symbol, names: parse_retains_names(trimmed), next: acc.next });
+                            false -> case string_starts_with(trimmed, "symbol:") of {
+                                true -> scan_retains_block(content, next_pos, false, { symbol: extract_value_after_key(trimmed, "symbol:"), names: acc.names, next: acc.next });
+                                false -> scan_retains_block(content, next_pos, false, acc)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The retains: names of the wrapper entry whose symbol: is sym ("found" false when there is none).
+fn sidecar_retains_scan(content: string, pos: int64, sym: string) -> { found: boolean, names: List[string, mem(normal)] } {
+    case pos >= length_bytes(content) of {
+        true -> { found: false, names: sir_ast@nil_sir_strings() };
+        false -> {
+            line: string <- substring_until_char(content, pos, '\n');
+            next_pos: int64 <- pos + length_bytes(line) + 1;
+            case string_starts_with(trim_line(line), "wrapper ") of {
+                false -> sidecar_retains_scan(content, next_pos, sym);
+                true -> {
+                    block: { symbol: string, names: List[string, mem(normal)], next: int64 } <- scan_retains_block(content, next_pos, false, { symbol: "", names: sir_ast@nil_sir_strings(), next: next_pos });
+                    case block.symbol == sym of {
+                        true -> { found: true, names: block.names };
+                        false -> sidecar_retains_scan(content, block.next, sym)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn lookup_sidecar_retains_in_one_path(path_lexeme: string, sym: string) -> { found: boolean, names: List[string, mem(normal)] } {
+    sequence proc[DeviceIO]
+        disk_path: string <- sidecar_path_from_lexeme(path_lexeme);
+        exists: boolean <- file_exists(disk_path);
+        result: { found: boolean, names: List[string, mem(normal)] } <- case exists of {
+            false -> { found: false, names: sir_ast@nil_sir_strings() };
+            true -> {
+                content: string <- read_lines(disk_path);
+                sidecar_retains_scan(content, 0, sym)
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+// The retains: names of sym's wrapper entry in the first of paths that has one (as the symbol lookup).
+fn lookup_sidecar_retains(paths: List[string, mem(normal)], sym: string) -> List[string, mem(normal)] {
+    case paths.is_nil of {
+        true -> sir_ast@nil_sir_strings();
+        false -> {
+            here: { found: boolean, names: List[string, mem(normal)] } <- lookup_sidecar_retains_in_one_path(paths.head, sym);
+            case here.found of {
+                true -> here.names;
+                false -> lookup_sidecar_retains(paths.tail, sym)
+            }
+        }
+    }
+}
+
+// The index of the parameter named name (-1 when there is none).
+fn retains_param_index(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], name: string, i: int64) -> int64 {
+    case params.is_nil of {
+        true -> -1;
+        false -> case params.head.name == name of {
+            true -> i;
+            false -> retains_param_index(params.tail, name, i + 1)
+        }
+    }
+}
+
+fn retains_param_at(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], i: int64) -> { name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } } {
+    case params.is_nil of {
+        true -> { name: "", type_name: "", location: parser_ast@zero_location() };
+        false -> case i <= 0 of {
+            true -> params.head;
+            false -> retains_param_at(params.tail, i - 1)
+        }
+    }
+}
+
+// A buffer or pointer parameter: buf(...), ref(...) or ref?(...), or the uint8 pointer of a
+// pointer-plus-length pair (a uint8 parameter followed by a uint64 one, wrapper spec §6.1, §6.2).
+// The parameter list is stored in reverse lexical order (last parameter at head, as in
+// ffi_abi_checker@params_have_ptr_len_pair), so the lexically next parameter is at i - 1.
+fn retains_param_is_pointer(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], i: int64) -> boolean {
+    t: string <- trim_line(retains_param_at(params, i).type_name);
+    case string_starts_with(t, "buf(") or string_starts_with(t, "ref(") or string_starts_with(t, "ref?(") of {
+        true -> true;
+        false -> t == "uint8" and i > 0 and trim_line(retains_param_at(params, i - 1).type_name) == "uint64"
+    }
+}
+
+// E4033 for the first retains: name that is not a buffer or pointer parameter of the declaration.
+fn validate_retains_names(names: List[string, mem(normal)], decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, sym: string) -> int64 {
+    case names.is_nil of {
+        true -> 0;
+        false -> {
+            idx: int64 <- retains_param_index(decl.parameters, names.head, 0);
+            prefix: string <- concat(concat(concat(concat("sidecar wrapper ", sym), " retains '"), names.head), "'");
+            case idx < 0 of {
+                true -> print_sidecar_error("E4033", decl.location, concat(concat(prefix, ", which is not a parameter of foreign fn "), decl.name));
+                false -> case retains_param_is_pointer(decl.parameters, idx) of {
+                    false -> print_sidecar_error("E4033", decl.location, concat(concat(concat(prefix, " of type "), retains_param_at(decl.parameters, idx).type_name), "; a retained parameter must be a buffer or a pointer (buf, ref, ref?, or the uint8 pointer of a pointer-plus-length pair)"));
+                    true -> validate_retains_names(names.tail, decl, sym)
+                }
+            }
+        }
+    }
+}
+
+// Every foreign c_wrapper parameter the sidecar declares retained, by function, symbol and Silica
+// argument position (retains_silica_arg_index; the region checker's input for E2300 case (a), chunk15_stack_memory_design.md §6.4).
+fn collect_program_retained_params(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] {
+    default_paths: List[string, mem(normal)] <- collect_module_default_sidecar_lexemes_from_program(program.declarations);
+    collect_retained_params_loop(program.declarations, default_paths, retained_params_nil())
+}
+
+fn retained_params_nil() -> List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] <- empty[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn retained_params_cons(fn_name: string, symbol: string, index: int64, param: string, rest: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)]) -> List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        entry: { fn_name: string, symbol: string, index: int64, param: string } <- { fn_name: fn_name, symbol: symbol, index: index, param: param };
+        result: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] <- prepend[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)](entry, rest)
+    produces
+        pure result
+    end
+}
+
+fn collect_retained_params_loop(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], default_paths: List[string, mem(normal)], acc: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)]) -> List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] {
+    case decls.is_nil of {
+        true -> acc;
+        false -> case decls.head.tag == 9 of {
+            true -> {
+                sym: string <- foreign_symbol_from_decl(decls.head);
+                names: List[string, mem(normal)] <- lookup_sidecar_retains(sidecar_paths_for_foreign_decl(decls.head, default_paths), sym);
+                collect_retained_params_loop(decls.tail, default_paths, add_retained_entries(names, decls.head.parameters, decls.head.name, sym, acc))
+            };
+            false -> collect_retained_params_loop(decls.tail, default_paths, acc)
+        }
+    }
+}
+
+fn add_retained_entries(names: List[string, mem(normal)], params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], fn_name: string, sym: string, acc: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)]) -> List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] {
+    case names.is_nil of {
+        true -> acc;
+        false -> {
+            idx: int64 <- retains_param_index(params, names.head, 0);
+            acc2: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] <- case idx < 0 of {
+                true -> acc;
+                false -> retained_params_cons(fn_name, sym, retains_silica_arg_index(params, idx), names.head, acc)
+            };
+            add_retained_entries(names.tail, params, fn_name, sym, acc2)
+        }
+    }
+}
+
+// The Silica argument that supplies the reverse-order C parameter at i: its lexical position, 0-based,
+// counting Silica arguments, where a pointer-plus-length pair (a uint8 parameter followed by a uint64
+// one) takes ONE Silica argument (wrapper spec §6.1). rc_call_arg reads the call's arguments by this
+// position (E2300 case (a), chunk15_stack_memory_design.md §6.4). -1 when i is not a parameter.
+fn retains_silica_arg_index(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], i: int64) -> int64 {
+    retains_silica_arg_from(params, retains_param_count(params) - 1, i, 0)
+}
+
+fn retains_param_count(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> int64 {
+    case params.is_nil of {
+        true -> 0;
+        false -> 1 + retains_param_count(params.tail)
+    }
+}
+
+// Walks the parameters lexically: r is the reverse-order index of the lexical parameter in hand
+// (the first parameter is at count - 1), k the Silica argument it is supplied by.
+fn retains_silica_arg_from(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], r: int64, i: int64, k: int64) -> int64 {
+    case r < 0 of {
+        true -> -1;
+        false -> case r == i of {
+            true -> k;
+            false -> {
+                pair: boolean <- trim_line(retains_param_at(params, r).type_name) == "uint8" and r > 0 and trim_line(retains_param_at(params, r - 1).type_name) == "uint64";
+                case pair of {
+                    true -> case r - 1 == i of {
+                        true -> k;
+                        false -> retains_silica_arg_from(params, r - 2, i, k + 1)
+                    };
+                    false -> retains_silica_arg_from(params, r - 1, i, k + 1)
+                }
+            }
+        }
+    }
 }
 
 fn validate_program_sidecar_metadata(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> int64 {

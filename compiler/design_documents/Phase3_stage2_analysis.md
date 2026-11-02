@@ -103,3 +103,4 @@ Decisions for Lee:
 * Which direction to take the 3.3/3.4 amendment and the actor-split direction forward, and in what order, given that the data point to retained adopted garbage and a high-water that is never returned inside a dispatch; the threshold of the copy-or-keep rule is unmeasured.
 * How to treat the exit-70 failures (k=10000 parse, probable shape-6 n=20000): a stack-policy limit, a memory ceiling, or a defect. They need a captured message before any memory conclusion is drawn from the runs that end in them.
 * Whether the stale goldens (about 666 asm drifts across the exit-2 suites, plus 18 ordered_data_structures) should be reviewed now or after the memory work, since further codegen changes will move them again.
+2026-11-01: superseded: alloc_region is a frame area (Lee's decision); see chunk15 section 3.8.

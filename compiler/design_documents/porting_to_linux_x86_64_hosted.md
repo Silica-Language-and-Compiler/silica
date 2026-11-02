@@ -252,7 +252,7 @@ operation into x86-64 text, so a site conversion is mechanical: `"    ADD dest, 
 | 3.2 | `silica_01_arith`, `silica_02_calls` | calls with results in `rdi`; parameter shadows into slots; `idiv` paths |
 | 3.3 | `silica_03_case_bool` | flag transparency between `CMP` and its consumer; short-circuit pushes |
 | 3.4 | `silica_04_print`, `silica_05_int64_wide` | the print helpers' `write` syscall path; 64-bit multiply/divide |
-| 3.5 | `silica_06_strings` | the mmap string arena (syscall 9) |
+| 3.5 | `silica_06_strings` | the mmap string store (syscall 9); the Linux target keeps the heap until phase 8 |
 | 3.6 | `silica_07_recursion_depth`, `silica_08_stack_guard` | frame size under deep recursion; the fault handler not taking a non-actor SIGSEGV for stack growth, and reporting it as a fatal fault (`[silica] fault at ...`, status 70, [runtime_failure_reporting.md](runtime_failure_reporting.md)) |
 | 3.7 | `silica_09_lists` … `silica_11_regions` | lists, records/tuples on frame regions off `rbp - SVR_AREA`, regions/refs/bufs, `L_region_grow` |
 | 3.8 | `silica_12_floats` | xmm arithmetic, `ucomisd` conditions, F16C, the digit-exact float printers |
@@ -367,7 +367,7 @@ for units whose trial output matched its `.scout`, never for a defect stem — p
 `stdlib/Supervisor.linux_x86_64.ascomp`; the formal run re-verified every one of them.
 
 Backend defect found by the native run and fixed in `terms/ffi_foreign.silica`: a foreign call returning the
-32-byte result record passed the arena buffer only in `X8` (AArch64 style), so the callee wrote the record over
+32-byte result record passed the result buffer only in `X8` (AArch64 style), so the callee wrote the record over
 its first argument (three FFI string trials faulted). System V AMD64 takes that buffer as a hidden FIRST integer
 argument: `emit_sret_hidden_arg_shift` now moves every integer argument up one home and `X8` into `X0` before the
 guarded call, and `c_call_stack_args` counts the hidden argument. `app_sd18_worker_second_message` still faults

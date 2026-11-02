@@ -22,16 +22,6 @@ void silica_ffi_past_end_of_ptr(uint8_t *base, int64_t offset) {
     base[offset] = 1;
 }
 
-extern int64_t silica_rt_ffi_trial_arena_base(void);
-
-void silica_ffi_arena_past_end(void) {
-    uint8_t *base = (uint8_t *)(uintptr_t)silica_rt_ffi_trial_arena_base();
-    if (base == 0) {
-        silica_ffi_null_deref();
-        return;
-    }
-    base[262144] = 1;
-}
 
 void silica_ffi_sigill_probe(void) {
 #if defined(__aarch64__)

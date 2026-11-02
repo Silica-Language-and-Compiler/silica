@@ -1033,3 +1033,4 @@ add it to `silica.config` and report its output (want 0, 7, 0).
 `.ascomp` refresh on the Mac for every suite whose `.sout == .scout`, per the "Golden refresh list" above
 (`programmer_tools/update_goldens.sh`); do not refresh any suite that still has a `.sout != .scout` trial. Linux hosts: nix
 (x86-64) and pix (aarch64) get the same sources by `sync_to_hosts.sh`; remember §3 item 5 (touch edited sources on the host).
+2026-11-01: superseded: alloc_region is a frame area (Lee's decision); see chunk15 section 3.8.

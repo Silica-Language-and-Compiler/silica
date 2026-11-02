@@ -33,7 +33,11 @@
 // chunk15_stack_memory_design.md §2.2: #528 the state edge, #536/#544/#552 the release log base, count
 // and capacity, #560 release enabled, #568 state bytes live, #576 state policy, #584 compaction
 // requested; 2026-10-30 +16 for phase 3c: #592 the root-word descriptor of the dispatched behaviour's
-// state type, stored by its epilogue and read and cleared by _silica_rt_state_dispatch_end, #600 spare.
+// state type, stored by its epilogue and read and cleared by _silica_rt_state_dispatch_end, #600 the
+// mailbox-buffer retain flag of chunk 15 phase 4a (cleared at dispatch start, set since stage 4e only by
+// the epilogue of a behaviour whose state type the descriptors cannot follow to every word, read at
+// LBB1_free_user and by phase 4b's _silica_rt_message_forward). The implicit heap's words #160..#184 are
+// unused since stage 4e (design §9.1: the heap is gone).
 // #528, #536..#568 and #592 are kept by prims_actors_state_asm.silica; #560 is set at dispatch start
 // from the behaviour's prefix word (_silica_rt_beh_proven_store) and again by the epilogue): #0..#215 the
 // actor runtime's, #216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
@@ -75,6 +79,20 @@
 // made by the first enqueue when the target was not spawned as a supervisor.
 // 152 B message nodes: #24 ingress_kind — 0 = structured child-exit heap payload ptr at #8 (Phase C; auto-restart reads #8);
 // non-zero = Phase B trial hook only: #8 holds inline int64 (not a pointer; sup_beh must run; skip maybe_restart).
+// A user message's node (chunk 15 phase 4a, design §5.1): #8 the message (the root of its copy in the mailbox
+// buffer, or the inline word), #16 needs_reply, #32 owned-payload kind (0 for a user message), #40 the mailbox
+// buffer's bytes and #48 its malloc'd block (both 0 for an inline message; an owned exit report, #32 = 2, uses
+// #40/#48 for its arena snapshot instead), #56 the caller's ACB, #136 reply_set, #144 the reply. Phase 4a buffered
+// the cast family (cast, send, the registered casts); phase 4c the call family too (a CALL record keeps its
+// buffer's block at +40, since its +48 is the parked carrier actor, and no byte count: a call's buffer is never
+// forwarded; it is freed by the replier at LBB1_reply_drain_done, after the reply copy and the dispatch end, or
+// by _silica_rt_actor_signal_call_death); a timer's message stays in the sender's arena until stage 4e. A CALL
+// record (chunk 15 phase 4c, design §5.3) is 176 B: +152 the
+// SP the caller published (its _silica_rt_actor_call_acb SP less 1024), +160 the reply's bytes (0: the reply
+// word at +144 is the value; else the reply was copied by _silica_rt_reply_place into the caller's stack,
+// [+152 - +160 rounded down to 16, +152)), +168 the holders (2 at creation; caller and replier each let go
+// under the lock and the last frees the record); reply_set +136: 0 waiting, 1 replied, 2 target died,
+// 4 the reply did not fit the caller's lowered reservation (3, caller abandoned, is call_with_timeout's).
 // Phase E e3a: child table anchors at SB #24 head ptr, #32 len (high-water row count),
 // SB #40 sync_failure_reported (0/1; root restart-cap escalation reports before replying, thread exit skips duplicate);
 // rows are singly-linked nodes (88 B: 80 B row + next@+80), no realloc — stable row pointers (Option B).
@@ -105,7 +123,6 @@ use atom_rodata;
 use ffi_arena_runtime_asm;
 use ffi_guarded_runtime_asm;
 use ffi_fault_runtime_asm;
-use canonical_arena_runtime_asm;
 use ordering_identity_runtime_asm;
 use checked_int64_runtime_asm;
 
@@ -216,8 +233,6 @@ Lsp0_no_sb:
 	bl	_silica_rt_state_install
 	cbnz	x0, LBB0_state_failed
 	bl	_silica_rt_install_sync_fault_handlers
-	mov	x0, x19
-	bl	_silica_rt_actor_init_region
 ; Item N: the actor is bound to a carrier (idle and started; a supervisor, X24 = its trampoline,
 ; is made ready instead and runs the trampoline in its first dispatch). Only a dangerous actor
 ; (X26) gets a thread of its own, below.
@@ -479,8 +494,6 @@ Lslp_policy:
 	bl	_silica_rt_state_install
 	cbnz	x0, LBBsl_state_failed
 	bl	_silica_rt_install_sync_fault_handlers
-	mov	x0, x19
-	bl	_silica_rt_actor_init_region
 ; Item N: bound to a carrier (a supervisor child, X22 = its trampoline, made ready for its first
 ; dispatch); a dangerous actor (X26) gets a thread of its own, below.
 	mov	x0, x19
@@ -797,6 +810,11 @@ LBB1_ingress_reply_result:
 ; after the behaviour reads the node (and its call flag, node+16) from there, never from this frame:
 ; a carrier actor parked inside the behaviour returns into a frame rebuilt by the carrier.
 	str	x20, [x19, #240]
+; #600 (chunk 15 phase 4a; since stage 4e set only by the epilogue of a behaviour whose state type the
+; descriptors cannot follow to every word, prims_actors@bmv_state_asm): a word of such a state may still
+; point into the message's mailbox buffer, so LBB1_free keeps the buffer instead of freeing it. Cleared
+; at every dispatch start.
+	str	xzr, [x19, #600]
 	mov	w22, w21
 	cbnz	w22, LBB1_ingress_check_kind
 	ldr	w9, [x20, #32]
@@ -987,12 +1005,39 @@ LBB1_reply_drain_call:
 	bl	_silica_rt_supervisor_drain_ingress
 LBB1_reply_drain_done:
 	str	x21, [x20, #144]
+; Chunk 15 phase 4c: the call's message buffer (a call record's +40; 0 when inline; never forwarded, a
+; call node fails _silica_rt_message_forward's +16 test) goes now, after the reply copy (the behaviour
+; epilogue, _silica_rt_reply_place) and the dispatch end (the state copied out of it), under
+; LBB1_free_user's rule: kept when ACB #600 says an undescribed state was returned in this dispatch. An owned report
+; (+32 != 0) keeps its words. reply_set 4 (the reply did not fit the caller's reservation) is left for
+; the caller.
+	ldr	w9, [x20, #32]
+	cbnz	w9, LBB1_reply_set
+	ldr	x0, [x20, #40]
+	cbz	x0, LBB1_reply_set
+	str	xzr, [x20, #40]
+	ldr	x9, [x19, #600]
+	cbnz	x9, LBB1_reply_set
+	bl	_free
+LBB1_reply_set:
+	ldr	w8, [x20, #136]
+	cmp	w8, #4
+	b.eq	LBB1_reply_wake
 	mov	w8, #1
 	str	w8, [x20, #136]
+LBB1_reply_wake:
 	mov	x0, x20
 	bl	_silica_rt_call_wrapper_wake
+; The replier's hold on the call record goes (design §5.3, holders at +168); the record itself only
+; when the caller let go first (a caller abandoned while waiting: no such path today), after the unlock.
+	ldr	x23, [x20, #168]
+	sub	x23, x23, #1
+	str	x23, [x20, #168]
 	add	x0, x20, #72
 	bl	_os_unfair_lock_unlock
+	cbnz	x23, LBB1_again
+	mov	x0, x20
+	bl	_free
 	b	LBB1_again
 LBB1_free:
 ; An ingress node (w22 == 1) was served at LBB1_ingress_no_beh (an exit notice: its payload is
@@ -1008,7 +1053,7 @@ LBB1_free_skip_restart:
 ; A payload the message owns (the FailureReporter's report string) goes back now that the
 ; behaviour has returned, unless the behaviour kept it (_silica_rt_report_release).
 	ldr	w9, [x20, #32]
-	cbz	w9, LBB1_free_node
+	cbz	w9, LBB1_free_user
 	cmp	w9, #2
 	b.eq	LBB1_free_owned_record
 	ldr	x0, [x20, #8]
@@ -1019,6 +1064,19 @@ LBB1_free_owned_record:
 	mov	x0, x20
 	mov	x1, x19
 	bl	_silica_rt_owned_record_release
+	b	LBB1_free_node
+LBB1_free_user:
+; A user message's mailbox buffer (node +48; chunk 15 phase 4a, design §5.1) is freed now that the
+; behaviour has returned and the dispatch end has copied whatever the new state kept out of it. It is
+; kept (leaked) when ACB #600 says the behaviour returned a state the descriptors cannot follow to every
+; word (chunk 15 stage 4e: such a word may still point into it; prims_actors@bmv_state_asm sets the flag).
+; +48 is 0 when the behaviour forwarded the buffer (phase 4b, _silica_rt_message_forward): it is then
+; the new node's.
+	ldr	x0, [x20, #48]
+	cbz	x0, LBB1_free_node
+	ldr	x9, [x19, #600]
+	cbnz	x9, LBB1_free_node
+	bl	_free
 LBB1_free_node:
 	mov	x0, x20
 	bl	_free
@@ -1109,8 +1167,6 @@ LBB1_exit_free_stack:
 LBB1_exit_skip_legacy_root:
 	mov	x0, x19
 	bl	_silica_rt_ffi_arena_teardown
-	mov	x0, x19
-	bl	_silica_rt_actor_dealloc_region
 ; Phase E e4f: AFTER full teardown the release drops this thread's hold, then signals the
 ; supervisor's row.exit_done = 1 and drops this child's block reference (sb_child_done; the
 ; reference is what keeps the row alive when the supervisor has already ended). The supervisor's
@@ -1236,13 +1292,14 @@ LBB2_7:
 	.globl	_silica_rt_actor_cast           ; -- Begin function silica_rt_actor_cast
 	.p2align	2
 _silica_rt_actor_cast:                  ; @silica_rt_actor_cast
-; X0 = reference, X1 = message -> X0 = 1. An actor that has ended (or never existed) raises
-; actor_not_found and the message is dropped (§16.1.2, §16.1.4).
+; X0 = reference, X1 = message, X2 = the mailbox buffer's bytes, X3 = its block (both 0 for an inline
+; message; chunk 15 phase 4a, design §5.1: the emitter copied the message into the block with
+; _silica_rt_message_buffer and X1 is the copy's root) -> X0 = 1. An actor that has ended (or never
+; existed) raises actor_not_found and the message is dropped, its buffer freed (§16.1.2, §16.1.4; Q17).
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
-	mov	x2, #0
-	adrp	x9, _silica_rt_actor_cast_flagged@PAGE
-	add	x9, x9, _silica_rt_actor_cast_flagged@PAGEOFF
+	adrp	x9, _silica_rt_actor_cast_flagged_buffered@PAGE
+	add	x9, x9, _silica_rt_actor_cast_flagged_buffered@PAGEOFF
 	bl	_silica_rt_ref_call
 	ldp	x29, x30, [sp], #16
 	cbz	x0, Lcast_not_found
@@ -1260,12 +1317,31 @@ _silica_rt_actor_cast_flagged:
 ; payload: a runtime-built block (the FailureReporter's report string) that the receiver's dispatch
 ; frees once its behaviour has returned (node+32; _silica_rt_report_release). Returns X0 = 1
 ; enqueued, 0 not (no target, an ended target, no memory), 2 not: the target is call-only (§16.2.6.4).
+; The runtime's own cast (the exit-report sink) enters here: no mailbox buffer (+40 = +48 = 0); the timer
+; enters _silica_rt_actor_cast_flagged_buffered with its record's buffer words (chunk 15 stage 4e).
+; No .cfi pair here: the global label below may not sit inside one, so the pair starts there.
+	mov	x3, xzr
+	mov	x4, xzr
+	b	LBB3_entry
+	.globl	_silica_rt_actor_cast_flagged_buffered
+	.p2align	2
+_silica_rt_actor_cast_flagged_buffered:
+; X0 = the target's ACB or 0, X1 = the message (the copy's root), X2 = the mailbox buffer's bytes, X3 = its
+; block, both 0 when the message is inline (chunk 15 phase 4a, design §5.1): the body of
+; _silica_rt_actor_cast. The node takes the bytes at +40 and the block at +48 (a user message's node;
+; an owned exit report, +32 = 2, uses those words for its arena snapshot and is told apart by +32).
+; A dropped message (no target, an ended or call-only target, no node) frees the block here (Q17).
 	.cfi_startproc
+	mov	x4, x3
+	mov	x3, x2
+	mov	x2, xzr
+LBB3_entry:
 ; %bb.0:
-	stp	x22, x21, [sp, #-48]!           ; 16-byte Folded Spill
-	stp	x20, x19, [sp, #16]             ; 16-byte Folded Spill
-	stp	x29, x30, [sp, #32]             ; 16-byte Folded Spill
-	add	x29, sp, #32
+	stp	x24, x23, [sp, #-64]!           ; 16-byte Folded Spill
+	stp	x22, x21, [sp, #16]             ; 16-byte Folded Spill
+	stp	x20, x19, [sp, #32]             ; 16-byte Folded Spill
+	stp	x29, x30, [sp, #48]             ; 16-byte Folded Spill
+	add	x29, sp, #48
 	.cfi_def_cfa w29, 16
 	.cfi_offset w30, -8
 	.cfi_offset w29, -16
@@ -1273,11 +1349,14 @@ _silica_rt_actor_cast_flagged:
 	.cfi_offset w20, -32
 	.cfi_offset w21, -40
 	.cfi_offset w22, -48
+	.cfi_offset w23, -56
+	.cfi_offset w24, -64
 	mov	w21, w2
+	mov	x22, x1
+	mov	x23, x3
+	mov	x24, x4
 	bl	_silica_rt_report_escape_check
 	cbz	x0, LBB3_fail
-; %bb.1:
-	mov	x22, x1
 ; %bb.2:
 	mov	x19, x0
 	ldr	x9, [x19, #432]
@@ -1294,6 +1373,8 @@ _silica_rt_actor_cast_flagged:
 	mov	w9, #1
 	str	w9, [x0, #24]
 	str	w21, [x0, #32]
+	str	x23, [x0, #40]
+	str	x24, [x0, #48]
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 "
@@ -1312,9 +1393,10 @@ fn actor_rt_asm_chunk_4() -> string {
 	mov	w21, #1                         ; =0x1
 LBB3_7:
 	mov	x0, x21
-	ldp	x29, x30, [sp, #32]             ; 16-byte Folded Reload
-	ldp	x20, x19, [sp, #16]             ; 16-byte Folded Reload
-	ldp	x22, x21, [sp], #48             ; 16-byte Folded Reload
+	ldp	x29, x30, [sp, #48]             ; 16-byte Folded Reload
+	ldp	x20, x19, [sp, #32]             ; 16-byte Folded Reload
+	ldp	x22, x21, [sp, #16]             ; 16-byte Folded Reload
+	ldp	x24, x23, [sp], #64             ; 16-byte Folded Reload
 	ret
 LBB3_dead_locked:
 	add	x0, x19, #16
@@ -1323,9 +1405,14 @@ LBB3_dead_locked:
 	bl	_free
 LBB3_fail:
 	mov	w21, #0
-	b	LBB3_7
+	b	LBB3_dropped
 LBB3_conv:
 	mov	w21, #2
+LBB3_dropped:
+; The message is not delivered: its mailbox buffer, if any, goes with it (decision 7).
+	cbz	x24, LBB3_7
+	mov	x0, x24
+	bl	_free
 	b	LBB3_7
 	.cfi_endproc
                                         ; -- End function
@@ -1345,8 +1432,28 @@ _silica_rt_actor_signal_call_death:
 ; reply_set 2: the target ended before replying; the caller raises actor_not_found (§16.1.1).
 	mov	w8, #2
 	str	w8, [x19, #136]
+; The call's message buffer (a call record's +40; chunk 15 phase 4c) goes with the target: its state,
+; the only thing that could keep a part, is gone with it. An owned report (+32 != 0) keeps its words.
+	ldr	w8, [x19, #32]
+	cbnz	w8, LBBsig_wake
+	ldr	x0, [x19, #40]
+	cbz	x0, LBBsig_wake
+	str	xzr, [x19, #40]
+	bl	_free
+LBBsig_wake:
 	mov	x0, x19
 	bl	_silica_rt_call_wrapper_wake
+; The replier side's hold on the record goes (design §5.3, +168); the record too when the caller
+; let go first, after the unlock.
+	ldr	x20, [x19, #168]
+	sub	x20, x20, #1
+	str	x20, [x19, #168]
+	add	x0, x19, #72
+	bl	_os_unfair_lock_unlock
+	cbnz	x20, LBBsig_done
+	mov	x0, x19
+	bl	_free
+	b	LBBsig_done
 LBBsig_unlock:
 	add	x0, x19, #72
 	bl	_os_unfair_lock_unlock
@@ -1377,7 +1484,7 @@ _silica_rt_actor_signal_pending_call_deaths:
 ; goes back as at a normal return, unless it was sent on (report_release keeps it then).
 LBBsigpend_active_cast:
 	ldr	w8, [x20, #32]
-	cbz	w8, LBBsigpend_active_free
+	cbz	w8, LBBsigpend_active_user
 	cmp	w8, #2
 	b.eq	LBBsigpend_owned_record
 	ldr	x0, [x20, #8]
@@ -1388,6 +1495,15 @@ LBBsigpend_owned_record:
 	mov	x0, x20
 	mov	x1, x19
 	bl	_silica_rt_owned_record_release
+	b	LBBsigpend_active_free
+LBBsigpend_active_user:
+; The mailbox buffer of the message being served when the actor ended (node +48), under the rule of
+; LBB1_free_user (kept when an undescribed state was returned in the dispatch, ACB #600).
+	ldr	x0, [x20, #48]
+	cbz	x0, LBBsigpend_active_free
+	ldr	x8, [x19, #600]
+	cbnz	x8, LBBsigpend_active_free
+	bl	_free
 LBBsigpend_active_free:
 	mov	x0, x20
 	bl	_free
@@ -1406,9 +1522,16 @@ LBBsigpend_loop:
 	b	LBBsigpend_loop
 LBBsigpend_free_message:
 	ldr	w8, [x20, #32]
-	cbz	w8, LBBsigpend_free_node
+	cbz	w8, LBBsigpend_free_user
 	ldr	x0, [x20, #8]
 	bl	_silica_rt_report_unhandled
+	b	LBBsigpend_free_node
+LBBsigpend_free_user:
+; A pending user message never served: its mailbox buffer (node +48) goes with the node, one free per
+; pending message (decision 31; the queue is the owner list).
+	ldr	x0, [x20, #48]
+	cbz	x0, LBBsigpend_free_node
+	bl	_free
 LBBsigpend_free_node:
 	mov	x0, x20
 	bl	_free
@@ -1426,12 +1549,19 @@ LBBsigpend_done:
 	.globl	_silica_rt_actor_call           ; -- Begin function silica_rt_actor_call
 	.p2align	2
 _silica_rt_actor_call:
-; X0 = reference, X1 = message -> X0 = the reply. An actor that has ended (or never existed) raises
-; actor_not_found (§16.1.1). The target is held for the call (_silica_rt_ref_hold).
-	stp	x29, x30, [sp, #-48]!
+; X0 = reference, X1 = message, X2 = the message buffer's bytes, X3 = its block (0, 0 for an inline
+; message; chunk 15 phase 4c: the call family travels in a mailbox buffer as the cast family does)
+; -> X0 = the reply. An actor that has ended (or never existed) raises actor_not_found (§16.1.1); a
+; block whose message is not enqueued is freed here. The target is held for the call
+; (_silica_rt_ref_hold). A composite reply lies in THIS caller's stack below the pre-call SP (design
+; §5.3, decision 33): _silica_rt_actor_call_acb then returns with SP lowered onto it and X2 = 1, and
+; this frame is left through X29 instead of being popped, so that the emitted call site adopts
+; [SP, pre-call SP) as the bottom of its frame's dynamic part (prims_actors@emit_actor_call).
+	stp	x29, x30, [sp, #-64]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
 	stp	x21, x22, [sp, #32]
+	stp	x2, x3, [sp, #48]
 	mov	x21, x1
 	bl	_silica_rt_ref_hold
 	mov	x19, x0
@@ -1441,40 +1571,61 @@ _silica_rt_actor_call:
 	cmp	x9, #2
 	b.eq	Lcallw_conv
 	mov	x1, x21
+	ldp	x2, x3, [x29, #48]
+	str	xzr, [x29, #56]
 	bl	_silica_rt_actor_call_acb
 	mov	x20, x0
 	mov	x21, x1
+	mov	x22, x2
 	mov	x0, x19
 	bl	_silica_rt_acb_release
 	cbnz	x21, Lcallw_not_found
 	mov	x0, x20
-	ldp	x21, x22, [sp, #32]
-	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #48
+	cbnz	x22, Lcallw_leave
+	add	sp, x29, #64
+Lcallw_leave:
+	mov	x16, x29
+	ldp	x21, x22, [x16, #32]
+	ldp	x19, x20, [x16, #16]
+	ldp	x29, x30, [x16]
 	ret
 Lcallw_not_found:
+; The block, when the message was never handed to _silica_rt_actor_call_acb ([X29, #56] is zeroed
+; before that call: a target that ended under the call freed it there).
+	ldr	x0, [x29, #56]
+	cbz	x0, Lcallw_not_found_go
+	bl	_free
+Lcallw_not_found_go:
 	ldp	x21, x22, [sp, #32]
 	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #48
+	ldp	x29, x30, [sp], #64
 	b	_silica_rt_actor_not_found
 Lcallw_conv:
 	mov	x0, x19
 	bl	_silica_rt_acb_release
+	ldr	x0, [x29, #56]
+	cbz	x0, Lcallw_conv_go
+	bl	_free
+Lcallw_conv_go:
 	ldp	x21, x22, [sp, #32]
 	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #48
+	ldp	x29, x30, [sp], #64
 	b	_silica_rt_convention_mismatch
 	.globl	_silica_rt_actor_call_acb
 	.p2align	2
 _silica_rt_actor_call_acb:
-; X0 = the target's ACB (held) or 0, X1 = message -> X0 = the reply, X1 = 0; or X1 = 1 when the
-; target has ended (nothing was enqueued) or ended before replying (the wrapper's reply_set is 2).
+; X0 = the target's ACB (held) or 0, X1 = message, X2 = the message buffer's bytes, X3 = its block ->
+; X0 = the reply, X1 = 0, X2 = 0; or X1 = 1 when the target has ended (nothing was enqueued) or ended
+; before replying (the record's reply_set is 2); X2 = 1 when a composite reply was placed in this
+; caller's stack (design §5.3): SP is then the reply's bottom, below this frame, which is left through
+; X29 (LBB4_9_leave) and never popped.
 	.cfi_startproc
 ; %bb.0:
-	stp	x22, x21, [sp, #-48]!           ; 16-byte Folded Spill
-	stp	x20, x19, [sp, #16]             ; 16-byte Folded Spill
-	stp	x29, x30, [sp, #32]             ; 16-byte Folded Spill
-	add	x29, sp, #32
+	stp	x24, x23, [sp, #-64]!           ; 16-byte Folded Spill
+	stp	x22, x21, [sp, #16]             ; 16-byte Folded Spill
+	stp	x20, x19, [sp, #32]             ; 16-byte Folded Spill
+	stp	x29, x30, [sp, #48]             ; 16-byte Folded Spill
+	add	x29, sp, #48
 	.cfi_def_cfa w29, 16
 	.cfi_offset w30, -8
 	.cfi_offset w29, -16
@@ -1482,6 +1633,9 @@ _silica_rt_actor_call_acb:
 	.cfi_offset w20, -32
 	.cfi_offset w21, -40
 	.cfi_offset w22, -48
+	.cfi_offset w23, -56
+	.cfi_offset w24, -64
+	mov	x24, x3
 	bl	_silica_rt_report_escape_check
 	mov	x20, x0
 	mov	x0, #0                          ; =0x0
@@ -1491,16 +1645,31 @@ _silica_rt_actor_call_acb:
 ; %bb.2:
 	mov	w22, #1                         ; =0x1
 	mov	w0, #1                          ; =0x1
-	mov	w1, #152                        ; =0x98
+	mov	w1, #176                        ; =0xb0
 	bl	_calloc
 	cbz	x0, LBB4_dead
 ; %bb.3:
 	mov	x19, x0
 	str	x21, [x0, #8]
 	str	w22, [x0, #16]
-; wrapper+56: the caller (0 in main). A composite reply is copied into the caller's arena at the
-; reply boundary (prims_actors@bmv_reply_asm, design region_memory_safety_design.md H4): the
-; replier's arena goes when it ends, the caller's lives as long as the caller.
+	str	x24, [x0, #40]
+; The call record (chunk 15 phase 4c, design §5.3; 176 B): +40 the message buffer's block (a CALL
+; record keeps the block at +40, not a cast node's +48: +48 of a call record is the parked carrier
+; actor, LBB4_wait_start; a call's buffer is never forwarded, so its byte count, X2, is not kept;
+; freed by the replier after its reply copy and dispatch end, LBB1_reply_drain_done), +152 the SP
+; this caller publishes, +160 the reply's bytes (written by the replier, _silica_rt_reply_place),
+; +168 the holders (2: caller and replier; the last to let go frees the record). The published SP is this frame's SP
+; less a margin for everything this thread runs below it between the enqueue and the moment it
+; lowers SP onto the reply at LBB4_8 (the mail signal, the record lock, the 176 B context save of a
+; carrier actor or the futex wait, the wake-up lock and unlock): the replier writes the reply
+; directly under the published SP, in this caller's stack, from the moment the message is visible,
+; so the record is complete before the enqueue and no lock is needed for +152.
+	mov	x9, sp
+	sub	x9, x9, #1024
+	str	x9, [x0, #152]
+	mov	x9, #2
+	str	x9, [x0, #168]
+; wrapper+56: the caller (0 in main): the owner of the stack the reply is copied into.
 	bl	_silica_rt_tls_current_actor_get
 	str	x0, [x19, #56]
 ; Phase E e4f: wrapper+72 is an os_unfair_lock (4 B) and wrapper+24 is a 4 B futex seq word.
@@ -1577,25 +1746,67 @@ LBB4_7:                                 ; =>This Inner Loop Header: Depth=1
 	ldr	w8, [x19, #136]
 	cbz	w8, LBB4_7
 LBB4_8:
-	ldr	x20, [x19, #144]
-	ldr	w21, [x19, #136]
-	add	x0, x19, #72
-	bl	_os_unfair_lock_unlock
+; Under the record's lock: the reply, reply_set, the reply's bytes and the published SP, then this
+; side's hold on the record goes (+168); the record is freed by whichever side lets go last (the
+; replier lets go under the lock before this side can take it, so today it is this side).
 ; Phase E e4f: wrapper+72 (os_unfair_lock) and wrapper+24 (futex seq word) have no
 ; out-of-line state, so freeing the wrapper buffer reclaims everything. No destroy call needed.
+	ldr	x20, [x19, #144]
+	ldr	w21, [x19, #136]
+	ldr	x23, [x19, #160]
+	ldr	x24, [x19, #152]
+	ldr	x9, [x19, #168]
+	sub	x9, x9, #1
+	str	x9, [x19, #168]
+	mov	x22, x9
+	add	x0, x19, #72
+	bl	_os_unfair_lock_unlock
+	cbnz	x22, LBB4_8_held
 	mov	x0, x19
 	bl	_free
+LBB4_8_held:
+	cmp	w21, #4
+	b.eq	LBB4_too_large
 	mov	x0, x20
 	cmp	w21, #2
 	cset	x1, eq
+	mov	x2, xzr
+	cbz	x23, LBB4_9
+; A composite reply (design §5.3, decision 33) lies in [published SP - bytes, published SP), rounded
+; down to 16, in this caller's own stack: SP goes to its bottom and stays there through both
+; returns; the emitted call site adopts [SP, pre-call SP) as the bottom of its frame's dynamic part
+; (prims_memory L_adopt), so the reply pops with the caller's frame.
+	sub	x9, x24, x23
+	and	x9, x9, #0xfffffffffffffff0
+	mov	sp, x9
+	mov	x2, #1
+	b	LBB4_9_leave
+LBB4_too_large:
+; reply_set 4: the reply did not fit this caller's lowered reservation (the replier could not grow
+; it, _silica_rt_reply_place); the caller fails with (:explicit, :reservation_exceeded). Never returns.
+	adrp	x8, _silica_rt_reservation_exceeded_atom@PAGE
+	add	x8, x8, _silica_rt_reservation_exceeded_atom@PAGEOFF
+	ldr	x0, [x8]
+	bl	_silica_rt_fail_self
 LBB4_9:
-	ldp	x29, x30, [sp, #32]             ; 16-byte Folded Reload
-	ldp	x20, x19, [sp, #16]             ; 16-byte Folded Reload
-	ldp	x22, x21, [sp], #48             ; 16-byte Folded Reload
+	add	sp, x29, #16
+LBB4_9_leave:
+	mov	x16, x29
+	ldp	x20, x19, [x16, #-16]
+	ldp	x22, x21, [x16, #-32]
+	ldp	x24, x23, [x16, #-48]
+	ldp	x29, x30, [x16]
 	ret
 LBB4_dead:
+; Nothing was enqueued (no target, no record) or the target ended before taking the message: the
+; message buffer goes with it (decision 7).
+	cbz	x24, LBB4_dead_go
+	mov	x0, x24
+	bl	_free
+LBB4_dead_go:
 	mov	x0, #0
 	mov	x1, #1
+	mov	x2, xzr
 	b	LBB4_9
 	.cfi_endproc
                                         ; -- End function
@@ -1626,6 +1837,14 @@ _silica_rt_actor_call_registered:       ; @silica_rt_actor_call_registered
 	mov	x1, x12
 	b	_silica_rt_actor_call
 LBB4r_not_found:
+; The message buffer (X3; chunk 15 phase 4c) goes with a message that is never enqueued.
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
+	cbz	x3, LBB4r_fail
+	mov	x0, x3
+	bl	_free
+LBB4r_fail:
+	ldp	x29, x30, [sp], #16
 	b	_silica_rt_actor_not_found
 	.cfi_endproc
                                         ; -- End function
@@ -1755,7 +1974,7 @@ fn actor_rt_topology_phase_g_chunk() -> string {
 	.p2align	2
 _silica_rt_get_cpu_topology:
 	.cfi_startproc
-	stp	x29, x30, [sp, #-96]!
+	stp	x29, x30, [sp, #-112]!
 	stp	x19, x20, [sp, #16]
 	stp	x21, x22, [sp, #32]
 	stp	x23, x24, [sp, #48]
@@ -1790,6 +2009,19 @@ _silica_rt_get_cpu_topology:
 	add	sp, sp, #16
 	add	w21, w19, w20
 	cbz	w21, L_topo_fail_zero
+; Chunk 15 stage 4e (design §9.1): every list, string and record of the answer is built in a destination
+; area reserved here in this frame's dynamic part (256 bytes per core plus 2048: ample for the caps list,
+; the core records and their array, five lists, two node records, the cache levels and the record itself;
+; _silica_rt_dest_take aborts on an overrun), its pair at [x29, #96]. L_topo_epilogue lowers SP onto what
+; was taken and leaves through X29, and the emitted call site adopts the area into the caller's frame.
+	uxtw	x9, w21
+	lsl	x9, x9, #8
+	add	x9, x9, #2048
+	mov	x10, sp
+	sub	sp, sp, x9
+	mov	x11, sp
+	stp	x10, x11, [x29, #96]
+	add	x0, x29, #96
 	bl	_silica_rt_apple_hw_optional_caps_list
 	mov	x26, x0
 ; cores: one boxed core_info (40 bytes: shape word, id, core_type, capabilities, frequency_mhz) per
@@ -1797,20 +2029,20 @@ _silica_rt_get_cpu_topology:
 ; over the array by _silica_rt_build_list_from_words. The record lists get_cpu_topology answers
 ; (cores, numa_nodes, memory_ranges, cache levels) were 16-byte {record, next} cons cells until
 ; 2026-10-20, which compiled code read as a list handle: length(top.cores) was the first record's
-; address and any walk of the list faulted. The loop index is x24 (callee-saved: malloc may
+; address and any walk of the list faulted. The loop index is x24 (callee-saved: the call may
 ; clobber x9-x17); x24 is reassigned once the loop is done.
-	uxtw	x0, w21
-	lsl	x0, x0, #3
-	bl	_silica_rt_region_alloc
-	cbz	x0, L_topo_fail_zero
+	uxtw	x1, w21
+	lsl	x1, x1, #3
+	add	x0, x29, #96
+	bl	_silica_rt_dest_take
 	mov	x22, x0
 	mov	x24, xzr
 L_topo_core_loop:
 	cmp	w24, w21
 	b.hs	L_topo_after_cores
-	mov	x0, #40
-	bl	_malloc
-	cbz	x0, L_topo_fail_zero
+	add	x0, x29, #96
+	mov	x1, #40
+	bl	_silica_rt_dest_take
 	mov	x23, x0
 	movz	x11, #1, lsl #16
 	movk	x11, #1
@@ -1830,11 +2062,13 @@ L_topo_core_loop:
 L_topo_after_cores:
 	mov	x0, x22
 	uxtw	x1, w21
+	add	x2, x29, #96
 	bl	_silica_rt_build_list_from_words
 	cbz	x0, L_topo_fail_zero
 	mov	x22, x0
 	mov	x0, xzr
 	uxtw	x1, w21
+	add	x2, x29, #96
 	bl	_silica_rt_build_int_range_list
 	mov	x24, x0
 	mov	x28, x24
@@ -1843,9 +2077,9 @@ L_topo_after_cores:
 	bl	_silica_rt_sysctl_u64
 	cbz	x0, L_topo_fail_zero
 	mov	x27, x0
-	mov	x0, #32
-	bl	_malloc
-	cbz	x0, L_topo_fail_zero
+	add	x0, x29, #96
+	mov	x1, #32
+	bl	_silica_rt_dest_take
 ; memory_range: one NUMA node (Apple Silicon has no multi-domain sysctl matrix). start=0 = domain origin in this layout;
 ; macOS sysctl does not expose physical DRAM base per node — size is real (hw.memsize bytes). latency=0 = local self-
 ; distance (ACPI SLIT-style relative units: same node as itself), not an OS picoseconds value.
@@ -1859,13 +2093,14 @@ L_topo_after_cores:
 	str	x0, [sp, #-16]!
 	mov	x0, sp
 	mov	x1, #1
+	add	x2, x29, #96
 	bl	_silica_rt_build_list_from_words
 	add	sp, sp, #16
 	cbz	x0, L_topo_fail_zero
 	mov	x23, x0
-	mov	x0, #32
-	bl	_malloc
-	cbz	x0, L_topo_fail_zero
+	add	x0, x29, #96
+	mov	x1, #32
+	bl	_silica_rt_dest_take
 	movz	x9, #1, lsl #16
 	movk	x9, #3
 	str	x9, [x0]
@@ -1876,6 +2111,7 @@ L_topo_after_cores:
 	str	x0, [sp, #-16]!
 	mov	x0, sp
 	mov	x1, #1
+	add	x2, x29, #96
 	bl	_silica_rt_build_list_from_words
 	add	sp, sp, #16
 	cbz	x0, L_topo_fail_zero
@@ -1884,11 +2120,12 @@ L_topo_after_cores:
 	uxtw	x1, w20
 	uxtw	x2, w21
 	mov	x3, x28
+	add	x4, x29, #96
 	bl	_silica_rt_apple_build_cache_levels
 	mov	x25, x0
-	mov	x0, #32
-	bl	_malloc
-	cbz	x0, L_topo_fail_zero
+	add	x0, x29, #96
+	mov	x1, #32
+	bl	_silica_rt_dest_take
 	movz	x9, #1, lsl #16
 	movk	x9, #2
 	str	x9, [x0]
@@ -1899,26 +2136,29 @@ L_topo_after_cores:
 L_topo_sysctl_fail:
 	add	sp, sp, #16
 L_topo_fail_zero:
-; OOM / sysctl / zero-core failure: still return a non-NULL 32-byte record (shape word; cores, numa_nodes, cache_hierarchy
-; pointers all nil) so Silica callers can field-load and length(empty) without SIGSEGV. If malloc fails, return NULL.
-	mov	x0, #32
-	bl	_malloc
-	cbz	x0, L_topo_null_ret
+; sysctl or zero-core failure: still a non-NULL 32-byte record (shape word; cores, numa_nodes,
+; cache_hierarchy pointers all nil) so Silica callers can field-load and length(empty) without a fault,
+; built below SP in this frame (a destination area reserved before the failure lies above it and is
+; adopted with it).
+	sub	sp, sp, #32
+	mov	x0, sp
 	movz	x9, #1, lsl #16
 	movk	x9, #2
 	str	x9, [x0]
 	str	xzr, [x0, #8]
 	stp	xzr, xzr, [x0, #16]
-	b	L_topo_epilogue
-L_topo_null_ret:
-	mov	x0, xzr
+	b	L_topo_leave
 L_topo_epilogue:
-	ldp	x27, x28, [sp, #80]
-	ldp	x25, x26, [sp, #64]
-	ldp	x23, x24, [sp, #48]
-	ldp	x21, x22, [sp, #32]
-	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #96
+	ldr	x9, [x29, #96]
+	and	x9, x9, #0xfffffffffffffff0
+	mov	sp, x9
+L_topo_leave:
+	ldp	x27, x28, [x29, #80]
+	ldp	x25, x26, [x29, #64]
+	ldp	x23, x24, [x29, #48]
+	ldp	x21, x22, [x29, #32]
+	ldp	x19, x20, [x29, #16]
+	ldp	x29, x30, [x29]
 	ret
 	.cfi_endproc
 	.globl	_silica_rt_get_core_capabilities
@@ -1929,7 +2169,11 @@ _silica_rt_get_core_capabilities:
 ; and until 2026-10-20 saved only x19-x26, so a compiled caller holding a live binding in x28
 ; across the call (the tenth simultaneously live value) read the core id back instead
 ; (cpu_discovery_and_spawn_pinning/cpu_topology_x28_live_across_capabilities).
-	stp	x29, x30, [sp, #-96]!
+; Chunk 15 stage 4e (design §9.1): the core_info record and its capabilities list (40 + 344 bytes at
+; most) are built in a 400-byte destination area reserved below this frame (its pair at [x29, #96]);
+; L_cap_epilogue lowers SP onto what was taken and leaves through X29, and the emitted call site adopts
+; the area into the caller's frame.
+	stp	x29, x30, [sp, #-112]!
 	stp	x19, x20, [sp, #16]
 	stp	x21, x22, [sp, #32]
 	stp	x23, x24, [sp, #48]
@@ -1937,6 +2181,10 @@ _silica_rt_get_core_capabilities:
 	stp	x27, x28, [sp, #80]
 	mov	x29, sp
 	mov	x28, x0
+	mov	x10, sp
+	sub	sp, sp, #400
+	mov	x11, sp
+	stp	x10, x11, [x29, #96]
 	sub	sp, sp, #16
 	mov	w0, #4
 	str	w0, [sp, #8]
@@ -1969,9 +2217,9 @@ _silica_rt_get_core_capabilities:
 	uxtw	x8, w21
 	cmp	x28, x8
 	b.hs	L_cap_emit_sentinel
-	mov	x0, #40
-	bl	_malloc
-	cbz	x0, L_cap_emit_sentinel
+	add	x0, x29, #96
+	mov	x1, #40
+	bl	_silica_rt_dest_take
 	mov	x23, x0
 	movz	x9, #1, lsl #16
 	movk	x9, #1
@@ -1984,6 +2232,7 @@ _silica_rt_get_core_capabilities:
 	csel	w11, w11, w12, lt
 	uxtw	x11, w11
 	str	x11, [x23, #16]
+	add	x0, x29, #96
 	bl	_silica_rt_apple_hw_optional_caps_list
 	str	x0, [x23, #24]
 	str	xzr, [x23, #32]
@@ -1992,11 +2241,11 @@ _silica_rt_get_core_capabilities:
 L_cap_sysctl_fail:
 	add	sp, sp, #16
 	b	L_cap_emit_sentinel
-; Failure / OOM: heap core_info with id=-1 (sentinel); core_type=0 (:efficiency); caps/freq zero — distinguish from valid id>=0.
+; Failure: a core_info with id=-1 (sentinel); core_type=0 (:efficiency); caps/freq zero: distinguish from valid id>=0.
 L_cap_emit_sentinel:
-	mov	x0, #40
-	bl	_malloc
-	cbz	x0, L_cap_sentinel_oom
+	add	x0, x29, #96
+	mov	x1, #40
+	bl	_silica_rt_dest_take
 	movz	x9, #1, lsl #16
 	movk	x9, #1
 	str	x9, [x0]
@@ -2005,17 +2254,16 @@ L_cap_emit_sentinel:
 	str	xzr, [x0, #16]
 	str	xzr, [x0, #24]
 	str	xzr, [x0, #32]
-	b	L_cap_epilogue
-L_cap_sentinel_oom:
-	mov	x0, xzr
-	b	L_cap_epilogue
 L_cap_epilogue:
-	ldp	x27, x28, [sp, #80]
-	ldp	x25, x26, [sp, #64]
-	ldp	x23, x24, [sp, #48]
-	ldp	x21, x22, [sp, #32]
-	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #96
+	ldr	x9, [x29, #96]
+	and	x9, x9, #0xfffffffffffffff0
+	mov	sp, x9
+	ldp	x27, x28, [x29, #80]
+	ldp	x25, x26, [x29, #64]
+	ldp	x23, x24, [x29, #48]
+	ldp	x21, x22, [x29, #32]
+	ldp	x19, x20, [x29, #16]
+	ldp	x29, x30, [x29]
 	ret
 	.cfi_endproc
 "
@@ -2026,18 +2274,14 @@ fn actor_rt_asm_chunk_6() -> string {
 	.p2align	2
 _silica_rt_get_efficiency_cores:        ; @silica_rt_get_efficiency_cores
 	.cfi_startproc
-; %bb.0: query P-core count (offset) then E-core count, build list [p..p+e-1]
-	stp	x22, x21, [sp, #-48]!
+; %bb.0: query P-core count (offset) then E-core count, build list [p..p+e-1]. Chunk 15 stage 4e
+; (design §9.1): the list is built in a destination area reserved in this frame (24 + 32 * ((e + 1) / 2)
+; bytes and slack, its pair at [x29, #16]); the leave lowers SP onto it and goes through X29, and the
+; emitted call site adopts it. An empty list (e <= 0) or a sysctl failure answers 0 with SP as it was.
+	stp	x22, x21, [sp, #-64]!
 	stp	x20, x19, [sp, #16]
 	stp	x29, x30, [sp, #32]
 	add	x29, sp, #32
-	.cfi_def_cfa w29, 16
-	.cfi_offset w30, -8
-	.cfi_offset w29, -16
-	.cfi_offset w19, -24
-	.cfi_offset w20, -32
-	.cfi_offset w21, -40
-	.cfi_offset w22, -48
 	sub	sp, sp, #16
 	mov	x0, #4
 	str	x0, [sp, #8]
@@ -2067,19 +2311,35 @@ Lloh9:
 	bl	_sysctlbyname
 	cbnz	w0, LBBec_fail
 	ldr	w1, [sp]
-	mov	x0, x19
 	add	sp, sp, #16
+	cmp	w1, #0
+	b.le	LBBec_nil
+	add	x9, x1, #1
+	lsr	x9, x9, #1
+	lsl	x9, x9, #5
+	add	x9, x9, #48
+	and	x9, x9, #0xfffffffffffffff0
+	mov	x10, sp
+	sub	sp, sp, x9
+	mov	x11, sp
+	stp	x10, x11, [x29, #16]
+	mov	x0, x19
+	add	x2, x29, #16
 	bl	_silica_rt_build_int_range_list
-	ldp	x29, x30, [sp, #32]
-	ldp	x20, x19, [sp, #16]
-	ldp	x22, x21, [sp], #48
+	ldr	x9, [x29, #16]
+	and	x9, x9, #0xfffffffffffffff0
+	mov	sp, x9
+	ldp	x20, x19, [x29, #-16]
+	ldp	x22, x21, [x29, #-32]
+	ldp	x29, x30, [x29]
 	ret
 LBBec_fail:
 	add	sp, sp, #16
+LBBec_nil:
 	mov	x0, #0
 	ldp	x29, x30, [sp, #32]
 	ldp	x20, x19, [sp, #16]
-	ldp	x22, x21, [sp], #48
+	ldp	x22, x21, [sp], #64
 	ret
 	.loh AdrpAdd	Lloh6, Lloh7
 	.loh AdrpAdd	Lloh8, Lloh9
@@ -2089,15 +2349,11 @@ LBBec_fail:
 	.p2align	2
 _silica_rt_get_performance_cores:       ; @silica_rt_get_performance_cores
 	.cfi_startproc
-; %bb.0: query P-core count, build list [0..count-1]
-	stp	x20, x19, [sp, #-32]!
+; %bb.0: query P-core count, build list [0..count-1]; the destination area and the adopting leave as in
+; _silica_rt_get_efficiency_cores (chunk 15 stage 4e).
+	stp	x20, x19, [sp, #-48]!
 	stp	x29, x30, [sp, #16]
 	add	x29, sp, #16
-	.cfi_def_cfa w29, 16
-	.cfi_offset w30, -8
-	.cfi_offset w29, -16
-	.cfi_offset w19, -24
-	.cfi_offset w20, -32
 	sub	sp, sp, #16
 	mov	x0, #4
 	str	x0, [sp, #8]
@@ -2113,17 +2369,33 @@ Lloh11:
 	bl	_sysctlbyname
 	cbnz	w0, LBBpc_fail
 	ldr	w1, [sp]
-	mov	x0, #0
 	add	sp, sp, #16
+	cmp	w1, #0
+	b.le	LBBpc_nil
+	add	x9, x1, #1
+	lsr	x9, x9, #1
+	lsl	x9, x9, #5
+	add	x9, x9, #48
+	and	x9, x9, #0xfffffffffffffff0
+	mov	x10, sp
+	sub	sp, sp, x9
+	mov	x11, sp
+	stp	x10, x11, [x29, #16]
+	mov	x0, #0
+	add	x2, x29, #16
 	bl	_silica_rt_build_int_range_list
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldr	x9, [x29, #16]
+	and	x9, x9, #0xfffffffffffffff0
+	mov	sp, x9
+	ldp	x20, x19, [x29, #-16]
+	ldp	x29, x30, [x29]
 	ret
 LBBpc_fail:
 	add	sp, sp, #16
+LBBpc_nil:
 	mov	x0, #0
 	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldp	x20, x19, [sp], #48
 	ret
 	.loh AdrpAdd	Lloh10, Lloh11
 	.cfi_endproc
@@ -2825,36 +3097,61 @@ L_sc_opt_advsimd:
 L_tok_opt_advsimd:
 	.asciz	\"optional.AdvSIMD\"
 	.section	__TEXT,__text,regular,pure_instructions
+; _silica_rt_dest_take(X0 = a destination pair: [0] the next free address (the area grows DOWN from it),
+; [8] the area's floor; X1 = bytes) -> X0 = a zeroed, 8-byte aligned block of that many bytes (rounded up
+; to 8) taken from the top of what is free. Chunk 15 stage 4e (design §9.1): the runtime's list, string
+; and record builders write into a destination area their caller reserved in the dynamic part of its own
+; frame (get_cpu_topology, get_efficiency_cores, get_performance_cores, get_core_capabilities,
+; which_children, get_child_info) and that caller returns with SP at the area's bottom, so the emitted call
+; site adopts the value into the calling frame (prims_actors@runtime_call_asm, prims_memory L_adopt);
+; nothing comes from a heap. A request past the floor is a sizing bug of the caller and aborts the process
+; (status 71) rather than overrun a frame. Leaf: X1 and x9-x11 only.
+	.globl	_silica_rt_dest_take
+	.p2align	2
+_silica_rt_dest_take:
+	add	x1, x1, #7
+	and	x1, x1, #0xfffffffffffffff8
+	ldr	x9, [x0]
+	sub	x9, x9, x1
+	ldr	x10, [x0, #8]
+	cmp	x9, x10
+	b.lo	Ldtk_overrun
+	str	x9, [x0]
+	mov	x10, x9
+	mov	x11, x1
+Ldtk_zero:
+	cbz	x11, Ldtk_done
+	str	xzr, [x10], #8
+	sub	x11, x11, #8
+	b	Ldtk_zero
+Ldtk_done:
+	mov	x0, x9
+	ret
+Ldtk_overrun:
+	b	_silica_rt_abort_dest_take
 	.p2align	2                               ; -- Begin function silica_rt_build_int_range_list
 _silica_rt_build_int_range_list:        ; @silica_rt_build_int_range_list
 	.cfi_startproc
-; X0 = start, X1 = count -> X0 = the List[int64, mem(normal)] [start .. start + count - 1], or 0
-; (nil) when count <= 0 or the region is exhausted. The layout is the one the compiled list prims
-; read (prims_list.silica): a 24-byte handle {length, first chunk, cursor} over 32-byte chunks
-; {two int64 slots filled back to front, next chunk at +16, claim at +24}. The elements go in
-; from the last to the first, so every chunk after the first is full (cursor 0) as
+; X0 = start, X1 = count, X2 = the destination pair (_silica_rt_dest_take) -> X0 = the
+; List[int64, mem(normal)] [start .. start + count - 1], or 0 (nil) when count <= 0. The layout is the
+; one the compiled list prims read (prims_list.silica): a 24-byte handle {length, first chunk, cursor}
+; over 32-byte chunks {two int64 slots filled back to front, next chunk at +16, claim at +24}. The
+; elements go in from the last to the first, so every chunk after the first is full (cursor 0) as
 ; L_list_tail_helper expects when it steps to a successor, and the first chunk's claim equals its
-; cursor so a later prepend takes its free slot in place. Allocation is the actor's region, as
-; the compiled prepend allocates, so the list is released with the actor that asked for it.
+; cursor so a later prepend takes its free slot in place. Chunk 15 stage 4e: the handle and the chunks
+; come from the caller's destination area (24 + 32 * ((count + 1) / 2) bytes), never from a heap.
 ; Earlier this built 16-byte cons cells {value, next}: read as a handle, the first value was the
 ; length and the next cell the chunk, which is what cpu_topology_runtime_queries faulted on.
-	stp	x24, x23, [sp, #-64]!
-	stp	x22, x21, [sp, #16]
-	stp	x20, x19, [sp, #32]
-	stp	x29, x30, [sp, #48]
-	add	x29, sp, #48
-	.cfi_def_cfa w29, 16
-	.cfi_offset w30, -8
-	.cfi_offset w29, -16
-	.cfi_offset w19, -24
-	.cfi_offset w20, -32
-	.cfi_offset w21, -40
-	.cfi_offset w22, -48
-	.cfi_offset w23, -56
-	.cfi_offset w24, -64
+	stp	x26, x25, [sp, #-80]!
+	stp	x24, x23, [sp, #16]
+	stp	x22, x21, [sp, #32]
+	stp	x20, x19, [sp, #48]
+	stp	x29, x30, [sp, #64]
+	add	x29, sp, #64
 	mov	x19, x0
 	mov	x20, x1
 	mov	x24, x1
+	mov	x25, x2
 	mov	x21, #0
 	mov	x22, #0
 	cmp	x20, #0
@@ -2864,9 +3161,9 @@ LBBrl_loop:
 	cbz	x20, LBBrl_handle
 	sub	x23, x23, #1
 	cbnz	x22, LBBrl_store
-	mov	x0, #32
-	bl	_silica_rt_region_alloc
-	cbz	x0, LBBrl_nil
+	mov	x0, x25
+	mov	x1, #32
+	bl	_silica_rt_dest_take
 	str	x21, [x0, #16]
 	str	xzr, [x0, #24]
 	mov	x21, x0
@@ -2878,9 +3175,9 @@ LBBrl_store:
 	b	LBBrl_loop
 LBBrl_handle:
 	str	x22, [x21, #24]
-	mov	x0, #24
-	bl	_silica_rt_region_alloc
-	cbz	x0, LBBrl_nil
+	mov	x0, x25
+	mov	x1, #24
+	bl	_silica_rt_dest_take
 	str	x24, [x0]
 	str	x21, [x0, #8]
 	str	x22, [x0, #16]
@@ -2888,41 +3185,35 @@ LBBrl_handle:
 LBBrl_nil:
 	mov	x0, #0
 LBBrl_done:
-	ldp	x29, x30, [sp, #48]
-	ldp	x20, x19, [sp, #32]
-	ldp	x22, x21, [sp, #16]
-	ldp	x24, x23, [sp], #64
+	ldp	x29, x30, [sp, #64]
+	ldp	x20, x19, [sp, #48]
+	ldp	x22, x21, [sp, #32]
+	ldp	x24, x23, [sp, #16]
+	ldp	x26, x25, [sp], #80
 	ret
 	.cfi_endproc
                                         ; -- End function
 	.p2align	2                               ; -- Begin function silica_rt_build_list_from_words
 _silica_rt_build_list_from_words:       ; @silica_rt_build_list_from_words
 	.cfi_startproc
-; X0 = array of one-word elements (element i at [X0 + 8 i]), X1 = count -> X0 = the
-; List[T, mem(normal)] holding those words in array order, or 0 (nil) when count <= 0 or the
-; region is exhausted. The handle and chunk layout and the back-to-front fill are those of
-; _silica_rt_build_int_range_list above; the word is what the element type keeps in a chunk slot
-; (prims_list chunk_elem_slot_bytes): a pointer to a boxed record for every record the runtime
-; does not splice inline, a string header pointer, an int64. get_cpu_topology builds cores,
-; numa_nodes, memory_ranges and cache_hierarchy.levels through it, and
-; _silica_rt_apple_hw_optional_caps_list the capabilities strings.
-	stp	x24, x23, [sp, #-64]!
-	stp	x22, x21, [sp, #16]
-	stp	x20, x19, [sp, #32]
-	stp	x29, x30, [sp, #48]
-	add	x29, sp, #48
-	.cfi_def_cfa w29, 16
-	.cfi_offset w30, -8
-	.cfi_offset w29, -16
-	.cfi_offset w19, -24
-	.cfi_offset w20, -32
-	.cfi_offset w21, -40
-	.cfi_offset w22, -48
-	.cfi_offset w23, -56
-	.cfi_offset w24, -64
+; X0 = array of one-word elements (element i at [X0 + 8 i]), X1 = count, X2 = the destination pair ->
+; X0 = the List[T, mem(normal)] holding those words in array order, or 0 (nil) when count <= 0. The
+; handle and chunk layout and the back-to-front fill are those of _silica_rt_build_int_range_list above
+; (24 + 32 * ((count + 1) / 2) bytes of the destination); the word is what the element type keeps in a
+; chunk slot (prims_list chunk_elem_slot_bytes): a pointer to a boxed record for every record the runtime
+; does not splice inline, a string header pointer, an int64. get_cpu_topology builds cores, numa_nodes,
+; memory_ranges and cache_hierarchy.levels through it, and _silica_rt_apple_hw_optional_caps_list the
+; capabilities strings.
+	stp	x26, x25, [sp, #-80]!
+	stp	x24, x23, [sp, #16]
+	stp	x22, x21, [sp, #32]
+	stp	x20, x19, [sp, #48]
+	stp	x29, x30, [sp, #64]
+	add	x29, sp, #64
 	mov	x19, x0
 	mov	x20, x1
 	mov	x24, x1
+	mov	x25, x2
 	mov	x21, #0
 	mov	x22, #0
 	cmp	x20, #0
@@ -2932,9 +3223,9 @@ LBBlw_loop:
 	sub	x20, x20, #1
 	ldr	x23, [x19, x20, lsl #3]
 	cbnz	x22, LBBlw_store
-	mov	x0, #32
-	bl	_silica_rt_region_alloc
-	cbz	x0, LBBlw_nil
+	mov	x0, x25
+	mov	x1, #32
+	bl	_silica_rt_dest_take
 	str	x21, [x0, #16]
 	str	xzr, [x0, #24]
 	mov	x21, x0
@@ -2945,9 +3236,9 @@ LBBlw_store:
 	b	LBBlw_loop
 LBBlw_handle:
 	str	x22, [x21, #24]
-	mov	x0, #24
-	bl	_silica_rt_region_alloc
-	cbz	x0, LBBlw_nil
+	mov	x0, x25
+	mov	x1, #24
+	bl	_silica_rt_dest_take
 	str	x24, [x0]
 	str	x21, [x0, #8]
 	str	x22, [x0, #16]
@@ -2955,10 +3246,11 @@ LBBlw_handle:
 LBBlw_nil:
 	mov	x0, #0
 LBBlw_done:
-	ldp	x29, x30, [sp, #48]
-	ldp	x20, x19, [sp, #32]
-	ldp	x22, x21, [sp, #16]
-	ldp	x24, x23, [sp], #64
+	ldp	x29, x30, [sp, #64]
+	ldp	x20, x19, [sp, #48]
+	ldp	x22, x21, [sp, #32]
+	ldp	x24, x23, [sp, #16]
+	ldp	x26, x25, [sp], #80
 	ret
 	.cfi_endproc
                                         ; -- End function
@@ -2991,17 +3283,20 @@ L_si32_fail:
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
 	ret
-; X0 = C string pointer -> X0 = a Silica string over those bytes: the 24-byte header {-1, bytes,
-; byte length} every emitted string literal and string helper reads (string_literal_pool emits
-; `.quad -1`, the data label, the length), allocated in the actor's region; 0 when the region is
-; exhausted. The bytes stay where they are (rodata here). Replaces _silica_rt_cons_cstr_list, which
-; consed bare C-string pointers into 16-byte cells that no compiled list or string code could read.
+; X0 = C string pointer, X1 = the destination pair -> X0 = a Silica string over those bytes: the 24-byte
+; header {-1, bytes, byte length} every emitted string literal and string helper reads
+; (string_literal_pool emits `.quad -1`, the data label, the length), taken from the caller's destination
+; area (chunk 15 stage 4e; _silica_rt_dest_take). The bytes stay where they are (rodata here). Replaces
+; _silica_rt_cons_cstr_list, which consed bare C-string pointers into 16-byte cells that no compiled list
+; or string code could read.
 	.p2align	2
 _silica_rt_cstr_to_string:
-	stp	x29, x30, [sp, #-32]!
+	stp	x29, x30, [sp, #-48]!
 	stp	x19, x20, [sp, #16]
+	str	x21, [sp, #32]
 	mov	x29, sp
 	mov	x19, x0
+	mov	x21, x1
 	mov	x20, #0
 L_c2s_len:
 	ldrb	w9, [x19, x20]
@@ -3009,21 +3304,22 @@ L_c2s_len:
 	add	x20, x20, #1
 	b	L_c2s_len
 L_c2s_alloc:
-	mov	x0, #24
-	bl	_silica_rt_region_alloc
-	cbz	x0, L_c2s_done
+	mov	x0, x21
+	mov	x1, #24
+	bl	_silica_rt_dest_take
 	mov	x9, #-1
 	str	x9, [x0]
 	str	x19, [x0, #8]
 	str	x20, [x0, #16]
-L_c2s_done:
+	ldr	x21, [sp, #32]
 	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #32
+	ldp	x29, x30, [sp], #48
 	ret
 ; Machine-wide sysctl hw.optional.* flags -> List[string, mem(normal)] of their names (see
 ; cpu_topology_implementation_plan): each present flag's name becomes a string header
 ; (_silica_rt_cstr_to_string) in the 8-word frame array at [x29, #64], and the list is built over
-; the array in detection order. X19 counts the entries. Shared by every core_info record.
+; the array in detection order. X19 counts the entries. Shared by every core_info record. X0 = the
+; destination pair (x20) the strings and the list are taken from (chunk 15 stage 4e; 344 bytes at most).
 	.globl	_silica_rt_apple_hw_optional_caps_list
 	.p2align	2
 _silica_rt_apple_hw_optional_caps_list:
@@ -3033,6 +3329,7 @@ _silica_rt_apple_hw_optional_caps_list:
 	stp	x23, x24, [sp, #48]
 	mov	x29, sp
 	mov	x19, xzr
+	mov	x20, x0
 	adrp	x0, L_sc_opt_neon@PAGE
 	add	x0, x0, L_sc_opt_neon@PAGEOFF
 	bl	_silica_rt_sysctl_i32
@@ -3040,6 +3337,7 @@ _silica_rt_apple_hw_optional_caps_list:
 	b.ne	L_iho_1
 	adrp	x0, L_tok_opt_neon@PAGE
 	add	x0, x0, L_tok_opt_neon@PAGEOFF
+	mov	x1, x20
 	bl	_silica_rt_cstr_to_string
 	cbz	x0, L_iho_1
 	add	x9, x29, #64
@@ -3053,6 +3351,7 @@ L_iho_1:
 	b.ne	L_iho_2
 	adrp	x0, L_tok_opt_armv8crc@PAGE
 	add	x0, x0, L_tok_opt_armv8crc@PAGEOFF
+	mov	x1, x20
 	bl	_silica_rt_cstr_to_string
 	cbz	x0, L_iho_2
 	add	x9, x29, #64
@@ -3066,6 +3365,7 @@ L_iho_2:
 	b.ne	L_iho_3
 	adrp	x0, L_tok_opt_arm64@PAGE
 	add	x0, x0, L_tok_opt_arm64@PAGEOFF
+	mov	x1, x20
 	bl	_silica_rt_cstr_to_string
 	cbz	x0, L_iho_3
 	add	x9, x29, #64
@@ -3079,6 +3379,7 @@ L_iho_3:
 	b.ne	L_iho_4
 	adrp	x0, L_tok_opt_lse@PAGE
 	add	x0, x0, L_tok_opt_lse@PAGEOFF
+	mov	x1, x20
 	bl	_silica_rt_cstr_to_string
 	cbz	x0, L_iho_4
 	add	x9, x29, #64
@@ -3092,6 +3393,7 @@ L_iho_4:
 	b.ne	L_iho_5
 	adrp	x0, L_tok_opt_sha512@PAGE
 	add	x0, x0, L_tok_opt_sha512@PAGEOFF
+	mov	x1, x20
 	bl	_silica_rt_cstr_to_string
 	cbz	x0, L_iho_5
 	add	x9, x29, #64
@@ -3105,6 +3407,7 @@ L_iho_5:
 	b.ne	L_iho_6
 	adrp	x0, L_tok_opt_sha256@PAGE
 	add	x0, x0, L_tok_opt_sha256@PAGEOFF
+	mov	x1, x20
 	bl	_silica_rt_cstr_to_string
 	cbz	x0, L_iho_6
 	add	x9, x29, #64
@@ -3118,6 +3421,7 @@ L_iho_6:
 	b.ne	L_iho_7
 	adrp	x0, L_tok_opt_aes@PAGE
 	add	x0, x0, L_tok_opt_aes@PAGEOFF
+	mov	x1, x20
 	bl	_silica_rt_cstr_to_string
 	cbz	x0, L_iho_7
 	add	x9, x29, #64
@@ -3131,6 +3435,7 @@ L_iho_7:
 	b.ne	L_iho_done
 	adrp	x0, L_tok_opt_advsimd@PAGE
 	add	x0, x0, L_tok_opt_advsimd@PAGEOFF
+	mov	x1, x20
 	bl	_silica_rt_cstr_to_string
 	cbz	x0, L_iho_done
 	add	x9, x29, #64
@@ -3139,6 +3444,7 @@ L_iho_7:
 L_iho_done:
 	add	x0, x29, #64
 	mov	x1, x19
+	mov	x2, x20
 	bl	_silica_rt_build_list_from_words
 	ldp	x23, x24, [sp, #48]
 	ldp	x21, x22, [sp, #32]
@@ -3180,18 +3486,20 @@ L_s64_fail:
 	ret
 ; Apple Silicon cache_info.levels: sysctl exposes per-cluster L1D/L2 (hw.perflevel0/1.*), aggregate hw.l1d/l2/l3,
 ; hw.cachelinesize, hw.nperflevels. Not exposed in sysctl: SLC/unified last-level cache as a stable L3; associativity
-; (we store 0). X0=P, X1=E, X2=total, X3=all-core-ids list. Returns X0 = the boxed cache_info record
-; { levels: List[cache level] } (levels nil when none is known), or 0 when malloc fails.
+; (we store 0). X0=P, X1=E, X2=total, X3=all-core-ids list, X4 = the destination pair (kept at
+; [x29, #160]; chunk 15 stage 4e: every list and record here is taken from it). Returns X0 = the boxed
+; cache_info record { levels: List[cache level] } (levels nil when none is known).
 	.globl	_silica_rt_apple_build_cache_levels
 	.p2align	2
 _silica_rt_apple_build_cache_levels:
-	stp	x29, x30, [sp, #-160]!
+	stp	x29, x30, [sp, #-176]!
 	stp	x19, x20, [sp, #16]
 	stp	x21, x22, [sp, #32]
 	stp	x23, x24, [sp, #48]
 	stp	x25, x26, [sp, #64]
 	stp	x27, x28, [sp, #80]
 	mov	x29, sp
+	str	x4, [x29, #160]
 	sub	sp, sp, #48
 	mov	x19, x0
 	mov	x20, x1
@@ -3204,11 +3512,13 @@ _silica_rt_apple_build_cache_levels:
 	mov	x23, x0
 	mov	x0, xzr
 	uxtw	x1, w19
+	ldr	x2, [x29, #160]
 	bl	_silica_rt_build_int_range_list
 	mov	x24, x0
 	cbz	w20, L_bc_no_epl
 	uxtw	x0, w19
 	uxtw	x1, w20
+	ldr	x2, [x29, #160]
 	bl	_silica_rt_build_int_range_list
 	mov	x25, x0
 	b	L_bc_have_epl
@@ -3217,6 +3527,7 @@ L_bc_no_epl:
 L_bc_have_epl:
 	mov	x0, xzr
 	uxtw	x1, w21
+	ldr	x2, [x29, #160]
 	bl	_silica_rt_build_int_range_list
 	mov	x26, x0
 	sub	sp, sp, #16
@@ -3249,6 +3560,7 @@ L_bc_agg:
 	mov	x3, x23
 	mov	x4, xzr
 	mov	x5, x26
+	ldr	x6, [x29, #160]
 	add	x0, x29, #96
 	bl	L_bc_push
 	mov	x22, x0
@@ -3263,6 +3575,7 @@ L_bc_a_skip_l3:
 	mov	x3, x23
 	mov	x4, xzr
 	mov	x5, x26
+	ldr	x6, [x29, #160]
 	add	x0, x29, #96
 	bl	L_bc_push
 	mov	x22, x0
@@ -3277,6 +3590,7 @@ L_bc_a_skip_l2:
 	mov	x3, x23
 	mov	x4, xzr
 	mov	x5, x26
+	ldr	x6, [x29, #160]
 	add	x0, x29, #96
 	bl	L_bc_push
 	mov	x22, x0
@@ -3292,6 +3606,7 @@ L_bc_dual:
 	mov	x3, x23
 	mov	x4, xzr
 	mov	x5, x26
+	ldr	x6, [x29, #160]
 	add	x0, x29, #96
 	bl	L_bc_push
 	mov	x22, x0
@@ -3307,6 +3622,7 @@ L_bc_d_skip_l3:
 	mov	x3, x23
 	mov	x4, xzr
 	mov	x5, x25
+	ldr	x6, [x29, #160]
 	add	x0, x29, #96
 	bl	L_bc_push
 	mov	x22, x0
@@ -3322,6 +3638,7 @@ L_bc_d_skip_el2:
 	mov	x3, x23
 	mov	x4, xzr
 	mov	x5, x24
+	ldr	x6, [x29, #160]
 	add	x0, x29, #96
 	bl	L_bc_push
 	mov	x22, x0
@@ -3337,6 +3654,7 @@ L_bc_d_skip_pl2:
 	mov	x3, x23
 	mov	x4, xzr
 	mov	x5, x25
+	ldr	x6, [x29, #160]
 	add	x0, x29, #96
 	bl	L_bc_push
 	mov	x22, x0
@@ -3352,6 +3670,7 @@ L_bc_d_skip_el1:
 	mov	x3, x23
 	mov	x4, xzr
 	mov	x5, x24
+	ldr	x6, [x29, #160]
 	add	x0, x29, #96
 	bl	L_bc_push
 	mov	x22, x0
@@ -3364,11 +3683,12 @@ L_bc_done:
 	sub	x9, x9, x22
 	add	x0, x0, x9, lsl #3
 	mov	x1, x22
+	ldr	x2, [x29, #160]
 	bl	_silica_rt_build_list_from_words
 	mov	x22, x0
-	mov	x0, #16
-	bl	_malloc
-	cbz	x0, L_bc_wrapped
+	ldr	x0, [x29, #160]
+	mov	x1, #16
+	bl	_silica_rt_dest_take
 	movz	x9, #1, lsl #16
 	movk	x9, #5
 	str	x9, [x0]
@@ -3380,13 +3700,13 @@ L_bc_wrapped:
 	ldp	x23, x24, [sp, #48]
 	ldp	x21, x22, [sp, #32]
 	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #160
+	ldp	x29, x30, [sp], #176
 	ret
 ; X0 = the caller's 8-word entry array, X22 = entries so far, X1 = level, X2 = size_kb, X3 = line,
-; X4 = assoc, X5 = shared -> X0 = the new entry count (X22 unchanged when malloc fails). Builds the
-; boxed cache-level record (48 bytes: shape word + 5 fields) and stores its pointer at array
-; slot 7 - X22. X3..X5 are held in callee-saved registers and the stack across malloc (the cons
-; version left them in X3..X5 over the call).
+; X4 = assoc, X5 = shared, X6 = the destination pair -> X0 = the new entry count. Builds the boxed
+; cache-level record (48 bytes: shape word + 5 fields) in the destination (chunk 15 stage 4e) and stores
+; its pointer at array slot 7 - X22. X3..X5 are held in callee-saved registers and the stack across
+; the call (the cons version left them in X3..X5 over it).
 L_bc_push:
 	stp	x29, x30, [sp, #-64]!
 	stp	x19, x20, [sp, #16]
@@ -3398,11 +3718,11 @@ L_bc_push:
 	mov	x21, x2
 	mov	x23, x3
 	mov	x24, x4
-	str	x5, [sp, #-16]!
-	mov	x0, #48
-	bl	_malloc
-	ldr	x5, [sp], #16
-	cbz	x0, L_bcp_fail
+	stp	x5, x6, [sp, #-16]!
+	mov	x0, x6
+	mov	x1, #48
+	bl	_silica_rt_dest_take
+	ldp	x5, x6, [sp], #16
 	movz	x9, #1, lsl #16
 	movk	x9, #6
 	str	x9, [x0]
@@ -3430,6 +3750,11 @@ L_bcp_done:
 fn actor_rt_asm_chunk_10() -> string {
     "	.section	__DATA,__bss
 	.p2align	3
+; One process-wide word: L_region_grow (prims_memory, emitted per module) serializes region growth on it.
+; It lived in canonical_arena_runtime_asm until chunk 15 stage 5d removed that module.
+	.globl	_silica_rt_region_lock
+_silica_rt_region_lock:
+	.zero	8
 _silica_actor_pthread_key:
 	.zero	8
 _silica_actor_tls_init_lock:
@@ -3509,74 +3834,6 @@ _silica_rt_tls_actor_set_from_x19:
 	mov	x0, x19
 	b	_silica_rt_tls_actor_set
 	.cfi_endproc
-	.p2align	2
-_silica_rt_actor_init_region:           ; arena bookkeeping for the actor's implicit heap
-	.cfi_startproc
-; X0=actor_ptr. The arena is a chain of anonymous blocks allocated on demand by
-; _silica_rt_region_alloc, so nothing is mapped here: #160 newest block (header: prev, size),
-; #168 bytes mapped so far, #176 bump pointer, #184 limit of the newest block.
-	str	xzr, [x0, #160]
-	str	xzr, [x0, #168]
-	str	xzr, [x0, #176]
-	str	xzr, [x0, #184]
-	ret
-	.cfi_endproc
-                                        ; -- End function
-	.p2align	2
-_silica_rt_actor_dealloc_region:        ; release every arena block of an actor
-	.cfi_startproc
-; X0=actor_ptr. Walks the block chain from #160 and munmaps each block.
-	stp	x29, x30, [sp, #-48]!
-	mov	x29, sp
-	.cfi_def_cfa w29, 16
-	.cfi_offset w30, -8
-	.cfi_offset w29, -16
-	stp	x19, x20, [sp, #16]
-	str	x21, [sp, #32]
-	mov	x20, x0
-	str	xzr, [x29, #40]
-	ldr	x19, [x20, #160]
-LBBdr_loop:
-	cbz	x19, LBBdr_done
-	ldr	x21, [x19]
-	ldr	x1, [x19, #8]
-	ldr	x9, [x29, #40]
-	add	x9, x9, x1
-	sub	x9, x9, #16
-	str	x9, [x29, #40]
-	mov	x0, x19
-	bl	_munmap
-	mov	x19, x21
-	b	LBBdr_loop
-LBBdr_done:
-; the newest block's untouched tail was never handed out
-	ldr	x9, [x20, #176]
-	cbz	x9, LBBdr_acc
-	ldr	x10, [x20, #184]
-	sub	x10, x10, x9
-	ldr	x9, [x29, #40]
-	sub	x9, x9, x10
-	str	x9, [x29, #40]
-LBBdr_acc:
-	ldr	x9, [x29, #40]
-	neg	x9, x9
-	adrp	x11, _silica_rt_heap_in_use@PAGE
-	add	x11, x11, _silica_rt_heap_in_use@PAGEOFF
-LBBdr_acc_loop:
-	ldaxr	x12, [x11]
-	add	x12, x12, x9
-	stlxr	w13, x12, [x11]
-	cbnz	w13, LBBdr_acc_loop
-	str	xzr, [x20, #160]
-	str	xzr, [x20, #168]
-	str	xzr, [x20, #176]
-	str	xzr, [x20, #184]
-	ldr	x21, [sp, #32]
-	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #48
-	ret
-	.cfi_endproc
-                                        ; -- End function
 "
 }
 
@@ -3739,146 +3996,23 @@ Lmig_not_found:
 fn actor_rt_asm_chunk_13() -> string {
     "	.section	__TEXT,__text,regular,pure_instructions
 ; get_actor_memory_usage lives in prims_actors_stack_asm.silica (four-field record).
-	.globl	_silica_rt_region_alloc_in
+; The implicit heap (_silica_rt_region_alloc, _silica_rt_region_alloc_in, _silica_rt_actor_init_region,
+; _silica_rt_actor_dealloc_region, _silica_rt_region_destroy, the mark/release_to pair, ACB #160..#184 and
+; _silica_rt_heap_in_use) lived here until chunk 15 stage 4e (design §9.1).
+	.globl	_silica_rt_state_area_bytes
 	.p2align	2
-_silica_rt_region_alloc_in:
-; X0 = an ACB or 0, X1 = size: as _silica_rt_region_alloc, but in THAT actor's arena (0: the
-; fallback list, as in main). The reply boundary move copies a composite reply into the caller's
-; arena with it (design region_memory_safety_design.md H4); the caller is blocked in its call, so
-; nothing else bumps that arena meanwhile.
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
-	add	x19, x1, #7
-	and	x19, x19, #0xfffffffffffffff8
-	mov	x20, x0
-	b	LBBra_have_actor
-	.globl	_silica_rt_region_alloc         ; -- Begin function silica_rt_region_alloc
-	.p2align	2
-_silica_rt_region_alloc:                ; @silica_rt_region_alloc
-	.cfi_startproc
-; X0=size. Bump-allocates from current actor's mmap region.
-; Falls back to _malloc if not in actor context.
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
-	.cfi_def_cfa w29, 16
-	.cfi_offset w30, -8
-	.cfi_offset w29, -16
-	.cfi_offset w19, -24
-	.cfi_offset w20, -32
-	add	x19, x0, #7
-	and	x19, x19, #0xfffffffffffffff8
+_silica_rt_state_area_bytes:
+; The state_area_bytes() builtin (Lee 2026-10-31; replaces the retired heap measure of the implicit heap
+; that stage 4e removed). -> X0 = ACB #568, the bytes of live nodes in the calling actor's state area
+; (allocated minus freed; chunk15_stack_memory_design.md §2.2, the probe of §9.4). Nothing else is
+; summed. With no current actor (the main thread) it answers 0.
+	stp	x29, x30, [sp, #-16]!
+	mov	x29, sp
 	bl	_silica_rt_tls_current_actor_get
-	mov	x20, x0
-LBBra_have_actor:
-	cbz	x20, LBBra_fallback
-	ldr	x8, [x20, #176]
-	cbz	x8, LBBra_grow
-	ldr	x9, [x20, #184]
-	add	x10, x8, x19
-	cmp	x10, x9
-	b.hi	LBBra_grow
-	str	x10, [x20, #176]
-	adrp	x11, _silica_rt_heap_in_use@PAGE
-	add	x11, x11, _silica_rt_heap_in_use@PAGEOFF
-LBBra_acc_bump:
-	ldaxr	x12, [x11]
-	add	x12, x12, x19
-	stlxr	w13, x12, [x11]
-	cbnz	w13, LBBra_acc_bump
-	mov	x0, x8
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
-	ret
-LBBra_grow:
-; New block: 64 MB, or the request plus its header when larger. Anonymous RW mappings cost
-; nothing until touched, so an idle actor still holds no arena memory. The old block's tail is
-; wasted from here on, so the in-use count takes it now and dealloc_region subtracts it.
-	cbz	x8, LBBra_grow_map
-	ldr	x9, [x20, #184]
-	sub	x9, x9, x8
-	adrp	x11, _silica_rt_heap_in_use@PAGE
-	add	x11, x11, _silica_rt_heap_in_use@PAGEOFF
-LBBra_acc_waste:
-	ldaxr	x12, [x11]
-	add	x12, x12, x9
-	stlxr	w13, x12, [x11]
-	cbnz	w13, LBBra_acc_waste
-LBBra_grow_map:
-	add	x9, x19, #32
-	movz	x10, #0x400, lsl #16
-	cmp	x9, x10
-	csel	x1, x9, x10, hi
-	str	x1, [sp, #-16]!
-	mov	x0, xzr
-	mov	w2, #3
-	movz	w3, #0x1002
-	mov	w4, #-1
-	mov	x5, xzr
-	bl	_mmap
-	ldr	x1, [sp], #16
-	cmn	x0, #1
-	b.eq	LBBra_grow_failed
-	ldr	x8, [x20, #160]
-	str	x8, [x0]
-	str	x1, [x0, #8]
-	str	x0, [x20, #160]
-	add	x9, x0, x1
-	str	x9, [x20, #184]
-	ldr	x10, [x20, #168]
-	add	x10, x10, x1
-	str	x10, [x20, #168]
-	add	x8, x0, #16
-	add	x10, x8, x19
-	str	x10, [x20, #176]
-	adrp	x11, _silica_rt_heap_in_use@PAGE
-	add	x11, x11, _silica_rt_heap_in_use@PAGEOFF
-LBBra_acc_grow:
-	ldaxr	x12, [x11]
-	add	x12, x12, x19
-	stlxr	w13, x12, [x11]
-	cbnz	w13, LBBra_acc_grow
-	mov	x0, x8
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
-	ret
-LBBra_grow_failed:
-; No block: the actor cannot continue (design region_memory_safety_design.md H5). Its arena is
-; untouched, so the exit path releases what it had; never returns.
-	bl	_silica_rt_region_alloc_failed
-LBBra_fallback:
-	add	x0, x19, #16
-	bl	_malloc
-	cbz	x0, LBBra_oom
-	adrp	x8, _silica_rt_region_list@PAGE
-	add	x8, x8, _silica_rt_region_list@PAGEOFF
-	ldr	x9, [x8]
-	str	x9, [x0]
-	str	x19, [x0, #8]
-	str	x0, [x8]
-	adrp	x11, _silica_rt_heap_in_use@PAGE
-	add	x11, x11, _silica_rt_heap_in_use@PAGEOFF
-LBBra_acc_fallback:
-	ldaxr	x12, [x11]
-	add	x12, x12, x19
-	stlxr	w13, x12, [x11]
-	cbnz	w13, LBBra_acc_fallback
-	add	x0, x0, #16
-LBBra_oom:
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
-	ret
-	.cfi_endproc
-	.globl	_silica_rt_heap_used
-_silica_rt_heap_used:
-; -> X0 = bytes handed out by _silica_rt_region_alloc and not yet released: every arena bump an actor
-; made (its blocks go back together when it ends, in _silica_rt_actor_dealloc_region) plus every
-; fallback allocation made outside an actor, which is never released. Requests, not resident
-; pages: a block is mapped lazily. The heap_used() builtin.
-	adrp	x8, _silica_rt_heap_in_use@PAGE
-	add	x8, x8, _silica_rt_heap_in_use@PAGEOFF
-	ldar	x0, [x8]
+	cbz	x0, Lsab_done
+	ldr	x0, [x0, #568]
+Lsab_done:
+	ldp	x29, x30, [sp], #16
 	ret
 	.globl	_silica_rt_compact_state
 	.p2align	2
@@ -3919,89 +4053,6 @@ LBBrw_oom:
 	ldp	x29, x30, [sp, #16]
 	ldp	x20, x19, [sp], #32
 	ret
-	.globl	_silica_rt_region_destroy
-_silica_rt_region_destroy:
-; X0=region handle. Frees every extension block on the [r+16] chain, then the
-; region header. Blocks come from _silica_rt_raw_alloc, so each malloc base is
-; payload-16. Null handle is a no-op so a moved-out region is safe to skip.
-; A canonical arena (_silica_rt_canonical_arena_lookup) is process-shared and belongs to the
-; canonical arena table, which hands the same base out to every lookup of its key for the life of
-; the process. A function that received one as a parameter owns the handle (spec 4.4.2) and
-; destroys it when it does not move on, exactly as for any region; the arena itself must survive
-; that, so the table is consulted first and a registered base is left untouched (LBBrd_canonical).
-; Freeing it here used to hand a non-malloc block to free (libmalloc assertion, SIGTRAP, 133).
-	cbz	x0, LBBrd_ret
-	adrp	x9, _silica_rt_canonical_arena_table@PAGE
-	add	x9, x9, _silica_rt_canonical_arena_table@PAGEOFF
-	mov	w10, #512
-LBBrd_cscan:
-	ldr	x11, [x9, #8]
-	cmp	x11, x0
-	b.eq	LBBrd_canonical
-	add	x9, x9, #16
-	subs	w10, w10, #1
-	b.ne	LBBrd_cscan
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
-	str	x21, [sp, #-16]!
-	mov	x19, x0
-	ldr	x20, [x19, #16]
-LBBrd_loop:
-	cbz	x20, LBBrd_hdr
-	ldr	x21, [x20, #16]
-	sub	x0, x20, #16
-	bl	_free
-	mov	x20, x21
-	b	LBBrd_loop
-LBBrd_hdr:
-	sub	x0, x19, #16
-	bl	_free
-	ldr	x21, [sp], #16
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
-LBBrd_ret:
-	ret
-LBBrd_canonical:
-; Deliberate no-op: the canonical arena stays registered and usable by its key.
-	ret
-	.globl	_silica_rt_region_mark
-_silica_rt_region_mark:
-	adrp	x16, _silica_rt_region_list@PAGE
-	add	x16, x16, _silica_rt_region_list@PAGEOFF
-	ldr	x16, [x16]
-	ret
-	.globl	_silica_rt_region_release_to
-_silica_rt_region_release_to:
-	stp	x29, x30, [sp, #-16]!
-	stp	x0, x1, [sp, #-16]!
-	stp	x19, x20, [sp, #-16]!
-	stp	x21, x22, [sp, #-16]!
-	mov	x21, x16
-	adrp	x19, _silica_rt_region_list@PAGE
-	add	x19, x19, _silica_rt_region_list@PAGEOFF
-	ldr	x20, [x19]
-Lrrt_loop:
-	cmp	x20, x21
-	b.eq	Lrrt_done
-	cbz	x20, Lrrt_done
-	ldr	x1, [x20]
-	str	x1, [x19]
-	mov	x0, x20
-	mov	x20, x1
-	bl	_free
-	b	Lrrt_loop
-Lrrt_done:
-	str	x21, [x19]
-	ldp	x21, x22, [sp], #16
-	ldp	x19, x20, [sp], #16
-	ldp	x0, x1, [sp], #16
-	ldp	x29, x30, [sp], #16
-	ret
-	.globl	_silica_rt_region_list
-	.comm	_silica_rt_region_list,8,3
-	.globl	_silica_rt_heap_in_use
-	.comm	_silica_rt_heap_in_use,8,3
                                         ; -- End function
 	.globl	_silica_rt_actor_supervision_ingress_enqueue ; Phase B — synthetic exit / trial hook; bounded queue
 	.p2align	2
@@ -4253,7 +4304,7 @@ _silica_rt_actor_demonitor:             ; @silica_rt_actor_demonitor
 // (atom index; 0 when not `(:explicit, …)`), [+24]=agent_type (atom copied from child's #200 slot).
 // Message node (152 B, heap) matches the standard cast shape: [+8]=payload pointer, [+16]=needs_reply=0, [+24]=ingress_kind (0 here).
 // Dead-supervisor handling (§15.4.10.4): caller is signalled via X0=1 to emit the existing root-actor stderr note.
-fn actor_rt_asm_phase_c_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn actor_rt_asm_phase_c_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     ok_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":ok"));
     normal_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":normal"));
     language_error_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":language_error"));
@@ -4703,10 +4754,6 @@ _silica_rt_report_begin:
 	add	x9, x9, _silica_rt_report_owner@PAGEOFF
 	str	x0, [x9]
 	str	xzr, [x9, #8]
-	ldr	x10, [x1, #160]
-	str	x10, [x9, #16]
-	ldr	x10, [x1, #176]
-	str	x10, [x9, #24]
 	bl	_silica_rt_report_list_take
 	ldp	x29, x30, [sp], #16
 	ret
@@ -4729,9 +4776,11 @@ Lrec_ret:
 	.p2align	2
 _silica_rt_report_release:
 ; X0 = owned payload, X1 = ACB whose behaviour just returned (its new state is in [X1]). Frees the
-; payload unless the behaviour kept it: it sent it on (escaped), it is the new state, or a word of
-; what the behaviour allocated in its arena names it or its text (the arena span since
-; _silica_rt_report_begin; the block a composite state lives in). Anything uncertain keeps it: a
+; payload unless the behaviour kept it: it sent it on (escaped), it is the new state, or ACB #600 says
+; the behaviour returned a state the descriptors cannot follow to every word (chunk 15 stage 4e: a
+; described state was copied into the state area by the dispatch end, so the report can go; an
+; undescribed one may still name it through a word the copier carried as it is; until 4e the arena span
+; allocated since _silica_rt_report_begin was scanned for such a word). Anything uncertain keeps it: a
 ; missed free leaks one report, a wrong one corrupts. Leaf apart from the tail call to free.
 	adrp	x9, _silica_rt_report_owner@PAGE
 	add	x9, x9, _silica_rt_report_owner@PAGEOFF
@@ -4747,24 +4796,8 @@ _silica_rt_report_release:
 	b.eq	Lrr_keep
 	cmp	x10, x15
 	b.eq	Lrr_keep
-	ldr	x11, [x9, #16]
-	ldr	x12, [x1, #160]
-	ldr	x13, [x9, #24]
-	ldr	x14, [x1, #176]
-	cmp	x11, x12
-	b.eq	Lrr_scan
-	cbnz	x11, Lrr_keep
-	cbz	x12, Lrr_free
-	add	x13, x12, #16
-Lrr_scan:
-	cmp	x13, x14
-	b.hs	Lrr_free
-	ldr	x10, [x13], #8
-	cmp	x10, x0
-	b.eq	Lrr_keep
-	cmp	x10, x15
-	b.eq	Lrr_keep
-	b	Lrr_scan
+	ldr	x12, [x1, #600]
+	cbnz	x12, Lrr_keep
 Lrr_free:
 	b	_free
 Lrr_keep:
@@ -5321,7 +5354,7 @@ Ldup_inflight_dec:
 "
 }
 
-fn actor_rt_pid_registry_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn actor_rt_pid_registry_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     insert_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":insert"));
     lookup_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":lookup"));
     delete_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":delete"));
@@ -5759,7 +5792,7 @@ Lrrfv_taken:
 ")
 }
 
-fn actor_rt_asm_phase_i_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn actor_rt_asm_phase_i_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     concat("	.section	__DATA,__bss
 	.p2align	3
 .globl	_silica_rt_wait_root_acb
@@ -6162,7 +6195,7 @@ Lce_lost:
 "))
 }
 
-fn actor_rt_emit_runtime_tail(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn actor_rt_emit_runtime_tail(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     concat(concat(concat(actor_rt_asm_phase_i_chunk(table), actor_rt_asm_phase_c_chunk(table)), actor_rt_asm_phase_f_chunk()), actor_rt_asm_reason_text_chunk(table))
 }
 
@@ -6219,7 +6252,7 @@ fn reason_text_atom_name_count(lexemes: List[string, mem(normal)]) -> int64 {
     end
 }
 
-fn actor_rt_asm_reason_text_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn actor_rt_asm_reason_text_chunk(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     sequence
         in_order: List[string, mem(normal)] <- atom_table@atom_table_lexemes_in_order(table);
         names: string <- reason_text_atom_name_strings(in_order, 0);
@@ -6425,8 +6458,6 @@ Lbadarith_no_supervisor:
 	bl	_silica_rt_child_table_free
 	mov	x0, x19
 	bl	_silica_rt_ffi_arena_teardown
-	mov	x0, x19
-	bl	_silica_rt_actor_dealloc_region
 	cbz	x23, Lbadarith_release
 ; Nothing of the actor waits any more: onto the carrier's stack, and the reservation is unmapped
 ; before the block can go.
@@ -6539,8 +6570,6 @@ Lcaseclause_no_supervisor:
 	bl	_silica_rt_child_table_free
 	mov	x0, x19
 	bl	_silica_rt_ffi_arena_teardown
-	mov	x0, x19
-	bl	_silica_rt_actor_dealloc_region
 	cbz	x23, Lcaseclause_release
 ; Nothing of the actor waits any more: onto the carrier's stack, and the reservation is unmapped
 ; before the block can go.
@@ -6873,8 +6902,6 @@ Lnametaken_no_supervisor:
 	bl	_silica_rt_child_table_free
 	mov	x0, x19
 	bl	_silica_rt_ffi_arena_teardown
-	mov	x0, x19
-	bl	_silica_rt_actor_dealloc_region
 	cbz	x23, Lnametaken_release
 ; Nothing of the actor waits any more: onto the carrier's stack, and the reservation is unmapped
 ; before the block can go.
@@ -7246,8 +7273,16 @@ _silica_rt_sup_ref_call:
 	mov	x0, x19
 	bl	_silica_rt_acb_release
 	mov	x0, x20
-	ldp	x19, x20, [sp, #16]
-	ldp	x29, x30, [sp], #64
+; Chunk 15 stage 4e (design §9.1): a body that built its answer in its own frame (which_children,
+; get_child_info) returns with SP lowered onto it; the lowered SP is passed on to the emitted call site,
+; which adopts it (prims_actors@runtime_call_asm). A body that kept SP gets this frame popped as before.
+	ldp	x19, x20, [x29, #16]
+	mov	x9, sp
+	cmp	x9, x29
+	ldp	x29, x30, [x29]
+	b.ne	Lsrc_adopt
+	add	sp, sp, #64
+Lsrc_adopt:
 	ret
 Lsrc_dead:
 	mov	x0, x19
@@ -7373,13 +7408,12 @@ Lie_main:
 ")
 }
 
-fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     arena_asm: string <- ffi_arena_runtime_asm@emit_ffi_arena_runtime_asm();
     guarded_asm: string <- ffi_guarded_runtime_asm@emit_guarded_ffi_runtime_asm();
     fault_asm: string <- ffi_fault_runtime_asm@emit_ffi_fault_runtime_asm();
-    canonical_arena_asm: string <- canonical_arena_runtime_asm@emit_canonical_arena_runtime_asm();
     ordering_identity_asm: string <- ordering_identity_runtime_asm@emit_ordering_identity_runtime_asm();
     checked_int64_asm: string <- checked_int64_runtime_asm@emit_checked_int64_runtime_asm();
     stack_asm: string <- concat(concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_state_asm@emit_actor_state_runtime_asm()), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
-    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), actor_rt_asm_chunk_9()), actor_rt_asm_chunk_10()), actor_rt_asm_chunk_11()), actor_rt_asm_chunk_12()), actor_rt_asm_chunk_13()), actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), actor_rt_asm_badarith_chunk()), concat(actor_rt_asm_case_clause_chunk(), concat(actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, checked_int64_asm))))))))), concat(stack_asm, prims_actors_timer_asm@emit_actor_timer_runtime_asm()))
+    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), actor_rt_asm_chunk_9()), actor_rt_asm_chunk_10()), actor_rt_asm_chunk_11()), actor_rt_asm_chunk_12()), actor_rt_asm_chunk_13()), actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), actor_rt_asm_badarith_chunk()), concat(actor_rt_asm_case_clause_chunk(), concat(actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(ordering_identity_asm, checked_int64_asm)))))))), concat(stack_asm, prims_actors_timer_asm@emit_actor_timer_runtime_asm()))
 }

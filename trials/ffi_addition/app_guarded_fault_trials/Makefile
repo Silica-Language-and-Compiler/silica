@@ -3,7 +3,6 @@ APP_TRIAL_DIR := $(abspath $(THIS_DIR))
 APP_LABEL := app_guarded_fault_trials
 APP_EXECUTABLES := \
 	dangerous_guarded_null_deref_fault \
-	dangerous_guarded_arena_bounds_fault \
 	dangerous_guarded_sigbus_fault \
 	dangerous_guarded_sigill_fault \
 	dangerous_guarded_sigfpe_fault \
@@ -107,7 +106,7 @@ integrate-run: fixtures unguarded_probe
 	done; \
 	$(TRIAL_SUPPORT_ASSEMBLE); \
 	rejected_units=$$(cut -f1 silica.compile.rejected 2>/dev/null); \
-	for trial in dangerous_guarded_null_deref_fault dangerous_guarded_arena_bounds_fault dangerous_guarded_sigbus_fault dangerous_guarded_sigill_fault dangerous_guarded_sigfpe_fault dangerous_handler_altstack_stack_overflow_smoke; do \
+	for trial in dangerous_guarded_null_deref_fault dangerous_guarded_sigbus_fault dangerous_guarded_sigill_fault dangerous_guarded_sigfpe_fault dangerous_handler_altstack_stack_overflow_smoke; do \
 		: "Each trial stands alone: a rejected, unassembled, unlinked or failing trial is reported once and the loop moves on."; \
 		if printf '%s\n' "$$rejected_units" | grep -qxF "$$trial.silica"; then continue; fi; \
 		case "$$bf" in *" $$trial "*) echo "$(APP_LABEL)/$$trial not run: assemble failed (reported above)"; continue;; esac; \

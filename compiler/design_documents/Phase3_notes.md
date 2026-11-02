@@ -767,3 +767,4 @@ board, no board lock, no change to any `.scout`, golden or trial):
    trials (`stack_release_on_return_shrinks`, `stack_many_idle_actors_hold_nothing`,
    `many_actors_one_carrier`, int64 states) must still report `committed == 0`; a composite-state
    `get_actor_memory_usage` reports one chunk committed.
+2026-11-01: superseded: alloc_region is a frame area (Lee's decision); see chunk15 section 3.8.

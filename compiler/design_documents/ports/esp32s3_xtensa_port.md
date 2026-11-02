@@ -5,6 +5,8 @@ bring-up apps) exists under `src/emitter/ESP32-S3_raw/board/`; the emitter conve
 being done file by file. This is a design record for one port, not a specification; where it
 disagrees with [silica-specification.md](../silica-specification.md), the specification wins.
 
+*[2026-11-01: the heap, region arena and heap-chunk stack wording in this document is the ESP32-S3 target, which keeps the heap until chunk 15 phase 9; on the hosted Mac targets the implicit heap is removed (phase 4e) and `alloc_region` allocates in the current stack frame (Lee, 2026-11-01).]*
+
 **Decisions taken by Lee (2026-09-12):**
 
 | Question | Decision |
