@@ -102,13 +102,16 @@ TRIAL_CACHE_STORE   = $(TRIAL_CACHE_ENV) "$(SHELL)" "$(TRIAL_CACHE_SH)" store
 
 .PHONY: all clean assembly objects executables integrate positive-integrate record-positive-golden record-golden help silica.config
 
+# Dependency-ordered lib list: a lib unit is listed after the lib units it `use`s (trials/lib_dependency_order.py).
+LIB_DEPENDENCY_ORDER := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../lib_dependency_order.py)
+
 .DEFAULT_GOAL := all
 
 silica.config:
 	@echo "$(MSG_PREFIX)regenerating silica.config..."
 	@cd "$(THIS_DIR)" && $(TRIAL_SUPPORT_LIB) && { \
 		printf '%s\n' $(POSITIVE_SILICA); \
-		if [ -d lib ]; then find lib \( -type f -o -type l \) -name '*.silica' | sort; fi; \
+		if [ -d lib ]; then python3 $(LIB_DEPENDENCY_ORDER) lib; fi; \
 	} > silica.config
 
 all: executables
