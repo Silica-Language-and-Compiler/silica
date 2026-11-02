@@ -1,0 +1,486 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Schema matching and placeholder recognition over type surfaces (Phase 2). Split from
+// type_interner.silica; the interner itself is in type_interner_core.
+
+use type_surface_cache;
+use type_interner_kinds;
+use type_interner_nodes;
+use type_interner_core;
+use type_interner_surface;
+
+export type_matches_schema/3;
+export surface_matches_schema/2;
+export is_placeholder_kind/1;
+export placeholder_kind_of_surface/1;
+export is_placeholder_surface/1;
+export surface_contains_placeholder/1;
+
+// ---------------------------------------------------------------------------
+// Schema matching (Phase 2, per call site)
+//
+// A formal parameter type may be a *schema*: a structure containing placeholder
+// kinds (KeyType, ValueType, ItemType, ...). Those are unbound, universally
+// quantified type parameters -- there is no `trait KeyType` anywhere -- so trait
+// dispatch can never resolve them. Matching binds each placeholder to whatever
+// subtree of the actual lines up with it, and requires every later occurrence of
+// that placeholder to agree.
+//
+// Bindings are fresh per call, so `wbt_map@size` can be used at KeyType=int64 in
+// one call and KeyType=string in another.
+//
+// Deliberately separate from types_equal/2, which stays exact node-id equality
+// (an O(1) compare, sound because the DAG is hash-consed).
+
+fn kind_ph_first() -> int64 { 60 }
+fn kind_ph_last() -> int64 { 75 }
+
+fn is_placeholder_kind(k: int64) -> boolean {
+    k >= kind_ph_first() and k <= kind_ph_last()
+}
+
+fn empty_schema_bindings() -> List[{ ph: int64, id: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ ph: int64, id: int64 }, mem(normal)] <- empty[{ ph: int64, id: int64 }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn schema_binding_lookup(bs: List[{ ph: int64, id: int64 }, mem(normal)], ph: int64) -> (boolean, int64) {
+    case bs.is_nil of {
+        true -> (false, type_interner_kinds@invalid_type_id());
+        false -> case bs.head.ph == ph of {
+            true -> (true, bs.head.id);
+            false -> schema_binding_lookup(bs.tail, ph)
+        }
+    }
+}
+
+fn schema_binding_add(bs: List[{ ph: int64, id: int64 }, mem(normal)], ph: int64, id: int64) -> List[{ ph: int64, id: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ ph: int64, id: int64 }, mem(normal)] <- prepend[{ ph: int64, id: int64 }, mem(normal)]({ ph: ph, id: id }, bs)
+    produces
+        pure result
+    end
+}
+
+// Placeholder check comes before the identity fast path so that a placeholder
+// always records a binding, even when it happens to face itself.
+fn schema_match_walk(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, actual: int64, formal: int64, bs: List[{ ph: int64, id: int64 }, mem(normal)], fuel: int64) -> (boolean, List[{ ph: int64, id: int64 }, mem(normal)]) {
+    case fuel <= 0 of {
+        true -> (false, bs);
+        false -> {
+            fk: int64 <- type_interner_nodes@node_kind(interner, formal);
+            case is_placeholder_kind(fk) of {
+                true -> {
+                    (found: boolean, bound: int64) <- schema_binding_lookup(bs, fk);
+                    case found of {
+                        true -> (bound == actual, bs);
+                        false -> (true, schema_binding_add(bs, fk, actual))
+                    }
+                };
+                false -> case actual == formal of {
+                    true -> (true, bs);
+                    false -> {
+                        ak: int64 <- type_interner_nodes@node_kind(interner, actual);
+                        case ak == fk of {
+                            false -> (false, bs);
+                            true -> {
+                                // A slot is walked only when it holds a type id for this kind
+                                // (dag_arg_role); a lexeme index or a literal is compared as a number.
+                                flag_a: boolean <- type_interner_nodes@nodes_at(interner.nodes, actual).buf_size_is_name;
+                                flag_f: boolean <- type_interner_nodes@nodes_at(interner.nodes, formal).buf_size_is_name;
+                                case flag_a == flag_f of {
+                                    false -> (false, bs);
+                                    true -> {
+                                        (oka: boolean, bsa: List[{ ph: int64, id: int64 }, mem(normal)]) <- schema_match_arg(interner, type_interner_kinds@dag_arg_role(fk, 0, flag_f), type_interner_nodes@node_a(interner, actual), type_interner_nodes@node_a(interner, formal), bs, fuel);
+                                        case oka of {
+                                            false -> (false, bsa);
+                                            true -> {
+                                                (okb: boolean, bsb: List[{ ph: int64, id: int64 }, mem(normal)]) <- schema_match_arg(interner, type_interner_kinds@dag_arg_role(fk, 1, flag_f), type_interner_nodes@node_b(interner, actual), type_interner_nodes@node_b(interner, formal), bsa, fuel);
+                                                case okb of {
+                                                    false -> (false, bsb);
+                                                    true -> schema_match_arg(interner, type_interner_kinds@dag_arg_role(fk, 2, flag_f), type_interner_nodes@node_c(interner, actual), type_interner_nodes@node_c(interner, formal), bsb, fuel)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One argument slot of two nodes of the same kind. Role 1 (a type id) is walked; roles 0 and 2 (a
+// literal such as a buf size or an unused slot's 0, or a lexeme index naming a record field, an
+// atom or a buf size name) are the same slot only when the numbers agree. Before 2026-10-23 every
+// slot was walked as a type id: a record field's name index was read as a node, and when that
+// index happened to be the node of a placeholder the formal had already bound, the field names
+// were checked against the binding and the record rejected (a record whose compare_value is
+// `fn(ValueType, ValueType)` against an instantiation whose ValueType is a node type over ValueType).
+fn schema_match_arg(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, role: int64, va: int64, vf: int64, bs: List[{ ph: int64, id: int64 }, mem(normal)], fuel: int64) -> (boolean, List[{ ph: int64, id: int64 }, mem(normal)]) {
+    case role == 1 of {
+        true -> schema_match_walk(interner, va, vf, bs, fuel - 1);
+        false -> (va == vf, bs)
+    }
+}
+
+fn type_matches_schema(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, actual: int64, formal: int64) -> (boolean, List[{ ph: int64, id: int64 }, mem(normal)]) {
+    schema_match_walk(interner, actual, formal, empty_schema_bindings(), 4096)
+}
+
+// Convenience for the checker: parse both surfaces into one interner and match.
+// Returns only the verdict; callers that need the bindings use type_matches_schema.
+fn surface_matches_schema(actual_surface: string, formal_surface: string) -> boolean {
+    sequence
+        i0: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- type_interner_core@create_type_interner();
+        ra: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64, ok: boolean } <- type_interner_surface@parse_type(i0, actual_surface);
+        rf: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64, ok: boolean } <- type_interner_surface@parse_type(ra.interner, formal_surface);
+        ok: boolean <- case ra.ok and rf.ok of {
+            false -> false;
+            true -> {
+                (m: boolean, _: List[{ ph: int64, id: int64 }, mem(normal)]) <- type_matches_schema(rf.interner, ra.id, rf.id);
+                m
+            }
+        }
+    produces
+        pure ok
+    end
+}
+
+
+// ---------------------------------------------------------------------------
+// Placeholder recognition for the checker.
+//
+// These replace the hardcoded `t == "KeyType" or t == "ValueType" or ...` lists
+// that were duplicated across type_checker_collections, _identifiers and
+// _literals. parse_type's name->kind table is now the single authority for what
+// counts as a placeholder; adding a new one there is picked up everywhere.
+
+// 0 when the surface is not a placeholder, else its kind_ph_* code.
+fn placeholder_kind_of_surface(s: string) -> int64 {
+    sequence
+        i0: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- type_interner_core@create_type_interner();
+        r: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64, ok: boolean } <- type_interner_surface@parse_type(i0, s);
+        k: int64 <- case r.ok of {
+            false -> 0;
+            true -> {
+                kk: int64 <- type_interner_nodes@node_kind(r.interner, r.id);
+                case is_placeholder_kind(kk) of {
+                    true -> kk;
+                    false -> 0
+                }
+            }
+        }
+    produces
+        pure k
+    end
+}
+
+fn is_placeholder_surface(s: string) -> boolean {
+    placeholder_kind_of_surface(s) != 0
+}
+
+// Any placeholder anywhere inside a composite type (replaces substring probes
+// for "KeyType" / "ValueType" / ... inside record and fn texts).
+fn dag_contains_placeholder(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64, fuel: int64) -> boolean {
+    case fuel <= 0 of {
+        true -> false;
+        false -> case id <= 0 of {
+            true -> false;
+            false -> {
+                k: int64 <- type_interner_nodes@node_kind(interner, id);
+                case is_placeholder_kind(k) of {
+                    true -> true;
+                    false -> dag_contains_placeholder(interner, type_interner_nodes@node_a(interner, id), fuel - 1)
+                        or dag_contains_placeholder(interner, type_interner_nodes@node_b(interner, id), fuel - 1)
+                        or dag_contains_placeholder(interner, type_interner_nodes@node_c(interner, id), fuel - 1)
+                }
+            }
+        }
+    }
+}
+
+// The answer depends on the text alone (it is computed in a fresh interner), but computing it
+// parses the whole surface into that throw-away interner, and the type checker asks it again and
+// again about the same signatures: with Q19's spelled nodes (2026-10-24) those parses were the
+// largest single writer into the never-released string arena of a wbt_set / graph_wbt_core
+// compile. The answer is remembered process-wide in the type_surface_cache actor under a key that
+// no type surface can be ("?placeholder?" + text), as "1" or "0" ("" is that cache's miss).
+fn surface_contains_placeholder(s: string) -> boolean {
+    key: string <- concat("?placeholder?", s);
+    hit: string <- type_surface_cache@stripped_for(key);
+    case length_bytes(hit) > 0 of {
+        true -> hit == "1";
+        false -> {
+            r: boolean <- surface_contains_placeholder_parsed(s);
+            answer: string <- case r of { true -> "1"; false -> "0" };
+            stored: string <- type_surface_cache@remember_stripped(key, answer);
+            length_bytes(stored) >= 0 and r
+        }
+    }
+}
+
+fn surface_contains_placeholder_parsed(s: string) -> boolean {
+    sequence
+        i0: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- type_interner_core@create_type_interner();
+        r: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64, ok: boolean } <- type_interner_surface@parse_type(i0, s);
+        out: boolean <- case r.ok of {
+            false -> false;
+            true -> dag_contains_placeholder(r.interner, r.id, 4096)
+        }
+    produces
+        pure out
+    end
+}

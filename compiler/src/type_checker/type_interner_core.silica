@@ -1,0 +1,3332 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Type DAG + interning (Phase 1). Authority: design_documents/Phase1_TODOs/type_dag_interning_phase0_kinds.md
+// Logical TypeKey = { kind, a, b, c }; stored in OrderedMap via decimal encoding "k,a,b,c".
+// Seed-legal: inline records + List. Checker still uses strings; this module is unused by checker until Phase 2.
+// Split on 2026-11-02 from type_interner.silica for memory reasons (profile 20261102T050916Z_silica-6b.tsv).
+
+use wbt_map;
+use OrderedMap;
+
+export create_type_interner/0;
+export mk_prim/2;
+export mk_id_seq_nil/1;
+export mk_id_seq/3;
+export mk_id_seq_from_list/2;
+export mk_name/2;
+export mk_field_pair/3;
+export mk_fn/3;
+export mk_tuple/2;
+export mk_record/2;
+export mk_list/3;
+export mk_list_legacy/2;
+export mk_mem/2;
+export mk_ref/4;
+export mk_ref_q/4;
+export mk_region/3;
+export mk_buf/6;
+export mk_atomic_ref/4;
+export mk_type_sum/2;
+export mk_atom_lit/2;
+export mk_atom_union/2;
+export mk_ordered_set/3;
+export mk_ordered_map/4;
+export mk_heap/3;
+export mk_search_tree/3;
+export mk_tree/3;
+export mk_binary_tree/3;
+export mk_directed_graph/4;
+export mk_undirected_graph/4;
+export mk_weighted_graph/5;
+export mk_priority_queue/4;
+
+// Used by the other type_interner_* modules.
+export ch_lbracket/0;
+export ch_rbracket/0;
+export ch_lbrace/0;
+export ch_rbrace/0;
+export empty_strings/0;
+export i64_to_dec/1;
+export nodes_length_bytes/1;
+export strings_length_bytes/1;
+export strings_at/2;
+export repair_string_int_map/1;
+export intern_key/6;
+export intern_name/2;
+export list_int_reverse/2;
+export empty_int_list/0;
+export mk_device_window/3;
+
+fn ch_lbracket() -> string { "[" }
+fn ch_rbracket() -> string { "]" }
+fn ch_lbrace() -> string { "{" }
+fn ch_rbrace() -> string { "}" }
+
+fn compare_string(a: string, b: string) -> :less | :equal | :greater {
+    case a < b of {
+        true -> :less;
+        false -> case a == b of {
+            true -> :equal;
+            false -> :greater
+        }
+    }
+}
+
+fn compare_int64(a: int64, b: int64) -> :less | :equal | :greater {
+    case a < b of {
+        true -> :less;
+        false -> case a == b of {
+            true -> :equal;
+            false -> :greater
+        }
+    }
+}
+
+fn empty_nodes() -> List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] <- empty[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn empty_strings() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn empty_string_int_map() -> {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    } {
+    sequence
+        m: OrderedMap[string, int64, mem(normal)] <- wbt_map@empty({
+            compare_key: compare_string,
+            compare_value: compare_int64
+        })
+    produces
+        pure m
+    end
+}
+
+fn digit_char(d: int64) -> string {
+    case d of {
+        0 -> "0";
+        1 -> "1";
+        2 -> "2";
+        3 -> "3";
+        4 -> "4";
+        5 -> "5";
+        6 -> "6";
+        7 -> "7";
+        8 -> "8";
+        9 -> "9";
+        _: int64 -> "?"
+    }
+}
+
+fn i64_to_dec_pos(n: int64) -> string {
+    case n < 10 of {
+        true -> digit_char(n);
+        false -> concat(i64_to_dec_pos(n / 10), digit_char(n - (n / 10) * 10))
+    }
+}
+
+fn i64_to_dec(n: int64) -> string {
+    case n < 0 of {
+        true -> case n == 0 - 1 of {
+            // avoid overflow on most-negative; TypeIds are non-negative in practice
+            true -> "-1";
+            false -> concat("-", i64_to_dec_pos(0 - n))
+        };
+        false -> i64_to_dec_pos(n)
+    }
+}
+
+fn encode_type_key(kind: int64, a: int64, b: int64, c: int64) -> string {
+    concat(i64_to_dec(kind), concat(",", concat(i64_to_dec(a), concat(",", concat(i64_to_dec(b), concat(",", i64_to_dec(c)))))))
+}
+
+fn nodes_length_bytes(nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        n: int64 <- length[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)](nodes)
+    produces
+        pure n
+    end
+}
+
+// O(1): prepend. The old form copied the whole list to append at the end (11.7 M allocations /
+// 0.6 GB on emitter_core). Ids are unchanged: id = position from the OLD end = n-1-(position
+// from the new head); nodes_at does that arithmetic.
+fn nodes_append(nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], node: { kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }) -> List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] <- prepend[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)](node, nodes)
+    produces
+        pure out
+    end
+}
+
+fn strings_length_bytes(xs: List[string, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        n: int64 <- length[string, mem(normal)](xs)
+    produces
+        pure n
+    end
+}
+
+fn strings_append(xs: List[string, mem(normal)], s: string) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        n: int64 <- length[string, mem(normal)](xs);
+        result: List[string, mem(normal)] <- case n == 0 of {
+            true -> prepend[string, mem(normal)](s, empty_strings());
+            false -> {
+                sequence proc[mem(normal)]
+                    h: string <- head[string, mem(normal)](xs);
+                    t: List[string, mem(normal)] <- remove_head[string, mem(normal)](xs);
+                    rest: List[string, mem(normal)] <- strings_append(t, s);
+                    out: List[string, mem(normal)] <- prepend[string, mem(normal)](h, rest)
+                produces
+                    pure out
+                end
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+fn strings_at(xs: List[string, mem(normal)], idx: int64) -> string {
+    sequence proc[mem(normal)]
+        n: int64 <- length[string, mem(normal)](xs);
+        result: string <- case n == 0 of {
+            true -> "";
+            false -> case idx == 0 of {
+                true -> head[string, mem(normal)](xs);
+                false -> {
+                    sequence proc[mem(normal)]
+                        t: List[string, mem(normal)] <- remove_head[string, mem(normal)](xs);
+                        out: string <- strings_at(t, idx - 1)
+                    produces
+                        pure out
+                    end
+                }
+            }
+        }
+    produces
+        pure result
+    end
+}
+
+fn map_insert_or_get(
+    map: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    key: string,
+    next_index: int64
+) -> {
+    map: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    index: int64,
+    inserted: boolean
+} {
+    sequence
+        g: { status: :not_found | :found, value: int64 } <- OrderedMap@get(map, key, 0);
+        out: {
+            map: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+            index: int64,
+            inserted: boolean
+        } <- case g.status of {
+            :found -> {
+                map: map,
+                index: g.value,
+                inserted: false
+            };
+            :not_found -> {
+                sequence
+                    r: :unchanged | (:inserted, {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    }) | (:replaced, {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    }) <- wbt_map@insert(map, key, next_index);
+                    new_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 } <- case r of {
+                        :unchanged -> map;
+                        (:inserted, m_ins: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }) -> m_ins;
+                        (:replaced, m_rep: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }) -> m_rep
+                    };
+                    done: {
+                        map: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+                        index: int64,
+                        inserted: boolean
+                    } <- {
+                        map: new_map,
+                        index: next_index,
+                        inserted: true
+                    }
+                produces
+                    pure done
+                end
+            }
+        }
+    produces
+        pure out
+    end
+}
+
+
+fn repair_string_int_map(m: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    }) -> {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    } {
+    {
+        root: m.root,
+        compare_key: compare_string,
+        compare_value: compare_int64,
+        specialization_key: m.specialization_key,
+        compare_key_ordering_bundle: m.compare_key_ordering_bundle,
+        compare_value_ordering_bundle: m.compare_value_ordering_bundle
+    }
+}
+
+fn intern_key(
+    interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+},
+    kind: int64,
+    a: int64,
+    b: int64,
+    c: int64,
+    buf_size_is_name: boolean
+) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        // Bind repairs/locals first: record_make with call-valued nested maps miscomputes
+        // field offsets (by_key lands on seq_nil_id=-1 → hang in wbt_map_get).
+        by0: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    } <- repair_string_int_map(interner.by_key);
+        names0: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    } <- repair_string_int_map(interner.names);
+        nodes0: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] <- interner.nodes;
+        lex0: List[string, mem(normal)] <- interner.name_lexemes;
+        nid0: int64 <- interner.next_id;
+        snil0: int64 <- interner.seq_nil_id;
+        key: string <- encode_type_key(kind, a, b, c);
+        r: {
+            map: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+            index: int64,
+            inserted: boolean
+        } <- map_insert_or_get(by0, key, nid0);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- case r.inserted of {
+            false -> {
+                sequence
+                    next_i: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- {
+                        nodes: nodes0,
+                        by_key: by0,
+                        names: names0,
+                        name_lexemes: lex0,
+                        next_id: nid0,
+                        seq_nil_id: snil0
+                    };
+                    done: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- {
+                        interner: next_i,
+                        id: r.index
+                    }
+                produces
+                    pure done
+                end
+            };
+            true -> {
+                sequence
+                    node: { kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean } <- { kind: kind, arg_a: a, arg_b: b, arg_c: c, buf_size_is_name: buf_size_is_name };
+                    by1: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    } <- repair_string_int_map(r.map);
+                    new_nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] <- nodes_append(nodes0, node);
+                    next_i: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- {
+                        nodes: new_nodes,
+                        by_key: by1,
+                        names: names0,
+                        name_lexemes: lex0,
+                        next_id: nid0 + 1,
+                        seq_nil_id: snil0
+                    };
+                    done: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- { interner: next_i, id: r.index }
+                produces
+                    pure done
+                end
+            }
+        }
+    produces
+        pure out
+    end
+}
+
+fn intern_name(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, lexeme: string) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        names0: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    } <- repair_string_int_map(interner.names);
+        r: {
+            map: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+            index: int64,
+            inserted: boolean
+        } <- map_insert_or_get(names0, lexeme, strings_length_bytes(interner.name_lexemes));
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- case r.inserted of {
+            false -> {
+                interner: {
+                    nodes: interner.nodes,
+                    by_key: interner.by_key,
+                    names: r.map,
+                    name_lexemes: interner.name_lexemes,
+                    next_id: interner.next_id,
+                    seq_nil_id: interner.seq_nil_id
+                },
+                id: r.index
+            };
+            true -> {
+                sequence
+                    new_lex: List[string, mem(normal)] <- strings_append(interner.name_lexemes, lexeme);
+                    next_i: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- {
+                        nodes: interner.nodes,
+                        by_key: interner.by_key,
+                        names: r.map,
+                        name_lexemes: new_lex,
+                        next_id: interner.next_id,
+                        seq_nil_id: interner.seq_nil_id
+                    }
+                produces
+                    pure { interner: next_i, id: r.index }
+                end
+            }
+        }
+    produces
+        pure { interner: out.interner, id: out.id }
+    end
+}
+
+fn create_type_interner() -> {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} {
+    sequence
+        nodes0: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)] <- empty_nodes();
+        by0: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    } <- empty_string_int_map();
+        names0: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    } <- empty_string_int_map();
+        lex0: List[string, mem(normal)] <- empty_strings();
+        base: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- {
+            nodes: nodes0,
+            by_key: by0,
+            names: names0,
+            name_lexemes: lex0,
+            next_id: 0,
+            seq_nil_id: 0 - 1
+        };
+        nil_r: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(base, 1, 0, 0, 0, false);
+        done: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- {
+            nodes: nil_r.interner.nodes,
+            by_key: nil_r.interner.by_key,
+            names: nil_r.interner.names,
+            name_lexemes: nil_r.interner.name_lexemes,
+            next_id: nil_r.interner.next_id,
+            seq_nil_id: nil_r.id
+        }
+    produces
+        pure done
+    end
+}
+
+fn mk_prim(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, kind: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, kind, 0, 0, 0, false)
+}
+
+fn mk_id_seq_nil(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    { interner: interner, id: interner.seq_nil_id }
+}
+
+fn mk_id_seq(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, head: int64, tail: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 2, head, tail, 0, false)
+}
+
+fn mk_id_seq_from_list_rev(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, ids: List[int64, mem(normal)], acc: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    case ids.is_nil of {
+        true -> { interner: interner, id: acc };
+        false -> {
+            sequence proc[mem(normal)]
+                h: int64 <- head[int64, mem(normal)](ids);
+                t: List[int64, mem(normal)] <- remove_head[int64, mem(normal)](ids);
+                r: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq(interner, h, acc);
+                next_i: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+} <- r.interner;
+                rid: int64 <- r.id;
+                out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list_rev(next_i, t, rid)
+            produces
+                pure out
+            end
+        }
+    }
+}
+
+fn list_int_reverse(xs: List[int64, mem(normal)], acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    case xs.is_nil of {
+        true -> acc;
+        false -> {
+            sequence proc[mem(normal)]
+                next: List[int64, mem(normal)] <- prepend[int64, mem(normal)](xs.head, acc);
+                result: List[int64, mem(normal)] <- list_int_reverse(xs.tail, next)
+            produces
+                pure result
+            end
+        }
+    }
+}
+
+fn empty_int_list() -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[int64, mem(normal)] <- empty[int64, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn mk_id_seq_from_list(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, ids: List[int64, mem(normal)]) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        empty_acc: List[int64, mem(normal)] <- empty_int_list();
+        rev: List[int64, mem(normal)] <- list_int_reverse(ids, empty_acc);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list_rev(interner, rev, interner.seq_nil_id)
+    produces
+        pure out
+    end
+}
+
+fn mk_name(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, lexeme: string) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        nr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_name(interner, lexeme);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(nr.interner, 4, nr.id, 0, 0, false)
+    produces
+        pure { interner: out.interner, id: out.id }
+    end
+}
+
+fn mk_field_pair(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, field_name: string, ty: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        nr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_name(interner, field_name);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(nr.interner, 3, nr.id, ty, 0, false)
+    produces
+        pure out
+    end
+}
+
+fn mk_fn(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, params: List[int64, mem(normal)], ret: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        pr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list(interner, params);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(pr.interner, 100, pr.id, ret, 0, false)
+    produces
+        pure out
+    end
+}
+
+fn mk_tuple(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, fields: List[int64, mem(normal)]) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        sr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list(interner, fields);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(sr.interner, 101, sr.id, 0, 0, false)
+    produces
+        pure out
+    end
+}
+
+fn mk_record_from_pairs(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, pair_ids: List[int64, mem(normal)]) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        sr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list(interner, pair_ids);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(sr.interner, 102, sr.id, 0, 0, false)
+    produces
+        pure out
+    end
+}
+
+// fields: List[{ name: string, ty: int64 }]
+fn mk_record_fields_loop(
+    interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+},
+    fields: List[{ name: string, ty: int64 }, mem(normal)],
+    acc: List[int64, mem(normal)]
+) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    case fields.is_nil of {
+        true -> {
+            sequence
+                empty_acc: List[int64, mem(normal)] <- empty_int_list();
+                rev: List[int64, mem(normal)] <- list_int_reverse(acc, empty_acc);
+                out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_record_from_pairs(interner, rev)
+            produces
+                pure out
+            end
+        };
+        false -> {
+            sequence proc[mem(normal)]
+                pr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_field_pair(interner, fields.head.name, fields.head.ty);
+                next_acc: List[int64, mem(normal)] <- prepend[int64, mem(normal)](pr.id, acc);
+                out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_record_fields_loop(pr.interner, fields.tail, next_acc)
+            produces
+                pure out
+            end
+        }
+    }
+}
+
+fn mk_record(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, fields: List[{ name: string, ty: int64 }, mem(normal)]) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        empty_acc: List[int64, mem(normal)] <- empty_int_list();
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_record_fields_loop(interner, fields, empty_acc)
+    produces
+        pure out
+    end
+}
+
+fn mk_list(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, elem: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 103, elem, space, 0, false)
+}
+
+fn mk_list_legacy(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, elem: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 104, elem, 0, 0, false)
+}
+
+fn mk_mem(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 105, space, 0, 0, false)
+}
+
+fn mk_ref(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, rgn_id: int64, space: int64, payload: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 106, rgn_id, space, payload, false)
+}
+
+fn mk_ref_q(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, rgn_id: int64, space: int64, payload: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 107, rgn_id, space, payload, false)
+}
+
+fn mk_region(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, rgn_id: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 108, rgn_id, space, 0, false)
+}
+
+fn mk_device_window(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, rgn_id: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 114, rgn_id, space, 0, false)
+}
+
+fn mk_buf(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, rgn_id: int64, space: int64, payload: int64, size_n: int64, size_is_name: boolean) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence proc[mem(normal)]
+        empty_acc: List[int64, mem(normal)] <- empty_int_list();
+        s1: List[int64, mem(normal)] <- prepend[int64, mem(normal)](payload, empty_acc);
+        s2: List[int64, mem(normal)] <- prepend[int64, mem(normal)](space, s1);
+        s3: List[int64, mem(normal)] <- prepend[int64, mem(normal)](rgn_id, s2);
+        // s3 is reverse order head=region — mk_id_seq_from_list expects [region, space, payload]
+        sr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list(interner, s3);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(sr.interner, 109, sr.id, size_n, 0, size_is_name)
+    produces
+        pure out
+    end
+}
+
+fn mk_atomic_ref(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, rgn_id: int64, space: int64, payload: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 110, rgn_id, space, payload, false)
+}
+
+fn mk_type_sum(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, alts: List[int64, mem(normal)]) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        sr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list(interner, alts);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(sr.interner, 111, sr.id, 0, 0, false)
+    produces
+        pure out
+    end
+}
+
+fn mk_atom_lit(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, lexeme: string) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        // store without leading colon in name table if present
+        bare: string <- case length_bytes(lexeme) > 0 of {
+            true -> case substring(lexeme, 0, 1) == ":" of {
+                true -> substring(lexeme, 1, length_bytes(lexeme));
+                false -> lexeme
+            };
+            false -> lexeme
+        };
+        nr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_name(interner, bare);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(nr.interner, 112, nr.id, 0, 0, false)
+    produces
+        pure out
+    end
+}
+
+fn mk_atom_union_from_ids(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, lit_ids: List[int64, mem(normal)]) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence
+        sr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list(interner, lit_ids);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(sr.interner, 113, sr.id, 0, 0, false)
+    produces
+        pure out
+    end
+}
+
+fn mk_atom_union(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, names: List[string, mem(normal)]) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    mk_atom_union_loop(interner, names, empty_int_list())
+}
+
+
+fn mk_atom_union_loop(
+    interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+},
+    names: List[string, mem(normal)],
+    acc: List[int64, mem(normal)]
+) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    case names.is_nil of {
+        true -> {
+            sequence
+                empty_acc: List[int64, mem(normal)] <- empty_int_list();
+                rev: List[int64, mem(normal)] <- list_int_reverse(acc, empty_acc);
+                out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_atom_union_from_ids(interner, rev)
+            produces
+                pure out
+            end
+        };
+        false -> {
+            sequence proc[mem(normal)]
+                lr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_atom_lit(interner, names.head);
+                next: List[int64, mem(normal)] <- prepend[int64, mem(normal)](lr.id, acc);
+                out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_atom_union_loop(lr.interner, names.tail, next)
+            produces
+                pure out
+            end
+        }
+    }
+}
+
+fn mk_ordered_set(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, item: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 120, item, space, 0, false)
+}
+
+fn mk_ordered_map(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, key: int64, value: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 121, key, value, space, false)
+}
+
+fn mk_heap(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, item: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 122, item, space, 0, false)
+}
+
+fn mk_search_tree(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, item: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 123, item, space, 0, false)
+}
+
+fn mk_tree(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, item: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 124, item, space, 0, false)
+}
+
+fn mk_binary_tree(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, item: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 129, item, space, 0, false)
+}
+
+fn mk_directed_graph(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, node: int64, edge: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 125, node, edge, space, false)
+}
+
+fn mk_undirected_graph(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, node: int64, edge_data: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 126, node, edge_data, space, false)
+}
+
+fn mk_weighted_graph(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, node: int64, edge_data: int64, weight: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    sequence proc[mem(normal)]
+        empty_acc: List[int64, mem(normal)] <- empty_int_list();
+        // build [node, edge_data, weight]
+        l1: List[int64, mem(normal)] <- prepend[int64, mem(normal)](weight, empty_acc);
+        l2: List[int64, mem(normal)] <- prepend[int64, mem(normal)](edge_data, l1);
+        l3: List[int64, mem(normal)] <- prepend[int64, mem(normal)](node, l2);
+        sr: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- mk_id_seq_from_list(interner, l3);
+        out: { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } <- intern_key(sr.interner, 127, sr.id, space, 0, false)
+    produces
+        pure out
+    end
+}
+
+fn mk_priority_queue(interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, priority: int64, item: int64, space: int64) -> { interner: {
+    nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)],
+    by_key: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    names: {
+        root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))),
+        compare_key: fn(string, string) -> :less | :equal | :greater,
+        compare_value: fn(int64, int64) -> :less | :equal | :greater,
+        specialization_key: int64,
+        compare_key_ordering_bundle: int64,
+        compare_value_ordering_bundle: int64
+    },
+    name_lexemes: List[string, mem(normal)],
+    next_id: int64,
+    seq_nil_id: int64
+}, id: int64 } {
+    intern_key(interner, 128, priority, item, space, false)
+}
