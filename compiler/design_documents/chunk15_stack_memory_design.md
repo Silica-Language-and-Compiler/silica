@@ -358,7 +358,7 @@ Slots that are not updated in the dispatch (`k = 0`): trivially proven if `v0` r
 
 - `S` is a buffer;
 - `S` is a record whose every field is a buffer or a type with no buffer anywhere in it;
-- `S` is a sum of atom literals and exactly one of those two, written with or without parentheses.
+- `S` is a sum of atom literals and exactly one of those two.
 
 In these shapes the type rules let a buffer sit only at the root (a buffer `S`) or in a root field of the record. An old buffer is therefore reachable from the new state exactly when it is one of the new state's words at those positions (buffers hold no pointers, and §13 item 1 rules out sharing between slots). Three pieces implement the rule:
 
