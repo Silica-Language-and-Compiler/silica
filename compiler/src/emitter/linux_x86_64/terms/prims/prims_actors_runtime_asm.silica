@@ -37,14 +37,18 @@
 // cpu_topology / cache / NUMA helpers (silica_rt_apple_*, sysctl hw.*): answered by the sysctl shim (cpuid / sysconf) on this target (see cpu_topology_implementation_plan Phase G).
 // ABI: spawn(X0,X1,X2)->X0  send(X0,X1)  cast(X0,X1)->W0  call(X0,X1)->X0  self()->X0  recv()->X0
 // X2=optional core_id (0 default) per §15.1.1, X4=packed stack_policy (0 = inherit the spawner's; see prims_actors_stack_asm).
-// Actor control block 600 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
+// Actor control block 608 B (actor_memory_budget_plan.md item I, 2026-10-09: 512 before; 2026-10-12 +16 for
 // the holder count and the parked exit notice; 2026-10-19 +32 for the carrier fields, item N, +16 for
 // the wait-list word of the restart protocol, +16 for the thread record, item N stage 2, and +16 for the
 // pending migration target, stage 3; 2026-10-24 +64 for the stack-based memory model, chunk 15 phase 0,
 // chunk15_stack_memory_design.md §2.2, at the Mac's offsets: +528 the state edge, +536/+544/+552 the
 // release log base, count and capacity, +560 release enabled, +568 state bytes live, +576 state policy,
-// +584 compaction requested (only +528 is read in phase 0, prims_actors_stack_asm.silica); the Linux
-// twins' own word, the dangerous actor thread's pthread-stack rsp, moved from +528 to +592): +0..+215 the
+// +584 compaction requested (since the 2026-11-02 port of phases 3-6: +576 stored at spawn by
+// silica_rt_actor_stack_reserve, +584 set by compact_state; since the 2026-11-03 port of the state area,
+// +528 and +536..+568 are kept by prims_actors_state_asm.silica); the Linux
+// twins' own word, the dangerous actor thread's pthread-stack rsp, moved from +528 to +592; 2026-11-03 +8
+// for +600, the root-word descriptor of the dispatched behaviour's state type (the Mac's #592), stored by
+// the behaviour epilogue and read and cleared by silica_rt_state_dispatch_end): +0..+215 the
 // actor runtime's, +216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
 // silica_rt_sb_require in prims_actors_runtime_asm_b), +224 started flag, +232 pending exit reason_tag (+384 its atom, or a language error's detail code),
 // +240 active call wrapper, +248/+256/+264 FFI arena base/end/bump (Phase 12), +272..+391 the
@@ -69,7 +73,7 @@
 // silica_rt_tls_record_set); unused for a carrier actor, whose carrier's block holds its thread's
 // record. #512 the pending migration target (a carrier block, 0 none; item N stage 3), #520 the
 // priority level (item N stage 4; spec §22.10: 0 low, 1 normal, 2 high; every actor starts at normal,
-// stored right after both callocs below). Control block 600 B.
+// stored right after both callocs below). Control block 608 B.
 // The dispatch frame of actor_thread_main ([rbp-8] the actor, [rbp-16] the node, [rbp-24] the
 // reply, [rbp-32] the ingress flag, [rbp-40] the state, [rbp-56] the exit payload, [rbp-64] the
 // carrier) is at a fixed place on a carrier's stack, rbp = the carrier's base - 16, and is saved
@@ -107,6 +111,7 @@
 
 use prims_actors_child_table_asm;
 use prims_actors_stack_asm;
+use prims_actors_state_asm;
 use prims_actors_carrier_asm;
 use prims_actors_timer_asm;
 use atom_table;
@@ -138,12 +143,15 @@ silica_rt_actor_spawn_dangerous:
 silica_rt_actor_spawn: # @silica_rt_actor_spawn
 # X0..X4 = rdi rsi rdx rcx r8. x19..x26 live in the frame: [rbp-8] acb, [rbp-16] beh, [rbp-24] init,
 # [rbp-32] w22 (=1), [rbp-40] core_id / pthread_create rc, [rbp-48] trampoline, [rbp-56] stack_policy,
-# [rbp-72] 1 for a dangerous actor (X5 = r9, x26).
+# [rbp-72] 1 for a dangerous actor (X5 = r9, x26), [rbp-80] X6 = r14, the root descriptor of the initial
+# state's type or 0 (chunk 15 phase 3b: silica_rt_state_install copies the state into the child's state
+# area once the reservation exists, prims_actors_state_asm).
 	xor	r9d, r9d
 Lsp_entry:
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
+	mov	QWORD PTR [rbp - 80], r14
 	mov	QWORD PTR [rbp - 72], r9
 	mov	QWORD PTR [rbp - 56], r8
 	mov	QWORD PTR [rbp - 48], rcx
@@ -152,7 +160,7 @@ Lsp_entry:
 	mov	QWORD PTR [rbp - 24], rdi
 	mov	QWORD PTR [rbp - 32], 1
 	mov	edi, 1
-	mov	esi, 600
+	mov	esi, 608
 	call	calloc
 	mov	rdi, rax
 	mov	QWORD PTR [rbp - 8], rdi
@@ -210,6 +218,15 @@ Lsp0_no_sb:
 	call	silica_rt_actor_stack_reserve
 	test	rdi, rdi
 	jnz	LBB0_reserve_failed
+# The initial state goes into the child's state area now, before the actor can run (design §5.4): one
+# copier table per state slot (P5), the copy's root at ACB #0. A state the reservation cannot hold
+# fails the spawner with (:explicit, :state_too_large).
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 24]
+	mov	rdx, QWORD PTR [rbp - 80]
+	call	silica_rt_state_install
+	test	rdi, rdi
+	jnz	LBB0_state_failed
 	call	silica_rt_install_sync_fault_handlers
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_init_region
@@ -266,6 +283,17 @@ LBB0_reserve_failed:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	free
 	call	silica_rt_spawn_reserve_failed
+LBB0_state_failed:
+# The reservation exists but cannot hold the initial state: identity, reservation and control block
+# go back, then the spawner fails (or main aborts). Never returns here.
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_idt_remove
+	mov	rdi, QWORD PTR [rbp - 8]
+	xor	esi, esi
+	call	silica_rt_actor_stack_free
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	free
+	call	silica_rt_spawn_state_too_large
 LBB0_3:
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	rdi, QWORD PTR [rax + 144]
@@ -308,7 +336,8 @@ silica_rt_actor_spawn_linked: # @silica_rt_actor_spawn_linked
 # [rbp-32] trampoline, [rbp-40] agent_type / pthread_create rc, [rbp-48] row/core metadata,
 # [rbp-56] supervisor (X5 = r9 from spawn_linked_row; 0 here), [rbp-72] 1 for a dangerous actor
 # (X6 = r14: spawn_dangerous_linked, a :dangerous row; it keeps a thread of its own, every other
-# actor is bound to a carrier). The plain entry lets go of the child (silica_rt_spawner_let_go);
+# actor is bound to a carrier), [rbp-80] X7 = r15, the root descriptor of the initial state's type or 0
+# (the spawn_linked site, prims_actors@emit_spawn_linked, or a row's +136, spawn_linked_row). The plain entry lets go of the child (silica_rt_spawner_let_go);
 # spawn_linked_row's caller commits it to its row first.
 	xor	r14d, r14d
 Lsl_entry:
@@ -323,6 +352,7 @@ LBBsl_common:
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
+	mov	QWORD PTR [rbp - 80], r15
 	mov	QWORD PTR [rbp - 72], r14
 	mov	QWORD PTR [rbp - 56], r9
 	mov	QWORD PTR [rbp - 40], rdx
@@ -331,7 +361,7 @@ LBBsl_common:
 	mov	QWORD PTR [rbp - 16], rsi
 	mov	QWORD PTR [rbp - 24], rdi
 	mov	edi, 1
-	mov	esi, 600
+	mov	esi, 608
 	call	calloc
 	mov	rdi, rax
 	mov	QWORD PTR [rbp - 8], rdi
@@ -446,6 +476,8 @@ Lslp_skip_list:
 # the thread's current actor (rsi = 0), since a row is respawned from any actor's drain of the
 # supervisor's ingress (prims_actors_child_table_asm.silica, supervisor_drain_ingress), which no
 # longer installs the supervisor as the current actor; anything else the current actor's.
+# A row child's own state policy (decision 40: the child spec's state_policy field, kept in its row at
+# +128, [rbp-48] = the row) replaces the state bits of that word; the runtime stores them at ACB #576.
 	mov	rdi, rax
 	xor	esi, esi
 	mov	rcx, QWORD PTR [rbp - 56]
@@ -453,12 +485,27 @@ Lslp_skip_list:
 	jz	Lslp_policy
 	mov	rsi, QWORD PTR [rcx + 360]
 	test	rsi, rsi
-	jnz	Lslp_policy
+	jnz	Lslp_have_policy
 	mov	esi, 2
+Lslp_have_policy:
+	mov	rcx, QWORD PTR [rbp - 48]
+	test	rcx, rcx
+	jz	Lslp_policy
+	mov	rcx, QWORD PTR [rcx + 128]
+	and	rcx, 48
+	or	rsi, rcx
 Lslp_policy:
 	call	silica_rt_actor_stack_reserve
 	test	rdi, rdi
 	jnz	LBBsl_reserve_failed
+# The initial state (ACB #0, stored above) goes into the child's state area before the actor can run
+# (design §5.4; a row child's every start and restart copies the row's start.0 afresh, Q14).
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rdi]
+	mov	rdx, QWORD PTR [rbp - 80]
+	call	silica_rt_state_install
+	test	rdi, rdi
+	jnz	LBBsl_state_failed
 	call	silica_rt_install_sync_fault_handlers
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_init_region
@@ -530,6 +577,28 @@ LBBsl_reserve_failed:
 	mov	rdi, QWORD PTR [rbp - 56]
 	call	silica_rt_acb_release
 	call	silica_rt_spawn_reserve_failed
+LBBsl_state_failed:
+# The reservation cannot hold the initial state: identity, reservation, control block, the hold on the
+# supervisor and a row child's reference on the supervision block go back, then the spawner fails (or
+# main aborts). Never returns here.
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_idt_remove
+	mov	rdi, QWORD PTR [rbp - 8]
+	xor	esi, esi
+	call	silica_rt_actor_stack_free
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	free
+	mov	rdi, QWORD PTR [rbp - 56]
+	call	silica_rt_acb_release
+	cmp	QWORD PTR [rbp - 56], 0
+	je	LBBsl_state_failed_go
+	mov	rax, QWORD PTR [rbp - 48]
+	cmp	rax, 4096
+	jb	LBBsl_state_failed_go
+	mov	rdi, QWORD PTR [rax + 88]
+	call	silica_rt_sb_unref
+LBBsl_state_failed_go:
+	call	silica_rt_spawn_state_too_large
 LBBsl_3:
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	rdi, QWORD PTR [rax + 144]
@@ -557,12 +626,16 @@ silica_rt_actor_spawn_dangerous_linked:
 silica_rt_actor_spawn_linked_row:
 # A supervisor starts the child of one of its rows: X0-X4 as spawn_linked, X3 (rcx) = the row,
 # X5 (r9) = the supervisor's ACB, X6 (r14) = 1 for a :dangerous row (passed through to
-# LBBsl_common untouched). The child's reference on the supervision block (the row's +88) is
-# taken here, before its thread can run and end; a spawn that fails gives it back.
+# LBBsl_common untouched); X7 (r15), the initial state's root descriptor, is the row's +136 (the child
+# spec's hidden word, copied into the row by materialize and start_child), so every restart copies
+# start.0 into the new child's state area as the first start did. The child's reference on the
+# supervision block (the row's +88) is taken here, before its thread can run and end; a spawn that
+# fails gives it back.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 16
 	mov	QWORD PTR [rbp - 8], rcx
+	mov	r15, QWORD PTR [rcx + 136]
 	mov	rax, QWORD PTR [rcx + 88]
 	lock add	QWORD PTR [rax + 112], 1
 	call	LBBsl_common
@@ -802,6 +875,7 @@ LBB1_payload_not_owned:
 	mov	rbx, QWORD PTR [rax + 8]
 	test	rbx, rbx
 	jz	LBB1_ingress_no_beh
+	call	silica_rt_beh_proven_store
 	mov	rdx, rsp
 	mov	r10, QWORD PTR [rax + 272]
 	test	r10, r10
@@ -896,6 +970,7 @@ LBB1_ingress_user_beh:
 	mov	rbx, QWORD PTR [rax + 8]
 	test	rbx, rbx
 	jz	LBB1_ingress_no_beh
+	call	silica_rt_beh_proven_store
 	mov	rdx, rsp
 	mov	r10, QWORD PTR [rax + 272]
 	test	r10, r10
@@ -927,8 +1002,17 @@ LBB1_ingress_no_reply_result:
 	mov	QWORD PTR [rbp - 32], 0
 	jmp	LBB1_post_beh
 LBB1_post_beh:
-# Message boundary: the behavior has returned and its stack is empty, so the release algorithm
-# runs now, before the reply is handed to the caller (spec §15.1.2.2).
+# Message boundary: the behavior has returned and its stack is empty. Dispatch end first (chunk 15
+# phase 3c, chunk15_stack_memory_design.md §4.6 step 2; an exit notice served in the behaviour's place,
+# [rbp-32], has no state), then the release algorithm, before the reply is handed to the caller
+# (spec §15.1.2.2).
+	cmp	QWORD PTR [rbp - 32], 0
+	jne	LBB1_post_state_kept
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, r10
+	call	silica_rt_state_dispatch_end
+	mov	r10, rdi
+LBB1_post_state_kept:
 	mov	QWORD PTR [rbp - 40], r10
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_stack_on_message_return
@@ -2728,18 +2812,18 @@ fn actor_rt_asm_chunk_8() -> string {
 "
 }
 
-fn actor_rt_emit_runtime_tail(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn actor_rt_emit_runtime_tail(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     concat(concat(concat(prims_actors_runtime_asm_c@actor_rt_asm_phase_i_chunk(table), prims_actors_runtime_asm_c@actor_rt_asm_phase_c_chunk(table)), prims_actors_runtime_asm_c@actor_rt_asm_phase_f_chunk()), prims_actors_runtime_asm_c@actor_rt_asm_reason_text_chunk(table))
 }
 
-fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     arena_asm: string <- ffi_arena_runtime_asm@emit_ffi_arena_runtime_asm();
     guarded_asm: string <- ffi_guarded_runtime_asm@emit_guarded_ffi_runtime_asm();
     fault_asm: string <- ffi_fault_runtime_asm@emit_ffi_fault_runtime_asm();
     canonical_arena_asm: string <- canonical_arena_runtime_asm@emit_canonical_arena_runtime_asm();
     ordering_identity_asm: string <- ordering_identity_runtime_asm@emit_ordering_identity_runtime_asm();
     checked_int64_asm: string <- checked_int64_runtime_asm@emit_checked_int64_runtime_asm();
-    stack_asm: string <- concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
+    stack_asm: string <- concat(concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_state_asm@emit_actor_state_runtime_asm()), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
     linux_shims_asm: string <- linux_rt_shims_asm@emit_linux_rt_shims_asm();
     concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_9()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_10()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_11()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_12()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_13()), prims_actors_runtime_asm_c@actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), prims_actors_runtime_asm_c@actor_rt_asm_badarith_chunk()), concat(prims_actors_runtime_asm_c@actor_rt_asm_case_clause_chunk(), concat(prims_actors_runtime_asm_c@actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(prims_actors_runtime_asm_c@actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, concat(checked_int64_asm, linux_shims_asm)))))))))), concat(stack_asm, prims_actors_timer_asm@emit_actor_timer_runtime_asm()))
 }

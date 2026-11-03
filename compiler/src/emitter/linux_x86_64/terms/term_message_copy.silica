@@ -385,7 +385,7 @@ fn ev_type_described(t0: string) -> boolean {
 fn ev_word_type_ok(t: string) -> boolean {
     t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16" or t == "int8" or t == "uint8"
         or t == "float64" or t == "float32" or t == "float16" or t == "boolean" or t == "bool" or t == "unit" or t == "lifetime"
-        or t == "atom" or t == "timer_ref" or t == "actor_ref" or mc_starts_with(t, ":") or mc_ends_with(t, "actor_ref")
+        or t == "atom" or t == "timer_ref" or t == "state_policy" or t == "actor_ref" or mc_starts_with(t, ":") or mc_ends_with(t, "actor_ref")
 }
 
 fn ev_described_at(t: string, depth: int64, bound: boolean) -> boolean {
@@ -458,7 +458,7 @@ fn ev_fields_described(t: string, i: int64, depth: int64, bound: boolean) -> boo
 
 // The descriptor an evacuation site passes: `<label>_0: .quad 1, -1` and the one entry that describes
 // the result word (the site loads KIND and AUX from <label>_0 + 16), then what the entry points at.
-fn ev_site_descriptor_rodata(t0: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn ev_site_descriptor_rodata(t0: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     t: string <- prims_record@strip_spaces_rt(t0);
     e: { line: string, child: string, k: int64 } <- mc_entry(t, label, 1, table, 0, "");
     concat(mc_lbl(label, 0), concat(":\n    .quad 1, -1\n", concat(e.line, e.child)))
@@ -476,7 +476,7 @@ fn mc_lbl(base: string, k: int64) -> string {
 
 // One entry line and the rodata of the descriptors it points at; `encl` is the label of the
 // innermost enclosing tuple's descriptor ("" when none), which is what `rec` names.
-fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
+fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
     kind: int64 <- case depth > 12 of { true -> 0; false -> mc_kind_of(t, length_bytes(encl) > 0) };
     case kind of {
         0 -> { line: "    .quad 0, 0\n", child: "", k: k };
@@ -532,9 +532,57 @@ fn mc_buf_elem_bytes(t: string) -> int64 {
     }
 }
 
+// A child spec record (term_child_spec@is_child_spec_record_type, repeated here: that module imports
+// this one).
+fn mc_is_child_spec(t: string) -> boolean {
+    length_bytes(prims_record@find_field_type_in_record(t, "id")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(t, "agent_type")) > 0
+        and (length_bytes(prims_record@find_field_type_in_record(t, "start")) > 0
+            or (length_bytes(prims_record@find_field_type_in_record(t, "initial_state")) > 0
+                and length_bytes(prims_record@find_field_type_in_record(t, "behavior")) > 0))
+        and length_bytes(prims_record@find_field_type_in_record(t, "restart")) > 0
+        and length_bytes(prims_record@find_field_type_in_record(t, "shutdown")) > 0
+}
+
+// The child's initial-state type: the `initial_state` field, or the first element of the `start` tuple.
+fn mc_child_spec_state_type(t: string) -> string {
+    s: string <- prims_record@find_field_type_in_record(t, "initial_state");
+    case length_bytes(s) > 0 of {
+        true -> prims_record@strip_spaces_rt(s);
+        false -> {
+            st: string <- prims_record@strip_spaces_rt(prims_record@find_field_type_in_record(t, "start"));
+            case mc_is_tuple(st) of {
+                true -> substring(st, 1, mc_top_sep(st, 1, 0, ","));
+                false -> ""
+            }
+        }
+    }
+}
+
+// The descriptor of a child spec record follows its ABI layout (term_child_spec@child_spec_field_abi_offset;
+// chunk 15 phase 3, ported from the Mac emitter), 11 words: shape, id, agent_type, initial_state /
+// start.0, behavior / start.1, restart, shutdown, flavor, state_policy, the hidden supervisor trampoline
+// (72) and the hidden initial-state descriptor word (80). Only the state word can hold a node; the others
+// are atoms, small integers and code or rodata addresses, copied as they are. Entries in the type's
+// field order would not line up with the record (a `start` tuple is spliced into two words), and a copy
+// of the spelled words alone would lose the hidden ones, which every restart of the child reads from the row.
+fn mc_child_spec_desc(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
+    en: { line: string, child: string, k: int64 } <- mc_entry(mc_child_spec_state_type(t), base, k + 1, table, depth, encl);
+    head: string <- concat(mc_lbl(base, k), ":\n    .quad 11, -1\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n");
+    rest: string <- "    .quad 9, 0\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n    .quad 0, 0\n";
+    { text: concat(head, concat(en.line, concat(rest, en.child))), k: en.k }
+}
+
 // The descriptor of a record or tuple type at label base_k: (rodata, next_k).
-fn mc_agg_desc(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
+fn mc_agg_desc(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
     inner: string <- substring(t, 1, length_bytes(t) - 1);
+    case mc_is_record(t) and mc_is_child_spec(t) of {
+        true -> mc_child_spec_desc(t, base, k, table, depth, encl);
+        false -> mc_agg_desc_plain(t, inner, base, k, table, depth, encl)
+    }
+}
+
+fn mc_agg_desc_plain(t: string, inner: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
     case mc_is_record(t) of {
         true -> {
             a: { entries: string, children: string, n: int64, ridx: int64, k: int64 } <- mc_field_entries(inner, 0, base, k + 1, table, depth, encl, { entries: "", children: "", n: 1, ridx: 0 - 1, k: k + 1 });
@@ -550,7 +598,7 @@ fn mc_agg_desc(t: string, base: string, k: int64, table: { is_empty: boolean, in
 }
 
 // Entries for the fields of record content "a:T,b:U,..." (n starts at 1 for the shape word).
-fn mc_field_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+fn mc_field_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
     case i >= length_bytes(content) of {
         true -> acc;
         false -> {
@@ -566,7 +614,7 @@ fn mc_field_entries(content: string, i: int64, base: string, k0: int64, table: {
 }
 
 // Entries for the elements of tuple content "T,U,...".
-fn mc_elem_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+fn mc_elem_entries(content: string, i: int64, base: string, k0: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
     case i >= length_bytes(content) of {
         true -> acc;
         false -> {
@@ -582,7 +630,7 @@ fn mc_elem_entries(content: string, i: int64, base: string, k0: int64, table: { 
 // The alternative table of a sum type at label base_k: (rodata, next_k). An alternative with a
 // payload is a tuple led by its tag atom, or a record matched by its shape number; atoms and
 // alternatives whose tag this program's atom table does not hold are left out (copied as is).
-fn mc_sum_table(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
+fn mc_sum_table(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { text: string, k: int64 } {
     a: { entries: string, children: string, n: int64, ridx: int64, k: int64 } <- mc_sum_alts(t, 0, base, table, depth, encl, { entries: "", children: "", n: 0, ridx: 0 - 1, k: k + 1 });
     // The header is -1 - M: negative, so L_mc_root tells a sum table apart from an aggregate
     // descriptor (whose first word is a count) when the message type itself is a sum.
@@ -590,7 +638,7 @@ fn mc_sum_table(t: string, base: string, k: int64, table: { is_empty: boolean, i
     { text: concat(head, concat(a.entries, a.children)), k: a.k }
 }
 
-fn mc_sum_alts(t: string, i: int64, base: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
+fn mc_sum_alts(t: string, i: int64, base: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string, acc: { entries: string, children: string, n: int64, ridx: int64, k: int64 }) -> { entries: string, children: string, n: int64, ridx: int64, k: int64 } {
     case i >= length_bytes(t) of {
         true -> acc;
         false -> {
@@ -611,7 +659,7 @@ fn mc_sum_alts(t: string, i: int64, base: string, table: { is_empty: boolean, in
 
 // The word that identifies a payload alternative: a tuple's leading atom index, a record's shape
 // number; -1 when the alternative carries no payload or its tag is unknown here.
-fn mc_alt_tag(alt: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> int64 {
+fn mc_alt_tag(alt: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> int64 {
     case mc_is_record(alt) of {
         true -> atom_table@atom_lexeme_to_index(table, record_shape@record_shape_lexeme(alt));
         false -> case mc_is_tuple(alt) of {
@@ -630,7 +678,7 @@ fn mc_alt_tag(alt: string, table: { is_empty: boolean, index_map: { root: ref?(L
 
 // The descriptor rodata of a message type rooted at md_site_label(fnl, node): the root descriptor
 // is `<label>_0`. "" when the type is not copied.
-fn md_descriptor_rodata(t0: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn md_descriptor_rodata(t0: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     t: string <- prims_record@strip_spaces_rt(t0);
     case mc_kind_of(t, false) of {
         4 -> mc_agg_desc(t, label, 0, table, 0, "").text;
@@ -996,7 +1044,7 @@ fn md_reply_elided(outer_reg: string) -> boolean {
 // reply type is not copied or every reply site transfers (markers "|_mvr=1"); else the copy call
 // with the shell in the CALLER's arena ([SP] is this ACB, its #240 the node served, the node's +56
 // the caller, as bmv_reply_asm reads them) followed by the descriptor rodata.
-fn md_reply_copy_asm(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, entry_label: string, markers: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn md_reply_copy_asm(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, entry_label: string, markers: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     rt: string <- mc_reply_type(fn_val.return_type);
     case length_bytes(rt) == 0 or md_type_needs_copy(rt) == false or md_reply_elided(markers) of {
         true -> "";
@@ -1203,7 +1251,7 @@ fn md_root_needs_descriptor(t: string) -> boolean {
 
 // The descriptor rodata of a type rooted at <label>_0: an aggregate or sum as md_descriptor_rodata
 // emits it; any other pointer kind as a one-entry descriptor `.quad 1, -1` over the root word.
-fn md_root_descriptor_rodata(t: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn md_root_descriptor_rodata(t: string, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     case mc_kind_of(t, false) of {
         4 -> mc_agg_desc(t, label, 0, table, 0, "").text;
         5 -> mc_sum_table(t, label, 0, table, 0, "").text;
@@ -1253,7 +1301,7 @@ fn mc_type_line_index(seen: string, t: string, i: int64, k: int64) -> int64 {
 }
 
 // One label: the body (when the type is new) and the alias line.
-fn md_td_one(t0: string, label: string, module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, acc: { seen: string, n: int64, bodies: string, aliases: string }) -> { seen: string, n: int64, bodies: string, aliases: string } {
+fn md_td_one(t0: string, label: string, module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, acc: { seen: string, n: int64, bodies: string, aliases: string }) -> { seen: string, n: int64, bodies: string, aliases: string } {
     t: string <- prims_record@strip_spaces_rt(t0);
     case length_bytes(t) == 0 or md_root_needs_descriptor(t) == false of {
         true -> acc;
@@ -1269,7 +1317,7 @@ fn md_td_one(t0: string, label: string, module_name: string, table: { is_empty: 
     }
 }
 
-fn md_td_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, acc: { seen: string, n: int64, bodies: string, aliases: string }) -> { seen: string, n: int64, bodies: string, aliases: string } {
+fn md_td_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, acc: { seen: string, n: int64, bodies: string, aliases: string }) -> { seen: string, n: int64, bodies: string, aliases: string } {
     case fns.is_nil of {
         true -> acc;
         false -> {
@@ -1284,7 +1332,7 @@ fn md_td_functions(fns: List[{ name: string, return_type: string, effects: strin
 }
 
 // The module's block: the bodies in the pointer-bearing constant section, then the aliases.
-fn md_type_descriptors_block(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn md_type_descriptors_block(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], module_name: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     r: { seen: string, n: int64, bodies: string, aliases: string } <- md_td_functions(fns, module_name, table, { seen: "", n: 0, bodies: "", aliases: "" });
     case length_bytes(r.bodies) == 0 of {
         true -> "";
@@ -1341,7 +1389,7 @@ fn mcp_scalar_type(t: string) -> boolean {
     t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16"
         or t == "int8" or t == "uint8" or t == "float64" or t == "float32" or t == "float16"
         or t == "boolean" or t == "bool" or t == "atom" or t == "string" or t == "unit" or t == "lifetime"
-        or t == "timer_ref"
+        or t == "timer_ref" or t == "state_policy"
 }
 
 // True when a value of this type cannot hold a pointer that matters to the elision walk: scalars,

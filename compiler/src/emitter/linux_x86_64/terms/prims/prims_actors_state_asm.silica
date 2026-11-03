@@ -1,0 +1,2944 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The state area, Linux x86-64 (chunk15_stack_memory_design.md §2.1, §2.3, §4.2-§4.7, §5.4, §7; chunk 15
+// phases 3 and 7, ported 2026-11-03 from apple_silicon_mac prims_actors_state_asm.silica, whose header
+// documents every routine; the routines, their arguments and their answers are the same here).
+//
+// An actor's state lives at the top of its own reservation: the 1,040-byte header at [top - 1040, top)
+// holds 129 free-list heads (head i for nodes of 8 * (i + 1) bytes, head 128 for every size above 1,024)
+// and, at top - 8, the pending list of retained buffers (alloc_buf_retained); the state area [edge,
+// top - 1040) holds the nodes, growing down as the edge (ACB #528) moves. ACB #568 counts the live bytes.
+//
+//   silica_rt_state_alloc / silica_rt_state_hole_pop / silica_rt_state_free     the free lists (§2.3)
+//   silica_rt_state_retain_node     alloc_buf_retained's runtime half (§7, the pin rule)
+//   silica_rt_state_install         a spawn's initial state into the child's state area (§5.4)
+//   silica_rt_spawn_state_too_large the spawner fails with (:explicit, :state_too_large); main aborts 71
+//   silica_rt_state_measure / silica_rt_state_copy          the state copier (one table per state slot)
+//   silica_rt_message_measure / silica_rt_message_copy      the same walk with one table for the value
+//   silica_rt_state_evacuate        a proven dispatch's new nodes into the area (§4.3)
+//   silica_rt_state_copy_all        the fallback whole-state copy (§4.4)
+//   silica_rt_state_retire / silica_rt_state_log_drain      the release log (§4.2)
+//   silica_rt_state_dispatch_end    the driver the dispatch loop calls (prims_actors_runtime_asm
+//                                   LBB1_post_beh) before the release algorithm (§4.6)
+//
+// Differences from the Mac: the root-word descriptor of the dispatched behaviour's state type is at ACB
+// #600 (the Mac's #592; #592 is this target's dangerous-thread rsp, so the control block is 608 bytes), and
+// the mailbox-buffer and reply-placement routines of the Mac's phase 4 (message_buffer, message_forward,
+// reply_place) are not here: this target still copies messages and replies through the heap.
+//
+// The text is the Mac's AArch64, translated instruction by instruction (scratchpad translator a64_to_x86.py of
+// the 2026-11-03 port; regenerate from the Mac file when that changes):
+//   X0..X7 -> rdi rsi rdx rcx r8 r9 r14 r15 (the internal homes: arguments arrive in place, results leave
+//   in rdi / rsi); X9..X12 -> r10 r11 r12 r13; X8, X13..X17 and X19..X28 -> a 128-byte register file at
+//   [rbp - 8] .. [rbp - 128] (X8 -8, X13..X17 -16..-48, X19..X28 -56..-128). Every exported routine opens its
+//   own frame (push rbp; mov rbp, rsp; sub rsp, 128 + the AArch64 frame) where the AArch64 text saves X29/X30,
+//   so the file is that routine's own and survives its calls (callee-saved semantics); the local walkers
+//   (Lstc_*, Lstm_*) keep the caller's rbp, so the file is the walk's registers and their saves and restores
+//   on the stack copy slots exactly as the AArch64 callee-saved registers. rax and rbx are the translation's
+//   scratch. A call out of the module (C library, other silica_rt_* routines) aligns rsp to 16 around the call
+//   (rbp saved), and a C result is moved from rax to rdi. Every routine clobbers the caller-saved homes.
+
+export emit_actor_state_runtime_asm/0;
+
+fn state_asm_alloc_free() -> string {
+    "	.text
+	.globl	silica_rt_state_hole_pop
+	.p2align	4
+silica_rt_state_hole_pop:
+# X0 = ACB, X1 = bytes -> X0 = a free node of exactly that size, or 0 when none is free. The edge is not
+# moved: the evacuation bumps its scratch instead (Lstc_bump). X22 = 1 marks the pop-only entry below.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 176
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 40], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	mov	QWORD PTR [rbp - 80], 1
+	jmp	Lsta_common
+	.globl	silica_rt_state_alloc
+	.p2align	4
+silica_rt_state_alloc:
+# X0 = ACB, X1 = bytes (a multiple of 8, above 0) -> X0 = the node, 0 when the reservation cannot hold it.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 176
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 40], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	mov	QWORD PTR [rbp - 80], 0
+Lsta_common:
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	QWORD PTR [rbp - 72], rax
+	mov	rax, QWORD PTR [rbp - 72]
+	lea	rax, [rax - 1040]
+	mov	QWORD PTR [rbp - 72], rax
+# The header is read below, so its page must be committed first. The reservation is made PROT_NONE
+# with nothing committed (_silica_rt_actor_stack_reserve stores 0 at #288), and the first call here is
+# the spawn's install, before the child has run a single instruction; a release of an EMPTY area
+# (_silica_rt_stack_release_to) also leaves the header decommitted. When the committed run [top - #288,
+# top) does not reach top - 1040, commit the top chunk through _silica_rt_stack_grow_to: a fresh commit
+# (first mprotect, or the anonymous MAP_FIXED remap of a release) reads as zero, so the 129 heads are
+# empty without initialisation (§2.3); the chunk is the same first chunk a fault would commit (#304),
+# so the release algorithms' chunk sequence is unchanged. Answer 1 (a lowered reservation of one
+# page: the lowest page is never committed) or 2 (the host refused) is a state the reservation cannot
+# hold, 0 to the caller (decision 39). Answer 3 cannot occur here: it means the run already reaches
+# the address.
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r11, QWORD PTR [rax + 288]
+	cmp	r11, 1040
+	jae	Lsta_header_committed
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 72]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_stack_grow_to
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 1
+	je	Lsta_fail
+	cmp	rdi, 2
+	je	Lsta_fail
+Lsta_header_committed:
+	cmp	QWORD PTR [rbp - 64], 1024
+	ja	Lsta_large
+	mov	rax, QWORD PTR [rbp - 64]
+	shr	rax, 3
+	mov	r10, rax
+	lea	r10, [r10 - 1]
+	mov	rax, QWORD PTR [rbp - 72]
+	lea	rax, [rax + r10*8]
+	mov	r10, rax
+	mov	r11, QWORD PTR [r10]
+	cmp	r11, 0
+	je	Lsta_extend
+	mov	r12, QWORD PTR [r11]
+	mov	QWORD PTR [r10], r12
+	mov	rdi, r11
+	jmp	Lsta_live
+Lsta_large:
+	mov	rax, QWORD PTR [rbp - 72]
+	lea	r10, [rax + 1024]
+Lsta_large_walk:
+	mov	r11, QWORD PTR [r10]
+	cmp	r11, 0
+	je	Lsta_extend
+	mov	r12, QWORD PTR [r11 + 8]
+	cmp	r12, QWORD PTR [rbp - 64]
+	je	Lsta_large_hit
+	mov	r10, r11
+	jmp	Lsta_large_walk
+Lsta_large_hit:
+	mov	r12, QWORD PTR [r11]
+	mov	QWORD PTR [r10], r12
+	mov	rdi, r11
+	jmp	Lsta_live
+Lsta_extend:
+# No hole of this size: the pop-only entry answers 0 here. Else the node is [edge - n, edge). The pages
+# below the committed run are committed first; the lowest page of the reservation is never committed
+# (_silica_rt_stack_grow_to), so a lowered reservation that cannot hold the node answers 0.
+	cmp	QWORD PTR [rbp - 80], 0
+	jne	Lsta_fail
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 528]
+	mov	rax, r10
+	mov	rbx, QWORD PTR [rbp - 64]
+	sub	rax, rbx
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r11, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r11]
+	mov	r11, rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r12, QWORD PTR [rax + 288]
+	mov	rax, r11
+	sub	rax, r12
+	mov	r11, rax
+	cmp	r10, r11
+	jae	Lsta_committed
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, r10
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_stack_grow_to
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 1
+	je	Lsta_fail
+	cmp	rdi, 2
+	je	Lsta_fail
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 528]
+	mov	rax, r10
+	mov	rbx, QWORD PTR [rbp - 64]
+	sub	rax, rbx
+	mov	r10, rax
+Lsta_committed:
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 528], r10
+	mov	rdi, r10
+Lsta_live:
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 568]
+	mov	rbx, QWORD PTR [rbp - 64]
+	lea	rax, [r10 + rbx]
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 568], r10
+	jmp	Lsta_ret
+Lsta_fail:
+	mov	rdi, 0
+Lsta_ret:
+	mov	rbx, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 40]
+	mov	QWORD PTR [rbp - 80], rbx
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+	.globl	silica_rt_state_free
+	.p2align	4
+silica_rt_state_free:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 128
+# X0 = ACB, X1 = a node of the state area, X2 = its bytes. The node's first word becomes the list link; a
+# node above 1,024 bytes keeps its size in its second word. Leaf; X8-X10. The node was handed out by
+# _silica_rt_state_alloc, which committed the header's page before it read a head, and a state area
+# holding nodes is never decommitted (decision 27), so the header is committed here.
+	mov	rbx, QWORD PTR [rdi + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	r10, QWORD PTR [rdi + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	lea	r10, [r10 - 1040]
+	cmp	rdx, 1024
+	ja	Lstfr_large
+	mov	rax, rdx
+	shr	rax, 3
+	mov	r11, rax
+	lea	r11, [r11 - 1]
+	lea	rax, [r10 + r11*8]
+	mov	r10, rax
+	jmp	Lstfr_push
+Lstfr_large:
+	lea	r10, [r10 + 1024]
+	mov	QWORD PTR [rsi + 8], rdx
+Lstfr_push:
+	mov	r11, QWORD PTR [r10]
+	mov	QWORD PTR [rsi], r11
+	mov	QWORD PTR [r10], rsi
+	mov	r11, QWORD PTR [rdi + 568]
+	mov	rax, r11
+	sub	rax, rdx
+	mov	r11, rax
+	mov	QWORD PTR [rdi + 568], r11
+	leave
+	ret
+	.globl	silica_rt_state_retain_node
+	.p2align	4
+silica_rt_state_retain_node:
+# alloc_buf_retained's runtime half (chunk 15 phase 7, the pin rule; design §7). X0 = a 16-aligned block of
+# X1 bytes in the running behaviour's own frame (L_dyn_alloc), X2 = the element count -> X0 = the element
+# pointer, or 0 when there is no current actor or the state header cannot be committed.
+# Block (X1 = round16(n + 24) bytes): the buffer NODE is the block's last round8(n + 8) bytes, laid out as
+# every buffer's (the count, then the bytes, zeroed; the value points past the count), so that once
+# placed it is exactly the node an alloc_buf buffer of n bytes is and the epilogue's retire
+# (prims_actors@bmv_state_buffer_retire_asm: node buf - 8, length word plus elements rounded to 8) frees
+# all of it. The block's first G = X1 - round8(n + 8) bytes (16 or 24) are the front gap: +0 the pending
+# link, +8 G. An exact-size hole of the state area is taken when one is free (it is a state node already,
+# counted by _silica_rt_state_alloc's Lsta_live): its front gap is pushed back on the free lists at once
+# and the frame block is simply left to the frame. Otherwise the frame block is pushed on the PENDING
+# list, whose head is the spare word of the state header at top - 8 (the 129 free-list heads end at
+# top - 16), and _silica_rt_state_dispatch_end makes its node a state node in place and its front gap a
+# hole. Blocks of one dispatch are taken from one frame's dynamic part, whose floor only goes down, so
+# the list runs from the lowest block (the head) upwards.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 176
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 40], rbx
+	mov	QWORD PTR [rbp - 64], rdi
+	mov	QWORD PTR [rbp - 72], rsi
+	mov	QWORD PTR [rbp - 80], rdx
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_tls_current_actor_get
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 0
+	je	Lstrn_fail
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	rsi, QWORD PTR [rbp - 72]
+	call	silica_rt_state_hole_pop
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 288]
+	cmp	r10, 1040
+	jb	Lstrn_fail
+	mov	rax, QWORD PTR [rbp - 80]
+	lea	r12, [rax + 15]
+	mov	rax, r12
+	and	rax, -8
+	mov	r12, rax
+	mov	rax, QWORD PTR [rbp - 72]
+	sub	rax, r12
+	mov	r12, rax
+	cmp	rdi, 0
+	je	Lstrn_pending
+	mov	QWORD PTR [rbp - 64], rdi
+# The hole's front gap goes back on its free list (a leaf: X8-X10 only, so X11 survives).
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	mov	rdx, r12
+	call	silica_rt_state_free
+	jmp	Lstrn_fill
+Lstrn_pending:
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	mov	r11, QWORD PTR [r10 - 8]
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax], r11
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [r10 - 8], rbx
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 8], r12
+Lstrn_fill:
+	mov	rax, QWORD PTR [rbp - 64]
+	lea	rax, [rax + r12]
+	mov	r13, rax
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [r13], rbx
+	lea	rdi, [r13 + 8]
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rbx, QWORD PTR [rbp - 72]
+	lea	rax, [rax + rbx]
+	mov	r11, rax
+	mov	r10, rdi
+Lstrn_zero:
+	cmp	r10, r11
+	jae	Lstrn_ret
+	mov	QWORD PTR [r10], 0
+	lea	r10, [r10 + 8]
+	jmp	Lstrn_zero
+Lstrn_fail:
+	mov	rdi, 0
+Lstrn_ret:
+	mov	rbx, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 40]
+	mov	QWORD PTR [rbp - 80], rbx
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+
+"
+}
+
+fn state_asm_install() -> string {
+    "	.globl	silica_rt_state_install
+	.p2align	4
+silica_rt_state_install:
+# X0 = ACB, X1 = the initial state, X2 = its root descriptor (0: a scalar type, or one the descriptors do
+# not follow: the value is stored as given) -> X0 = 0, or 1 when the reservation cannot hold the state.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 192
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 40], rbx
+	mov	rbx, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rsp + 48], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	mov	QWORD PTR [rbp - 72], rdx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax], rbx
+	cmp	QWORD PTR [rbp - 72], 0
+	je	Lsti_ok
+	cmp	QWORD PTR [rbp - 64], 65536
+	jb	Lsti_ok
+	mov	rdi, QWORD PTR [rbp - 64]
+	mov	rsi, QWORD PTR [rbp - 72]
+	call	silica_rt_state_measure
+	cmp	rdi, 0
+	jl	Lsti_fail
+	cmp	rdi, 0
+	je	Lsti_ok
+# The block is rounded to 16: the edge is the SP every dispatch starts from.
+	lea	rax, [rdi + 15]
+	mov	QWORD PTR [rbp - 80], rax
+	mov	rax, QWORD PTR [rbp - 80]
+	and	rax, -16
+	mov	QWORD PTR [rbp - 80], rax
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 80]
+	call	silica_rt_state_alloc
+	cmp	rdi, 0
+	je	Lsti_fail
+	mov	QWORD PTR [rbp - 88], rdi
+	mov	rdi, QWORD PTR [rbp - 64]
+	mov	rsi, QWORD PTR [rbp - 72]
+	mov	rdx, QWORD PTR [rbp - 88]
+	mov	rax, QWORD PTR [rbp - 88]
+	mov	rbx, QWORD PTR [rbp - 80]
+	lea	rax, [rax + rbx]
+	mov	rcx, rax
+	mov	r8, 0
+	call	silica_rt_state_copy
+	cmp	rsi, 0
+	jne	Lsti_fail
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax], rdi
+Lsti_ok:
+	mov	rdi, 0
+	jmp	Lsti_ret
+Lsti_fail:
+	mov	rdi, 1
+Lsti_ret:
+	mov	rbx, QWORD PTR [rsp + 48]
+	mov	QWORD PTR [rbp - 88], rbx
+	mov	rbx, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 40]
+	mov	QWORD PTR [rbp - 80], rbx
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+	.globl	silica_rt_spawn_state_too_large
+	.p2align	4
+silica_rt_spawn_state_too_large:
+# A spawn's initial state does not fit the child's reservation (a lowered one; decision 39). The spawning
+# actor fails with (:explicit, :state_too_large); in main the process ends with a runtime abort, status 71.
+# Never returns.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 144
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_tls_current_actor_get
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 0
+	je	Lstl_main
+	lea	rax, [rip + silica_rt_state_too_large_atom]
+	mov	QWORD PTR [rbp - 8], rax
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rax]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_actor_fail_current
+	mov	rsp, rbp
+	pop	rbp
+Lstl_main:
+	leave
+	and	rsp, -16
+	call	silica_rt_abort_state_too_large
+
+"
+}
+
+fn state_asm_table() -> string {
+    "Lstc_lookup:
+	mov	rax, QWORD PTR [rbp - 88]
+	lea	r10, [rax - 1]
+	mov	rax, rdi
+	shr	rax, 3
+	mov	r11, rax
+	mov	rax, r11
+	and	rax, r10
+	mov	r11, rax
+Lstc_lk_probe:
+	mov	rax, QWORD PTR [rbp - 80]
+	mov	rbx, r11
+	shl	rbx, 4
+	lea	rax, [rax + rbx]
+	mov	r12, rax
+	mov	r13, QWORD PTR [r12]
+	cmp	r13, 0
+	je	Lstc_lk_miss
+	cmp	r13, rdi
+	je	Lstc_lk_hit
+	lea	r11, [r11 + 1]
+	mov	rax, r11
+	and	rax, r10
+	mov	r11, rax
+	jmp	Lstc_lk_probe
+Lstc_lk_miss:
+	mov	rdi, 0
+	ret
+Lstc_lk_hit:
+	mov	rdi, QWORD PTR [r12 + 8]
+	ret
+Lstc_insert:
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rsp], rdi
+	mov	QWORD PTR [rsp + 8], rsi
+	mov	rax, QWORD PTR [rbp - 96]
+	shl	rax, 1
+	mov	r10, rax
+	cmp	r10, QWORD PTR [rbp - 88]
+	jb	Lstc_in_room
+	call	Lstc_grow
+Lstc_in_room:
+	mov	rdi, QWORD PTR [rsp]
+	mov	rsi, QWORD PTR [rsp + 8]
+	lea	rsp, [rsp + 16]
+	mov	rax, QWORD PTR [rbp - 88]
+	lea	r10, [rax - 1]
+	mov	rax, rdi
+	shr	rax, 3
+	mov	r11, rax
+	mov	rax, r11
+	and	rax, r10
+	mov	r11, rax
+Lstc_in_probe:
+	mov	rax, QWORD PTR [rbp - 80]
+	mov	rbx, r11
+	shl	rbx, 4
+	lea	rax, [rax + rbx]
+	mov	r12, rax
+	mov	r13, QWORD PTR [r12]
+	cmp	r13, 0
+	je	Lstc_in_put
+	lea	r11, [r11 + 1]
+	mov	rax, r11
+	and	rax, r10
+	mov	r11, rax
+	jmp	Lstc_in_probe
+Lstc_in_put:
+	mov	QWORD PTR [r12], rdi
+	mov	QWORD PTR [r12 + 8], rsi
+	mov	rax, QWORD PTR [rbp - 96]
+	lea	rax, [rax + 1]
+	mov	QWORD PTR [rbp - 96], rax
+	add	rsp, 16
+	ret
+Lstc_grow:
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	mov	rax, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rbp - 112], rax
+	mov	rax, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rbp - 120], rax
+	mov	rax, QWORD PTR [rbp - 88]
+	shl	rax, 1
+	mov	rdi, rax
+	mov	rsi, 16
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	calloc
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	cmp	rdi, 0
+	je	Lstc_gr_done
+	mov	QWORD PTR [rbp - 80], rdi
+	mov	rax, QWORD PTR [rbp - 88]
+	shl	rax, 1
+	mov	QWORD PTR [rbp - 88], rax
+	mov	QWORD PTR [rbp - 96], 0
+	mov	QWORD PTR [rbp - 128], 0
+Lstc_gr_loop:
+	mov	rax, QWORD PTR [rbp - 128]
+	cmp	rax, QWORD PTR [rbp - 120]
+	jae	Lstc_gr_free
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	rbx, QWORD PTR [rbp - 128]
+	shl	rbx, 4
+	lea	rax, [rax + rbx]
+	mov	r12, rax
+	mov	rdi, QWORD PTR [r12]
+	cmp	rdi, 0
+	je	Lstc_gr_next
+	mov	rsi, QWORD PTR [r12 + 8]
+	call	Lstc_insert
+Lstc_gr_next:
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	rax, [rax + 1]
+	mov	QWORD PTR [rbp - 128], rax
+	jmp	Lstc_gr_loop
+Lstc_gr_free:
+	mov	rdi, QWORD PTR [rbp - 112]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	free
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+Lstc_gr_done:
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 128], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+	ret
+Lstc_table_clear:
+# A new slot begins: the table forgets every node of the previous slot (P5).
+	sub	rsp, 16
+	mov	rdi, QWORD PTR [rbp - 80]
+	mov	rsi, 0
+	mov	rax, QWORD PTR [rbp - 88]
+	shl	rax, 4
+	mov	rdx, rax
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	memset
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	mov	QWORD PTR [rbp - 96], 0
+	add	rsp, 16
+	ret
+Lstc_sum_desc:
+	cmp	rdi, 65536
+	jb	Lstc_sd_none
+	mov	r10, QWORD PTR [rdi]
+	mov	r12, QWORD PTR [rsi]
+	mov	rax, r12
+	not	rax
+	mov	r12, rax
+	lea	r13, [rsi + 8]
+Lstc_sd_loop:
+	cmp	r12, 0
+	je	Lstc_sd_none
+	mov	r11, QWORD PTR [r13]
+	cmp	r11, r10
+	je	Lstc_sd_hit
+	lea	r13, [r13 + 16]
+	lea	r12, [r12 - 1]
+	jmp	Lstc_sd_loop
+Lstc_sd_hit:
+	mov	rsi, QWORD PTR [r13 + 8]
+	ret
+Lstc_sd_none:
+	mov	rsi, 0
+	ret
+
+"
+}
+
+fn state_asm_measure_root() -> string {
+    "	.globl	silica_rt_state_measure
+	.p2align	4
+silica_rt_state_measure:
+# X0 = value, X1 = root descriptor -> X0 = bytes (-1: no table). One table per state slot (X21 = 1 at the root).
+	mov	r9, 1
+	jmp	Lstm_root_entry
+	.globl	silica_rt_message_measure
+	.p2align	4
+silica_rt_message_measure:
+# X0 = value, X1 = root descriptor -> X0 = bytes (-1: no table): the same walk with ONE table for the whole
+# value (the spine flag off at the root, so nothing empties it): the size of a message copy, in which two
+# parts of one message that share a node share its copy (chunk 15 phase 4a, design §5.1; R4.2).
+	mov	r9, 0
+Lstm_root_entry:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 144
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 96]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 104]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp + 8], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	mov	QWORD PTR [rbp - 72], r9
+	mov	QWORD PTR [rbp - 104], 0
+	mov	rdi, 64
+	mov	rsi, 16
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	calloc
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	mov	QWORD PTR [rbp - 80], rdi
+	mov	QWORD PTR [rbp - 88], 64
+	mov	QWORD PTR [rbp - 96], 0
+	cmp	QWORD PTR [rbp - 80], 0
+	je	Lstm_root_notable
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rsi, QWORD PTR [rax + 16]
+	mov	rdx, QWORD PTR [rax + 24]
+	mov	rdi, QWORD PTR [rbp - 56]
+	call	Lstm_word
+	mov	rdi, QWORD PTR [rbp - 80]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	free
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	jmp	Lstm_root_done
+Lstm_root_notable:
+	mov	QWORD PTR [rbp - 104], -1
+Lstm_root_done:
+	mov	rdi, QWORD PTR [rbp - 104]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 120], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 128], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 104], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 112], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 88], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 96], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 80], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 64], rbx
+	lea	rsp, [rsp + 16]
+	leave
+	ret
+Lstm_word:
+# X0 = word, X1 = kind, X2 = aux.
+	cmp	rsi, 0
+	je	Lstm_w_ret
+	cmp	rsi, 1
+	je	Lstm_w_ret
+	cmp	rsi, 9
+	je	Lstm_w_ret
+	cmp	rsi, 4
+	je	Lstm_w_agg
+	cmp	rsi, 5
+	je	Lstm_w_sum
+	cmp	rsi, 7
+	je	Lstm_list
+	cmp	rsi, 8
+	je	Lstm_str
+	jmp	Lstm_ref
+Lstm_w_agg:
+	mov	rsi, rdx
+	jmp	Lstm_agg
+Lstm_w_sum:
+	sub	rsp, 16
+	mov	rsi, rdx
+	call	Lstc_sum_desc
+	cmp	rsi, 0
+	je	Lstm_w_sum_done
+	call	Lstm_agg
+Lstm_w_sum_done:
+	add	rsp, 16
+Lstm_w_ret:
+	ret
+
+"
+}
+
+fn state_asm_measure_agg() -> string {
+    "Lstm_agg:
+	cmp	rdi, 65536
+	jb	Lstm_agg_ret
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 120], rsi
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	r10, QWORD PTR [rax]
+	mov	rax, QWORD PTR [rbp - 104]
+	lea	rax, [rax + r10*8]
+	mov	QWORD PTR [rbp - 104], rax
+	jmp	Lstm_agg_enter
+Lstm_agg_words:
+	cmp	rdi, 65536
+	jb	Lstm_agg_ret
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 120], rsi
+Lstm_agg_enter:
+	mov	QWORD PTR [rbp - 128], 0
+Lstm_agg_loop:
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	r10, QWORD PTR [rax]
+	mov	rax, QWORD PTR [rbp - 128]
+	cmp	rax, r10
+	jae	Lstm_agg_done
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	r11, [rax + 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	shl	rbx, 4
+	mov	rax, r11
+	lea	rax, [rax + rbx]
+	mov	r11, rax
+	mov	rsi, QWORD PTR [r11]
+	mov	rdx, QWORD PTR [r11 + 8]
+	cmp	QWORD PTR [rbp - 72], 0
+	je	Lstm_agg_word
+	cmp	rsi, 2
+	jb	Lstm_agg_word
+	cmp	rsi, 3
+	jbe	Lstm_agg_slot
+	cmp	rsi, 6
+	jb	Lstm_agg_word
+	cmp	rsi, 8
+	ja	Lstm_agg_word
+Lstm_agg_slot:
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rsp], rsi
+	mov	QWORD PTR [rsp + 8], rdx
+	call	Lstc_table_clear
+	mov	rsi, QWORD PTR [rsp]
+	mov	rdx, QWORD PTR [rsp + 8]
+	lea	rsp, [rsp + 16]
+Lstm_agg_word:
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	rdi, QWORD PTR [rax + rbx*8]
+	call	Lstm_word
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	rax, [rax + 1]
+	mov	QWORD PTR [rbp - 128], rax
+	jmp	Lstm_agg_loop
+Lstm_agg_done:
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 128], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+Lstm_agg_ret:
+	ret
+
+"
+}
+
+fn state_asm_measure_ref() -> string {
+    "Lstm_ref:
+	cmp	rdi, 65536
+	jb	Lstm_ref_asis
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 120], rsi
+	mov	QWORD PTR [rbp - 128], rdx
+	mov	QWORD PTR [rbp - 72], 0
+	call	Lstc_lookup
+	cmp	rdi, 0
+	jne	Lstm_ref_done
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, 1
+	call	Lstc_insert
+	cmp	QWORD PTR [rbp - 120], 2
+	je	Lstm_ref1
+	cmp	QWORD PTR [rbp - 120], 3
+	je	Lstm_refrec
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax - 8]
+	mov	rax, r10
+	mov	rbx, QWORD PTR [rbp - 128]
+	imul	rax, rbx
+	mov	r10, rax
+	lea	r10, [r10 + 15]
+	mov	rax, r10
+	and	rax, -8
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 104]
+	lea	rax, [rax + r10]
+	mov	QWORD PTR [rbp - 104], rax
+	jmp	Lstm_ref_done
+Lstm_ref1:
+	mov	rax, QWORD PTR [rbp - 104]
+	lea	rax, [rax + 8]
+	mov	QWORD PTR [rbp - 104], rax
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	rdi, QWORD PTR [rax]
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	r11, [rax + 16]
+	mov	rsi, QWORD PTR [r11]
+	mov	rdx, QWORD PTR [r11 + 8]
+	call	Lstm_word
+	jmp	Lstm_ref_done
+Lstm_refrec:
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r11, QWORD PTR [rax]
+	mov	rax, r11
+	shl	rax, 3
+	mov	r10, rax
+	lea	r10, [r10 + 15]
+	mov	rax, r10
+	and	rax, -16
+	mov	r10, rax
+	lea	r10, [r10 + 8]
+	mov	rax, QWORD PTR [rbp - 104]
+	lea	rax, [rax + r10]
+	mov	QWORD PTR [rbp - 104], rax
+	mov	QWORD PTR [rsp], 0
+Lstm_rr_loop:
+	mov	r10, QWORD PTR [rsp]
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r11, QWORD PTR [rax]
+	cmp	r10, r11
+	jae	Lstm_ref_done
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r12, QWORD PTR [rax]
+	mov	rdi, QWORD PTR [r12 + r10*8]
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	r11, [rax + 16]
+	mov	rbx, r10
+	shl	rbx, 4
+	mov	rax, r11
+	lea	rax, [rax + rbx]
+	mov	r11, rax
+	mov	rsi, QWORD PTR [r11]
+	mov	rdx, QWORD PTR [r11 + 8]
+	call	Lstm_word
+	mov	r10, QWORD PTR [rsp]
+	lea	r10, [r10 + 1]
+	mov	QWORD PTR [rsp], r10
+	jmp	Lstm_rr_loop
+Lstm_ref_done:
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 128], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 72], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+Lstm_ref_asis:
+	ret
+
+"
+}
+
+fn state_asm_measure_list_str() -> string {
+    "Lstm_list:
+	cmp	rdi, 0
+	je	Lstm_ml_ret
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 32]
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 128], rdx
+	mov	QWORD PTR [rbp - 72], 0
+	call	Lstc_lookup
+	cmp	rdi, 0
+	jne	Lstm_ml_done
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, 1
+	call	Lstc_insert
+	mov	rax, QWORD PTR [rbp - 104]
+	lea	rax, [rax + 24]
+	mov	QWORD PTR [rbp - 104], rax
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax]
+	mov	QWORD PTR [rsp], r10
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r10, QWORD PTR [rax + 8]
+	mov	r11, 16
+	cmp	r10, r11
+	mov	rax, r11
+	cmova	rax, r10
+	mov	r10, rax
+	mov	QWORD PTR [rsp + 16], r10
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	rbx, QWORD PTR [rax + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax + 16]
+	mov	QWORD PTR [rsp + 8], r10
+Lstm_ml_chunk:
+	cmp	QWORD PTR [rbp - 120], 0
+	je	Lstm_ml_done
+	mov	r10, QWORD PTR [rsp + 16]
+	lea	r10, [r10 + 16]
+	mov	rax, QWORD PTR [rbp - 104]
+	lea	rax, [rax + r10]
+	mov	QWORD PTR [rbp - 104], rax
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r10, QWORD PTR [rax + 16]
+	cmp	r10, 0
+	je	Lstm_ml_next
+	cmp	r10, 1
+	je	Lstm_ml_next
+	cmp	r10, 9
+	je	Lstm_ml_next
+Lstm_ml_slot:
+	mov	r10, QWORD PTR [rsp]
+	cmp	r10, 0
+	je	Lstm_ml_done
+	mov	r11, QWORD PTR [rsp + 8]
+	mov	r12, QWORD PTR [rsp + 16]
+	cmp	r11, r12
+	jae	Lstm_ml_next
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r13, QWORD PTR [rax + 8]
+	lea	rax, [r11 + r13]
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rbx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	r10, [r10 - 1]
+	mov	QWORD PTR [rsp], r10
+	cmp	r13, 8
+	jne	Lstm_ml_inline
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	rdi, QWORD PTR [rax + r11]
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	r12, [rax + 16]
+	mov	rsi, QWORD PTR [r12]
+	mov	rdx, QWORD PTR [r12 + 8]
+	call	Lstm_word
+	jmp	Lstm_ml_slot
+Lstm_ml_inline:
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	rsi, QWORD PTR [rax + 16]
+	cmp	rsi, 4
+	jne	Lstm_ml_slot
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	rax, [rax + r11]
+	mov	rdi, rax
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	rsi, QWORD PTR [rax + 24]
+	call	Lstm_agg_words
+	jmp	Lstm_ml_slot
+Lstm_ml_next:
+	mov	r10, QWORD PTR [rsp + 16]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	rbx, QWORD PTR [rax + r10]
+	mov	QWORD PTR [rbp - 120], rbx
+	cmp	QWORD PTR [rbp - 120], 0
+	je	Lstm_ml_done
+	lea	r10, [r10 + 8]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	r11, QWORD PTR [rax + r10]
+	mov	QWORD PTR [rsp + 8], r11
+	jmp	Lstm_ml_chunk
+Lstm_ml_done:
+	lea	rsp, [rsp + 32]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 128], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 72], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+Lstm_ml_ret:
+	ret
+Lstm_str:
+	cmp	rdi, 65536
+	jb	Lstm_str_ret
+	mov	r10, QWORD PTR [rdi]
+	cmp	r10, -2
+	je	Lstm_str_ret
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	QWORD PTR [rbp - 112], rdi
+	call	Lstc_lookup
+	cmp	rdi, 0
+	jne	Lstm_str_done
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, 1
+	call	Lstc_insert
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax + 16]
+	lea	r10, [r10 + 32]
+	mov	rax, r10
+	and	rax, -8
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 104]
+	lea	rax, [rax + r10]
+	mov	QWORD PTR [rbp - 104], rax
+Lstm_str_done:
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+Lstm_str_ret:
+	ret
+
+"
+}
+
+fn state_asm_copy_root() -> string {
+    "	.globl	silica_rt_state_copy
+	.p2align	4
+silica_rt_state_copy:
+# X0 = value, X1 = root descriptor, X2 = destination, X3 = destination end, X4 = relocation delta -> X0 =
+# the copy's root, X1 = 0 (1: no table, X0 = the value as given). One table per state slot.
+	mov	r9, 1
+	jmp	Lstc_copy_entry
+	.globl	silica_rt_message_copy
+	.p2align	4
+silica_rt_message_copy:
+# The same arguments and answers with ONE table for the whole value (the spine flag off at the root): the
+# copy of a message into its mailbox buffer (chunk 15 phase 4a, design §5.1), sized by
+# _silica_rt_message_measure. Sharing between any two parts of the message is kept (R4.2).
+	mov	r9, 0
+Lstc_copy_entry:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 144
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 96]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 104]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 64]
+	mov	QWORD PTR [rbp - 56], rdx
+	mov	QWORD PTR [rbp - 64], rsp
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax], rcx
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 8], 0
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 16], 0
+	mov	QWORD PTR [rax + 24], 0
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 32], 0
+	mov	QWORD PTR [rax + 40], 0
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 48], 0
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 56], r8
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 120], rsi
+	cmp	r9, 0
+	je	Lstc_copy_flat
+	call	Lstc_run
+	jmp	Lstc_copy_ran
+Lstc_copy_flat:
+	call	Lstc_run_flat
+Lstc_copy_ran:
+	lea	rsp, [rsp + 64]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 120], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 128], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 104], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 112], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 88], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 96], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 80], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 64], rbx
+	lea	rsp, [rsp + 16]
+	leave
+	ret
+Lstc_run:
+# X26 = value, X27 = root descriptor, X19 = the cursor, X20 = the copy control block -> X0 = the root,
+# X1 = 0 (1: no table). The table is this copy's; X21 = 1 (on the spine) at the root. Lstc_run_flat is
+# the same walk with the spine flag off at the root (one table for the whole value: the message copy).
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 72], 1
+	jmp	Lstc_run_go
+Lstc_run_flat:
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 72], 0
+Lstc_run_go:
+	mov	rdi, 64
+	mov	rsi, 16
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	calloc
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	mov	QWORD PTR [rbp - 80], rdi
+	mov	QWORD PTR [rbp - 88], 64
+	mov	QWORD PTR [rbp - 96], 0
+	cmp	QWORD PTR [rbp - 80], 0
+	je	Lstc_run_notable
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	rsi, QWORD PTR [rax + 16]
+	mov	rdx, QWORD PTR [rax + 24]
+	mov	rdi, QWORD PTR [rbp - 112]
+	call	Lstc_word
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	rdi, QWORD PTR [rbp - 80]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	free
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, 0
+	jmp	Lstc_run_done
+Lstc_run_notable:
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, 1
+Lstc_run_done:
+	add	rsp, 16
+	ret
+Lstc_bump:
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 8]
+	cmp	r10, 0
+	jne	Lstc_bump_evac
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rax, QWORD PTR [rbp - 56]
+	lea	rax, [rax + r15]
+	mov	QWORD PTR [rbp - 56], rax
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax]
+	mov	rax, QWORD PTR [rbp - 56]
+	cmp	rax, r10
+	ja	Lstc_bump_overrun
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 56]
+	lea	rax, [rdi + r10]
+	mov	rsi, rax
+	ret
+Lstc_bump_overrun:
+	and	rsp, -16
+	call	silica_rt_abort_state_copy
+Lstc_bump_evac:
+	sub	rsp, 32
+	mov	QWORD PTR [rsp + 16], r15
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rdi, QWORD PTR [rax + 16]
+	mov	rsi, r15
+	call	silica_rt_state_hole_pop
+	cmp	rdi, 0
+	je	Lstc_bump_edge
+	mov	rsi, rdi
+	jmp	Lstc_bump_evac_ret
+Lstc_bump_edge:
+	mov	r15, QWORD PTR [rsp + 16]
+	mov	rax, QWORD PTR [rbp - 56]
+	sub	rax, r15
+	mov	QWORD PTR [rbp - 56], rax
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 48]
+	mov	rax, QWORD PTR [rbp - 56]
+	cmp	rax, r10
+	jae	Lstc_bump_edge_committed
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rdi, QWORD PTR [rax + 16]
+	mov	rsi, QWORD PTR [rbp - 56]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_stack_grow_to
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 1
+	je	Lstc_bump_exhausted
+	cmp	rdi, 2
+	je	Lstc_bump_exhausted
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rdi, QWORD PTR [rax + 16]
+	mov	rbx, QWORD PTR [rdi + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	r10, QWORD PTR [rdi + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	mov	r11, QWORD PTR [rdi + 288]
+	mov	rax, r10
+	sub	rax, r11
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 48], r10
+Lstc_bump_edge_committed:
+	mov	r15, QWORD PTR [rsp + 16]
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 40]
+	lea	rax, [r10 + r15]
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 40], r10
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 56]
+	lea	rax, [rdi + r10]
+	mov	rsi, rax
+Lstc_bump_evac_ret:
+	add	rsp, 32
+	ret
+Lstc_bump_exhausted:
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rdi, QWORD PTR [rax + 16]
+	jmp	Lstc_fail_actor
+Lstc_word:
+# X0 = word, X1 = kind, X2 = aux -> X0 = the copied word.
+	cmp	rsi, 0
+	je	Lstc_w_ret
+	cmp	rsi, 1
+	je	Lstc_w_ret
+	cmp	rsi, 9
+	je	Lstc_w_ret
+	cmp	rsi, 4
+	je	Lstc_w_agg
+	cmp	rsi, 5
+	je	Lstc_w_sum
+	cmp	rsi, 7
+	je	Lstc_list
+	cmp	rsi, 8
+	je	Lstc_str
+	jmp	Lstc_ref
+Lstc_w_agg:
+	mov	rsi, rdx
+	jmp	Lstc_agg
+Lstc_w_sum:
+	sub	rsp, 16
+	mov	rsi, rdx
+	call	Lstc_sum_desc
+	cmp	rsi, 0
+	je	Lstc_w_sum_done
+	call	Lstc_agg
+Lstc_w_sum_done:
+	add	rsp, 16
+Lstc_w_ret:
+	ret
+
+"
+}
+
+fn state_asm_copy_agg() -> string {
+    "Lstc_agg:
+	cmp	rdi, 65536
+	jb	Lstc_agg_ret
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 8]
+	cmp	r10, 0
+	je	Lstc_agg_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 24]
+	cmp	rdi, r11
+	jb	Lstc_agg_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 32]
+	cmp	rdi, r11
+	jb	Lstc_agg_ret
+Lstc_agg_new:
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 120], rsi
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	r10, QWORD PTR [rax]
+	mov	rax, r10
+	shl	rax, 3
+	mov	r15, rax
+	call	Lstc_bump
+	mov	QWORD PTR [rsp], rdi
+	mov	QWORD PTR [rsp + 8], rsi
+	jmp	Lstc_agg_enter
+Lstc_agg_words:
+	cmp	rdi, 65536
+	jb	Lstc_agg_ret
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 120], rsi
+	mov	QWORD PTR [rsp], rdi
+	mov	QWORD PTR [rsp + 8], rdi
+Lstc_agg_enter:
+	mov	QWORD PTR [rbp - 128], 0
+Lstc_agg_loop:
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	r10, QWORD PTR [rax]
+	mov	rax, QWORD PTR [rbp - 128]
+	cmp	rax, r10
+	jae	Lstc_agg_done
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	r11, [rax + 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	shl	rbx, 4
+	mov	rax, r11
+	lea	rax, [rax + rbx]
+	mov	r11, rax
+	mov	rsi, QWORD PTR [r11]
+	mov	rdx, QWORD PTR [r11 + 8]
+	cmp	QWORD PTR [rbp - 72], 0
+	je	Lstc_agg_word
+	cmp	rsi, 2
+	jb	Lstc_agg_word
+	cmp	rsi, 3
+	jbe	Lstc_agg_slot
+	cmp	rsi, 6
+	jb	Lstc_agg_word
+	cmp	rsi, 8
+	ja	Lstc_agg_word
+Lstc_agg_slot:
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rsp], rsi
+	mov	QWORD PTR [rsp + 8], rdx
+	call	Lstc_table_clear
+	mov	rsi, QWORD PTR [rsp]
+	mov	rdx, QWORD PTR [rsp + 8]
+	lea	rsp, [rsp + 16]
+Lstc_agg_word:
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	rdi, QWORD PTR [rax + rbx*8]
+	call	Lstc_word
+	mov	r12, QWORD PTR [rsp]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [r12 + rbx*8], rdi
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	rax, [rax + 1]
+	mov	QWORD PTR [rbp - 128], rax
+	jmp	Lstc_agg_loop
+Lstc_agg_done:
+	mov	rdi, QWORD PTR [rsp + 8]
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 128], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+Lstc_agg_ret:
+	ret
+
+"
+}
+
+fn state_asm_copy_ref() -> string {
+    "Lstc_ref:
+	cmp	rdi, 65536
+	jb	Lstc_ref_asis
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 8]
+	cmp	r10, 0
+	je	Lstc_ref_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 24]
+	cmp	rdi, r11
+	jb	Lstc_ref_retained
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 32]
+	cmp	rdi, r11
+	jb	Lstc_ref_asis
+	jmp	Lstc_ref_new
+# Below the old range: a buffer whose node is on this dispatch's pending retained list (alloc_buf_retained,
+# design §7) is kept where it is, like an old node; dispatch_end has lowered the edge to it. Exact: the
+# element pointer is compared with every pending node's (+24); the list holds the dispatch's retained
+# buffers only.
+Lstc_ref_retained:
+	cmp	rsi, 6
+	jne	Lstc_ref_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 16]
+	mov	r10, QWORD PTR [r11 + 288]
+	cmp	r10, 1040
+	jb	Lstc_ref_new
+	mov	r10, QWORD PTR [r11 + 272]
+	mov	r11, QWORD PTR [r11 + 280]
+	lea	rax, [r10 + r11]
+	mov	r11, rax
+	mov	r11, QWORD PTR [r11 - 8]
+Lstc_ref_rt_loop:
+	cmp	r11, 0
+	je	Lstc_ref_new
+	mov	r10, QWORD PTR [r11 + 8]
+	lea	rax, [r11 + r10]
+	mov	r10, rax
+	lea	r10, [r10 + 8]
+	cmp	r10, rdi
+	je	Lstc_ref_asis
+	mov	r11, QWORD PTR [r11]
+	jmp	Lstc_ref_rt_loop
+Lstc_ref_new:
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 120], rsi
+	mov	QWORD PTR [rbp - 128], rdx
+	mov	QWORD PTR [rbp - 72], 0
+	call	Lstc_lookup
+	cmp	rdi, 0
+	jne	Lstc_ref_done
+	cmp	QWORD PTR [rbp - 120], 2
+	je	Lstc_ref1
+	cmp	QWORD PTR [rbp - 120], 3
+	je	Lstc_refrec
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax - 8]
+	mov	rax, r10
+	mov	rbx, QWORD PTR [rbp - 128]
+	imul	rax, rbx
+	mov	r15, rax
+	lea	r15, [r15 + 15]
+	mov	rax, r15
+	and	rax, -8
+	mov	r15, rax
+	call	Lstc_bump
+	mov	QWORD PTR [rbp - 120], rdi
+	mov	QWORD PTR [rsp + 8], rsi
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax - 8]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rax], r10
+	mov	rax, r10
+	mov	rbx, QWORD PTR [rbp - 128]
+	imul	rax, rbx
+	mov	r10, rax
+	lea	r10, [r10 + 7]
+	mov	rax, r10
+	shr	rax, 3
+	mov	r10, rax
+	mov	r11, 0
+Lstc_buf_loop:
+	cmp	r11, r10
+	jae	Lstc_buf_copied
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r12, QWORD PTR [rax + r11*8]
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	r13, [rax + 8]
+	mov	QWORD PTR [r13 + r11*8], r12
+	lea	r11, [r11 + 1]
+	jmp	Lstc_buf_loop
+Lstc_buf_copied:
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	rax, [rax + 8]
+	mov	QWORD PTR [rbp - 120], rax
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, QWORD PTR [rbp - 120]
+	call	Lstc_insert
+	mov	rdi, QWORD PTR [rbp - 120]
+	jmp	Lstc_ref_done
+Lstc_ref1:
+	mov	r15, 8
+	call	Lstc_bump
+	mov	QWORD PTR [rbp - 120], rdi
+	mov	QWORD PTR [rsp + 8], rsi
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, QWORD PTR [rsp + 8]
+	call	Lstc_insert
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	rdi, QWORD PTR [rax]
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	r11, [rax + 16]
+	mov	rsi, QWORD PTR [r11]
+	mov	rdx, QWORD PTR [r11 + 8]
+	call	Lstc_word
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rax], rdi
+	mov	rdi, QWORD PTR [rsp + 8]
+	jmp	Lstc_ref_done
+Lstc_refrec:
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r11, QWORD PTR [rax]
+	mov	rax, r11
+	shl	rax, 3
+	mov	r15, rax
+	lea	r15, [r15 + 15]
+	mov	rax, r15
+	and	rax, -16
+	mov	r15, rax
+	lea	r15, [r15 + 8]
+	call	Lstc_bump
+	mov	QWORD PTR [rbp - 120], rdi
+	mov	QWORD PTR [rsp + 8], rsi
+	lea	r10, [rsi + 8]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rax], r10
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, QWORD PTR [rsp + 8]
+	call	Lstc_insert
+	mov	QWORD PTR [rsp], 0
+Lstc_rr_loop:
+	mov	r10, QWORD PTR [rsp]
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r11, QWORD PTR [rax]
+	cmp	r10, r11
+	jae	Lstc_rr_done
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r12, QWORD PTR [rax]
+	mov	rdi, QWORD PTR [r12 + r10*8]
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	r11, [rax + 16]
+	mov	rbx, r10
+	shl	rbx, 4
+	mov	rax, r11
+	lea	rax, [rax + rbx]
+	mov	r11, rax
+	mov	rsi, QWORD PTR [r11]
+	mov	rdx, QWORD PTR [r11 + 8]
+	call	Lstc_word
+	mov	r10, QWORD PTR [rsp]
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	r12, [rax + 8]
+	mov	QWORD PTR [r12 + r10*8], rdi
+	lea	r10, [r10 + 1]
+	mov	QWORD PTR [rsp], r10
+	jmp	Lstc_rr_loop
+Lstc_rr_done:
+	mov	rdi, QWORD PTR [rsp + 8]
+Lstc_ref_done:
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 128], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 72], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+Lstc_ref_asis:
+	ret
+
+"
+}
+
+fn state_asm_copy_list_str() -> string {
+    "Lstc_list:
+	cmp	rdi, 0
+	je	Lstc_ml_ret
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 8]
+	cmp	r10, 0
+	je	Lstc_ml_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 24]
+	cmp	rdi, r11
+	jb	Lstc_ml_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 32]
+	cmp	rdi, r11
+	jb	Lstc_ml_ret
+Lstc_ml_new:
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 64]
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	QWORD PTR [rbp - 128], rdx
+	mov	QWORD PTR [rbp - 72], 0
+	call	Lstc_lookup
+	cmp	rdi, 0
+	jne	Lstc_ml_exit
+	mov	r15, 24
+	call	Lstc_bump
+	mov	QWORD PTR [rsp + 24], rdi
+	mov	QWORD PTR [rsp + 48], rsi
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, QWORD PTR [rsp + 48]
+	call	Lstc_insert
+	mov	rdi, QWORD PTR [rsp + 24]
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax]
+	mov	QWORD PTR [rdi], r10
+	mov	QWORD PTR [rsp], r10
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax + 16]
+	mov	QWORD PTR [rdi + 16], r10
+	mov	QWORD PTR [rsp + 8], r10
+	mov	QWORD PTR [rdi + 8], 0
+	lea	r10, [rdi + 8]
+	mov	QWORD PTR [rsp + 32], r10
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r10, QWORD PTR [rax + 8]
+	mov	r11, 16
+	cmp	r10, r11
+	mov	rax, r11
+	cmova	rax, r10
+	mov	r10, rax
+	mov	QWORD PTR [rsp + 16], r10
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	rbx, QWORD PTR [rax + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+Lstc_ml_chunk:
+	cmp	QWORD PTR [rbp - 120], 0
+	je	Lstc_ml_done
+# Evacuation: an old chunk ends the walk; the copy before it links to the old chunk as it is (the rest of
+# the spine is old too). Without this a cons onto the state's list would copy the whole list every
+# dispatch and leave the copies as garbage above the edge.
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 8]
+	cmp	r10, 0
+	je	Lstc_ml_chunk_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 24]
+	mov	rax, QWORD PTR [rbp - 120]
+	cmp	rax, r11
+	jb	Lstc_ml_chunk_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 32]
+	mov	rax, QWORD PTR [rbp - 120]
+	cmp	rax, r11
+	jae	Lstc_ml_chunk_new
+	mov	r12, QWORD PTR [rsp + 32]
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [r12], rbx
+	jmp	Lstc_ml_done
+Lstc_ml_chunk_new:
+	mov	r10, QWORD PTR [rsp + 16]
+	lea	r15, [r10 + 16]
+	call	Lstc_bump
+	mov	r12, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [r12], rsi
+	mov	r10, QWORD PTR [rsp + 16]
+	lea	r10, [r10 + 16]
+	mov	r11, 0
+Lstc_ml_copy:
+	cmp	r11, r10
+	jae	Lstc_ml_copied
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	r12, QWORD PTR [rax + r11]
+	mov	QWORD PTR [rdi + r11], r12
+	lea	r11, [r11 + 8]
+	jmp	Lstc_ml_copy
+Lstc_ml_copied:
+	mov	QWORD PTR [rbp - 120], rdi
+	mov	r10, QWORD PTR [rsp + 16]
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	mov	QWORD PTR [rsp + 32], r10
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r10, QWORD PTR [rax + 16]
+	cmp	r10, 0
+	je	Lstc_ml_next
+	cmp	r10, 1
+	je	Lstc_ml_next
+	cmp	r10, 9
+	je	Lstc_ml_next
+Lstc_ml_slot:
+	mov	r10, QWORD PTR [rsp]
+	cmp	r10, 0
+	je	Lstc_ml_fin
+	mov	r11, QWORD PTR [rsp + 8]
+	mov	r12, QWORD PTR [rsp + 16]
+	cmp	r11, r12
+	jae	Lstc_ml_next
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	r13, QWORD PTR [rax + 8]
+	lea	rax, [r11 + r13]
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rbx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	r10, [r10 - 1]
+	mov	QWORD PTR [rsp], r10
+	cmp	r13, 8
+	jne	Lstc_ml_inline
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	rdi, QWORD PTR [rax + r11]
+	mov	rax, QWORD PTR [rbp - 128]
+	lea	r12, [rax + 16]
+	mov	rsi, QWORD PTR [r12]
+	mov	rdx, QWORD PTR [r12 + 8]
+	mov	QWORD PTR [rsp + 40], r11
+	call	Lstc_word
+	mov	r11, QWORD PTR [rsp + 40]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rax + r11], rdi
+	jmp	Lstc_ml_slot
+Lstc_ml_inline:
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	rsi, QWORD PTR [rax + 16]
+	cmp	rsi, 4
+	jne	Lstc_ml_slot
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	rax, [rax + r11]
+	mov	rdi, rax
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	rsi, QWORD PTR [rax + 24]
+	call	Lstc_agg_words
+	jmp	Lstc_ml_slot
+Lstc_ml_next:
+	mov	r10, QWORD PTR [rsp + 16]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	rbx, QWORD PTR [rax + r10]
+	mov	QWORD PTR [rbp - 120], rbx
+	cmp	QWORD PTR [rbp - 120], 0
+	je	Lstc_ml_done
+	lea	r10, [r10 + 8]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	r11, QWORD PTR [rax + r10]
+	mov	QWORD PTR [rsp + 8], r11
+	jmp	Lstc_ml_chunk
+Lstc_ml_fin:
+	mov	r12, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [r12], 0
+Lstc_ml_done:
+	mov	rdi, QWORD PTR [rsp + 48]
+Lstc_ml_exit:
+	lea	rsp, [rsp + 64]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 128], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 72], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+Lstc_ml_ret:
+	ret
+Lstc_str:
+	cmp	rdi, 65536
+	jb	Lstc_str_ret
+	mov	r10, QWORD PTR [rdi]
+	cmp	r10, -2
+	je	Lstc_str_ret
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 8]
+	cmp	r10, 0
+	je	Lstc_str_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 24]
+	cmp	rdi, r11
+	jb	Lstc_str_new
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r11, QWORD PTR [rax + 32]
+	cmp	rdi, r11
+	jb	Lstc_str_ret
+Lstc_str_new:
+	sub	rsp, 16
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rbp - 112], rdi
+	call	Lstc_lookup
+	cmp	rdi, 0
+	jne	Lstc_str_done
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax + 16]
+	lea	r15, [r10 + 32]
+	mov	rax, r15
+	and	rax, -8
+	mov	r15, rax
+	call	Lstc_bump
+	mov	QWORD PTR [rbp - 120], rdi
+	mov	QWORD PTR [rsp], rsi
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, QWORD PTR [rsp]
+	call	Lstc_insert
+	mov	r10, -1
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rax], r10
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 16], rbx
+	mov	rax, QWORD PTR [rbp - 16]
+	lea	rax, [rax + 24]
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	rbx, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 8], rbx
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	r10, [rax + 24]
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r11, QWORD PTR [rax + 16]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rax + 16], r11
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r12, QWORD PTR [rax + 8]
+	lea	r11, [r11 + 1]
+Lstc_str_bytes:
+	cmp	r11, 0
+	je	Lstc_str_copied
+	movzx	r13d, BYTE PTR [r12]
+	lea	r12, [r12 + 1]
+	mov	BYTE PTR [r10], r13b
+	lea	r10, [r10 + 1]
+	lea	r11, [r11 - 1]
+	jmp	Lstc_str_bytes
+Lstc_str_copied:
+	mov	rdi, QWORD PTR [rsp]
+Lstc_str_done:
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 120], rbx
+	lea	rsp, [rsp + 16]
+	add	rsp, 16
+Lstc_str_ret:
+	ret
+
+"
+}
+
+fn state_asm_evacuate_copy_all() -> string {
+    "	.globl	silica_rt_state_evacuate
+	.p2align	4
+silica_rt_state_evacuate:
+# X0 = ACB, X1 = root, X2 = root descriptor, X3 = the low end of the old-node range (the entry edge)
+# -> X0 = the root's final address, X1 = 0 (1: no table). The
+# scratch cursor X19 starts at the bottom of the committed run and goes down; a scratch node's final address
+# is its scratch address + (edge - run bottom), so the edge-bound block is moved to [edge - E, edge) by one
+# memmove (the two ranges overlap when the dead frames are shallower than E). The new edge is edge - E
+# rounded down to 16; #568 grows by E (hole pops counted themselves in _silica_rt_state_alloc).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 144
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 96]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 104]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 16]
+	mov	rbx, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rsp], rbx
+	mov	rbx, QWORD PTR [rbp - 128]
+	mov	QWORD PTR [rsp + 8], rbx
+	lea	rsp, [rsp - 64]
+	mov	QWORD PTR [rbp - 64], rsp
+	mov	QWORD PTR [rbp - 104], rdi
+	mov	QWORD PTR [rbp - 112], rsi
+	mov	QWORD PTR [rbp - 120], rdx
+	mov	rax, QWORD PTR [rbp - 104]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 104]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 104]
+	mov	r11, QWORD PTR [rax + 528]
+	mov	rax, QWORD PTR [rbp - 104]
+	mov	r12, QWORD PTR [rax + 288]
+	mov	rax, r10
+	sub	rax, r12
+	mov	r12, rax
+	mov	QWORD PTR [rbp - 56], r12
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax], 0
+	mov	r13, 1
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 8], r13
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rbx, QWORD PTR [rbp - 104]
+	mov	QWORD PTR [rax + 16], rbx
+# The OLD range is [X3, top): X3 is the entry edge, which is #528 except after a dispatch that took
+# retained buffers, where #528 is already the lowest retained block (dispatch_end, design §7).
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 24], rcx
+	mov	QWORD PTR [rax + 32], r10
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 40], 0
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 48], r12
+	mov	rax, r11
+	sub	rax, r12
+	mov	r13, rax
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rax + 56], r13
+	call	Lstc_run
+	cmp	rsi, 0
+	jne	Lste_done
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rdx, QWORD PTR [rax + 40]
+	cmp	rdx, 0
+	je	Lste_placed
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rax + 56]
+	mov	rax, QWORD PTR [rbp - 56]
+	lea	rax, [rax + r10]
+	mov	rdi, rax
+	mov	rsi, QWORD PTR [rbp - 56]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	memmove
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	mov	rax, QWORD PTR [rbp - 104]
+	mov	r11, QWORD PTR [rax + 528]
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rdx, QWORD PTR [rax + 40]
+	mov	rax, r11
+	sub	rax, rdx
+	mov	r11, rax
+	mov	rax, r11
+	and	rax, -16
+	mov	r11, rax
+	mov	rax, QWORD PTR [rbp - 104]
+	mov	QWORD PTR [rax + 528], r11
+	mov	rax, QWORD PTR [rbp - 104]
+	mov	r10, QWORD PTR [rax + 568]
+	lea	rax, [r10 + rdx]
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 104]
+	mov	QWORD PTR [rax + 568], r10
+Lste_placed:
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, 0
+Lste_done:
+	lea	rsp, [rsp + 64]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 120], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 128], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 104], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 112], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 88], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 96], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 80], rbx
+	lea	rsp, [rsp + 16]
+	mov	rbx, QWORD PTR [rsp]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 8]
+	mov	QWORD PTR [rbp - 64], rbx
+	lea	rsp, [rsp + 16]
+	leave
+	ret
+	.globl	silica_rt_state_copy_all
+	.p2align	4
+silica_rt_state_copy_all:
+# X0 = ACB, X1 = root, X2 = root descriptor -> X0 = the new root, X1 = 0 (1: no table, 2: the reservation
+# cannot hold the scratch). The live state is measured (B, rounded to 16), copied into a scratch block
+# just below the lower of the committed run's bottom and the new area's bottom (so the block overlaps
+# neither a source nor its destination), moved to [top - 1040 - B, top - 1040), the 129 heads are zeroed,
+# #528 = the compacted end, #568 = B. The caller applies the state policy to the edge (§4.7).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 208
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 40], rbx
+	mov	rbx, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rsp + 48], rbx
+	mov	rbx, QWORD PTR [rbp - 96]
+	mov	QWORD PTR [rsp + 56], rbx
+	mov	rbx, QWORD PTR [rbp - 104]
+	mov	QWORD PTR [rsp + 64], rbx
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp + 72], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	mov	QWORD PTR [rbp - 72], rdx
+	mov	rdi, QWORD PTR [rbp - 64]
+	mov	rsi, QWORD PTR [rbp - 72]
+	call	silica_rt_state_measure
+	cmp	rdi, 0
+	jl	Lsca_notable
+	lea	rax, [rdi + 15]
+	mov	QWORD PTR [rbp - 80], rax
+	mov	rax, QWORD PTR [rbp - 80]
+	and	rax, -16
+	mov	QWORD PTR [rbp - 80], rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	lea	rax, [r10 - 1040]
+	mov	QWORD PTR [rbp - 88], rax
+	mov	rax, QWORD PTR [rbp - 88]
+	mov	rbx, QWORD PTR [rbp - 80]
+	sub	rax, rbx
+	mov	QWORD PTR [rbp - 88], rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r11, QWORD PTR [rax + 288]
+	mov	rax, r10
+	sub	rax, r11
+	mov	r11, rax
+	mov	rax, QWORD PTR [rbp - 88]
+	cmp	rax, r11
+	mov	rax, r11
+	mov	rbx, QWORD PTR [rbp - 88]
+	cmovb	rax, rbx
+	mov	QWORD PTR [rbp - 96], rax
+	mov	rax, QWORD PTR [rbp - 96]
+	mov	rbx, QWORD PTR [rbp - 80]
+	sub	rax, rbx
+	mov	QWORD PTR [rbp - 104], rax
+	mov	rax, QWORD PTR [rbp - 104]
+	cmp	rax, r11
+	jae	Lsca_committed
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 104]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_stack_grow_to
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 1
+	je	Lsca_noroom
+	cmp	rdi, 2
+	je	Lsca_noroom
+Lsca_committed:
+	mov	rdi, QWORD PTR [rbp - 64]
+	mov	rsi, QWORD PTR [rbp - 72]
+	mov	rdx, QWORD PTR [rbp - 104]
+	mov	rcx, QWORD PTR [rbp - 96]
+	mov	rax, QWORD PTR [rbp - 88]
+	mov	rbx, QWORD PTR [rbp - 104]
+	sub	rax, rbx
+	mov	r8, rax
+	call	silica_rt_state_copy
+	cmp	rsi, 0
+	jne	Lsca_notable
+	mov	QWORD PTR [rbp - 112], rdi
+	mov	rdi, QWORD PTR [rbp - 88]
+	mov	rsi, QWORD PTR [rbp - 104]
+	mov	rdx, QWORD PTR [rbp - 80]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	memcpy
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	rdi, rax
+	lea	rdi, [rdi - 1040]
+	mov	rsi, 0
+	mov	rdx, 1040
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	memset
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rax + 528], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rax + 568], rbx
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, 0
+	jmp	Lsca_ret
+Lsca_notable:
+	mov	rdi, QWORD PTR [rbp - 64]
+	mov	rsi, 1
+	jmp	Lsca_ret
+Lsca_noroom:
+	mov	rdi, QWORD PTR [rbp - 64]
+	mov	rsi, 2
+Lsca_ret:
+	mov	rbx, QWORD PTR [rsp + 64]
+	mov	QWORD PTR [rbp - 104], rbx
+	mov	rbx, QWORD PTR [rsp + 72]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 48]
+	mov	QWORD PTR [rbp - 88], rbx
+	mov	rbx, QWORD PTR [rsp + 56]
+	mov	QWORD PTR [rbp - 96], rbx
+	mov	rbx, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 40]
+	mov	QWORD PTR [rbp - 80], rbx
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+
+"
+}
+
+fn state_asm_retire_log() -> string {
+    "	.globl	silica_rt_state_retire
+	.p2align	4
+silica_rt_state_retire:
+# X0 = node, X1 = its bytes (the static size the emitter computed from the ref's type, the copier's
+# sizes). Logged only while #560 is set and the node lies in [edge, top): a node in a frame or a mailbox
+# buffer dies with its owner. The log doubles when full (64 entries first); a failed growth ends the actor.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 176
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_tls_current_actor_get
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 0
+	je	Lstr_done
+	mov	QWORD PTR [rbp - 72], rdi
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	r10, QWORD PTR [rax + 560]
+	cmp	r10, 0
+	je	Lstr_done
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	r10, QWORD PTR [rax + 528]
+	mov	rax, QWORD PTR [rbp - 56]
+	cmp	rax, r10
+	jb	Lstr_done
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 56]
+	cmp	rax, r10
+	jae	Lstr_done
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	r10, QWORD PTR [rax + 544]
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	r11, QWORD PTR [rax + 552]
+	cmp	r10, r11
+	jb	Lstr_append
+	mov	rax, r11
+	shl	rax, 1
+	mov	r11, rax
+	mov	r12, 64
+	cmp	r11, 64
+	mov	rax, r12
+	cmovae	rax, r11
+	mov	r11, rax
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rax + 552], r11
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	rdi, QWORD PTR [rax + 536]
+	mov	rax, r11
+	shl	rax, 4
+	mov	rsi, rax
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	realloc
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	cmp	rdi, 0
+	je	Lstr_oom
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rax + 536], rdi
+Lstr_append:
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	r10, QWORD PTR [rax + 544]
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	r11, QWORD PTR [rax + 536]
+	mov	rbx, r10
+	shl	rbx, 4
+	mov	rax, r11
+	lea	rax, [rax + rbx]
+	mov	r11, rax
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [r11], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [r11 + 8], rbx
+	lea	r10, [r10 + 1]
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rax + 544], r10
+Lstr_done:
+	mov	rbx, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+Lstr_oom:
+	mov	rdi, QWORD PTR [rbp - 72]
+	jmp	Lstc_fail_actor
+	.globl	silica_rt_state_log_drain
+	.p2align	4
+silica_rt_state_log_drain:
+# X0 = ACB: every logged (node, bytes) goes on the free list of its size; the count is reset.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 160
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], 0
+Lstd_loop:
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 544]
+	mov	rax, QWORD PTR [rbp - 64]
+	cmp	rax, r10
+	jae	Lstd_done
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r11, QWORD PTR [rax + 536]
+	mov	rbx, QWORD PTR [rbp - 64]
+	shl	rbx, 4
+	mov	rax, r11
+	lea	rax, [rax + rbx]
+	mov	r11, rax
+	mov	rsi, QWORD PTR [r11]
+	mov	rdx, QWORD PTR [r11 + 8]
+	mov	rdi, QWORD PTR [rbp - 56]
+	call	silica_rt_state_free
+	mov	rax, QWORD PTR [rbp - 64]
+	lea	rax, [rax + 1]
+	mov	QWORD PTR [rbp - 64], rax
+	jmp	Lstd_loop
+Lstd_done:
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 544], 0
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+
+"
+}
+
+fn state_asm_dispatch_end() -> string {
+    "	.globl	silica_rt_state_dispatch_end
+	.p2align	4
+silica_rt_state_dispatch_end:
+# X0 = ACB, X1 = the new state as the behaviour returned it -> X0 = the root to store at ACB #0. Runs on
+# the carrier's stack after the behaviour returned (the actor's frames are dead) and before the release
+# algorithm. X19 ACB, X20 the returned state, X21 the descriptor (#592), X22 the edge at entry, X23 the
+# old root (#0), X24 compacted, X25 the answer.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 208
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 40], rbx
+	mov	rbx, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rsp + 48], rbx
+	mov	rbx, QWORD PTR [rbp - 96]
+	mov	QWORD PTR [rsp + 56], rbx
+	mov	rbx, QWORD PTR [rbp - 104]
+	mov	QWORD PTR [rsp + 64], rbx
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rsp + 72], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 600]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 528]
+	mov	QWORD PTR [rbp - 80], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax]
+	mov	QWORD PTR [rbp - 88], rbx
+	mov	QWORD PTR [rbp - 96], 0
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rbp - 104], rax
+# Retained buffers (alloc_buf_retained, design §7, the pin rule): X26 = the pending list (top - 8; read only
+# when the header is committed), lowest block first. The edge goes down to that block now, so the blocks
+# are inside [edge, top) when the walk and the next dispatch see them; the evacuation is told the entry
+# edge (X3 = X22) as the low end of the OLD range, so the frame nodes between the blocks are still copied
+# (their gaps become holes at Lsde_policy), and its edge-bound block goes below the lowest retained one.
+	mov	QWORD PTR [rbp - 112], 0
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 288]
+	cmp	r10, 1040
+	jb	Lsde_no_retained
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	mov	rbx, QWORD PTR [r10 - 8]
+	mov	QWORD PTR [rbp - 112], rbx
+	cmp	QWORD PTR [rbp - 112], 0
+	je	Lsde_no_retained
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rax + 528], rbx
+Lsde_no_retained:
+	cmp	QWORD PTR [rbp - 72], 0
+	je	Lsde_scalar
+	cmp	QWORD PTR [rbp - 64], 65536
+	jb	Lsde_scalar
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 560]
+	cmp	r10, 0
+	je	Lsde_copy_all
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 584]
+	cmp	r10, 0
+	jne	Lsde_copy_all
+# Proven, no compaction asked for: evacuate the new nodes, then free the old root shell when the root
+# changed (a by-value record or tuple root is a node of the area that nothing in the new state can reach
+# once another root replaced it: packing the old state into the new one is an alias the proof rejects),
+# then drain the log (§4.3: this dispatch's holes serve the next one).
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	mov	rdx, QWORD PTR [rbp - 72]
+	mov	rcx, QWORD PTR [rbp - 80]
+	call	silica_rt_state_evacuate
+	cmp	rsi, 0
+	jne	Lsde_no_room
+	mov	QWORD PTR [rbp - 104], rdi
+	mov	rax, QWORD PTR [rbp - 88]
+	cmp	rax, QWORD PTR [rbp - 104]
+	je	Lsde_drain
+Lsde_old_shell:
+	mov	rax, QWORD PTR [rbp - 88]
+	cmp	rax, QWORD PTR [rbp - 80]
+	jb	Lsde_drain
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 88]
+	cmp	rax, r10
+	jae	Lsde_drain
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	rsi, QWORD PTR [rax + 16]
+	mov	rdx, QWORD PTR [rax + 24]
+	cmp	rsi, 4
+	je	Lsde_root_agg
+	cmp	rsi, 5
+	jne	Lsde_drain
+	mov	rdi, QWORD PTR [rbp - 88]
+	mov	rsi, rdx
+	call	Lstc_sum_desc
+	cmp	rsi, 0
+	je	Lsde_drain
+	mov	rdx, rsi
+Lsde_root_agg:
+	mov	r10, QWORD PTR [rdx]
+	mov	rax, r10
+	shl	rax, 3
+	mov	rdx, rax
+	cmp	rdx, 0
+	je	Lsde_drain
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 88]
+	call	silica_rt_state_free
+Lsde_drain:
+# Discarded retires free nothing (Lee 2026-11-01): under the proof an update whose version reaches the
+# new state makes the behaviour unproven, so every retire() logged in a proven dispatch is of an old
+# node whose updated version was discarded, and the new state may still hold it. The log is drained
+# only when the behaviour epilogue's buffer retire wrote it (#560 = 2: it emptied the log first and
+# then logged the old buffers the new state does not keep, prims_actors@bmv_state_buffer_retire_asm);
+# with #560 = 1 it is dropped.
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 560]
+	cmp	r10, 2
+	je	Lsde_drain_go
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 544], 0
+	jmp	Lsde_policy
+Lsde_drain_go:
+	mov	rdi, QWORD PTR [rbp - 56]
+	call	silica_rt_state_log_drain
+	jmp	Lsde_policy
+Lsde_copy_all:
+# No retained-buffer test here (the pin rule): a retained buffer exists only in the behaviour
+# spawn_dangerous installs (E4041), that behaviour is proven (E4037) and returns to the runtime through
+# its own epilogue's flag, and its spawn's state_policy(:keep_state_area) (E4036) makes compact_state()
+# a no-op, so a pinned actor never reaches the fallback.
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	mov	rdx, QWORD PTR [rbp - 72]
+	call	silica_rt_state_copy_all
+	cmp	rsi, 0
+	jne	Lsde_no_room
+	mov	QWORD PTR [rbp - 104], rdi
+	mov	QWORD PTR [rbp - 96], 1
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 544], 0
+	jmp	Lsde_policy
+Lsde_scalar:
+# A scalar new state of a DESCRIBED type (an atom replacing a record or a buffer) reaches no node. An
+# unproven behaviour, or a compaction request, takes the fallback as a pointer state does: copy_all of a
+# scalar root measures 0, copies nothing and leaves an empty area (every old node, buffers included, is
+# dropped; the state policy then applies as after any compaction). A proven one frees the old root shell
+# as on the evacuating path, then drains the log (which holds the old buffers the epilogue retired). A
+# state type with no descriptor has no nodes: only the log is drained.
+	cmp	QWORD PTR [rbp - 72], 0
+	je	Lsde_scalar_undescribed
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 560]
+	cmp	r10, 0
+	je	Lsde_copy_all
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 584]
+	cmp	r10, 0
+	jne	Lsde_copy_all
+	mov	rax, QWORD PTR [rbp - 88]
+	cmp	rax, QWORD PTR [rbp - 104]
+	jne	Lsde_old_shell
+	jmp	Lsde_drain
+Lsde_scalar_undescribed:
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 560]
+	cmp	r10, 0
+	je	Lsde_policy
+	jmp	Lsde_drain
+Lsde_policy:
+	cmp	QWORD PTR [rbp - 112], 0
+	je	Lsde_policy_go
+# The pending blocks are state nodes now; the dead frame bytes between them, and between the highest one
+# and the entry edge, become holes (each piece a multiple of 16: the blocks and the entry edge are
+# 16-aligned). #568 grows by the whole [lowest block, entry edge) and each hole's push takes its piece
+# off again, so it ends up counting the retained bytes. Then the pending list is emptied.
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 568]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 80]
+	mov	rbx, QWORD PTR [rbp - 112]
+	sub	rax, rbx
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	QWORD PTR [rbp - 8], rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 568], rbx
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	QWORD PTR [rbp - 64], rax
+Lsde_rt_loop:
+# Each block's front gap G ([x20, x20 + G), the pending link and G itself, both read first) becomes a hole;
+# its node [x20 + G, + round8(count + 8)) stays; the block ends where the node does.
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	rbx, QWORD PTR [rax]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rax, QWORD PTR [rbp - 64]
+	mov	r12, QWORD PTR [rax + 8]
+	mov	rax, QWORD PTR [rbp - 64]
+	lea	rax, [rax + r12]
+	mov	r13, rax
+	mov	rbx, QWORD PTR [r13]
+	mov	QWORD PTR [rbp - 16], rbx
+	mov	rax, QWORD PTR [rbp - 16]
+	lea	rax, [rax + 15]
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rax, QWORD PTR [rbp - 16]
+	and	rax, -8
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	mov	rdx, r12
+	call	silica_rt_state_free
+	mov	rbx, QWORD PTR [rbp - 16]
+	lea	rax, [r13 + rbx]
+	mov	rsi, rax
+	mov	rax, QWORD PTR [rbp - 80]
+	sub	rax, rsi
+	mov	rdx, rax
+	cmp	QWORD PTR [rbp - 72], 0
+	je	Lsde_rt_piece
+	mov	rax, QWORD PTR [rbp - 72]
+	sub	rax, rsi
+	mov	rdx, rax
+Lsde_rt_piece:
+	cmp	rdx, 16
+	jl	Lsde_rt_next
+	mov	rdi, QWORD PTR [rbp - 56]
+	call	silica_rt_state_free
+Lsde_rt_next:
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rbp - 64], rax
+	cmp	QWORD PTR [rbp - 64], 0
+	jne	Lsde_rt_loop
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r10]
+	mov	r10, rax
+	mov	QWORD PTR [r10 - 8], 0
+Lsde_policy_go:
+	cmp	QWORD PTR [rbp - 96], 0
+	je	Lsde_done
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 576]
+	cmp	r10, 0
+	jne	Lsde_shrink
+# :keep_state_area: the edge never moves up (the area keeps its largest size); it moves down only when
+# the compacted state is larger than the old area. The gap above the old edge is reclaimed by the next
+# compaction; it is above the edge, so the stack measurer never scans it.
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 528]
+	cmp	r10, QWORD PTR [rbp - 80]
+	mov	rax, QWORD PTR [rbp - 80]
+	cmovb	rax, r10
+	mov	r10, rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 528], r10
+	jmp	Lsde_done
+Lsde_shrink:
+# :shrink_after_compaction / :compact_on_request: the edge is the compacted end; the pages between the
+# old edge and the new one go back (keep = the committed bytes below the old edge), and the gap is zeroed
+# so no old state word reads as frame depth.
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r10, QWORD PTR [rax + 528]
+	cmp	r10, QWORD PTR [rbp - 80]
+	jbe	Lsde_done
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rax + 272]
+	mov	QWORD PTR [rbp - 8], rbx
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r11, QWORD PTR [rax + 280]
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	rax, [rax + r11]
+	mov	r11, rax
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	r12, QWORD PTR [rax + 288]
+	mov	rax, r11
+	sub	rax, r12
+	mov	r11, rax
+	mov	rax, QWORD PTR [rbp - 80]
+	sub	rax, r11
+	mov	rsi, rax
+	mov	rax, r10
+	mov	rbx, QWORD PTR [rbp - 80]
+	sub	rax, rbx
+	mov	rdx, rax
+	mov	rdi, QWORD PTR [rbp - 56]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_stack_release_to
+	mov	rsp, rbp
+	pop	rbp
+Lsde_done:
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 584], 0
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 560], 0
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 544], 0
+	mov	rax, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rax + 600], 0
+	mov	rdi, QWORD PTR [rbp - 104]
+	mov	rbx, QWORD PTR [rsp + 64]
+	mov	QWORD PTR [rbp - 104], rbx
+	mov	rbx, QWORD PTR [rsp + 72]
+	mov	QWORD PTR [rbp - 112], rbx
+	mov	rbx, QWORD PTR [rsp + 48]
+	mov	QWORD PTR [rbp - 88], rbx
+	mov	rbx, QWORD PTR [rsp + 56]
+	mov	QWORD PTR [rbp - 96], rbx
+	mov	rbx, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 40]
+	mov	QWORD PTR [rbp - 80], rbx
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+Lsde_no_room:
+	mov	rdi, QWORD PTR [rbp - 56]
+Lstc_fail_actor:
+# X0 = ACB: the state does not fit the reservation, or the runtime's own table or log could not be
+# allocated (decision 39): (:explicit, :reservation_exceeded) when the program lowered the reservation
+# (#376), (:explicit, :out_of_memory) otherwise. _silica_rt_actor_fail_current leaves this stack (the
+# carrier's base, or the thread's alternate stack) and never returns.
+	mov	r10, QWORD PTR [rdi + 376]
+	cmp	r10, 0
+	je	Lstc_fail_default
+	lea	rax, [rip + silica_rt_reservation_exceeded_atom]
+	mov	QWORD PTR [rbp - 8], rax
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rax]
+	and	rsp, -16
+	call	silica_rt_actor_fail_current
+Lstc_fail_default:
+	lea	rax, [rip + silica_rt_out_of_memory_atom]
+	mov	QWORD PTR [rbp - 8], rax
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rax]
+	and	rsp, -16
+	call	silica_rt_actor_fail_current
+
+"
+}
+
+fn emit_actor_state_runtime_asm() -> string {
+    concat(concat(concat(concat(state_asm_alloc_free(), state_asm_install()), concat(state_asm_table(), concat(state_asm_measure_root(), state_asm_measure_agg()))), concat(concat(state_asm_measure_ref(), state_asm_measure_list_str()), concat(concat(state_asm_copy_root(), state_asm_copy_agg()), concat(state_asm_copy_ref(), state_asm_copy_list_str())))), concat(state_asm_evacuate_copy_all(), concat(state_asm_retire_log(), state_asm_dispatch_end())))
+}

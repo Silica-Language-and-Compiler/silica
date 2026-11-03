@@ -29,7 +29,8 @@
 // Operands: binary prims expect inner -> X9, right_expr -> X10 (same as arithmetic).
 // spawn: right_expr is the flat chain tuple_make(behavior, stack_policy[, placement]); X10 points at the flat words
 // [beh, policy(, core)] and X11 holds the initial state (§15.1.2.2: the stack policy is a required argument; the
-// runtime takes it in X4 as (reserve & ~15) | algorithm). stack_policy(reserve, release) itself is packed inline.
+// runtime takes it in X4 as (reserve & ~63) | state policy << 4 | algorithm). stack_policy(reserve, release) itself is
+// packed inline; a following state policy (decision 40) is joined into bits 4-5 by "spawn_policy_join".
 // Structured returns (cpu_topology, core_info, List[...]): runtime passes a heap pointer in X0 per AAPCS; Phase G fills layout in prims_actors_runtime_asm.silica.
 
 use reg_conventions;
@@ -37,6 +38,7 @@ use atom_table;
 use prims_record;
 use prims_tuple;
 use term_message_copy;
+use sir_state_release;
 use var;
 use module_linkage;
 use x86_isa;
@@ -52,9 +54,9 @@ export module_uses_link_monitor_prims/1;
 export gpr_x_view/1;
 export composite_move_bytes/1;
 export composite_move_has_scalar_alt/1;
-export behaviour_result_move_asm/4;
+export behaviour_result_move_asm/5;
 export behaviour_result_evacuate_asm/3;
-export behaviour_convention_prefix/1;
+export behaviour_convention_prefix/2;
 
 
 // Local SIRTerm arena helpers (sir_ast node accessors are not exported).
@@ -228,14 +230,15 @@ fn is_actor_prim(name: string) -> bool {
         or name == "migrate_actor"
         or name == "register_failure_reporter"
         or name == "wait_for_exit" or name == "cast_exit"
-        or name == "stack_policy"
-        or name == "heap_used" or name == "actor_carrier_index"
+        or name == "stack_policy" or name == "state_policy" or name == "spawn_policy_join"
+        or name == "heap_used" or name == "state_area_bytes" or name == "compact_state" or name == "actor_carrier_index"
 }
 
 fn actor_prim_is_nullary(name: string) -> bool {
     name == "self" or name == "recv" or name == "get_cpu_topology" or name == "get_efficiency_cores" or name == "get_performance_cores"
         or name == "supervision_wait_and_drain_one" or name == "wait_for_exit" or name == "child_table_first_ref"
         or name == "get_registry_actor" or name == "get_pid_registry" or name == "heap_used"
+        or name == "state_area_bytes" or name == "compact_state"
         or name == "stop_self_normal"
         or name == "monotonic_time" or name == "current_time"
 }
@@ -252,6 +255,7 @@ fn actor_prim_is_unary(name: string) -> bool {
         or name == "supervisor_op_child"
         or name == "register_failure_reporter" or name == "set_scheduler_policy" or name == "cast_exit"
         or name == "actor_carrier_index"
+        or name == "state_policy"
 }
 
 fn asm_bl(label: string) -> string {
@@ -383,23 +387,23 @@ fn mov_dest_from_x0_for_type(dest: string, result_type: string) -> string {
 // spawn_linked: §15.4.8.3 / supervisors_implementation_development_plan Phase A.
 // ABI silica_rt_actor_spawn_linked(X0 init, X1 beh, X2 agent_atom, X3 core_id): core_id 0 = default placement.
 // 3-arg SIR: right = tuple_make(beh, agent); 4-arg: flat [beh, agent, core] at X10 (nested tuple_make layout).
-fn emit_spawn_linked(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+fn emit_spawn_linked(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, desc: { load: string, data: string }) -> string {
     e3b_pfx: string <- e3b_trampoline_x4_prefix(sir_term_root_node(term).value);
     four_args: bool <- sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).kind == 6 and sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).name == "tuple_make"
         and sir_term_root_node(sir_term_at(sir_term_at(term, sir_term_root_node(term).right_expr), sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).inner)).kind == 6 and sir_term_root_node(sir_term_at(sir_term_at(term, sir_term_root_node(term).right_expr), sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).inner)).name == "tuple_make";
     case four_args of {
         true -> {
             args4: string <- concat(concat(x86_isa@x86_mov("X0", "X11"), x86_mem@x86_ldr("X1", "[X10]")), concat(x86_mem@x86_ldr("X2", "[X10, #8]"), x86_mem@x86_ldr("X3", "[X10, #16]")));
-            concat(concat(concat(e3b_pfx, args4), asm_bl("silica_rt_actor_spawn_linked")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
+            concat(concat(concat(concat(e3b_pfx, concat(args4, desc.load)), asm_bl("silica_rt_actor_spawn_linked")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)), desc.data)
         };
         false -> case sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).kind == 6 and sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).name == "tuple_make" of {
             true -> {
                 args3: string <- concat(concat(x86_isa@x86_mov("X0", "X11"), x86_mem@x86_ldr("X1", "[X10]")), concat(x86_mem@x86_ldr("X2", "[X10, #8]"), x86_isa@x86_mov("X3", "XZR")));
-                concat(concat(concat(e3b_pfx, args3), asm_bl("silica_rt_actor_spawn_linked")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
+                concat(concat(concat(concat(e3b_pfx, concat(args3, desc.load)), asm_bl("silica_rt_actor_spawn_linked")), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)), desc.data)
             };
             false -> {
                 args2: string <- concat(stage_x0_x1("X9", "X10"), concat(x86_isa@x86_mov("X2", "XZR"), x86_isa@x86_mov("X3", "XZR")));
-                concat(concat(spawn_init_move_asm(sir_term_at(term, sir_term_root_node(term).inner), "X9", "X10"), concat(concat(e3b_pfx, args2), asm_bl("silica_rt_actor_spawn_linked"))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
+                concat(concat(concat(spawn_promote_init_reg(term, "X9", "X10", desc), concat(concat(e3b_pfx, concat(args2, desc.load)), asm_bl("silica_rt_actor_spawn_linked"))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)), desc.data)
             }
         }
     }
@@ -424,8 +428,56 @@ fn spawn_core_from_flat(count: int64, core_idx: int64) -> string {
 // The initial state is held in X11 while the flat argument words are built into X10. A stack-built
 // aggregate initial state is promoted to the heap first, so the actor never keeps a pointer into the
 // spawning frame; the promote clobbers X1..X4 and X9..X17, so X10 is parked on the stack around it.
-fn spawn_promote_init_x11(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    spawn_init_move_asm(sir_term_at(term, sir_term_root_node(term).inner), "X11", "X10")
+fn spawn_promote_init_x11(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, desc: { load: string, data: string }) -> string {
+    spawn_promote_init_reg(term, "X11", "X10", desc)
+}
+
+// Chunk 15 phase 3b (design §5.4): a spawn site that hands the runtime a descriptor (spawn_state_desc_asm)
+// promotes nothing: silica_rt_state_install copies the initial state into the child's state area,
+// reading it where it lies (a frame, the state area, a literal). Only a state the descriptors cannot
+// follow keeps the one-level shell promote to the heap of the phase 2 model.
+fn spawn_promote_init_reg(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, reg: string, park: string, desc: { load: string, data: string }) -> string {
+    case length_bytes(desc.data) > 0 of {
+        true -> "";
+        false -> spawn_init_move_asm(sir_term_at(term, sir_term_root_node(term).inner), reg, park)
+    }
+}
+
+fn spawn_state_described(t0: string) -> bool {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    length_bytes(t) > 0 and reg_conventions@is_frame_free_scalar_type(t) == false and term_message_copy@ev_type_described(t)
+}
+
+// Chunk 15 phase 3b (design §5.4, P5; the Mac emitter's spawn_state_desc_asm): the spawn site hands the
+// runtime the ROOT-WORD descriptor of the initial state's type (`L_sd_<fn>_<node>_0: .quad 1, -1; .quad
+// KIND, AUX`), in `reg` (X6 = r14 for the spawn family, X7 = r15 for spawn_linked), or 0 for a scalar type
+// and for one the descriptors do not follow. silica_rt_state_install (prims_actors_state_asm) measures the
+// value and copies it into the child's state area, one copier table per state slot, once the child's
+// reservation exists and before it can run. `load` goes right before the runtime call; `data` is the
+// descriptor's rodata block. A described state takes no heap copy at the site (`copy` is ""); an
+// undescribed one keeps the phase 2 copy (spawn_deep_copy_asm).
+fn spawn_state_desc_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, reg: string) -> { load: string, data: string } {
+    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
+    t: string <- prims_record@strip_spaces_rt(sir_term_root_node(sir_term_at(term, n.inner)).type_name);
+    case spawn_state_described(t) of {
+        false -> spawn_no_desc(reg);
+        true -> {
+            label: string <- concat("L_sd_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(term.root))));
+            { load: x86_isa@x86_adr(reg, concat(label, "_0")), data: term_message_copy@md_rodata_block(term_message_copy@ev_site_descriptor_rodata(t, label, table)) }
+        }
+    }
+}
+
+fn spawn_no_desc(reg: string) -> { load: string, data: string } {
+    { load: x86_isa@x86_mov(reg, "XZR"), data: "" }
+}
+
+// The phase 2 heap copy of an undescribed initial state; "" when the site has a descriptor.
+fn spawn_init_copy(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    case spawn_state_described(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name) of {
+        true -> "";
+        false -> spawn_deep_copy_asm(term, outer_reg, table)
+    }
 }
 
 // The initial state is MOVED from the spawner into the new actor (actor_memory_budget_plan.md item
@@ -595,94 +647,254 @@ fn bmv_reply_asm(rbytes: int64, r_scalar: bool, skip_label: string, reply_copy: 
     }
 }
 
-fn bmv_state_asm(sbytes: int64, s_scalar: bool, soff: int64, lbl: string) -> string {
-    l_install: string <- concat(lbl, "_si");
+// The undescribed state (a type the descriptors cannot follow to every word: a type parameter, a trait
+// type; term_message_copy@ev_type_described false): the one-level shell promote to the actor's heap of
+// the phase 2 model, written back into the result tuple, which the runtime's dispatch end answers as
+// given (its descriptor word, ACB #600, is 0). X9 = the new state, [SP] = ACB, [SP, #8] = result tuple.
+fn bmv_state_undescribed_asm(sbytes: int64, s_scalar: bool, soff: int64, lbl: string) -> string {
     l_end: string <- concat(lbl, "_se");
     load: string <- concat(x86_mem@x86_ldr("X0", "[SP, #8]"), concat(x86_mem@x86_ldr("X9", bmv_off("X0", soff)), concat(x86_mem@x86_ldr("X10", "[SP, #0]"), x86_mem@x86_ldr("X10", "[X10, #0]"))));
     same: string <- x86_isa@x86_cmp_branch("EQ", "X9", "X10", l_end);
     atom_new: string <- case s_scalar of {
-        true -> x86_isa@x86_cmp_branch("LO", "X9", "#65536", l_install);
+        true -> x86_isa@x86_cmp_branch("LO", "X9", "#65536", l_end);
         false -> ""
     };
     copy: string <- concat(x86_isa@x86_mov("X0", "X9"), concat(heap_promote_stack_aggregate_x0(sbytes), concat(x86_isa@x86_mov("X9", "X0"), concat(x86_mem@x86_ldr("X0", "[SP, #8]"), x86_mem@x86_str("X9", bmv_off("X0", soff))))));
-    install: string <- concat(concat(l_install, ":\n"), concat(x86_mem@x86_ldr("X10", "[SP, #0]"), x86_mem@x86_str("X9", "[X10, #0]")));
-    concat(concat(concat(load, same), concat(atom_new, copy)), concat(install, concat(l_end, ":\n")))
+    concat(concat(load, same), concat(concat(atom_new, copy), concat(l_end, ":\n")))
 }
 
-// Tag in the word before a state block the boundary move allocated: the owning ACB's address
-// XOR a constant (X12 <- tag, X13 scratch).
-fn bmv_tag_x12() -> string {
-    concat(x86_mem@x86_ldr("X12", "[SP, #0]"), concat(x86_isa@x86_mov("X13", "#6636617002358145024"), x86_isa@x86_eor("X12", "X12", "X13")))
-}
-
-fn bmv_copy_words(i: int64, words: int64, from: string, to: string) -> string {
-    case i >= words of {
-        true -> "";
-        false -> concat(concat(x86_mem@x86_ldr("X11", bmv_off(from, i * 8)), x86_mem@x86_str("X11", bmv_off(to, i * 8))), bmv_copy_words(i + 1, words, from, to))
+// The state part of the behaviour epilogue (chunk 15 phase 3c, chunk15_stack_memory_design.md §4.3-§4.6;
+// the Mac emitter's bmv_state_asm). The behaviour frame lies directly below the state area (the dispatch
+// switched rsp to the edge), so nothing can be placed at the edge here: the epilogue records what the
+// runtime's dispatch end needs (prims_actors_state_asm silica_rt_state_dispatch_end, called from
+// LBB1_post_beh on the carrier's stack) and the state is never moved to a heap. [SP] = ACB. A described
+// state type stores its root-word descriptor at ACB #600 (L_std_<fn>_0, the form every spawn site emits;
+// the Mac's #592); a scalar or undescribed state stores 0 there (the undescribed one is promoted to the
+// heap first, bmv_state_undescribed_asm). The proof flag goes to #560 last (the prefix word set it at
+// dispatch start; a behaviour-shaped helper called in the body may have set its own, and the function
+// returning to the runtime decides).
+fn bmv_state_asm(stype: string, soff: int64, entry_label: string, proven: bool, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> { code: string, data: string } {
+    flag: string <- case proven of { true -> "1"; false -> "0" };
+    flag_asm: string <- concat("    mov QWORD PTR [r11 + 560], ", concat(flag, "\n"));
+    scalar: bool <- length_bytes(stype) == 0 or reg_conventions@is_frame_free_scalar_type(stype);
+    described: bool <- scalar == false and term_message_copy@ev_type_described(stype);
+    label: string <- concat("L_std_", entry_label);
+    case described of {
+        true -> {
+            desc: string <- concat("    mov r11, QWORD PTR [rsp]\n    lea rax, [rip + ", concat(label, "_0]\n    mov QWORD PTR [r11 + 600], rax\n"));
+            { code: concat(desc, flag_asm), data: term_message_copy@md_rodata_block(term_message_copy@ev_site_descriptor_rodata(stype, label, table)) }
+        };
+        false -> {
+            sbytes: int64 <- composite_move_bytes(stype);
+            promote: string <- case scalar or sbytes <= 0 of {
+                true -> "";
+                false -> bmv_state_undescribed_asm(sbytes, composite_move_has_scalar_alt(stype), soff, concat("L_bmv_", entry_label))
+            };
+            clear: string <- "    mov r11, QWORD PTR [rsp]\n    mov QWORD PTR [r11 + 600], 0\n";
+            { code: concat(promote, concat(clear, flag_asm)), data: "" }
+        }
     }
 }
 
-// The state move when the old block may be reused (see emitter_core@behaviour_state_reusable):
-// X9 = new state, [SP] = ACB, [SP, #8] = result tuple. Same state -> nothing; a tagged current block
-// -> copy the shell over it; else a fresh tagged block.
-fn bmv_state_reuse_asm(sbytes: int64, soff: int64, lbl: string) -> string {
-    l_fresh: string <- concat(lbl, "_sf");
-    l_set: string <- concat(lbl, "_ss");
-    l_end: string <- concat(lbl, "_se");
-    words: int64 <- sbytes / 8;
-    load: string <- concat(x86_mem@x86_ldr("X0", "[SP, #8]"), concat(x86_mem@x86_ldr("X9", bmv_off("X0", soff)), concat(x86_mem@x86_ldr("X10", "[SP, #0]"), concat(x86_mem@x86_ldr("X10", "[X10, #0]"), x86_isa@x86_cmp_branch("EQ", "X9", "X10", l_end)))));
-    check: string <- concat(x86_isa@x86_cbz("X10", l_fresh), concat(x86_mem@x86_ldr("X11", "[X10, #-8]"), concat(bmv_tag_x12(), x86_isa@x86_cmp_branch("NE", "X11", "X12", l_fresh))));
-    reuse: string <- concat(bmv_copy_words(0, words, "X9", "X10"), concat(x86_isa@x86_mov("X9", "X10"), x86_isa@x86_b(l_set)));
-    fresh: string <- concat(concat(concat(l_fresh, ":\n"), concat(x86_mem@x86_str("X9", "[SP, #-16]!"), concat(x86_isa@x86_movi("X0", sbytes + 8), concat(x86_isa@x86_call("silica_rt_region_alloc"), concat(x86_mem@x86_ldr("X9", "[SP], #16"), bmv_tag_x12()))))),
-        concat(x86_mem@x86_str("X12", "[X0, #0]"), concat(x86_isa@x86_add("X10", "X0", "#8"), concat(bmv_copy_words(0, words, "X9", "X10"), x86_isa@x86_mov("X9", "X10")))));
-    set: string <- concat(concat(l_set, ":\n"), concat(x86_mem@x86_ldr("X0", "[SP, #8]"), concat(x86_mem@x86_str("X9", bmv_off("X0", soff)), concat(x86_mem@x86_ldr("X10", "[SP, #0]"), x86_mem@x86_str("X9", "[X10, #0]")))));
-    concat(concat(concat(load, check), concat(reuse, fresh)), concat(set, concat(l_end, ":\n")))
+// Buffers in state (Lee 2026-11-01; chunk15_stack_memory_design.md §4.2; the Mac emitter's
+// bmv_state_buffer_retire_asm, whose comment gives the rule in full): when the state's buffers are at one
+// field offset each (sir_state_release@state_buffer_variant: S a buffer, a record whose fields are buffers
+// or hold none, a sum of atoms and one of these, or the tuple shape (region, A)), a proven behaviour's
+// epilogue retires every OLD buffer the new state does not keep, and the dispatch end frees it with the
+// rest of the release log after the evacuation. It runs only when this function's result IS the
+// dispatch's result (the tuple is the runtime's buffer, the carrier rsp the dispatch saved at ACB #368),
+// empties the log first (#544 = 0) and stores #560 = 2, the mark that tells the dispatch end to drain the
+// log (with 1 it drops it: a retire() whose updated version was discarded frees nothing, Lee
+// 2026-11-01). The old root is ACB #0, the new one the result tuple's state word. Registers (everything
+// is dead in the epilogue; each block reloads, the retire call clobbers the caller-saved homes): r11 the
+// ACB, r10 the tuple, r8 the new root, r9 the old root, rdi the buffer, rax a compared word.
+fn bsr_csv_first(csv: string) -> string {
+    i: int64 <- bsr_find_comma(csv, 0);
+    case i < 0 of { true -> csv; false -> substring(csv, 0, i) }
 }
 
+fn bsr_csv_rest(csv: string) -> string {
+    i: int64 <- bsr_find_comma(csv, 0);
+    case i < 0 of { true -> ""; false -> substring(csv, i + 1, length_bytes(csv)) }
+}
+
+fn bsr_find_comma(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 1) == "," of {
+            true -> i;
+            false -> bsr_find_comma(s, i + 1)
+        }
+    }
+}
+
+fn bsr_contains(h: string, needle: string, i: int64) -> bool {
+    case i + length_bytes(needle) > length_bytes(h) of {
+        true -> false;
+        false -> case substring(h, i, i + length_bytes(needle)) == needle of {
+            true -> true;
+            false -> bsr_contains(h, needle, i + 1)
+        }
+    }
+}
+
+// A buffer's element bytes, exactly as prims_memory@elem_size_bytes_from_buf_type sizes the allocation:
+// 1 for int8 / uint8, 2 for int16 / uint16, 4 for int32 / uint32, else 8.
+fn bsr_elem_bytes(buf_type: string) -> int64 {
+    case bsr_contains(buf_type, "int8", 0) of {
+        true -> 1;
+        false -> case bsr_contains(buf_type, "int16", 0) of {
+            true -> 2;
+            false -> case bsr_contains(buf_type, "int32", 0) of {
+                true -> 4;
+                false -> 8
+            }
+        }
+    }
+}
+
+fn bsr_dec(n: int64) -> string {
+    atom_table@int64_to_decimal_string(n)
+}
+
+// Every buffer field's offset is a real field of the variant.
+fn bsr_offsets_ok(variant: string, names: string) -> bool {
+    case length_bytes(names) == 0 of {
+        true -> true;
+        false -> prims_record@offset_bytes_before_field(variant, bsr_csv_first(names)) > 0 and bsr_offsets_ok(variant, bsr_csv_rest(names))
+    }
+}
+
+// "mov rax, [base + off]; cmp rdi, rax; je keep" for each buffer field in names.
+fn bsr_compare_fields(variant: string, names: string, base: string, keep: string) -> string {
+    case length_bytes(names) == 0 of {
+        true -> "";
+        false -> {
+            off: int64 <- prims_record@offset_bytes_before_field(variant, bsr_csv_first(names));
+            here: string <- concat(concat(concat("    mov rax, QWORD PTR [", base), concat(" + ", concat(bsr_dec(off), "]\n"))), concat("    cmp rdi, rax\n    je ", concat(keep, "\n")));
+            concat(here, bsr_compare_fields(variant, bsr_csv_rest(names), base, keep))
+        }
+    }
+}
+
+fn bsr_reload(soff: string) -> string {
+    concat("    mov r11, QWORD PTR [rsp]\n    mov r10, QWORD PTR [rsp + 8]\n    mov r8, QWORD PTR [r10 + ", concat(soff, "]\n    mov r9, QWORD PTR [r11]\n"))
+}
+
+// rdi = the buffer value: its node and size into rdi / rsi, then the retire.
+fn bsr_retire_x0(elem_bytes: int64) -> string {
+    concat(concat("    mov rsi, QWORD PTR [rdi - 8]\n    imul rsi, rsi, ", concat(bsr_dec(elem_bytes), "\n")), "    add rsi, 15\n    and rsi, -8\n    sub rdi, 8\n    call silica_rt_state_retire\n")
+}
+
+// One block per buffer field, in field order; earlier = the fields before this one.
+fn bsr_field_blocks(variant: string, names: string, all: string, earlier: string, soff: string, lbl: string, i: int64) -> string {
+    case length_bytes(names) == 0 of {
+        true -> "";
+        false -> {
+            fname: string <- bsr_csv_first(names);
+            off: int64 <- prims_record@offset_bytes_before_field(variant, fname);
+            keep: string <- concat(lbl, concat("_k", bsr_dec(i)));
+            go: string <- concat(lbl, concat("_r", bsr_dec(i)));
+            load: string <- concat(bsr_reload(soff), concat("    mov rdi, QWORD PTR [r9 + ", concat(bsr_dec(off), concat("]\n    cmp rdi, 65536\n    jb ", concat(keep, "\n")))));
+            dedupe: string <- bsr_compare_fields(variant, earlier, "r9", keep);
+            kept: string <- concat(concat("    cmp r8, 65536\n    jb ", concat(go, "\n")), bsr_compare_fields(variant, all, "r8", keep));
+            retire: string <- concat(concat(go, ":\n"), bsr_retire_x0(bsr_elem_bytes(prims_record@find_field_type_in_record(variant, fname))));
+            block: string <- concat(concat(load, dedupe), concat(kept, concat(retire, concat(keep, ":\n"))));
+            concat(block, bsr_field_blocks(variant, bsr_csv_rest(names), all, concat(earlier, concat(fname, ",")), soff, lbl, i + 1))
+        }
+    }
+}
+
+// The tuple buffer shape: r8 / r9 = the new / old root tuples (bsr_reload, still live: no call since).
+// Element 1 is the sum A at [root + 8]; the region element (+0) is carried by the proof and left alone.
+// The old element 1 is kept when it is an atom or the new root's element 1; any other old buffer is retired.
+fn bsr_tuple_block(buf_type: string, lbl: string) -> string {
+    keep: string <- concat(lbl, "_k0");
+    go: string <- concat(lbl, "_r0");
+    load: string <- concat("    mov rdi, QWORD PTR [r9 + 8]\n    cmp rdi, 65536\n    jb ", concat(keep, "\n"));
+    kept: string <- concat(concat("    cmp r8, 65536\n    jb ", concat(go, "\n")), concat("    mov rax, QWORD PTR [r8 + 8]\n    cmp rdi, rax\n    je ", concat(keep, "\n")));
+    retire: string <- concat(concat(go, ":\n"), bsr_retire_x0(bsr_elem_bytes(buf_type)));
+    concat(concat(load, kept), concat(retire, concat(keep, ":\n")))
+}
+
+fn bmv_state_buffer_retire_asm(return_type: string, entry_label: string, proven: bool) -> string {
+    variant: string <- sir_state_release@state_buffer_variant(return_type);
+    names: string <- sir_state_release@state_buffer_field_names(variant);
+    is_buf: bool <- length_bytes(variant) >= 4 and substring(variant, 0, 4) == "buf(";
+    is_tuple: bool <- length_bytes(variant) >= 10 and substring(variant, 0, 10) == "#tuplebuf,";
+    case proven == false or length_bytes(variant) == 0 or (is_buf == false and is_tuple == false and (length_bytes(names) == 0 or bsr_offsets_ok(variant, names) == false)) of {
+        true -> "";
+        false -> {
+            t: string <- prims_record@strip_spaces_rt(return_type);
+            soff: string <- case length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply," of { true -> "16"; false -> "8" };
+            lbl: string <- concat("L_bsr_", entry_label);
+            done: string <- concat(lbl, "_done");
+            dispatched: string <- concat("    mov r11, QWORD PTR [rsp]\n    mov r10, QWORD PTR [rsp + 8]\n    cmp r10, QWORD PTR [r11 + 368]\n    jne ", concat(done, "\n    mov QWORD PTR [r11 + 544], 0\n    mov QWORD PTR [r11 + 560], 2\n"));
+            changed: string <- concat(bsr_reload(soff), concat("    cmp r8, r9\n    je ", concat(done, concat("\n    cmp r9, 65536\n    jb ", concat(done, "\n")))));
+            body: string <- case is_buf of {
+                true -> concat("    mov rdi, r9\n", bsr_retire_x0(bsr_elem_bytes(variant)));
+                false -> case is_tuple of {
+                    true -> bsr_tuple_block(substring(variant, 10, length_bytes(variant)), lbl);
+                    false -> bsr_field_blocks(variant, names, names, "", soff, lbl, 0)
+                }
+            };
+            concat(concat(dispatched, changed), concat(body, concat(done, ":\n")))
+        }
+    }
+}
 
 // Spec §16.2.6.4: the calling convention that a spawn of this function records. The word sits
 // immediately before the function's entry: 0x5C1AC0F1 call-only ((:reply, ...)), 0x5C1AC0F2
 // cast-only ((:no_reply, ...)); the runtime reads it at spawn and compares it on every call/cast.
-fn behaviour_convention_prefix(return_type: string) -> string {
+// Bit 2 (0x5C1AC0F5 / 0x5C1AC0F6) is the state-release proof of chunk15_stack_memory_design.md §4.1
+// (sir_state_release, chunk 15 phase 3c; the Mac emitter's word): the runtime reads it at every
+// dispatch start into ACB #560 (silica_rt_beh_proven_store), so retire() logs during a proven
+// behaviour's dispatch; silica_rt_beh_convention reads bits 0-1 only.
+fn behaviour_convention_prefix(return_type: string, proven: bool) -> string {
     t: string <- prims_record@strip_spaces_rt(return_type);
     case length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply," of {
-        true -> "    .p2align 2\n    .long 0x5C1AC0F1\n";
+        true -> case proven of {
+            true -> "    .p2align 2\n    .long 0x5C1AC0F5\n";
+            false -> "    .p2align 2\n    .long 0x5C1AC0F1\n"
+        };
         false -> case length_bytes(t) >= 11 and substring(t, 0, 11) == "(:no_reply," of {
-            true -> "    .p2align 2\n    .long 0x5C1AC0F2\n";
+            true -> case proven of {
+                true -> "    .p2align 2\n    .long 0x5C1AC0F6\n";
+                false -> "    .p2align 2\n    .long 0x5C1AC0F2\n"
+            };
             false -> ""
         }
     }
 }
 
-// Chunk 15 phase 2, interim until phase 3 (state at the base) and phase 4 (replies into the caller):
-// X0 = rdi = the result tuple. The new state and a composite reply are walked out of the behaviour's
-// frame ([rsp, entry rsp), the entry rsp being rbp + 16) into the actor's heap by L_ev_heap
-// (prims_memory), so the shell moves of behaviour_result_move_asm and the runtime see heap data only.
+// Chunk 15 phase 2, interim until the reply goes into the caller's stack (the Mac's phase 4c): X0 = rdi =
+// the result tuple. A composite reply is walked into the actor's heap by L_ev_heap (prims_memory), so the
+// shell move of behaviour_result_move_asm and the caller see heap data only. Since the state area (chunk
+// 15 phase 3) the walk's upper bound is the top of the actor's reservation, not the behaviour's entry rsp:
+// a reply that points into the actor's state (a string or list of the state) is copied out too, because
+// the dispatch end may free or compact the state area before the caller reads the reply (the Mac's phase
+// 3 string-reply copy, for every kind). Outside an actor, or without a reservation, the bound is the
+// entry rsp (rbp + 16). The new state is not walked: the dispatch end evacuates it into the state area.
 // A type the descriptors cannot follow (a type parameter, a trait type) is left as it is.
-fn behaviour_result_evacuate_asm(return_type: string, entry_label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn behaviour_result_evacuate_asm(return_type: string, entry_label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     t: string <- prims_record@strip_spaces_rt(return_type);
     reply_form: bool <- length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,";
-    stype: string <- case reply_form of {
-        true -> prims_tuple@tuple_type_nth_element(t, 2);
-        false -> prims_tuple@tuple_type_nth_element(t, 1)
-    };
-    soff: int64 <- case reply_form of { true -> 16; false -> 8 };
-    s_part: { code: string, data: string } <- bev_one(stype, soff, concat("L_evb_", concat(entry_label, "_s")), table);
     r_part: { code: string, data: string } <- case reply_form of {
         true -> bev_one(prims_tuple@tuple_type_nth_element(t, 1), 8, concat("L_evb_", concat(entry_label, "_r")), table);
         false -> { code: "", data: "" }
     };
-    case length_bytes(s_part.code) == 0 and length_bytes(r_part.code) == 0 of {
+    case length_bytes(r_part.code) == 0 of {
         true -> "";
-        false -> concat(concat(x86_mem@x86_str("X0", "[SP, #-16]!"), concat(s_part.code, r_part.code)), concat(x86_mem@x86_ldr("X0", "[SP], #16"), concat(s_part.data, r_part.data)))
+        false -> concat(concat(x86_mem@x86_str("X0", "[SP, #-16]!"), r_part.code), concat(x86_mem@x86_ldr("X0", "[SP], #16"), r_part.data))
     }
 }
 
-fn bev_one(t: string, off: int64, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> { code: string, data: string } {
+fn bev_one(t: string, off: int64, label: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> { code: string, data: string } {
     case length_bytes(t) == 0 or reg_conventions@is_frame_free_scalar_type(t) or term_message_copy@ev_type_described(t) == false of {
         true -> { code: "", data: "" };
         false -> {
             o: string <- atom_table@int64_to_decimal_string(off);
+            hi: string <- "    call silica_rt_tls_current_actor_get\n    lea rcx, [rbp + 16]\n    test rdi, rdi\n    jz 1f\n    mov rax, QWORD PTR [rdi + 272]\n    test rax, rax\n    jz 1f\n    add rax, QWORD PTR [rdi + 280]\n    mov rcx, rax\n1:\n";
             load: string <- concat("    mov r10, QWORD PTR [rsp]\n    mov rdi, QWORD PTR [r10 + ", concat(o, "]\n"));
             desc: string <- concat("    lea rax, [rip + ", concat(label, "_0]\n    mov rsi, QWORD PTR [rax + 16]\n    mov rdx, QWORD PTR [rax + 24]\n"));
             // A record or tuple shell stays put (the move below copies it); only what it points at moves.
@@ -690,15 +902,15 @@ fn bev_one(t: string, off: int64, label: string, table: { is_empty: boolean, ind
                 true -> "L_ev_heap_shell";
                 false -> "L_ev_heap"
             };
-            call: string <- concat(concat("    lea rcx, [rbp + 16]\n    call ", entry), concat("\n    mov r10, QWORD PTR [rsp]\n    mov QWORD PTR [r10 + ", concat(o, "], rdi\n")));
-            { code: concat(load, concat(desc, call)), data: term_message_copy@md_rodata_block(term_message_copy@ev_site_descriptor_rodata(t, label, table)) }
+            call: string <- concat(concat("    call ", entry), concat("\n    mov r10, QWORD PTR [rsp]\n    mov QWORD PTR [r10 + ", concat(o, "], rdi\n")));
+            { code: concat(hi, concat(load, concat(desc, call))), data: term_message_copy@md_rodata_block(term_message_copy@ev_site_descriptor_rodata(t, label, table)) }
         }
     }
 }
 
 // The value in `vreg` (a message, an initial state) is walked out of every frame of this stack
 // ([rsp, L_stack_top)) into this actor's heap before it is handed over; `keep_reg` is kept across.
-fn stack_value_to_heap_asm(t: string, label: string, vreg: string, keep_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn stack_value_to_heap_asm(t: string, label: string, vreg: string, keep_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     case length_bytes(t) == 0 or reg_conventions@is_frame_free_scalar_type(t) or term_message_copy@ev_type_described(t) == false of {
         true -> "";
         false -> {
@@ -710,7 +922,14 @@ fn stack_value_to_heap_asm(t: string, label: string, vreg: string, keep_reg: str
     }
 }
 
-fn behaviour_result_move_asm(return_type: string, entry_label: string, reuse_state: bool, reply_copy: string) -> string {
+// The behaviour epilogue's boundary work (chunk15_stack_memory_design.md §4.6 steps 1-3): X0 = the result
+// tuple. Inside an actor ([SP] = this ACB and [SP, #8] = the tuple after the head; outside one, main,
+// nothing happens) a composite reply is moved into the caller's arena (bmv_reply_asm), the state part
+// records the descriptor and the proof flag for the dispatch end (bmv_state_asm), and a proven behaviour
+// whose state is a buffer shape retires the old buffers the new state does not keep
+// (bmv_state_buffer_retire_asm). Every behaviour-shaped function runs this, a scalar-state one too: its
+// epilogue must clear ACB #600, which a behaviour-shaped helper called in the body may have set.
+fn behaviour_result_move_asm(return_type: string, entry_label: string, proven: bool, reply_copy: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     t: string <- prims_record@strip_spaces_rt(return_type);
     reply_form: bool <- length_bytes(t) >= 8 and substring(t, 0, 8) == "(:reply,";
     rtype: string <- case reply_form of {
@@ -722,29 +941,18 @@ fn behaviour_result_move_asm(return_type: string, entry_label: string, reuse_sta
         false -> prims_tuple@tuple_type_nth_element(t, 1)
     };
     rbytes: int64 <- composite_move_bytes(rtype);
-    sbytes: int64 <- composite_move_bytes(stype);
-    case rbytes <= 0 and sbytes <= 0 of {
-        true -> "";
-        false -> {
-            soff: int64 <- case reply_form of {
-                true -> 16;
-                false -> 8
-            };
-            lbl: string <- concat("L_bmv_", entry_label);
-            l_end: string <- concat(lbl, "_end");
-            head: string <- concat(x86_mem@x86_str("X0", "[SP, #-16]!"), concat(asm_bl("silica_rt_tls_current_actor_get"), concat(x86_isa@x86_mov("X10", "X0"), concat(x86_mem@x86_ldr("X0", "[SP, #0]"), concat(x86_isa@x86_cbz("X10", l_end), x86_mem@x86_stp("X10", "X0", "[SP, #-16]!"))))));
-            reply: string <- bmv_reply_asm(rbytes, composite_move_has_scalar_alt(rtype), concat(lbl, "_rs"), reply_copy);
-            state: string <- case sbytes > 0 of {
-                true -> case reuse_state and composite_move_has_scalar_alt(stype) == false of {
-                    true -> bmv_state_reuse_asm(sbytes, soff, lbl);
-                    false -> bmv_state_asm(sbytes, composite_move_has_scalar_alt(stype), soff, lbl)
-                };
-                false -> ""
-            };
-            tail: string <- concat(x86_mem@x86_ldp("X10", "X0", "[SP], #16"), concat(concat(l_end, ":\n"), x86_isa@x86_add("SP", "SP", "#16")));
-            concat(concat(head, reply), concat(state, tail))
-        }
-    }
+    soff: int64 <- case reply_form of {
+        true -> 16;
+        false -> 8
+    };
+    lbl: string <- concat("L_bmv_", entry_label);
+    l_end: string <- concat(lbl, "_end");
+    head: string <- concat(x86_mem@x86_str("X0", "[SP, #-16]!"), concat(asm_bl("silica_rt_tls_current_actor_get"), concat(x86_isa@x86_mov("X10", "X0"), concat(x86_mem@x86_ldr("X0", "[SP, #0]"), concat(x86_isa@x86_cbz("X10", l_end), x86_mem@x86_stp("X10", "X0", "[SP, #-16]!"))))));
+    reply: string <- bmv_reply_asm(rbytes, composite_move_has_scalar_alt(rtype), concat(lbl, "_rs"), reply_copy);
+    state: { code: string, data: string } <- bmv_state_asm(stype, soff, entry_label, proven, table);
+    buffers: string <- bmv_state_buffer_retire_asm(return_type, entry_label, proven);
+    tail: string <- concat(x86_mem@x86_ldp("X10", "X0", "[SP], #16"), concat(concat(l_end, ":\n"), x86_isa@x86_add("SP", "SP", "#16")));
+    concat(concat(concat(head, reply), concat(concat(state.code, buffers), tail)), state.data)
 }
 
 // Spec §15.4.7.3 / §16.3.5: a message is copied at send time. A tuple or record message travels
@@ -780,7 +988,7 @@ fn actor_message_copy_bytes(msg: { nodes: List[{ kind: int64, type_name: string,
 // actor's arena) instead of the one-level promote, unless the SIR tagged the send "|mv"
 // (`move(x)`) or emit_sir_function found the send to be the operand's last use ("|_mvs="). The
 // descriptor the copy interprets follows the call in the constant section.
-fn send_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn send_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
     t: string <- sir_term_root_node(sir_term_at(term, n.right_expr)).type_name;
     to_heap: string <- stack_value_to_heap_asm(t, concat("L_evs_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(term.root)))), "X10", "X11", table);
@@ -795,7 +1003,7 @@ fn send_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, valu
 }
 
 // The initial state is in X11 and the flat argument words in X10 (parked around the copy).
-fn spawn_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn spawn_deep_copy_asm(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, outer_reg: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
     t: string <- sir_term_root_node(sir_term_at(term, n.inner)).type_name;
     to_heap: string <- stack_value_to_heap_asm(t, concat("L_evp_", concat(term_message_copy@md_fn_label_of(outer_reg), concat("_", atom_table@int64_to_decimal_string(term.root)))), "X11", "X10", table);
@@ -833,17 +1041,17 @@ fn spawn_runtime_label(prim: string) -> string {
     }
 }
 
-fn emit_spawn(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, prim: string, init_copy: string) -> string {
+fn emit_spawn(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, prim: string, init_copy: string, desc: { load: string, data: string }) -> string {
     e3b_pfx: string <- e3b_trampoline_x3_prefix(sir_term_root_node(term).value);
     case spawn_right_is_tuple(term) of {
         true -> {
             count: int64 <- spawn_right_count(term);
-            loads: string <- concat(concat(concat(x86_isa@x86_mov("X0", "X11"), x86_mem@x86_ldr("X1", "[X10]")), x86_mem@x86_ldr("X4", "[X10, #8]")), spawn_core_from_flat(count, 2));
-            concat(concat(concat(concat(concat(spawn_promote_init_x11(term), init_copy), e3b_pfx), loads), asm_bl(spawn_runtime_label(prim))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
+            loads: string <- concat(concat(concat(concat(x86_isa@x86_mov("X0", "X11"), x86_mem@x86_ldr("X1", "[X10]")), x86_mem@x86_ldr("X4", "[X10, #8]")), spawn_core_from_flat(count, 2)), desc.load);
+            concat(concat(concat(concat(concat(concat(spawn_promote_init_x11(term, desc), init_copy), e3b_pfx), loads), asm_bl(spawn_runtime_label(prim))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)), desc.data)
         };
         // No policy word (not reachable from source: the type checker requires one). X4 = 0 inherits.
         false -> {
-            args: string <- concat(stage_x0_x1("X9", "X10"), concat(x86_isa@x86_mov("W2", "WZR"), x86_isa@x86_mov("X4", "XZR")));
+            args: string <- concat(stage_x0_x1("X9", "X10"), concat(x86_isa@x86_mov("W2", "WZR"), concat(x86_isa@x86_mov("X4", "XZR"), x86_isa@x86_mov("X6", "XZR"))));
             concat(concat(concat(e3b_pfx, args), asm_bl(spawn_runtime_label(prim))), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
         }
     }
@@ -852,18 +1060,18 @@ fn emit_spawn(dest: string, term: { nodes: List[{ kind: int64, type_name: string
 // spawn_registered / spawn_dangerous_registered / spawn_device_registered: X10 -> [beh, name,
 // policy(, core)], X11 = init. The registration entry picks the registry; the spawn entry is the
 // prim's (spawn_runtime_label).
-fn emit_spawn_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, register_label: string, prim: string, init_copy: string) -> string {
+fn emit_spawn_registered(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, register_label: string, prim: string, init_copy: string, desc: { load: string, data: string }) -> string {
     e3b_pfx: string <- e3b_trampoline_x3_prefix(sir_term_root_node(term).value);
     count: int64 <- spawn_right_count(term);
     save_name: string <- concat(concat(x86_isa@x86_sub("SP", "SP", "#16"), x86_mem@x86_ldr("X12", "[X10, #8]")), x86_mem@x86_str("X12", "[SP, #8]"));
     // §20.3.1: a name a live actor already holds spawns nothing; the caller fails with :language_error.
     // X10/X11 (operand block, init) are caller-saved, so they are kept across the runtime call.
     check: string <- concat(concat(concat(x86_isa@x86_sub("SP", "SP", "#16"), x86_mem@x86_str("X10", "[SP, #0]")), concat(x86_mem@x86_str("X11", "[SP, #8]"), x86_mem@x86_ldr("X0", "[X10, #8]"))), concat(concat(asm_bl(registry_check_label(register_label)), x86_mem@x86_ldr("X10", "[SP, #0]")), concat(x86_mem@x86_ldr("X11", "[SP, #8]"), x86_isa@x86_add("SP", "SP", "#16"))));
-    loads: string <- concat(concat(concat(x86_isa@x86_mov("X0", "X11"), x86_mem@x86_ldr("X1", "[X10]")), x86_mem@x86_ldr("X4", "[X10, #16]")), spawn_core_from_flat(count, 3));
+    loads: string <- concat(concat(concat(concat(x86_isa@x86_mov("X0", "X11"), x86_mem@x86_ldr("X1", "[X10]")), x86_mem@x86_ldr("X4", "[X10, #16]")), spawn_core_from_flat(count, 3)), desc.load);
     spawn_asm: string <- concat(concat(e3b_pfx, loads), asm_bl(spawn_runtime_label(prim)));
     save_actor: string <- x86_mem@x86_str("X0", "[SP, #0]");
     reg: string <- concat(concat(x86_mem@x86_ldr("X1", "[SP, #8]"), asm_bl(register_label)), concat(x86_mem@x86_ldr("X0", "[SP, #0]"), x86_isa@x86_add("SP", "SP", "#16")));
-    concat(concat(concat(concat(concat(concat(concat(spawn_promote_init_x11(term), init_copy), check), save_name), spawn_asm), save_actor), reg), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
+    concat(concat(concat(concat(concat(concat(concat(concat(spawn_promote_init_x11(term, desc), init_copy), check), save_name), spawn_asm), save_actor), reg), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name)), desc.data)
 }
 
 // The pre-spawn registry check that goes with a registration entry: the same table, probed before
@@ -887,15 +1095,17 @@ fn emit_spawn_registered_supervisor(dest: string, term: { nodes: List[{ kind: in
     save_name: string <- concat(concat(x86_isa@x86_sub("SP", "SP", "#16"), x86_mem@x86_ldr("X12", "[X10]")), x86_mem@x86_str("X12", "[SP, #8]"));
     // §20.3.1: a name a live actor or supervisor already holds spawns nothing; the caller fails.
     check: string <- concat(concat(concat(x86_isa@x86_sub("SP", "SP", "#16"), x86_mem@x86_str("X10", "[SP, #0]")), concat(x86_mem@x86_str("X11", "[SP, #8]"), x86_mem@x86_ldr("X0", "[X10]"))), concat(concat(asm_bl("silica_rt_registry_require_free"), x86_mem@x86_ldr("X10", "[SP, #0]")), concat(x86_mem@x86_ldr("X11", "[SP, #8]"), x86_isa@x86_add("SP", "SP", "#16"))));
-    loads: string <- concat(concat(concat(x86_isa@x86_mov("X0", "X11"), x86_isa@x86_mov("X1", "XZR")), x86_mem@x86_ldr("X4", "[X10, #8]")), spawn_core_from_flat(count, 2));
+    loads: string <- concat(concat(concat(x86_isa@x86_mov("X0", "X11"), x86_isa@x86_mov("X1", "XZR")), x86_mem@x86_ldr("X4", "[X10, #8]")), concat(spawn_core_from_flat(count, 2), x86_isa@x86_mov("X6", "XZR")));
     spawn_asm: string <- concat(concat(e3b_pfx, loads), asm_bl("silica_rt_actor_spawn"));
     save_actor: string <- x86_mem@x86_str("X0", "[SP, #0]");
     reg: string <- concat(concat(x86_mem@x86_ldr("X1", "[SP, #8]"), asm_bl("silica_rt_register_actor_named")), concat(x86_mem@x86_ldr("X0", "[SP, #0]"), x86_isa@x86_add("SP", "SP", "#16")));
     concat(concat(concat(concat(concat(check, save_name), spawn_asm), save_actor), reg), mov_dest_from_x0_for_type(dest, sir_term_root_node(term).type_name))
 }
 
-// stack_policy(reserve, release) -> one word: (reserve rounded up to 16) | algorithm index. The
-// release atom is a literal (the type checker requires one), so the index is fixed here.
+// stack_policy(reserve, release) -> one word: (reserve rounded up to 64) | algorithm index (bits 0-3).
+// The release atom is a literal (the type checker requires one), so the index is fixed here. Bits 4-5
+// hold the state policy (decision 40, emit_spawn_policy_join; every spawning form joins one since chunk
+// 15 phase 3d; the Mac emitter's packing).
 fn release_algorithm_index(lexeme: string) -> int64 {
     case lexeme of {
         ":release_on_return" -> 1;
@@ -914,7 +1124,36 @@ fn release_algorithm_index(lexeme: string) -> int64 {
 
 fn emit_stack_policy(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
     alg: int64 <- release_algorithm_index(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).value);
-    pack: string <- concat(concat(x86_isa@x86_add("X9", "X9", "#15"), x86_isa@x86_and("X9", "X9", "#0xfffffffffffffff0")), concat(x86_isa@x86_movi("X10", alg), x86_isa@x86_orr("X9", "X9", "X10")));
+    pack: string <- concat(concat(x86_isa@x86_add("X9", "X9", "#63"), x86_isa@x86_and("X9", "X9", "#0xffffffffffffffc0")), concat(x86_isa@x86_movi("X10", alg), x86_isa@x86_orr("X9", "X9", "X10")));
+    case gpr_x_view(dest) == "X9" of {
+        true -> pack;
+        false -> concat(pack, x86_isa@x86_mov(gpr_x_view(dest), "X9"))
+    }
+}
+
+// state_policy(choice) (decision 40, P15; chunk15_stack_memory_design.md §4.7, §5.4): a value of type
+// state_policy is one word, the choice index << 4 (0 :keep_state_area, 16 :shrink_after_compaction,
+// 32 :compact_on_request), the bits it occupies in the policy word a spawn passes in X4. The choice is
+// an atom literal (the type checker requires one), so the value is fixed here.
+fn state_policy_choice_index(lexeme: string) -> int64 {
+    case lexeme of {
+        ":shrink_after_compaction" -> 1;
+        "shrink_after_compaction" -> 1;
+        ":compact_on_request" -> 2;
+        "compact_on_request" -> 2;
+        _: string -> 0
+    }
+}
+
+fn emit_state_policy(dest: string, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+    choice: int64 <- state_policy_choice_index(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).value);
+    x86_isa@x86_movi(gpr_x_view(dest), choice * 16)
+}
+
+// A spawn's policy word with its state policy: X9 = the stack policy word, X10 = the state policy value;
+// the value replaces bits 4-5 of the word; silica_rt_actor_stack_reserve stores them at ACB #576.
+fn emit_spawn_policy_join(dest: string) -> string {
+    pack: string <- concat(concat(x86_isa@x86_and("X9", "X9", "#0xffffffffffffffcf"), x86_isa@x86_and("X10", "X10", "#0x30")), x86_isa@x86_orr("X9", "X9", "X10"));
     case gpr_x_view(dest) == "X9" of {
         true -> pack;
         false -> concat(pack, x86_isa@x86_mov(gpr_x_view(dest), "X9"))
@@ -1021,6 +1260,8 @@ fn runtime_label(name: string) -> string {
         "wait_for_exit" -> "silica_rt_wait_for_exit";
         "cast_exit" -> "silica_rt_cast_exit";
         "heap_used" -> "silica_rt_heap_used";
+        "state_area_bytes" -> "silica_rt_state_area_bytes";
+        "compact_state" -> "silica_rt_compact_state";
         "actor_carrier_index" -> "silica_rt_actor_carrier_index";
         // Clocks and timers (spec §22.14; prims_actors_timer_asm).
         "monotonic_time" -> "silica_rt_monotonic_time";
@@ -1084,7 +1325,7 @@ fn emit_timer_cast(dest: string, term: { nodes: List[{ kind: int64, type_name: s
 }
 
 // cancel_timer(timer) -> :cancelled | :not_found (spec §22.14.2): the runtime answers 0 or 1.
-fn emit_cancel_timer_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn emit_cancel_timer_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     c_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":cancelled");
     nf_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":not_found");
     call_asm: string <- concat(x86_isa@x86_mov("X0", "X9"), asm_bl(runtime_label("cancel_timer")));
@@ -1125,7 +1366,7 @@ fn select_eq_idx(dst: string, idx: int64, a: string, b: string) -> string {
 }
 
 // migrate_actor(ref, core) -> :ok | :invalid_target | :actor_not_found | :migration_blocked: codes 0..3.
-fn emit_migrate_actor_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn emit_migrate_actor_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
     inv_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":invalid_target");
     nf_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":actor_not_found");
@@ -1139,7 +1380,7 @@ fn emit_migrate_actor_with_atoms(term: { nodes: List[{ kind: int64, type_name: s
 // priority_level = :low | :normal | :high; the runtime takes 0 low, 1 normal, 2 high in X1, so the
 // program's atom indices are mapped to the levels first (an unknown atom is normal, as the runtime
 // treats any other value), and the runtime's 0 / 1 result is mapped back.
-fn emit_set_actor_priority_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn emit_set_actor_priority_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
     nf_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":actor_not_found");
     low_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":low");
@@ -1161,7 +1402,7 @@ fn emit_set_actor_priority_with_atoms(term: { nodes: List[{ kind: int64, type_na
 // An atom the program never names has index -1 and gets no compare (X9 cannot hold it); the code
 // then stays 4, rejected. Every carrier reads the policy at its next push or pop; a dangerous actor's
 // own thread is scheduled by the OS and takes no part.
-fn policy_atom_to_code(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, lexeme: string, code: int64) -> string {
+fn policy_atom_to_code(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, lexeme: string, code: int64) -> string {
     idx: int64 <- atom_table@atom_lexeme_to_index(table, lexeme);
     case idx < 0 of {
         true -> "";
@@ -1169,7 +1410,7 @@ fn policy_atom_to_code(table: { is_empty: boolean, index_map: { root: ref?(L, no
     }
 }
 
-fn emit_set_scheduler_policy_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn emit_set_scheduler_policy_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
     inv_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":invalid_policy");
     to_code: string <- concat(x86_isa@x86_movi("X0", 4), concat(concat(policy_atom_to_code(table, ":priority_fifo", 0), policy_atom_to_code(table, ":round_robin", 1)), concat(policy_atom_to_code(table, ":weighted_fair", 2), policy_atom_to_code(table, ":lottery", 3))));
@@ -1178,7 +1419,7 @@ fn emit_set_scheduler_policy_with_atoms(term: { nodes: List[{ kind: int64, type_
     concat(concat(concat(to_code, call_asm), map_asm), x86_isa@x86_mov(gpr_x_view(dest), "X12"))
 }
 
-fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, outer_reg: string) -> string {
+fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, outer_reg: string) -> string {
     ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
     case sir_term_root_node(term).name of {
         // register_failure_reporter calls the caller unit's region_dump_limit, so its label needs the
@@ -1195,12 +1436,13 @@ fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string,
         "actor_cast_registered" -> emit_actor_cast_registered(dest, term, send_deep_copy_asm(term, outer_reg, table));
         "actor_cast_dangerous_registered" -> emit_actor_cast_dangerous_registered(dest, term, send_deep_copy_asm(term, outer_reg, table));
         "actor_cast_device_registered" -> emit_actor_cast_device_registered(dest, term, send_deep_copy_asm(term, outer_reg, table));
-        "spawn" -> emit_spawn(dest, term, "spawn", spawn_deep_copy_asm(term, outer_reg, table));
-        "spawn_dangerous" -> emit_spawn(dest, term, "spawn_dangerous", spawn_deep_copy_asm(term, outer_reg, table));
-        "spawn_device" -> emit_spawn(dest, term, "spawn_device", spawn_deep_copy_asm(term, outer_reg, table));
-        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named", "spawn_registered", spawn_deep_copy_asm(term, outer_reg, table));
-        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named", "spawn_dangerous_registered", spawn_deep_copy_asm(term, outer_reg, table));
-        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named", "spawn_device_registered", spawn_deep_copy_asm(term, outer_reg, table));
+        "spawn" -> emit_spawn(dest, term, "spawn", spawn_init_copy(term, outer_reg, table), spawn_state_desc_asm(term, outer_reg, table, "X6"));
+        "spawn_dangerous" -> emit_spawn(dest, term, "spawn_dangerous", spawn_init_copy(term, outer_reg, table), spawn_state_desc_asm(term, outer_reg, table, "X6"));
+        "spawn_device" -> emit_spawn(dest, term, "spawn_device", spawn_init_copy(term, outer_reg, table), spawn_state_desc_asm(term, outer_reg, table, "X6"));
+        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named", "spawn_registered", spawn_init_copy(term, outer_reg, table), spawn_state_desc_asm(term, outer_reg, table, "X6"));
+        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named", "spawn_dangerous_registered", spawn_init_copy(term, outer_reg, table), spawn_state_desc_asm(term, outer_reg, table, "X6"));
+        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named", "spawn_device_registered", spawn_init_copy(term, outer_reg, table), spawn_state_desc_asm(term, outer_reg, table, "X6"));
+        "spawn_linked" -> emit_spawn_linked(dest, term, spawn_state_desc_asm(term, outer_reg, table, "X7"));
         "migrate_actor" -> emit_migrate_actor_with_atoms(term, dest, table);
         "cancel_timer" -> emit_cancel_timer_with_atoms(term, dest, table);
         "set_actor_priority" -> emit_set_actor_priority_with_atoms(term, dest, table);
@@ -1214,14 +1456,14 @@ fn emit_prim_op_with_atoms(term: { nodes: List[{ kind: int64, type_name: string,
 
 fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     case sir_term_root_node(term).name of {
-        "spawn" -> emit_spawn(dest, term, "spawn", "");
-        "spawn_dangerous" -> emit_spawn(dest, term, "spawn_dangerous", "");
-        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named", "spawn_registered", "");
-        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named", "spawn_dangerous_registered", "");
-        "spawn_device" -> emit_spawn(dest, term, "spawn_device", "");
-        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named", "spawn_device_registered", "");
+        "spawn" -> emit_spawn(dest, term, "spawn", "", spawn_no_desc("X6"));
+        "spawn_dangerous" -> emit_spawn(dest, term, "spawn_dangerous", "", spawn_no_desc("X6"));
+        "spawn_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_actor_named", "spawn_registered", "", spawn_no_desc("X6"));
+        "spawn_dangerous_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_dangerous_actor_named", "spawn_dangerous_registered", "", spawn_no_desc("X6"));
+        "spawn_device" -> emit_spawn(dest, term, "spawn_device", "", spawn_no_desc("X6"));
+        "spawn_device_registered" -> emit_spawn_registered(dest, term, "silica_rt_register_device_actor_named", "spawn_device_registered", "", spawn_no_desc("X6"));
         "spawn_registered_supervisor" -> emit_spawn_registered_supervisor(dest, term);
-        "spawn_linked" -> emit_spawn_linked(dest, term);
+        "spawn_linked" -> emit_spawn_linked(dest, term, spawn_no_desc("X7"));
         "send" -> emit_send(dest, term, "");
         "actor_call" -> emit_actor_call(dest, term, "");
         "actor_call_registered" -> emit_actor_call_registered(dest, term, "");
@@ -1305,6 +1547,12 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "timer_cast" -> emit_timer_cast(dest, term, "", x86_isa@x86_movi("X2", 0));
         "cancel_timer" -> emit_runtime_unary(dest, term);
         "stack_policy" -> emit_stack_policy(dest, term);
+        // state_area_bytes() -> int64: ACB #568 (state bytes live) of the calling actor; 0 outside an actor.
+        "state_area_bytes" -> emit_runtime_nullary(dest, term);
+        // compact_state() (decision 40): the runtime sets the request only under :compact_on_request.
+        "compact_state" -> emit_runtime_nullary(dest, term);
+        "state_policy" -> emit_state_policy(dest, term);
+        "spawn_policy_join" -> emit_spawn_policy_join(dest);
         _: string -> concat(concat(".error \"unsupported actor prim: ", concat(sir_term_root_node(term).name, "\"\n")), "\n")
     }
 }

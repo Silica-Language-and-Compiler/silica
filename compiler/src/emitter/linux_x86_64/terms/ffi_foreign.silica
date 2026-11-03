@@ -118,18 +118,43 @@ fn param_types_for_outer_encoding(param_types: string) -> string {
     replace_pipe_with_comma_loop(param_types, 0, "")
 }
 
+// Entry: local~c_symbol~param_types~return_class. The return class is "word" for a declared scalar
+// result (int*, uint*, float*, boolean) and "rec" otherwise; see inferred_return_type_from_param_types.
 fn encode_one_binding(b: { local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }) -> string {
     pt_enc: string <- param_types_for_outer_encoding(b.param_types);
     concat(
         concat(
             concat(
-                concat(b.local_name, binding_field_sep()),
-                b.c_symbol
+                concat(
+                    concat(b.local_name, binding_field_sep()),
+                    b.c_symbol
+                ),
+                binding_field_sep()
             ),
-            binding_field_sep()
+            pt_enc
         ),
-        pt_enc
+        concat(binding_field_sep(), return_class_of(b.return_type))
     )
+}
+
+fn return_class_of(return_type: string) -> string {
+    case declared_return_is_word(return_type) of {
+        true -> "word";
+        false -> "rec"
+    }
+}
+
+fn declared_return_is_word(t: string) -> boolean {
+    case t == "boolean" of {
+        true -> true;
+        false -> case length_bytes(t) >= 3 and substring(t, 0, 3) == "int" of {
+            true -> true;
+            false -> case length_bytes(t) >= 4 and substring(t, 0, 4) == "uint" of {
+                true -> true;
+                false -> length_bytes(t) >= 5 and substring(t, 0, 5) == "float"
+            }
+        }
+    }
 }
 
 fn encode_bindings_loop(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], acc: string) -> string {
@@ -181,8 +206,20 @@ fn parse_binding_entry(entry: string) -> (string, string, string, string) {
                 true -> ("", "", "", "");
                 false -> {
                     c_sym: string <- substring(rest1, 0, s2);
-                    pt: string <- substring_to_end(rest1, s2 + length_bytes(binding_field_sep()));
-                    rt: string <- inferred_return_type_from_param_types(pt);
+                    rest2: string <- substring_to_end(rest1, s2 + length_bytes(binding_field_sep()));
+                    s3: int64 <- find_field_sep(rest2, binding_field_sep(), 0);
+                    pt: string <- case s3 < 0 of {
+                        true -> rest2;
+                        false -> substring(rest2, 0, s3)
+                    };
+                    rclass: string <- case s3 < 0 of {
+                        true -> "rec";
+                        false -> substring_to_end(rest2, s3 + length_bytes(binding_field_sep()))
+                    };
+                    rt: string <- case rclass == "word" of {
+                        true -> "int64";
+                        false -> inferred_return_type_from_param_types(pt)
+                    };
                     (local, c_sym, pt, rt)
                 }
             }
@@ -239,8 +276,7 @@ fn emit_extern_loop(bindings: List[{ local_name: string, c_symbol: string, meta_
 
 fn emit_extern_directives(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> string {
     guarded: string <- ".extern silica_rt_ffi_guarded_enter\n.extern silica_rt_ffi_guarded_exit\n.extern silica_rt_ffi_guarded_setjmp\n.extern silica_rt_ffi_guarded_fault_finish\n";
-    arena: string <- ".extern silica_rt_ffi_arena_bump\n";
-    concat(concat(guarded, arena), emit_extern_loop(bindings, ""))
+    concat(guarded, emit_extern_loop(bindings, ""))
 }
 
 fn module_uses_foreign_calls(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> boolean {
@@ -288,6 +324,11 @@ fn type_text_contains(s: string, needle: string) -> boolean {
     }
 }
 
+// A pointer-plus-length parameter pair with a record result is the ptr/len/tag result record, returned
+// in memory (sret). A declared scalar result (return class "word", e.g. silica_call_only_sum's int64
+// over a buf pointer and length) comes back in rax and takes no hidden sret pointer: System V passes
+// that pointer in rdi, so a wrong sret moves every argument up one register (the C callee then read the
+// buffer pointer as its length and faulted). AArch64's X8 is beside the arguments, so the Mac never saw it.
 fn inferred_return_type_from_param_types(param_types: string) -> string {
     case param_types_are_ptr_len_pair(param_types) of {
         true -> "ptr_len_struct";
@@ -314,6 +355,19 @@ fn foreign_return_uses_sret(return_type: string) -> boolean {
 
 fn needs_string_in_marshal(param_types: string, arg1_type: string) -> boolean {
     param_types_are_ptr_len_pair(param_types) and arg1_type == "string"
+}
+
+// A buf(L, Space, uint8, N) argument for a pointer-plus-length pair (wrapper spec §6.1, §6.2). The buffer
+// crosses into C only as pointer and length, for the call (Lee 2026-11-01; the Mac emitter's phase 7 form).
+fn needs_buf_in_marshal(param_types: string, arg1_type: string) -> boolean {
+    param_types_are_ptr_len_pair(param_types) and is_uint8_buf_type(arg1_type)
+}
+
+fn is_uint8_buf_type(t: string) -> boolean {
+    case length_bytes(t) >= 4 of {
+        true -> substring(t, 0, 4) == "buf(" and type_text_contains(t, "uint8");
+        false -> false
+    }
 }
 
 fn needs_string_out_unmarshal(return_type: string, expected_type: string) -> boolean {
@@ -404,8 +458,8 @@ fn shift_int_args_from(i: int64, acc: string) -> string {
 // A foreign result record (sret_bytes > 0: the 32-byte ptr/len/tag records) is returned in memory.
 // AArch64 passes the buffer in X8 beside the arguments; System V AMD64 passes it as a hidden FIRST
 // integer argument (rdi), so every integer argument moves up one home and the buffer (X8, the
-// arena slot reloaded from scratch[+0]) goes into X0. The callee returns the same pointer in rax;
-// the result is read from scratch[+0] as on AArch64. Float arguments do not move.
+// scratch frame's [rsp+32] since chunk 15 phase 7) goes into X0. The callee returns the same pointer
+// in rax; a string result is read from [rsp+32] as on AArch64. Float arguments do not move.
 fn emit_sret_hidden_arg_shift(param_types: string, sret_bytes: int64) -> string {
     case sret_bytes > 0 of {
         true -> {
@@ -475,8 +529,22 @@ fn emit_result_mov(dest: string) -> string {
 }
 
 fn emit_string_in_marshal() -> string {
-    // Copies Silica string into the per-actor FFI arena (X0=ptr, X1=len, X2=0).
-    x86_isa@x86_call("silica_rt_ffi_string_in")
+    // Per-call scratch is held in the caller's frame (chunk 15 phase 7, the FFI arena's removal; the Mac
+    // emitter's form): a block of len + 1 bytes rounded to 16 is taken from the frame's dynamic part
+    // (L_dyn_alloc, rax = bytes -> rax = block, moves the transient area, so the scratch frame's
+    // rsp-relative words move with it; every VR home is kept), and the helper copies the string's bytes
+    // and a NUL into it (X0 = rdi the string, X3 = rcx the block -> X0 = ptr, X1 = len, X2 = 0). The
+    // block pops with the frame, after the call returned.
+    concat("    mov eax, 16\n    test rdi, rdi\n    jz 3f\n    mov rax, QWORD PTR [rdi + 16]\n    add rax, 16\n    and rax, -16\n3:\n    call L_dyn_alloc\n    mov rcx, rax\n", x86_isa@x86_call("silica_rt_ffi_string_in"))
+}
+
+// X0 = rdi = the buffer value, which points at the data with the count word just below it
+// (prims_memory emit_alloc_buf). The data pointer stays in X0 (the uint8 slot) and the count, the byte
+// length for uint8 elements, goes to X1 = rsi (the uint64 slot); a hidden sret pointer shifts both up
+// one home afterwards (emit_sret_hidden_arg_shift), as for a marshalled string. No scratch, no copy,
+// no runtime call.
+fn emit_buf_in_marshal() -> string {
+    "    mov rsi, QWORD PTR [rdi - 8]\n"
 }
 
 fn emit_string_in_cleanup() -> string {
@@ -484,9 +552,10 @@ fn emit_string_in_cleanup() -> string {
 }
 
 fn emit_string_out_unmarshal_heap() -> string {
-    // sret struct lives in the FFI arena at scratch[+0]. Helper copies C bytes into a Silica
-    // string handle and leaves arena/sret storage for the next guarded-call reset.
-    concat(concat(x86_mem@x86_ldr("X0", "[SP, #0]"), x86_isa@x86_call("silica_rt_ffi_string_out_and_free")), concat(x86_mem@x86_str("X0", "[SP, #16]"), x86_mem@x86_str("XZR", "[SP, #0]")))
+    // The sret struct lives in the scratch frame at [rsp+32, rsp+64) (the caller's frame; chunk 15
+    // phase 7). The helper copies the C bytes into a Silica string handle and frees the C wrapper's
+    // malloc'd span; the sret storage pops with the scratch frame.
+    concat(concat("    lea rdi, [rsp + 32]\n", x86_isa@x86_call("silica_rt_ffi_string_out_and_free")), x86_mem@x86_str("X0", "[SP, #16]"))
 }
 
 // Returns true when this FFI call needs the 32-byte scratch frame (string and/or sret).
@@ -506,18 +575,21 @@ fn emit_foreign_user_call(
     uses_heap: boolean <- foreign_call_uses_heap_scratch(ctx.param_types, ctx.return_type, ctx.arg1_type);
     string_in: string <- case needs_string_in_marshal(ctx.param_types, ctx.arg1_type) of {
         true -> emit_string_in_marshal();
-        false -> ""
+        false -> case needs_buf_in_marshal(ctx.param_types, ctx.arg1_type) of {
+            true -> emit_buf_in_marshal();
+            false -> ""
+        }
     };
-    // After string_in (which BLs into a runtime helper), X8 may have been clobbered.
-    // Reload from the heap-alloc'd sret pointer stored at scratch[+0].
+    // After string_in (which calls a runtime helper), X8 = rbx may have been clobbered: the sret struct
+    // is at [rsp+32] of the scratch frame (rsp-relative, so a frame block taken meanwhile moved it with rsp).
     reload_x8: string <- case ctx.sret_bytes > 0 of {
-        true -> x86_mem@x86_ldr("X8", "[SP, #0]");
+        true -> "    lea rbx, [rsp + 32]\n";
         false -> ""
     };
     hidden_ret: int64 <- case ctx.sret_bytes > 0 of { true -> 1; false -> 0 };
     arg_shift: string <- emit_sret_hidden_arg_shift(ctx.param_types, ctx.sret_bytes);
     bl: string <- emit_guarded_foreign_call_lines(ctx.c_symbol, c_call_float_args(ctx.param_types), c_call_stack_args(ctx.param_types, hidden_ret), arg_shift);
-    string_out: string <- case expects_string_out of {
+    string_out: string <- case expects_string_out and ctx.sret_bytes > 0 of {
         true -> emit_string_out_unmarshal_heap();
         false -> ""
     };
@@ -528,7 +600,10 @@ fn emit_foreign_user_call(
         false -> ""
     };
     sret_cleanup: string <- case uses_heap of {
-        true -> x86_isa@x86_add("SP", "SP", "#32");
+        true -> case ctx.sret_bytes > 0 of {
+            true -> x86_isa@x86_add("SP", "SP", "#64");
+            false -> x86_isa@x86_add("SP", "SP", "#32")
+        };
         false -> ""
     };
     result_mov: string <- emit_result_mov(dest);
@@ -560,19 +635,21 @@ fn foreign_call_sret_bytes(return_type: string) -> int64 {
     }
 }
 
-// Pre-call setup: reserves a 32-byte scratch frame and, when sret_bytes > 0, bumps 32 bytes
-// from the per-actor FFI arena and stores the pointer at scratch[+0].
-// Scratch layout:
-//   [SP+0]  = sret arena ptr (0 when no sret)
+// Pre-call setup: reserves the scratch frame in the caller's frame (chunk 15 phase 7: the FFI arena is
+// gone from compiled code; per-call scratch lives where the call does; the Mac emitter's form). With
+// sret_bytes > 0 it is 64 bytes and holds the 32-byte sret struct itself. Scratch layout:
+//   [SP+0]  = reserved (0)
 //   [SP+8]  = reserved
 //   [SP+16] = result Silica string handle (filled in by string-out helper)
 //   [SP+24] = padding (reserved for keeping 16-byte alignment)
+//   [SP+32, SP+64) = the sret struct (sret calls only); X8 = rbx points at it, and
+//   emit_sret_hidden_arg_shift passes it to the C callee as the hidden first argument (rdi)
 fn emit_foreign_sret_setup(sret_bytes: int64) -> string {
     case sret_bytes > 0 of {
         true -> {
-            reserve: string <- concat(x86_isa@x86_sub("SP", "SP", "#32"), concat(x86_mem@x86_str("XZR", "[SP, #8]"), concat(x86_mem@x86_str("XZR", "[SP, #16]"), x86_mem@x86_str("XZR", "[SP, #24]"))));
-            bump: string <- concat(x86_isa@x86_mov("X0", "#32"), concat(x86_isa@x86_call("silica_rt_ffi_arena_bump"), concat(x86_mem@x86_str("X0", "[SP, #0]"), x86_isa@x86_mov("X8", "X0"))));
-            concat(reserve, bump)
+            reserve: string <- concat(x86_isa@x86_sub("SP", "SP", "#64"), concat(x86_mem@x86_str("XZR", "[SP, #0]"), concat(x86_mem@x86_str("XZR", "[SP, #8]"), concat(x86_mem@x86_str("XZR", "[SP, #16]"), x86_mem@x86_str("XZR", "[SP, #24]")))));
+            sret_zero: string <- "    mov QWORD PTR [rsp + 32], 0\n    mov QWORD PTR [rsp + 40], 0\n    mov QWORD PTR [rsp + 48], 0\n    mov QWORD PTR [rsp + 56], 0\n    lea rbx, [rsp + 32]\n";
+            concat(reserve, sret_zero)
         };
         false -> ""
     }

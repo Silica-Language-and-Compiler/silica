@@ -16,7 +16,7 @@
 -}
 
 // Memory region prim emission: alloc_region, alloc_ref, alloc_rec, read_ref, write_ref,
-// alloc_buf, buf_load, buf_store, read_buf, write_buf, fresh_lifetime,
+// alloc_buf, alloc_buf_retained, buf_load, buf_store, read_buf, write_buf, fresh_lifetime,
 // canonical_arena_lookup, canonical_arena_same, ref_eq, ref_in_region
 // sir_design_spec §7.4, §7.5; silica-specification §12.1.2
 // Heap-based allocation per spec: regions are heap-allocated with scope-tied deallocation.
@@ -24,15 +24,14 @@
 // extension blocks, [24:32]=this block's own data end; data at offset 32. First block is 4096
 // bytes of data, so 4128 in total.
 //
-// A region is not a fixed-size buffer. When the current block cannot satisfy an allocation,
-// L_region_grow attaches another block and the allocation retries against it, so the only hard
-// failure left is the underlying allocator returning nothing. This matters because the region
-// holds whatever the program puts in it: the compiler's own atom table filled 4096 bytes after
-// eleven atoms, and a fixed arena aborted there.
-//
-// The region handle is the address of the first block and never moves, so refs handed out before
-// a growth stay valid. Each block records its own span at [24:32] and the next block at [16:24],
-// which is what lets ref_in_region still answer for a ref allocated from an earlier block.
+// A region is not a fixed-size buffer. When the current block cannot satisfy an allocation, the
+// allocation is a frame allocation of the function that executes the prim (L_dyn_alloc), of any
+// size, as an allocation into a normal region always is (Lee 2026-11-01: heap is not to be used,
+// only stack; ported from the Mac emitter, chunk 15 phase 7). Nothing is chained and the heap is
+// never reached by a region prim; the block's bump is not moved. The extension chain word [16:24]
+// stays 0 for a region that alloc_region made. (The message copier's fresh regions,
+// term_message_copy L_mc_new_region / L_mc_reserve, still grow through L_region_grow until the
+// phase 4 copier is ported in phase 8.)
 
 use prims_tuple;
 use atom_table;
@@ -101,7 +100,7 @@ fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: stri
 }
 
 fn is_memory_prim(name: string) -> boolean {
-    name == "alloc_region" or name == "alloc_ref" or name == "alloc_rec" or name == "read_ref" or name == "write_ref" or name == "alloc_buf" or name == "buf_load" or name == "buf_store" or name == "read_buf" or name == "write_buf" or name == "fresh_lifetime" or name == "canonical_arena_lookup" or name == "canonical_arena_same" or name == "ref_eq"
+    name == "alloc_region" or name == "alloc_ref" or name == "alloc_rec" or name == "read_ref" or name == "write_ref" or name == "alloc_buf" or name == "alloc_buf_retained" or name == "buf_load" or name == "buf_store" or name == "read_buf" or name == "write_buf" or name == "fresh_lifetime" or name == "canonical_arena_lookup" or name == "canonical_arena_same" or name == "ref_eq" or name == "retire"
 }
 
 // ref_eq(a, b): X1 = ref A, X2 = ref B -> boolean in dest (pointer identity).
@@ -128,26 +127,28 @@ fn emit_canonical_arena_same(dest: string) -> string {
     concat(concat(concat(mov_a, mov_b), bl_same), mov_dest)
 }
 
-// alloc_region(space): allocate arena on heap via malloc, return region base.
-// Region layout: [base+0]=bump (starts at base+32), [base+8]=end, [base+16]=extensions, [base+24]=span end.
-// Operands: X1 = space (unused; memory space would configure MAIR at runtime)
+// alloc_region(space) in an atomic or device space (a normal space gets the witness, emit_prim_op):
+// the region's block is a frame allocation of the function that executes the prim (chunk 15 design
+// §3.8, Lee 2026-11-01: alloc_region is in the stack; the Mac emitter's phase 7 form), so it is
+// released with that frame and nothing is malloc'd or checked for failure. The block is the 4128
+// bytes the heap form used: a 32-byte header and 4096 bytes of cells, a multiple of 16 as
+// L_dyn_alloc requires (rax = bytes -> rax = the block; only rax, r12, r13 and xmm8/xmm9 change).
+// Region layout, unchanged: [base+0]=bump (starts at base+32), [base+8]=end, [base+16]=extensions,
+// [base+24]=span end; emit_region_bump_check and L_region_contains read these words.
+// Operands: X1 = space (unused). X4 = r8 is the block and X5 = r9 the scratch the heap form used.
 fn emit_alloc_region(dest: string) -> string {
-    mov_size: string <- x86_isa@x86_movi("X0", 4128);
-    bl_malloc: string <- x86_isa@x86_call("silica_rt_raw_alloc");
-    // No block: the current actor ends with (:explicit, :region_alloc_failed), main aborts (H5).
-    null_check: string <- concat("    test rdi, rdi\n    jnz 1f\n", concat(x86_isa@x86_call("silica_rt_region_alloc_failed"), "1:\n"));
-    add_bump: string <- x86_isa@x86_add("X4", "X0", "#32");
-    str_bump: string <- x86_mem@x86_str("X4", "[X0]");
+    alloc: string <- "    mov eax, 4128\n    call L_dyn_alloc\n    mov r8, rax\n";
+    add_bump: string <- x86_isa@x86_add("X5", "X4", "#32");
+    str_bump: string <- x86_mem@x86_str("X5", "[X4]");
     // The AArch64 site formed 4128 in X5 because ADD takes at most #4095; kept as reg + reg.
     mov_arena_sz: string <- x86_isa@x86_movi("X5", 4128);
-    add_end: string <- x86_isa@x86_add("X4", "X0", "X5");
-    str_end: string <- x86_mem@x86_str("X4", "[X0, #8]");
-    // No extension blocks yet, and the first block's span ends where its bump limit does.
-    str_no_ext: string <- x86_mem@x86_str("XZR", "[X0, #16]");
-    str_span_end: string <- x86_mem@x86_str("X4", "[X0, #24]");
-    mov_dest: string <- x86_isa@x86_mov(dest, "X0");
-    part1: string <- concat(mov_size, concat(bl_malloc, null_check));
-    part2: string <- concat(part1, concat(add_bump, str_bump));
+    add_end: string <- x86_isa@x86_add("X5", "X4", "X5");
+    str_end: string <- x86_mem@x86_str("X5", "[X4, #8]");
+    // No extension blocks, and the block's span ends where its bump limit does.
+    str_no_ext: string <- x86_mem@x86_str("XZR", "[X4, #16]");
+    str_span_end: string <- x86_mem@x86_str("X5", "[X4, #24]");
+    mov_dest: string <- x86_isa@x86_mov(dest, "X4");
+    part2: string <- concat(alloc, concat(add_bump, str_bump));
     part3: string <- concat(part2, concat(mov_arena_sz, concat(add_end, str_end)));
     part4: string <- concat(part3, concat(str_no_ext, str_span_end));
     concat(part4, mov_dest)
@@ -155,30 +156,31 @@ fn emit_alloc_region(dest: string) -> string {
 
 // The reservation every region allocation shares. `size_math` must leave the request in bytes in
 // X7 = r15 (X7-X9 are scratch in every prim sequence: alloc_buf already computes its byte count
-// there). Afterwards X3 = rcx is the start of the reserved bytes, X4 = r8 the block's end and
-// X5 = r9 the new bump, and the bump is already published: the sites must not store it again.
+// there). Afterwards X3 = rcx is the start of the reserved bytes; X4 = r8 and X5 = r9 are scratch
+// the sites overwrite, and on the reservation path the bump is already published: the sites must
+// not store it again.
 //
 // The bump is moved with `lock cmpxchg` (design region_memory_safety_design.md §9.4, H1): a
 // canonical arena is process-shared, and two actors allocating in the same arena from two threads
 // used to read one bump, each write bump+size, and hand out the same cell. The AArch64 emitters use
 // an exclusive pair for the same reservation; here rax carries the expected bump (rax is no VR's
-// home, so it is free scratch in a prim sequence). The compare-exchange also makes a growth safe:
-// L_region_grow (below) parks a sentinel in the bump before it publishes the new block, so a
-// reservation that read the old bump either sees a request that cannot fit or finds the word
-// changed under its exchange and starts over; x86 loads and stores keep program order, so a
-// reservation that reads the new bump reads the new end (the grow stores the end first).
+// home, so it is free scratch in a prim sequence).
 //
-// Nothing is moved into place for the grow call: L_region_grow reads the region from X1 and the
-// request from X7, both of which the site set up for the reservation. Setting up argument registers
-// instead would corrupt the caller on exactly the rare path that is hardest to notice -- the emitter
-// stages call arguments in X0-X7, so a `MOV X6, X1` here destroys a staged argument, but only in
-// the runs where the region happened to fill up.
+// A request the block cannot hold (path 3) is a frame allocation of the executing function, of any
+// size (chunk 15 phase 7, the Mac emitter's form): X7 = r15 rounded up to 16 is taken with
+// L_dyn_alloc and X3 = rcx is its start, so the site continues as after a reservation. The bump is
+// left alone, so no concurrent reservation is affected. L_dyn_alloc keeps every VR home (only rax,
+// r12, r13, xmm8, xmm9 and the flags change) and moves the transient area with rsp, so the staged
+// call arguments and the rsp-relative pushes survive. The heap path through L_region_grow and
+// silica_rt_raw_alloc is gone from region allocation (Lee 2026-11-01: heap is not to be used, only
+// stack). Such a block lives with the executing frame and reaches the caller only by return
+// (evacuation), as an allocation into a normal region does (chunk15_stack_memory_design.md §3.8).
 //
-// Numeric local labels, so the sites need no unique names: 2 is the retry, 3 the grow, 1 the exit.
+// Numeric local labels, so the sites need no unique names: 2 is the retry, 3 the frame block, 1 the exit.
 fn emit_region_bump_check(size_math: string) -> string {
     reserve: string <- "2:\n    mov rax, QWORD PTR [rsi]\n    mov r8, QWORD PTR [rsi + 8]\n    lea r9, [rax + r15]\n    cmp r9, r8\n    ja 3f\n    lock cmpxchg QWORD PTR [rsi], r9\n    jne 2b\n    mov rcx, rax\n    jmp 1f\n";
-    grow: string <- concat("3:\n", concat(x86_isa@x86_call("L_region_grow"), "    jmp 2b\n1:\n"));
-    concat(size_math, concat(reserve, grow))
+    frame_block: string <- "3:\n    lea rax, [r15 + 15]\n    and rax, -16\n    call L_dyn_alloc\n    mov rcx, rax\n1:\n";
+    concat(size_math, concat(reserve, frame_block))
 }
 
 fn memory_type_is_tuple(type_name: string) -> boolean {
@@ -203,10 +205,11 @@ fn memory_tuple_word_count(value: { nodes: List[{ kind: int64, type_name: string
 
 // alloc_ref(region, scalar): bump-allocate one cell in region, store value, return ref.
 // Operands: X1 = region base, X2 = value. Region [X1]=bump, [X1+8]=end.
-// Bounds check: if bump+8 > end, grow the region and allocate from the new block.
+// Bounds check: if bump+8 > end, the cell is a frame allocation (emit_region_bump_check path 3).
 // Chunk 15 phase 2 (design §3.2): an allocation into a region in a normal memory space is a frame
 // allocation (prims_memory L_dyn_alloc), the region handle a lifetime witness that is not read. An
-// atomic or device region keeps the shared block it has today (§2.7).
+// atomic or device region keeps its block and bump words; since chunk 15 phase 7 that block is itself
+// a frame allocation of the function that executes alloc_region (emit_alloc_region, design §3.8).
 fn alloc_in_frame(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
     v: string <- sir_term_root_node(term).value;
     memory_type_contains(v, "atomic") == false and memory_type_contains(v, "device") == false
@@ -280,7 +283,8 @@ fn emit_write_ref(term: { nodes: List[{ kind: int64, type_name: string, value: s
 }
 
 // alloc_buf(region, N): bump-allocate buffer of N elements within region.
-// Operands: X1 = region, X2 = N (element count). Rejects negative N, byte-size overflow, and arena overflow.
+// Operands: X1 = region, X2 = N (element count). Rejects negative N and byte-size overflow; a buffer of
+// any size is a frame allocation (a full atomic/device block hands it to L_dyn_alloc, emit_region_bump_check).
 fn elem_size_shift_from_buf_type(buf_type: string) -> int64 {
     case memory_type_contains(buf_type, "int8") of {
         true -> 0;
@@ -347,6 +351,34 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
             concat(check, alloc)
         }
     }
+}
+
+// alloc_buf_retained(n) (chunk 15 phase 7, the pin rule of Lee 2026-11-01; chunk15_stack_memory_design.md
+// §7; the Mac emitter's emit_alloc_buf_retained): a uint8 buffer for a foreign parameter the sidecar declares
+// `retains`. It is a node of the dangerous actor's STATE AREA, so its address is stable for the actor's
+// life: the actor is pinned (spawned with state_policy(:keep_state_area), E4036, and no behaviour of it
+// takes the fallback copy, E4037), and nodes never move under :keep_state_area for proven behaviours
+// (decision 21, §4.3). The behaviour runs with rsp at the state edge, so the edge cannot be extended during
+// the dispatch; the node is therefore taken as a block of the behaviour's own frame (L_dyn_alloc;
+// external_danger sequences are only directly inside the behaviour, E4041, so the block is in the
+// behaviour's frame and lives to dispatch end) and handed to silica_rt_state_retain_node
+// (prims_actors_state_asm), which gives back an exact-size hole of the state area instead when one is
+// free, else records the block as pending; silica_rt_state_dispatch_end lowers the edge to the lowest
+// pending block, so the block becomes a state node in place, never copied.
+// Block layout (16-aligned, round16(n + 24) bytes): the buffer node is the block's last round8(n + 8)
+// bytes, the count then the bytes, exactly an alloc_buf buffer's node (the value points past the count,
+// so the count is at [buf - 8]); the front gap G (16 or 24 bytes) holds +0 the pending link and +8 G and
+// becomes a hole once the node is placed. Operands as alloc_buf's region-less form: X1 = the lifetime
+// witness (unused), X2 = rdx = n. L_dyn_alloc keeps every VR home (rax = bytes in, the block out), so
+// rdx is still n at the runtime call: X0 = the block, X1 = its bytes, X2 = n. The call clobbers the
+// caller-saved homes, as every memory prim is assumed to (body_has_bl_producing_prim). A 0 answer (no
+// current actor, or the state header cannot be committed) ends the actor through L_region_overflow.
+fn emit_alloc_buf_retained(dest: string) -> string {
+    neg_check: string <- x86_isa@x86_cmp_branch("LT", "X2", "#0", "L_buf_invalid");
+    size: string <- "    lea rax, [rdx + 39]\n    and rax, -16\n    mov r15, rax\n";
+    frame_block: string <- "    call L_dyn_alloc\n    mov rdi, rax\n    mov rsi, r15\n";
+    retain: string <- "    call silica_rt_state_retain_node\n    test rdi, rdi\n    jz L_region_overflow\n";
+    concat(concat(neg_check, size), concat(frame_block, concat(retain, x86_isa@x86_mov(dest, "X0"))))
 }
 
 fn int64_to_str(n: int64) -> string {
@@ -531,7 +563,7 @@ fn is_buf_access_prim(name: string) -> boolean {
 fn term_has_region_allocation(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
     case term.root < 0 of {
         true -> false;
-        false -> case sir_term_root_node(term).kind == 6 and (sir_term_root_node(term).name == "alloc_ref" or sir_term_root_node(term).name == "alloc_buf" or sir_term_root_node(term).name == "alloc_rec" or is_buf_access_prim(sir_term_root_node(term).name)) of {
+        false -> case sir_term_root_node(term).kind == 6 and (sir_term_root_node(term).name == "alloc_ref" or sir_term_root_node(term).name == "alloc_buf" or sir_term_root_node(term).name == "alloc_buf_retained" or sir_term_root_node(term).name == "alloc_rec" or is_buf_access_prim(sir_term_root_node(term).name)) of {
             true -> true;
             false -> case term_has_region_allocation(sir_term_at(term, sir_term_root_node(term).inner)) of {
                 true -> true;
@@ -555,8 +587,9 @@ fn module_uses_region_allocation(sir_module: { module_name: string, used_modules
     region_allocation_in_functions(sir_module.functions)
 }
 
-// True when emitted code calls silica_rt_region_alloc (alloc_region prim only).
-// Used to append the malloc stub; separate from module_uses_region_allocation (arena bump overflow).
+// True when some function has an alloc_region prim. Since chunk 15 phase 7 alloc_region calls nothing
+// (its block is a frame allocation), but the gate of the malloc stub in emitter_core is kept until the
+// phase 4 copier and the implicit heap's removal are ported (phase 8).
 fn term_has_alloc_region(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
     case term.root < 0 of {
         true -> false;
@@ -585,7 +618,11 @@ fn module_uses_alloc_region(sir_module: { module_name: string, used_modules: Lis
 }
 
 // L_region_grow(X1 = rsi = region, X7 = r15 = bytes wanted): attach a block that can hold the
-// request and point the region's bump/end at it. Hand-written x86-64. Preserves every general
+// request and point the region's bump/end at it. Hand-written x86-64.
+// Since chunk 15 phase 7 no region prim calls it (emit_region_bump_check takes a frame block
+// instead, as on the Mac, where this helper is deleted). Its one remaining caller on this target is
+// the pre-phase-4 message copier (term_message_copy L_mc_reserve, the copy's fresh heap region,
+// which must outlive the copier's frame); it goes with that copier in phase 8. Preserves every general
 // register (all fourteen are pushed), because it is called from the middle of an allocation sequence
 // that still holds the value being stored: the caller only retries its reservation afterwards. The
 // region and the rounded size (X19/X20 on AArch64) live in two frame slots across
@@ -630,8 +667,11 @@ fn emit_region_grow_helper() -> string {
 
 // L_region_contains(X1 = rsi = ref, X2 = rdx = region) -> X5 = r9 = 0 or 1: is the ref one this
 // region handed out? Hand-written x86-64 leaf.
-// The first block's data starts at region+32 and the rest hang off [region+16], each carrying its
-// own end at [block+24], so a ref from a block filled before the region grew still answers true.
+// The block's data starts at region+32 and ends at [region+24]. [region+16] is always 0 for a
+// region alloc_region made since the region prims stopped growing by chained heap blocks (chunk 15
+// phase 7), so the chain walk finds nothing; a block taken in the frame after the region filled
+// (emit_region_bump_check path 3) answers false. A fresh region of the message copier can still
+// carry a chain (L_region_grow), which the walk keeps answering for.
 //
 // X5 (r9) is the only register this leaves changed. The walk needs two scratch registers and borrows
 // X6/X7 (r14/r15), but restores them: ref_in_region runs on every operation of a region-backed map, and
@@ -742,6 +782,7 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "read_ref" -> emit_read_ref(dest);
         "write_ref" -> emit_write_ref(term, dest);
         "alloc_buf" -> emit_alloc_buf(term, dest);
+        "alloc_buf_retained" -> emit_alloc_buf_retained(dest);
         "buf_load" -> emit_buf_load(term, dest);
         "buf_store" -> emit_buf_store(term, dest, "");
         "read_buf" -> emit_buf_load(term, dest);
@@ -750,6 +791,52 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         "canonical_arena_lookup" -> emit_canonical_arena_lookup(dest);
         "canonical_arena_same" -> emit_canonical_arena_same(dest);
         "ref_eq" -> emit_ref_eq(dest);
+        "retire" -> emit_retire(term);
         _: string -> concat(concat(".error \"unsupported memory prim: ", concat(sir_term_root_node(term).name, "\"\n")), "")
     }
+}
+
+// retire(r) (chunk 15 phase 3c, chunk15_stack_memory_design.md §4.2; ported from the Mac emitter):
+// X1 = the ref. The node's size is static, the state copier's: a one-word cell is 8 bytes, an alloc_rec
+// cell is its payload tuple rounded to 16 plus the 8-byte cell word. The runtime half
+// (silica_rt_state_retire, prims_actors_runtime_asm_b) logs the node only during a proven dispatch
+// (ACB #560) and only when it lies in the state area [edge, top); result unit, nothing is written to
+// the destination. X0 = rdi = the node, X1 = rsi = its bytes; the call clobbers every non-slot home.
+fn retire_node_bytes(ref_type: string) -> int64 {
+    open: int64 <- memory_find_from(ref_type, "(", 0);
+    case open < 0 of {
+        true -> 8;
+        false -> {
+            elem: string <- memory_trim_spaces(prims_tuple@tuple_type_nth_element(substring(ref_type, open, length_bytes(ref_type)), 2));
+            case length_bytes(elem) > 0 and substring(elem, 0, 1) == "(" of {
+                true -> ((prims_tuple@count_type_elements(elem) * 8 + 15) / 16) * 16 + 8;
+                false -> 8
+            }
+        }
+    }
+}
+
+fn memory_find_from(s: string, ch: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 1) == ch of {
+            true -> i;
+            false -> memory_find_from(s, ch, i + 1)
+        }
+    }
+}
+
+fn memory_trim_spaces(s: string) -> string {
+    case length_bytes(s) > 0 and substring(s, 0, 1) == " " of {
+        true -> memory_trim_spaces(substring(s, 1, length_bytes(s)));
+        false -> case length_bytes(s) > 0 and substring(s, length_bytes(s) - 1, length_bytes(s)) == " " of {
+            true -> memory_trim_spaces(substring(s, 0, length_bytes(s) - 1));
+            false -> s
+        }
+    }
+}
+
+fn emit_retire(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+    n: int64 <- retire_node_bytes(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name);
+    concat(concat(x86_isa@x86_mov("X0", "X1"), x86_isa@x86_movi("X1", n)), x86_isa@x86_call("silica_rt_state_retire"))
 }

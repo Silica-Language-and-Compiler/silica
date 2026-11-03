@@ -386,14 +386,30 @@ integrate_rss_mark="$(1)"; integrate_rss_mark="$${integrate_rss_mark##*/}.max_rs
 if [ "$(SILICA_TARGET_IS_HOST)" != 1 ] || [ ! -f "$$integrate_rss_mark" ]; then integrate_rss_mark=""; fi
 endef
 #
+# Task cap, Linux hosts only (a trial's own marker): when the directory the suite runs in holds
+# <trial>.linux_max_tasks, a file whose first word is a count, and the host emit target is a linux one
+# with systemd-run present, the trial runs in its own scope with that TasksMax. A trial that spawns
+# threads until the host refuses one (ffi_addition's dangerous_spawn_thread_limit, which macOS ends at
+# kern.num_taskthreads 4096) then meets the cap in its own scope and never takes the user slice's
+# pids.max from the compiler, assembler and linker jobs running beside it. On any other host, or
+# without the marker, the command line is the one used before the cap existed.
+# Sets integrate_tasks_pfx to the command prefix, or to "".
+define INTEGRATE_TASKS_MARK
+integrate_tasks_pfx=""; \
+$(if $(filter linux_%,$(SILICA_HOST_EMIT_TARGET)),integrate_tasks_mark="$(1)"; integrate_tasks_mark="$${integrate_tasks_mark##*/}.linux_max_tasks"; \
+if [ -f "$$integrate_tasks_mark" ] && command -v systemd-run >/dev/null 2>&1; then \
+integrate_tasks_pfx="systemd-run --user --scope -q -p TasksMax=$$(head -n 1 "$$integrate_tasks_mark" | cut -d' ' -f1)"; fi,:)
+endef
+#
 # $(call INTEGRATE_RUN_TRIAL,<label>,<sout path>,<command>): output then exit status into <sout path>.
 define INTEGRATE_RUN_TRIAL
 integrate_killed=0; \
 $(call INTEGRATE_RSS_MARK,$(1)); \
+$(call INTEGRATE_TASKS_MARK,$(1)); \
 if [ -n "$$integrate_rss_mark" ]; then \
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' python3 "$(INTEGRATE_RSS_RUNNER)" "$(1)" "$$integrate_rss_mark" "$(2)" -- $(3) 7>&1 > "$(2)" 2>&1 & integrate_pid=$$!; \
 else \
-perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $(3) > "$(2)" 2>&1 & integrate_pid=$$!; \
+perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $$integrate_tasks_pfx $(3) > "$(2)" 2>&1 & integrate_pid=$$!; \
 fi; \
 integrate_reg="$${SILICA_INTEGRATE_ROOT:-.}/.integrate_running/$$integrate_pid"; \
 { printf '%s %s\n' "$$integrate_pid" "$(1)" > "$$integrate_reg"; } 2>/dev/null; \
@@ -407,10 +423,11 @@ endef
 define INTEGRATE_EXEC_TRIAL
 integrate_killed=0; \
 $(call INTEGRATE_RSS_MARK,$(1)); \
+$(call INTEGRATE_TASKS_MARK,$(1)); \
 if [ -n "$$integrate_rss_mark" ]; then \
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' python3 "$(INTEGRATE_RSS_RUNNER)" "$(1)" "$$integrate_rss_mark" "$${integrate_rss_mark%.max_rss_mb}.sout" -- $(2) 7>&1 & integrate_pid=$$!; \
 else \
-perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $(2) & integrate_pid=$$!; \
+perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $$integrate_tasks_pfx $(2) & integrate_pid=$$!; \
 fi; \
 integrate_reg="$${SILICA_INTEGRATE_ROOT:-.}/.integrate_running/$$integrate_pid"; \
 { printf '%s %s\n' "$$integrate_pid" "$(1)" > "$$integrate_reg"; } 2>/dev/null; \
