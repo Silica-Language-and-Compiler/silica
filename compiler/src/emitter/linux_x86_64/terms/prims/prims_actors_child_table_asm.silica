@@ -1731,6 +1731,11 @@ silica_rt_supervisor_get_child_info:
 	.globl	silica_rt_supervisor_get_child_info_acb
 	.p2align	2
 silica_rt_supervisor_get_child_info_acb:
+# rdi = the held supervisor ACB, rsi = the child id -> rdi = the child-info record { id, agent_type, child,
+# restart } (shape word + 4 fields, 40 bytes; an empty record with child -1 when no live row holds the id,
+# spec §15.4.8.3). Chunk 15 stage 4e (design §9.1): the record is built below rsp in this frame ([rbp-24])
+# and the routine leaves through rbp with rsp at the record, so silica_rt_sup_ref_call passes the lowered
+# rsp on and the emitted call site adopts the record into the caller's frame (prims_actors@runtime_call_asm).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -1740,6 +1745,10 @@ silica_rt_supervisor_get_child_info_acb:
 	mov	rsi, rdi
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_supervisor_drain_ingress
+	sub	rsp, 48
+	mov	QWORD PTR [rbp - 24], rsp
+	mov	QWORD PTR [rsp], 65536
+	mov	QWORD PTR [rsp + 40], 0
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	rax, QWORD PTR [rax + 216]
 	test	rax, rax
@@ -1761,10 +1770,7 @@ Lsgetinfo_next:
 	jmp	Lsgetinfo_loop
 Lsgetinfo_found:
 	mov	QWORD PTR [rbp - 8], r9
-	mov	edi, 40
-	call	silica_rt_region_alloc
-	mov	QWORD PTR [rbp - 24], rdi
-	mov	QWORD PTR [rdi], 65536
+	mov	rdi, QWORD PTR [rbp - 24]
 	mov	rax, QWORD PTR [rbp - 16]
 	mov	QWORD PTR [rdi + 8], rax
 	mov	rax, QWORD PTR [rbp - 8]
@@ -1787,17 +1793,15 @@ Lsgetinfo_restart_done:
 	jmp	Lsgetinfo_done
 Lsgetinfo_none:
 # No live row holds the id (spec §15.4.8.3 :get_child names the child by id): an empty record.
-	mov	edi, 40
-	call	silica_rt_region_alloc
-	mov	QWORD PTR [rbp - 24], rdi
-	mov	QWORD PTR [rdi], 65536
+	mov	rdi, QWORD PTR [rbp - 24]
 	mov	QWORD PTR [rdi + 8], 0
 	mov	QWORD PTR [rdi + 16], 0
 	mov	QWORD PTR [rdi + 24], -1
 	mov	QWORD PTR [rdi + 32], 0
 Lsgetinfo_done:
-	leave
-	ret
+	mov	rax, QWORD PTR [rbp + 8]
+	mov	rbp, QWORD PTR [rbp]
+	jmp	rax
 	.globl	silica_rt_supervisor_get_child_id
 	.p2align	2
 silica_rt_supervisor_get_child_id:
@@ -1946,12 +1950,20 @@ silica_rt_supervisor_which_children:
 	.globl	silica_rt_supervisor_which_children_acb
 	.p2align	2
 silica_rt_supervisor_which_children_acb:
+# rdi = the held supervisor ACB -> rdi = the List of child-info records { id, agent_type, child, restart }
+# (one 40-byte inline record per live row in a 56-byte chunk {record, pad, next}, with a 24-byte handle
+# {length, first chunk, cursor 0} per chunk, as the compiled list prims read an inline-record list), or 0
+# when no row is live. Chunk 15 stage 4e (design §9.1): the live rows are counted first, 120 bytes per row
+# are reserved below rsp in this frame as a destination area (its pair at [rbp - 96]), the list is built
+# there back to front through silica_rt_dest_take, and the routine leaves through rbp with rsp at the
+# area's bottom, so silica_rt_sup_ref_call passes the lowered rsp on and the emitted call site adopts
+# the list into the caller's frame (prims_actors@runtime_call_asm).
 # [rbp - 8] ACB (x19), [rbp - 16] row (x20), [rbp - 24] list so far (x21), [rbp - 32] child (x22),
 # [rbp - 40] info record (x23), [rbp - 48] id, then chunk (x24), [rbp - 56] agent (x25), [rbp - 64] restart (x26),
-# [rbp - 72] new list handle (x27).
+# [rbp - 72] new list handle (x27), [rbp - 96] / [rbp - 88] the destination pair.
 	push	rbp
 	mov	rbp, rsp
-	sub	rsp, 80
+	sub	rsp, 96
 	mov	QWORD PTR [rbp - 8], rdi
 	call	silica_rt_tls_current_actor_get
 	mov	rsi, rdi
@@ -1964,6 +1976,26 @@ silica_rt_supervisor_which_children_acb:
 	mov	rax, QWORD PTR [rax + 24]
 Lsbh_9:
 	mov	QWORD PTR [rbp - 16], rax
+	xor	ecx, ecx
+Lswhich_count:
+	test	rax, rax
+	jz	Lswhich_counted
+	cmp	QWORD PTR [rax], 0
+	je	Lswhich_count_next
+	add	rcx, 1
+Lswhich_count_next:
+	mov	rax, QWORD PTR [rax + 80]
+	jmp	Lswhich_count
+Lswhich_counted:
+	test	rcx, rcx
+	jz	Lswhich_none
+	imul	rcx, rcx, 120
+	add	rcx, 15
+	and	rcx, -16
+	mov	r10, rsp
+	sub	rsp, rcx
+	mov	QWORD PTR [rbp - 96], r10
+	mov	QWORD PTR [rbp - 88], rsp
 	mov	QWORD PTR [rbp - 24], 0
 Lswhich_scan:
 	mov	rax, QWORD PTR [rbp - 16]
@@ -1973,8 +2005,9 @@ Lswhich_scan:
 	mov	QWORD PTR [rbp - 32], rcx
 	test	rcx, rcx
 	jz	Lswhich_next
-	mov	edi, 40
-	call	silica_rt_region_alloc
+	lea	rdi, [rbp - 96]
+	mov	esi, 40
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rbp - 40], rdi
 	mov	QWORD PTR [rdi], 65536
 	mov	rax, QWORD PTR [rbp - 16]
@@ -1989,8 +2022,9 @@ Lswhich_scan:
 	mov	rcx, QWORD PTR [rax + 40]
 	mov	QWORD PTR [rbp - 64], rcx
 	mov	QWORD PTR [rdi + 32], rcx
-	mov	edi, 56
-	call	silica_rt_region_alloc
+	lea	rdi, [rbp - 96]
+	mov	esi, 56
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rbp - 48], rdi
 	mov	rax, QWORD PTR [rbp - 40]
 	mov	r8, QWORD PTR [rax]
@@ -2012,8 +2046,9 @@ Lswhich_scan:
 Lswhich_chunk_nil:
 	mov	QWORD PTR [rdi + 48], 0
 Lswhich_chunk_ready:
-	mov	edi, 24
-	call	silica_rt_region_alloc
+	lea	rdi, [rbp - 96]
+	mov	esi, 24
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rbp - 72], rdi
 	mov	rax, QWORD PTR [rbp - 24]
 	test	rax, rax
@@ -2036,6 +2071,14 @@ Lswhich_next:
 	jmp	Lswhich_scan
 Lswhich_done:
 	mov	rdi, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [rbp - 96]
+	and	rax, -16
+	mov	rsp, rax
+	mov	rax, QWORD PTR [rbp + 8]
+	mov	rbp, QWORD PTR [rbp]
+	jmp	rax
+Lswhich_none:
+	xor	edi, edi
 	leave
 	ret
 	.globl	silica_rt_supervisor_terminate_child
@@ -2619,23 +2662,24 @@ Lers_new_child:
 Lers_done:
 	leave
 	ret
-# silica_rt_owned_record_begin(rdi = the node, rsi = the receiving ACB): the arena position when the
-# dispatch of an owned record (node +32 = 2: an exit report) begins, noted in the node (+40 the
-# arena block, +48 its bump) for the release below. Leaf.
+# silica_rt_owned_record_begin(rdi = the node, rsi = the receiving ACB): the dispatch of an owned record
+# (node +32 = 2: an exit report) begins. Until chunk 15 stage 4e the node took a snapshot of the actor's
+# arena here (+40 the block, +48 its bump) for the release below; the implicit heap is gone, so the two
+# words are cleared. Leaf.
 	.globl	silica_rt_owned_record_begin
 	.p2align	2
 silica_rt_owned_record_begin:
-	mov	rax, QWORD PTR [rsi + 160]
-	mov	QWORD PTR [rdi + 40], rax
-	mov	rax, QWORD PTR [rsi + 176]
-	mov	QWORD PTR [rdi + 48], rax
+	mov	QWORD PTR [rdi + 40], 0
+	mov	QWORD PTR [rdi + 48], 0
 	ret
 # silica_rt_owned_record_release(rdi = the node, rsi = the ACB whose behaviour just returned): the
 # record (node +8; the pair (:explicit, atom) it may hold is inside it, at +48) goes back unless
-# the behaviour kept it: it is the new state (ACB word 0) or a word of what the behaviour
-# allocated in its arena since the dispatch began names the record or the pair (a state or a cell
-# holding r.failure_reason). The rule of silica_rt_report_release: anything uncertain keeps it, a
-# missed free leaks one record, a wrong one corrupts. A behaviour that sends the record on sends a
+# the behaviour kept it: it is the new state (ACB word 0), or ACB #608 says the behaviour returned a
+# state the descriptors cannot follow to every word (chunk 15 stage 4e: a described state was copied
+# into the state area by the dispatch end, so the record can go; an undescribed one may still name the
+# record or the pair through a word the copier carried as it is; until 4e the arena span allocated since
+# the dispatch began was scanned for such a word). The rule of silica_rt_report_release: anything
+# uncertain keeps it, a missed free leaks one record, a wrong one corrupts. A behaviour that sends the record on sends a
 # copy (copy-on-send, term_message_copy: a parameter is never moved), so no escape is tracked.
 # Leaf apart from the tail jump to free.
 	.globl	silica_rt_owned_record_release
@@ -2650,32 +2694,8 @@ silica_rt_owned_record_release:
 	je	Lorr_ret
 	cmp	r10, r9
 	je	Lorr_ret
-# ACB #608 (chunk 15 phase 4a): the behaviour returned a state the descriptors cannot follow to every
-# word, which the dispatch end carried as it is into the state area (not the arena scanned below): such
-# a word may still name the record or the pair, so it is kept.
 	cmp	QWORD PTR [rsi + 608], 0
 	jne	Lorr_ret
-	mov	r11, QWORD PTR [rdi + 40]
-	mov	rcx, QWORD PTR [rsi + 160]
-	mov	rdx, QWORD PTR [rdi + 48]
-	mov	r8, QWORD PTR [rsi + 176]
-	cmp	r11, rcx
-	je	Lorr_scan
-	test	r11, r11
-	jnz	Lorr_ret
-	test	rcx, rcx
-	jz	Lorr_free
-	lea	rdx, [rcx + 16]
-Lorr_scan:
-	cmp	rdx, r8
-	jae	Lorr_free
-	mov	r10, QWORD PTR [rdx]
-	add	rdx, 8
-	cmp	r10, rax
-	je	Lorr_ret
-	cmp	r10, r9
-	je	Lorr_ret
-	jmp	Lorr_scan
 Lorr_free:
 	mov	rdi, rax
 	jmp	free

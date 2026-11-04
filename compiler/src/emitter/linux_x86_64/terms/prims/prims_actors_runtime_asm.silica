@@ -52,7 +52,9 @@
 // mailbox-buffer retain flag of chunk 15 phase 4a (the Mac's #600: cleared at every dispatch start, set
 // by the epilogue of a behaviour whose state type the descriptors cannot follow to every word,
 // prims_actors@bmv_state_asm; read at LBB1_free_user, LBB1_reply_drain_done, LBBsigpend_active_user
-// and by silica_rt_message_forward)): +0..+215 the
+// and by silica_rt_message_forward; also by silica_rt_report_release and silica_rt_owned_record_release
+// since stage 4e). The implicit heap's words +160..+184 are unused since chunk 15 stage 4e (design §9.1:
+// the heap is gone)): +0..+215 the
 // actor runtime's, +216 the supervision block pointer (SB, 144 B, only a supervisor has one; layout at
 // silica_rt_sb_require in prims_actors_runtime_asm_b), +224 started flag, +232 pending exit reason_tag (+384 its atom, or a language error's detail code),
 // +240 active call wrapper, +248/+256/+264 FFI arena base/end/bump (Phase 12), +272..+391 the
@@ -132,7 +134,6 @@ use atom_table;
 use ffi_arena_runtime_asm;
 use ffi_guarded_runtime_asm;
 use ffi_fault_runtime_asm;
-use canonical_arena_runtime_asm;
 use ordering_identity_runtime_asm;
 use checked_int64_runtime_asm;
 use linux_rt_shims_asm;
@@ -242,8 +243,6 @@ Lsp0_no_sb:
 	test	rdi, rdi
 	jnz	LBB0_state_failed
 	call	silica_rt_install_sync_fault_handlers
-	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_actor_init_region
 # Item N: the actor is bound to a carrier (idle and started; a supervisor, [rbp-48] = its
 # trampoline, is made ready instead and runs the trampoline in its first dispatch). Only a
 # dangerous actor ([rbp-72]) gets a thread of its own, below.
@@ -521,8 +520,6 @@ Lslp_policy:
 	test	rdi, rdi
 	jnz	LBBsl_state_failed
 	call	silica_rt_install_sync_fault_handlers
-	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_actor_init_region
 # Item N: bound to a carrier (a supervisor child, [rbp-32] = its trampoline, made ready for its
 # first dispatch); a dangerous actor ([rbp-72]) gets a thread of its own, below.
 	mov	rdi, QWORD PTR [rbp - 8]
@@ -1289,8 +1286,6 @@ LBB1_exit_free_stack:
 LBB1_exit_skip_legacy_root:
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_ffi_arena_teardown
-	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_actor_dealloc_region
 # Phase E e4f: AFTER full teardown the release drops this thread's hold, then stores the
 # supervisor's row.exit_done = this actor's identity and drops this child's block reference
 # (sb_child_done; the reference is what keeps the row alive when the supervisor has already ended).
@@ -2155,10 +2150,11 @@ silica_rt_get_cpu_topology:
 # Frame: [rbp-8] w19 P-cores, [rbp-16] w20 E-cores, [rbp-24] w21 total, [rbp-32] x22 cores list,
 # [rbp-40] x23 scratch node, [rbp-48] x24 / [rbp-80] x28 core-id range list, [rbp-56] x25 cache levels,
 # [rbp-64] x26 caps / numa list, [rbp-72] x27 memsize; [rbp-88] w9 loop counter and [rbp-96] w10
-# are kept in the frame because malloc clobbers r10/r11. The sysctl scratch pair lives at [rsp], [rsp+8].
+# are kept in the frame because the calls clobber r10/r11; [rbp-112] / [rbp-104] the destination pair
+# (the AArch64 [x29, #96]). The sysctl scratch pair lives at [rsp], [rsp+8].
 	push	rbp
 	mov	rbp, rsp
-	sub	rsp, 96
+	sub	rsp, 112
 	sub	rsp, 16
 	mov	DWORD PTR [rsp + 8], 4
 	mov	DWORD PTR [rsp], 0
@@ -2190,31 +2186,41 @@ silica_rt_get_cpu_topology:
 	mov	QWORD PTR [rbp - 24], rax
 	test	eax, eax
 	jz	L_topo_fail_zero
+# Chunk 15 stage 4e (design §9.1): every list, string and record of the answer is built in a destination
+# area reserved here in this frame's dynamic part (256 bytes per core plus 2048: ample for the caps list,
+# the core records and their array, five lists, two node records, the cache levels and the record itself;
+# silica_rt_dest_take aborts on an overrun), its pair at [rbp-112]. L_topo_epilogue lowers rsp onto what
+# was taken and leaves through rbp, and the emitted call site adopts the area into the caller's frame.
+	mov	eax, DWORD PTR [rbp - 24]
+	shl	rax, 8
+	add	rax, 2048
+	mov	r10, rsp
+	sub	rsp, rax
+	mov	QWORD PTR [rbp - 112], r10
+	mov	QWORD PTR [rbp - 104], rsp
+	lea	rdi, [rbp - 112]
 	call	silica_rt_apple_hw_optional_caps_list
 	mov	QWORD PTR [rbp - 64], rdi
 # cores: one boxed core_info (40 bytes: shape word, id, core_type, capabilities, frequency_mhz) per
-# id, its pointer in an id-ordered word array ([rbp-96], region), then the List[core_info] handle
+# id, its pointer in an id-ordered word array ([rbp-96], destination), then the List[core_info] handle
 # built over the array by silica_rt_build_list_from_words into [rbp-32]. The record lists
 # get_cpu_topology answers (cores, numa_nodes, memory_ranges, cache levels) were 16-byte
 # {record, next} cons cells until 2026-10-20, which compiled code read as a list handle:
 # length(top.cores) was the first record's address and any walk of the list faulted. The loop
 # index is [rbp-88], ascending.
-	mov	edi, DWORD PTR [rbp - 24]
-	shl	rdi, 3
-	call	silica_rt_region_alloc
-	test	rdi, rdi
-	jz	L_topo_fail_zero
+	mov	esi, DWORD PTR [rbp - 24]
+	shl	rsi, 3
+	lea	rdi, [rbp - 112]
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rbp - 96], rdi
 	mov	QWORD PTR [rbp - 88], 0
 L_topo_core_loop:
 	mov	rax, QWORD PTR [rbp - 88]
 	cmp	eax, DWORD PTR [rbp - 24]
 	jae	L_topo_after_cores
-	mov	edi, 40
-	call	malloc
-	mov	rdi, rax
-	test	rdi, rdi
-	jz	L_topo_fail_zero
+	lea	rdi, [rbp - 112]
+	mov	esi, 40
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rbp - 40], rdi
 	mov	QWORD PTR [rdi], 65537
 	mov	r11, QWORD PTR [rbp - 88]
@@ -2234,12 +2240,14 @@ L_topo_core_loop:
 L_topo_after_cores:
 	mov	rdi, QWORD PTR [rbp - 96]
 	mov	esi, DWORD PTR [rbp - 24]
+	lea	rdx, [rbp - 112]
 	call	silica_rt_build_list_from_words
 	test	rdi, rdi
 	jz	L_topo_fail_zero
 	mov	QWORD PTR [rbp - 32], rdi
 	xor	edi, edi
 	mov	esi, DWORD PTR [rbp - 24]
+	lea	rdx, [rbp - 112]
 	call	silica_rt_build_int_range_list
 	mov	QWORD PTR [rbp - 48], rdi
 	mov	QWORD PTR [rbp - 80], rdi
@@ -2248,11 +2256,9 @@ L_topo_after_cores:
 	test	rdi, rdi
 	jz	L_topo_fail_zero
 	mov	QWORD PTR [rbp - 72], rdi
-	mov	edi, 32
-	call	malloc
-	mov	rdi, rax
-	test	rdi, rdi
-	jz	L_topo_fail_zero
+	lea	rdi, [rbp - 112]
+	mov	esi, 32
+	call	silica_rt_dest_take
 # memory_range: one NUMA node (Apple Silicon has no multi-domain sysctl matrix). start=0 = domain origin in this layout;
 # macOS sysctl does not expose physical DRAM base per node — size is real (hw.memsize bytes). latency=0 = local self-
 # distance (ACPI SLIT-style relative units: same node as itself), not an OS picoseconds value.
@@ -2266,16 +2272,15 @@ L_topo_after_cores:
 	mov	QWORD PTR [rsp], rdi
 	mov	rdi, rsp
 	mov	esi, 1
+	lea	rdx, [rbp - 112]
 	call	silica_rt_build_list_from_words
 	lea	rsp, [rsp + 16]
 	test	rdi, rdi
 	jz	L_topo_fail_zero
 	mov	QWORD PTR [rbp - 40], rdi
-	mov	edi, 32
-	call	malloc
-	mov	rdi, rax
-	test	rdi, rdi
-	jz	L_topo_fail_zero
+	lea	rdi, [rbp - 112]
+	mov	esi, 32
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rdi], 65539
 	mov	QWORD PTR [rdi + 8], 0
 	mov	rax, QWORD PTR [rbp - 80]
@@ -2287,6 +2292,7 @@ L_topo_after_cores:
 	mov	QWORD PTR [rsp], rdi
 	mov	rdi, rsp
 	mov	esi, 1
+	lea	rdx, [rbp - 112]
 	call	silica_rt_build_list_from_words
 	lea	rsp, [rsp + 16]
 	test	rdi, rdi
@@ -2296,13 +2302,12 @@ L_topo_after_cores:
 	mov	esi, DWORD PTR [rbp - 16]
 	mov	edx, DWORD PTR [rbp - 24]
 	mov	rcx, QWORD PTR [rbp - 80]
+	lea	r8, [rbp - 112]
 	call	silica_rt_apple_build_cache_levels
 	mov	QWORD PTR [rbp - 56], rdi
-	mov	edi, 32
-	call	malloc
-	mov	rdi, rax
-	test	rdi, rdi
-	jz	L_topo_fail_zero
+	lea	rdi, [rbp - 112]
+	mov	esi, 32
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rdi], 65538
 	mov	rax, QWORD PTR [rbp - 32]
 	mov	QWORD PTR [rdi + 8], rax
@@ -2314,31 +2319,43 @@ L_topo_after_cores:
 L_topo_sysctl_fail:
 	add	rsp, 16
 L_topo_fail_zero:
-# OOM / sysctl / zero-core failure: still return a non-NULL 32-byte record (shape word; cores, numa_nodes, cache_hierarchy
-# pointers all nil) so Silica callers can field-load and length(empty) without SIGSEGV. If malloc fails, return NULL.
-	mov	edi, 32
-	call	malloc
-	mov	rdi, rax
-	test	rdi, rdi
-	jz	L_topo_null_ret
+# sysctl or zero-core failure: still a non-NULL 32-byte record (shape word; cores, numa_nodes,
+# cache_hierarchy pointers all nil) so Silica callers can field-load and length(empty) without a fault,
+# built below rsp in this frame (a destination area reserved before the failure lies above it and is
+# adopted with it).
+	sub	rsp, 32
+	mov	rdi, rsp
 	mov	QWORD PTR [rdi], 65538
 	mov	QWORD PTR [rdi + 8], 0
 	mov	QWORD PTR [rdi + 16], 0
 	mov	QWORD PTR [rdi + 24], 0
-	jmp	L_topo_epilogue
-L_topo_null_ret:
-	xor	edi, edi
+	jmp	L_topo_leave
 L_topo_epilogue:
-	leave
-	ret
+	mov	rax, QWORD PTR [rbp - 112]
+	and	rax, -16
+	mov	rsp, rax
+L_topo_leave:
+# rsp stays on the answer: the frame is left through rbp, never popped (silica_rt_actor_call's leave).
+	mov	rax, QWORD PTR [rbp + 8]
+	mov	rbp, QWORD PTR [rbp]
+	jmp	rax
 	.globl	silica_rt_get_core_capabilities
 	.p2align	2
 silica_rt_get_core_capabilities:
-# Frame: [rbp-8] w19 P-cores, [rbp-16] w20 E-cores, [rbp-24] w21 total, [rbp-40] x23 record, [rbp-80] x28 requested id.
+# Frame: [rbp-8] w19 P-cores, [rbp-16] w20 E-cores, [rbp-24] w21 total, [rbp-40] x23 record, [rbp-80] x28 requested id,
+# [rbp-112] / [rbp-104] the destination pair.
+# Chunk 15 stage 4e (design §9.1): the core_info record and its capabilities list (40 + 344 bytes at
+# most) are built in a 400-byte destination area reserved below this frame (its pair at [rbp-112]);
+# L_cap_epilogue lowers rsp onto what was taken and leaves through rbp, and the emitted call site adopts
+# the area into the caller's frame.
 	push	rbp
 	mov	rbp, rsp
-	sub	rsp, 96
+	sub	rsp, 112
 	mov	QWORD PTR [rbp - 80], rdi
+	mov	r10, rsp
+	sub	rsp, 400
+	mov	QWORD PTR [rbp - 112], r10
+	mov	QWORD PTR [rbp - 104], rsp
 	sub	rsp, 16
 	mov	DWORD PTR [rsp + 8], 4
 	mov	DWORD PTR [rsp], 0
@@ -2378,11 +2395,9 @@ silica_rt_get_core_capabilities:
 	mov	r11d, DWORD PTR [rbp - 24]
 	cmp	rax, r11
 	jae	L_cap_emit_sentinel
-	mov	edi, 40
-	call	malloc
-	mov	rdi, rax
-	test	rdi, rdi
-	jz	L_cap_emit_sentinel
+	lea	rdi, [rbp - 112]
+	mov	esi, 40
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rbp - 40], rdi
 	mov	QWORD PTR [rdi], 65537
 	mov	rax, QWORD PTR [rbp - 80]
@@ -2392,6 +2407,7 @@ silica_rt_get_core_capabilities:
 	setl	cl
 	movzx	ecx, cl
 	mov	QWORD PTR [rdi + 16], rcx
+	lea	rdi, [rbp - 112]
 	call	silica_rt_apple_hw_optional_caps_list
 	mov	rax, QWORD PTR [rbp - 40]
 	mov	QWORD PTR [rax + 24], rdi
@@ -2401,25 +2417,23 @@ silica_rt_get_core_capabilities:
 L_cap_sysctl_fail:
 	add	rsp, 16
 	jmp	L_cap_emit_sentinel
-# Failure / OOM: heap core_info with id=-1 (sentinel); core_type=0 (:efficiency); caps/freq zero — distinguish from valid id>=0.
+# Failure: a core_info with id=-1 (sentinel); core_type=0 (:efficiency); caps/freq zero: distinguish from valid id>=0.
 L_cap_emit_sentinel:
-	mov	edi, 40
-	call	malloc
-	mov	rdi, rax
-	test	rdi, rdi
-	jz	L_cap_sentinel_oom
+	lea	rdi, [rbp - 112]
+	mov	esi, 40
+	call	silica_rt_dest_take
 	mov	QWORD PTR [rdi], 65537
 	mov	QWORD PTR [rdi + 8], -1
 	mov	QWORD PTR [rdi + 16], 0
 	mov	QWORD PTR [rdi + 24], 0
 	mov	QWORD PTR [rdi + 32], 0
-	jmp	L_cap_epilogue
-L_cap_sentinel_oom:
-	xor	edi, edi
-	jmp	L_cap_epilogue
 L_cap_epilogue:
-	leave
-	ret
+	mov	rax, QWORD PTR [rbp - 112]
+	and	rax, -16
+	mov	rsp, rax
+	mov	rax, QWORD PTR [rbp + 8]
+	mov	rbp, QWORD PTR [rbp]
+	jmp	rax
 "
 }
 
@@ -2427,7 +2441,11 @@ fn actor_rt_asm_chunk_6() -> string {
     "	.globl	silica_rt_get_efficiency_cores # -- Begin function silica_rt_get_efficiency_cores
 	.p2align	2
 silica_rt_get_efficiency_cores: # @silica_rt_get_efficiency_cores
-# %bb.0: query P-core count (offset) then E-core count, build list [p..p+e-1]
+# %bb.0: query P-core count (offset) then E-core count, build list [p..p+e-1]. Chunk 15 stage 4e
+# (design §9.1): the list is built in a destination area reserved in this frame (24 + 32 * ((e + 1) / 2)
+# bytes and slack, its pair at [rbp-32] / [rbp-24]); the leave lowers rsp onto it and goes through rbp,
+# and the emitted call site adopts it. An empty list (e <= 0) or a sysctl failure answers 0 with rsp as
+# it was.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -2455,13 +2473,30 @@ silica_rt_get_efficiency_cores: # @silica_rt_get_efficiency_cores
 	test	edi, edi
 	jnz	LBBec_fail
 	mov	esi, DWORD PTR [rsp]
-	mov	rdi, QWORD PTR [rbp - 8]
 	add	rsp, 16
+	cmp	esi, 0
+	jle	LBBec_nil
+	lea	rax, [rsi + 1]
+	shr	rax, 1
+	shl	rax, 5
+	add	rax, 48
+	and	rax, -16
+	mov	r10, rsp
+	sub	rsp, rax
+	mov	QWORD PTR [rbp - 32], r10
+	mov	QWORD PTR [rbp - 24], rsp
+	mov	rdi, QWORD PTR [rbp - 8]
+	lea	rdx, [rbp - 32]
 	call	silica_rt_build_int_range_list
-	leave
-	ret
+	mov	rax, QWORD PTR [rbp - 32]
+	and	rax, -16
+	mov	rsp, rax
+	mov	rax, QWORD PTR [rbp + 8]
+	mov	rbp, QWORD PTR [rbp]
+	jmp	rax
 LBBec_fail:
 	add	rsp, 16
+LBBec_nil:
 	xor	edi, edi
 	leave
 	ret
@@ -2469,7 +2504,8 @@ LBBec_fail:
 	.globl	silica_rt_get_performance_cores # -- Begin function silica_rt_get_performance_cores
 	.p2align	2
 silica_rt_get_performance_cores: # @silica_rt_get_performance_cores
-# %bb.0: query P-core count, build list [0..count-1]
+# %bb.0: query P-core count, build list [0..count-1]; the destination area and the adopting leave as in
+# silica_rt_get_efficiency_cores (chunk 15 stage 4e).
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
@@ -2485,13 +2521,30 @@ silica_rt_get_performance_cores: # @silica_rt_get_performance_cores
 	test	edi, edi
 	jnz	LBBpc_fail
 	mov	esi, DWORD PTR [rsp]
-	xor	edi, edi
 	add	rsp, 16
+	cmp	esi, 0
+	jle	LBBpc_nil
+	lea	rax, [rsi + 1]
+	shr	rax, 1
+	shl	rax, 5
+	add	rax, 48
+	and	rax, -16
+	mov	r10, rsp
+	sub	rsp, rax
+	mov	QWORD PTR [rbp - 32], r10
+	mov	QWORD PTR [rbp - 24], rsp
+	xor	edi, edi
+	lea	rdx, [rbp - 32]
 	call	silica_rt_build_int_range_list
-	leave
-	ret
+	mov	rax, QWORD PTR [rbp - 32]
+	and	rax, -16
+	mov	rsp, rax
+	mov	rax, QWORD PTR [rbp + 8]
+	mov	rbp, QWORD PTR [rbp]
+	jmp	rax
 LBBpc_fail:
 	add	rsp, 16
+LBBpc_nil:
 	xor	edi, edi
 	leave
 	ret
@@ -3078,10 +3131,9 @@ fn emit_actor_runtime_helpers(table: { is_empty: boolean, index_map: { root: ref
     arena_asm: string <- ffi_arena_runtime_asm@emit_ffi_arena_runtime_asm();
     guarded_asm: string <- ffi_guarded_runtime_asm@emit_guarded_ffi_runtime_asm();
     fault_asm: string <- ffi_fault_runtime_asm@emit_ffi_fault_runtime_asm();
-    canonical_arena_asm: string <- canonical_arena_runtime_asm@emit_canonical_arena_runtime_asm();
     ordering_identity_asm: string <- ordering_identity_runtime_asm@emit_ordering_identity_runtime_asm();
     checked_int64_asm: string <- checked_int64_runtime_asm@emit_checked_int64_runtime_asm();
     stack_asm: string <- concat(concat(prims_actors_stack_asm@emit_actor_stack_runtime_asm(table), prims_actors_state_asm@emit_actor_state_runtime_asm()), prims_actors_carrier_asm@emit_actor_carrier_runtime_asm());
     linux_shims_asm: string <- linux_rt_shims_asm@emit_linux_rt_shims_asm();
-    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_9()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_10()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_11()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_12()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_13()), prims_actors_runtime_asm_c@actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), prims_actors_runtime_asm_c@actor_rt_asm_badarith_chunk()), concat(prims_actors_runtime_asm_c@actor_rt_asm_case_clause_chunk(), concat(prims_actors_runtime_asm_c@actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(prims_actors_runtime_asm_c@actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(canonical_arena_asm, concat(ordering_identity_asm, concat(checked_int64_asm, linux_shims_asm)))))))))), concat(stack_asm, prims_actors_timer_asm@emit_actor_timer_runtime_asm()))
+    concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(actor_rt_asm_chunk_0(), actor_rt_asm_chunk_1()), actor_rt_asm_chunk_2()), actor_rt_asm_chunk_3()), actor_rt_asm_chunk_4()), actor_rt_asm_chunk_5()), actor_rt_topology_phase_g_chunk()), actor_rt_asm_chunk_6()), actor_rt_asm_chunk_7()), actor_rt_asm_chunk_8()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_9()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_10()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_11()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_12()), prims_actors_runtime_asm_b@actor_rt_asm_chunk_13()), prims_actors_runtime_asm_c@actor_rt_asm_cv_chunk()), prims_actors_child_table_asm@emit_child_table_runtime_asm(table)), actor_rt_emit_runtime_tail(table)), prims_actors_runtime_asm_c@actor_rt_asm_badarith_chunk()), concat(prims_actors_runtime_asm_c@actor_rt_asm_case_clause_chunk(), concat(prims_actors_runtime_asm_c@actor_rt_asm_name_taken_chunk(atom_table@lexeme_to_index_first_added_order(table, ":actor_not_found")), concat(prims_actors_runtime_asm_c@actor_rt_identity_chunk(atom_table@lexeme_to_index_first_added_order(table, ":identity_exhausted")), concat(arena_asm, concat(guarded_asm, concat(fault_asm, concat(ordering_identity_asm, concat(checked_int64_asm, linux_shims_asm))))))))), concat(stack_asm, prims_actors_timer_asm@emit_actor_timer_runtime_asm()))
 }
