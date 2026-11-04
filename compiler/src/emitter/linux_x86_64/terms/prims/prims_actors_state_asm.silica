@@ -36,10 +36,17 @@
 //   silica_rt_state_dispatch_end    the driver the dispatch loop calls (prims_actors_runtime_asm
 //                                   LBB1_post_beh) before the release algorithm (§4.6)
 //
+//   silica_rt_message_buffer        the mailbox buffer of a message (chunk 15 phase 4a, §5.1): measure,
+//                                   malloc, copy with one table; also a child row's spec buffer (4d)
+//   silica_rt_message_forward       a forwarding site hands the serving node's buffer on (4b, §5.2)
+//   silica_rt_reply_place           a reply into the blocked caller's stack (4c, §5.3)
+//
 // Differences from the Mac: the root-word descriptor of the dispatched behaviour's state type is at ACB
-// #600 (the Mac's #592; #592 is this target's dangerous-thread rsp, so the control block is 608 bytes), and
-// the mailbox-buffer and reply-placement routines of the Mac's phase 4 (message_buffer, message_forward,
-// reply_place) are not here: this target still copies messages and replies through the heap.
+// #600 (the Mac's #592; #592 is this target's dangerous-thread rsp) and the mailbox-buffer retain flag at
+// ACB #608 (the Mac's #600), so the control block is 616 bytes. The three phase 4 routines were added
+// 2026-11-03 from the Mac file with the same translator (scratchpad p45/gen_msg.py drives a64_to_x86.py
+// over the Mac's message_buffer .. reply_place block; the node's 4-byte words +16 / +32 and the record's
+// reply_set +136 were then made DWORD accesses by hand).
 //
 // The text is the Mac's AArch64, translated instruction by instruction (scratchpad translator a64_to_x86.py of
 // the 2026-11-03 port; regenerate from the Mac file when that changes):
@@ -504,6 +511,314 @@ Lstl_main:
 	leave
 	and	rsp, -16
 	call	silica_rt_abort_state_too_large
+	.globl	silica_rt_message_buffer
+	.p2align	4
+silica_rt_message_buffer:
+# The mailbox buffer (chunk 15 phase 4a, design §5.1). X0 = the message, X1 = the root-word descriptor of
+# its type -> X0 = the root of the copy, X1 = the buffer's bytes, X2 = the buffer block (malloc'd, freed by
+# the receiver's dispatch end, by a failed send, or by the end-of-actor drain). A scalar or atom (below
+# 65536), or a value whose measure is 0 (a literal string, a function value), is answered as given with
+# X1 = X2 = 0: the message stays inline in the node, as today. The copy is silica_rt_message_copy: one
+# table for the whole message, every node once, so the root is the first node bumped and lies at the
+# block's start for every kind but a bare buffer (whose root is its element pointer, block + 8; the node
+# keeps the block in a word of its own for the free). No memory for the block or the table fails the
+# sender as an arena growth failure does (silica_rt_region_alloc_failed; main aborts).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 176
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 40], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	cmp	QWORD PTR [rbp - 56], 65536
+	jb	Lmbf_inline
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	call	silica_rt_message_measure
+	cmp	rdi, 0
+	jl	Lmbf_fail
+	cmp	rdi, 0
+	je	Lmbf_inline
+	mov	QWORD PTR [rbp - 72], rdi
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	malloc
+	mov	rsp, rbp
+	pop	rbp
+	mov	rdi, rax
+	cmp	rdi, 0
+	je	Lmbf_fail
+	mov	QWORD PTR [rbp - 80], rdi
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	mov	rdx, QWORD PTR [rbp - 80]
+	mov	rax, QWORD PTR [rbp - 80]
+	mov	rbx, QWORD PTR [rbp - 72]
+	lea	rax, [rax + rbx]
+	mov	rcx, rax
+	mov	r8, 0
+	call	silica_rt_message_copy
+	cmp	rsi, 0
+	jne	Lmbf_fail
+	mov	rsi, QWORD PTR [rbp - 72]
+	mov	rdx, QWORD PTR [rbp - 80]
+	jmp	Lmbf_ret
+Lmbf_inline:
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, 0
+	mov	rdx, 0
+Lmbf_ret:
+	mov	rbx, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 40]
+	mov	QWORD PTR [rbp - 80], rbx
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+Lmbf_fail:
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_region_alloc_failed
+	mov	rsp, rbp
+	pop	rbp
+	.globl	silica_rt_message_forward
+	.p2align	4
+silica_rt_message_forward:
+# Forwarding-only elision (chunk 15 phase 4b, design §5.2, decision 32). The arguments and results of
+# silica_rt_message_buffer, plus X2 = the entry of the function sending; called in its place at a
+# cast-family site the emitter marked with the |_mvs marker (term_message_copy fn_copy_markers: the operand is the
+# behaviour's whole message parameter, used for the last time, no part of it reaching the new state).
+# When X2 is the behaviour this actor is dispatching (ACB #8: not a behaviour-shaped helper it called,
+# whose caller may still use the message), the node being served (ACB #240) is a plain user cast node
+# (+32 = 0, +16 = 0) holding a mailbox buffer (+48) whose root is the message (+8 = X0), and no shallow
+# copy has run in this dispatch (ACB #608 = 0: one may hold a pointer into the buffer), the buffer itself
+# is handed on: X0 = the root, X1 = the bytes (+40), X2 = the block (+48), and the node's +40/+48 are
+# zeroed so that its dispatch end (LBB1_free_user) and the teardown (LBBsigpend_active_user) skip it; the
+# new node takes the words through silica_rt_actor_cast as for a fresh copy, and a dropped send frees
+# the block there (LBB3_7). In every other case (main, an inline or runtime-cast message, a call
+# node, a retained buffer) the message is copied as at any other site.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 160
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	lea	rsp, [rsp - 16]
+	mov	QWORD PTR [rsp], rdx
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_tls_current_actor_get
+	mov	rsp, rbp
+	pop	rbp
+	mov	r11, QWORD PTR [rsp]
+	lea	rsp, [rsp + 16]
+	cmp	rdi, 0
+	je	Lmfw_copy
+	mov	r10, QWORD PTR [rdi + 8]
+	cmp	r10, r11
+	jne	Lmfw_copy
+	mov	r10, QWORD PTR [rdi + 608]
+	cmp	r10, 0
+	jne	Lmfw_copy
+	mov	rbx, QWORD PTR [rdi + 240]
+	mov	QWORD PTR [rbp - 8], rbx
+	cmp	QWORD PTR [rbp - 8], 0
+	je	Lmfw_copy
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	DWORD PTR [rax + 32], 0
+	jne	Lmfw_copy
+	mov	rax, QWORD PTR [rbp - 8]
+	cmp	DWORD PTR [rax + 16], 0
+	jne	Lmfw_copy
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rdx, QWORD PTR [rax + 48]
+	cmp	rdx, 0
+	je	Lmfw_copy
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	r10, QWORD PTR [rax + 8]
+	cmp	r10, QWORD PTR [rbp - 56]
+	jne	Lmfw_copy
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rax + 40]
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 40], 0
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	QWORD PTR [rax + 48], 0
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+Lmfw_copy:
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	jmp	silica_rt_message_buffer
+	.globl	silica_rt_reply_place
+	.p2align	4
+silica_rt_reply_place:
+# The reply into the blocked caller's stack (chunk 15 phase 4c, design §5.3, decision 33). Called by the
+# behaviour epilogue (prims_actors@bmv_reply_stack_asm) with X0 = the reply and X1 = the root-word descriptor
+# of its type -> X0 = the root of its copy in the CALLER's stack, or the reply as given when nothing is
+# copied: a scalar or atom (below 65536), no current actor, no node being served (ACB #240), a node that
+# needs no reply (+16 = 0: a cast that reached a call-style behaviour), or a measure of 0 (a literal string).
+# Otherwise the copy goes to [dest, dest + bytes), dest = (the SP the caller published at the call record's
+# +152, less the bytes) rounded down to 16. When the published SP lies in the caller's managed reservation
+# (node +56 names the caller; main and a path on a carrier thread's own stack need no growth) the
+# reservation is grown to dest first (silica_rt_stack_grow_to, with the caller's ACB: a foreign stack is
+# committed here, never faulted in); a reply the reservation cannot take (dest below its base, or grow_to
+# answering 1 exhausted or 2 refused) sets reply_set (+136) to 4 and leaves the reply as given, and the
+# caller fails with (:explicit, :reservation_exceeded) on waking (LBB4_8). The bytes go to +160. Sources are
+# read where they lie (the behaviour's frame, live during the epilogue; the state area; the message
+# buffer) with ONE table, so sharing inside the reply is kept (R4.2). No table or an overrun fails this
+# actor as a mailbox buffer's does (silica_rt_region_alloc_failed).
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 192
+	mov	rbx, QWORD PTR [rbp - 56]
+	mov	QWORD PTR [rsp + 16], rbx
+	mov	rbx, QWORD PTR [rbp - 64]
+	mov	QWORD PTR [rsp + 24], rbx
+	mov	rbx, QWORD PTR [rbp - 72]
+	mov	QWORD PTR [rsp + 32], rbx
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rsp + 40], rbx
+	mov	rbx, QWORD PTR [rbp - 88]
+	mov	QWORD PTR [rsp + 48], rbx
+	mov	rbx, QWORD PTR [rbp - 96]
+	mov	QWORD PTR [rsp + 56], rbx
+	mov	QWORD PTR [rbp - 56], rdi
+	mov	QWORD PTR [rbp - 64], rsi
+	cmp	QWORD PTR [rbp - 56], 65536
+	jb	Lrpl_as_is
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_tls_current_actor_get
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 0
+	je	Lrpl_as_is
+	mov	rbx, QWORD PTR [rdi + 240]
+	mov	QWORD PTR [rbp - 72], rbx
+	cmp	QWORD PTR [rbp - 72], 0
+	je	Lrpl_as_is
+	mov	rax, QWORD PTR [rbp - 72]
+	cmp	DWORD PTR [rax + 16], 0
+	je	Lrpl_as_is
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	call	silica_rt_message_measure
+	cmp	rdi, 0
+	jl	Lrpl_fail
+	cmp	rdi, 0
+	je	Lrpl_as_is
+	mov	QWORD PTR [rbp - 80], rdi
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	r10, QWORD PTR [rax + 152]
+	mov	rax, r10
+	mov	rbx, QWORD PTR [rbp - 80]
+	sub	rax, rbx
+	mov	QWORD PTR [rbp - 88], rax
+	mov	rax, QWORD PTR [rbp - 88]
+	and	rax, -16
+	mov	QWORD PTR [rbp - 88], rax
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	rbx, QWORD PTR [rax + 56]
+	mov	QWORD PTR [rbp - 96], rbx
+	cmp	QWORD PTR [rbp - 96], 0
+	je	Lrpl_copy
+	mov	rax, QWORD PTR [rbp - 96]
+	mov	r11, QWORD PTR [rax + 272]
+	cmp	r11, 0
+	je	Lrpl_copy
+	mov	rax, QWORD PTR [rbp - 96]
+	mov	r12, QWORD PTR [rax + 280]
+	lea	rax, [r11 + r12]
+	mov	r12, rax
+	cmp	r10, r11
+	jb	Lrpl_copy
+	cmp	r10, r12
+	jae	Lrpl_copy
+	mov	rax, QWORD PTR [rbp - 88]
+	cmp	rax, r11
+	jb	Lrpl_too_large
+	mov	rdi, QWORD PTR [rbp - 96]
+	mov	rsi, QWORD PTR [rbp - 88]
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_stack_grow_to
+	mov	rsp, rbp
+	pop	rbp
+	cmp	rdi, 1
+	je	Lrpl_too_large
+	cmp	rdi, 2
+	je	Lrpl_too_large
+Lrpl_copy:
+	mov	rdi, QWORD PTR [rbp - 56]
+	mov	rsi, QWORD PTR [rbp - 64]
+	mov	rdx, QWORD PTR [rbp - 88]
+	mov	rax, QWORD PTR [rbp - 88]
+	mov	rbx, QWORD PTR [rbp - 80]
+	lea	rax, [rax + rbx]
+	mov	rcx, rax
+	mov	r8, 0
+	call	silica_rt_message_copy
+	cmp	rsi, 0
+	jne	Lrpl_fail
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	rbx, QWORD PTR [rbp - 80]
+	mov	QWORD PTR [rax + 160], rbx
+	jmp	Lrpl_ret
+Lrpl_too_large:
+	mov	rax, QWORD PTR [rbp - 72]
+	mov	DWORD PTR [rax + 136], 4
+Lrpl_as_is:
+	mov	rdi, QWORD PTR [rbp - 56]
+Lrpl_ret:
+	mov	rbx, QWORD PTR [rsp + 48]
+	mov	QWORD PTR [rbp - 88], rbx
+	mov	rbx, QWORD PTR [rsp + 56]
+	mov	QWORD PTR [rbp - 96], rbx
+	mov	rbx, QWORD PTR [rsp + 32]
+	mov	QWORD PTR [rbp - 72], rbx
+	mov	rbx, QWORD PTR [rsp + 40]
+	mov	QWORD PTR [rbp - 80], rbx
+	mov	rbx, QWORD PTR [rsp + 16]
+	mov	QWORD PTR [rbp - 56], rbx
+	mov	rbx, QWORD PTR [rsp + 24]
+	mov	QWORD PTR [rbp - 64], rbx
+	leave
+	ret
+Lrpl_fail:
+	push	rbp
+	mov	rbp, rsp
+	and	rsp, -16
+	call	silica_rt_region_alloc_failed
+	mov	rsp, rbp
+	pop	rbp
 
 "
 }

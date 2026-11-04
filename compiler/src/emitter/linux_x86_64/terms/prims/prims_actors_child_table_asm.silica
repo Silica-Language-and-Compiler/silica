@@ -20,7 +20,7 @@
 // actor_memory_budget_plan.md): SB +24 head (first node ptr), +32 len (i64 row count / list length),
 // +40 sync_failure_reported (0/1; root cap-breach reports synchronously, later thread exit skips duplicate).
 // An actor without a block has no table; start_child and materialize make one for the running actor.
-// Node size 144 B: payload 80 B (same row layout as e3a), next ptr @ +80 (0 = end), the supervision block @ +88
+// Node size 160 B: payload 80 B (same row layout as e3a), next ptr @ +80 (0 = end), the supervision block @ +88
 // (sb_child_done finds it there; the child's reference keeps the node alive), the child's spawner record
 // @ +96 (position + 1) / +104 (next child number), kept across the child's restarts (spec §15.1.4,
 // §15.4.12.1), the current child's identity @ +112 (what call_supervisor answers with), and @ +120 the
@@ -28,9 +28,15 @@
 // prims_actors_carrier_asm.silica, emptied by the child's exit_done store).
 // @ +128 the row's state policy word (decision 40, Lee 2026-10-27: a field of the child spec; the spec's
 // state_policy@64, 0 = :keep_state_area), ORed into every start's policy word (silica_rt_actor_spawn_linked).
-// @ +136 the root descriptor word of the child's initial-state type (the spec's hidden word@80; always 0
-// on this target, whose runtime keeps actor state in the actor's heap: term_child_spec). The Mac layout
-// of chunk 15 phase 3.
+// @ +136 the root descriptor word of the child's initial-state type (the spec's hidden word@80; 0 for a
+// scalar type or one whose root is not a node: term_child_spec), passed to every start and restart so
+// start.0 is copied into the new child's state area. The Mac layout of chunk 15 phase 3.
+// @ +144 the row spec buffer (chunk 15 phase 4d, design §5.4 Q14, decision 11; the Mac layout): when +136
+// is not 0, the row's start.0 (+24) is the root of a copy of the spec's initial state made by
+// silica_rt_message_buffer as the row is filled (materialize, start_child), and +144 is that copy's
+// malloc block (0: the state is inline, a scalar or an atom alternative). The row owns the block: every
+// start and restart copies from it into the new child's state area, a reused tombstone row frees it
+// before taking the new spec, and silica_rt_sb_unref frees it with the row. +152 is spare.
 // Offsets in row payload: +0 child_ref, +8 id atom, +16 agent_type, +24 start.0, +32 start.1, +40 restart atom,
 // +48 shutdown i64, +56 exit_done, +64 flavor atom (:plain | :dangerous), +72 supervisor_start_trampoline (0 for worker).
 // exit_done is a generation word: the identity (ACB #408) of the last child of the row that ended, stored
@@ -112,7 +118,7 @@ fn child_table_rt_asm_chunk_0() -> string {
     "	.text
 # --- Phase E e3a Option B: linked-list child table ---
 # silica_rt_child_table_free: X0=ACB* — walk nodes (+80 next), free each, clear anchors.
-# silica_rt_child_table_ensure_min_cap: X0=ACB*, X1=min node count — X0=0 ok, 1 OOM. Appends 144 B nodes (80 B row + links + the state policy and descriptor words) until count >= X1.
+# silica_rt_child_table_ensure_min_cap: X0=ACB*, X1=min node count — X0=0 ok, 1 OOM. Appends 160 B nodes (80 B row + links + the state policy, descriptor and spec buffer words) until count >= X1.
 	.globl	silica_rt_child_table_free
 	.p2align	2
 silica_rt_child_table_free:
@@ -294,8 +300,15 @@ Lsbu_rows:
 Lsbu_free_row:
 	test	rax, rax
 	jz	Lsbu_free_block
-	mov	rdi, rax
-	mov	rax, QWORD PTR [rax + 80]
+# The row spec buffer (+144) goes with its row (design §5.4 Q14: freed at table free).
+	mov	QWORD PTR [rbp - 16], rax
+	mov	rdi, QWORD PTR [rax + 144]
+	test	rdi, rdi
+	jz	Lsbu_free_row_node
+	call	free
+Lsbu_free_row_node:
+	mov	rdi, QWORD PTR [rbp - 16]
+	mov	rax, QWORD PTR [rdi + 80]
 	mov	QWORD PTR [rbp - 16], rax
 	call	free
 	mov	rax, QWORD PTR [rbp - 16]
@@ -359,7 +372,7 @@ Lct_count_done:
 	cmp	rax, QWORD PTR [rbp - 16]
 	jae	Lct_ens_ok
 	mov	edi, 1
-	mov	esi, 144
+	mov	esi, 160
 	call	calloc
 	mov	rdi, rax
 	test	rdi, rdi
@@ -402,6 +415,24 @@ Lct_ens_fail:
 	leave
 	ret
 "
+}
+
+// Chunk 15 phase 4d (design §5.4 Q14, decision 11; the Mac emitter's child_table_row_spec_buffer_asm): the
+// row spec buffer. `slot` is the frame slot ([rbp - slot]) holding the row node at both sites (the row is
+// reloaded after every call; rax, rdi, rsi, rdx and the caller-saved registers are clobbered), `pfx` makes
+// the labels unique per site. Emitted after the row's words are stored and before its child is spawned:
+// when the row's state descriptor (+136) is not 0, start.0 (+24) is copied out of the spec by
+// silica_rt_message_buffer (one table, sharing inside the state kept) into a block the row owns (+144),
+// and +24 becomes the copy's root, so every start and restart copies the same source into the new
+// child's state area whatever became of the spec (the init list cell, the start_child caller's record).
+// An inline value (a scalar, an atom alternative) comes back as given with rdx = 0. A reused tombstone
+// row frees its earlier block first.
+fn child_table_row_spec_buffer_asm(slot: string, pfx: string) -> string {
+    row: string <- concat("    mov rax, QWORD PTR [rbp - ", concat(slot, "]\n"));
+    free_old: string <- concat(concat(row, concat("    mov rdi, QWORD PTR [rax + 144]\n    test rdi, rdi\n    jz ", concat(pfx, "_spec_fresh\n    call free\n"))), concat(row, "    mov QWORD PTR [rax + 144], 0\n"));
+    copy: string <- concat(concat(concat(pfx, "_spec_fresh:\n"), row), concat("    mov rsi, QWORD PTR [rax + 136]\n    test rsi, rsi\n    jz ", concat(pfx, "_spec_done\n    mov rdi, QWORD PTR [rax + 24]\n    call silica_rt_message_buffer\n")));
+    tail: string <- concat(concat(row, "    mov QWORD PTR [rax + 24], rdi\n    mov QWORD PTR [rax + 144], rdx\n"), concat(pfx, "_spec_done:\n"));
+    concat(free_old, concat(copy, tail))
 }
 
 fn child_table_rt_spawn_child_row_by_flavor_asm(danger_idx: int64) -> string {
@@ -591,7 +622,7 @@ Lmat_walk_row:
 Lmat_walk_row_done:
 	mov	QWORD PTR [rbp - 80], rcx
 ";
-    post: string <- concat("    mov QWORD PTR [rcx], 0\n    mov rax, QWORD PTR [rbp - 56]\n    mov QWORD PTR [rcx + 8], rax\n    mov rax, QWORD PTR [rbp - 48]\n    mov QWORD PTR [rcx + 16], rax\n    mov rax, QWORD PTR [rbp - 32]\n    mov QWORD PTR [rcx + 24], rax\n    mov rax, QWORD PTR [rbp - 40]\n    mov QWORD PTR [rcx + 32], rax\n    mov rax, QWORD PTR [rbp - 64]\n    mov QWORD PTR [rcx + 40], rax\n    mov rax, QWORD PTR [rbp - 72]\n    mov QWORD PTR [rcx + 48], rax\n    mov rax, QWORD PTR [rbp - 96]\n    mov r9, QWORD PTR [rax + 56]\n    mov QWORD PTR [rcx + 64], r9\n    mov r9, QWORD PTR [rax + 72]\n    mov QWORD PTR [rcx + 72], r9\n    mov r9, QWORD PTR [rax + 64]\n    mov QWORD PTR [rcx + 128], r9\n    mov r9, QWORD PTR [rax + 80]\n    mov QWORD PTR [rcx + 136], r9\n", "    mov rdi, QWORD PTR [rbp - 80]\n    mov rsi, QWORD PTR [rbp - 8]\n    call silica_rt_supervisor_spawn_child_row_by_flavor\n");
+    post: string <- concat("    mov QWORD PTR [rcx], 0\n    mov rax, QWORD PTR [rbp - 56]\n    mov QWORD PTR [rcx + 8], rax\n    mov rax, QWORD PTR [rbp - 48]\n    mov QWORD PTR [rcx + 16], rax\n    mov rax, QWORD PTR [rbp - 32]\n    mov QWORD PTR [rcx + 24], rax\n    mov rax, QWORD PTR [rbp - 40]\n    mov QWORD PTR [rcx + 32], rax\n    mov rax, QWORD PTR [rbp - 64]\n    mov QWORD PTR [rcx + 40], rax\n    mov rax, QWORD PTR [rbp - 72]\n    mov QWORD PTR [rcx + 48], rax\n    mov rax, QWORD PTR [rbp - 96]\n    mov r9, QWORD PTR [rax + 56]\n    mov QWORD PTR [rcx + 64], r9\n    mov r9, QWORD PTR [rax + 72]\n    mov QWORD PTR [rcx + 72], r9\n    mov r9, QWORD PTR [rax + 64]\n    mov QWORD PTR [rcx + 128], r9\n    mov r9, QWORD PTR [rax + 80]\n    mov QWORD PTR [rcx + 136], r9\n", concat(child_table_row_spec_buffer_asm("80", "Lmat"), "    mov rdi, QWORD PTR [rbp - 80]\n    mov rsi, QWORD PTR [rbp - 8]\n    call silica_rt_supervisor_spawn_child_row_by_flavor\n"));
     list_chunk_s: string <- atom_table@int64_to_decimal_string(list_chunk_bytes);
     tail_pre: string <- "	mov	rax, QWORD PTR [rbp - 8]
 	mov	rax, QWORD PTR [rax + 216]
@@ -729,7 +760,7 @@ Lsc_post_row:
 	mov	r8, QWORD PTR [rax + 80]
 	mov	QWORD PTR [rcx + 136], r8
 ";
-    post: string <- concat("    mov r9, QWORD PTR [rax + 56]\n    mov QWORD PTR [rcx], 0\n    mov rax, QWORD PTR [rbp - 24]\n    mov QWORD PTR [rcx + 8], rax\n    mov rax, QWORD PTR [rbp - 32]\n    mov QWORD PTR [rcx + 16], rax\n    mov rax, QWORD PTR [rbp - 40]\n    mov QWORD PTR [rcx + 24], rax\n    mov rax, QWORD PTR [rbp - 48]\n    mov QWORD PTR [rcx + 32], rax\n    mov rax, QWORD PTR [rbp - 56]\n    mov QWORD PTR [rcx + 40], rax\n    mov rax, QWORD PTR [rbp - 64]\n    mov QWORD PTR [rcx + 48], rax\n    mov QWORD PTR [rcx + 64], r9\n    mov QWORD PTR [rcx + 96], 0\n    mov QWORD PTR [rcx + 104], 0\n", "    mov rdi, QWORD PTR [rbp - 72]\n    mov rsi, QWORD PTR [rbp - 8]\n    call silica_rt_supervisor_spawn_child_row_by_flavor\n    mov QWORD PTR [rbp - 16], rdi\n");
+    post: string <- concat("    mov r9, QWORD PTR [rax + 56]\n    mov QWORD PTR [rcx], 0\n    mov rax, QWORD PTR [rbp - 24]\n    mov QWORD PTR [rcx + 8], rax\n    mov rax, QWORD PTR [rbp - 32]\n    mov QWORD PTR [rcx + 16], rax\n    mov rax, QWORD PTR [rbp - 40]\n    mov QWORD PTR [rcx + 24], rax\n    mov rax, QWORD PTR [rbp - 48]\n    mov QWORD PTR [rcx + 32], rax\n    mov rax, QWORD PTR [rbp - 56]\n    mov QWORD PTR [rcx + 40], rax\n    mov rax, QWORD PTR [rbp - 64]\n    mov QWORD PTR [rcx + 48], rax\n    mov QWORD PTR [rcx + 64], r9\n    mov QWORD PTR [rcx + 96], 0\n    mov QWORD PTR [rcx + 104], 0\n", concat(child_table_row_spec_buffer_asm("72", "Lsc"), "    mov rdi, QWORD PTR [rbp - 72]\n    mov rsi, QWORD PTR [rbp - 8]\n    call silica_rt_supervisor_spawn_child_row_by_flavor\n    mov QWORD PTR [rbp - 16], rdi\n"));
     tail: string <- "	cmp	QWORD PTR [rbp - 80], 0
 	je	Lsc_done
 	mov	rax, QWORD PTR [rbp - 8]
@@ -2619,6 +2650,11 @@ silica_rt_owned_record_release:
 	je	Lorr_ret
 	cmp	r10, r9
 	je	Lorr_ret
+# ACB #608 (chunk 15 phase 4a): the behaviour returned a state the descriptors cannot follow to every
+# word, which the dispatch end carried as it is into the state area (not the arena scanned below): such
+# a word may still name the record or the pair, so it is kept.
+	cmp	QWORD PTR [rsi + 608], 0
+	jne	Lorr_ret
 	mov	r11, QWORD PTR [rdi + 40]
 	mov	rcx, QWORD PTR [rsi + 160]
 	mov	rdx, QWORD PTR [rdi + 48]

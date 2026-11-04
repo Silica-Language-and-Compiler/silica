@@ -85,14 +85,21 @@
 // nodes are not copied (chunk 15, candidate D, slice 2). Copied cells go into the most recently
 // mapped fresh region; a ref met when no fresh region exists is shared, as before.
 //
-// Elision: with no `drop` in the language yet (stage 4), a copying send would leave the sender's
-// original to leak at every send that was written for move semantics. fn_copy_markers therefore
-// finds the sends and spawns whose operand is a LAST USE -- nothing the function evaluates after
-// the send mentions the operand's data or an alias of it (a taint closure over the lets in both
-// directions), and none of it is a parameter -- and marks them "|_mvs=<node>,"; those transfer
-// the original exactly as a `move` would, which is unobservable to the sender. A behaviour's reply
-// is likewise copied only when a reply site needs it ("|_mvr=1" marks the elided function):
-// its data is a parameter's, or is also in the new state.
+// Elision (chunk 15 phase 4b, chunk15_stack_memory_design.md §5.2, decision 32; ported from the Mac emitter
+// 2026-11-03): "|_mvs=<node>," names the FORWARDING sites of a behaviour: a cast-family send whose operand
+// is the behaviour's whole message parameter (a kind-1 var naming parameter 0, not a projection of it),
+// used for the last time (nothing evaluated after the send mentions it or an alias: the taint closure over
+// the lets in both directions, mc_closure / mc_after), with no alias among the other parameters, no
+// write_ref over it and no part of it in the result positions (the sink of §4.1: nothing reaches the new
+// state). Such a send hands its MAILBOX BUFFER on instead of copying (prims_actors@send_buffer_copy_asm
+// calls silica_rt_message_forward, which detaches the serving node's buffer, or copies when the node has
+// none). A part of a message is never forwarded: a part has no buffer of its own.
+// Every reply is copied into the CALLER's stack by the behaviour epilogue (prims_actors@
+// bmv_reply_stack_asm, silica_rt_reply_place), including one whose data is a parameter's or also in the
+// new state: the "|_mvr=1" elision and mc_reply_needs_copy are gone (§5.2). No site calls the emitted
+// copier L_mc_root below any longer (messages, spawn states and replies are all copied by the runtime
+// copier of prims_actors_state_asm); it is still emitted behind module_uses_message_copy (emitter_core)
+// and its description remains the specification of the descriptor format the runtime copier interprets.
 
 use sir_ast;
 use term_sir_helpers;
@@ -114,9 +121,7 @@ export md_copy_call_asm/2;
 export md_prim_value_is_move/1;
 export md_prim_is_move_wrapper/1;
 export fn_copy_markers/1;
-export md_site_elided/2;
-export md_reply_elided/1;
-export md_reply_copy_asm/4;
+export md_site_forwards/2;
 export md_fn_label_marker/1;
 export md_fn_label_of/1;
 export module_uses_message_copy/1;
@@ -124,6 +129,7 @@ export emit_message_copy_helper/0;
 export md_type_label/2;
 export md_type_descriptors_block/3;
 export ev_type_described/1;
+export ev_type_has_node_root/1;
 export ev_site_descriptor_rodata/3;
 
 // ---- strings ----------------------------------------------------------------------------------
@@ -380,6 +386,19 @@ fn md_type_needs_copy(t0: string) -> boolean {
 // instead of evacuating the result (prims_memory L_adopt), which keeps every node whatever it is.
 fn ev_type_described(t0: string) -> boolean {
     ev_described_at(prims_record@strip_spaces_rt(t0), 0, false)
+}
+
+// Whether a value of this type is itself a node the copier can enter (a ref, record, tuple, sum, buffer,
+// list or string at the root: kinds 2 to 8, md_root_needs_descriptor). Such a type gets a root-word
+// descriptor at every actor boundary (a message, a reply, a spawn or child-spec state, a behaviour's new
+// state) since chunk 15 stage 4e (on this target since the 2026-11-03 port), whether or not the
+// descriptors follow every word inside it
+// (ev_type_described): an unknown word (a type parameter, a trait type) is spelled as a scalar entry by
+// mc_entry and carried as it is, which is what the one-level shell promote to the implicit heap did for
+// every word. A scalar, a function value, a region witness or a bare type parameter answers false and
+// travels as a word.
+fn ev_type_has_node_root(t0: string) -> boolean {
+    md_root_needs_descriptor(prims_record@strip_spaces_rt(t0))
 }
 
 fn ev_word_type_ok(t: string) -> boolean {
@@ -727,7 +746,7 @@ fn md_fn_label_of(outer_reg: string) -> string {
     case length_bytes(l) == 0 of { true -> "f"; false -> l }
 }
 
-// ---- elision: last-use sends and spawns, replies whose data stays private ---------------------------
+// ---- taint closure and last use (shared by the forwarding analysis below) ----------------------------
 
 fn mc_is_send_prim(name: string) -> boolean {
     name == "send" or name == "actor_call" or name == "actor_call_registered" or name == "actor_cast" or name == "timer_cast"
@@ -926,86 +945,9 @@ fn mc_site_is_last_use(body: { nodes: List[{ kind: int64, type_name: string, val
     }
 }
 
-// ",12,45," of the send and spawn nodes whose operand would be copied and is a last use.
-fn mc_elided_sites(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, params: string, acc: string) -> string {
-    case term.root < 0 of {
-        true -> acc;
-        false -> {
-            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
-            acc1: string <- case n.kind == 6 and (mc_is_send_prim(n.name) or mc_is_spawn_prim(n.name)) and md_prim_value_is_move(n.value) == false and md_type_needs_copy(mc_operand_type(mc_site_operand(term))) of {
-                true -> case mc_site_is_last_use(body, term.root, params) of {
-                    true -> concat(acc, concat(mc_itos(term.root), ","));
-                    false -> acc
-                };
-                false -> acc
-            };
-            acc2: string <- mc_elided_sites(body, term_sir_helpers@sir_term_at(term, n.inner), params, acc1);
-            mc_elided_sites(body, term_sir_helpers@sir_term_at(term, n.right_expr), params, acc2)
-        }
-    }
-}
-
-// Replies. The result positions of the body (through lets and case arms); a result that is a
-// three-element tuple_make led by an atom is a behaviour result (:reply, r, s): r is the second
-// element, s the third (tuple_make(inner = e1, right = tuple_make(inner = e2, right = e3))).
-fn mc_reply_needs_copy(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, params: string) -> boolean {
-    case term.root < 0 of {
-        true -> false;
-        false -> {
-            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
-            case n.kind of {
-                2 -> mc_reply_needs_copy(body, term_sir_helpers@sir_term_at(term, n.right_expr), params);
-                3 -> mc_reply_arms_need_copy(body, term_sir_helpers@sir_term_at(term, n.right_expr), params);
-                6 -> case n.name == "tuple_make" of {
-                    false -> false;
-                    true -> {
-                        rest: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, n.right_expr);
-                        rn: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(rest);
-                        case rn.kind == 6 and rn.name == "tuple_make" of {
-                            false -> false;
-                            true -> {
-                                r: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(rest, rn.inner);
-                                s: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(rest, rn.right_expr);
-                                case md_prim_is_move_wrapper(r) of {
-                                    true -> false;
-                                    false -> {
-                                        roots: string <- mc_vars(r, ",");
-                                        case length_bytes(roots) <= 1 of {
-                                            true -> false;
-                                            false -> {
-                                                set: string <- mc_closure(body, roots, 64);
-                                                mc_in_set(set, "!") or mc_intersects(params, set) or mc_mentions(s, set)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                };
-                _: int64 -> false
-            }
-        }
-    }
-}
-
-fn mc_reply_arms_need_copy(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, arms: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, params: string) -> boolean {
-    case arms.root < 0 of {
-        true -> false;
-        false -> {
-            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(arms);
-            case a.kind of {
-                7 -> case mc_reply_arms_need_copy(body, term_sir_helpers@sir_term_at(arms, a.inner), params) of {
-                    true -> true;
-                    false -> mc_reply_arms_need_copy(body, term_sir_helpers@sir_term_at(arms, a.right_expr), params)
-                };
-                8 -> mc_reply_needs_copy(body, term_sir_helpers@sir_term_at(arms, a.right_expr), params);
-                _: int64 -> false
-            }
-        }
-    }
-}
-
+// Replies: since the 2026-11-03 port of the Mac's stage 4c every reply is copied into the caller's stack
+// (design §5.2, §5.3); the reply-side last-use analysis (mc_reply_needs_copy, the "|_mvr=1" marker) is gone.
+// mc_reply_type stays for the module gate below.
 fn mc_reply_type(return_type: string) -> string {
     t: string <- prims_record@strip_spaces_rt(return_type);
     case mc_starts_with(t, "(:reply,") of {
@@ -1014,46 +956,163 @@ fn mc_reply_type(return_type: string) -> string {
     }
 }
 
-// The markers emit_sir_function adds to the body's binding string: "|_mvs=<node>,..." (sends and
-// spawns that transfer their operand) and "|_mvr=1" (the reply is not copied).
-fn fn_copy_markers(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
-    params: string <- mc_param_set(fn_val.param_names, ",");
-    sites: string <- mc_elided_sites(fn_val.body, fn_val.body, params, ",");
-    mvs: string <- case length_bytes(sites) <= 1 of {
+// ---- forwarding (chunk 15 phase 4b, design §5.2, decision 32) ---------------------------------------
+
+// The cast family: its message travels in a mailbox buffer since phase 4a and can be forwarded. A call's
+// message travels in a buffer too since 4c but never forwards (a reply may name it; the runtime's +16 test
+// is the belt and braces); a timer's travels in a buffer but is not a forwarding site either.
+fn mc_is_cast_prim(name: string) -> boolean {
+    name == "send" or name == "actor_cast" or name == "actor_cast_device" or name == "actor_cast_registered"
+        or name == "actor_cast_dangerous_registered" or name == "actor_cast_device_registered"
+}
+
+fn mc_is_behaviour_return(return_type: string) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(return_type);
+    mc_starts_with(t, "(:reply,") or mc_starts_with(t, "(:no_reply,")
+}
+
+// "a|b|c": the first name (a behaviour's message parameter) and the rest.
+fn mc_first_param(names: string) -> string {
+    substring(names, 0, mc_top_sep(names, 0, 0, "|"))
+}
+
+fn mc_rest_params(names: string) -> string {
+    p: int64 <- mc_top_sep(names, 0, 0, "|");
+    case p >= length_bytes(names) of {
         true -> "";
-        false -> concat("|_mvs=", sites)
-    };
-    rt: string <- mc_reply_type(fn_val.return_type);
-    mvr: string <- case length_bytes(rt) > 0 and md_type_needs_copy(rt) and mc_reply_needs_copy(fn_val.body, fn_val.body, params) == false of {
-        true -> "|_mvr=1";
-        false -> ""
-    };
-    concat(mvs, mvr)
+        false -> substring(names, p + 1, length_bytes(names))
+    }
 }
 
-fn md_site_elided(outer_reg: string, node: int64) -> boolean {
-    m: string <- var@find_sp_binding(outer_reg, "_mvs");
-    length_bytes(m) > 1 and mc_has(m, concat(",", concat(mc_itos(node), ",")))
-}
-
-fn md_reply_elided(outer_reg: string) -> boolean {
-    var@find_sp_binding(outer_reg, "_mvr") == "1"
-}
-
-// The deep copy of a behaviour's reply for prims_actors@behaviour_result_move_asm: "" when the
-// reply type is not copied or every reply site transfers (markers "|_mvr=1"); else the copy call
-// with the shell in the CALLER's arena ([SP] is this ACB, its #240 the node served, the node's +56
-// the caller, as bmv_reply_asm reads them) followed by the descriptor rodata.
-fn md_reply_copy_asm(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, entry_label: string, markers: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
-    rt: string <- mc_reply_type(fn_val.return_type);
-    case length_bytes(rt) == 0 or md_type_needs_copy(rt) == false or md_reply_elided(markers) of {
-        true -> "";
+// ",%a,a,%b,b," of the parameters: a var node names a parameter bare or "%"-prefixed.
+fn mc_param_set_both(names: string, acc: string) -> string {
+    case length_bytes(names) == 0 of {
+        true -> acc;
         false -> {
-            label: string <- concat("L_md_", concat(entry_label, "_r"));
-            acb: string <- concat(x86_mem@x86_ldr("X2", "[SP, #0]"), concat(x86_mem@x86_ldr("X2", "[X2, #240]"), x86_mem@x86_ldr("X2", "[X2, #56]")));
-            concat(md_copy_call_asm(label, acb), md_rodata_block(md_descriptor_rodata(rt, label, table)))
+            nm: string <- mc_first_param(names);
+            mc_param_set_both(mc_rest_params(names), mc_add(mc_add(acc, concat("%", nm)), nm))
         }
     }
+}
+
+// Is the operand the whole parameter `name`: a kind-1 var naming it, not a projection of it?
+fn mc_operand_is_param(operand: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, name: string) -> boolean {
+    case operand.root < 0 or length_bytes(name) == 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(operand);
+            n.kind == 1 and (n.name == name or n.name == concat("%", name))
+        }
+    }
+}
+
+// Does a write_ref anywhere in the term mention the set? A message part written into a cell may reach
+// the new state through the cell (§4.1 Sink; the region checker of phase 6 carries the full rule).
+fn mc_write_mentions(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind == 6 and n.name == "write_ref" and mc_mentions(term, set) of {
+                true -> true;
+                false -> case mc_write_mentions(term_sir_helpers@sir_term_at(term, n.inner), set) of {
+                    true -> true;
+                    false -> mc_write_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), set)
+                }
+            }
+        }
+    }
+}
+
+// Do the result positions of the body (through lets and case arms) mention the set? A behaviour's
+// result tuple carries the new state (and the reply): the sink test of §5.2, over the whole tuple.
+fn mc_result_mentions(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            case n.kind of {
+                2 -> mc_result_mentions(term_sir_helpers@sir_term_at(term, n.right_expr), set);
+                3 -> mc_result_arms_mention(term_sir_helpers@sir_term_at(term, n.right_expr), set);
+                _: int64 -> mc_mentions(term, set)
+            }
+        }
+    }
+}
+
+fn mc_result_arms_mention(arms: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, set: string) -> boolean {
+    case arms.root < 0 of {
+        true -> false;
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(arms);
+            case a.kind of {
+                7 -> case mc_result_arms_mention(term_sir_helpers@sir_term_at(arms, a.inner), set) of {
+                    true -> true;
+                    false -> mc_result_arms_mention(term_sir_helpers@sir_term_at(arms, a.right_expr), set)
+                };
+                8 -> mc_result_mentions(term_sir_helpers@sir_term_at(arms, a.right_expr), set);
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+// §5.2: a cast-family site forwards its mailbox buffer when its operand is the behaviour's whole message
+// parameter `msg`, no alias of it is poisoned, another parameter, written into a cell or in a result
+// position, and nothing evaluated after the site mentions it or an alias (today's last-use rule).
+fn mc_site_forwards_message(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, site: int64, msg: string, others: string) -> boolean {
+    operand: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- mc_site_operand(term_sir_helpers@sir_term_at(body, site));
+    case mc_operand_is_param(operand, msg) of {
+        false -> false;
+        true -> {
+            set: string <- mc_closure(body, mc_add(mc_add(",", msg), concat("%", msg)), 64);
+            case mc_in_set(set, "!") or mc_intersects(others, set) or mc_write_mentions(body, set) or mc_result_mentions(body, set) of {
+                true -> false;
+                false -> mc_after(body, set, site) == 1
+            }
+        }
+    }
+}
+
+// ",12,45," of the cast-family sites of a behaviour that forward their mailbox buffer.
+fn mc_forward_sites(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, msg: string, others: string, acc: string) -> string {
+    case term.root < 0 of {
+        true -> acc;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+            acc1: string <- case n.kind == 6 and mc_is_cast_prim(n.name) of {
+                true -> case mc_site_forwards_message(body, term.root, msg, others) of {
+                    true -> concat(acc, concat(mc_itos(term.root), ","));
+                    false -> acc
+                };
+                false -> acc
+            };
+            acc2: string <- mc_forward_sites(body, term_sir_helpers@sir_term_at(term, n.inner), msg, others, acc1);
+            mc_forward_sites(body, term_sir_helpers@sir_term_at(term, n.right_expr), msg, others, acc2)
+        }
+    }
+}
+
+// The marker emit_sir_function adds to the body's binding string: "|_mvs=<node>,..." (the cast-family
+// sites of a behaviour that forward their mailbox buffer, §5.2). The last-use "|_mvs" sends and spawns of
+// the heap copy and the "|_mvr=1" reply marker went with the 2026-11-03 port of the Mac's phases 4b/4c
+// (every message, spawn state and reply is copied by the runtime copier; prims_actors).
+fn fn_copy_markers(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    msg: string <- mc_first_param(fn_val.param_names);
+    fwd: string <- case mc_is_behaviour_return(fn_val.return_type) and length_bytes(msg) > 0 of {
+        true -> mc_forward_sites(fn_val.body, fn_val.body, msg, mc_param_set_both(mc_rest_params(fn_val.param_names), ","), ",");
+        false -> ","
+    };
+    case length_bytes(fwd) <= 1 of {
+        true -> "";
+        false -> concat("|_mvs=", fwd)
+    }
+}
+
+// Is `node` a forwarding site of this function ("|_mvs")?
+fn md_site_forwards(outer_reg: string, node: int64) -> boolean {
+    m: string <- var@find_sp_binding(outer_reg, "_mvs");
+    length_bytes(m) > 1 and mc_has(m, concat(",", concat(mc_itos(node), ",")))
 }
 
 // ---- module gate ----------------------------------------------------------------------------------
@@ -1393,8 +1452,8 @@ fn mcp_scalar_type(t: string) -> boolean {
 }
 
 // True when a value of this type cannot hold a pointer that matters to the elision walk: scalars,
-// atoms, strings (immutable; a frame string a send or spawn hands over is first copied to the heap
-// by prims_actors@stack_value_to_heap_asm, chunk 15 phase 2), and tuples, records and sums built
+// atoms, strings (immutable; a frame string a send or spawn hands over is copied by the runtime
+// copier, chunk 15 phase 4), and tuples, records and sums built
 // only from those. Unknown spellings (List[...], ref, region, buf,
 // function types, type parameters, device windows, actor references) answer false.
 fn mc_type_is_pointer_free(t0: string) -> boolean {
