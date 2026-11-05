@@ -20,18 +20,20 @@
 //   decode(F, frame: string) -> (:ok, T) | (:rejected, atom)
 // F is a literal format tag, `(:etf)`; a variable or an unknown tag is E2408. T is the argument's
 // type for encode and the binding's for decode (E2403 when the binding does not have the
-// `(:ok, T) | (:rejected, atom)` shape), and must be declared Transportable in the unit or a
-// module it uses (E2411). The derivation itself happens after SIR generation (transport_derive).
+// `(:ok, T) | (:rejected, atom)` shape). T is checked at each call (E2401, E2404); `decode` takes
+// its limits as an optional third argument, a record literal of integer literals (E2402 when a
+// variable-sized T has none or the literal is malformed). The derivation itself happens after SIR
+// generation (transport_derive), one decode family per (format, type, limits).
 
 use type_checker_core;
 use type_checker_expressions_helpers;
 use type_checker_expressions_actors;
 use type_checker_tuple_decompose_helpers;
-use type_checker_transport;
 use transport_types;
 
 export is_wire_builtin_name/1;
 export check_wire_builtin/6;
+export limits_text_of_call/1;
 
 fn is_wire_builtin_name(n: string) -> boolean {
     n == "encode" or n == "decode"
@@ -54,8 +56,8 @@ fn check_wire_builtin(expr: { nodes: List[{ kind: int64, value: string, name: st
     name: string <- type_checker_expressions_helpers@expr_name(expr);
     loc: { file: string, line: int64, column: int64, offset: int64 } <- type_checker_expressions_helpers@expr_loc(expr);
     ac: int64 <- type_checker_expressions_actors@count_chain_args(expr);
-    case ac == 2 of {
-        false -> type_checker_core@type_check_err("E2005", loc, concat(name, " expects 2 arguments: a format tag such as (:etf) and the value"), "sect16.4");
+    case ac == 2 or (ac == 3 and name == "decode") of {
+        false -> type_checker_core@type_check_err("E2005", loc, concat(name, " expects a format tag such as (:etf) and the value; decode may add a third argument, its limits { max_bytes: N, max_depth: D, max_length: L }"), "sect16.4");
         true -> {
             fmt: string <- format_of_argument(type_checker_expressions_helpers@expr_child_inner(expr));
             case length_bytes(fmt) == 0 of {
@@ -80,10 +82,10 @@ fn check_encode(expr: { nodes: List[{ kind: int64, value: string, name: string, 
     case length_bytes(nt) == 0 of {
         true -> type_checker_core@type_check_err("E2003", loc, "encode cannot infer the type of its value; bind it to a typed name first", "sect16.4");
         false -> {
-            lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean } <- type_checker_transport@world_transportable_limits(world, nt);
-            case lim.found of {
-                false -> type_checker_core@type_check_err("E2411", loc, concat(concat("encode: the type ", t), " is not declared Transportable; add `impl Transportable for <type> { max_bytes: N };` (design §4.1)"), "sect16.4");
-                true -> {
+            problem: string <- transport_types@transport_problem(nt);
+            case length_bytes(problem) > 0 of {
+                true -> type_problem_err(loc, "encode", t, problem);
+                false -> {
                     (r, _) <- check_surface(arg, t, context, world);
                     case r.is_ok of {
                         false -> r;
@@ -109,17 +111,98 @@ fn check_decode(expr: { nodes: List[{ kind: int64, value: string, name: string, 
     case length_bytes(nt) == 0 of {
         true -> type_checker_core@type_check_err("E2403", loc, concat("decode needs a binding typed (:ok, T) | (:rejected, atom) to know the type to build, got ", surf), "sect16.4");
         false -> {
-            lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean } <- type_checker_transport@world_transportable_limits(world, nt);
-            case lim.found of {
-                false -> type_checker_core@type_check_err("E2411", loc, concat(concat("decode: the type ", nt), " is not declared Transportable; add `impl Transportable for <type> { max_bytes: N };` (design §4.1)"), "sect16.4");
-                true -> {
+            problem: string <- transport_types@transport_problem(nt);
+            case length_bytes(problem) > 0 of {
+                true -> type_problem_err(loc, "decode", nt, problem);
+                false -> {
                     (r, _) <- check_surface(arg, "string", context, world);
                     case r.is_ok of {
                         false -> r;
-                        true -> type_checker_core@type_check_ok()
+                        true -> check_limits(expr, loc, nt)
                     }
                 }
             }
+        }
+    }
+}
+
+// E2401 for a component that cannot cross, E2404 for a sum whose variants cannot be told apart.
+fn type_problem_err(loc: { file: string, line: int64, column: int64, offset: int64 }, name: string, t: string, problem: string) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    code: string <- case length_bytes(problem) >= 11 and substring(problem, 0, 11) == "variants of" of { true -> "E2404"; false -> "E2401" };
+    type_checker_core@type_check_err(code, loc, concat(concat(concat(name, " of "), t), concat(": ", problem)), "sect16.4")
+}
+
+// ---- the limits argument ------------------------------------------------------------------------
+// `{ max_bytes: N, max_depth: D, max_length: L, utf8: true }`, any subset, every value a literal: the
+// limits are compile-time constants that select the derived decoder (design §4.1).
+
+fn third_argument(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    type_checker_expressions_helpers@expr_child_inner(type_checker_expressions_helpers@expr_child_right(type_checker_expressions_helpers@expr_child_right(expr)))
+}
+
+fn literal_text(v: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> string {
+    k: int64 <- type_checker_expressions_helpers@expr_kind(v);
+    case k == 0 or k == 7 of {
+        true -> type_checker_expressions_helpers@expr_value(v);
+        false -> case k == 2 of {
+            true -> literal_text(type_checker_expressions_helpers@expr_child_inner(v));
+            false -> ""
+        }
+    }
+}
+
+fn limits_walk(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, acc: { ok: boolean, message: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean, has_bytes: boolean, has_length: boolean }) -> { ok: boolean, message: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean, has_bytes: boolean, has_length: boolean } {
+    k: int64 <- type_checker_expressions_helpers@expr_kind(e);
+    case k == -1 or k == 999 of {
+        true -> acc;
+        false -> case k == 21 of {
+            false -> { ok: false, message: "the limits of decode must be a record literal { max_bytes: N, max_depth: D, max_length: L }", max_bytes: 0, max_depth: 0, max_length: 0, utf8: false, has_bytes: false, has_length: false };
+            true -> {
+                field: string <- type_checker_expressions_helpers@expr_name(e);
+                lit: string <- literal_text(type_checker_expressions_helpers@expr_child_inner(e));
+                rest: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- type_checker_expressions_helpers@expr_child_right(e);
+                n: int64 <- transport_types@parse_decimal(lit);
+                case field == "max_bytes" and n >= 0 of {
+                    true -> limits_walk(rest, { ok: acc.ok, message: acc.message, max_bytes: n, max_depth: acc.max_depth, max_length: acc.max_length, utf8: acc.utf8, has_bytes: true, has_length: acc.has_length });
+                    false -> case field == "max_depth" and n >= 0 of {
+                        true -> limits_walk(rest, { ok: acc.ok, message: acc.message, max_bytes: acc.max_bytes, max_depth: n, max_length: acc.max_length, utf8: acc.utf8, has_bytes: acc.has_bytes, has_length: acc.has_length });
+                        false -> case field == "max_length" and n >= 0 of {
+                            true -> limits_walk(rest, { ok: acc.ok, message: acc.message, max_bytes: acc.max_bytes, max_depth: acc.max_depth, max_length: n, utf8: acc.utf8, has_bytes: acc.has_bytes, has_length: true });
+                            false -> case field == "utf8" and (lit == "true" or lit == "false") of {
+                                true -> limits_walk(rest, { ok: acc.ok, message: acc.message, max_bytes: acc.max_bytes, max_depth: acc.max_depth, max_length: acc.max_length, utf8: lit == "true", has_bytes: acc.has_bytes, has_length: acc.has_length });
+                                false -> { ok: false, message: concat(concat("the limits of decode: field `", field), "` is not max_bytes, max_depth or max_length with a non-negative integer literal, or utf8 with a boolean literal"), max_bytes: 0, max_depth: 0, max_length: 0, utf8: false, has_bytes: false, has_length: false }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn limits_of_call(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { ok: boolean, message: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean, has_bytes: boolean, has_length: boolean } {
+    start: { ok: boolean, message: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean, has_bytes: boolean, has_length: boolean } <- { ok: true, message: "", max_bytes: 1048576, max_depth: 64, max_length: 0, utf8: false, has_bytes: false, has_length: false };
+    case type_checker_expressions_actors@count_chain_args(expr) == 3 of {
+        true -> limits_walk(third_argument(expr), start);
+        false -> start
+    }
+}
+
+// The limits of a decode call as the text the derivation is keyed by (transport_types@limits_text);
+// max_length defaults to max_bytes.
+fn limits_text_of_call(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> string {
+    r: { ok: boolean, message: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean, has_bytes: boolean, has_length: boolean } <- limits_of_call(expr);
+    ml: int64 <- case r.has_length of { true -> r.max_length; false -> r.max_bytes };
+    transport_types@limits_text(r.max_bytes, r.max_depth, ml, r.utf8)
+}
+
+fn check_limits(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, loc: { file: string, line: int64, column: int64, offset: int64 }, nt: string) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    r: { ok: boolean, message: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean, has_bytes: boolean, has_length: boolean } <- limits_of_call(expr);
+    case r.ok of {
+        false -> type_checker_core@type_check_err("E2402", loc, r.message, "sect16.4");
+        true -> case transport_types@is_variable_sized(nt) and r.has_bytes == false of {
+            true -> type_checker_core@type_check_err("E2402", loc, concat(concat("decode of ", nt), " needs limits: the type holds a string or a list, so its size is not fixed; give decode a third argument { max_bytes: N, max_depth: D, max_length: L } (design §4.1)"), "sect16.4");
+            false -> type_checker_core@type_check_ok()
         }
     }
 }

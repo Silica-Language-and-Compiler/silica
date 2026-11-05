@@ -5,7 +5,7 @@
 **Implementation status (2026-10-16).**
 
 - *Implemented:* the `dangerous_*` module rules, `foreign c_wrapper` declarations, sidecar loading and the `silica.link` manifest (`src/ffi/`), the placement, ABI and taint checkers, `spawn_dangerous` / `spawn_dangerous_registered` / `cast_dangerous_registered`, the split dangerous registry, cast-only FFI workers, and the guarded FFI runtime (fault handlers, per-actor FFI arena, `_silica_rt_ffi_guarded_enter` / `_exit`; sources `ffi_guarded_runtime_asm.silica` and `ffi_fault_runtime_asm.silica` in the Apple Silicon, linux_aarch64 and linux_x86_64 emitters). Codes: E2103, E2110 to E2114, E4020 to E4026, E4030 to E4034, E4040 to E4049 ([error_codes.md](../error_codes.md)). Trials: `trials/ffi_addition` (app trials including guarded-fault and supervised-dangerous-fault trials), `trials/error_enforcement_addition/ffi_addition`.
-- *Not implemented:* **re-creation (§7.7)**. No `Recreatable` trait, `recreate` or related diagnostics exist in the compiler, standard library or trials. Wherever this specification, `dangerous_ffi_security_model.md`, `crypto-proposal-introduction.md` and `tls_quantum_safe_future.md` rely on re-creation to clear taint, that is design, not behaviour; today FFI results leave a worker only by the designated result cast and external-danger-touched data stays tainted. Package declarations (§14.3) and building C wrapper sources are also future.
+- *Not implemented:* **re-creation (§7.7)**. No `recreate` or related diagnostics exist in the compiler, standard library or trials (its transport twin `decode` does, transport_serialization_design.md §14). Wherever this specification, `dangerous_ffi_security_model.md`, `crypto-proposal-introduction.md` and `tls_quantum_safe_future.md` rely on re-creation to clear taint, that is design, not behaviour; today FFI results leave a worker only by the designated result cast and external-danger-touched data stays tainted. Package declarations (§14.3) and building C wrapper sources are also future.
 - *Differences from the text below:* the process-global registries are three, not two (the third serves device workers, [silica_device_actor_specification.md](silica_device_actor_specification.md)); each is a table sized by the build's atom count with no overflow list (see [atom_actor_registry_direct_index_design.md](atom_actor_registry_direct_index_design.md)); `get_dangerous_pid_registry()` (§4.9.2) is not a builtin; `ffi_wrapper_implementation_plan.md` is not in the tree.
 
 ## Related Documents
@@ -41,7 +41,7 @@ Silica does not call arbitrary external APIs directly. Every external operation 
 - **Typed Danger Boundary**: `dangerous_actor_ref` is distinct from `actor_ref`. A `dangerous_actor_ref` may be obtained only from `spawn_dangerous(...)` or `spawn_dangerous_registered(...)`; it cannot be coerced from `actor_ref` or obtained from `spawn_registered(...)`.
 - **Split Actor Registries**: Process-global actor registration uses **two** atom-keyed slot tables—one for ordinary `actor_ref` values and one for `dangerous_actor_ref` values. Registration stores the same opaque runtime handle in either table; retrieval is typed by **which table and which lookup primitive** are used (§4.9).
 - **No Retained Dangerous Data in `produces pure`**: A completed `external_danger` sequence produces only structurally pure Silica values. Foreign results leave the worker through designated FFI result casts, not through a tainted `produces pure` value.
-- **Strict Structural Taint**: Values returned from `dangerous_*` modules remain external-danger-touched at every depth. User code cannot clear taint. The only way to clear it is **re-creation**: a compiler-derived `Recreatable` trait that validates a tainted value and builds a new, pure one (§7.7).
+- **Strict Structural Taint**: Values returned from `dangerous_*` modules remain external-danger-touched at every depth. User code cannot clear taint. The only way to clear it is **re-creation**: a compiler-derived `recreate` call that validates a tainted value within the limits the call gives and builds a new, pure one (§7.7).
 - **Strong Typing at the Boundary**: Silica foreign declarations, explicit `wrapper_meta` references, and sidecar metadata define the Silica-facing ABI; compile time verifies that named prebuilt archives exist; link time verifies that required wrapper symbols are defined in those archives.
 - **Two-Layer String Declarations**: Raw foreign bindings use pointer-plus-length arguments; exported adapter wrappers accept Silica `string` and perform the copy before calling the raw binding.
 - **No Raw Pointer Exposure**: Raw pointers, `void *`, and opaque C structs must not be exposed directly to Silica source types.
@@ -1045,25 +1045,31 @@ delivered through an FFI result cast (§4.2, §7.6), or **re-created**. Re-creat
 specification defines, and it is written by the compiler, never by the program. User-defined helpers still never
 clear taint (§7.4).
 
-**Declaring a re-creatable type.** A program establishes the `Recreatable` marker trait on an inline type. The
-body carries only limits, never code:
+**No declaration.** There is no marker trait and nothing to declare (decided 2026-11-05, with the transport
+design's §4.1, so that `recreate` and the transport `decode` stay one mechanism). The compiler derives `recreate`
+for the static type at each call, and the call carries the limits:
 
 ```silica
-// A 64-byte digest.
-impl Recreatable for buf(L, normal, uint8, 64) { max_bytes: 64 };
+// A 64-byte digest: fixed-size, no limits needed.
+d: (:ok, buf(L, normal, uint8, 64)) | (:rejected, atom) <- recreate(raw);
 
-// A decoded record from a foreign parser.
-impl Recreatable for { tag: :ok | :error, value: int64, name: string } { max_bytes: 4096, max_depth: 4 };
+// A decoded record from a foreign parser: variable-sized, so limits are required.
+r: (:ok, { tag: :ok | :error, value: int64, name: string }) | (:rejected, atom)
+    <- recreate(raw, { max_bytes: 4096, max_depth: 4, utf8: true });
 ```
 
-Limits are optional keyword fields: `max_bytes` (total size of the value), `max_depth` (nesting depth), and
-`max_length` (maximum element count of any list or buffer). A type without a limit field uses the type's own fixed
-bounds, and a variable-sized type with no applicable limit is rejected at compile time.
+Limits are optional fields of a record literal of literals: `max_bytes` (total size of the value), `max_depth`
+(nesting depth), `max_length` (maximum element count of any list or buffer) and `utf8` (check string fields).
+A type without a limit field uses the type's own fixed bounds, and a variable-sized type with no `max_bytes` is
+rejected at compile time. The limits are compile-time constants baked into the derived function, exactly as the
+transport design's `decode` takes them (transport_serialization_design.md §4.1); `decode` is `recreate` applied
+to bytes, with the same rejection atoms and the same call-site rule, and both are derived by one generator.
 
-**The derived function.** For each such type `T`, the compiler derives:
+**The derived function.** For the type `T` at each call, the compiler derives:
 
 ```silica
 recreate(x: T) -> (:ok, T) | (:rejected, atom)
+recreate(x: T, { max_bytes: N, max_depth: D, max_length: L, utf8: true }) -> (:ok, T) | (:rejected, atom)
 ```
 
 The derived code does the following, in this order:
@@ -1089,8 +1095,9 @@ sequence block of an FFI worker, or inside the handler that receives an FFI resu
 - It **remains barred** from `hot_swap`, command execution, and code loading (§7.2). Re-created bytes are still
   foreign content.
 
-**Auditability.** Every `impl Recreatable` is a visible de-taint point. The compiler reports each one as an advisory
-warning, alongside the W4001 warning emitted for every foreign binding.
+**Auditability.** Every `recreate` call (and every transport `decode` call) is a visible de-taint point. The
+compiler reports each one as an advisory warning (W2401), alongside the W4001 warning emitted for every foreign
+binding. A leftover `impl Recreatable` or `impl Transportable` declaration from the earlier drafts is E2411.
 
 **Type-check failures**:
 
@@ -1098,8 +1105,8 @@ warning, alongside the W4001 warning emitted for every foreign binding.
 RecreateCallSiteError:
 recreate may be called only inside an external_danger sequence block or an FFI result-cast handler.
 
-RecreatableLimitError:
-Recreatable on a variable-sized type requires max_bytes, max_length, or another applicable limit.
+RecreateLimitError (E2402):
+recreate of a variable-sized type requires max_bytes in its limits argument, a record literal of literals.
 ```
 
 ---
@@ -2243,7 +2250,7 @@ The following decisions are fixed by this specification version:
 | Metadata | Sidecar `.meta` files under `dangerous_exposure_source/`, referenced explicitly by `wrapper_meta` or per-binding `meta` in Silica source. |
 | Toolchain validation | No C parsing; Silica declarations + sidecar metadata + compile-time archive existence (`E4034`) + link-time symbol resolution. §15.2 wrapper-side C checks are authoring guidelines only. |
 | Build integration | Prebuilt static wrapper libraries under `dangerous_exposure_source/lib/`; compiler emits `silica.link`; project Makefiles pass manifest `archive:` paths to the external linker. |
-| De-taint | Strict structural taint. The only way to clear it is re-creation: a compiler-derived `recreate` for a type that declares `Recreatable` (§7.7). User-defined helpers never clear taint. |
+| De-taint | Strict structural taint. The only way to clear it is re-creation: a compiler-derived `recreate` call with its limits as an argument (§7.7). User-defined helpers never clear taint. |
 | Pure actor state from FFI result casts | A client re-creates the payload inside the result-cast handler (§7.7). Only the re-created value may enter actor state, ordinary casts or `call` replies. |
 | Region values from FFI result casts | Re-creation builds the value in a fresh region owned by the caller (§7.7). That region, not the worker's, becomes actor state. |
 | Foreign call scheduling | Architecturally non-blocking via cast-only client and FFI worker actors; no `blocking` sidecar field. |
