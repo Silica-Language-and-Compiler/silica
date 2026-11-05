@@ -103,7 +103,7 @@ TRIAL_CACHE_STORE   = $(TRIAL_CACHE_ENV) "$(SHELL)" "$(TRIAL_CACHE_SH)" store
 .PHONY: all clean assembly objects executables integrate positive-integrate record-positive-golden record-golden help silica.config
 
 # Dependency-ordered lib list: a lib unit is listed after the lib units it `use`s (trials/lib_dependency_order.py).
-LIB_DEPENDENCY_ORDER := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))../lib_dependency_order.py)
+LIB_DEPENDENCY_ORDER := $(abspath $(LEAF_DIR)../../lib_dependency_order.py)
 
 .DEFAULT_GOAL := all
 
