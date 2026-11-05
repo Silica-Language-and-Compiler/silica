@@ -8,8 +8,6 @@ APP_EXECUTABLES := \
 	dangerous_supervisor_guarded_sigill_cast_registered \
 	dangerous_supervisor_guarded_sigfpe_restart \
 	dangerous_supervisor_guarded_sigfpe_cast_registered \
-	dangerous_supervisor_guarded_arena_bounds_restart \
-	dangerous_supervisor_guarded_arena_bounds_cast_registered \
 	dangerous_supervisor_guarded_cast_registered \
 	dangerous_supervisor_guarded_restart
 

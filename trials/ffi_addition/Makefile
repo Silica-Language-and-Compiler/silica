@@ -57,7 +57,9 @@ APP_DIRS := \
 	app_worker_second_message \
 	app_foreign_call_from_deep_stack \
 	app_process_fatal_paths \
-	app_dangerous_spawn_thread_limit
+	app_dangerous_spawn_thread_limit \
+	app_retained_buf_keep_state_area \
+	app_frame_buf_nonretaining_wrapper
 
 GUARDED_APP_DIRS := \
 	$(APP_GUARDED_ONCE_DIR) \
@@ -215,11 +217,11 @@ phase-12: fixtures
 	@$(ENSURE_SILICA_COMPILER)
 	@failed=0; \
 	for dir in $(ARENA_APP_DIRS); do \
-		echo "=== ffi_addition/$$dir (per-actor FFI arena) ==="; \
+		echo "=== ffi_addition/$$dir (FFI app trials) ==="; \
 		$(MAKE) -C "$(THIS_DIR)$$dir" integrate || failed=1; \
 	done; \
 	test "$$failed" -eq 0
-	@echo "✅ ffi_addition phase-12 complete (per-actor FFI arena marshaling)"
+	@echo "✅ ffi_addition phase-12 complete (FFI app trials)"
 
 phase-13: fixtures
 	@$(ENSURE_SILICA_COMPILER)
@@ -267,7 +269,7 @@ help:
 	@echo "  phase-4..8  - One app trial integrate per phase (see app dirs above)"
 	@echo "  phase-9     - All app integrates with silica.link-driven link (.scout goldens)"
 	@echo "  phase-11    - Guarded FFI boundary app trials (legacy math add via enter/exit wrapper)"
-	@echo "  phase-12    - Per-actor FFI arena app trials (string echo in/out via arena bump)"
+	@echo "  phase-12    - FFI app trials (string echo in/out)"
 	@echo "  (compile/link failure goldens: error_enforcement_addition/ffi_addition integrate)"
 	@echo "  fixtures    - Build libsilica_legacy_math.a, libsilica_text.a, libsilica_net.a, libsilica_abi_types.a"
 	@echo "  clean       - Remove fixture and app trial build artifacts"

@@ -175,7 +175,7 @@ Three kinds of storage, each with one release rule:
 | **Actor heap** (implicit) **(today: removed by the chunk 15 direction, 2026-10-24; escaping values move to the actors' stacks, §19)** | lists, promoted tuples and records, strings, message copies | the actor | hosted: the actor's arena, freed at the actor's end; board: per block (`silica_rt_free`); `main`: never |
 
 The frame is not storage a value may outlive. Item B and `arg_aggregate_heap_promote` move every aggregate that leaves
-the frame into the actor heap, and H3 is the one path that still escapes.
+the frame into the actor heap, and H3 is the one path that still escapes. **Update 2026-11-01 (Lee, chunk 15 phase 4e):** `alloc_region` allocates an area in the frame, not on the heap, and the implicit actor heap is removed on the hosted (Mac) targets; this paragraph, the actor-heap row above and H3 to H5 describe the state before phase 4e. The Linux and ESP32-S3 targets keep the heap until chunk 15 phases 8 and 9. See chunk15_stack_memory_design.md sections 3.2, 3.8 and 9.
 
 **Update 2026-10-24.** The three-row table above, and its "owned region" row (released when its owner is dropped, §7; owner lists, §7.3), describe the 2026-10-22 model and today's runtime. Under the direction owned regions fold into the stack and the structure-storage and actor-heap rows are removed (requirements §2A decisions 1, 2, 5, 12); owned regions are not linear and owner lists are dropped (decision 16); an explicit region is an area in the current frame that follows the rules of any value (decision 34) and mailbox buffers at actor end are released by the end-of-actor drain (decision 31).
 

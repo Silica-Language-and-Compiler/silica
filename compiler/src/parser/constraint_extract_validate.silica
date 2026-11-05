@@ -33,6 +33,7 @@ export validate_no_illegal_trailing_semicolon/1;
 export validate_no_unused_scope_bindings/1;
 export validate_max_tuple_decompose_bindings/1;
 export validate_function_literal_return_types/1;
+export validate_buffer_regions/1;
 
 
 
@@ -1038,6 +1039,390 @@ fn validate_no_escaping_capturing_lambda(program: { declarations: List[{ tag: in
     (found: boolean, err_loc: { file: string, line: int64, column: int64, offset: int64 }) <- decls_has_escaping_capturing_lambda(program.declarations, program.declarations);
     case found of {
         true -> parser_core@parse_err("E1067", err_loc, "a function literal that captures local bindings cannot be returned from the function that owns them (closure environments are not supported yet); pass the values as parameters instead", "sect3.4");
+        false -> parser_core@parse_ok(program)
+    }
+}
+
+
+
+// --- E2323 BufferWithoutRegion (Lee 2026-11-01) ---------------------------------------------------
+// A bare buffer, a buf(L, S, T, N) with no region(L, ...) beside it, is accepted only where Silica
+// meets C: in a foreign fn's signature and as an argument of a call to a foreign fn ("add the fix to
+// the parser for bare buffers, but only when receiving or passing them to C in FFI"; "#1 is
+// intended"). Everywhere else a buffer comes with its region. Two checks on the parsed program:
+//   signature  a function (tag 0) or required method (tag 7) whose parameter or return types name
+//              buf(L, ...) must name region(L, ...) in the same signature: a parameter, a record
+//              field or a tuple element. A foreign fn (tag 9) is exempt.
+//   binding    a region-less alloc_buf(n) or alloc_buf_retained(n) makes a bare buffer. Its name must
+//              be an argument of a call to a foreign fn of this module in its scope, and of no call to
+//              any other function (read_buf, write_buf, buf_load and buf_store are buffer operations,
+//              not functions that receive the buffer).
+// A buffer that escapes some other way (returned, stored in a record or in actor state) reaches a
+// signature, which the first check covers.
+
+fn bfr_char(s: string, i: int64) -> string {
+    case i < 0 or i >= length_bytes(s) of {
+        true -> "";
+        false -> substring(s, i, i + 1)
+    }
+}
+
+fn bfr_is_name_char(c: string) -> boolean {
+    case c of {
+        "a" -> true; "b" -> true; "c" -> true; "d" -> true; "e" -> true; "f" -> true; "g" -> true;
+        "h" -> true; "i" -> true; "j" -> true; "k" -> true; "l" -> true; "m" -> true; "n" -> true;
+        "o" -> true; "p" -> true; "q" -> true; "r" -> true; "s" -> true; "t" -> true; "u" -> true;
+        "v" -> true; "w" -> true; "x" -> true; "y" -> true; "z" -> true;
+        "A" -> true; "B" -> true; "C" -> true; "D" -> true; "E" -> true; "F" -> true; "G" -> true;
+        "H" -> true; "I" -> true; "J" -> true; "K" -> true; "L" -> true; "M" -> true; "N" -> true;
+        "O" -> true; "P" -> true; "Q" -> true; "R" -> true; "S" -> true; "T" -> true; "U" -> true;
+        "V" -> true; "W" -> true; "X" -> true; "Y" -> true; "Z" -> true;
+        "0" -> true; "1" -> true; "2" -> true; "3" -> true; "4" -> true;
+        "5" -> true; "6" -> true; "7" -> true; "8" -> true; "9" -> true;
+        "_" -> true;
+        _: string -> false
+    }
+}
+
+fn bfr_nil() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn bfr_cons(s: string, rest: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[string, mem(normal)] <- prepend[string, mem(normal)](s, rest)
+    produces
+        pure result
+    end
+}
+
+fn bfr_has(items: List[string, mem(normal)], s: string) -> boolean {
+    case items.is_nil of {
+        true -> false;
+        false -> case items.head == s of {
+            true -> true;
+            false -> bfr_has(items.tail, s)
+        }
+    }
+}
+
+fn bfr_skip_spaces(t: string, i: int64) -> int64 {
+    case bfr_char(t, i) == " " of {
+        true -> bfr_skip_spaces(t, i + 1);
+        false -> i
+    }
+}
+
+fn bfr_name_end(t: string, i: int64) -> int64 {
+    case bfr_is_name_char(bfr_char(t, i)) of {
+        true -> bfr_name_end(t, i + 1);
+        false -> i
+    }
+}
+
+// The lifetime name that opens a head's argument list at start (after "buf(" or "region(").
+fn bfr_label_at(t: string, start: int64) -> string {
+    s0: int64 <- bfr_skip_spaces(t, start);
+    s1: int64 <- bfr_name_end(t, s0);
+    substring(t, s0, s1)
+}
+
+// True when head opens at i and is not the tail of a longer identifier (alloc_buf(, my_region().
+fn bfr_head_at(t: string, i: int64, head: string) -> boolean {
+    case i + length_bytes(head) > length_bytes(t) of {
+        true -> false;
+        false -> case substring(t, i, i + length_bytes(head)) == head of {
+            false -> false;
+            true -> case bfr_is_name_char(bfr_char(t, i - 1)) of {
+                true -> false;
+                false -> true
+            }
+        }
+    }
+}
+
+// The lifetime names of every head ("buf(" or "region(") in the type text t.
+fn bfr_labels(t: string, i: int64, head: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= length_bytes(t) of {
+        true -> acc;
+        false -> case bfr_head_at(t, i, head) of {
+            true -> bfr_labels(t, i + length_bytes(head), head, bfr_cons(bfr_label_at(t, i + length_bytes(head)), acc));
+            false -> bfr_labels(t, i + 1, head, acc)
+        }
+    }
+}
+
+// The first buffer lifetime with no region of the same lifetime ("" when every buffer has one).
+fn bfr_missing_label(bufs: List[string, mem(normal)], regions: List[string, mem(normal)]) -> string {
+    case bufs.is_nil of {
+        true -> "";
+        false -> case bfr_has(regions, bufs.head) of {
+            true -> bfr_missing_label(bufs.tail, regions);
+            false -> bufs.head
+        }
+    }
+}
+
+fn bfr_params_text(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], acc: string) -> string {
+    case params.is_nil of {
+        true -> acc;
+        false -> bfr_params_text(params.tail, concat(acc, concat(" ; ", params.head.type_name)))
+    }
+}
+
+// The location of the first parameter whose type names a buffer of lifetime label; the return
+// type's location when no parameter does (the buffer is in the result).
+fn bfr_label_location(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], label: string, ret_loc: { file: string, line: int64, column: int64, offset: int64 }) -> { file: string, line: int64, column: int64, offset: int64 } {
+    case params.is_nil of {
+        true -> ret_loc;
+        false -> case bfr_has(bfr_labels(params.head.type_name, 0, "buf(", bfr_nil()), label) of {
+            true -> params.head.location;
+            false -> bfr_label_location(params.tail, label, ret_loc)
+        }
+    }
+}
+
+// The callee's own name: the text after the last '@' of a qualified call.
+fn bfr_base_from(name: string, i: int64) -> string {
+    case i < 0 of {
+        true -> name;
+        false -> case substring(name, i, i + 1) == "@" of {
+            true -> substring(name, i + 1, length_bytes(name));
+            false -> bfr_base_from(name, i - 1)
+        }
+    }
+}
+
+fn bfr_base(name: string) -> string {
+    bfr_base_from(name, length_bytes(name) - 1)
+}
+
+fn bfr_is_buffer_op(base: string) -> boolean {
+    base == "read_buf" or base == "write_buf" or base == "buf_load" or base == "buf_store"
+}
+
+fn bfr_foreign_names(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case decls.is_nil of {
+        true -> acc;
+        false -> case decls.head.tag == 9 of {
+            true -> bfr_foreign_names(decls.tail, bfr_cons(decls.head.name, acc));
+            false -> bfr_foreign_names(decls.tail, acc)
+        }
+    }
+}
+
+fn bfr_is_ident(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, nm: string) -> boolean {
+    case e.root < 0 of {
+        true -> false;
+        false -> parser_ast@expr_root_kind(e) == 1 and parser_ast@expr_root_name(e) == nm
+    }
+}
+
+// True when an argument of a call is the identifier nm: the inner argument, then the right chain
+// (nameless kind-4 links, the last argument standing alone).
+fn bfr_args_name(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, inner_i: int64, right_i: int64, nm: string) -> boolean {
+    first: boolean <- case expr_child_is_absent(e.root, inner_i) == 1 of {
+        true -> false;
+        false -> bfr_is_ident(parser_ast@expr_at(e, inner_i), nm)
+    };
+    case first of {
+        true -> true;
+        false -> case expr_child_is_absent(e.root, right_i) == 1 of {
+            true -> false;
+            false -> bfr_args_chain(parser_ast@expr_at(e, right_i), nm)
+        }
+    }
+}
+
+fn bfr_args_chain(right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, nm: string) -> boolean {
+    case right_e.root < 0 of {
+        true -> false;
+        false -> case parser_ast@expr_root_kind(right_e) == 4 and length_bytes(parser_ast@expr_root_name(right_e)) == 0 of {
+            true -> bfr_args_name(right_e, parser_ast@expr_root_inner(right_e), parser_ast@expr_root_right(right_e), nm);
+            false -> bfr_is_ident(right_e, nm)
+        }
+    }
+}
+
+// The root of e as a use of nm: (passed to a foreign fn, the name of another function it is passed to).
+fn bfr_call_use(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, nm: string, foreign_fns: List[string, mem(normal)]) -> (boolean, string) {
+    callee: string <- parser_ast@expr_root_name(e);
+    case parser_ast@expr_root_kind(e) == 4 and length_bytes(callee) > 0 of {
+        false -> (false, "");
+        true -> case bfr_args_name(e, parser_ast@expr_root_inner(e), parser_ast@expr_root_right(e), nm) of {
+            false -> (false, "");
+            true -> case bfr_has(foreign_fns, bfr_base(callee)) of {
+                true -> (true, "");
+                false -> case bfr_is_buffer_op(bfr_base(callee)) of {
+                    true -> (false, "");
+                    false -> (false, callee)
+                }
+            }
+        }
+    }
+}
+
+fn bfr_child_uses(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, idx: int64, nm: string, foreign_fns: List[string, mem(normal)]) -> (boolean, string) {
+    case expr_child_is_absent(e.root, idx) == 1 of {
+        true -> (false, "");
+        false -> bfr_uses(parser_ast@expr_at(e, idx), nm, foreign_fns)
+    }
+}
+
+fn bfr_first_name(a: string, b: string) -> string {
+    case length_bytes(a) > 0 of {
+        true -> a;
+        false -> b
+    }
+}
+
+// Every use of nm as a call argument in e: (some call passes it to a foreign fn, the first other
+// function it is passed to or "").
+fn bfr_uses(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, nm: string, foreign_fns: List[string, mem(normal)]) -> (boolean, string) {
+    case e.root < 0 of {
+        true -> (false, "");
+        false -> {
+            (h_foreign: boolean, h_other: string) <- bfr_call_use(e, nm, foreign_fns);
+            (i_foreign: boolean, i_other: string) <- bfr_child_uses(e, parser_ast@expr_root_inner(e), nm, foreign_fns);
+            (r_foreign: boolean, r_other: string) <- bfr_child_uses(e, parser_ast@expr_root_right(e), nm, foreign_fns);
+            any_foreign: boolean <- h_foreign or i_foreign or r_foreign;
+            other: string <- bfr_first_name(h_other, bfr_first_name(i_other, r_other));
+            (any_foreign, other)
+        }
+    }
+}
+
+// The root of e as a binding of a region-less buffer: alloc_buf(n) or alloc_buf_retained(n) with
+// one argument. The scope after the binding must pass the name to a foreign fn and to nothing else.
+fn bfr_let_error(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, foreign_fns: List[string, mem(normal)]) -> (boolean, { file: string, line: int64, column: int64, offset: int64 }, string) {
+    inner_i: int64 <- parser_ast@expr_root_inner(e);
+    case parser_ast@expr_root_kind(e) == 6 and expr_child_is_absent(e.root, inner_i) == 0 of {
+        false -> (false, parser_ast@zero_location(), "");
+        true -> {
+            rhs: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, inner_i);
+            alloc_name: string <- case rhs.root < 0 of {
+                true -> "";
+                false -> case parser_ast@expr_root_kind(rhs) == 4 and expr_child_is_absent(rhs.root, parser_ast@expr_root_right(rhs)) == 1 of {
+                    true -> bfr_base(parser_ast@expr_root_name(rhs));
+                    false -> ""
+                }
+            };
+            case alloc_name == "alloc_buf" or alloc_name == "alloc_buf_retained" of {
+                false -> (false, parser_ast@zero_location(), "");
+                true -> {
+                    nm: string <- parser_ast@expr_root_name(e);
+                    (to_foreign: boolean, other: string) <- bfr_child_uses(e, parser_ast@expr_root_right(e), nm, foreign_fns);
+                    case length_bytes(other) > 0 of {
+                        true -> (true, parser_ast@expr_root_node(e).location, concat(concat(concat(concat(concat(concat("'", nm), "' is a buffer without a region ("), alloc_name), "(n)) and is passed to '"), other), "', which is not a foreign fn; only a foreign fn takes a bare buffer: allocate it with alloc_buf(r, n) from r: region(L, S) <- alloc_region(S) and pass r with it"));
+                        false -> case to_foreign of {
+                            true -> (false, parser_ast@zero_location(), "");
+                            false -> (true, parser_ast@expr_root_node(e).location, concat(concat(concat(concat("'", nm), "' is a buffer without a region ("), alloc_name), "(n)) that is not passed to a foreign fn; outside FFI a buffer must carry its region: allocate it with alloc_buf(r, n) from r: region(L, S) <- alloc_region(S)"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn bfr_child_error(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, idx: int64, foreign_fns: List[string, mem(normal)]) -> (boolean, { file: string, line: int64, column: int64, offset: int64 }, string) {
+    case expr_child_is_absent(e.root, idx) == 1 of {
+        true -> (false, parser_ast@zero_location(), "");
+        false -> bfr_body_error(parser_ast@expr_at(e, idx), foreign_fns)
+    }
+}
+
+fn bfr_body_error(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, foreign_fns: List[string, mem(normal)]) -> (boolean, { file: string, line: int64, column: int64, offset: int64 }, string) {
+    case e.root < 0 of {
+        true -> (false, parser_ast@zero_location(), "");
+        false -> {
+            (h_found: boolean, h_loc: { file: string, line: int64, column: int64, offset: int64 }, h_msg: string) <- bfr_let_error(e, foreign_fns);
+            case h_found of {
+                true -> (true, h_loc, h_msg);
+                false -> {
+                    (i_found: boolean, i_loc: { file: string, line: int64, column: int64, offset: int64 }, i_msg: string) <- bfr_child_error(e, parser_ast@expr_root_inner(e), foreign_fns);
+                    case i_found of {
+                        true -> (true, i_loc, i_msg);
+                        false -> bfr_child_error(e, parser_ast@expr_root_right(e), foreign_fns)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The cheap test first: contains is a builtin search, so a signature without "buf(" costs no
+// per-character scan.
+fn bfr_params_have_buf(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> boolean {
+    case params.is_nil of {
+        true -> false;
+        false -> case contains(params.head.type_name, "buf(") of {
+            true -> true;
+            false -> bfr_params_have_buf(params.tail)
+        }
+    }
+}
+
+fn bfr_signature_error(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> (boolean, { file: string, line: int64, column: int64, offset: int64 }, string) {
+    has_buf: boolean <- case contains(decl.return_type_name, "buf(") of {
+        true -> true;
+        false -> bfr_params_have_buf(decl.parameters)
+    };
+    sig: string <- case has_buf of {
+        true -> concat(bfr_params_text(decl.parameters, ""), concat(" -> ", decl.return_type_name));
+        false -> ""
+    };
+    bufs: List[string, mem(normal)] <- bfr_labels(sig, 0, "buf(", bfr_nil());
+    case bufs.is_nil of {
+        true -> (false, parser_ast@zero_location(), "");
+        false -> {
+            missing: string <- bfr_missing_label(bufs, bfr_labels(sig, 0, "region(", bfr_nil()));
+            case length_bytes(missing) == 0 of {
+                true -> (false, parser_ast@zero_location(), "");
+                false -> (true, bfr_label_location(decl.parameters, missing, decl.return_type_location), concat(concat(concat(concat(concat(concat("the signature of '", decl.name), "' has buf("), missing), ", ...) but no region("), missing), ", S): outside a foreign fn a buffer must carry its region; add the region to the same signature (a parameter, a record field or a tuple element)"))
+            }
+        }
+    }
+}
+
+fn bfr_decl_error(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, foreign_fns: List[string, mem(normal)]) -> (boolean, { file: string, line: int64, column: int64, offset: int64 }, string) {
+    case decl.tag == 0 or decl.tag == 7 of {
+        false -> (false, parser_ast@zero_location(), "");
+        true -> {
+            (s_found: boolean, s_loc: { file: string, line: int64, column: int64, offset: int64 }, s_msg: string) <- bfr_signature_error(decl);
+            case s_found of {
+                true -> (true, s_loc, s_msg);
+                false -> case decl_skips_body_walk(decl.tag, decl.body.root) == 1 of {
+                    true -> (false, parser_ast@zero_location(), "");
+                    false -> bfr_body_error(decl.body, foreign_fns)
+                }
+            }
+        }
+    }
+}
+
+fn bfr_decls_error(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], foreign_fns: List[string, mem(normal)]) -> (boolean, { file: string, line: int64, column: int64, offset: int64 }, string) {
+    case decls.is_nil of {
+        true -> (false, parser_ast@zero_location(), "");
+        false -> {
+            (found: boolean, loc: { file: string, line: int64, column: int64, offset: int64 }, msg: string) <- bfr_decl_error(decls.head, foreign_fns);
+            case found of {
+                true -> (true, loc, msg);
+                false -> bfr_decls_error(decls.tail, foreign_fns)
+            }
+        }
+    }
+}
+
+fn validate_buffer_regions(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> { is_ok: boolean, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    foreign_fns: List[string, mem(normal)] <- bfr_foreign_names(program.declarations, bfr_nil());
+    (found: boolean, err_loc: { file: string, line: int64, column: int64, offset: int64 }, msg: string) <- bfr_decls_error(program.declarations, foreign_fns);
+    case found of {
+        true -> parser_core@parse_err("E2323", err_loc, msg, "sect12.3.3");
         false -> parser_core@parse_ok(program)
     }
 }

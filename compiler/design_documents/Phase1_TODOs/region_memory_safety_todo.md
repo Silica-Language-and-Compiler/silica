@@ -51,9 +51,9 @@ In many other languages, **arena** names an allocator *pattern*, not a full type
 
 ### 1.2 Current Allocation Strategy
 
-Each **memory region** is implemented in `prims_memory.silica` as a heap-allocated block with bump-pointer metadata at the base (see emitter comments for layout). This matches the spec’s model of scope-tied deallocation better than an earlier stack-only sketch, but remains a minimal prototype:
+Each **memory region** is an area in the stack frame of the function that executes `alloc_region` on the hosted Mac targets since chunk 15 phase 4e (Lee, 2026-11-01; [chunk15_stack_memory_design.md](../chunk15_stack_memory_design.md) section 3.8); the Linux and ESP32-S3 targets still implement it in `prims_memory.silica` as a heap-allocated block with bump-pointer metadata at the base (see emitter comments for layout) until chunk 15 phases 8 and 9. This matches the spec’s model of scope-tied deallocation better than an earlier stack-only sketch, but remains a minimal prototype:
 
-- `alloc_region`: obtain a block (e.g. via `malloc`), initialize bump/end pointers
+- `alloc_region`: obtain a block (on Linux and ESP32-S3, e.g. via `malloc`, until phases 8 and 9; on the hosted Mac targets an area in the current frame), initialize bump/end pointers
 - `alloc_ref` / `alloc_buf`: bump-allocate within that block, with overflow checks to the region overflow path
 
 Terminology: [memory region vs arena](#terminology-memory-region-vs-arena) (above). Without lifetime analysis, the compiler cannot fully prevent returning or storing references that would become dangling after the backing storage is released or invalidated.
@@ -162,7 +162,7 @@ fn leak_ref() -> ref(R, normal, int64) {
 **Required**:
 
 1. **Lifetime analysis** (see §2.1) must reject returning references whose region does not outlive the function
-2. **Allocation strategy**: Enforce (via lifetime analysis) that no ref outlives its region; keep heap-backed regions with deallocation tied to scope exit as the spec implies (see §1.2)
+2. **Allocation strategy**: Enforce (via lifetime analysis) that no ref outlives its region; keep regions with deallocation tied to scope exit as the spec implies (frame areas on the hosted Mac targets; heap-backed on Linux and ESP32-S3 until chunk 15 phases 8 and 9) (see §1.2)
 
 The spec describes "implicit deallocation when r goes out of scope" — the implementation must ensure no references remain when that happens.
 

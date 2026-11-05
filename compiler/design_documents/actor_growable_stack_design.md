@@ -26,8 +26,8 @@
 > reservation is never committed, so that reaching it is the end of the reservation; the per-message usage that
 > `:keep_last_message` and `:track_recent_peak` need is measured by scanning for the lowest nonzero page of a run
 > that is zeroed after every message; `:release_when_idle` is a one-second timed wait in the actor's own mailbox
-> loop, since there is no carrier thread to sweep (§4.2.1 says carriers); the implicit heap is a chain of 64 MB
-> anonymous blocks with a bounds-checked bump pointer; child-spec children inherit the spawner's policy;
+> loop, since there is no carrier thread to sweep (§4.2.1 says carriers); the implicit heap was a chain of 64 MB
+> anonymous blocks with a bounds-checked bump pointer (removed on the hosted Mac targets by chunk 15 phase 4e, Lee 2026-11-01: `alloc_region` is a frame area; Linux and ESP32-S3 keep the heap until phases 8 and 9); child-spec children inherit the spawner's policy;
 > `stack_policy(reserve, release)` is one word, `(reserve rounded to 16) | algorithm index`, and the release atom
 > must be a literal. Trials: `trials/actor_stacks_addition`, `error_enforcement_addition/stack_policy_*`,
 > `ffi_addition/app_foreign_call_from_deep_stack`. **Not implemented:** NUMA-node-local commitment and the lazy page
@@ -50,9 +50,9 @@ This document describes the complete actor memory architecture for Silica, repla
 
 ## 1. Architecture Overview
 
-### 1.1 Current Model vs. Proposed Model
+### 1.1 Old Model vs. Proposed Model
 
-| Aspect | Current (Per-Actor Heap) | Proposed (Growable Stack) |
+| Aspect | Old design (Per-Actor Heap) | Proposed (Growable Stack) |
 |--------|------------------------|--------------------------|
 | **Memory allocation** | malloc/free in per-actor heap | Stack pointer adjustment |
 | **Actor isolation** | Separate heaps carved from app heap | Complete isolation via stack |

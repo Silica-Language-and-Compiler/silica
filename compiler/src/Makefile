@@ -38,6 +38,11 @@ SILICA_LINK_SH := $(abspath $(THIS_DIR)../../trials/silica_link.sh)
 # assembly's per-unit compiler log is rewritten by this filter (terminal bar, or one
 # line per stage under CI). SILICA_PROGRESS=off on the make command line keeps the raw log.
 COMPILE_PROGRESS := $(abspath $(THIS_DIR)../tools/compile_progress.sh)
+# RAM profile of the assembly batch: one benchmarking/memory_use_reports/data/<UTC>_<compiler>.tsv per build.
+# SILICA_RAM_PROFILE=0 disables it. The wrapper never changes the compiler's args, output or exit code.
+RAM_PROFILE := $(abspath $(THIS_DIR)../../programmer_tools/ram_profile_unit.sh)
+RAM_PROFILE_DATA := $(abspath $(THIS_DIR)../../benchmarking/memory_use_reports/data)
+RAM_MAKE_CMD = make $(MAKECMDGOALS) $(MAKEOVERRIDES)
 STDLIB_DS := $(abspath $(THIS_DIR)../stdlib/data_structures)
 # POLICY: src links NO Rust libraries. The bootstrap crate's staticlib
 # (libsilica_compiler.a) used to be linked here and supplied the whole runtime.
@@ -86,7 +91,45 @@ endif
 
 # Parallel .sams → .o assembly (Stage 2). Silica emission (Stage 1) stays serial
 # (leaf-to-root + process-per-unit). Override: make build JOBS=4
-JOBS ?= $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+#
+# Default JOBS = max(1, min(ncpu, floor(usable_RAM_MB / PER_JOB_MB))) so a wide
+# machine with little free memory does not OOM. usable_RAM_MB is the memory
+# available when make starts times JOBS_RAM_PCT percent. Read once per make.
+# PER_JOB_MB comes from the newest benchmarking/memory_use_reports/data/*.tsv: its largest unit
+# peak_footprint_MB rounded up to a multiple of 64 MB, floor 512 MB; 2048 when no profile can be read.
+# PER_JOB_MB=N on the command line overrides it (source 'override').
+# Test hook: SILICA_AVAILABLE_MB=N overrides the measured available memory (MB).
+# Unreadable memory falls back to ncpu.
+RAM_NEWEST := $(shell ls -1 "$(RAM_PROFILE_DATA)"/*.tsv 2>/dev/null | sort | tail -n 1)
+RAM_PEAK := $(if $(RAM_NEWEST),$(shell awk -F'\t' '/^\#/||$$1=="unit"{next} $$6+0>m{m=$$6+0} END{print int(m+0.999)}' "$(RAM_NEWEST)" 2>/dev/null))
+PER_JOB_PROFILE := $(if $(filter-out 0,$(RAM_PEAK)),$(shell p=$$(( ($(RAM_PEAK) + 63) / 64 * 64 )); [ $$p -lt 512 ] && p=512; echo $$p))
+PER_JOB_MB ?= $(if $(PER_JOB_PROFILE),$(PER_JOB_PROFILE),2048)
+PER_JOB_SRC := $(if $(filter command line environment,$(origin PER_JOB_MB)),override,$(if $(PER_JOB_PROFILE),profile $(notdir $(RAM_NEWEST)),fallback))
+JOBS_RAM_PCT ?= 50
+NCPU := $(shell sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
+AVAIL_MB := $(shell if [ -n "$$SILICA_AVAILABLE_MB" ]; then echo "$$SILICA_AVAILABLE_MB"; \
+	elif [ -r /proc/meminfo ]; then awk '/^MemAvailable:/{print int($$2/1024)}' /proc/meminfo; \
+	elif command -v vm_stat >/dev/null 2>&1; then vm_stat | awk '/page size of/{ps=$$8} /^Pages (free|inactive|speculative):/{n+=$$3} END{if(ps>0&&n>0)print int(n*ps/1048576)}'; \
+	fi 2>/dev/null)
+USABLE_MB := $(if $(AVAIL_MB),$(shell echo $$(( $(AVAIL_MB) * $(JOBS_RAM_PCT) / 100 ))))
+JOBS_RAM := $(if $(USABLE_MB),$(shell echo $$(( $(USABLE_MB) / $(PER_JOB_MB) ))),$(NCPU))
+JOBS_AUTO := $(shell n=$(NCPU); r=$(JOBS_RAM); [ $$r -lt $$n ] && n=$$r; [ $$n -lt 1 ] && n=1; echo $$n)
+JOBS ?= $(JOBS_AUTO)
+
+.PHONY: print-jobs
+print-jobs:
+	@echo "JOBS=$(JOBS) ncpu=$(NCPU) usable_ram_mb=$(if $(USABLE_MB),$(USABLE_MB),unknown) per_job_mb=$(PER_JOB_MB) per_job_source=$(PER_JOB_SRC)"
+
+# Read-only: the newest profile's largest units and the per-job figure they imply.
+.PHONY: ram-compare
+ram-compare:
+	@echo "newest profile: $(if $(RAM_NEWEST),$(RAM_NEWEST),none)"
+	@if [ -n "$(RAM_NEWEST)" ]; then \
+	  printf '%-70s %10s %8s\n' unit peak_MB seconds; \
+	  awk -F'\t' '/^\#/||$$1=="unit"||$$6=="NA"{next} {printf "%s\t%s\t%s\n",$$6,$$5,$$1}' "$(RAM_NEWEST)" | sort -t'\t' -k1,1 -rn | head -n 10 | \
+	    awk -F'\t' '{printf "%-70s %10s %8s\n",$$3,$$1,$$2}'; \
+	fi
+	@echo "largest unit peak: $(if $(RAM_PEAK),$(RAM_PEAK) MB,unknown); per-job figure: $(PER_JOB_MB) MB (source: $(PER_JOB_SRC), 64 MB steps, floor 512, fallback 2048)"
 
 # Stdlib modules pulled in by compiler_maps (staged under lib/ like trial leaves).
 LIB_STDLIB_MODULES := wbt_map OrderedMap
@@ -355,9 +398,10 @@ assembly: check-seed silica.config stage record-compile-start
 	  echo "Compiling with seed host: $(SILICA_COMPILER) ($$need unit(s) to compile)"; \
 	  echo "Emit target: $(TARGET) (see silica.target)"; \
 	  export SILICA_PROGRESS_TOTAL="$$need"; \
+	  export SILICA_RAM_PROFILE_FILE="$$("$(RAM_PROFILE)" --init "$(SILICA_COMPILER)" "$$need" "$(JOBS)" "$(RAM_MAKE_CMD)")"; \
 	  ecfile=$$(mktemp); \
 	  while true; do \
-	    { "$(SILICA_COMPILER)"; echo $$? > "$$ecfile"; } 2>&1 | "$(COMPILE_PROGRESS)"; \
+	    { "$(RAM_PROFILE)" "$(SILICA_COMPILER)"; echo $$? > "$$ecfile"; } 2>&1 | "$(COMPILE_PROGRESS)"; \
 	    ec=$$(cat "$$ecfile"); \
 	    if [ "$$ec" -eq 0 ]; then break; fi; \
 	    if [ "$$ec" -eq 75 ]; then \

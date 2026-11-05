@@ -1,0 +1,1363 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Chunk 15 phase 6, stages 6a and 6b: the lifetime-only region checker (chunk15_stack_memory_design.md
+// §6.1, §6.2). Runs between the effect check and SIR generation on the model of ffi_taint_checker. It
+// does nothing unless the program declares `strict region_check;` (declaration tag 10). Then it prints
+// one report line per function with the sizes of the frame set F and the moved set M and the lifetime
+// bindings it found (stage 6a), and reports E2301 UseAfterMove for every use of a moved name (stage
+// 6b); the pass returns the number of E2301 errors, and a non-zero result fails the unit. Phase 7 adds
+// E2300 case (a) (§6.4, §7): a value in F passed to a foreign parameter the sidecar declares `retains`,
+// counted with the E2301 errors. E2302 (§6.3, Lee 2026-11-01: a pointer not backed by a region in scope
+// is invalid) reports a write_ref(c, v) whose value is built in this frame into a cell that is older,
+// counted the same way. The other diagnostics of §6.4-§6.6 (E2300 (b)/(c), E2242) are later stages.
+//
+// Per function body, flow-sensitively over the let nesting and the case arms:
+//   F  names whose value may hold a pointer into the current frame: a binding whose right side is an
+//      alloc_* result, a call whose declared binding type carries a pointer, a tuple / record / list
+//      literal, a projection of a name in F, or a case-arm pattern name over a scrutinee in F; closed
+//      as a taint set. Parameters are not in F, nor are projections of parameters.
+//   M  names given to an explicit move(x) (any position; the SIR tags both the stripped and the
+//      prim form), with the move's line and the innermost case arm (0 outside a case). Alias closure:
+//      a binding whose right side mentions a name already in M, or whose right side's value is a
+//      move(...) (directly, or through a literal, a paren, a let tail, a case arm or an if branch;
+//      not through a call's argument), is moved too. A fresh binding of a moved name leaves M.
+//   lifetimes  every lifetime name of the body: `L:param` when it appears in a parameter type,
+//      `L:here` when bound by an alloc_region binding annotated region(L, S) (the names of the
+//      annotation) or by `l <- fresh_lifetime()` (the binding name).
+//   E2301  every identifier read (any position: an argument, a projection base, a return, a scrutinee,
+//      a send, the operand of a second move, a callee) whose name is in M at that point, with the
+//      use's location and the move's line and arm. Each case arm and if branch starts from the state
+//      after the scrutinee (condition), so a move in one arm and a use in another is legal; after the
+//      construct the arms' M are united, so a move in an arm and a use after the case is an error
+//      (the message names the arm), as is a move before the case and a use in any arm (§6.2).
+// After a case the arms' sets are united (each arm starts from the state after the scrutinee).
+
+use parser_ast;
+use sir_ast;
+use type_checker_core;
+use diagnostics_core;
+use ffi_sidecar_loader;
+
+export check_program_regions/2;
+export program_declares_strict/2;
+
+// --- the moved list and the string lists -------------------------------------------------------
+
+fn rc_mv_nil() -> List[{ name: string, line: int64, arm: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ name: string, line: int64, arm: int64 }, mem(normal)] <- empty[{ name: string, line: int64, arm: int64 }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn rc_mv_cons(name: string, line: int64, arm: int64, rest: List[{ name: string, line: int64, arm: int64 }, mem(normal)]) -> List[{ name: string, line: int64, arm: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        entry: { name: string, line: int64, arm: int64 } <- { name: name, line: line, arm: arm };
+        result: List[{ name: string, line: int64, arm: int64 }, mem(normal)] <- prepend[{ name: string, line: int64, arm: int64 }, mem(normal)](entry, rest)
+    produces
+        pure result
+    end
+}
+
+fn rc_mv_has(items: List[{ name: string, line: int64, arm: int64 }, mem(normal)], name: string) -> boolean {
+    case items.is_nil of {
+        true -> false;
+        false -> case items.head.name == name of {
+            true -> true;
+            false -> rc_mv_has(items.tail, name)
+        }
+    }
+}
+
+fn rc_mv_len(items: List[{ name: string, line: int64, arm: int64 }, mem(normal)]) -> int64 {
+    case items.is_nil of {
+        true -> 0;
+        false -> 1 + rc_mv_len(items.tail)
+    }
+}
+
+fn rc_mv_add(items: List[{ name: string, line: int64, arm: int64 }, mem(normal)], name: string, line: int64, arm: int64) -> List[{ name: string, line: int64, arm: int64 }, mem(normal)] {
+    case length_bytes(name) == 0 or name == "_" of {
+        true -> items;
+        false -> case rc_mv_has(items, name) of {
+            true -> items;
+            false -> rc_mv_cons(name, line, arm, items)
+        }
+    }
+}
+
+fn rc_mv_union(a: List[{ name: string, line: int64, arm: int64 }, mem(normal)], b: List[{ name: string, line: int64, arm: int64 }, mem(normal)]) -> List[{ name: string, line: int64, arm: int64 }, mem(normal)] {
+    case b.is_nil of {
+        true -> a;
+        false -> rc_mv_union(rc_mv_add(a, b.head.name, b.head.line, b.head.arm), b.tail)
+    }
+}
+
+fn rc_str_len(items: List[string, mem(normal)]) -> int64 {
+    case items.is_nil of {
+        true -> 0;
+        false -> 1 + rc_str_len(items.tail)
+    }
+}
+
+fn rc_str_add(items: List[string, mem(normal)], name: string) -> List[string, mem(normal)] {
+    case length_bytes(name) == 0 or name == "_" of {
+        true -> items;
+        false -> case sir_ast@sir_string_list_contains(items, name) of {
+            true -> items;
+            false -> sir_ast@cons_sir_string(name, items)
+        }
+    }
+}
+
+fn rc_str_union(a: List[string, mem(normal)], b: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case b.is_nil of {
+        true -> a;
+        false -> rc_str_union(rc_str_add(a, b.head), b.tail)
+    }
+}
+
+fn rc_str_reverse(items: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case items.is_nil of {
+        true -> acc;
+        false -> rc_str_reverse(items.tail, sir_ast@cons_sir_string(items.head, acc))
+    }
+}
+
+// Joined with commas, oldest entry first (the lists are built by prepending).
+fn rc_str_join(items: List[string, mem(normal)]) -> string {
+    rc_str_join_from(rc_str_reverse(items, sir_ast@nil_sir_strings()), "")
+}
+
+fn rc_str_join_from(items: List[string, mem(normal)], acc: string) -> string {
+    case items.is_nil of {
+        true -> acc;
+        false -> case length_bytes(acc) == 0 of {
+            true -> rc_str_join_from(items.tail, items.head);
+            false -> rc_str_join_from(items.tail, concat(concat(acc, ","), items.head))
+        }
+    }
+}
+
+// --- the analysis state -----------------------------------------------------------------------
+
+fn rc_state(frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)]) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    { frame: frame, moved: moved, lifetimes: lifetimes, arm: arm, errors: errors, retained: retained }
+}
+
+fn rc_with_arm(rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }, arm: int64) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    { frame: rs.frame, moved: rs.moved, lifetimes: rs.lifetimes, arm: arm, errors: rs.errors, retained: rs.retained }
+}
+
+// The same state with the error list of a sibling walk: the second branch of an if and every case
+// arm after the first start from the state before the construct but keep the errors found so far.
+fn rc_with_errors(rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)]) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    { frame: rs.frame, moved: rs.moved, lifetimes: rs.lifetimes, arm: rs.arm, errors: errors, retained: rs.retained }
+}
+
+// b was walked after a (its error list extends a's), so the merged errors are b's.
+fn rc_merge(a: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }, b: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    { frame: rc_str_union(a.frame, b.frame), moved: rc_mv_union(a.moved, b.moved), lifetimes: rc_str_union(a.lifetimes, b.lifetimes), arm: a.arm, errors: b.errors, retained: a.retained }
+}
+
+// --- E2301 UseAfterMove: the error list (design §6.2) ---------------------------------------------
+// One entry per use of a moved name: the move's name, line and arm, and the use's location. Built by
+// prepending; printed oldest first after the function's report line.
+
+fn rc_err_nil() -> List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)] <- empty[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn rc_err_cons(name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64, rest: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)]) -> List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        entry: { name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 } <- { name: name, line: line, arm: arm, file: file, use_line: use_line, use_column: use_column, use_offset: use_offset };
+        result: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)] <- prepend[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)](entry, rest)
+    produces
+        pure result
+    end
+}
+
+fn rc_err_len(items: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)]) -> int64 {
+    case items.is_nil of {
+        true -> 0;
+        false -> 1 + rc_err_len(items.tail)
+    }
+}
+
+fn rc_err_reverse(items: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], acc: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)]) -> List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)] {
+    case items.is_nil of {
+        true -> acc;
+        false -> rc_err_reverse(items.tail, rc_err_cons(items.head.name, items.head.line, items.head.arm, items.head.file, items.head.use_line, items.head.use_column, items.head.use_offset, acc))
+    }
+}
+
+// The line of the move that put name into M (0 when it is not there).
+fn rc_mv_line(items: List[{ name: string, line: int64, arm: int64 }, mem(normal)], name: string) -> int64 {
+    case items.is_nil of {
+        true -> 0;
+        false -> case items.head.name == name of {
+            true -> items.head.line;
+            false -> rc_mv_line(items.tail, name)
+        }
+    }
+}
+
+// The arm of the move that put name into M (0 when it is not there or was outside a case).
+fn rc_mv_arm(items: List[{ name: string, line: int64, arm: int64 }, mem(normal)], name: string) -> int64 {
+    case items.is_nil of {
+        true -> 0;
+        false -> case items.head.name == name of {
+            true -> items.head.arm;
+            false -> rc_mv_arm(items.tail, name)
+        }
+    }
+}
+
+// M without name: a fresh binding of a moved name (a let, a decomposition or a case-arm pattern over
+// an unmoved scrutinee) is a new value, not the released one.
+fn rc_mv_remove(items: List[{ name: string, line: int64, arm: int64 }, mem(normal)], name: string) -> List[{ name: string, line: int64, arm: int64 }, mem(normal)] {
+    case items.is_nil of {
+        true -> items;
+        false -> case items.head.name == name of {
+            true -> rc_mv_remove(items.tail, name);
+            false -> rc_mv_cons(items.head.name, items.head.line, items.head.arm, rc_mv_remove(items.tail, name))
+        }
+    }
+}
+
+fn rc_mv_remove_all(items: List[{ name: string, line: int64, arm: int64 }, mem(normal)], names: List[string, mem(normal)]) -> List[{ name: string, line: int64, arm: int64 }, mem(normal)] {
+    case names.is_nil of {
+        true -> items;
+        false -> rc_mv_remove_all(rc_mv_remove(items, names.head), names.tail)
+    }
+}
+
+// A use of name at loc: an E2301 entry when name is in M, otherwise the state unchanged.
+fn rc_note_use(rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }, name: string, loc: { file: string, line: int64, column: int64, offset: int64 }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    case length_bytes(name) == 0 of {
+        true -> rs;
+        false -> case rc_mv_has(rs.moved, name) of {
+            false -> rs;
+            true -> rc_with_errors(rs, rc_err_cons(name, rc_mv_line(rs.moved, name), rc_mv_arm(rs.moved, name), loc.file, loc.line, loc.column, loc.offset, rs.errors))
+        }
+    }
+}
+
+fn rc_digit_text(d: int64) -> string {
+    case d of {
+        0 -> "0"; 1 -> "1"; 2 -> "2"; 3 -> "3"; 4 -> "4";
+        5 -> "5"; 6 -> "6"; 7 -> "7"; 8 -> "8"; 9 -> "9";
+        _: int64 -> "0"
+    }
+}
+
+fn rc_int_text(n: int64) -> string {
+    case n < 0 of {
+        true -> concat("-", rc_int_text(0 - n));
+        false -> case n < 10 of {
+            true -> rc_digit_text(n);
+            false -> concat(rc_int_text(n / 10), rc_digit_text(n % 10))
+        }
+    }
+}
+
+// `'x' was moved at line N (arm K) and is used here; after an explicit move the sender's frame may
+// release the value` (design §6.2); `(arm K)` only when the move was inside a case (K >= 1).
+fn rc_e2301_message(name: string, line: int64, arm: int64) -> string {
+    prefix: string <- concat(concat(concat("'", name), "' was moved at line "), rc_int_text(line));
+    arm_text: string <- case arm > 0 of {
+        true -> concat(concat(" (arm ", rc_int_text(arm)), ")");
+        false -> ""
+    };
+    concat(concat(prefix, arm_text), " and is used here; after an explicit move the sender's frame may release the value")
+}
+
+fn rc_print_error(entry: { name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }) -> int64 {
+    loc: { file: string, line: int64, column: int64, offset: int64 } <- { file: entry.file, line: entry.use_line, column: entry.use_column, offset: entry.use_offset };
+    _: int8 <- case entry.arm == -2 of {
+        true -> diagnostics_core@print_compiler_error("TypeError", "E2302", loc, entry.name, "sect12.1.4");
+        false -> case entry.arm < 0 of {
+            true -> diagnostics_core@print_compiler_error("TypeError", "E2300", loc, entry.name, "sect12.1.4");
+            false -> diagnostics_core@print_compiler_error("TypeError", "E2301", loc, rc_e2301_message(entry.name, entry.line, entry.arm), "sect12.1.4")
+        }
+    };
+    1
+}
+
+// Prints the entries oldest first and returns their number.
+fn rc_print_errors(items: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)]) -> int64 {
+    case items.is_nil of {
+        true -> 0;
+        false -> {
+            n: int64 <- rc_print_error(items.head);
+            n + rc_print_errors(items.tail)
+        }
+    }
+}
+
+// --- E2300 ReferenceOutlivesRegion, case (a) (design §6.4, §7) -------------------------------------
+// A value in F passed to a foreign parameter its sidecar declares `retains`: the C wrapper keeps the
+// pointer past the call, but this frame pops after it. Such an entry rides the E2301 error list with
+// arm -1 and the finished message in `name`; rc_print_error tells the two apart.
+
+// Argument k of the call (0 = inner; the right chain continues the list as rc_args_in_frame reads
+// it); root -1 when the call has fewer arguments.
+fn rc_call_arg(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, k: int64) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    case k == 0 of {
+        true -> case node.inner >= 0 of {
+            true -> parser_ast@expr_at(e, node.inner);
+            false -> parser_ast@expr_at(e, -1)
+        };
+        false -> case node.right_expr < 0 of {
+            true -> parser_ast@expr_at(e, -1);
+            false -> {
+                right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.right_expr);
+                right_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(right_e);
+                case right_node.kind == 4 and length_bytes(right_node.name) == 0 of {
+                    true -> rc_call_arg(right_e, right_node, k - 1);
+                    false -> case k == 1 of {
+                        true -> right_e;
+                        false -> parser_ast@expr_at(e, -1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The argument as the message names it: a name, or the callee of a call argument.
+fn rc_arg_text(arg: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> string {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arg);
+    case node.kind of {
+        1 -> node.name;
+        4 -> concat(rc_call_base(node.name), "(...)");
+        _: int64 -> "value"
+    }
+}
+
+// `the buffer 'b' lives in this frame but '<wrapper>' retains its parameter '<p>' past the call;
+// allocate it with alloc_buf_retained (§7)` (design §6.4; case (a) confirmed by Lee 2026-11-01).
+fn rc_e2300_message(value: string, wrapper: string, param: string) -> string {
+    head: string <- concat(concat(concat(concat("the buffer '", value), "' lives in this frame but '"), wrapper), "' retains its parameter '");
+    concat(concat(head, param), "' past the call; allocate it with alloc_buf_retained (§7)")
+}
+
+// One E2300 entry per retained parameter of this call whose argument is in F (rs: the state at the call).
+// An entry's index is the Silica argument position, lexical and 0-based, a pointer-plus-length pair
+// counting once (ffi_sidecar_loader@retains_silica_arg_index), which is how rc_call_arg counts.
+fn rc_check_retained(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }, entries: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)], errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)]) -> List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)] {
+    case entries.is_nil of {
+        true -> errors;
+        false -> {
+            rest: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)] <- rc_check_retained(e, node, rs, entries.tail, errors);
+            case entries.head.fn_name == rc_call_base(node.name) of {
+                false -> rest;
+                true -> {
+                    arg: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- rc_call_arg(e, node, entries.head.index);
+                    case rc_expr_in_frame(arg, rs) of {
+                        false -> rest;
+                        true -> {
+                            loc: { file: string, line: int64, column: int64, offset: int64 } <- parser_ast@expr_root_node(arg).location;
+                            rc_err_cons(rc_e2300_message(rc_arg_text(arg), entries.head.symbol, entries.head.param), 0, -1, loc.file, loc.line, loc.column, loc.offset, rest)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- E2302 ReferenceAfterRegionGone: the write_ref rule (design §6.3) -------------------------------
+// Under full evacuation the only way a pointer into a frame survives the frame is a mutable cell older
+// than the frame. `write_ref(c, v)` is E2302 unless (a) v's type is pointer-free, or (b) c is in F (the
+// cell was created in this frame, so it dies with the value), or (c) every pointer-carrying part of v
+// is older than this frame: v is not in F. The exemptions are tried in that order. Such an entry rides
+// the E2301 error list with arm -2 and the finished message in `name`; rc_print_error tells it apart.
+// v's type is known from the source only: a scalar, atom or boolean literal, a tuple literal of such
+// values, or a name whose every let / decomposition binding in the body is annotated with a
+// pointer-free type (a name also bound by a case-arm pattern has no annotation read here and is not
+// exempt by (a)). A tuple literal's words are copied into the cell's payload (emit_write_ref_tuple), so
+// its parts for (c) are its elements along the right spine; any other value is one part.
+
+// write_ref(c, v): a call node whose base name is write_ref with a second argument.
+fn rc_is_write_ref_call(node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> boolean {
+    case node.kind == 4 and node.inner >= 0 and node.right_expr >= 0 of {
+        false -> false;
+        true -> rc_call_base(node.name) == "write_ref"
+    }
+}
+
+// 0 when bindings has no entry named name, 1 when its entry's type is pointer-free, 2 otherwise.
+fn rc_pb_state(bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], name: string) -> int64 {
+    case bindings.is_nil of {
+        true -> 0;
+        false -> case bindings.head.name == name of {
+            true -> case rc_type_is_pointer_free(bindings.head.type_str) of {
+                true -> 1;
+                false -> 2
+            };
+            false -> rc_pb_state(bindings.tail, name)
+        }
+    }
+}
+
+// Is every binding of name in the body annotated with a pointer-free type (and is there one)? A let
+// (kind 6: name, type in value), a decomposition (kind 10: pattern_bindings) or a case-arm pattern
+// (kind 18: unannotated here, so it makes the answer false).
+fn rc_name_pointer_free(nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], name: string, found: boolean) -> boolean {
+    case nodes.is_nil of {
+        true -> found;
+        false -> {
+            n: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- nodes.head;
+            case n.kind of {
+                6 -> case n.name == name of {
+                    false -> rc_name_pointer_free(nodes.tail, name, found);
+                    true -> case rc_type_is_pointer_free(n.value) of {
+                        true -> rc_name_pointer_free(nodes.tail, name, true);
+                        false -> false
+                    }
+                };
+                10 -> case rc_pb_state(n.pattern_bindings, name) of {
+                    0 -> rc_name_pointer_free(nodes.tail, name, found);
+                    1 -> rc_name_pointer_free(nodes.tail, name, true);
+                    _: int64 -> false
+                };
+                18 -> case sir_ast@sir_string_list_contains(rc_pattern_names(n.value), name) of {
+                    true -> false;
+                    false -> rc_name_pointer_free(nodes.tail, name, found)
+                };
+                _: int64 -> rc_name_pointer_free(nodes.tail, name, found)
+            }
+        }
+    }
+}
+
+// Exemption (a): is the type of the value v pointer-free?
+fn rc_expr_pointer_free(v: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    case v.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(v);
+            case node.kind of {
+                0 -> true;
+                5 -> true;
+                7 -> true;
+                1 -> rc_name_pointer_free(v.nodes, node.name, false);
+                2 -> rc_expr_pointer_free(parser_ast@expr_at(v, node.inner));
+                9 -> case rc_expr_pointer_free(parser_ast@expr_at(v, node.inner)) of {
+                    false -> false;
+                    true -> rc_expr_pointer_free(parser_ast@expr_at(v, node.right_expr))
+                };
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+// One part of v: itself when it is in F and its type is not known to be pointer-free, else root -1.
+fn rc_frame_part_one(part: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    case rc_expr_pointer_free(part) of {
+        true -> parser_ast@expr_at(part, -1);
+        false -> case rc_expr_in_frame(part, rs) of {
+            true -> part;
+            false -> parser_ast@expr_at(part, -1)
+        }
+    }
+}
+
+// Exemption (c): the first pointer-carrying part of v that is in F (root -1 when there is none).
+fn rc_frame_part(v: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    case v.root < 0 of {
+        true -> v;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(v);
+            case node.kind of {
+                2 -> rc_frame_part(parser_ast@expr_at(v, node.inner), rs);
+                9 -> {
+                    first: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- rc_frame_part_one(parser_ast@expr_at(v, node.inner), rs);
+                    case first.root >= 0 of {
+                        true -> first;
+                        false -> rc_frame_part(parser_ast@expr_at(v, node.right_expr), rs)
+                    }
+                };
+                _: int64 -> rc_frame_part_one(v, rs)
+            }
+        }
+    }
+}
+
+// The line of the binding of name nearest before offset (a let, a decomposition or a case-arm
+// pattern), or best_line when there is none.
+fn rc_binding_line(nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], name: string, before: int64, best_offset: int64, best_line: int64) -> int64 {
+    case nodes.is_nil of {
+        true -> best_line;
+        false -> {
+            n: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- nodes.head;
+            binds: boolean <- case n.kind of {
+                6 -> n.name == name;
+                10 -> rc_pb_state(n.pattern_bindings, name) > 0;
+                18 -> sir_ast@sir_string_list_contains(rc_pattern_names(n.value), name);
+                _: int64 -> false
+            };
+            case binds and n.location.offset < before and n.location.offset > best_offset of {
+                true -> rc_binding_line(nodes.tail, name, before, n.location.offset, n.location.line);
+                false -> rc_binding_line(nodes.tail, name, before, best_offset, best_line)
+            }
+        }
+    }
+}
+
+// The line N of the message: where the part was built (a name's binding, a projection's base, or the
+// expression itself).
+fn rc_built_line(part: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> int64 {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(part);
+    case node.kind of {
+        1 -> rc_binding_line(part.nodes, node.name, node.location.offset, -1, node.location.line);
+        2 -> rc_built_line(parser_ast@expr_at(part, node.inner));
+        22 -> rc_built_line(parser_ast@expr_at(part, node.inner));
+        _: int64 -> node.location.line
+    }
+}
+
+// The cell or value as the message names it: a name, a field path, or rc_arg_text's spelling.
+fn rc_value_text(x: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> string {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(x);
+    case node.kind of {
+        2 -> rc_value_text(parser_ast@expr_at(x, node.inner));
+        22 -> concat(concat(rc_value_text(parser_ast@expr_at(x, node.inner)), "."), node.name);
+        _: int64 -> rc_arg_text(x)
+    }
+}
+
+// `the cell 'c' outlives the value 'v' built in this frame (line N); a cell may only be given a value
+// whose lifetime is at least its own` (design §6.3).
+fn rc_e2302_message(cell: string, value: string, line: int64) -> string {
+    head: string <- concat(concat(concat(concat("the cell '", cell), "' outlives the value '"), value), "' built in this frame (line ");
+    concat(concat(head, rc_int_text(line)), "); a cell may only be given a value whose lifetime is at least its own")
+}
+
+// One E2302 entry when this call is a write_ref that none of the exemptions (a), (b), (c) covers (rs:
+// the state at the call), reported at the call.
+fn rc_check_write_ref(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)]) -> List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)] {
+    case rc_is_write_ref_call(node) of {
+        false -> errors;
+        true -> {
+            cell: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- rc_call_arg(e, node, 0);
+            value: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- rc_call_arg(e, node, 1);
+            // (a) v's type is pointer-free; (b) c is in F, the cell dies with the frame; (c) no
+            // pointer-carrying part of v is in F.
+            case rc_expr_pointer_free(value) of {
+                true -> errors;
+                false -> case rc_expr_in_frame(cell, rs) of {
+                    true -> errors;
+                    false -> {
+                        part: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- rc_frame_part(value, rs);
+                        case part.root < 0 of {
+                            true -> errors;
+                            false -> rc_err_cons(rc_e2302_message(rc_value_text(cell), rc_value_text(part), rc_built_line(part)), 0, -2, node.location.file, node.location.line, node.location.column, node.location.offset, errors)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- characters and type text -----------------------------------------------------------------
+
+fn rc_char(s: string, i: int64) -> string {
+    case i < 0 or i >= length_bytes(s) of {
+        true -> "";
+        false -> substring(s, i, i + 1)
+    }
+}
+
+fn rc_is_name_start(c: string) -> boolean {
+    case c == "_" of {
+        true -> true;
+        false -> rc_is_letter(c)
+    }
+}
+
+fn rc_is_letter(c: string) -> boolean {
+    case c of {
+        "a" -> true; "b" -> true; "c" -> true; "d" -> true; "e" -> true; "f" -> true; "g" -> true;
+        "h" -> true; "i" -> true; "j" -> true; "k" -> true; "l" -> true; "m" -> true; "n" -> true;
+        "o" -> true; "p" -> true; "q" -> true; "r" -> true; "s" -> true; "t" -> true; "u" -> true;
+        "v" -> true; "w" -> true; "x" -> true; "y" -> true; "z" -> true;
+        "A" -> true; "B" -> true; "C" -> true; "D" -> true; "E" -> true; "F" -> true; "G" -> true;
+        "H" -> true; "I" -> true; "J" -> true; "K" -> true; "L" -> true; "M" -> true; "N" -> true;
+        "O" -> true; "P" -> true; "Q" -> true; "R" -> true; "S" -> true; "T" -> true; "U" -> true;
+        "V" -> true; "W" -> true; "X" -> true; "Y" -> true; "Z" -> true;
+        _: string -> false
+    }
+}
+
+fn rc_is_digit(c: string) -> boolean {
+    case c of {
+        "0" -> true; "1" -> true; "2" -> true; "3" -> true; "4" -> true;
+        "5" -> true; "6" -> true; "7" -> true; "8" -> true; "9" -> true;
+        _: string -> false
+    }
+}
+
+fn rc_is_name_char(c: string) -> boolean {
+    rc_is_name_start(c) or rc_is_digit(c)
+}
+
+fn rc_name_end(s: string, i: int64) -> int64 {
+    case rc_is_name_char(rc_char(s, i)) of {
+        true -> rc_name_end(s, i + 1);
+        false -> i
+    }
+}
+
+fn rc_skip_spaces(s: string, i: int64) -> int64 {
+    case rc_char(s, i) == " " of {
+        true -> rc_skip_spaces(s, i + 1);
+        false -> i
+    }
+}
+
+fn rc_prev_nonspace(s: string, i: int64) -> string {
+    case i <= 0 of {
+        true -> "";
+        false -> case rc_char(s, i - 1) == " " of {
+            true -> rc_prev_nonspace(s, i - 1);
+            false -> rc_char(s, i - 1)
+        }
+    }
+}
+
+fn rc_trim(s: string) -> string {
+    case length_bytes(s) == 0 of {
+        true -> s;
+        false -> case substring(s, 0, 1) == " " of {
+            true -> rc_trim(substring(s, 1, length_bytes(s)));
+            false -> case substring(s, length_bytes(s) - 1, length_bytes(s)) == " " of {
+                true -> rc_trim(substring(s, 0, length_bytes(s) - 1));
+                false -> s
+            }
+        }
+    }
+}
+
+fn rc_has_char(s: string, c: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> false;
+        false -> case rc_char(s, i) == c of {
+            true -> true;
+            false -> rc_has_char(s, c, i + 1)
+        }
+    }
+}
+
+fn rc_starts_with(s: string, i: int64, prefix: string) -> boolean {
+    case i + length_bytes(prefix) > length_bytes(s) of {
+        true -> false;
+        false -> substring(s, i, i + length_bytes(prefix)) == prefix
+    }
+}
+
+fn rc_scalar_type_name(t: string) -> boolean {
+    case t of {
+        "int8" -> true; "int16" -> true; "int32" -> true; "int64" -> true;
+        "uint8" -> true; "uint16" -> true; "uint32" -> true; "uint64" -> true;
+        "float16" -> true; "float32" -> true; "float64" -> true;
+        "boolean" -> true; "unit" -> true; "lifetime" -> true; "atom" -> true;
+        _: string -> false
+    }
+}
+
+// A type whose values hold no pointer: a scalar name, or a sum of atoms and scalars (no parenthesis,
+// brace or bracket in its text). Everything else (ref, ref?, buf, region, string, List, tuple, record,
+// function value, device_window) may carry a pointer.
+fn rc_type_is_pointer_free(type_text: string) -> boolean {
+    t: string <- rc_trim(type_text);
+    case rc_scalar_type_name(t) of {
+        true -> true;
+        false -> case rc_char(t, 0) == ":" of {
+            true -> case rc_has_char(t, "(", 0) or rc_has_char(t, "{", 0) or rc_has_char(t, "[", 0) of {
+                true -> false;
+                false -> true
+            };
+            false -> false
+        }
+    }
+}
+
+// A call result is in F when its declared binding type may carry a pointer.
+fn rc_call_result_in_frame(rhs_is_call: boolean, type_text: string) -> boolean {
+    case rhs_is_call of {
+        false -> false;
+        true -> case rc_type_is_pointer_free(type_text) of {
+            true -> false;
+            false -> true
+        }
+    }
+}
+
+// Length of the lifetime-carrying type head at i (ref(, ref?(, buf(, region(, atomic_ref(), or 0.
+fn rc_lifetime_head_len(t: string, i: int64) -> int64 {
+    case rc_starts_with(t, i, "atomic_ref(") of {
+        true -> 11;
+        false -> case rc_starts_with(t, i, "region(") of {
+            true -> 7;
+            false -> case rc_starts_with(t, i, "ref?(") of {
+                true -> 5;
+                false -> case rc_starts_with(t, i, "ref(") of {
+                    true -> 4;
+                    false -> case rc_starts_with(t, i, "buf(") of {
+                        true -> 4;
+                        false -> 0
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The lifetime names of a type text: the first argument of every ref(, ref?(, buf(, region( and
+// atomic_ref( head that is not the tail of a longer identifier.
+fn rc_lifetimes_in_type(t: string, i: int64, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= length_bytes(t) of {
+        true -> acc;
+        false -> {
+            head_len: int64 <- case rc_is_name_char(rc_char(t, i - 1)) of {
+                true -> 0;
+                false -> rc_lifetime_head_len(t, i)
+            };
+            case head_len == 0 of {
+                true -> rc_lifetimes_in_type(t, i + 1, acc);
+                false -> {
+                    start: int64 <- rc_skip_spaces(t, i + head_len);
+                    stop: int64 <- rc_name_end(t, start);
+                    acc2: List[string, mem(normal)] <- case rc_is_name_start(rc_char(t, start)) of {
+                        true -> rc_str_add(acc, substring(t, start, stop));
+                        false -> acc
+                    };
+                    rc_lifetimes_in_type(t, i + head_len, acc2)
+                }
+            }
+        }
+    }
+}
+
+fn rc_tag_names(names: List[string, mem(normal)], suffix: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case names.is_nil of {
+        true -> acc;
+        false -> rc_tag_names(names.tail, suffix, rc_str_add(acc, concat(names.head, suffix)))
+    }
+}
+
+// --- case-arm pattern names -------------------------------------------------------------------
+
+// The names a case-arm pattern binds, from its source text: identifiers that are not `true`,
+// `false` or `_`, not atoms (a colon touches them), not record field names (inside braces, followed
+// by a colon) and not type names (after the colon of a typed binding outside braces). A quoted
+// string pattern is not recognised; its words would be reported as names (report mode only).
+fn rc_pattern_names(pat: string) -> List[string, mem(normal)] {
+    rc_pat_scan(pat, 0, 0, sir_ast@nil_sir_strings())
+}
+
+fn rc_pat_scan(s: string, i: int64, depth: int64, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            c: string <- rc_char(s, i);
+            case c == "{" of {
+                true -> rc_pat_scan(s, i + 1, depth + 1, acc);
+                false -> case c == "}" of {
+                    true -> rc_pat_scan(s, i + 1, depth - 1, acc);
+                    false -> case rc_is_name_start(c) of {
+                        false -> case rc_is_digit(c) of {
+                            true -> rc_pat_scan(s, rc_name_end(s, i), depth, acc);
+                            false -> rc_pat_scan(s, i + 1, depth, acc)
+                        };
+                        true -> rc_pat_word(s, i, rc_name_end(s, i), depth, acc)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rc_pat_word(s: string, i: int64, j: int64, depth: int64, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    word: string <- substring(s, i, j);
+    next_c: string <- rc_char(s, rc_skip_spaces(s, j));
+    is_kw: boolean <- word == "true" or word == "false" or word == "_";
+    case rc_char(s, i - 1) == ":" of {
+        true -> rc_pat_scan(s, j, depth, acc);
+        false -> case next_c == ":" of {
+            true -> case depth > 0 of {
+                true -> rc_pat_scan(s, j, depth, acc);
+                false -> {
+                    acc2: List[string, mem(normal)] <- case is_kw of {
+                        true -> acc;
+                        false -> rc_str_add(acc, word)
+                    };
+                    rc_pat_scan(s, rc_pat_skip_type(s, rc_skip_spaces(s, j) + 1, 0), depth, acc2)
+                }
+            };
+            false -> case rc_prev_nonspace(s, i) == ":" and depth == 0 of {
+                true -> rc_pat_scan(s, j, depth, acc);
+                false -> case is_kw of {
+                    true -> rc_pat_scan(s, j, depth, acc);
+                    false -> rc_pat_scan(s, j, depth, rc_str_add(acc, word))
+                }
+            }
+        }
+    }
+}
+
+// Skip a type text after a typed binding's colon: up to the next comma or closing parenthesis at
+// nesting 0 (parentheses, brackets and braces nest).
+fn rc_pat_skip_type(s: string, i: int64, nest: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> {
+            c: string <- rc_char(s, i);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> rc_pat_skip_type(s, i + 1, nest + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> case nest == 0 of {
+                        true -> i;
+                        false -> rc_pat_skip_type(s, i + 1, nest - 1)
+                    };
+                    false -> case c == "," and nest == 0 of {
+                        true -> i;
+                        false -> rc_pat_skip_type(s, i + 1, nest)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- expression queries -----------------------------------------------------------------------
+
+fn rc_call_base(name: string) -> string {
+    case length_bytes(name) == 0 of {
+        true -> "";
+        false -> type_checker_core@user_call_base_function_name(name)
+    }
+}
+
+fn rc_is_alloc_builtin(base: string) -> boolean {
+    case base of {
+        "alloc_region" -> true;
+        "alloc_region_on_numa_node" -> true;
+        "alloc_ref" -> true;
+        "alloc_rec" -> true;
+        "alloc_buf" -> true;
+        _: string -> false
+    }
+}
+
+fn rc_is_region_binder(base: string) -> boolean {
+    base == "alloc_region" or base == "alloc_region_on_numa_node"
+}
+
+// move(x): a call node whose base name is move with one argument (inner set, no right chain).
+fn rc_is_move_call(node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> boolean {
+    node.kind == 4 and rc_call_base(node.name) == "move" and node.inner >= 0 and node.right_expr < 0
+}
+
+// Every identifier mentioned in e (any depth), added to acc.
+fn rc_collect_idents(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case e.root < 0 of {
+        true -> acc;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(e);
+            case node.kind < 0 of {
+                true -> acc;
+                false -> case node.kind == 1 of {
+                    true -> rc_str_add(acc, node.name);
+                    false -> {
+                        acc1: List[string, mem(normal)] <- case node.inner >= 0 of {
+                            true -> rc_collect_idents(parser_ast@expr_at(e, node.inner), acc);
+                            false -> acc
+                        };
+                        case node.right_expr >= 0 of {
+                            true -> rc_collect_idents(parser_ast@expr_at(e, node.right_expr), acc1);
+                            false -> acc1
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rc_any_moved(names: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)]) -> boolean {
+    case names.is_nil of {
+        true -> false;
+        false -> case rc_mv_has(moved, names.head) of {
+            true -> true;
+            false -> rc_any_moved(names.tail, moved)
+        }
+    }
+}
+
+fn rc_expr_mentions_moved(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)]) -> boolean {
+    rc_any_moved(rc_collect_idents(e, sir_ast@nil_sir_strings()), moved)
+}
+
+// Does the value of e come from a move(...) inside it? True for a move call itself and for one reached
+// through a paren, a projection base, a tuple / list / record literal, a let or decomposition tail, a
+// case arm or an if branch. A call's result is its own value (an argument's move does not flow into
+// it), and a lambda is a closure environment (§6.4(c), a later stage).
+fn rc_expr_carries_move(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    case e.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(e);
+            case node.kind of {
+                4 -> rc_is_move_call(node);
+                6 -> rc_expr_carries_move(parser_ast@expr_at(e, node.right_expr));
+                10 -> rc_expr_carries_move(parser_ast@expr_at(e, node.right_expr));
+                991 -> false;
+                0 -> false;
+                1 -> false;
+                5 -> false;
+                7 -> false;
+                8 -> false;
+                _: int64 -> rc_children_carry_move(e, node)
+            }
+        }
+    }
+}
+
+fn rc_children_carry_move(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> boolean {
+    case node.inner >= 0 and rc_expr_carries_move(parser_ast@expr_at(e, node.inner)) of {
+        true -> true;
+        false -> case node.right_expr >= 0 of {
+            true -> rc_expr_carries_move(parser_ast@expr_at(e, node.right_expr));
+            false -> false
+        }
+    }
+}
+
+// The last expression of a let / decomposition chain.
+fn rc_chain_tail(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    case e.root < 0 of {
+        true -> e;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(e);
+            case node.kind == 6 or node.kind == 10 of {
+                true -> rc_chain_tail(parser_ast@expr_at(e, node.right_expr));
+                false -> e
+            }
+        }
+    }
+}
+
+// May the value of e hold a pointer into the current frame, given the state rs?
+fn rc_expr_in_frame(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> boolean {
+    case e.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(e);
+            case node.kind of {
+                1 -> sir_ast@sir_string_list_contains(rs.frame, node.name);
+                2 -> rc_expr_in_frame(parser_ast@expr_at(e, node.inner), rs);
+                4 -> case rc_is_alloc_builtin(rc_call_base(node.name)) of {
+                    true -> true;
+                    false -> rc_args_in_frame(e, node, rs)
+                };
+                6 -> rc_expr_in_frame(rc_chain_tail(e), rc_walk(e, rs));
+                10 -> rc_expr_in_frame(rc_chain_tail(e), rc_walk(e, rs));
+                9 -> true;
+                20 -> true;
+                21 -> true;
+                22 -> rc_expr_in_frame(parser_ast@expr_at(e, node.inner), rs);
+                11 -> rc_expr_in_frame(parser_ast@expr_at(e, node.right_expr), rc_walk(parser_ast@expr_at(e, node.inner), rs));
+                13 -> rc_arms_any_in_frame(parser_ast@expr_at(e, node.right_expr), rc_walk(e, rs));
+                19 -> {
+                    branches: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.right_expr);
+                    bnode: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(branches);
+                    rs1: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(e, rs);
+                    case rc_expr_in_frame(parser_ast@expr_at(branches, bnode.inner), rs1) of {
+                        true -> true;
+                        false -> rc_expr_in_frame(parser_ast@expr_at(branches, bnode.right_expr), rs1)
+                    }
+                };
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+// Any argument of the call (inner, then the right chain: a kind-4 node with an empty name continues
+// the argument list; anything else on the right is the last argument).
+fn rc_args_in_frame(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> boolean {
+    case node.inner >= 0 and rc_expr_in_frame(parser_ast@expr_at(e, node.inner), rs) of {
+        true -> true;
+        false -> case node.right_expr < 0 of {
+            true -> false;
+            false -> {
+                right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.right_expr);
+                right_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(right_e);
+                case right_node.kind == 4 and length_bytes(right_node.name) == 0 of {
+                    true -> rc_args_in_frame(right_e, right_node, rs);
+                    false -> rc_expr_in_frame(right_e, rs)
+                }
+            }
+        }
+    }
+}
+
+fn rc_arms_any_in_frame(arms: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> boolean {
+    case arms.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arms);
+            case node.kind == 17 of {
+                true -> case rc_arm_body_in_frame(parser_ast@expr_at(arms, node.inner), rs) of {
+                    true -> true;
+                    false -> rc_arms_any_in_frame(parser_ast@expr_at(arms, node.right_expr), rs)
+                };
+                false -> rc_arm_body_in_frame(arms, rs)
+            }
+        }
+    }
+}
+
+fn rc_arm_body_in_frame(arm: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> boolean {
+    case arm.root < 0 of {
+        true -> false;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arm);
+            case node.kind == 18 of {
+                true -> rc_expr_in_frame(parser_ast@expr_at(arm, node.right_expr), rs);
+                false -> rc_expr_in_frame(arm, rs)
+            }
+        }
+    }
+}
+
+// --- the walk: state after an expression --------------------------------------------------------
+
+fn rc_walk(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    case e.root < 0 of {
+        true -> rs;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(e);
+            case node.kind of {
+                1 -> rc_note_use(rs, node.name, node.location);
+                6 -> rc_walk_let(e, node, rs);
+                10 -> rc_walk_decompose(e, node, rs);
+                4 -> rc_walk_call(e, node, rs);
+                13 -> rc_walk_case(e, node, rs);
+                19 -> rc_walk_if(e, node, rs);
+                _: int64 -> rc_walk_pair(e, node, rs)
+            }
+        }
+    }
+}
+
+fn rc_walk_pair(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    rs1: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- case node.inner >= 0 of {
+        true -> rc_walk(parser_ast@expr_at(e, node.inner), rs);
+        false -> rs
+    };
+    case node.right_expr >= 0 of {
+        true -> rc_walk(parser_ast@expr_at(e, node.right_expr), rs1);
+        false -> rs1
+    }
+}
+
+// name: type <- rhs; body
+fn rc_walk_let(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    rhs: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.inner);
+    rhs_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(rhs);
+    rs1: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(rhs, rs);
+    rhs_is_call: boolean <- rhs.root >= 0 and rhs_node.kind == 4;
+    base: string <- case rhs_is_call of {
+        true -> rc_call_base(rhs_node.name);
+        false -> ""
+    };
+    // alloc_buf_retained's buffer is a node of the actor's state area, not of the frame (the pin rule,
+    // design §7): it outlives the frame, so it is never in F.
+    in_frame: boolean <- case base == "alloc_buf_retained" of {
+        true -> false;
+        false -> case rc_expr_in_frame(rhs, rs1) of {
+            true -> true;
+            false -> rc_call_result_in_frame(rhs_is_call, node.value)
+        }
+    };
+    frame2: List[string, mem(normal)] <- case in_frame of {
+        true -> rc_str_add(rs1.frame, node.name);
+        false -> rs1.frame
+    };
+    // Alias closure over the names moved before this binding (a mention of one is itself a use,
+    // recorded by the walk of rhs) and over a move whose value flows into the binding; otherwise
+    // the binding is a fresh value and leaves M (a rebinding of a moved name).
+    rhs_moved: boolean <- case rc_expr_mentions_moved(rhs, rs.moved) of {
+        true -> true;
+        false -> rc_expr_carries_move(rhs)
+    };
+    moved2: List[{ name: string, line: int64, arm: int64 }, mem(normal)] <- case rhs_moved of {
+        true -> rc_mv_add(rc_mv_remove(rs1.moved, node.name), node.name, node.location.line, rs1.arm);
+        false -> rc_mv_remove(rs1.moved, node.name)
+    };
+    lifetimes2: List[string, mem(normal)] <- case rc_is_region_binder(base) of {
+        true -> rc_tag_names(rc_lifetimes_in_type(node.value, 0, sir_ast@nil_sir_strings()), ":here", rs1.lifetimes);
+        false -> case base == "fresh_lifetime" of {
+            true -> rc_str_add(rs1.lifetimes, concat(node.name, ":here"));
+            false -> rs1.lifetimes
+        }
+    };
+    rc_walk(parser_ast@expr_at(e, node.right_expr), rc_state(frame2, moved2, lifetimes2, rs1.arm, rs1.errors, rs1.retained))
+}
+
+// (a: T1, b: T2) <- rhs; body
+fn rc_walk_decompose(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    rhs: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.inner);
+    rhs_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(rhs);
+    rs1: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(rhs, rs);
+    rhs_is_call: boolean <- rhs.root >= 0 and rhs_node.kind == 4;
+    rhs_in_frame: boolean <- rc_expr_in_frame(rhs, rs1);
+    rhs_moved: boolean <- case rc_expr_mentions_moved(rhs, rs.moved) of {
+        true -> true;
+        false -> rc_expr_carries_move(rhs)
+    };
+    rs2: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_bind_pattern_names(node.pattern_bindings, rhs_in_frame, rhs_is_call, rhs_moved, node.location.line, rs1);
+    rc_walk(parser_ast@expr_at(e, node.right_expr), rs2)
+}
+
+fn rc_bind_pattern_names(bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], rhs_in_frame: boolean, rhs_is_call: boolean, rhs_moved: boolean, line: int64, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    case bindings.is_nil of {
+        true -> rs;
+        false -> {
+            in_frame: boolean <- case rhs_in_frame of {
+                true -> true;
+                false -> rc_call_result_in_frame(rhs_is_call, bindings.head.type_str)
+            };
+            frame2: List[string, mem(normal)] <- case in_frame of {
+                true -> rc_str_add(rs.frame, bindings.head.name);
+                false -> rs.frame
+            };
+            moved2: List[{ name: string, line: int64, arm: int64 }, mem(normal)] <- case rhs_moved of {
+                true -> rc_mv_add(rc_mv_remove(rs.moved, bindings.head.name), bindings.head.name, line, rs.arm);
+                false -> rc_mv_remove(rs.moved, bindings.head.name)
+            };
+            rc_bind_pattern_names(bindings.tail, rhs_in_frame, rhs_is_call, rhs_moved, line, rc_state(frame2, moved2, rs.lifetimes, rs.arm, rs.errors, rs.retained))
+        }
+    }
+}
+
+// A call: move(x) records every name of its operand as moved at this line and arm (the operand is
+// walked first, so a second move of a moved name is a use); any other call walks its arguments (the
+// right chain is itself a kind-4 node) after checking its callee name (a function value in M), and
+// a call of a foreign wrapper checks its retained parameters (E2300 case (a)).
+fn rc_walk_call(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    case rc_is_move_call(node) of {
+        true -> {
+            operand: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.inner);
+            rs1: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(operand, rs);
+            moved2: List[{ name: string, line: int64, arm: int64 }, mem(normal)] <- rc_mv_add_all(rs1.moved, rc_collect_idents(operand, sir_ast@nil_sir_strings()), node.location.line, rs1.arm);
+            rc_state(rs1.frame, moved2, rs1.lifetimes, rs1.arm, rs1.errors, rs1.retained)
+        };
+        false -> {
+            after: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk_pair(e, node, rc_note_use(rs, node.name, node.location));
+            rc_with_errors(after, rc_check_write_ref(e, node, rs, rc_check_retained(e, node, rs, rs.retained, after.errors)))
+        }
+    }
+}
+
+fn rc_mv_add_all(moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], names: List[string, mem(normal)], line: int64, arm: int64) -> List[{ name: string, line: int64, arm: int64 }, mem(normal)] {
+    case names.is_nil of {
+        true -> moved;
+        false -> rc_mv_add_all(rc_mv_add(moved, names.head, line, arm), names.tail, line, arm)
+    }
+}
+
+// case scrutinee of { arms }: every arm starts from the state after the scrutinee (its M is the
+// scrutinee's, not an earlier arm's: a move in one arm and a use in another is legal); the result is
+// the union over the arms (a move in an arm and a use after the case is E2301, naming the arm).
+// Arms are numbered from 1; the enclosing arm number is restored after. The error list runs
+// through the arms in order.
+fn rc_walk_case(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    scrutinee: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.inner);
+    rs1: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(scrutinee, rs);
+    scrut_in_frame: boolean <- rc_expr_in_frame(scrutinee, rs1);
+    scrut_moved: boolean <- case rc_expr_mentions_moved(scrutinee, rs.moved) of {
+        true -> true;
+        false -> rc_expr_carries_move(scrutinee)
+    };
+    merged: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk_arms(parser_ast@expr_at(e, node.right_expr), rs1, scrut_in_frame, scrut_moved, 1, rs1);
+    rc_with_arm(merged, rs.arm)
+}
+
+fn rc_walk_arms(arms: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, pre: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }, scrut_in_frame: boolean, scrut_moved: boolean, k: int64, acc: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    case arms.root < 0 of {
+        true -> acc;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arms);
+            case node.kind == 17 of {
+                true -> {
+                    after: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk_arm(parser_ast@expr_at(arms, node.inner), rc_with_errors(pre, acc.errors), scrut_in_frame, scrut_moved, k);
+                    rc_walk_arms(parser_ast@expr_at(arms, node.right_expr), pre, scrut_in_frame, scrut_moved, k + 1, rc_merge(acc, after))
+                };
+                false -> rc_merge(acc, rc_walk_arm(arms, rc_with_errors(pre, acc.errors), scrut_in_frame, scrut_moved, k))
+            }
+        }
+    }
+}
+
+// One arm (kind 18: pattern text in value, body on the right). The pattern's names join F when the
+// scrutinee is in F and M when the scrutinee mentions a moved name; over an unmoved scrutinee they
+// are fresh bindings and leave M.
+fn rc_walk_arm(arm: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, pre: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }, scrut_in_frame: boolean, scrut_moved: boolean, k: int64) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    case arm.root < 0 of {
+        true -> pre;
+        false -> {
+            node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(arm);
+            case node.kind == 18 of {
+                false -> rc_walk(arm, rc_with_arm(pre, k));
+                true -> {
+                    names: List[string, mem(normal)] <- rc_pattern_names(node.value);
+                    frame2: List[string, mem(normal)] <- case scrut_in_frame of {
+                        true -> rc_str_union(pre.frame, names);
+                        false -> pre.frame
+                    };
+                    moved2: List[{ name: string, line: int64, arm: int64 }, mem(normal)] <- case scrut_moved of {
+                        true -> rc_mv_add_all(rc_mv_remove_all(pre.moved, names), names, node.location.line, k);
+                        false -> rc_mv_remove_all(pre.moved, names)
+                    };
+                    rc_walk(parser_ast@expr_at(arm, node.right_expr), rc_state(frame2, moved2, pre.lifetimes, k, pre.errors, pre.retained))
+                }
+            }
+        }
+    }
+}
+
+// if (kind 19): inner = condition, right = kind 9 pair (then, else); both branches start after the
+// condition and are united; the else branch continues the then branch's error list.
+fn rc_walk_if(e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] }) -> { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } {
+    rs1: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(parser_ast@expr_at(e, node.inner), rs);
+    branches: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(e, node.right_expr);
+    case branches.root < 0 of {
+        true -> rs1;
+        false -> {
+            bnode: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(branches);
+            a: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(parser_ast@expr_at(branches, bnode.inner), rs1);
+            b: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(parser_ast@expr_at(branches, bnode.right_expr), rc_with_errors(rs1, a.errors));
+            rc_merge(a, b)
+        }
+    }
+}
+
+// --- per function ---------------------------------------------------------------------------------
+
+fn rc_param_lifetimes(params: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case params.is_nil of {
+        true -> acc;
+        false -> rc_param_lifetimes(params.tail, rc_tag_names(rc_lifetimes_in_type(params.head.type_name, 0, sir_ast@nil_sir_strings()), ":param", acc))
+    }
+}
+
+fn rc_report_function(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)]) -> int64 {
+    initial: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_state(sir_ast@nil_sir_strings(), rc_mv_nil(), rc_param_lifetimes(decl.parameters, sir_ast@nil_sir_strings()), 0, rc_err_nil(), retained);
+    final_rs: { frame: List[string, mem(normal)], moved: List[{ name: string, line: int64, arm: int64 }, mem(normal)], lifetimes: List[string, mem(normal)], arm: int64, errors: List[{ name: string, line: int64, arm: int64, file: string, use_line: int64, use_column: int64, use_offset: int64 }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] } <- rc_walk(decl.body, initial);
+    lifetimes_text: string <- case final_rs.lifetimes.is_nil of {
+        true -> "-";
+        false -> rc_str_join(final_rs.lifetimes)
+    };
+    _: int64 <- rc_print_report_line(decl.name, rc_str_len(final_rs.frame), rc_mv_len(final_rs.moved), lifetimes_text);
+    rc_print_errors(rc_err_reverse(final_rs.errors, rc_err_nil()))
+}
+
+// `  region check: <fn> F=<n> M=<m> lifetimes=<L:here,L2:param or ->`
+fn rc_print_report_line(fn_name: string, f_count: int64, m_count: int64, lifetimes_text: string) -> int64 {
+    sequence proc[DeviceIO]
+        _: int8 <- print("  region check: ");
+        _: int8 <- print(fn_name);
+        _: int8 <- print(" F=");
+        _: int8 <- print_int64(f_count);
+        _: int8 <- print(" M=");
+        _: int8 <- print_int64(m_count);
+        _: int8 <- print(" lifetimes=");
+        _: int8 <- println(lifetimes_text);
+        result: int64 <- 0
+    produces
+        pure result
+    end
+}
+
+fn rc_print_stage_line() -> int64 {
+    sequence proc[DeviceIO]
+        _: int8 <- println("  Region check (report mode)...");
+        result: int64 <- 0
+    produces
+        pure result
+    end
+}
+
+fn rc_report_decls(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)]) -> int64 {
+    case decls.is_nil of {
+        true -> 0;
+        false -> case decls.head.tag == 0 of {
+            true -> {
+                n: int64 <- rc_report_function(decls.head, retained);
+                n + rc_report_decls(decls.tail, retained)
+            };
+            false -> rc_report_decls(decls.tail, retained)
+        }
+    }
+}
+
+// --- entry points -------------------------------------------------------------------------------
+
+// `strict <what>;` is declaration tag 10 with the word in `name`.
+fn program_declares_strict(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }, what: string) -> boolean {
+    rc_decls_declare_strict(program.declarations, what)
+}
+
+fn rc_decls_declare_strict(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], what: string) -> boolean {
+    case decls.is_nil of {
+        true -> false;
+        false -> case decls.head.tag == 10 and decls.head.name == what of {
+            true -> true;
+            false -> rc_decls_declare_strict(decls.tail, what)
+        }
+    }
+}
+
+// The pass entry point: 0 without `strict region_check;` (nothing printed, nothing changed); under it,
+// the number of E2301, E2300 and E2302 errors printed over every function, so a non-zero result fails the unit as the
+// FFI taint check does. `context` is the type checker's context (design §6.1: the pass receives it
+// for each binding's type); the binding types this stage needs are the declared annotations in the
+// AST, so it is not read yet.
+fn check_program_regions(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }, context: { env: List[{ name: string, type_id: int64, surface_type: string, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], is_effect_alias: boolean, source_module: string }, mem(normal)], interner: { nodes: List[{ kind: int64, arg_a: int64, arg_b: int64, arg_c: int64, buf_size_is_name: boolean }, mem(normal)], by_key: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, names: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, name_lexemes: List[string, mem(normal)], next_id: int64, seq_nil_id: int64 } }) -> int64 {
+    case program_declares_strict(program, "region_check") of {
+        false -> 0;
+        true -> {
+            _: int64 <- rc_print_stage_line();
+            // E2300 case (a) needs the parameters each foreign wrapper's sidecar declares retained (§7).
+            retained: List[{ fn_name: string, symbol: string, index: int64, param: string }, mem(normal)] <- ffi_sidecar_loader@collect_program_retained_params(program);
+            rc_report_decls(program.declarations, retained)
+        }
+    }
+}

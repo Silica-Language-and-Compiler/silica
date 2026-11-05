@@ -85,6 +85,8 @@ ee-units: $(CUR_FAILS) $(SUB_TARGETS)
 	tmpdir=$$(mktemp -d); \
 	ln -s "$(THIS_DIR)$$base.silica" "$$tmpdir/$$base.silica"; \
 	echo "$$base.silica" > "$$tmpdir/silica.config"; \
+	mkdir -p "$$tmpdir/dangerous_exposure_source"; \
+	ln -s "$(THIS_DIR)ffi_addition/error_app_sidecar_metadata/dangerous_exposure_source/good_retains_data_ptr.meta" "$$tmpdir/dangerous_exposure_source/good_retains_data_ptr.meta"; \
 	$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$$base.silica); \
 	(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(SILICA_COMPILER)); }) > "$$base.cur_fail" 2>&1 || true; \
 	rm -rf "$$tmpdir"; \

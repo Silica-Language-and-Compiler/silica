@@ -83,7 +83,7 @@ produces pure 0 end
 ```
 
 **What you gain:**
-- Every node lives in region `r` — contiguous arena, not scattered heap
+- Every node lives in region `r` — contiguous area in the frame, not scattered heap
 - The memory space (`normal`) is explicit in the type
 - When the `sequence` block exits, the entire region is freed at once — no GC, no refcount
 - You can choose `normal_writethrough`, `atomic`, or any other space by changing one parameter

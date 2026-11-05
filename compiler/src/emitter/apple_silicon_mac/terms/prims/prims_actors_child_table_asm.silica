@@ -20,12 +20,23 @@
 // actor_memory_budget_plan.md): SB #24 head (first node ptr), #32 len (i64 row count / list length),
 // #40 sync_failure_reported (0/1; root cap-breach reports synchronously, later thread exit skips duplicate).
 // An actor without a block has no table; start_child and materialize make one for the running actor.
-// Node size 128 B: payload 80 B (same row layout as e3a), next ptr @ +80 (0 = end), the supervision block @ +88
+// Node size 160 B: payload 80 B (same row layout as e3a), next ptr @ +80 (0 = end), the supervision block @ +88
 // (sb_child_done finds it there; the child's reference keeps the node alive), the child's spawner record
 // @ +96 (position + 1) / +104 (next child number), kept across the child's restarts (spec §15.1.4,
 // §15.4.12.1), the current child's identity @ +112 (what call_supervisor answers with), and @ +120 the
 // carrier actors parked for this row's exit_done (linked through ACB #456; _silica_rt_row_wait in
 // prims_actors_carrier_asm.silica, emptied by the child's exit_done store).
+// @ +128 the row's state policy word (decision 40, Lee 2026-10-27: a field of the child spec; the spec's
+// state_policy@64, 0 = :keep_state_area when the spec has none), ORed into every start's policy word.
+// @ +136 the root descriptor of the child's initial-state type (the spec's hidden word@80; 0 for a scalar
+// or undescribed type), passed as X7 to every start and restart so start.0 is copied into the new
+// child's state area (chunk 15 phase 3b, design §5.4 Q14; prims_actors_state_asm.silica).
+// @ +144 the row spec buffer (chunk 15 phase 4d, design §5.4 Q14, decision 11): when +136 is not 0, the
+// row's start.0 (+24) is the root of a copy of the spec's initial state made by _silica_rt_message_buffer
+// as the row is filled (materialize, start_child), and +144 is that copy's malloc block (0: the state is
+// inline, a scalar or an atom alternative, or undescribed and left as the spec gave it). The row owns the
+// block: every start and restart copies from it into the new child's state area, a reused tombstone row
+// frees it before taking the new spec, and _silica_rt_sb_unref frees it with the row. +152 is spare.
 // Offsets in row payload: +0 child_ref, +8 id atom, +16 agent_type, +24 start.0, +32 start.1, +40 restart atom,
 // +48 shutdown i64, +56 exit_done, +64 flavor atom (:plain | :dangerous), +72 supervisor_start_trampoline (0 for worker).
 // exit_done is a generation word: the identity (ACB #408) of the last child of the row that ended, stored
@@ -108,7 +119,7 @@ fn child_table_rt_asm_chunk_0() -> string {
     "	.section	__TEXT,__text,regular,pure_instructions
 ; --- Phase E e3a Option B: linked-list child table ---
 ; _silica_rt_child_table_free: X0=ACB* — walk nodes (+80 next), free each, clear anchors.
-; _silica_rt_child_table_ensure_min_cap: X0=ACB*, X1=min node count — X0=0 ok, 1 OOM. Appends 88 B nodes (80 B row + next) until count >= X1.
+; _silica_rt_child_table_ensure_min_cap: X0=ACB*, X1=min node count — X0=0 ok, 1 OOM. Appends 160 B nodes (80 B row + next + the words of the header) until count >= X1.
 	.globl	_silica_rt_child_table_free
 	.p2align	2
 _silica_rt_child_table_free:
@@ -288,6 +299,11 @@ Lsbu_rows:
 	ldr	x20, [x19, #24]
 Lsbu_free_row:
 	cbz	x20, Lsbu_free_block
+; The row spec buffer (+144) goes with its row (design §5.4 Q14: freed at table free).
+	ldr	x0, [x20, #144]
+	cbz	x0, Lsbu_free_row_node
+	bl	_free
+Lsbu_free_row_node:
 	mov	x0, x20
 	ldr	x20, [x20, #80]
 	bl	_free
@@ -356,7 +372,7 @@ Lct_count_done:
 	cmp	x22, x20
 	b.hs	Lct_ens_ok
 	mov	w0, #1
-	mov	w1, #128
+	mov	w1, #160
 	bl	_calloc
 	cbz	x0, Lct_ens_fail
 	mov	x24, x0
@@ -395,6 +411,21 @@ Lct_ens_fail:
 	ret
 	.cfi_endproc
 "
+}
+
+// Chunk 15 phase 4d (design §5.4 Q14, decision 11): the row spec buffer. `row` names the register holding
+// the row node (callee-saved at both sites; X0-X2 and X9 are clobbered), `pfx` makes the labels unique per
+// site. Emitted after the row's words are stored and before its child is spawned: when the row's state
+// descriptor (+136) is not 0, start.0 (+24) is copied out of the spec by _silica_rt_message_buffer (one
+// table, sharing inside the state kept) into a block the row owns (+144), and +24 becomes the copy's root,
+// so every start and restart copies the same source into the new child's state area whatever became of
+// the spec (the init list cell, the start_child caller's record). An inline value (a scalar, an atom
+// alternative) comes back as given with X2 = 0. A reused tombstone row frees its earlier block first.
+fn child_table_row_spec_buffer_asm(row: string, pfx: string) -> string {
+    free_old: string <- concat(concat(concat(concat(concat(concat("    ldr x0, [", row), ", #144]\n    cbz x0, "), pfx), "_spec_fresh\n    bl _free\n    str xzr, ["), row), ", #144]\n");
+    copy: string <- concat(concat(concat(concat(concat(concat(concat(concat(pfx, "_spec_fresh:\n    ldr x1, ["), row), ", #136]\n    cbz x1, "), pfx), "_spec_done\n    ldr x0, ["), row), ", #24]\n    bl _silica_rt_message_buffer\n    str x0, ["), row);
+    tail: string <- concat(concat(concat(concat(", #24]\n    str x2, [", row), ", #144]\n"), pfx), "_spec_done:\n");
+    concat(free_old, concat(copy, tail))
 }
 
 fn child_table_rt_spawn_child_row_by_flavor_asm(danger_idx: int64) -> string {
@@ -480,9 +511,12 @@ Lsscr_done:
 // Phase E e3b: _silica_rt_supervisor_materialize_init_children
 // X0=ACB*, X1=tuple_ptr (init return: flags record pointer in slot 0 -- shape word at +0, fields at +8..+31 -- children list head at +8).
 // Walks the list-literal handle of child_spec records (shape word plus 56 B of fields, then the hidden
-// supervisor_start_trampoline at +64 in each child_spec element).
-// Payload layout matches the emitter's record: shape@0, id@8, agent@16, start@(24,32), restart@40, shutdown@48, flavor@56.
-// For each child_spec: spawn_linked(start.0, start.1, agent_type, row_ptr), append a linked row node (88 B; 80 B payload).
+// supervisor_start_trampoline at +72 in each child_spec element, its state policy at +64, the
+// initial-state descriptor at +80).
+// Payload layout matches the emitter's record: shape@0, id@8, agent@16, start@(24,32), restart@40, shutdown@48, flavor@56,
+// state_policy@64, hidden trampoline@72, hidden initial-state descriptor@80 (term_child_spec@child_spec_field_abi_offset).
+// For each child_spec: append a linked row node (160 B; 80 B payload), buffer a described start.0 into the
+// row (child_table_row_spec_buffer_asm, phase 4d), spawn_linked(start.0, start.1, agent_type, row_ptr).
 // Stores strategy atom, allowed_restart_count, and restarts_time_frame at SB#56/#64/#72 for
 // restart strategy dispatch (e3d) and frequency cap (e3e). Current record emission returns a pointer
 // to the supervisor_flags record in tuple slot 0 and the child list in slot 24; keep a flat fallback
@@ -578,7 +612,7 @@ Lmat_walk_row:
 	b	Lmat_walk_row
 Lmat_walk_row_done:
 ";
-    post: string <- concat("    str xzr, [x28]\n    str x25, [x28, #8]\n    str x24, [x28, #16]\n    str x22, [x28, #24]\n    str x23, [x28, #32]\n    str x26, [x28, #40]\n    str x27, [x28, #48]\n    str xzr, [x28, #56]\n    ldr x9, [x15, #56]\n    str x9, [x28, #64]\n    ldr x9, [x15, #64]\n    str x9, [x28, #72]\n", "    mov x0, x28\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n");
+    post: string <- concat("    str xzr, [x28]\n    str x25, [x28, #8]\n    str x24, [x28, #16]\n    str x22, [x28, #24]\n    str x23, [x28, #32]\n    str x26, [x28, #40]\n    str x27, [x28, #48]\n    str xzr, [x28, #56]\n    ldr x9, [x15, #56]\n    str x9, [x28, #64]\n    ldr x9, [x15, #72]\n    str x9, [x28, #72]\n    ldr x9, [x15, #64]\n    str x9, [x28, #128]\n    ldr x9, [x15, #80]\n    str x9, [x28, #136]\n", concat(child_table_row_spec_buffer_asm("x28", "Lmat"), "    mov x0, x28\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n"));
     list_chunk_s: string <- atom_table@int64_to_decimal_string(list_chunk_bytes);
     tail_pre: string <- "	ldr	x10, [x19, #216]
 	ldr	x9, [x10, #32]
@@ -605,12 +639,13 @@ Lmat_done:
 
 // Phase E e3b2: _silica_rt_supervisor_start_child
 // X0 = child_spec record pointer (shape word@+0, id@+8, agent_type@+16, start.0@+24, start.1@+32, restart@+40, shutdown@+48,
-// flavor@+56; hidden supervisor_start_trampoline@+64).
+// flavor@+56; state_policy@+64; hidden supervisor_start_trampoline@+72; hidden initial-state descriptor@+80).
 // Layout matches `_silica_rt_supervisor_materialize_init_children` (cons payload) so the compiler can build a single
 // stack record and pass it to either path. (Earlier comment claimed +40/+48 — that 72 B layout never matched the
 // emitter's value-flat record_make output; e4b corrects this to the canonical +32/+40 used elsewhere.)
 // Reads current-actor TLS for supervisor ACB. spawn_linked(start.0, start.1, agent_type, row_ptr).
-// Reuses the first e3f tombstone row (child_ref==0) or appends a linked row node (88 B) to the child table.
+// Reuses the first e3f tombstone row (child_ref==0) or appends a linked row node (160 B) to the child table;
+// a described start.0 is buffered into the row (child_table_row_spec_buffer_asm, phase 4d) before the spawn.
 // Returns actor_ref (new child) in X0.
 fn child_table_rt_asm_chunk_2(danger_idx: int64) -> string {
     pre: string <- "	.globl	_silica_rt_supervisor_start_child
@@ -709,10 +744,14 @@ Lsc_append_at_row:
 Lsc_use_reuse_row:
 	mov	x28, xzr
 Lsc_post_row:
-	ldr	x4, [x20, #64]
+	ldr	x4, [x20, #72]
 	str	x4, [x27, #72]
+	ldr	x4, [x20, #64]
+	str	x4, [x27, #128]
+	ldr	x4, [x20, #80]
+	str	x4, [x27, #136]
 ";
-    post: string <- concat("    ldr x9, [x20, #56]\n    str xzr, [x27]\n    str x21, [x27, #8]\n    str x22, [x27, #16]\n    str x23, [x27, #24]\n    str x24, [x27, #32]\n    str x25, [x27, #40]\n    str x26, [x27, #48]\n    str x9, [x27, #64]\n    str xzr, [x27, #96]\n    str xzr, [x27, #104]\n", "    mov x0, x27\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n    mov x20, x0\n");
+    post: string <- concat("    ldr x9, [x20, #56]\n    str xzr, [x27]\n    str x21, [x27, #8]\n    str x22, [x27, #16]\n    str x23, [x27, #24]\n    str x24, [x27, #32]\n    str x25, [x27, #40]\n    str x26, [x27, #48]\n    str x9, [x27, #64]\n    str xzr, [x27, #96]\n    str xzr, [x27, #104]\n", concat(child_table_row_spec_buffer_asm("x27", "Lsc"), "    mov x0, x27\n    mov x1, x19\n    bl _silica_rt_supervisor_spawn_child_row_by_flavor\n    mov x20, x0\n"));
     tail: string <- "	cbz	x28, Lsc_done
 	ldr	x10, [x19, #216]
 	ldr	x9, [x10, #32]
@@ -1622,6 +1661,11 @@ _silica_rt_supervisor_get_child_info:
 	.p2align	2
 _silica_rt_supervisor_get_child_info_acb:
 	.cfi_startproc
+; X0 = the held supervisor ACB, X1 = the child id -> X0 = the child-info record { id, agent_type, child,
+; restart } (shape word + 4 fields, 40 bytes; an empty record with child -1 when no live row holds the id,
+; spec §15.4.8.3). Chunk 15 stage 4e (design §9.1): the record is built below SP in this frame and the
+; routine leaves through X29 with SP at the record, so _silica_rt_sup_ref_call passes the lowered SP on
+; and the emitted call site adopts the record into the caller's frame (prims_actors@runtime_call_asm).
 	stp	x21, x20, [sp, #-48]!
 	stp	x19, x29, [sp, #16]
 	str	x30, [sp, #32]
@@ -1632,6 +1676,12 @@ _silica_rt_supervisor_get_child_info_acb:
 	mov	x1, x0
 	mov	x0, x19
 	bl	_silica_rt_supervisor_drain_ingress
+	sub	sp, sp, #48
+	mov	x21, sp
+	movz	x8, #1, lsl #16
+	movk	x8, #0
+	str	x8, [x21]
+	str	xzr, [x21, #40]
 	ldr	x9, [x19, #216]
 	cbz	x9, Lsbh_5
 	ldr	x9, [x9, #24]
@@ -1648,12 +1698,6 @@ Lsgetinfo_next:
 	b	Lsgetinfo_loop
 Lsgetinfo_found:
 	mov	x19, x9
-	mov	x0, #40
-	bl	_silica_rt_region_alloc
-	mov	x21, x0
-	movz	x8, #1, lsl #16
-	movk	x8, #0
-	str	x8, [x21]
 	str	x20, [x21, #8]
 	ldr	x11, [x19, #16]
 	mov	x12, #7
@@ -1671,26 +1715,19 @@ Lsgetinfo_restart_default:
 	mov	x8, #9
 Lsgetinfo_restart_done:
 	str	x8, [x21, #32]
-	mov	x0, x21
 	b	Lsgetinfo_done
 Lsgetinfo_none:
 ; No live row holds the id (spec §15.4.8.3 :get_child names the child by id): an empty record.
-	mov	x0, #40
-	bl	_silica_rt_region_alloc
-	mov	x21, x0
-	movz	x8, #1, lsl #16
-	movk	x8, #0
-	str	x8, [x21]
 	str	xzr, [x21, #8]
 	str	xzr, [x21, #16]
 	mov	x8, #-1
 	str	x8, [x21, #24]
 	str	xzr, [x21, #32]
-	mov	x0, x21
 Lsgetinfo_done:
-	ldr	x30, [sp, #32]
-	ldp	x19, x29, [sp, #16]
-	ldp	x21, x20, [sp], #48
+	mov	x0, x21
+	ldr	x30, [x29, #16]
+	ldp	x21, x20, [x29, #-16]
+	ldp	x19, x29, [x29]
 	ret
 	.cfi_endproc
 	.globl	_silica_rt_supervisor_get_child_id
@@ -1840,7 +1877,15 @@ _silica_rt_supervisor_which_children:
 	.p2align	2
 _silica_rt_supervisor_which_children_acb:
 	.cfi_startproc
-	stp	x28, x27, [sp, #-96]!
+; X0 = the held supervisor ACB -> X0 = the List of child-info records { id, agent_type, child, restart }
+; (one 40-byte inline record per live row in a 56-byte chunk {record, pad, next}, with a 24-byte handle
+; {length, first chunk, cursor 0} per chunk, as the compiled list prims read an inline-record list), or 0
+; when no row is live. Chunk 15 stage 4e (design §9.1): the live rows are counted first, 120 bytes per row
+; are reserved below SP in this frame as a destination area (its pair at [x29, #16]), the list is built
+; there back to front through _silica_rt_dest_take, and the routine leaves through X29 with SP at the
+; area's bottom, so _silica_rt_sup_ref_call passes the lowered SP on and the emitted call site adopts
+; the list into the caller's frame (prims_actors@runtime_call_asm).
+	stp	x28, x27, [sp, #-112]!
 	stp	x26, x25, [sp, #16]
 	stp	x24, x23, [sp, #32]
 	stp	x22, x21, [sp, #48]
@@ -1856,13 +1901,34 @@ _silica_rt_supervisor_which_children_acb:
 	cbz	x20, Lsbh_10
 	ldr	x20, [x20, #24]
 Lsbh_10:
+	mov	x28, x20
+	mov	x21, xzr
+Lswhich_count:
+	cbz	x28, Lswhich_counted
+	ldr	x22, [x28]
+	cbz	x22, Lswhich_count_next
+	add	x21, x21, #1
+Lswhich_count_next:
+	ldr	x28, [x28, #80]
+	b	Lswhich_count
+Lswhich_counted:
+	cbz	x21, Lswhich_none
+	mov	x9, #120
+	mul	x9, x21, x9
+	add	x9, x9, #15
+	and	x9, x9, #0xfffffffffffffff0
+	mov	x10, sp
+	sub	sp, sp, x9
+	mov	x11, sp
+	stp	x10, x11, [x29, #16]
 	mov	x21, #0
 Lswhich_scan:
 	cbz	x20, Lswhich_done
 	ldr	x22, [x20]
 	cbz	x22, Lswhich_next
-	mov	x0, #40
-	bl	_silica_rt_region_alloc
+	add	x0, x29, #16
+	mov	x1, #40
+	bl	_silica_rt_dest_take
 	mov	x23, x0
 	ldr	x24, [x20, #8]
 	ldr	x25, [x20, #16]
@@ -1875,8 +1941,9 @@ Lswhich_scan:
 	ldr	x8, [x20, #112]
 	str	x8, [x23, #24]
 	str	x26, [x23, #32]
-	mov	x0, #56
-	bl	_silica_rt_region_alloc
+	add	x0, x29, #16
+	mov	x1, #56
+	bl	_silica_rt_dest_take
 	mov	x24, x0
 	ldr	x8, [x23]
 	str	x8, [x24]
@@ -1895,8 +1962,9 @@ Lswhich_scan:
 Lswhich_chunk_nil:
 	str	xzr, [x24, #48]
 Lswhich_chunk_ready:
-	mov	x0, #24
-	bl	_silica_rt_region_alloc
+	add	x0, x29, #16
+	mov	x1, #24
+	bl	_silica_rt_dest_take
 	mov	x27, x0
 	cbz	x21, Lswhich_len_one
 	ldr	x8, [x21]
@@ -1914,12 +1982,24 @@ Lswhich_next:
 	b	Lswhich_scan
 Lswhich_done:
 	mov	x0, x21
+	ldr	x9, [x29, #16]
+	and	x9, x9, #0xfffffffffffffff0
+	mov	sp, x9
+	ldp	x20, x19, [x29, #-16]
+	ldp	x22, x21, [x29, #-32]
+	ldp	x24, x23, [x29, #-48]
+	ldp	x26, x25, [x29, #-64]
+	ldp	x28, x27, [x29, #-80]
+	ldp	x29, x30, [x29]
+	ret
+Lswhich_none:
+	mov	x0, xzr
 	ldp	x29, x30, [sp, #80]
 	ldp	x20, x19, [sp, #64]
 	ldp	x22, x21, [sp, #48]
 	ldp	x24, x23, [sp, #32]
 	ldp	x26, x25, [sp, #16]
-	ldp	x28, x27, [sp], #96
+	ldp	x28, x27, [sp], #112
 	ret
 	.cfi_endproc
 	.globl	_silica_rt_supervisor_terminate_child
@@ -2462,23 +2542,24 @@ Lers_done:
 	ldp	x24, x23, [sp], #64
 	ret
 	.cfi_endproc
-; _silica_rt_owned_record_begin(X0 = the node, X1 = the receiving ACB): the arena position when the
-; dispatch of an owned record (node +32 = 2: an exit report) begins, noted in the node (+40 the
-; arena block, +48 its bump) for the release below. Leaf.
+; _silica_rt_owned_record_begin(X0 = the node, X1 = the receiving ACB): the dispatch of an owned record
+; (node +32 = 2: an exit report) begins. Until chunk 15 stage 4e the node took a snapshot of the actor's
+; arena here (+40 the block, +48 its bump) for the release below; the implicit heap is gone, so the two
+; words are cleared. Leaf.
 	.globl	_silica_rt_owned_record_begin
 	.p2align	2
 _silica_rt_owned_record_begin:
-	ldr	x9, [x1, #160]
-	str	x9, [x0, #40]
-	ldr	x9, [x1, #176]
-	str	x9, [x0, #48]
+	str	xzr, [x0, #40]
+	str	xzr, [x0, #48]
 	ret
 ; _silica_rt_owned_record_release(X0 = the node, X1 = the ACB whose behaviour just returned): the
 ; record (node +8; the pair (:explicit, atom) it may hold is inside it, at +48) goes back unless
-; the behaviour kept it: it is the new state (ACB word 0) or a word of what the behaviour
-; allocated in its arena since the dispatch began names the record or the pair (a state or a cell
-; holding r.failure_reason). The rule of _silica_rt_report_release: anything uncertain keeps it, a
-; missed free leaks one record, a wrong one corrupts. A behaviour that sends the record on sends a
+; the behaviour kept it: it is the new state (ACB word 0), or ACB #600 says the behaviour returned a
+; state the descriptors cannot follow to every word (chunk 15 stage 4e: a described state was copied
+; into the state area by the dispatch end, so the record can go; an undescribed one may still name the
+; record or the pair through a word the copier carried as it is; until 4e the arena span allocated since
+; the dispatch began was scanned for such a word). The rule of _silica_rt_report_release: anything
+; uncertain keeps it, a missed free leaks one record, a wrong one corrupts. A behaviour that sends the record on sends a
 ; copy (copy-on-send, term_message_copy: a parameter is never moved), so no escape is tracked.
 ; Leaf apart from the tail call to free.
 	.globl	_silica_rt_owned_record_release
@@ -2492,24 +2573,8 @@ _silica_rt_owned_record_release:
 	b.eq	Lorr_ret
 	cmp	x10, x15
 	b.eq	Lorr_ret
-	ldr	x11, [x0, #40]
-	ldr	x12, [x1, #160]
-	ldr	x13, [x0, #48]
-	ldr	x14, [x1, #176]
-	cmp	x11, x12
-	b.eq	Lorr_scan
-	cbnz	x11, Lorr_ret
-	cbz	x12, Lorr_free
-	add	x13, x12, #16
-Lorr_scan:
-	cmp	x13, x14
-	b.hs	Lorr_free
-	ldr	x10, [x13], #8
-	cmp	x10, x8
-	b.eq	Lorr_ret
-	cmp	x10, x15
-	b.eq	Lorr_ret
-	b	Lorr_scan
+	ldr	x12, [x1, #600]
+	cbnz	x12, Lorr_ret
 Lorr_free:
 	mov	x0, x8
 	b	_free
@@ -2565,7 +2630,7 @@ Lsrs_ret:
 ")
 }
 
-fn emit_child_table_runtime_asm(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn emit_child_table_runtime_asm(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
         // Match const_atoms.silica / rodata: first-added order, not bst_lookup_string alone.
         p: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":permanent");
         t: int64 <- atom_table@lexeme_to_index_first_added_order(table, ":transient");

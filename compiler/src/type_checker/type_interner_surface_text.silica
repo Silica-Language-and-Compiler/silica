@@ -1,0 +1,566 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Surface-type text helpers for parse_type: trim, strip spaces, find matching/top-level delimiters, splits, small list helpers.
+// Split on 2026-11-02 from type_interner_surface.silica for memory reasons (profile 20261102T111603Z_silica-6b.tsv).
+
+use type_surface_cache;
+use type_interner_core;
+
+export trim_type/1;
+export strip_type_spaces/1;
+export find_matching_brackets/3;
+export find_matching_braces/3;
+export find_matching_parens/3;
+export find_top_arrow/5;
+export find_top_comma/5;
+export find_top_type_sum_bar/5;
+export memo_key/1;
+export surface_is_composite/1;
+export reverse_ids/1;
+export strip_fn_prefix/1;
+export find_colon_top/3;
+export strip_named_params_work/2;
+export empty_string_list/0;
+export reverse_strings/2;
+export split_atom_parts/2;
+export list_string_length_bytes/1;
+export split_type_sum_parts/2;
+export empty_field_list/0;
+export reverse_fields/2;
+export list_len_int/1;
+export nth_int/2;
+export parse_decimal/1;
+
+fn trim_left(s: string) -> string {
+    case length_bytes(s) == 0 of {
+        true -> s;
+        false -> case substring(s, 0, 1) == " " of {
+            true -> trim_left(substring(s, 1, length_bytes(s)));
+            false -> s
+        }
+    }
+}
+
+fn trim_right_type_text(s: string, end_i: int64) -> string {
+    case end_i <= 0 of {
+        true -> "";
+        false -> case substring(s, end_i - 1, end_i) == " " of {
+            true -> trim_right_type_text(s, end_i - 1);
+            // No trailing space: return the string itself. This runs at EVERY parse_type_inner
+            // recursion level; the unconditional substring(s, 0, end_i) copied each (already
+            // stripped) sub-surface into the never-released arena once per level.
+            false -> case end_i == length_bytes(s) of {
+                true -> s;
+                false -> substring(s, 0, end_i)
+            }
+        }
+    }
+}
+
+fn trim_type(s: string) -> string {
+    t: string <- trim_left(s);
+    trim_right_type_text(t, length_bytes(t))
+}
+
+// Parser type surfaces insert spaces between tokens (`region ( L , normal )`).
+// Interning prefixes require compact forms (`region(L,normal)`); strip spaces once up front.
+fn type_surface_has_space(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0;
+        false -> case substring(s, i, i + 1) == " " of {
+            true -> 1;
+            false -> type_surface_has_space(s, i + 1)
+        }
+    }
+}
+
+// Divide-and-conquer strip. The old loop did concat(acc, ch) once per character, so a 10 KB
+// surface copied ~50 MB into the concat arena (sum of growing prefixes) on every parse; the
+// arena is never released, and that was 7 GB of 4 MB chunks on emitter_core. Splitting
+// recursively and concatenating the halves copies O(n log n) bytes instead: ~140 KB.
+fn strip_type_spaces_from(s: string, i: int64, acc: string) -> string {
+    concat(acc, strip_type_spaces_range(s, i, length_bytes(s)))
+}
+
+fn strip_type_spaces_range(s: string, lo: int64, hi: int64) -> string {
+    case hi - lo <= 48 of {
+        true -> strip_type_spaces_small(s, lo, hi, "");
+        false -> {
+            mid: int64 <- lo + (hi - lo) / 2;
+            concat(strip_type_spaces_range(s, lo, mid), strip_type_spaces_range(s, mid, hi))
+        }
+    }
+}
+
+fn strip_type_spaces_small(s: string, i: int64, hi: int64, acc: string) -> string {
+    case i >= hi of {
+        true -> acc;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == " " of {
+                true -> strip_type_spaces_small(s, i + 1, hi, acc);
+                false -> strip_type_spaces_small(s, i + 1, hi, concat(acc, ch))
+            }
+        }
+    }
+}
+
+fn strip_type_spaces(s: string) -> string {
+    // Hot path: annotations are usually already compact — avoid O(n) rebuild.
+    case type_surface_has_space(s, 0) of {
+        0 -> s;
+        _: int64 -> strip_type_spaces_cached(s)
+    }
+}
+
+// Process-wide strip cache (see type_surface_cache): the interner's own memo is lost whenever
+// the type checker discards a context, so the same spaced annotation was re-stripped
+// hundreds of times into the never-released string arena.
+fn strip_type_spaces_cached(s: string) -> string {
+    hit: string <- type_surface_cache@stripped_for(s);
+    case length_bytes(hit) > 0 of {
+        true -> hit;
+        false -> type_surface_cache@remember_stripped(s, strip_type_spaces_from(s, 0, ""))
+    }
+}
+
+fn find_matching(s: string, i: int64, open_ch: string, close_ch: string, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == open_ch of {
+                true -> find_matching(s, i + 1, open_ch, close_ch, depth + 1);
+                false -> case ch == close_ch of {
+                    true -> case depth == 1 of {
+                        true -> i;
+                        false -> find_matching(s, i + 1, open_ch, close_ch, depth - 1)
+                    };
+                    false -> find_matching(s, i + 1, open_ch, close_ch, depth)
+                }
+            }
+        }
+    }
+}
+
+fn find_matching_brackets(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == type_interner_core@ch_lbracket() of {
+                true -> find_matching_brackets(s, i + 1, depth + 1);
+                false -> case ch == type_interner_core@ch_rbracket() of {
+                    true -> case depth == 1 of {
+                        true -> i;
+                        false -> find_matching_brackets(s, i + 1, depth - 1)
+                    };
+                    false -> find_matching_brackets(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+fn find_matching_braces(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == type_interner_core@ch_lbrace() of {
+                true -> find_matching_braces(s, i + 1, depth + 1);
+                false -> case ch == type_interner_core@ch_rbrace() of {
+                    true -> case depth == 1 of {
+                        true -> i;
+                        false -> find_matching_braces(s, i + 1, depth - 1)
+                    };
+                    false -> find_matching_braces(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+fn find_matching_parens(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == "(" of {
+                true -> find_matching_parens(s, i + 1, depth + 1);
+                false -> case ch == ")" of {
+                    true -> case depth == 1 of {
+                        true -> i;
+                        false -> find_matching_parens(s, i + 1, depth - 1)
+                    };
+                    false -> find_matching_parens(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
+fn find_top_arrow(s: string, i: int64, depth_paren: int64, depth_brack: int64, depth_brace: int64) -> int64 {
+    case i >= length_bytes(s) - 1 of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == "(" of {
+                true -> find_top_arrow(s, i + 1, depth_paren + 1, depth_brack, depth_brace);
+                false -> case ch == ")" of {
+                    true -> find_top_arrow(s, i + 1, depth_paren - 1, depth_brack, depth_brace);
+                    false -> case ch == type_interner_core@ch_lbracket() of {
+                        true -> find_top_arrow(s, i + 1, depth_paren, depth_brack + 1, depth_brace);
+                        false -> case ch == type_interner_core@ch_rbracket() of {
+                            true -> find_top_arrow(s, i + 1, depth_paren, depth_brack - 1, depth_brace);
+                            false -> case ch == type_interner_core@ch_lbrace() of {
+                                true -> find_top_arrow(s, i + 1, depth_paren, depth_brack, depth_brace + 1);
+                                false -> case ch == type_interner_core@ch_rbrace() of {
+                                    true -> find_top_arrow(s, i + 1, depth_paren, depth_brack, depth_brace - 1);
+                                    false -> case depth_paren == 0 and depth_brack == 0 and depth_brace == 0 and substring(s, i, i + 2) == "->" of {
+                                        true -> i;
+                                        false -> find_top_arrow(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn find_top_comma(s: string, i: int64, depth_paren: int64, depth_brack: int64, depth_brace: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == "(" of {
+                true -> find_top_comma(s, i + 1, depth_paren + 1, depth_brack, depth_brace);
+                false -> case ch == ")" of {
+                    true -> find_top_comma(s, i + 1, depth_paren - 1, depth_brack, depth_brace);
+                    false -> case ch == type_interner_core@ch_lbracket() of {
+                        true -> find_top_comma(s, i + 1, depth_paren, depth_brack + 1, depth_brace);
+                        false -> case ch == type_interner_core@ch_rbracket() of {
+                            true -> find_top_comma(s, i + 1, depth_paren, depth_brack - 1, depth_brace);
+                            false -> case ch == type_interner_core@ch_lbrace() of {
+                                true -> find_top_comma(s, i + 1, depth_paren, depth_brack, depth_brace + 1);
+                                false -> case ch == type_interner_core@ch_rbrace() of {
+                                    true -> find_top_comma(s, i + 1, depth_paren, depth_brack, depth_brace - 1);
+                                    false -> case ch == "," of {
+                                        true -> case depth_paren == 0 of {
+                                            true -> case depth_brack == 0 of {
+                                                true -> case depth_brace == 0 of {
+                                                    true -> i;
+                                                    false -> find_top_comma(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                                };
+                                                false -> find_top_comma(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                            };
+                                            false -> find_top_comma(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                        };
+                                        false -> find_top_comma(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn find_top_type_sum_bar(s: string, i: int64, depth_paren: int64, depth_brack: int64, depth_brace: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == "(" of {
+                true -> find_top_type_sum_bar(s, i + 1, depth_paren + 1, depth_brack, depth_brace);
+                false -> case ch == ")" of {
+                    true -> find_top_type_sum_bar(s, i + 1, depth_paren - 1, depth_brack, depth_brace);
+                    false -> case ch == type_interner_core@ch_lbracket() of {
+                        true -> find_top_type_sum_bar(s, i + 1, depth_paren, depth_brack + 1, depth_brace);
+                        false -> case ch == type_interner_core@ch_rbracket() of {
+                            true -> find_top_type_sum_bar(s, i + 1, depth_paren, depth_brack - 1, depth_brace);
+                            false -> case ch == type_interner_core@ch_lbrace() of {
+                                true -> find_top_type_sum_bar(s, i + 1, depth_paren, depth_brack, depth_brace + 1);
+                                false -> case ch == type_interner_core@ch_rbrace() of {
+                                    true -> find_top_type_sum_bar(s, i + 1, depth_paren, depth_brack, depth_brace - 1);
+                                    false -> case ch == "|" of {
+                                        true -> case depth_paren == 0 of {
+                                            true -> case depth_brack == 0 of {
+                                                true -> case depth_brace == 0 of {
+                                                    true -> i;
+                                                    false -> find_top_type_sum_bar(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                                };
+                                                false -> find_top_type_sum_bar(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                            };
+                                            false -> find_top_type_sum_bar(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                        };
+                                        false -> find_top_type_sum_bar(s, i + 1, depth_paren, depth_brack, depth_brace)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The memo lives in `names`, which also maps identifier lexemes to lexeme indices, and
+// parse_type_into_context falls back to mk_name on a surface the parser rejects -- that stored
+// the composite surface itself as a lexeme, so the next memo lookup of the same surface handed
+// the lexeme index back as a type id (constructor_stub_empty_run: the second Heap[...] binding
+// checked against node 0). Memo keys carry a prefix no lexeme or surface can start with.
+fn memo_key(surface: string) -> string {
+    concat("@memo:", surface)
+}
+
+fn surface_is_composite(s: string) -> boolean {
+    contains_char_ti(s, "(") or contains_char_ti(s, "[") or contains_char_ti(s, "{") or contains_char_ti(s, "-")
+}
+
+fn contains_char_ti(s: string, c: string) -> boolean {
+    contains_char_ti_from(s, c, 0)
+}
+
+fn contains_char_ti_from(s: string, c: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> false;
+        false -> case substring(s, i, i + 1) == c of {
+            true -> true;
+            false -> contains_char_ti_from(s, c, i + 1)
+        }
+    }
+}
+
+fn reverse_ids(xs: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence
+        empty_acc: List[int64, mem(normal)] <- type_interner_core@empty_int_list();
+        result: List[int64, mem(normal)] <- type_interner_core@list_int_reverse(xs, empty_acc)
+    produces
+        pure result
+    end
+}
+
+fn strip_fn_prefix(s: string) -> string {
+    t: string <- trim_type(s);
+    case starts_with(t, "fn") of {
+        true -> trim_type(substring(t, 2, length_bytes(t)));
+        false -> t
+    }
+}
+
+fn find_colon_top(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == "(" or ch == type_interner_core@ch_lbracket() or ch == type_interner_core@ch_lbrace() of {
+                true -> find_colon_top(s, i + 1, depth + 1);
+                false -> case ch == ")" or ch == type_interner_core@ch_rbracket() or ch == type_interner_core@ch_rbrace() of {
+                    true -> find_colon_top(s, i + 1, depth - 1);
+                    false -> case depth == 0 and ch == ":" of {
+                        true -> i;
+                        false -> find_colon_top(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn strip_named_params_work(s: string, acc: string) -> string {
+    t: string <- trim_type(s);
+    case length_bytes(t) == 0 of {
+        true -> acc;
+        false -> {
+            cpos: int64 <- find_top_comma(t, 0, 0, 0, 0);
+            piece: string <- case cpos < 0 of { true -> t; false -> substring(t, 0, cpos) };
+            rest: string <- case cpos < 0 of { true -> ""; false -> substring(t, cpos + 1, length_bytes(t)) };
+            colon: int64 <- find_colon_top(piece, 0, 0);
+            ty: string <- case colon < 0 of {
+                true -> trim_type(piece);
+                false -> trim_type(substring(piece, colon + 1, length_bytes(piece)))
+            };
+            next_acc: string <- case length_bytes(acc) == 0 of { true -> ty; false -> concat(acc, concat(", ", ty)) };
+            case cpos < 0 of {
+                true -> next_acc;
+                false -> strip_named_params_work(rest, next_acc)
+            }
+        }
+    }
+}
+
+fn empty_string_list() -> List[string, mem(normal)] {
+    type_interner_core@empty_strings()
+}
+
+fn reverse_strings(xs: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case xs.is_nil of {
+        true -> acc;
+        false -> {
+            sequence proc[mem(normal)]
+                next: List[string, mem(normal)] <- prepend[string, mem(normal)](xs.head, acc);
+                result: List[string, mem(normal)] <- reverse_strings(xs.tail, next)
+            produces
+                pure result
+            end
+        }
+    }
+}
+
+fn find_top_bar(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == "(" of {
+                true -> find_top_bar(s, i + 1, depth + 1);
+                false -> case ch == ")" of {
+                    true -> find_top_bar(s, i + 1, depth - 1);
+                    false -> case depth == 0 and ch == "|" of {
+                        true -> i;
+                        false -> find_top_bar(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn split_atom_parts(s: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    pos: int64 <- find_top_bar(s, 0, 0);
+    case pos < 0 of {
+        true -> {
+            sequence proc[mem(normal)]
+                next: List[string, mem(normal)] <- prepend[string, mem(normal)](trim_type(s), acc);
+                result: List[string, mem(normal)] <- next
+            produces
+                pure result
+            end
+        };
+        false -> {
+            left: string <- trim_type(substring(s, 0, pos));
+            right: string <- substring(s, pos + 1, length_bytes(s));
+            sequence proc[mem(normal)]
+                next: List[string, mem(normal)] <- prepend[string, mem(normal)](left, acc);
+                result: List[string, mem(normal)] <- split_atom_parts(right, next)
+            produces
+                pure result
+            end
+        }
+    }
+}
+
+fn list_string_length_bytes(xs: List[string, mem(normal)]) -> int64 {
+    case xs.is_nil of { true -> 0; false -> 1 + list_string_length_bytes(xs.tail) }
+}
+
+fn split_type_sum_parts(s: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    bar: int64 <- find_top_type_sum_bar(s, 0, 0, 0, 0);
+    case bar < 0 of {
+        true -> {
+            sequence proc[mem(normal)]
+                next: List[string, mem(normal)] <- prepend[string, mem(normal)](trim_type(s), acc);
+                result: List[string, mem(normal)] <- next
+            produces
+                pure result
+            end
+        };
+        false -> {
+            left: string <- trim_type(substring(s, 0, bar));
+            right: string <- substring(s, bar + 1, length_bytes(s));
+            sequence proc[mem(normal)]
+                next: List[string, mem(normal)] <- prepend[string, mem(normal)](left, acc);
+                result: List[string, mem(normal)] <- split_type_sum_parts(right, next)
+            produces
+                pure result
+            end
+        }
+    }
+}
+
+fn empty_field_list() -> List[{ name: string, ty: int64 }, mem(normal)] {
+    sequence proc[mem(normal)]
+        result: List[{ name: string, ty: int64 }, mem(normal)] <- empty[{ name: string, ty: int64 }, mem(normal)]()
+    produces
+        pure result
+    end
+}
+
+fn reverse_fields(
+    xs: List[{ name: string, ty: int64 }, mem(normal)],
+    acc: List[{ name: string, ty: int64 }, mem(normal)]
+) -> List[{ name: string, ty: int64 }, mem(normal)] {
+    case xs.is_nil of {
+        true -> acc;
+        false -> {
+            sequence proc[mem(normal)]
+                next: List[{ name: string, ty: int64 }, mem(normal)] <- prepend[{ name: string, ty: int64 }, mem(normal)](xs.head, acc);
+                result: List[{ name: string, ty: int64 }, mem(normal)] <- reverse_fields(xs.tail, next)
+            produces
+                pure result
+            end
+        }
+    }
+}
+
+fn list_len_int(xs: List[int64, mem(normal)]) -> int64 {
+    case xs.is_nil of { true -> 0; false -> 1 + list_len_int(xs.tail) }
+}
+
+fn nth_int(xs: List[int64, mem(normal)], i: int64) -> int64 {
+    case xs.is_nil of {
+        true -> 0 - 1;
+        false -> case i == 0 of { true -> xs.head; false -> nth_int(xs.tail, i - 1) }
+    }
+}
+
+fn parse_decimal(s: string) -> { ok: boolean, value: int64 } {
+    t: string <- trim_type(s);
+    case length_bytes(t) == 0 of {
+        true -> { ok: false, value: 0 };
+        false -> parse_decimal_from(t, 0, 0)
+    }
+}
+
+fn digit_val(ch: string) -> int64 {
+    case ch of {
+        "0" -> 0; "1" -> 1; "2" -> 2; "3" -> 3; "4" -> 4;
+        "5" -> 5; "6" -> 6; "7" -> 7; "8" -> 8; "9" -> 9;
+        _: string -> 0 - 1
+    }
+}
+
+fn parse_decimal_from(s: string, i: int64, acc: int64) -> { ok: boolean, value: int64 } {
+    case i >= length_bytes(s) of {
+        true -> { ok: true, value: acc };
+        false -> {
+            d: int64 <- digit_val(substring(s, i, i + 1));
+            case d < 0 of {
+                true -> { ok: false, value: 0 };
+                false -> parse_decimal_from(s, i + 1, acc * 10 + d)
+            }
+        }
+    }
+}

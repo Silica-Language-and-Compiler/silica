@@ -29,15 +29,30 @@
 //          body of such a branch                                          -> true
 //     node is an operand of a kind-6 tuple_make / record_make / list_cons /
 //          string_concat / alloc_rec / alloc_ref / move that is rp        -> true
+//     node is the value (inner) of a kind-2 let that is rp, the value is a user call
+//          (a non-tail self call included) and the bound name REACHES THE RESULT: it is a direct
+//          operand of an rp allocation above, a direct argument of an rp user call
+//          that is not a self call, or a direct argument of the value call of a later
+//          rp let whose own name reaches the result, or the value of a later rp let
+//          that is the name or a projection of it whose own name reaches the result;
+//          a projection of the name counts as the name everywhere; other reads of the
+//          name do not matter. Not in a function that calls itself in return
+//          position.                                                      -> true
+//     node is an argument of a user call that is rp, in a function that does not
+//          call itself in return position                                 -> true
 //     otherwise                                                           -> false
 //
-// The analysis is syntactic and needs no flow information: marking too little only costs an
-// evacuation where adoption would have done, and nothing it marks can be wrong, because a node it
-// marks is reached from the root through result-forming positions only. Each emitter takes the
-// marked call nodes as `|rp` (the ",i,j," list it threads through its binding string) and adopts
-// the callee's frame at those calls instead of evacuating the result.
+// The let-bound rule (Lee 2026-10-27, Phase3_notes.md Q4). Adoption only ever keeps memory, so it is
+// safe wherever it is chosen; evacuation is the space optimisation that drops a callee's garbage. When
+// the bound result reaches the function's result its nodes are kept anyway, and evacuating it at
+// every level of a recursion copies the whole remaining structure each time: `rest <- f(t);
+// cons(x, rest)` was O(n²) (the parser's tokens_to_slots, the chunk 15 phase 3a compile hang). Such
+// a let now adopts its call, also when the name is read besides (a length, a lookup) or reaches the
+// result through further let-bound calls (`r1 <- f(t); r2 <- g(r1); cons(x, r2)`). A function that
+// calls itself in return position is a TCO loop: an adopted frame per iteration would stay for the
+// loop's life (the S9 defect), so no let of such a function is adopted.
 
-export rp_call_nodes/1;
+export rp_call_nodes/2;
 
 fn rp_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
     sequence proc[mem(normal)]
@@ -87,27 +102,30 @@ fn rp_wraps_result(name: string) -> boolean {
 
 // ",i,j," -- the node indices of the user calls (kinds 4 and 5) in return position below `idx`,
 // which is itself in return position.
-fn rp_from(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> string {
+fn rp_from(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, fname: string, loops: boolean) -> string {
     case idx < 0 of {
         true -> "";
         false -> {
             n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, idx);
             case n.kind of {
                 2 -> {
-                    from_body: string <- rp_from(nodes, n.right_expr);
+                    from_body: string <- rp_from(nodes, n.right_expr, fname, loops);
                     b: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, n.right_expr);
                     case b.kind == 1 and b.name == n.name of {
-                        true -> concat(rp_from(nodes, n.inner), from_body);
-                        false -> from_body
+                        true -> concat(rp_from(nodes, n.inner, fname, loops), from_body);
+                        false -> case rp_let_value_adoptable(nodes, n, fname, loops) of {
+                            true -> concat(concat(",", concat(rp_itos(n.inner), ",")), from_body);
+                            false -> from_body
+                        }
                     }
                 };
-                3 -> rp_from(nodes, n.right_expr);
-                7 -> concat(rp_from(nodes, n.inner), rp_from(nodes, n.right_expr));
-                8 -> rp_from(nodes, n.right_expr);
-                4 -> concat(",", concat(rp_itos(idx), ","));
-                5 -> concat(",", concat(rp_itos(idx), ","));
+                3 -> rp_from(nodes, n.right_expr, fname, loops);
+                7 -> concat(rp_from(nodes, n.inner, fname, loops), rp_from(nodes, n.right_expr, fname, loops));
+                8 -> rp_from(nodes, n.right_expr, fname, loops);
+                4 -> concat(concat(",", concat(rp_itos(idx), ",")), rp_call_args_from(nodes, n, fname, loops));
+                5 -> concat(concat(",", concat(rp_itos(idx), ",")), rp_call_args_from(nodes, n, fname, loops));
                 6 -> case rp_wraps_result(n.name) of {
-                    true -> concat(rp_from(nodes, n.inner), rp_from(nodes, n.right_expr));
+                    true -> concat(rp_from(nodes, n.inner, fname, loops), rp_from(nodes, n.right_expr, fname, loops));
                     false -> ""
                 };
                 _: int64 -> ""
@@ -116,6 +134,193 @@ fn rp_from(nodes: List[{ kind: int64, type_name: string, value: string, name: st
     }
 }
 
-fn rp_call_nodes(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
-    rp_from(body.nodes, body.root)
+// Shape (i) (Lee 2026-10-28): the arguments of a return-position user call are in return position too
+// (`cons_declaration(a.head, append_decl_lists(a.tail, b))`): what the call builds from them is the
+// result, so a call among them adopts its callee's frame rather than evacuating per level. Not in a
+// TCO-looping function, where every call stays as today.
+fn rp_call_args_from(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], call: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, fname: string, loops: boolean) -> string {
+    case loops of {
+        true -> "";
+        false -> concat(rp_from(nodes, call.inner, fname, loops), rp_rest_args_from(nodes, call.right_expr, fname, loops))
+    }
+}
+
+fn rp_rest_args_from(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, fname: string, loops: boolean) -> string {
+    case idx < 0 of {
+        true -> "";
+        false -> {
+            r: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, idx);
+            case r.kind == 6 and r.name == "user_call_rest" of {
+                true -> concat(rp_from(nodes, r.inner, fname, loops), rp_rest_args_from(nodes, r.right_expr, fname, loops));
+                false -> rp_from(nodes, idx, fname, loops)
+            }
+        }
+    }
+}
+
+// `fname` is the function's own name as its self calls carry it (emitter_core@tco_tail_self_calls).
+fn rp_call_nodes(body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fname: string) -> string {
+    loops: boolean <- rp_has_self_call(body.nodes, body.root, fname);
+    rp_from(body.nodes, body.root, fname, loops)
+}
+
+// The let n (in return position) binds a pointer-carrying user call whose name reaches the result.
+fn rp_let_value_adoptable(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, fname: string, loops: boolean) -> boolean {
+    v: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, n.inner);
+    case loops == false and (v.kind == 4 or v.kind == 5) and length_bytes(n.name) > 0 and rp_type_may_point(v.type_name) of {
+        false -> false;
+        true -> rp_reaches_result(nodes, n.right_expr, n.name, fname)
+    }
+}
+
+// A scalar result is never adopted or evacuated (the emitter restores SP); skip the walk for it.
+fn rp_type_may_point(t: string) -> boolean {
+    case t of {
+        "int64" -> false;
+        "uint64" -> false;
+        "int32" -> false;
+        "uint32" -> false;
+        "int16" -> false;
+        "uint16" -> false;
+        "int8" -> false;
+        "uint8" -> false;
+        "float64" -> false;
+        "float32" -> false;
+        "float16" -> false;
+        "boolean" -> false;
+        "bool" -> false;
+        "atom" -> false;
+        "unit" -> false;
+        "actor_ref" -> false;
+        _: string -> true
+    }
+}
+
+// True when `name` reaches the result below `idx` (itself in return position), by the rule above.
+fn rp_reaches_result(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, name: string, fname: string) -> boolean {
+    case idx < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, idx);
+            case n.kind of {
+                2 -> case rp_reaches_result(nodes, n.right_expr, name, fname) of {
+                    true -> true;
+                    false -> {
+                        b: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, n.right_expr);
+                        case b.kind == 1 and b.name == n.name of {
+                            true -> rp_reaches_result(nodes, n.inner, name, fname);
+                            false -> {
+                                v: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, n.inner);
+                                case ((v.kind == 4 or v.kind == 5) and rp_call_args_name(nodes, v, name)) or rp_arg_is_name(nodes, n.inner, name) of {
+                                    true -> rp_reaches_result(nodes, n.right_expr, n.name, fname);
+                                    false -> false
+                                }
+                            }
+                        }
+                    }
+                };
+                3 -> rp_reaches_result(nodes, n.right_expr, name, fname);
+                7 -> case rp_reaches_result(nodes, n.inner, name, fname) of {
+                    true -> true;
+                    false -> rp_reaches_result(nodes, n.right_expr, name, fname)
+                };
+                8 -> rp_reaches_result(nodes, n.right_expr, name, fname);
+                4 -> n.name != fname and rp_call_args_name(nodes, n, name);
+                5 -> n.name != fname and rp_call_args_name(nodes, n, name);
+                6 -> case rp_wraps_result(n.name) of {
+                    true -> case rp_operand_reaches(nodes, n.inner, name, fname) of {
+                        true -> true;
+                        false -> rp_operand_reaches(nodes, n.right_expr, name, fname)
+                    };
+                    false -> false
+                };
+                _: int64 -> false
+            }
+        }
+    }
+}
+
+// An operand of an rp allocation: the name itself, or an rp subtree that the name reaches.
+fn rp_operand_reaches(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, name: string, fname: string) -> boolean {
+    case idx < 0 of {
+        true -> false;
+        false -> {
+            o: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, idx);
+            case rp_arg_is_name(nodes, idx, name) of {
+                true -> true;
+                false -> rp_reaches_result(nodes, idx, name, fname)
+            }
+        }
+    }
+}
+
+// A direct argument of the call is the name (inner = the first argument, right = the second or a
+// `user_call_rest` chain, sir_generator/terms/user_calls.silica).
+fn rp_call_args_name(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], call: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, name: string) -> boolean {
+    case rp_arg_is_name(nodes, call.inner, name) of {
+        true -> true;
+        false -> rp_rest_args_named(nodes, call.right_expr, name)
+    }
+}
+
+fn rp_rest_args_named(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, name: string) -> boolean {
+    case idx < 0 of {
+        true -> false;
+        false -> {
+            r: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, idx);
+            case r.kind == 6 and r.name == "user_call_rest" of {
+                true -> case rp_arg_is_name(nodes, r.inner, name) of {
+                    true -> true;
+                    false -> rp_rest_args_named(nodes, r.right_expr, name)
+                };
+                false -> rp_arg_is_name(nodes, idx, name)
+            }
+        }
+    }
+}
+
+// The node is the name itself or a projection of it (record_proj / tuple_proj chains, shape (ii),
+// Lee 2026-10-28: `pack <- f(t); rest <- pack.decls; ...`).
+fn rp_arg_is_name(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, name: string) -> boolean {
+    case idx < 0 of {
+        true -> false;
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, idx);
+            case a.kind == 1 of {
+                true -> a.name == name;
+                false -> case a.kind == 6 and (a.name == "record_proj" or a.name == "tuple_proj") of {
+                    true -> rp_arg_is_name(nodes, a.inner, name);
+                    false -> false
+                }
+            }
+        }
+    }
+}
+
+// The function calls itself in return position (a TCO loop's restart, emitter_core@tco_tail_self_calls).
+fn rp_has_self_call(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, fname: string) -> boolean {
+    case idx < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, idx);
+            case n.kind of {
+                2 -> case rp_has_self_call(nodes, n.right_expr, fname) of {
+                    true -> true;
+                    false -> {
+                        b: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- rp_node_at(nodes, n.right_expr);
+                        b.kind == 1 and b.name == n.name and rp_has_self_call(nodes, n.inner, fname)
+                    }
+                };
+                3 -> rp_has_self_call(nodes, n.right_expr, fname);
+                7 -> case rp_has_self_call(nodes, n.inner, fname) of {
+                    true -> true;
+                    false -> rp_has_self_call(nodes, n.right_expr, fname)
+                };
+                8 -> rp_has_self_call(nodes, n.right_expr, fname);
+                4 -> n.name == fname;
+                5 -> n.name == fname;
+                _: int64 -> false
+            }
+        }
+    }
 }

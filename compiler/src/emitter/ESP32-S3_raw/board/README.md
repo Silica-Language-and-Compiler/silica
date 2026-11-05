@@ -359,15 +359,12 @@ record for the language features.
 | `asm_00_hello` | ROM load, `_start`, UART0, exit status | ✓ `hello from silica on esp32s3`, status 42 |
 | `asm_01_blink` | GPIO output, delay | ✓ LED (GPIO6) blinks 10x -- faint, it runs at ~0.3 mA |
 | `asm_02_rgb` | RGB LED red GPIO2 / green GPIO4 / blue GPIO5 | ✓ red, green, blue, white, off |
-| `asm_03_buttons` | Inputs; prints raw levels for 30 s | ✓ all six directional/A/B buttons, active high |
-| `asm_04_buzzer` | Buzzer (GPIO48) at 440 / 880 / 2730 Hz, CCOUNT per tone | ✓ once the RV1 trimmer is turned up (counter-clockwise); CPU at ~20 MHz |
 | `asm_05_recursion` | Window overflow/underflow, int64 add-with-carry | ✓ `sum 500500`, `sum64 hi 999 lo 4294966296`, `windows ok` |
 | `asm_06_heap` | Allocator alignment/zeroing | ✓ `heap used 48000`, `list sum 1999000` (with the block headers of 2026-09-28 the expected figure is `heap used 64000`; not yet re-run on the board) |
 | `asm_07_fault` | Fault vector -> fatal fault report + status 70 + details | ✓ status 139, `exccause=28` (before 2026-09-19; now expected: `[silica] fault at 0x4037....  addr=0x00000000`, status 70, `exccause=28` after the marker; not yet run on the board) |
 | `asm_08_gpio_diag` | Register read-back of the GPIO setup | diagnostic |
 | `asm_09_pin_readback` | Each output pin's real pad level at 1 and 0 | ✓ all listed pins toggle |
 | `asm_10_pin_hunt` | Square wave on every pin in `pins.inc` | diagnostic (used to rule out pin-map errors) |
-| `asm_11_addressable_leds` | 24 x WS2813B on GPIO7, bit-banged | ✓ red, green, blue, running white dot |
 | `asm_13_display_hello` | ST7789 display (FPC P2) bit-banged (historical reference; the display is now driven by `silica_18_device_display` through SPI2): "Hello from Silica", white on black, landscape | ✓ |
 | `silica_00_return42` | Prologue/epilogue, int64 constant, exit status | ✓ 42 |
 | `silica_01_arith` | let bindings, int64 mul/div/rem (libgcc `__divdi3`) | ✓ 100 |

@@ -35,18 +35,18 @@ Records and tuples use one uniform boxed layout. The rule is written at the top 
 
 - every field is one 8-byte slot;
 - a scalar field holds its value; a record-, tuple-, list-, string- or function-typed field holds a pointer;
-- a nested record or tuple literal is built in its own slab, heap-promoted, and its pointer is stored;
+- a nested record or tuple literal is built in its own slab, promoted out of the frame that builds it (to the region, in the frame), and its pointer is stored;
 - a nested aggregate variable is copied to the region and its pointer is stored.
 
 So `{ id: int64, customer: { name: string, street: string, city: string }, weight: int64, express: boolean }` is not one object of seven values. It is a four-slot object whose `customer` slot points at a second, three-slot object, whose slots point at three strings. Every level of nesting adds an allocation and a copy when the value is built.
 
-### Aggregates built at a call are copied out of the caller's frame
+### Aggregates built at a call stay in the caller's frame
 
-A record or tuple literal written as an argument is built in the caller's frame. Silica moves values, so the callee may keep the pointer after the caller returns, and the frame would then be gone. The emitter therefore copies the aggregate into the region before the pointer leaves the frame: `arg_aggregate_heap_promote` in [term_aggregate_helpers.silica](../src/emitter/apple_silicon_mac/terms/term_aggregate_helpers.silica), called from `emit_rest_args` in [term_emit_kind_call.silica](../src/emitter/apple_silicon_mac/terms/term_emit_kind_call.silica). The copy is proportional to the aggregate's size.
+A record or tuple literal written as an argument is built in the caller's frame and is not copied when it is passed. On the Mac the nested aggregate stays in its frame region for the duration of the call; the emitter no longer copies it out before the call (chunk 15 phase 2, [emitter_core.silica](../src/emitter/apple_silicon_mac/emitter_core.silica)). Linux and ESP32-S3 still copy the argument into the region before the pointer leaves the frame, until phases 8 and 9.
 
-### Aggregate results come back by pointer, after a copy
+### Aggregate results come back by pointer, after the callee's frame is handed over
 
-A function whose result is a record or a tuple hands back a pointer in `X0`. Before it returns, the callee copies the value into memory the region owns: `aggregate_return_heap_promote_x0` in the same helper file emits a `_silica_rt_region_alloc` of the value's size followed by a word-by-word copy. A function that returns an echo of a six-field input with one field changed pays a six-slot allocation and a six-word copy on every call, and the caller then reads one or two of those words.
+A function whose result is a record or a tuple hands back a pointer in `X0`. On the Mac the value stays in the callee's frame. After the call, the caller either adopts that frame or evacuates the value into its own frame, in [call.silica](../src/emitter/apple_silicon_mac/terms/call.silica) (`BL L_adopt` or `BL L_ev_frame`); see [chunk15_stack_memory_design.md](../design_documents/chunk15_stack_memory_design.md) section 3.3. Linux and ESP32-S3 still copy the value into the region before it returns, through the `*_heap_promote_*` helpers in their own `term_aggregate_helpers.silica`, until phases 8 and 9. A function that returns an echo of a six-field input with one field changed still pays for the six-field result on every call, and the caller then reads one or two of those words.
 
 ### Eight argument registers, then grouping
 

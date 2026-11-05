@@ -15,6 +15,7 @@ import pty
 import select
 import signal
 import sys
+import termios
 import time
 
 
@@ -68,6 +69,10 @@ def main() -> int:
     timeout_sec = float(timeout_env) if timeout_env else float("inf")
 
     master, slave = pty.openpty()
+    # Do not let the kernel rewrite \n as \r\n in the program's output.
+    attrs = termios.tcgetattr(slave)
+    attrs[1] &= ~termios.OPOST
+    termios.tcsetattr(slave, termios.TCSANOW, attrs)
     stdin_r, stdin_w = os.pipe()
 
     pid = os.fork()

@@ -40,3 +40,7 @@ Expected output: `1000 actors x 1000 messages, total 250501250000`.
 ## measure.sh: time and RAM
 
 `./measure.sh` runs both 1000 x 1000 apps under `/usr/bin/time -l` and prints wall time, maximum resident set size and peak memory footprint. The Silica app spawns its workers with the `:keep_last_message` stack-release policy (stacks keep what the last message used).
+
+## memory_use_reports/: RAM use of each compiler build
+
+Each compiler build writes a RAM profile (`<UTC>_<compiler>.tsv`) to `memory_use_reports/data/`; `build_display.py` turns them into pages. `SILICA_RAM_PROFILE=0` disables the profile. The build's job count is RAM-aware (`JOBS` defaults to `max(1, min(ncpu, floor(usable_RAM_MB / PER_JOB_MB)))`, `PER_JOB_MB` defaults to 2048 from the newest profile; `make JOBS=N` overrides, `make print-jobs` shows it). Details: [memory_use_reports/README.md](memory_use_reports/README.md) and [../compiler/src/README.md](../compiler/src/README.md).

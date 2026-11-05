@@ -21,17 +21,21 @@
 //
 // One contiguous inaccessible reservation per actor, made at spawn: the default is the machine's
 // memory plus swap (sysconf(_SC_PHYS_PAGES) and sysinfo().totalswap, read once, page rounded) and `stack_policy(reserve, ...)`
-// lowers it. Nothing is committed at spawn. The synchronous fault handler commits chunks below the
+// lowers it. The reservation is made with nothing committed; a scalar initial state leaves it so until
+// the actor's first instruction faults, while a composite initial state has silica_rt_state_alloc
+// (prims_actors_state_asm, called by the spawn's silica_rt_state_install) commit the top chunk first,
+// since the state-area header it reads lives at top - 1040. The synchronous fault handler commits chunks below the
 // committed run: one platform page first, doubling per fault to 1 MB, then 1 MB per fault. The committed
 // run is one mapping and the untouched remainder the second; there is no guard mapping. At the message
 // boundary the actor's release algorithm decides what stays committed, and a release is an anonymous
 // MAP_FIXED remap to PROT_NONE (the same primitive as on Darwin; on Linux it also keeps the two
 // mappings merged, which matters against vm.max_map_count).
 //
-// ACB fields owned by this module (the control block is 600 B on Linux: 0..271 and 392..527 are the actor
-// runtime's, actor_memory_budget_plan.md items I and N; 528..591 are the stack-based memory model's,
-// chunk15_stack_memory_design.md §2.2, the same offsets as the Mac, of which only #528 is read in phase 0;
-// #592 is the dangerous actor thread's own-stack SP, prims_actors_runtime_asm.silica):
+// ACB fields owned by this module (the control block is 608 B on Linux: 0..271 and 392..527 are the actor
+// runtime's, actor_memory_budget_plan.md items I and N; 528..591 and 600 are the stack-based memory
+// model's, chunk15_stack_memory_design.md §2.2, the same offsets as the Mac except the state descriptor
+// (#600 here, the Mac's #592); #592 is the dangerous actor thread's own-stack SP,
+// prims_actors_runtime_asm.silica):
 //   #272 stack base (reservation low address; 0 = none)   #280 reservation bytes
 //   #288 committed bytes (the run [top-committed, top))     #296 high-water committed bytes
 //   #304 next growth chunk bytes                           #312 release algorithm 1..5
@@ -43,14 +47,19 @@
 //   #384 pending (:explicit, atom) reason atom for the exit payload; under tag 2 the language error's
 //        detail code for the report's reason line (0 none, 1 division by zero, 2 no case arm matched)
 //   #528 the state edge (chunk15_stack_memory_design.md §2.1, §2.2, §2.4): the lowest address of the
-//        state area at the top of the reservation. Phase 0 (2026-10-24) has no state area yet, so the
-//        edge is top - 1040 for the actor's life: the 1,040 bytes above it are the state-area header
-//        (129 free-list heads, §2.3), never used by a frame. Every SP switch into user code starts at
-//        the edge, silica_rt_stack_measure measures down from it and silica_rt_stack_release_to keeps
-//        and zeroes relative to it; the release algorithms are otherwise unchanged (the header is
-//        released with everything else by :release_on_return until the state area exists, phase 3).
+//        state area at the top of the reservation; top - 1040 at the reservation (the 1,040 bytes above
+//        it are the state-area header: 129 free-list heads, §2.3, and the pending-list word at top - 8,
+//        never used by a frame), lower once a composite initial state has been copied in at spawn or a
+//        dispatch end placed new nodes (prims_actors_state_asm.silica; the edge stays 16-aligned, it is
+//        an SP). Every SP switch into user code starts at the edge, silica_rt_stack_measure measures down
+//        from it and silica_rt_stack_release_to keeps and zeroes relative to it. A non-empty state area
+//        is never decommitted while the actor lives (decision 27); an empty one is released with the rest.
+//   #568 state bytes live: allocated minus freed in the state area (silica_rt_state_alloc / _free).
 // Release algorithms: 1 :release_on_return, 2 :keep_last_message, 3 :track_recent_peak,
-// 4 :release_when_idle, 5 :keep_high_water. The packed stack_policy word is (reserve & ~15) | algorithm.
+// 4 :release_when_idle, 5 :keep_high_water. The packed stack_policy word is (reserve & ~63) | state policy
+// << 4 | algorithm: bits 0-3 the algorithm, bits 4-5 the state policy (decision 40: 0 :keep_state_area,
+// 1 :shrink_after_compaction, 2 :compact_on_request; stored at ACB #576, never inherited; chunk 15
+// phase 3a, the Mac packing). #584 is the compaction request compact_state() sets under policy 2.
 //
 // Per-message usage for :keep_last_message and :track_recent_peak is measured, not guessed: the run is
 // zero at the start of every message (fresh pages are zero and the runtime zeroes what a message used
@@ -387,7 +396,7 @@ Lasr_have_policy:
 	mov	QWORD PTR [rbp - 24], 2
 Lasr_alg_ok:
 	mov	rax, QWORD PTR [rbp - 16]
-	and	rax, -16
+	and	rax, -64
 	mov	QWORD PTR [rbp - 32], rax
 	lea	rcx, [rip + silica_rt_stack_page]
 	mov	rcx, QWORD PTR [rcx]
@@ -458,9 +467,15 @@ Lasr_mapped:
 	mov	QWORD PTR [rax + 344], 0
 	mov	QWORD PTR [rax + 352], 0
 	mov	r10, QWORD PTR [rbp - 16]
-	and	r10, -16
+	and	r10, -64
 	or	r10, rcx
 	mov	QWORD PTR [rax + 360], r10
+# The state policy (bits 4-5, decision 40) is the spawn's own: #360 above drops it, so a child that
+# inherits the policy word (a row child, X1 = 0) gets 0, :keep_state_area.
+	mov	r10, QWORD PTR [rbp - 16]
+	shr	r10, 4
+	and	r10, 3
+	mov	QWORD PTR [rax + 576], r10
 	mov	QWORD PTR [rax + 368], 0
 	mov	rcx, QWORD PTR [rbp - 48]
 	mov	QWORD PTR [rax + 376], rcx
@@ -689,8 +704,11 @@ silica_rt_stack_release_to:
 # X0 = ACB, X1 = bytes to keep below the state edge, X2 = bytes below the edge the last message used
 # (zeroed if kept). Releases whole chunks below the smallest chunk prefix (measured from the top,
 # so the state area above the edge is inside it) that covers the edge's offset plus X1, in the sizes
-# they grew by. X1 = 0 keeps nothing (phase 0: there is no state area yet, so :release_on_return
-# still returns every page; the state area becomes undecommittable in phase 3, decision 27).
+# they grew by. While the state area holds nodes (the edge is below top - 1040: a composite state was
+# copied in at spawn or placed at a dispatch end, prims_actors_state_asm) it is never decommitted,
+# whatever X1 says (decision 27; chunk15_stack_memory_design.md §2.4). With an empty area X1 = 0 keeps
+# nothing: the 1,040-byte header is all zero then and comes back zero with the next page commit, so a
+# scalar-state actor under :release_on_return holds no stack between messages (spec §15.1.2.2).
 # Frame: [rbp - 8] ACB (x19), [rbp - 16] keep prefix (x20), [rbp - 24] used (x21), [rbp - 32] next chunk (x22).
 	push	rbp
 	mov	rbp, rsp
@@ -699,11 +717,14 @@ silica_rt_stack_release_to:
 	mov	QWORD PTR [rbp - 24], rdx
 	mov	rax, rdi
 	mov	rdi, rsi
-	test	rdi, rdi
-	jz	Lsrt_zero_keep
 	mov	r8, QWORD PTR [rax + 272]
 	add	r8, QWORD PTR [rax + 280]
 	sub	r8, QWORD PTR [rax + 528]
+	cmp	r8, 1040
+	ja	Lsrt_keep_area
+	test	rdi, rdi
+	jz	Lsrt_zero_keep
+Lsrt_keep_area:
 	add	rdi, r8
 	call	silica_rt_stack_prefix_for
 	jmp	Lsrt_have
@@ -1088,8 +1109,6 @@ Lafc_started_set:
 	xor	esi, esi
 	call	silica_rt_actor_stack_free
 Lafc_stack_done:
-	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_actor_dealloc_region
 	cmp	QWORD PTR [rbp - 24], 0
 	je	Lafc_thread_end
 	mov	rdi, QWORD PTR [rbp - 8]
@@ -1338,7 +1357,7 @@ Llif_main:
 ")
 }
 
-fn emit_actor_stack_runtime_asm(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, region: region(L, normal), specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+fn emit_actor_stack_runtime_asm(table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
     reservation_exceeded_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":reservation_exceeded"));
     out_of_memory_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":out_of_memory"));
     state_too_large_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":state_too_large"));

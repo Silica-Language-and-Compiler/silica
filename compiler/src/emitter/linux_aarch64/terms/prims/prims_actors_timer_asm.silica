@@ -46,11 +46,12 @@
 //                 The pop and the cancel both happen under the lock, so a cancel racing a firing
 //                 timer yields exactly one of delivered / :cancelled. A pending timer whose target
 //                 has ended is "cancelled automatically" (§22.14.2): removed, and :not_found.
-//   the message   follows the cast's ownership rules at the send_after call (copied into fresh
-//                 owned regions, or moved on a last use, term_message_copy). A timer that will not
-//                 deliver runs the site's release thunk (prims_actors timer_release_thunk_asm: the
-//                 message record's top-level region fields are destroyed, as the receiver's dispatch
-//                 would have done, term_message_regions) and frees its record.
+//   the message   travels in a mailbox buffer exactly as a cast's (chunk 15 stage 4e, design §5.1:
+//                 the emitted timer_cast copies it with silica_rt_message_buffer and hands the
+//                 buffer's bytes and block to silica_rt_timer_prepare, which keeps them in the
+//                 record). The fire gives the block to the receiver's node through
+//                 silica_rt_actor_cast_flagged_buffered (a dropped cast frees it there); a timer that
+//                 will not deliver frees the block with its record (silica_rt_timer_release).
 //
 // Clocks: monotonic_time is CLOCK_MONOTONIC in nanoseconds (silica_rt_stack_now_ns, the clock the
 // deadlines and the idle sweep already use); current_time is CLOCK_REALTIME in milliseconds.
@@ -101,34 +102,43 @@ silica_rt_current_time:
 	add x0, x0, x1
 	ldp x29, x30, [sp], #32
 	ret
-// silica_rt_timer_prepare(X0 = the target's identity, X1 = the message, X2 = the release thunk or 0)
-// -> X0 = a timer record (64 B: #0 number, #8 deadline, #16 target, #24 message, #32 thunk, #40 heap
-// index), or 0 when there is no memory. The inner half of send_after (emitter timer_cast).
+// silica_rt_timer_prepare(X0 = the target's identity, X1 = the message (the copy's root), X2 = the
+// mailbox buffer's bytes, X3 = its block; both 0 when the message is inline) -> X0 = a timer record
+// (64 B: #0 number, #8 deadline, #16 target, #24 message, #32 the buffer block, #40 heap index, #48 the
+// buffer's bytes), or 0 when there is no memory (the block is freed then). The inner half of send_after
+// (emitter timer_cast; chunk 15 stage 4e: the message travels in a mailbox buffer as a cast's does).
 	.globl silica_rt_timer_prepare
 	.p2align 2
 silica_rt_timer_prepare:
 	stp x29, x30, [sp, #-48]!
 	mov x29, sp
 	stp x19, x20, [sp, #16]
-	str x21, [sp, #32]
+	stp x21, x22, [sp, #32]
 	mov x19, x0
 	mov x20, x1
 	mov x21, x2
+	mov x22, x3
 	mov w0, #1
 	mov w1, #64
 	bl calloc
-	cbz x0, Ltp_ret
+	cbz x0, Ltp_nomem
 	str x19, [x0, #16]
 	str x20, [x0, #24]
-	str x21, [x0, #32]
+	str x22, [x0, #32]
+	str x21, [x0, #48]
 Ltp_ret:
-	ldr x21, [sp, #32]
+	ldp x21, x22, [sp, #32]
 	ldp x19, x20, [sp, #16]
 	ldp x29, x30, [sp], #48
 	ret
-// silica_rt_timer_release(X0 = record): a timer that will not be delivered gives its message back
-// (the release thunk destroys the message's owned regions, as the receiver's dispatch would have)
-// and frees the record.
+Ltp_nomem:
+	cbz x22, Ltp_ret
+	mov x0, x22
+	bl free
+	mov x0, xzr
+	b Ltp_ret
+// silica_rt_timer_release(X0 = record): a timer that will not be delivered frees its message's
+// buffer block (#32, when there is one) and the record.
 	.globl silica_rt_timer_release
 	.p2align 2
 silica_rt_timer_release:
@@ -136,18 +146,19 @@ silica_rt_timer_release:
 	mov x29, sp
 	str x19, [sp, #16]
 	mov x19, x0
-	ldr x9, [x19, #32]
-	cbz x9, Ltr_free
-	ldr x0, [x19, #24]
-	blr x9
+	ldr x0, [x19, #32]
+	cbz x0, Ltr_free
+	bl free
 Ltr_free:
 	mov x0, x19
 	bl free
 	ldr x19, [sp, #16]
 	ldp x29, x30, [sp], #32
 	ret
-// silica_rt_timer_fire(X0 = record): the cast. An ended (or unknown) target, or a call-only one,
-// drops the message silently (§22.14.2); the record is freed either way.
+// silica_rt_timer_fire(X0 = record): the cast, with the record's buffer words (bytes #48, block #32)
+// as a cast site passes them: a delivered message's node owns the block from here on, and a dropped one
+// (an ended or unknown target, a call-only one, §22.14.2) is freed by the cast itself (LBB3_dropped), so
+// only the record goes here either way.
 	.globl silica_rt_timer_fire
 	.p2align 2
 silica_rt_timer_fire:
@@ -157,19 +168,13 @@ silica_rt_timer_fire:
 	mov x19, x0
 	ldr x0, [x19, #16]
 	ldr x1, [x19, #24]
-	mov x2, #0
-	adrp x9, silica_rt_actor_cast_flagged
-	add x9, x9, :lo12:silica_rt_actor_cast_flagged
+	ldr x2, [x19, #48]
+	ldr x3, [x19, #32]
+	adrp x9, silica_rt_actor_cast_flagged_buffered
+	add x9, x9, :lo12:silica_rt_actor_cast_flagged_buffered
 	bl silica_rt_ref_call
-	cmp x0, #1
-	b.eq Ltf_delivered
-	mov x0, x19
-	bl silica_rt_timer_release
-	b Ltf_ret
-Ltf_delivered:
 	mov x0, x19
 	bl free
-Ltf_ret:
 	ldr x19, [sp, #16]
 	ldp x29, x30, [sp], #32
 	ret

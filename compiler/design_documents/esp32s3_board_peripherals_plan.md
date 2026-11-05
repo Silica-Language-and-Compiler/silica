@@ -71,31 +71,8 @@ Agreed order, steps 1 to 4. Reference apps are under `src/emitter/ESP32-S3_raw/b
 | --- | --- | --- | --- |
 | 1 | `asm_13_display_hello` | `silica_18_device_display` (rework) | Fill before DISPON, so the first visible frame is black. Then the SPI2 peripheral with its 64-byte data buffer (16 x 32-bit registers) instead of bit-banging: about 0.3 pokes per byte instead of about 16, and the clock rate is independent of the CPU |
 | 2 | (none) | board pack generated; `device_lib` descriptions removed | See below |
-| 3 | `asm_04_buzzer` | new, LEDC | Hardware PWM sets frequency and duty; no software square wave |
-| 3 | `asm_11_addressable_leds` | new, RMT | RMT generates the WS2813B waveform (24 LEDs) from a RAM table; bit-banging cannot meet the nanosecond timing from Silica |
-| 4 | `asm_01_blink`, `asm_02_rgb`, `asm_03_buttons`, `asm_08_gpio_diag`, `asm_09_pin_readback`, `asm_10_pin_hunt` | on the GPIO device worker (extends `silica_17_device_gpio`) | Port reads and writes through the worker's described registers (set/clear/enable-style registers), no per-pin helper loops |
-| 4 | `asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault` | coverage check against `silica_00` to `silica_15` (and `silica_16` to `silica_19`); write whatever is missing (done 2026-10-28, see below) | Native Silica already; the work is finding gaps |
-
-### Coverage of the native apps (item D, 2026-10-28)
-
-Only four native apps exist under `board/apps/` (`asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault`), not five; every other `asm_*` app is GPIO, display, LEDC or RMT. Each behaviour of the four and the Silica app that covers it:
-
-| asm app | Behaviour | Covering Silica app(s) |
-| --- | --- | --- |
-| asm_00_hello | UART0 text output ("hello from silica ...") | silica_04_print (prints "hello from silica", then int64 values) |
-| asm_00_hello | main's int64 result becomes the exit status (42) | silica_00_return42 (status 42) |
-| asm_00_hello | text and a non-zero int64 status in one run | silica_04 (text) with silica_00 (status); silica_15 shows output followed by an int64 result. No single app prints and returns 42; judged covered by the two halves |
-| asm_05_recursion | 1000-deep recursion forcing window overflow and underflow | silica_07_recursion_depth (2000 deep), silica_29_recursion_wide (1000 deep) |
-| asm_05_recursion | int64 add with carry into the high word | silica_05_int64_wide (no recursion), silica_29_recursion_wide (1000 x 4294967295 through recursion; new) |
-| asm_05_recursion | values survive across deep calls (sentinels a2..a7) | silica_29_recursion_wide (six bound values checked after both deep calls; new). Register sentinels as such are not expressible: Silica has no register access, the closest is bound values |
-| asm_06_heap | 2000 allocations, linked list of nodes, walk and sum | silica_09_lists (100 elements), silica_30_heap_list (2000 elements, length, sum, end elements; new) |
-| asm_06_heap | blocks are zeroed and 8-byte aligned | not expressible: Silica has no raw allocation or pointer reads; closest silica_11_regions (alloc_ref/alloc_buf read back, region growth) |
-| asm_06_heap | heap usage figure ("heap used 64000") | not expressible: no Silica builtin exposes the runtime heap counter; closest silica_30_heap_list (2000 nodes must fit) |
-| asm_07_fault | load from address 0 gives the fatal fault report and status 70 | not expressible as a load: peek/poke only accept a map_device window (a base outside a window is the runtime abort "illegal device map", status 71, not a fault), and plain Silica has no pointers. Closest: silica_08_stack_guard (fatal fault report "[silica] fault at <PTR>", status 70) |
-| asm_07_fault | output before the fault is flushed ahead of the report | silica_08 prints nothing first; silica_15_list_index_abort prints "9" before its abort report (status 71, abort path, not fault) |
-| asm_07_fault | board-only details after the exit marker (exccause=28 LoadProhibited, EXCVADDR) | not expressible, board-only text (stderr); only asm_07 reaches exccause 28 |
-
-Gaps filled: `silica_29_recursion_wide` (1000-deep recursion, int64 wide sum, values bound across deep calls) and `silica_30_heap_list` (2000-element list built, walked and summed). Not expressible in Silica: register sentinels, block zeroing and alignment, the heap-usage figure, and a load from address 0 (`peek` and `poke` reach only `map_device` windows; a bad base is the "illegal device map" abort, status 71). The closest covered behaviours are named in the table. Both new apps' expected output matches the macOS host run, and both matched on the board 2026-10-28.
+| 4 | `asm_01_blink`, `asm_02_rgb`, `asm_08_gpio_diag`, `asm_09_pin_readback`, `asm_10_pin_hunt` | on the GPIO device worker (extends `silica_17_device_gpio`) | Port reads and writes through the worker's described registers (set/clear/enable-style registers), no per-pin helper loops |
+| 4 | `asm_00_hello`, `asm_05_recursion`, `asm_06_heap`, `asm_07_fault` | coverage check against `silica_00` to `silica_15` (and `silica_16` to `silica_19`); write whatever is missing | Native Silica already; the work is finding gaps |
 
 **Step 2 detail.** Generate the full register map with access modes into `board_pack`. The compiler reads
 board-pack descriptions (spec §4.9.1), and the hand-written `device_lib` descriptions

@@ -1,0 +1,80 @@
+use trial_wait_int64;
+
+module dangerous_retained_buf_keep_state_area;
+
+// Chunk 15 phase 7 (design §7, the pin rule): a buffer C keeps past the call is allocated with
+// alloc_buf_retained(n), is a node of the dangerous actor's state area, and survives every later
+// dispatch because the actor is spawned with state_policy(:keep_state_area). The sidecar declares
+// retains: [data_ptr] for silica_retain_keep, so a frame buffer there would be E2300.
+//
+// Dispatch 0 allocates the 4-byte retained buffer, fills it with 11, 22, 33, 44, hands it to C, and
+// makes it the actor's state, carried with its region: the state is (region(L1, normal), :none | one buffer), the region created in main and passed in the initial state as (r, :none). Dispatches 1..4 read
+// byte msg-1 back through C, which reads the kept pointer, and cast it to the registered sink, which
+// prints it. The state is carried unchanged, so the buffer is never moved or freed while C holds it.
+// Expected: 11, 22, 33, 44, each followed by "done", then status 0.
+
+wrapper_meta "dangerous_exposure_source/legacy/silica_legacy_math_wrapper.meta";
+
+foreign c_wrapper "silica_retain_keep"
+fn keep_raw(data_ptr: uint8, data_len: uint64) -> int64;
+
+foreign c_wrapper "silica_retain_byte"
+fn byte_raw(index: int64) -> int64;
+
+fn result_sink(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        print_int64(msg);
+        println("");
+        println("done")
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn ffi_worker(msg: int64, state: (region(L1, normal), :none | buf(L1, normal, uint8, 4))) -> (:no_reply, (region(L1, normal), :none | buf(L1, normal, uint8, 4))) {
+    sequence proc[external_danger, concurrency, mem(normal)]
+        (r, held): (region(L1, normal), :none | buf(L1, normal, uint8, 4)) <- state;
+        next: (region(L1, normal), :none | buf(L1, normal, uint8, 4)) <- case msg == 0 of {
+            true -> {
+                bf: buf(L1, normal, uint8, 4) <- alloc_buf_retained(4);
+                _: atom <- write_buf(bf, 0, 11);
+                _: atom <- write_buf(bf, 1, 22);
+                _: atom <- write_buf(bf, 2, 33);
+                _: atom <- write_buf(bf, 3, 44);
+                _: int64 <- keep_raw(bf);
+                (r, bf)
+            };
+            false -> {
+                v: int64 <- byte_raw(msg - 1);
+                _: boolean <- cast_registered(:sink, v impl ActorMessage {});
+                (r, held)
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency, mem(normal)]
+                L1: lifetime <- fresh_lifetime();
+                r: region(L1, normal) <- alloc_region(normal);
+                _: actor_ref <- spawn_registered(0, result_sink, :sink, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                worker_ref: dangerous_actor_ref <- spawn_dangerous((r, :none), ffi_worker, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(worker_ref, 0 impl ActorMessage {});
+                _: boolean <- cast(worker_ref, 1 impl ActorMessage {});
+                _: boolean <- cast(worker_ref, 2 impl ActorMessage {});
+                _: boolean <- cast(worker_ref, 3 impl ActorMessage {});
+                _: boolean <- cast(worker_ref, 4 impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

@@ -15,6 +15,8 @@ board's stacks are chains of heap chunks, not a fixed pool (§11.1 keeps the rea
 **Related:** [esp32s3_port_status.md](ports/esp32s3_port_status.md), [esp32s3_xtensa_port.md](ports/esp32s3_xtensa_port.md),
 [actor_growable_stack_design.md](actor_growable_stack_design.md).
 
+**Update 2026-11-01 (Lee, chunk 15 phase 4e).** On the hosted Mac targets the implicit per-actor heap is removed: variables and the values they hold are allocated in the stack frame that builds them, `alloc_region` allocates its region in the current stack frame, and state that outlives a call is in the actor's state area at the base of its stack ([chunk15_stack_memory_design.md](chunk15_stack_memory_design.md) sections 3.8 and 9). The heap, `malloc` and arena wording in Part I and Part III below, and the hosted rows of the numbers there, describe the old design (the state before phase 4e). The Linux targets keep the heap until chunk 15 phase 8 and the ESP32-S3 until phase 9; Part II, the board, is current for the ESP32-S3 until phase 9.
+
 **Status as of 2026-10-16** (board checked against `board/runtime`, hosted against the three hosted
 runtimes under `compiler/src/emitter/`, and the tree's `main.silica` and trial suites, that day; the item
 bodies in §5 keep the dates of the work). Detail in §5 and §17.
@@ -1928,6 +1930,8 @@ longer in the list (2026-10-08).
 
 # Part III: Hosted environments (`apple_silicon_mac`, `linux_aarch64`, `linux_x86_64`)
 
+*[2026-11-01: on `apple_silicon_mac` the per-actor implicit heap (the 64 MB arena blocks below) is removed by chunk 15 phase 4e; the numbers in this part record the old design. `linux_aarch64` and `linux_x86_64` keep it until phase 8.]*
+
 Sources: [actor_stack_growth_plan.md](Phase1_TODOs/actor_stack_growth_plan.md),
 [actor_growable_stack_design.md](actor_growable_stack_design.md), and
 `emitter/<target>/terms/prims/prims_actors_runtime_asm.silica`, `prims_actors_stack_asm.silica` and
@@ -1953,7 +1957,7 @@ mappings).
 | Release | anonymous `MAP_FIXED` remap to `PROT_NONE` at the message boundary, down to what the algorithm retains (five algorithms) | `prims_actors_stack_asm.silica` |
 | Per-actor OS thread (the runtime is one thread per actor) | pthread stack 128 KB (`pthread_attr_setstacksize`, `0x20000`), carrying the mailbox loop; behaviours run on the reservation (SP switched around each `blr`) | `prims_actors_runtime_asm.silica`; growth plan |
 | Per-thread signal alt stack | 64 KB `mmap` (virtual), freed with a full release | `prims_actors_stack_asm.silica` |
-| Implicit heap (arena) per actor | a chain of 64 MB anonymous RW blocks mapped on first allocation; an idle actor holds none; freed together when the actor ends | `_silica_rt_region_alloc`, `_silica_rt_actor_dealloc_region` |
+| Implicit heap (arena) per actor (hosted Mac: removed by chunk 15 phase 4e, Lee 2026-11-01; the row records the state before; Linux and ESP32-S3 keep it until phases 8 and 9) | a chain of 64 MB anonymous RW blocks mapped on first allocation; an idle actor holds none; freed together when the actor ends | `_silica_rt_region_alloc`, `_silica_rt_actor_dealloc_region` |
 | Mappings per actor, stack | 2 (committed run, inaccessible remainder), plus the thread stack, the alt stack and any arena blocks | growth plan; counts beyond the 2 **not measured** |
 | Child-table row, one per child held, `calloc`'d, freed on supervisor end (88 B before the row recorded its child's identity and spawner record) | 120 B | `prims_actors_child_table_asm.silica` `mov w1, #120` |
 | Message node | 152 B (heap) | `prims_actors_runtime_asm.silica` header comment |

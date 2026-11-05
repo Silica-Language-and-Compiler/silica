@@ -6626,14 +6626,14 @@ The specification provides latency ranges as **guidelines** rather than strict g
 
 #### 12.1.2 Region Lifetime and Allocation Strategy
 
-**Allocation Strategy:** Regions are heap-allocated with scope-tied deallocation. When a sequence block exits, all regions allocated within that scope are deallocated (unless returned). This enables returning regions and references when the lifetime analysis permits.
+**Allocation Strategy:** A region is an area in the stack frame of the function that executes `alloc_region`, not a heap block (Lee, 2026-11-01; chunk 15 phase 4e; the implicit heap is removed on the hosted targets, while the Linux and ESP32-S3 targets keep the heap until chunk 15 phases 8 and 9). When a sequence block exits, all regions allocated within that scope are deallocated (unless returned). This enables returning regions and references when the lifetime analysis permits.
 
 **Region Lifetime:** Regions exist until scope exit or process termination:
 
 ```
 sequence proc[mem(normal)]
     L1: lifetime <- fresh_lifetime();
-    r: region(L1, normal) <- alloc_region(normal)    // region created (heap)
+    r: region(L1, normal) <- alloc_region(normal)    // region created (frame area)
     ref1: ref(L1, normal, int64) <- alloc_ref(r, 42)
     // implicit deallocation when sequence exits (unless r is returned)
 produces pure () end
@@ -7010,7 +7010,9 @@ See §15.1.1 (Actor Creation) for the `spawn` function signature.
 
 #### 12.1.6 Region Handles in Actor Messages
 
-When the **message** operand to `call()` or `cast()` (Chapter 16) **contains** a region handle or other **move-only** values tied to a region’s ownership—`region(R, Space)`, `buf(...)`, `ref(...)`, and any composite message payload that embeds them under the usual linearity rules—the same **move** discipline applies as for ordinary function arguments (§4.4.2). Ownership **transfers from the actor that issued the `call` or `cast` to the receiving actor** when the message is **submitted** for delivery: that actor’s bindings that were moved **must not** be used afterward; misuse is a **compile-time error**.
+When the **message** operand to `call()` or `cast()` (Chapter 16) **contains** a region handle or other **move-only** values tied to a region’s ownership—`region(R, Space)`, `ref(...)`, and any composite message payload that embeds them under the usual linearity rules—the same **move** discipline applies as for ordinary function arguments (§4.4.2). Ownership **transfers from the actor that issued the `call` or `cast` to the receiving actor** when the message is **submitted** for delivery: that actor’s bindings that were moved **must not** be used afterward; misuse is a **compile-time error**.
+
+**A buffer is not a message part.** A `buf(...)` value is created, used and deleted inside a dangerous actor, and may be that actor’s state, but it never crosses an actor message boundary: it cannot appear in a message, in a reply, or in a spawn’s initial state, at any depth. Only a copied non-buffer value leaves a dangerous actor. A dangerous actor’s buffer stays in that actor.
 
 **`call()` and replies:** If the behavior returns `(:reply, reply_value, new_state)` and `reply_value` carries region-owned data back to the caller, ownership of that payload **returns** to the **caller** by the same move/return rules as a function result—the reply path is not a second, hidden copy.
 
@@ -7655,7 +7657,7 @@ stack_policy(reserve: int64, release: atom) -> stack_policy
 
 **Implementation status (2026-10-21).** The observable stack rules of this section hold on every target; the mechanics differ from the reservation model above.
 - **Hosted targets** (Apple silicon macOS, Linux AArch64, Linux x86-64) make the reservation, the chunked commit and the release as specified. Actors are not threads: hosted carriers are the only execution model, with one carrier thread per logical core by default (`SILICA_CARRIER_COUNT` overrides it; §15.1.2), and many actors share a carrier, each running on its own reserved stack. Only a dangerous actor (§15.4.13.5) is an operating-system thread of its own, so only dangerous actors are bounded by the number of threads the host allows. On a hosted target `migrate_actor` transfers the actor between carriers (§15.1.2), and `actor_carrier_index` (§22.10) reports which carrier an actor is bound to.
-- **ESP32-S3** (raw, two cores) has no address-space reservation. An actor holds no stack until its first dispatch; its machine stack and its auxiliary stack are then chains of heap chunks that grow on demand (twice the previous chunk, up to 16 KB machine and 4 KB auxiliary) and are released by the actor's release algorithm. A lowered `reserve` caps what an actor's chunks may hold together; reaching it ends the actor with `(:explicit, :stack_exhausted)`. With the default `reserve` the limit is the heap: heap exhaustion by growth is a runtime abort, status 71. `main` has two fixed stacks, sized per image from a static bound, and crossing one is a fatal fault, status 70. The target is sized for 1,000 actors and supervisors resident with heap left for the program ([actor_memory_budget_plan.md](actor_memory_budget_plan.md)).
+- **ESP32-S3** (raw, two cores) has no address-space reservation. An actor holds no stack until its first dispatch; its machine stack and its auxiliary stack are then chains of heap chunks (the ESP32-S3 keeps the heap until chunk 15 phase 9) that grow on demand (twice the previous chunk, up to 16 KB machine and 4 KB auxiliary) and are released by the actor's release algorithm. A lowered `reserve` caps what an actor's chunks may hold together; reaching it ends the actor with `(:explicit, :stack_exhausted)`. With the default `reserve` the limit is the heap: heap exhaustion by growth is a runtime abort, status 71. `main` has two fixed stacks, sized per image from a static bound, and crossing one is a fatal fault, status 70. The target is sized for 1,000 actors and supervisors resident with heap left for the program ([actor_memory_budget_plan.md](actor_memory_budget_plan.md)).
 
 **Observing a Stack**:
 
@@ -9059,7 +9061,7 @@ Guard pages and MTE tag mismatches are the primary mechanism for containing over
 Messages passed between actors must be values that the runtime can safely copy or move into a recipient's mailbox:
 
 - **Copy semantics** (preferred): plain data values copied at send time; sender and receiver are fully independent.
-- **Immutable shared buffers**: allowed with explicit ownership rules defined in the region system (§12).
+- **Buffers**: a `buf(...)` is not a message part and is never sent (§12.1.6).
 - **Region handles**: moving a region handle via a message transfers ownership (§15.1.1.1). The sender loses access after the send.
 
 Values that cannot be safely transferred (e.g. certain unresolved region handles) must be represented as a summary or redacted form in messages. For failure payloads specifically, region handle contents are captured as binary dumps by the runtime before region reclamation and handed to **`handle_report`** alongside the textual report (**asynchronous delivery**, §15.4.13.4–§15.4.13.6); region handles themselves are never placed in failure notification fields.

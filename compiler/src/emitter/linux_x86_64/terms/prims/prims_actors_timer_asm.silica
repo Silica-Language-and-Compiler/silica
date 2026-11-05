@@ -40,7 +40,7 @@
 //                 a signal, re-reads the head on every wake, and fires only when deadline <= now:
 //                 never earlier, possibly later (§22.14.2). A due timer is taken out of the heap and
 //                 the map under the lock and cast with the lock released, through silica_rt_ref_call
-//                 and silica_rt_actor_cast_flagged like any cast from another thread: the target's
+//                 and silica_rt_actor_cast_flagged_buffered like any cast from another thread: the target's
 //                 mailbox is signalled and its carrier woken (silica_rt_actor_mail_signal). An ended
 //                 target drops the message silently.
 //   cancel_timer  looks the number up under the lock: present means pending, and it is removed
@@ -48,11 +48,12 @@
 //                 The pop and the cancel both happen under the lock, so a cancel racing a firing
 //                 timer yields exactly one of delivered / :cancelled. A pending timer whose target
 //                 has ended is "cancelled automatically" (§22.14.2): removed, and :not_found.
-//   the message   follows the cast's ownership rules at the send_after call (copied into fresh
-//                 owned regions, or moved on a last use, term_message_copy). A timer that will not
-//                 deliver runs the site's release thunk (prims_actors timer_release_thunk_asm: the
-//                 message record's top-level region fields are destroyed, as the receiver's dispatch
-//                 would have done, term_message_regions) and frees its record.
+//   the message   travels in a mailbox buffer exactly as a cast's (chunk 15 stage 4e of the Mac,
+//                 design §5.1: the emitted timer_cast copies it with silica_rt_message_buffer and hands
+//                 the buffer's bytes and block to silica_rt_timer_prepare, which keeps them in the
+//                 record). The fire gives the block to the receiver's node through
+//                 silica_rt_actor_cast_flagged_buffered (a dropped cast frees it there); a timer that
+//                 will not deliver frees the block with its record (silica_rt_timer_release).
 //
 // Clocks: monotonic_time is CLOCK_MONOTONIC in nanoseconds (silica_rt_stack_now_ns, the clock the
 // deadlines and the idle sweep already use); current_time is CLOCK_REALTIME in milliseconds.
@@ -103,9 +104,11 @@ silica_rt_current_time:
 	add rdi, rax
 	leave
 	ret
-# silica_rt_timer_prepare(rdi = the target's identity, rsi = the message, rdx = the release thunk or 0)
-# -> rdi = a timer record (64 B: +0 number, +8 deadline, +16 target, +24 message, +32 thunk, +40 heap
-# index), or 0 when there is no memory. The inner half of send_after (emitter timer_cast).
+# silica_rt_timer_prepare(rdi = the target's identity, rsi = the message (the copy's root), rdx = the
+# mailbox buffer's bytes, rcx = its block; both 0 when the message is inline) -> rdi = a timer record
+# (64 B: +0 number, +8 deadline, +16 target, +24 message, +32 the buffer block, +40 heap index, +48 the
+# buffer's bytes), or 0 when there is no memory (the block is freed then). The inner half of send_after
+# (emitter timer_cast; the message travels in a mailbox buffer as a cast's does).
 	.globl silica_rt_timer_prepare
 	.p2align 4
 silica_rt_timer_prepare:
@@ -115,6 +118,7 @@ silica_rt_timer_prepare:
 	mov QWORD PTR [rbp - 8], rdi
 	mov QWORD PTR [rbp - 16], rsi
 	mov QWORD PTR [rbp - 24], rdx
+	mov QWORD PTR [rbp - 32], rcx
 	mov edi, 1
 	mov esi, 64
 	call calloc
@@ -124,18 +128,24 @@ silica_rt_timer_prepare:
 	mov QWORD PTR [rax + 16], rcx
 	mov rcx, QWORD PTR [rbp - 16]
 	mov QWORD PTR [rax + 24], rcx
-	mov rcx, QWORD PTR [rbp - 24]
+	mov rcx, QWORD PTR [rbp - 32]
 	mov QWORD PTR [rax + 32], rcx
+	mov rcx, QWORD PTR [rbp - 24]
+	mov QWORD PTR [rax + 48], rcx
 	mov rdi, rax
 	leave
 	ret
 Ltp_none:
+	mov rdi, QWORD PTR [rbp - 32]
+	test rdi, rdi
+	jz Ltp_none_ret
+	call free
+Ltp_none_ret:
 	xor edi, edi
 	leave
 	ret
-# silica_rt_timer_release(rdi = record): a timer that will not be delivered gives its message back
-# (the release thunk destroys the message's owned regions, as the receiver's dispatch would have)
-# and frees the record.
+# silica_rt_timer_release(rdi = record): a timer that will not be delivered frees its message's buffer
+# block (+32, when there is one) and the record.
 	.globl silica_rt_timer_release
 	.p2align 4
 silica_rt_timer_release:
@@ -143,18 +153,19 @@ silica_rt_timer_release:
 	mov rbp, rsp
 	sub rsp, 16
 	mov QWORD PTR [rbp - 8], rdi
-	mov rax, QWORD PTR [rdi + 32]
-	test rax, rax
+	mov rdi, QWORD PTR [rdi + 32]
+	test rdi, rdi
 	jz Ltr_free
-	mov rdi, QWORD PTR [rdi + 24]
-	call rax
+	call free
 Ltr_free:
 	mov rdi, QWORD PTR [rbp - 8]
 	call free
 	leave
 	ret
-# silica_rt_timer_fire(rdi = record): the cast. An ended (or unknown) target, or a call-only one,
-# drops the message silently (§22.14.2); the record is freed either way.
+# silica_rt_timer_fire(rdi = record): the cast, with the record's buffer words (bytes +48, block +32)
+# as a cast site passes them: a delivered message's node owns the block from here on, and a dropped one
+# (an ended or unknown target, a call-only one, §22.14.2) is freed by the cast itself (LBB3_7), so only
+# the record goes here either way.
 	.globl silica_rt_timer_fire
 	.p2align 4
 silica_rt_timer_fire:
@@ -163,17 +174,11 @@ silica_rt_timer_fire:
 	sub rsp, 16
 	mov QWORD PTR [rbp - 8], rdi
 	mov rsi, QWORD PTR [rdi + 24]
+	mov rdx, QWORD PTR [rdi + 48]
+	mov rcx, QWORD PTR [rdi + 32]
 	mov rdi, QWORD PTR [rdi + 16]
-	xor edx, edx
-	lea r10, [rip + silica_rt_actor_cast_flagged]
+	lea r10, [rip + silica_rt_actor_cast_flagged_buffered]
 	call silica_rt_ref_call
-	cmp rdi, 1
-	je Ltf_delivered
-	mov rdi, QWORD PTR [rbp - 8]
-	call silica_rt_timer_release
-	leave
-	ret
-Ltf_delivered:
 	mov rdi, QWORD PTR [rbp - 8]
 	call free
 	leave
