@@ -273,6 +273,12 @@ Tutorial for **`sequence` blocks** (`sequence` / `produces` / `pure` / monadic s
 
 ---
 
+## [transport_serialization_design.md](./transport_serialization_design.md)
+
+**Design (2026-11-05, nothing implemented) for wire transport as part of the language**: three built-in traits (`Transportable` with limits, the one a program implements on its own inline types; `WireFormat`, closed, one built-in implementation per wire protocol starting with BEAM ETF; `Carrier`, closed, one per link tag with an actor message contract and credit-based flow control) and a compiler-derived `encode` / `decode` pair that walks the type as the message copier does. Frames are `string`s; `decode` is a validator in the `recreate` sense. Transport and every new protocol are language, specified and shipped with the compiler, never a program library; which carriers and protocols a compiler build provides is decided per target, board or hosted, in a per-target transport pack, with a compile-time rejection for the rest (Lee, 2026-11-05). Covers the ESP32-S3 board's USB-UART, USB-Serial-JTAG, USB CDC dual-role, UART1, SPI, I2C and SD paths, Bluetooth LE on every target, the hooks the BEAM distribution protocol will need, and how CBOR, MessagePack, JSON, Protocol Buffers and a native format are added as further protocols.
+
+---
+
 ## Further documents in this directory
 
 - [actor_memory_budget_plan.md](./actor_memory_budget_plan.md): what one actor, supervisor and `main` cost in memory on the ESP32-S3 board and on hosted targets, how the cost is cut, and what bounds the number of actors (formerly `esp32s3_memory_budget_plan.md`).
