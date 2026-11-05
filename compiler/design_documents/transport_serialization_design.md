@@ -1,7 +1,7 @@
 # Transport serialization: the `Transportable`, `WireFormat` and `Carrier` traits
 
-**Status (2026-11-05): design only.** Nothing in this document exists in the compiler, its built-in modules or
-the trials. It is the design that controls the addition of wire transport to Silica: how a Silica value is
+**Status (2026-11-05): phases 0 and 1 implemented on Apple Silicon; see §14.** The rest of this document is
+the design that controls the addition of wire transport to Silica: how a Silica value is
 prepared for transport over TCP/IP and other links, in a form that lets the BEAM External Term Format (ETF) be
 the language's first wire protocol, lets the hardware of the ESP32-S3 port test board and Bluetooth carry the
 same frames, and lets other common protocols be added to the language in the same way. Branch:
@@ -947,3 +947,59 @@ Replace the carrier: `use uart1_carrier;` for `use tcp_carrier;`, `(:uart1)` for
 involved. The frames are the same bytes, and on the host an Erlang port program reading the serial line with
 `{packet, 4}` receives them unchanged. The readings themselves come from the I2C0 worker (plan item G) as
 `(:sample, ...)` casts instead of from a test cast in `main`.
+
+---
+
+## 14. Implementation status (2026-11-05, Apple Silicon)
+
+Phases 0 and 1 of §10 are in the tree and green on the Apple Silicon path; Linux lock-step (phase 2) is
+not started, and the other three targets' transport packs provide no protocol, so they answer E2410.
+
+**Builtins (§9.2), all pure, Apple Silicon emission in `emitter/apple_silicon_mac/terms/prims/prims_transport.silica`:**
+`byte_at`, `byte_slice`, `bytes_of` (a `List[int64, mem(normal)]` of byte values to a string),
+`join_bytes`, `atom_name`, `atom_index_of_name` (-1 when the program has no such atom) and `atom_of_bits`
+(these two replace the design's `atom_of_name`: a builtin answers a scalar, and the decoder turns the
+index into the atom), `float64_bits` / `float64_of_bits`, `float32_bits` / `float32_of_bits`,
+`float32_to_float64` / `float64_to_float32`, and the integer width conversions `to_int64`, `to_uint64`
+(any integer type in), `to_int8`, `to_int16`, `to_int32`, `to_uint8`, `to_uint16`, `to_uint32`
+(`int64` in, truncating). The byte builtins answer `int64`, not `uint8`, because the language has no
+implicit widening and byte arithmetic is written in `int64`. The atom helpers read the runtime unit's
+program-wide atom table, since a per-module table misses the atoms of units compiled later. Trial:
+`trials/transport_addition/transport_builtins`.
+
+**Declarations (§4.1):** `impl Transportable for T { limits };` (`type_checker/type_checker_transport.silica`,
+`transport_types.silica`), E2401, E2402, E2404, E2405, checked beside the device descriptions. Limits
+default to 1 MB / depth 64 for a fixed-size type. `Transportable` implies `Recreatable` only on paper
+until chunk 13 exists.
+
+**Calls (§4.3):** `encode(F, x)` and `decode(F, frame)` (`type_checker/expressions/type_checker_expressions_wire.silica`),
+E2403, E2408, E2411. F is the literal `(:etf)`; it is never a run-time value (a one-atom tagged tuple is
+not a usable value in the compilers today). `(:etf)` is an implicit `use wire_etf;` added by the parser,
+so the build order and the link see the dependency; a configuration must list
+`compiler/stdlib/wire_etf.silica` (the trial makefiles link it beside `Supervisor.silica`).
+
+**Derivation (§4.4, §4.5):** pass 1 lowers each call to `__tr_encode_<fmt>_<id>` / `__tr_decode_<fmt>_<id>`
+with a `tr_type_marker` prim naming the (format, type); `transport_pipeline.silica` then generates the
+family's source (`sir_generator/transport_derive.silica`), parses it, appends it to the unit and compiles
+the unit again. The source is kept beside the unit as `<unit>.derived`. Record fields decode in any key
+order through one slot parameter per field; an Erlang list of small integers (STRING_EXT) decodes into an
+integer list. Not derived in this phase, each a compile-time E2401 naming the component: `float16`,
+`char`, `actor_ref` (needs the concurrency effect inside derived code), recursive slots, record, list and
+scalar variants of a sum (a case selects variants by atom and by tuple pattern only), and a record with
+no fields.
+
+**ETF (§4.7):** `compiler/stdlib/wire_etf.silica`, pure Silica. Integers, floats, atoms, strings, tuples
+and lists encode byte for byte as `term_to_binary` writes them (checked against OTP 27 in the trials'
+goldens). Maps are written with keys in name order; OTP 26 and later write small maps in an undefined
+order, so map frames are compared by decoding, not byte for byte, and §4.4's "canonical" claim holds for
+Silica-to-Silica frames only. `WireFormat.silica` and `Carrier.silica` state the traits; the tag-keyed
+closed-trait rule (§9.1) is not enforced by the trait checker yet.
+
+**Packs (§6.0):** `emitter/<TARGET>/transport_pack.silica` with `provides_format` / `provides_carrier`;
+`sir_target_verify` answers E2410 for a protocol the pack does not list.
+
+**Trials:** `trials/transport_addition` (builtins, scalars, record, list and sum, rejections: every atom of
+§4.3 that phase 1 can produce) and the seven `transport_err_*` trials in `error_enforcement_addition`.
+Two language facts the trials had to work around, recorded here for the owner: a relational compare of
+two `uint64` values compiles as a signed compare (wire_etf tests magnitudes by shift instead), and `rec`
+is a keyword, so a binding named `rec` is mis-typed.

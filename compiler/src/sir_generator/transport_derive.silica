@@ -1,0 +1,875 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The derivation of encode / decode (transport_serialization_design.md §4.4, §4.5): for every
+// (format, type) a unit encodes or decodes, the Silica source of the derived functions, generated
+// from the type's text and compiled as ordinary functions of the unit (transport_pipeline).
+//
+// Names. A request (kind, fmt, T) is served by `__tr_<kind>_<fmt>_<id>` where id is the slug of T's
+// normalized text with its length and a checksum, so the SIR lowering (terms.silica) and this
+// generator agree on the name from the type text alone. Inside one family (one fmt and one top
+// type) every subtype k has `__tr_enc_<fmt>_<id>_<k>` (prepends the value's fragments onto an
+// accumulator, last fragment first, so that the whole frame comes out in order), and
+// `__tr_dec_<fmt>_<id>_<k>` (a cursor decoder answering (:ok, value, next) | (:rejected, reason)).
+//
+// Format modules. The walk calls `wire_<fmt>@...`: term_prefix, enc_unit, enc_boolean, enc_int64,
+// enc_uint64, enc_float64, enc_string, enc_atom, enc_atom_name, tuple_header, list_header,
+// list_tail, map_header, enc_key; dec_prefix, dec_int64, dec_uint64, dec_float64, dec_boolean,
+// dec_unit, dec_string, dec_atom_name, dec_tag, dec_tuple_arity, dec_list_length, dec_list_tail,
+// dec_map_size, dec_key, peek_kind, dec_end. The ETF module is wire_etf.
+//
+// Requests. The SIR lowering wraps the value of each call in a `tr_type_marker` prim whose value
+// is "<kind>|<fmt>|<T>"; requests_from_functions collects them from a unit's SIR.
+
+use lexer_keywords;
+use transport_types;
+use type_checker_transport;
+
+export derived_fn_name/3;
+export type_marker_value/3;
+export requests_from_functions/1;
+export generate_derived_source/2;
+
+fn j3(a: string, b: string, c: string) -> string { concat(a, concat(b, c)) }
+fn j4(a: string, b: string, c: string, d: string) -> string { concat(a, j3(b, c, d)) }
+fn j5(a: string, b: string, c: string, d: string, e: string) -> string { concat(a, j4(b, c, d, e)) }
+fn j6(a: string, b: string, c: string, d: string, e: string, f: string) -> string { concat(a, j5(b, c, d, e, f)) }
+fn j7(a: string, b: string, c: string, d: string, e: string, f: string, g: string) -> string { concat(a, j6(b, c, d, e, f, g)) }
+fn j8(a: string, b: string, c: string, d: string, e: string, f: string, g: string, h: string) -> string { concat(a, j7(b, c, d, e, f, g, h)) }
+
+fn nl() -> string { "\n" }
+fn q(s: string) -> string { j3("\"", s, "\"") }
+fn it(n: int64) -> string { transport_types@int_text(n) }
+
+// ---- names ----------------------------------------------------------------------------------------
+
+fn slug_from(s: string, i: int64, hi: int64, acc: string) -> string {
+    case i >= hi of {
+        true -> acc;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            m: string <- case lexer_keywords@is_identifier_char(c) of { true -> c; false -> "_" };
+            slug_from(s, i + 1, hi, concat(acc, m))
+        }
+    }
+}
+
+fn char_weight(c: string) -> int64 {
+    case c of {
+        "0" -> 1; "1" -> 2; "2" -> 3; "3" -> 4; "4" -> 5; "5" -> 6; "6" -> 7; "7" -> 8; "8" -> 9; "9" -> 10;
+        "a" -> 11; "b" -> 12; "c" -> 13; "d" -> 14; "e" -> 15; "f" -> 16; "g" -> 17; "h" -> 18; "i" -> 19;
+        "j" -> 20; "k" -> 21; "l" -> 22; "m" -> 23; "n" -> 24; "o" -> 25; "p" -> 26; "q" -> 27; "r" -> 28;
+        "s" -> 29; "t" -> 30; "u" -> 31; "v" -> 32; "w" -> 33; "x" -> 34; "y" -> 35; "z" -> 36;
+        "A" -> 37; "B" -> 38; "C" -> 39; "D" -> 40; "E" -> 41; "F" -> 42; "G" -> 43; "H" -> 44; "I" -> 45;
+        "J" -> 46; "K" -> 47; "L" -> 48; "M" -> 49; "N" -> 50; "O" -> 51; "P" -> 52; "Q" -> 53; "R" -> 54;
+        "S" -> 55; "T" -> 56; "U" -> 57; "V" -> 58; "W" -> 59; "X" -> 60; "Y" -> 61; "Z" -> 62;
+        "_" -> 63; "(" -> 64; ")" -> 65; "{" -> 66; "}" -> 67; "[" -> 68; "]" -> 69; "," -> 70;
+        ":" -> 71; "|" -> 72; "?" -> 73; "." -> 74; ">" -> 75; "-" -> 76;
+        _: string -> 77
+    }
+}
+
+fn checksum_from(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> checksum_from(s, i + 1, (acc * 31 + char_weight(substring(s, i, i + 1))) % 1000000007)
+    }
+}
+
+// The identifier-safe id of a normalized type text: its slug (at most 96 characters of it), its
+// length and a checksum of the whole text.
+fn type_id(nt: string) -> string {
+    n: int64 <- length_bytes(nt);
+    hi: int64 <- case n > 96 of { true -> 96; false -> n };
+    j5(slug_from(nt, 0, hi, ""), "_", it(n), "_", it(checksum_from(nt, 0, 7)))
+}
+
+fn derived_fn_name(kind: string, fmt: string, type_text: string) -> string {
+    j6("__tr_", kind, "_", fmt, "_", type_id(transport_types@norm_type(type_text)))
+}
+
+fn type_marker_value(kind: string, fmt: string, type_text: string) -> string {
+    j5(kind, "|", fmt, "|", transport_types@norm_type(type_text))
+}
+
+// ---- requests from SIR ----------------------------------------------------------------------------
+
+fn find_bar(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 1) == "|" of {
+            true -> i;
+            false -> find_bar(s, i + 1)
+        }
+    }
+}
+
+fn request_of_marker(v: string) -> { kind: string, fmt: string, type_text: string } {
+    b1: int64 <- find_bar(v, 0);
+    b2: int64 <- case b1 < 0 of { true -> -1; false -> find_bar(v, b1 + 1) };
+    case b1 < 0 or b2 < 0 of {
+        true -> { kind: "", fmt: "", type_text: "" };
+        false -> { kind: substring(v, 0, b1), fmt: substring(v, b1 + 1, b2), type_text: substring(v, b2 + 1, length_bytes(v)) }
+    }
+}
+
+fn requests_contain(rs: List[{ kind: string, fmt: string, type_text: string }, mem(normal)], r: { kind: string, fmt: string, type_text: string }) -> boolean {
+    case rs of {
+        []: List[{ kind: string, fmt: string, type_text: string }, mem(normal)] -> false;
+        [h: { kind: string, fmt: string, type_text: string }, t: List[{ kind: string, fmt: string, type_text: string }, mem(normal)]] -> case h.fmt == r.fmt and h.type_text == r.type_text of {
+            true -> true;
+            false -> requests_contain(t, r)
+        }
+    }
+}
+
+fn requests_from_nodes(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], acc: List[{ kind: string, fmt: string, type_text: string }, mem(normal)]) -> List[{ kind: string, fmt: string, type_text: string }, mem(normal)] {
+    case nodes of {
+        []: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)] -> acc;
+        [h: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, t: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]] -> case h.kind == 6 and h.name == "tr_type_marker" of {
+            false -> requests_from_nodes(t, acc);
+            true -> {
+                r: { kind: string, fmt: string, type_text: string } <- request_of_marker(h.value);
+                case length_bytes(r.kind) == 0 or requests_contain(acc, r) of {
+                    true -> requests_from_nodes(t, acc);
+                    false -> {
+                        sequence proc[mem(normal)]
+                            acc2: List[{ kind: string, fmt: string, type_text: string }, mem(normal)] <- prepend[{ kind: string, fmt: string, type_text: string }, mem(normal)](r, acc)
+                        produces
+                            pure requests_from_nodes(t, acc2)
+                        end
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn requests_from_function_list(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)], acc: List[{ kind: string, fmt: string, type_text: string }, mem(normal)]) -> List[{ kind: string, fmt: string, type_text: string }, mem(normal)] {
+    case fns of {
+        []: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] -> acc;
+        [h: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, t: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]] -> requests_from_function_list(t, requests_from_nodes(h.body.nodes, acc))
+    }
+}
+
+// Every distinct (format, type) a unit's SIR encodes or decodes.
+fn requests_from_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> List[{ kind: string, fmt: string, type_text: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        none: List[{ kind: string, fmt: string, type_text: string }, mem(normal)] <- empty[{ kind: string, fmt: string, type_text: string }, mem(normal)]();
+        out: List[{ kind: string, fmt: string, type_text: string }, mem(normal)] <- requests_from_function_list(fns, none)
+    produces
+        pure out
+    end
+}
+
+// ---- the subtypes of a family ----------------------------------------------------------------------
+
+fn strings_contain(xs: List[string, mem(normal)], s: string) -> boolean {
+    case xs of {
+        []: List[string, mem(normal)] -> false;
+        [h: string, t: List[string, mem(normal)]] -> case h == s of { true -> true; false -> strings_contain(t, s) }
+    }
+}
+
+fn index_of_from(xs: List[string, mem(normal)], s: string, i: int64) -> int64 {
+    case xs of {
+        []: List[string, mem(normal)] -> -1;
+        [h: string, t: List[string, mem(normal)]] -> case h == s of { true -> i; false -> index_of_from(t, s, i + 1) }
+    }
+}
+
+fn index_of(xs: List[string, mem(normal)], s: string) -> int64 {
+    index_of_from(xs, s, 0)
+}
+
+fn tagged_payload(es: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case es of {
+        []: List[string, mem(normal)] -> es;
+        [_h: string, t: List[string, mem(normal)]] -> t
+    }
+}
+
+fn field_types(fields: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case fields of {
+        []: List[string, mem(normal)] -> fields;
+        [h: string, t: List[string, mem(normal)]] -> {
+            sequence proc[mem(normal)]
+                rest: List[string, mem(normal)] <- field_types(t);
+                out: List[string, mem(normal)] <- prepend[string, mem(normal)](transport_types@field_type(h), rest)
+            produces
+                pure out
+            end
+        }
+    }
+}
+
+fn collect_list(ts: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case ts of {
+        []: List[string, mem(normal)] -> acc;
+        [h: string, t: List[string, mem(normal)]] -> collect_list(t, collect(h, acc))
+    }
+}
+
+// `acc` plus `t` and every component of it, each normalized type once.
+fn collect(t: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case strings_contain(acc, t) of {
+        true -> acc;
+        false -> {
+            sequence proc[mem(normal)]
+                acc1: List[string, mem(normal)] <- prepend[string, mem(normal)](t, acc);
+                k: string <- transport_types@kind_of(t);
+                out: List[string, mem(normal)] <- case k of {
+                    "tuple" -> collect_list(transport_types@tuple_elems(t), acc1);
+                    "tagged" -> collect_list(tagged_payload(transport_types@tuple_elems(t)), acc1);
+                    "record" -> collect_list(field_types(transport_types@record_fields(t)), acc1);
+                    "list" -> collect(transport_types@list_elem(t), acc1);
+                    "sum" -> collect_list(transport_types@sum_variants(t), acc1);
+                    _: string -> acc1
+                }
+            produces
+                pure out
+            end
+        }
+    }
+}
+
+fn spell(t: string) -> string {
+    case t == "()" of { true -> "unit"; false -> t }
+}
+
+// A unit value cannot be bound to a name or passed by name (E2006): a unit component is bound to
+// a discard and rebuilt as the literal ().
+fn arg_of(t: string, var: string) -> string {
+    case spell(t) == "unit" of { true -> "()"; false -> var }
+}
+
+fn bind_of(t: string, var: string) -> string {
+    case spell(t) == "unit" of { true -> concat("_", var); false -> var }
+}
+
+// ---- the encoder of one subtype ------------------------------------------------------------------
+
+fn enc_fn(fmt: string, tid: string, k: int64) -> string {
+    j6("__tr_enc_", fmt, "_", tid, "_", it(k))
+}
+
+fn dec_fn(fmt: string, tid: string, k: int64) -> string {
+    j6("__tr_dec_", fmt, "_", tid, "_", it(k))
+}
+
+fn wire(fmt: string, f: string) -> string {
+    j4("wire_", fmt, "@", f)
+}
+
+fn prepend_line(name: string, frag: string, onto: string) -> string {
+    j6("        ", name, ": List[string, mem(normal)] <- prepend[string, mem(normal)](", frag, concat(", ", onto), ");\n")
+}
+
+// The last binding of a sequence block carries no `;` (E1041).
+fn prepend_last(name: string, frag: string, onto: string) -> string {
+    j6("        ", name, ": List[string, mem(normal)] <- prepend[string, mem(normal)](", frag, concat(", ", onto), ")\n")
+}
+
+fn scalar_fragment(fmt: string, k: string, t: string) -> string {
+    case k of {
+        "unit" -> concat(wire(fmt, "enc_unit"), "()");
+        "boolean" -> concat(wire(fmt, "enc_boolean"), "(v)");
+        "int64" -> concat(wire(fmt, "enc_int64"), "(v)");
+        "uint64" -> concat(wire(fmt, "enc_uint64"), "(v)");
+        "float64" -> concat(wire(fmt, "enc_float64"), "(v)");
+        "float32" -> concat(wire(fmt, "enc_float64"), "(float32_to_float64(v))");
+        "string" -> concat(wire(fmt, "enc_string"), "(v)");
+        "atom" -> concat(wire(fmt, "enc_atom"), "(v)");
+        "atom_lit" -> j3(wire(fmt, "enc_atom_name"), "(", concat(q(transport_types@atom_lit_name(t)), ")"));
+        _: string -> concat(wire(fmt, "enc_int64"), "(to_int64(v))")
+    }
+}
+
+// `aN <- enc(xN, acc); ... a1 <- enc(x1, a2);` for the elements es (xi bound to the i-th element),
+// then the given final lines using a1 (or acc when there are no elements).
+fn enc_elem_lines(fmt: string, tid: string, subs: List[string, mem(normal)], es: List[string, mem(normal)], i: int64, n: int64) -> string {
+    case es of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- enc_elem_lines(fmt, tid, subs, t, i + 1, n);
+            prev: string <- case i == n of { true -> "acc"; false -> concat("a", it(i + 1)) };
+            line: string <- j8("        a", it(i), ": List[string, mem(normal)] <- ", enc_fn(fmt, tid, index_of(subs, h)), "(", arg_of(h, concat("x", it(i))), concat(", ", prev), ");\n");
+            concat(rest, line)
+        }
+    }
+}
+
+fn count(xs: List[string, mem(normal)], acc: int64) -> int64 {
+    case xs of {
+        []: List[string, mem(normal)] -> acc;
+        [_h: string, t: List[string, mem(normal)]] -> count(t, acc + 1)
+    }
+}
+
+fn typed_pattern_elems(es: List[string, mem(normal)], i: int64) -> string {
+    case es of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- typed_pattern_elems(t, i + 1);
+            sep: string <- case length_bytes(rest) == 0 of { true -> ""; false -> ", " };
+            j5(bind_of(h, concat("x", it(i))), ": ", spell(h), sep, rest)
+        }
+    }
+}
+
+fn seq_open() -> string { "            sequence proc[mem(normal)]\n" }
+fn seq_close(result: string) -> string { j3("            produces\n                pure ", result, "\n            end\n") }
+
+// The body lines, inside a sequence block, that prepend a tuple's or tagged tuple's fragments.
+fn tuple_body(fmt: string, tid: string, subs: List[string, mem(normal)], tag: string, payload: List[string, mem(normal)]) -> string {
+    n: int64 <- count(payload, 0);
+    elems: string <- enc_elem_lines(fmt, tid, subs, payload, 1, n);
+    first: string <- case n == 0 of { true -> "acc"; false -> "a1" };
+    tagged: boolean <- length_bytes(tag) > 0;
+    tag_line: string <- case tagged of {
+        true -> prepend_line("a0", j3(wire(fmt, "enc_atom_name"), "(", concat(q(tag), ")")), first);
+        false -> ""
+    };
+    base: string <- case tagged of { true -> "a0"; false -> first };
+    arity: int64 <- case tagged of { true -> n + 1; false -> n };
+    header: string <- prepend_last("out", j3(wire(fmt, "tuple_header"), "(", concat(it(arity), ")")), base);
+    j3(elems, tag_line, header)
+}
+
+fn tuple_arm(fmt: string, tid: string, subs: List[string, mem(normal)], tag: string, payload: List[string, mem(normal)]) -> string {
+    pat_elems: string <- typed_pattern_elems(payload, 1);
+    pattern: string <- case length_bytes(tag) > 0 of {
+        true -> case length_bytes(pat_elems) == 0 of {
+            true -> j3("(:", tag, ")");
+            false -> j5("(:", tag, ", ", pat_elems, ")")
+        };
+        false -> j3("(", pat_elems, ")")
+    };
+    j7("        ", pattern, " -> {\n", seq_open(), tuple_body(fmt, tid, subs, tag, payload), seq_close("out"), "        }")
+}
+
+fn enc_record_lines(fmt: string, tid: string, subs: List[string, mem(normal)], sorted: List[string, mem(normal)], i: int64, m: int64) -> string {
+    case sorted of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- enc_record_lines(fmt, tid, subs, t, i + 1, m);
+            prev: string <- case i == m of { true -> "acc"; false -> concat("a", it(2 * i + 1)) };
+            fname: string <- transport_types@field_name(h);
+            ftype: string <- transport_types@field_type(h);
+            value_line: string <- j8("        a", it(2 * i), ": List[string, mem(normal)] <- ", enc_fn(fmt, tid, index_of(subs, ftype)), "(", arg_of(ftype, concat("v.", fname)), concat(", ", prev), ");\n");
+            key_line: string <- prepend_line(concat("a", it(2 * i - 1)), j3(wire(fmt, "enc_key"), "(", concat(q(fname), ")")), concat("a", it(2 * i)));
+            j3(rest, value_line, key_line)
+        }
+    }
+}
+
+fn sum_enc_arms(fmt: string, tid: string, subs: List[string, mem(normal)], vs: List[string, mem(normal)]) -> string {
+    case vs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- sum_enc_arms(fmt, tid, subs, t);
+            sep: string <- case length_bytes(rest) == 0 of { true -> "\n"; false -> ";\n" };
+            arm: string <- case transport_types@kind_of(h) of {
+                "atom_lit" -> j7("        :", transport_types@atom_lit_name(h), " -> {\n", seq_open(), prepend_last("out", scalar_fragment(fmt, "atom_lit", h), "acc"), seq_close("out"), "        }");
+                _: string -> {
+                    es: List[string, mem(normal)] <- transport_types@tuple_elems(h);
+                    tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
+                    tuple_arm(fmt, tid, subs, tag, tagged_payload(es))
+                }
+            };
+            j3(arm, sep, rest)
+        }
+    }
+}
+
+fn gen_enc(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, t: string) -> string {
+    kind: string <- transport_types@kind_of(t);
+    head: string <- j6("fn ", enc_fn(fmt, tid, k), "(v: ", spell(t), ", acc: List[string, mem(normal)]) -> List[string, mem(normal)] {", "\n");
+    body: string <- case kind of {
+        "tuple" -> j3("    case v of {\n", tuple_arm(fmt, tid, subs, "", transport_types@tuple_elems(t)), "\n    }\n");
+        "tagged" -> {
+            es: List[string, mem(normal)] <- transport_types@tuple_elems(t);
+            tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
+            j3("    case v of {\n", tuple_arm(fmt, tid, subs, tag, tagged_payload(es)), "\n    }\n")
+        };
+        "record" -> {
+            sorted: List[string, mem(normal)] <- transport_types@sort_fields(transport_types@record_fields(t));
+            m: int64 <- count(sorted, 0);
+            base: string <- case m == 0 of { true -> "acc"; false -> "a1" };
+            j4("    sequence proc[mem(normal)]\n", enc_record_lines(fmt, tid, subs, sorted, 1, m), prepend_last("out", j3(wire(fmt, "map_header"), "(", concat(it(m), ")")), base), "    produces\n        pure out\n    end\n")
+        };
+        "list" -> {
+            e: string <- transport_types@list_elem(t);
+            j8("    sequence proc[mem(normal)]\n        n: int64 <- length[", spell(e), ", mem(normal)](v);\n        body: List[string, mem(normal)] <- __tr_encl_", j4(fmt, "_", tid, "_"), concat(it(k), "(v, acc, n);\n"), prepend_last("out", j3(wire(fmt, "list_header"), "(n)", ""), "body"), "    produces\n        pure out\n    end\n", "")
+        };
+        "sum" -> j3("    case v of {\n", sum_enc_arms(fmt, tid, subs, transport_types@sum_variants(t)), "    }\n");
+        _: string -> j3("    sequence proc[mem(normal)]\n", prepend_last("out", scalar_fragment(fmt, kind, t), "acc"), "    produces\n        pure out\n    end\n")
+    };
+    walker: string <- case kind == "list" of {
+        true -> {
+            e: string <- transport_types@list_elem(t);
+            le: string <- spell(e);
+            j8(j6("fn __tr_encl_", fmt, "_", tid, "_", it(k)), j3("(xs: List[", le, ", mem(normal)], acc: List[string, mem(normal)], n: int64) -> List[string, mem(normal)] {\n"),
+               j3("    case xs of {\n        []: List[", le, ", mem(normal)] -> {\n"),
+               j3(seq_open(), prepend_last("out", j3(wire(fmt, "list_tail"), "(n)", ""), "acc"), seq_close("out")),
+               j5("        };\n        [h: ", le, ", t: List[", le, ", mem(normal)]] -> {\n"),
+               j6("            rest: List[string, mem(normal)] <- __tr_encl_", fmt, "_", tid, "_", concat(it(k), "(t, acc, n);\n")),
+               j3("            ", enc_fn(fmt, tid, index_of(subs, e)), "(h, rest)\n        }\n    }\n}\n"), "")
+        };
+        false -> ""
+    };
+    j4(head, body, "}\n", walker)
+}
+
+// ---- the decoder of one subtype ------------------------------------------------------------------
+
+fn result_type(t: string) -> string {
+    j3("(:ok, ", spell(t), ", int64) | (:rejected, atom)")
+}
+
+fn dec_head(name: string, t: string) -> string {
+    j5("fn ", name, "(bs: string, pos: int64, depth: int64) -> ", result_type(t), " {\n")
+}
+
+fn reject_arm(r: string) -> string {
+    j5("(:rejected, ", r, ": atom) -> (:rejected, ", r, ");\n")
+}
+
+fn narrow_bounds(k: string) -> string {
+    case k of {
+        "int8" -> "w < -128 or w > 127";
+        "int16" -> "w < -32768 or w > 32767";
+        "int32" -> "w < -2147483648 or w > 2147483647";
+        "uint8" -> "w < 0 or w > 255";
+        "uint16" -> "w < 0 or w > 65535";
+        _: string -> "w < 0 or w > 4294967295"
+    }
+}
+
+fn narrow_conv(k: string) -> string {
+    concat("to_", k)
+}
+
+fn scalar_dec_body(fmt: string, k: string, t: string, lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean }) -> string {
+    case k of {
+        "int64" -> j3("    ", wire(fmt, "dec_int64"), "(bs, pos)\n");
+        "uint64" -> j3("    ", wire(fmt, "dec_uint64"), "(bs, pos)\n");
+        "float64" -> j3("    ", wire(fmt, "dec_float64"), "(bs, pos)\n");
+        "boolean" -> j3("    ", wire(fmt, "dec_boolean"), "(bs, pos)\n");
+        "string" -> j5("    ", wire(fmt, "dec_string"), "(bs, pos, ", it(lim.max_length), ")\n");
+        "float32" -> j5("    case ", wire(fmt, "dec_float64"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, f: float64, p0: int64) -> (:ok, float64_to_float32(f), p0)\n    }\n");
+        "unit" -> j5("    case ", wire(fmt, "dec_unit"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, p0: int64) -> (:ok, (), p0)\n    }\n");
+        "atom" -> j5("    case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, nm: string, p0: int64) -> {\n            i: int64 <- atom_index_of_name(nm);\n            case i < 0 of {\n                true -> (:rejected, :unknown_atom);\n                false -> (:ok, atom_of_bits(i), p0)\n            }\n        }\n    }\n");
+        "atom_lit" -> j8("    case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, nm: string, p0: int64) -> case nm == ", q(transport_types@atom_lit_name(t)), " of {\n            true -> (:ok, :", concat(transport_types@atom_lit_name(t), ", p0);\n            false -> (:rejected, :bad_variant)\n        }\n    }\n"));
+        _: string -> j8("    case ", wire(fmt, "dec_int64"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, w: int64, p0: int64) -> case ", narrow_bounds(k), " of {\n            true -> (:rejected, :out_of_range);\n            false -> (:ok, ", concat(narrow_conv(k), "(w), p0)\n        }\n    }\n"))
+    }
+}
+
+// Decode the elements es one after another from p<i-1> (p0 = pos) and finish with `final`.
+fn dec_chain(fmt: string, tid: string, subs: List[string, mem(normal)], es: List[string, mem(normal)], i: int64, final: string, indent: string) -> string {
+    case es of {
+        []: List[string, mem(normal)] -> j3(indent, final, "\n");
+        [h: string, t: List[string, mem(normal)]] -> {
+            inner: string <- dec_chain(fmt, tid, subs, t, i + 1, final, concat(indent, "    "));
+            j8(indent, j5("case ", dec_fn(fmt, tid, index_of(subs, h)), "(bs, p", it(i - 1), ", depth) of {\n"),
+               concat(indent, "    "), reject_arm(concat("r", it(i))),
+               j7(indent, "    (:ok, ", bind_of(h, concat("x", it(i))), ": ", spell(h), ", p", concat(it(i), ": int64) ->\n")),
+               inner, indent, "}\n")
+        }
+    }
+}
+
+fn vars_of(es: List[string, mem(normal)], i: int64) -> string {
+    case es of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- vars_of(t, i + 1);
+            sep: string <- case length_bytes(rest) == 0 of { true -> ""; false -> ", " };
+            j3(arg_of(h, concat("x", it(i))), sep, rest)
+        }
+    }
+}
+
+fn tuple_final(tag: string, payload: List[string, mem(normal)]) -> string {
+    n: int64 <- count(payload, 0);
+    vs: string <- vars_of(payload, 1);
+    case length_bytes(tag) > 0 of {
+        true -> case n == 0 of {
+            true -> j3("(:ok, (:", tag, "), p0)");
+            false -> j5("(:ok, (:", tag, ", ", vs, concat("), p", concat(it(n), ")")))
+        };
+        false -> j5("(:ok, (", vs, "), p", it(n), ")")
+    }
+}
+
+// A payload decoder: the elements after a tuple's header (and tag), answering `result_t`.
+fn payload_fn(fmt: string, tid: string, subs: List[string, mem(normal)], name: string, tag: string, payload: List[string, mem(normal)], result_t: string) -> string {
+    n: int64 <- count(payload, 0);
+    j5(j5("fn ", name, "(bs: string, p0: int64, depth: int64) -> ", result_type(result_t), " {\n"),
+       dec_chain(fmt, tid, subs, payload, 1, tuple_final(tag, payload), "    "), "}\n", "", "")
+}
+
+fn decp_fn(fmt: string, tid: string, k: int64) -> string {
+    j6("__tr_decp_", fmt, "_", tid, "_", it(k))
+}
+
+fn decs_fn(fmt: string, tid: string, k: int64, v: int64) -> string {
+    j8("__tr_decs_", fmt, "_", tid, "_", it(k), "_", it(v))
+}
+
+fn tuple_dec_body(fmt: string, tid: string, k: int64, tag: string, arity: int64) -> string {
+    tag_check: string <- case length_bytes(tag) > 0 of {
+        true -> j7("                true -> case ", wire(fmt, "dec_tag"), "(bs, p0, ", q(tag), ") of {\n                    ", reject_arm("rt"), j3("                    (:ok, pt: int64) -> ", decp_fn(fmt, tid, k), "(bs, pt, depth - 1)\n                }\n"));
+        false -> j3("                true -> ", decp_fn(fmt, tid, k), "(bs, p0, depth - 1)\n")
+    };
+    j8("    case depth <= 0 of {\n        true -> (:rejected, :too_deep);\n        false -> case ", wire(fmt, "dec_tuple_arity"), "(bs, pos) of {\n            ", reject_arm("r0"),
+       j3("            (:ok, ar: int64, p0: int64) -> case ar == ", it(arity), " of {\n                false -> (:rejected, :bad_tag);\n"), tag_check, "            }\n        }\n    }\n", "")
+}
+
+fn record_literal(fields: List[string, mem(normal)]) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- record_literal(t);
+            sep: string <- case length_bytes(rest) == 0 of { true -> ""; false -> ", " };
+            fname: string <- transport_types@field_name(h);
+            j5(fname, ": ", arg_of(transport_types@field_type(h), concat("x_", fname)), sep, rest)
+        }
+    }
+}
+
+fn slot_type(ftype: string) -> string {
+    j3("(:some, ", spell(ftype), ") | :none")
+}
+
+// The state of a record decode is one slot per field, `(:some, value) | :none`, each its own
+// parameter of the pair walker: a tuple of sums cannot be written with atom literals in it, and
+// a sum carried inside a tuple through the walk's recursion is not kept alive.
+fn slot_params(fields: List[string, mem(normal)]) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> j5(", s_", transport_types@field_name(h), ": ", slot_type(transport_types@field_type(h)), slot_params(t))
+    }
+}
+
+// The initial arguments: every slot `:none`.
+fn none_args(fields: List[string, mem(normal)]) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [_h: string, t: List[string, mem(normal)]] -> concat(", :none", none_args(t))
+    }
+}
+
+// The arguments with the slot of `fname` filled with `x`: the other slots keep their names.
+fn filled_args(fields: List[string, mem(normal)], fname: string, ftype: string) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            this: string <- case transport_types@field_name(h) == fname of {
+                true -> j3(", (:some, ", arg_of(ftype, "x"), ")");
+                false -> concat(", s_", transport_types@field_name(h))
+            };
+            concat(this, filled_args(t, fname, ftype))
+        }
+    }
+}
+
+// The `"name" -> ...` arms that decode one pair into its slot and go on with n - 1 pairs.
+fn record_key_arms(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, fields: List[string, mem(normal)], all: List[string, mem(normal)]) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- record_key_arms(fmt, tid, subs, k, t, all);
+            fname: string <- transport_types@field_name(h);
+            ftype: string <- transport_types@field_type(h);
+            arm: string <- j8(j3("                ", q(fname), concat(" -> case s_", concat(fname, " of {\n"))),
+                j3("                    (:some, _d: ", spell(ftype), ") -> (:rejected, :duplicate_field);\n"),
+                j3("                    :none -> case ", dec_fn(fmt, tid, index_of(subs, ftype)), "(bs, pk, depth) of {\n                        "),
+                reject_arm("r"),
+                j3(concat("                        (:ok, ", bind_of(ftype, "x")), concat(": ", spell(ftype)), ", p: int64) -> "),
+                j6("__tr_decm_", fmt, "_", tid, "_", concat(it(k), "(bs, p, depth, n - 1")),
+                concat(filled_args(all, fname, ftype), ")\n                    }\n                };\n"), "");
+            concat(arm, rest)
+        }
+    }
+}
+
+// The final check: every slot filled, else :missing_field; then the record.
+fn record_finish(fields: List[string, mem(normal)], final: string, indent: string) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> j3(indent, final, "\n");
+        [h: string, t: List[string, mem(normal)]] -> {
+            fname: string <- transport_types@field_name(h);
+            ftype: string <- transport_types@field_type(h);
+            inner: string <- record_finish(t, final, concat(indent, "    "));
+            j8(indent, j3("case s_", fname, " of {\n"), indent, "    :none -> (:rejected, :missing_field);\n", indent, j5("    (:some, ", bind_of(ftype, concat("x_", fname)), ": ", spell(ftype), ") ->\n"), inner, concat(indent, "}\n"))
+        }
+    }
+}
+
+fn decm_fn(fmt: string, tid: string, k: int64) -> string {
+    j6("__tr_decm_", fmt, "_", tid, "_", it(k))
+}
+
+// The pair walker of a record: n pairs left at pos, the slots filled so far in s_<field>.
+fn record_map_fn(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, t: string) -> string {
+    fields: List[string, mem(normal)] <- transport_types@record_fields(t);
+    final: string <- j3("(:ok, { ", record_literal(fields), " }, pos)");
+    head: string <- j7("fn ", decm_fn(fmt, tid, k), "(bs: string, pos: int64, depth: int64, n: int64", slot_params(fields), ") -> ", result_type(t), " {\n");
+    done: string <- j3("    case n == 0 of {\n        true ->\n", record_finish(fields, final, "            "), "        ;\n");
+    more: string <- j8("        false -> case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n            ", reject_arm("rk"), "            (:ok, key: string, pk: int64) -> case key of {\n", record_key_arms(fmt, tid, subs, k, fields, fields), "                _: string -> (:rejected, :unknown_field)\n            }\n        }\n    }\n}\n", "");
+    j3(head, done, more)
+}
+
+fn record_dec_body(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, t: string) -> string {
+    fields: List[string, mem(normal)] <- transport_types@record_fields(t);
+    m: int64 <- count(fields, 0);
+    j8("    case depth <= 0 of {\n        true -> (:rejected, :too_deep);\n        false -> case ", wire(fmt, "dec_map_size"), "(bs, pos) of {\n            ", reject_arm("r0"),
+       j3("            (:ok, ms: int64, p0: int64) -> case ms > ", it(m), " of {\n                true -> (:rejected, :unknown_field);\n                false -> "),
+       j7(decm_fn(fmt, tid, k), "(bs, p0, depth - 1, ms", none_args(fields), ")\n            }\n        }\n    }\n", "", "", ""), "", "")
+}
+
+fn last_of(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> case t of {
+            []: List[string, mem(normal)] -> h;
+            [_h2: string, _t2: List[string, mem(normal)]] -> last_of(t)
+        }
+    }
+}
+
+fn list_dec_body(fmt: string, tid: string, k: int64, e: string, lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean }) -> string {
+    le: string <- spell(e);
+    // An Erlang list of small integers arrives as STRING_EXT, bytes without tags; an integer
+    // element type takes that form through __tr_decb (design §4.7).
+    bytes_arm: string <- case transport_types@is_integer_kind(transport_types@kind_of(e)) of {
+        true -> j8("        false -> case ", wire(fmt, "peek_kind"), "(bs, pos) == :binary of {\n            true -> case ", wire(fmt, "dec_string"), j3("(bs, pos, ", it(lim.max_length), ") of {\n                "), reject_arm("rb"), j6("                (:ok, raw: string, pb: int64) -> __tr_decb_", fmt, "_", tid, "_", concat(it(k), "(raw, 0, length_bytes(raw), pb)\n            };\n            false -> ")), "");
+        false -> "        false -> "
+    };
+    bytes_close: string <- case transport_types@is_integer_kind(transport_types@kind_of(e)) of { true -> "        }\n"; false -> "" };
+    part1: string <- j5("    case depth <= 0 of {\n        true -> (:rejected, :too_deep);\n", bytes_arm, concat("case ", wire(fmt, "dec_list_length")), "(bs, pos) of {\n            ", reject_arm("r0"));
+    part1b: string <- "            (:ok, n: int64, p0: int64) -> case n == 0 of {\n";
+    part2: string <- j5("                true -> {\n                    sequence proc[mem(normal)]\n                        e: List[", le, ", mem(normal)] <- empty[", le, ", mem(normal)]()\n                    produces\n                        pure (:ok, e, p0)\n                    end\n                };\n");
+    part3: string <- j7("                false -> case n > ", it(lim.max_length), " of {\n                    true -> (:rejected, :too_long);\n                    false -> __tr_decl_", fmt, "_", tid, concat("_", concat(it(k), "(bs, p0, depth - 1, n)\n                }\n            }\n        }\n")));
+    j5(part1, part1b, part2, part3, concat(bytes_close, "    }\n"))
+}
+
+// The byte-list builder: n bytes of raw from i, each widened to the element type.
+fn bytes_list_fn(fmt: string, tid: string, k: int64, e: string) -> string {
+    le: string <- spell(e);
+    conv: string <- case le == "int64" of { true -> "byte_at(raw, i)"; false -> case le == "uint64" of { true -> "to_uint64(byte_at(raw, i))"; false -> j3("to_", le, "(byte_at(raw, i))") } };
+    name: string <- j6("__tr_decb_", fmt, "_", tid, "_", it(k));
+    j8(j5("fn ", name, "(raw: string, i: int64, n: int64, after: int64) -> (:ok, List[", le, ", mem(normal)], int64) | (:rejected, atom) {\n"),
+       j3("    case i >= n of {\n        true -> {\n            sequence proc[mem(normal)]\n                e: List[", le, ", mem(normal)] <- empty["),
+       j3(le, ", mem(normal)]()\n            produces\n                pure (:ok, e, after)\n            end\n        };\n        false -> case ", name),
+       j3("(raw, i + 1, n, after) of {\n            ", reject_arm("r"), "            (:ok, t: List["),
+       j5(le, ", mem(normal)], p: int64) -> {\n                sequence proc[mem(normal)]\n                    out: List[", le, ", mem(normal)] <- prepend[", concat(le, ", mem(normal)](")),
+       j3(conv, ", t)\n                produces\n                    pure (:ok, out, p)\n                end\n            }\n        }\n    }\n}\n", ""), "", "")
+}
+
+fn list_walker_dec(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, e: string) -> string {
+    le: string <- spell(e);
+    name: string <- j6("__tr_decl_", fmt, "_", tid, "_", it(k));
+    j8(j5("fn ", name, "(bs: string, pos: int64, depth: int64, n: int64) -> (:ok, List[", le, ", mem(normal)], int64) | (:rejected, atom) {\n"),
+       j5("    case n == 0 of {\n        true -> case ", wire(fmt, "dec_list_tail"), "(bs, pos) of {\n            ", reject_arm("rt"), j3("            (:ok, pt: int64) -> {\n                sequence proc[mem(normal)]\n                    e: List[", le, ", mem(normal)] <- empty[")),
+       j3(le, ", mem(normal)]()\n                produces\n                    pure (:ok, e, pt)\n                end\n            }\n        };\n        false -> case ", dec_fn(fmt, tid, index_of(subs, e))),
+       j3("(bs, pos, depth) of {\n            ", reject_arm("r1"), j3("            (:ok, h: ", le, ", p1: int64) -> case ")),
+       j5(name, "(bs, p1, depth, n - 1) of {\n                ", reject_arm("r2"), "                (:ok, t: List[", concat(le, ", mem(normal)], p2: int64) -> {\n                    sequence proc[mem(normal)]\n                        out: List[")),
+       j3(le, ", mem(normal)] <- prepend[", concat(le, ", mem(normal)](h, t)\n                    produces\n                        pure (:ok, out, p2)\n                    end\n                }\n            }\n        }\n    }\n}\n")), "", "")
+}
+
+fn sum_atom_arms(vs: List[string, mem(normal)]) -> string {
+    case vs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- sum_atom_arms(t);
+            case transport_types@kind_of(h) == "atom_lit" of {
+                true -> {
+                    nm: string <- transport_types@atom_lit_name(h);
+                    j5("                    ", q(nm), " -> (:ok, :", nm, concat(", pa);\n", rest))
+                };
+                false -> rest
+            }
+        }
+    }
+}
+
+fn sum_tuple_arms(fmt: string, tid: string, k: int64, vs: List[string, mem(normal)], vi: int64) -> string {
+    case vs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- sum_tuple_arms(fmt, tid, k, t, vi + 1);
+            case transport_types@kind_of(h) == "tagged" of {
+                true -> {
+                    es: List[string, mem(normal)] <- transport_types@tuple_elems(h);
+                    tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
+                    arity: int64 <- count(es, 0);
+                    j8("                        ", q(tag), " -> case ar == ", it(arity), " of { false -> (:rejected, :bad_tag); true -> ", decs_fn(fmt, tid, k, vi), "(bs, pg, depth - 1) };\n", rest)
+                };
+                false -> rest
+            }
+        }
+    }
+}
+
+fn sum_variant_fns(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, sum_t: string, vs: List[string, mem(normal)], vi: int64) -> string {
+    case vs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- sum_variant_fns(fmt, tid, subs, k, sum_t, t, vi + 1);
+            case transport_types@kind_of(h) == "tagged" of {
+                true -> {
+                    es: List[string, mem(normal)] <- transport_types@tuple_elems(h);
+                    tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
+                    concat(payload_fn(fmt, tid, subs, decs_fn(fmt, tid, k, vi), tag, tagged_payload(es), sum_t), rest)
+                };
+                false -> rest
+            }
+        }
+    }
+}
+
+fn sum_dec_body(fmt: string, tid: string, k: int64, vs: List[string, mem(normal)]) -> string {
+    part1: string <- j6("    case depth <= 0 of {\n        true -> (:rejected, :too_deep);\n        false -> case ", wire(fmt, "peek_kind"), "(bs, pos) of {\n            :atom -> case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n                ", reject_arm("ra"));
+    part2: string <- j3("                (:ok, nm: string, pa: int64) -> case nm of {\n", sum_atom_arms(vs), "                    _: string -> (:rejected, :bad_variant)\n                }\n            };\n");
+    part3: string <- j6("            :tuple -> case ", wire(fmt, "dec_tuple_arity"), "(bs, pos) of {\n                ", reject_arm("rt"), "                (:ok, ar: int64, pt: int64) -> case ", wire(fmt, "dec_atom_name"));
+    part4: string <- j3("(bs, pt) of {\n                    ", reject_arm("rg"), "                    (:ok, tg: string, pg: int64) -> case tg of {\n");
+    part5: string <- j3(sum_tuple_arms(fmt, tid, k, vs, 0), "                        _: string -> (:rejected, :bad_variant)\n                    }\n                }\n            };\n", "            _: atom -> (:rejected, :bad_variant)\n        }\n    }\n");
+    j5(part1, part2, part3, part4, part5)
+}
+
+fn gen_dec(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, t: string, lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean }) -> string {
+    kind: string <- transport_types@kind_of(t);
+    head: string <- dec_head(dec_fn(fmt, tid, k), t);
+    body: string <- case kind of {
+        "tuple" -> tuple_dec_body(fmt, tid, k, "", count(transport_types@tuple_elems(t), 0));
+        "tagged" -> {
+            es: List[string, mem(normal)] <- transport_types@tuple_elems(t);
+            tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
+            tuple_dec_body(fmt, tid, k, tag, count(es, 0))
+        };
+        "record" -> record_dec_body(fmt, tid, subs, k, t);
+        "list" -> list_dec_body(fmt, tid, k, transport_types@list_elem(t), lim);
+        "sum" -> sum_dec_body(fmt, tid, k, transport_types@sum_variants(t));
+        _: string -> scalar_dec_body(fmt, kind, t, lim)
+    };
+    extra: string <- case kind of {
+        "tuple" -> payload_fn(fmt, tid, subs, decp_fn(fmt, tid, k), "", transport_types@tuple_elems(t), t);
+        "tagged" -> {
+            es: List[string, mem(normal)] <- transport_types@tuple_elems(t);
+            tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
+            payload_fn(fmt, tid, subs, decp_fn(fmt, tid, k), tag, tagged_payload(es), t)
+        };
+        "record" -> record_map_fn(fmt, tid, subs, k, t);
+        "list" -> {
+            e: string <- transport_types@list_elem(t);
+            bl: string <- case transport_types@is_integer_kind(transport_types@kind_of(e)) of {
+                true -> bytes_list_fn(fmt, tid, k, e);
+                false -> ""
+            };
+            concat(list_walker_dec(fmt, tid, subs, k, e), bl)
+        };
+        "sum" -> sum_variant_fns(fmt, tid, subs, k, t, transport_types@sum_variants(t), 0);
+        _: string -> ""
+    };
+    j4(head, body, "}\n", extra)
+}
+
+// ---- one family: the top-level pair and every subtype ---------------------------------------------
+
+fn gen_subtypes(fmt: string, tid: string, subs: List[string, mem(normal)], remaining: List[string, mem(normal)], k: int64, lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean }) -> string {
+    case remaining of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> j3(gen_enc(fmt, tid, subs, k, h), gen_dec(fmt, tid, subs, k, h, lim), gen_subtypes(fmt, tid, subs, t, k + 1, lim))
+    }
+}
+
+// A unit value cannot be bound to a name (E2006): the top-level decode discards it and answers ().
+fn value_pattern(tt: string) -> string {
+    case spell(tt) == "unit" of {
+        true -> "_v: unit";
+        false -> j3("v: ", spell(tt), "")
+    }
+}
+
+fn value_result(tt: string) -> string {
+    case spell(tt) == "unit" of {
+        true -> "()";
+        false -> "v"
+    }
+}
+
+fn gen_tops(fmt: string, tid: string, tt: string, k0: int64, lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean }) -> string {
+    enc: string <- j8(j5("fn ", derived_fn_name("encode", fmt, tt), "(v: ", spell(tt), ") -> string {\n"),
+        "    sequence proc[mem(normal)]\n        tail0: List[string, mem(normal)] <- empty[string, mem(normal)]();\n        parts: List[string, mem(normal)] <- ",
+        enc_fn(fmt, tid, k0), concat(concat("(", arg_of(tt, "v")), ", tail0);\n"), prepend_line("whole", concat(wire(fmt, "term_prefix"), "()"), "parts"),
+        "        out: string <- join_bytes(whole)\n    produces\n        pure out\n    end\n}\n", "", "");
+    dec: string <- j8(j5("fn ", derived_fn_name("decode", fmt, tt), "(bs: string) -> (:ok, ", spell(tt), ") | (:rejected, atom) {\n"),
+        j3("    case length_bytes(bs) > ", it(lim.max_bytes), " of {\n        true -> (:rejected, :too_large);\n"),
+        j3("        false -> case ", wire(fmt, "dec_prefix"), "(bs, 0) of {\n            "), reject_arm("r0"),
+        j7("            (:ok, p0: int64) -> case ", dec_fn(fmt, tid, k0), "(bs, p0, ", it(lim.max_depth), ") of {\n                ", reject_arm("r1"), j3(concat("                (:ok, ", value_pattern(tt)), ", p1: int64) -> case ", "")),
+        j3(wire(fmt, "dec_end"), "(bs, p1) of {\n                    ", reject_arm("r2")),
+        j3("                    (:ok, _p2: int64) -> (:ok, ", value_result(tt), ")\n                }\n            }\n        }\n    }\n}\n"), "");
+    concat(enc, dec)
+}
+
+fn reverse_strings(xs: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case xs of {
+        []: List[string, mem(normal)] -> acc;
+        [h: string, t: List[string, mem(normal)]] -> {
+            sequence proc[mem(normal)]
+                acc2: List[string, mem(normal)] <- prepend[string, mem(normal)](h, acc)
+            produces
+                pure reverse_strings(t, acc2)
+            end
+        }
+    }
+}
+
+fn gen_family(fmt: string, tt: string, lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean }) -> string {
+    sequence proc[mem(normal)]
+        none: List[string, mem(normal)] <- empty[string, mem(normal)]();
+        collected: List[string, mem(normal)] <- collect(tt, none);
+        subs: List[string, mem(normal)] <- reverse_strings(collected, none);
+        tid: string <- type_id(tt);
+        k0: int64 <- index_of(subs, tt);
+        text: string <- j3(gen_tops(fmt, tid, tt, k0, lim), gen_subtypes(fmt, tid, subs, subs, 0, lim), "\n")
+    produces
+        pure text
+    end
+}
+
+fn gen_requests(rs: List[{ kind: string, fmt: string, type_text: string }, mem(normal)], program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> string {
+    case rs of {
+        []: List[{ kind: string, fmt: string, type_text: string }, mem(normal)] -> "";
+        [h: { kind: string, fmt: string, type_text: string }, t: List[{ kind: string, fmt: string, type_text: string }, mem(normal)]] -> {
+            tt: string <- transport_types@norm_type(h.type_text);
+            lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean } <- type_checker_transport@transportable_limits_in_decls(program.declarations, tt);
+            lim2: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean } <- case lim.found of {
+                true -> lim;
+                false -> { found: true, type_text: tt, max_bytes: type_checker_transport@default_max_bytes(), max_depth: type_checker_transport@default_max_depth(), max_length: type_checker_transport@default_max_bytes(), utf8: false }
+            };
+            concat(gen_family(h.fmt, tt, lim2), gen_requests(t, program))
+        }
+    }
+}
+
+// The Silica source of every derived function the requests need: one family per (format, type).
+fn generate_derived_source(rs: List[{ kind: string, fmt: string, type_text: string }, mem(normal)], program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }) -> string {
+    concat("// Derived by the compiler (transport_serialization_design.md §4.4, §4.5). Not for editing.\n\n", gen_requests(rs, program))
+}
