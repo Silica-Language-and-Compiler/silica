@@ -43,6 +43,7 @@ PERIPHERALS = [
       families=((r"^:ch[0-3]conf0$", ":ch#conf0_tx"), (r"^:ch[4-7]conf0$", ":ch#conf0_rx"), (r"^:ch[4-7]conf1$", ":ch#conf1_rx"),
                 (r"^:ch[0-3]status$", ":ch#status_tx"), (r"^:ch[4-7]status$", ":ch#status_rx"))),
     P("ledc", "ledc_reg.h", "DR_REG_LEDC_BASE", None, "LEDC_"),
+    P("usb_serial_jtag", "usb_serial_jtag_reg.h", "DR_REG_USB_SERIAL_JTAG_BASE", None, "USB_SERIAL_JTAG_"),
 ]
 
 # GPIO-matrix signal indices (gpio_sig_map.h; not registers) emitted as constant functions into
@@ -369,7 +370,8 @@ def gen_values(p, commit, regrows, vrows):
 
 # Device tag of each peripheral's description module (silica_device_actor_specification.md §4.9). The module
 # name must start with device_ (E2210), so the file is device_esp32s3_<tag>_registers.silica.
-DEVICE_TAGS = {"gpio": "gpio", "io_mux": "io_mux", "uart0": "uart", "spi2": "spi2", "system": "system", "rmt": "rmt", "ledc": "ledc"}
+DEVICE_TAGS = {"gpio": "gpio", "io_mux": "io_mux", "uart0": "uart", "spi2": "spi2", "system": "system", "rmt": "rmt", "ledc": "ledc",
+               "usb_serial_jtag": "usb_serial_jtag"}
 
 def desc_file(p): return "device_esp32s3_%s_registers.silica" % DEVICE_TAGS[p.name]
 

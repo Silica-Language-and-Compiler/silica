@@ -14,6 +14,13 @@
 # The build sets SILICA_COMPILER_WBT_THROUGH=insert so the compiler's own copy
 # of wbt_map stops at insert. The Linux jobs turn systemd-oomd off and add swap
 # at /swap-ci. The image's /swapfile is already active.
+#
+# The specification job packages compiler/design_documents/silica-specification.md
+# and the markdown files that specification links to. It uploads the tree and
+# silica-specification.zip. A push to main attaches both to the GitHub release
+# beside the compilers. The markdown is copied unchanged, with repository paths
+# kept inside the zip, so the specification's links still resolve after unzipping.
+# Each file is also attached on its own, under its file name.
 
 name: Compiler
 
@@ -206,16 +213,49 @@ jobs:
           path: ${{ steps.published.outputs.path }}
           if-no-files-found: error
 
+  specification:
+    name: Specification files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Package the specification
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/package_specification.py \
+            --root "${GITHUB_WORKSPACE}" \
+            --dest "${RUNNER_TEMP}/specification"
+
+      - name: Upload the unzipped specification
+        uses: actions/upload-artifact@v4
+        with:
+          name: silica-specification
+          path: ${{ runner.temp }}/specification/silica-specification
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload the specification zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: silica-specification-zip
+          path: ${{ runner.temp }}/specification/silica-specification.zip
+          if-no-files-found: error
+
   release:
-    name: Release compilers
-    needs: build
+    name: Release compilers and specification
+    needs: [build, specification]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: write
     steps:
-      - name: Download compiler artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -228,12 +268,65 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          assets=(release-assets/*)
-          if [ "${#assets[@]}" -eq 0 ]; then
+
+          compiler_assets=()
+          for asset in release-assets/*; do
+            if [ -f "${asset}" ] && [[ "${asset}" != *.md ]] && [[ "${asset}" != *.zip ]]; then
+              compiler_assets+=("${asset}")
+            fi
+          done
+          if [ "${#compiler_assets[@]}" -eq 0 ]; then
             echo "no compiler artifacts to release" >&2
             exit 1
           fi
-          chmod +x "${assets[@]}"
+          chmod +x "${compiler_assets[@]}"
+
+          spec_markers=()
+          while IFS= read -r marker; do
+            spec_markers+=("${marker}")
+          done < <(find release-assets -type f -path '*/compiler/design_documents/silica-specification.md' | sort)
+          if [ "${#spec_markers[@]}" -ne 1 ]; then
+            echo "expected one specification file, found ${#spec_markers[@]}" >&2
+            printf '  %s\n' "${spec_markers[@]}" >&2
+            exit 1
+          fi
+          spec_suffix="compiler/design_documents/silica-specification.md"
+          spec_root="${spec_markers[0]%/${spec_suffix}}"
+          if [ "${spec_root}" = "${spec_markers[0]}" ]; then
+            echo "specification path is not ${spec_suffix}" >&2
+            exit 1
+          fi
+
+          spec_files=()
+          while IFS= read -r spec_file; do
+            spec_files+=("${spec_file}")
+          done < <(find "${spec_root}" -type f -name '*.md' | sort)
+          if [ "${#spec_files[@]}" -eq 0 ]; then
+            echo "no specification markdown files to release" >&2
+            exit 1
+          fi
+          flat="${RUNNER_TEMP}/specification-assets"
+          mkdir -p "${flat}"
+          spec_assets=()
+          for file in "${spec_files[@]}"; do
+            name="$(basename "${file}")"
+            if [ -e "${flat}/${name}" ]; then
+              echo "specification file names collide: ${name}" >&2
+              exit 1
+            fi
+            cp "${file}" "${flat}/${name}"
+            spec_assets+=("${flat}/${name}")
+          done
+
+          spec_zips=()
+          while IFS= read -r spec_zip; do
+            spec_zips+=("${spec_zip}")
+          done < <(find release-assets -type f -name 'silica-specification.zip' | sort)
+          if [ "${#spec_zips[@]}" -ne 1 ]; then
+            echo "expected one specification zip, found ${#spec_zips[@]}" >&2
+            exit 1
+          fi
+          cp "${spec_zips[0]}" "${flat}/silica-specification.zip"
 
           tag="compiler-${GITHUB_SHA}"
           short="${GITHUB_SHA:0:7}"
@@ -241,20 +334,31 @@ jobs:
           {
             echo "Compilers built from \`${GITHUB_SHA}\`."
             echo
-            echo "Each asset is named the same way as the files in \`binaries/\`."
+            echo "Each compiler asset is named the same way as the files in \`binaries/\`."
             echo "\`<platform>\` is the machine the binary runs on."
             echo "A cross compiler also carries its emit target, with hyphens written as underscores."
             echo
-            echo "Assets:"
-            for asset in "${assets[@]}"; do
+            echo "Compiler assets:"
+            for asset in "${compiler_assets[@]}"; do
+              echo "- \`$(basename "${asset}")\`"
+            done
+            echo
+            echo "\`silica-specification.zip\` is the language specification and the markdown files it links to."
+            echo "The zip keeps repository paths, so those links still resolve after unzipping."
+            echo "The same files are also attached unzipped, each under its own file name."
+            echo
+            echo "Specification assets:"
+            echo "- \`silica-specification.zip\`"
+            for asset in "${spec_assets[@]}"; do
               echo "- \`$(basename "${asset}")\`"
             done
           } > "${notes}"
 
           if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release upload "${tag}" "${assets[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+            gh release upload "${tag}" "${compiler_assets[@]}" "${flat}/"* \
+              --clobber --repo "${GITHUB_REPOSITORY}"
           else
-            gh release create "${tag}" "${assets[@]}" \
+            gh release create "${tag}" "${compiler_assets[@]}" "${flat}/"* \
               --repo "${GITHUB_REPOSITORY}" \
               --target "${GITHUB_SHA}" \
               --title "Compiler ${short}" \
