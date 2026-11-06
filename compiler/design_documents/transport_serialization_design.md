@@ -1041,7 +1041,7 @@ call-site rule and W2401, the closed protocol set and E2410, the ETF binding, th
 paragraph) and §22.19 (the builtins). The carrier contract and framing (§5, §6) enter the specification
 with phase 2.
 
-**Phase 2, in progress (2026-11-05), Apple Silicon:**
+**Phase 2, complete (2026-11-05), Apple Silicon** (closed by the §10 rule: the TCP and UDP loopback trials pass under `make integrate`, the BEAM demo runs outside it, the full tree is green but for the pre-existing failures noted above, and gen3 is byte-identical to gen2):
 
 - `WireFrame` (§5) is `compiler/stdlib/wireframe.silica`: `fresh(boundaries)`, `frame(frame, mtu, boundaries)`
   and `unframe(state, segment, max_frame)`. The reassembly state is `{ mode: atom, expected: int64,
@@ -1092,9 +1092,9 @@ with phase 2.
   run (no device on the integrate host). The BEAM demo of §13 is `programmer_tools/transport_beam_demo`
   (`run_demo.sh`, outside `make integrate`): the Erlang peer receives the 48-byte `{accel, #{...}}` frame
   of §13.4 and the program decodes the `{led, #{which => red, on => true}}` it answers. The specification
-  text is §16.4.8 (framing) and §16.4.9 (carriers). Not done in this phase: E2407, the `WireFrame`
-  segmentation under a real BLE mtu (phase 5), and the Linux emitters' side of the FFI struct-result fix
-  (phase 3).
+  text is §16.4.8 (framing) and §16.4.9 (carriers). Deferred, each to the phase that first needs it: E2407 and the
+  `WireFrame` segmentation under a real BLE mtu to phase 5 (the first `:unreliable` carrier whose `mtu` a
+  fixed-size frame can exceed), and the Linux emitters' side of the FFI struct-result fix to phase 3.
 
 **Checks of §9.3 beyond the type walk:** E2406 (`decode` on external-danger-touched bytes outside a
 `sequence proc[external_danger]` block, in `ffi/ffi_taint_checker.silica`; trial
