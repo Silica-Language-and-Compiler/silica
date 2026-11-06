@@ -1,9 +1,9 @@
 # trials/platform/apple_silicon_mac.mk -- toolchain values for trials whose emitted code runs on
 # an Apple Silicon Mac. These are the values inlined today in 43 trial makefiles, unchanged.
 #
-# Nothing includes this file yet (see linux_x86_64.mk for the intended include). When it is
-# included from trials/silica_compiler.mk, the following lines are deleted from each makefile
-# below (counts over the 43 files; `?=` and `:=` variants both appear):
+# trials/silica_compiler.mk includes this file (-include platform/$(SILICA_EMIT_TARGET).mk). The
+# following lines are still inlined in each makefile below and can be deleted now that this
+# fragment is included (counts over the 43 files; `?=` and `:=` variants both appear):
 #
 #   RUST_SYSROOT := $(shell rustc --print sysroot 2>/dev/null)                              40
 #   RUST_TARGET := $(shell rustc -vV 2>/dev/null | sed -n "s/^host: *//p")                  40
@@ -31,9 +31,11 @@
 #   uint64_addition uint8_addition
 #
 # The rust-lld path: 40 makefiles still prefer rust-lld from the Rust sysroot when rustc is
-# installed and fall back to clang. The Rust bootstrap is retired, so once this fragment is the
-# only definition the rust-lld branch can go too (LINKER := clang); it is kept here verbatim so
-# that including this file changes no behavior.
+# installed and fall back to clang. Apple links with clang only (2026-11-06; the Rust bootstrap is
+# retired), so the linker variables below are `override`s, exactly as linux_x86_64.mk does: the
+# per-trial assignments after this include are discarded, every `test -x "$(RUST_LLD)"` in a
+# recipe fails and the clang branch runs, and the ffi link-fail golden suffix resolves to .clang.
+# Deleting the rust-lld branches from the 40 makefiles is the remaining cleanup.
 
 PLATFORM_ID := macos-applesilicon
 EMIT_TARGET := apple_silicon_mac
@@ -44,13 +46,14 @@ MACOS_MIN_VERSION ?= 26.0
 ASFLAGS_macos := -mmacosx-version-min=$(MACOS_MIN_VERSION)
 ASFLAGS := $(ASFLAGS_macos)
 
-RUST_SYSROOT := $(shell rustc --print sysroot 2>/dev/null)
-RUST_TARGET := $(shell rustc -vV 2>/dev/null | sed -n "s/^host: *//p")
-RUST_LLD := $(RUST_SYSROOT)/lib/rustlib/$(RUST_TARGET)/bin/rust-lld
-LINKER := $(shell test -x "$(RUST_LLD)" && echo "$(RUST_LLD)" || echo "clang")
+# clang only: rust-lld is not supported on Apple.
+override RUST_SYSROOT :=
+override RUST_TARGET :=
+override RUST_LLD := /nonexistent
+override LINKER := clang
 
 ARCH := arm64
-LDFLAGS_rust-lld := -arch $(ARCH) -platform_version macos $(MACOS_MIN_VERSION) $(MACOS_MIN_VERSION) -syslibroot $(MACOS_SDK) -lSystem -e main
+override LDFLAGS_rust-lld :=
 LDFLAGS_clang := -Wl,-e,main -Wl,-macos_version_min,$(MACOS_MIN_VERSION)
 LDFLAGS := $(LDFLAGS_clang)
 # deep_frame_spill_addition appends -Wl,-stack_size,$(STACK_SIZE) / -stack_size $(STACK_SIZE) itself.
