@@ -1,0 +1,236 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The (:udp) carrier of transport_serialization_design.md §6.3: a dangerous actor over the socket
+// wrappers (dangerous_sockets) speaking the carrier contract of §6.2, one endpoint per bound port.
+// It is opened with (:open, owner, address) where address is "host:port@local": the peer every :tx
+// segment goes to, and the local port to bind on 127.0.0.1 (0 picks a free port; :link_up carries
+// "port:<n>"). Every :rx is one datagram, delivered against the owner's :credit; the endpoint polls
+// its socket between mailbox messages with a 20 ms timeout.
+module dangerous_udp_carrier;
+
+use dangerous_sockets;
+
+export initial/0;
+export carrier/2;
+
+fn initial() -> { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64 } {
+    { owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, peer_host: "", peer_port: 0 }
+}
+
+// "host:port@local": the peer and the local port.
+fn at_index(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> case byte_at(s, i) == 64 of { true -> i; false -> at_index(s, i + 1) }
+    }
+}
+
+fn peer_part(address: string) -> string {
+    substring(address, 0, at_index(address, 0))
+}
+
+fn local_port_of(address: string) -> int64 {
+    digits_from(address, at_index(address, 0) + 1, 0)
+}
+
+fn starts(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+fn digits_from(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            d: int64 <- byte_at(s, i) - 48;
+            case d < 0 or d > 9 of {
+                true -> acc;
+                false -> digits_from(s, i + 1, acc * 10 + d)
+            }
+        }
+    }
+}
+
+fn host_of(address: string) -> string {
+    substring_until_char(address, 0, ':')
+}
+
+fn port_of(address: string) -> int64 {
+    h: string <- host_of(address);
+    digits_from(address, length_bytes(h) + 1, 0)
+}
+
+fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
+    case r of {
+        (:ok, v: int64) -> v;
+        (:rejected, _why: atom) -> 0 - 1
+    }
+}
+
+fn int_text_from(n: int64, acc: string) -> string {
+    case n < 10 of {
+        true -> concat(substring("0123456789", n, n + 1), acc);
+        false -> int_text_from(n / 10, concat(substring("0123456789", n % 10, n % 10 + 1), acc))
+    }
+}
+
+fn int_text(n: int64) -> string {
+    int_text_from(n, "")
+}
+
+// The message read without the worker's effects: pure selectors a sequence can bind.
+fn msg_kind(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> atom {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> :open;
+        (:tx, _s: string, _f: actor_ref) -> :tx;
+        (:credit, _n: int64) -> :credit;
+        :close -> :close;
+        :poll -> :poll
+    }
+}
+
+fn msg_owner(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, fallback: actor_ref) -> actor_ref {
+    case msg of {
+        (:open, o: actor_ref, _a: string) -> o;
+        (:tx, _s: string, _f: actor_ref) -> fallback;
+        (:credit, _n: int64) -> fallback;
+        :close -> fallback;
+        :poll -> fallback
+    }
+}
+
+fn msg_text(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> string {
+    case msg of {
+        (:open, _o: actor_ref, a: string) -> a;
+        (:tx, s: string, _f: actor_ref) -> s;
+        (:credit, _n: int64) -> "";
+        :close -> "";
+        :poll -> ""
+    }
+}
+
+fn msg_count(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> int64 {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> 0;
+        (:tx, _s: string, _f: actor_ref) -> 0;
+        (:credit, n: int64) -> n;
+        :close -> 0;
+        :poll -> 0
+    }
+}
+
+fn none_res() -> { tag: int64, value: int64, error_code: int64 } {
+    { tag: 2, value: 0 - 1, error_code: 0 }
+}
+
+fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64 }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64 }) {
+    sequence proc[external_danger, concurrency]
+        kind: atom <- msg_kind(msg);
+        owner: actor_ref <- msg_owner(msg, state.owner);
+        text: string <- msg_text(msg);
+        do_open: boolean <- kind == :open;
+        peer: string <- case do_open of { true -> peer_part(text); false -> "" };
+        host: string <- case do_open of { true -> host_of(peer); false -> state.peer_host };
+        pport: int64 <- case do_open of { true -> port_of(peer); false -> state.peer_port };
+        res_open: { tag: int64, value: int64, error_code: int64 } <- case do_open of {
+            true -> dangerous_sockets@udp_bind(local_port_of(text));
+            false -> none_res()
+        };
+        open_tag_raw: int64 <- res_open.tag;
+        open_fd_raw: int64 <- res_open.value;
+        open_tag: int64 <- pure_int(recreate(open_tag_raw));
+        open_fd: int64 <- pure_int(recreate(open_fd_raw));
+        bound: boolean <- do_open and open_tag == 0;
+        res_port: { tag: int64, value: int64, error_code: int64 } <- case bound of {
+            true -> dangerous_sockets@local_port(open_fd);
+            false -> none_res()
+        };
+        port_raw: int64 <- res_port.value;
+        port: int64 <- pure_int(recreate(port_raw));
+        do_tx: boolean <- kind == :tx and state.up;
+        res_tx: { tag: int64, value: int64, error_code: int64 } <- case do_tx of {
+            true -> dangerous_sockets@udp_send(state.fd, host, pport, text);
+            false -> none_res()
+        };
+        tx_tag_raw: int64 <- res_tx.tag;
+        tx_tag: int64 <- pure_int(recreate(tx_tag_raw));
+        do_rx: boolean <- kind == :poll and state.up and state.rx_credit > 0;
+        res_rx: { tag: int64, value: int64, error_code: int64 } <- case do_rx of {
+            true -> dangerous_sockets@udp_recv(state.fd, 65535, 20);
+            false -> none_res()
+        };
+        rx_tag_raw: int64 <- res_rx.tag;
+        rx_tag: int64 <- pure_int(recreate(rx_tag_raw));
+        got: boolean <- do_rx and rx_tag == 0;
+        bytes_in: string <- case got of {
+            true -> dangerous_sockets@take(state.fd);
+            false -> ""
+        };
+        do_close: boolean <- kind == :close;
+        _: { tag: int64, value: int64, error_code: int64 } <- case do_close of {
+            true -> dangerous_sockets@close_fd(state.fd);
+            false -> none_res()
+        };
+        link_down_now: boolean <- (do_open and open_tag != 0) or (do_rx and rx_tag == 1) or do_close;
+        _: boolean <- case bound of {
+            true -> cast(owner, (:link_up, concat("port:", int_text(port))) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case bound of {
+            true -> cast(owner, (:tx_credit, 8) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case do_tx of {
+            true -> case tx_tag == 0 of {
+                true -> cast(owner, (:tx_credit, 1) impl ActorMessage {});
+                false -> cast(owner, (:tx_failed, :link_down) impl ActorMessage {})
+            };
+            false -> case kind == :tx of {
+                true -> cast(owner, (:tx_failed, :link_down) impl ActorMessage {});
+                false -> true
+            }
+        };
+        _: boolean <- case got of {
+            true -> cast(owner, (:rx, bytes_in) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case link_down_now of {
+            true -> cast(owner, (:link_down, case do_close of { true -> :closed; false -> :fault }) impl ActorMessage {});
+            false -> true
+        };
+        up_next: boolean <- case link_down_now of { true -> false; false -> state.up or bound };
+        fd_next: int64 <- case do_open of { true -> open_fd; false -> case do_close of { true -> 0 - 1; false -> state.fd } };
+        credit_next: int64 <- case kind == :credit of {
+            true -> state.rx_credit + msg_count(msg);
+            false -> case got of { true -> state.rx_credit - 1; false -> state.rx_credit }
+        };
+        keep_polling: boolean <- bound or (kind == :poll and up_next);
+        poll_delay: uint64 <- case kind == :poll and up_next and state.rx_credit == 0 of { true -> 20; false -> 1 };
+        _: boolean <- case keep_polling of {
+            true -> {
+                sequence proc[concurrency]
+                    _: timer_ref <- send_after(poll_delay, self(), :poll impl ActorMessage {})
+                produces
+                    pure true
+                end
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, { owner: owner, fd: fd_next, rx_credit: credit_next, up: up_next, peer_host: host, peer_port: pport })
+    end
+}

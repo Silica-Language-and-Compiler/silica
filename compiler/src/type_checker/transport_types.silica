@@ -1,0 +1,735 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The transportable type walker (transport_serialization_design.md §4.2): the one reading of an
+// inline type's text that the Transportable declaration check (type_checker_transport), the
+// encode / decode call check (type_checker_expressions_wire) and the derivation
+// (transport_derive) share. Types are walked as normalized text, spaces removed, split at the
+// top level by the bracket depth of ( ) [ ] { }, as the record and list helpers of the type
+// checker do; there is no tree.
+//
+// Kinds: unit, boolean, int8 .. uint64, float32, float64, string, atom, actor_ref, atom_lit
+// (`:name`), tuple (`(A, B)`), tagged (`(:tag, A, B)`), record (`{ f: A }`), list
+// (`List[E, mem(S)]`), sum (`A | B`), and other for everything the design lists as not
+// transportable in this phase (functions, regions, refs, buffers, windows, capabilities, timers,
+// cores, vectors, float16, char, recursive slots).
+
+export norm_type/1;
+export kind_of/1;
+export split_top/2;
+export tuple_elems/1;
+export record_fields/1;
+export field_name/1;
+export field_type/1;
+export list_elem/1;
+export sum_variants/1;
+export atom_lit_name/1;
+export sort_fields/1;
+export transport_problem/1;
+export is_variable_sized/1;
+export is_integer_kind/1;
+export parse_decimal/1;
+export limits_text/4;
+export default_limits_text/0;
+export limits_of_text/2;
+export limits_field/2;
+export has_slot/1;
+export slot_referent/1;
+export slot_lifetime/1;
+export slot_lifetime_of_type/1;
+export int_text/1;
+export known_wire_format/1;
+export decode_target_of_surface/1;
+export format_of_tag_text/1;
+
+fn strip_spaces_from(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == " " or c == "\t" or c == "\n" of {
+                true -> strip_spaces_from(s, i + 1, acc);
+                false -> strip_spaces_from(s, i + 1, concat(acc, c))
+            }
+        }
+    }
+}
+
+// The type's text with every space removed, and a list space spelled `mem(normal)`: the type
+// printer writes `List[T,normal]` for what source spells `List[T, mem(normal)]`, and both must
+// name one type. Type text is ASCII, so byte and character positions agree.
+fn norm_type(t: string) -> string {
+    canon_spaces_from(strip_spaces_from(t, 0, ""), 0, "")
+}
+
+fn canon_spaces_from(s: string, i: int64, acc: string) -> string {
+    n: int64 <- length_bytes(s);
+    case i >= n of {
+        true -> acc;
+        false -> case i + 8 <= n and substring(s, i, i + 8) == ",normal]" of {
+            true -> canon_spaces_from(s, i + 8, concat(acc, ",mem(normal)]"));
+            false -> canon_spaces_from(s, i + 1, concat(acc, substring(s, i, i + 1)))
+        }
+    }
+}
+
+fn is_open(c: string) -> boolean {
+    c == "(" or c == "[" or c == "{"
+}
+
+fn is_close(c: string) -> boolean {
+    c == ")" or c == "]" or c == "}"
+}
+
+fn split_top_from(s: string, sep: string, i: int64, depth: int64, piece: string, acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case i >= length_bytes(s) of {
+        true -> {
+            sequence proc[mem(normal)]
+                out: List[string, mem(normal)] <- prepend[string, mem(normal)](piece, acc)
+            produces
+                pure out
+            end
+        };
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == sep and depth == 0 of {
+                true -> {
+                    sequence proc[mem(normal)]
+                        acc2: List[string, mem(normal)] <- prepend[string, mem(normal)](piece, acc);
+                        out: List[string, mem(normal)] <- split_top_from(s, sep, i + 1, depth, "", acc2)
+                    produces
+                        pure out
+                    end
+                };
+                false -> {
+                    d: int64 <- case is_open(c) of { true -> depth + 1; false -> case is_close(c) of { true -> depth - 1; false -> depth } };
+                    split_top_from(s, sep, i + 1, d, concat(piece, c), acc)
+                }
+            }
+        }
+    }
+}
+
+fn reverse_strings(xs: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case xs of {
+        []: List[string, mem(normal)] -> acc;
+        [h: string, t: List[string, mem(normal)]] -> {
+            sequence proc[mem(normal)]
+                acc2: List[string, mem(normal)] <- prepend[string, mem(normal)](h, acc)
+            produces
+                pure reverse_strings(t, acc2)
+            end
+        }
+    }
+}
+
+// The pieces of `s` between the occurrences of the one-character `sep` at bracket depth 0, in order.
+// An empty `s` gives one empty piece.
+fn split_top(s: string, sep: string) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        none: List[string, mem(normal)] <- empty[string, mem(normal)]();
+        rev: List[string, mem(normal)] <- split_top_from(s, sep, 0, 0, "", none);
+        out: List[string, mem(normal)] <- reverse_strings(rev, none)
+    produces
+        pure out
+    end
+}
+
+fn count_strings(xs: List[string, mem(normal)], acc: int64) -> int64 {
+    case xs of {
+        []: List[string, mem(normal)] -> acc;
+        [_h: string, t: List[string, mem(normal)]] -> count_strings(t, acc + 1)
+    }
+}
+
+fn strip_outer(s: string) -> string {
+    case length_bytes(s) >= 2 of {
+        true -> substring(s, 1, length_bytes(s) - 1);
+        false -> ""
+    }
+}
+
+fn starts(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+fn ends(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, length_bytes(s) - length_bytes(p), length_bytes(s)) == p
+}
+
+fn is_scalar_kind(t: string) -> boolean {
+    t == "unit" or t == "boolean" or t == "bool" or t == "int8" or t == "int16" or t == "int32" or t == "int64"
+        or t == "uint8" or t == "uint16" or t == "uint32" or t == "uint64" or t == "float16" or t == "float32" or t == "float64"
+        or t == "string" or t == "atom" or t == "char" or t == "actor_ref"
+}
+
+fn is_integer_kind(t: string) -> boolean {
+    t == "int8" or t == "int16" or t == "int32" or t == "int64" or t == "uint8" or t == "uint16" or t == "uint32" or t == "uint64"
+}
+
+// The kind of a normalized type text.
+fn kind_of(t: string) -> string {
+    case t == "()" of {
+        true -> "unit";
+        false -> case t == "bool" of {
+            true -> "boolean";
+            false -> case is_scalar_kind(t) of {
+                true -> t;
+                false -> {
+                    variants: List[string, mem(normal)] <- split_top(t, "|");
+                    nv: int64 <- count_strings(variants, 0);
+                    case nv > 1 of {
+                            true -> "sum";
+                            false -> case starts(t, ":") of {
+                                true -> "atom_lit";
+                                false -> case starts(t, "{") and ends(t, "}") of {
+                                    true -> "record";
+                                    false -> case starts(t, "List[") and ends(t, "]") of {
+                                        true -> "list";
+                                        false -> case starts(t, "ref?(") of {
+                                            true -> "slot";
+                                            false -> case starts(t, "(") and ends(t, ")") of {
+                                                true -> case starts(t, "(:") of {
+                                                    true -> "tagged";
+                                                    false -> "tuple"
+                                                };
+                                                false -> "other"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                }
+            }
+        }
+    }
+}
+
+// The element types of a tuple or tagged tuple, the tag included for a tagged one.
+fn tuple_elems(t: string) -> List[string, mem(normal)] {
+    expand_slots(split_top(strip_outer(t), ","), t)
+}
+
+// The `name:type` pieces of a record type, in declared order.
+fn record_fields(t: string) -> List[string, mem(normal)] {
+    inner: string <- strip_outer(t);
+    case length_bytes(inner) == 0 of {
+        true -> {
+            sequence proc[mem(normal)]
+                none: List[string, mem(normal)] <- empty[string, mem(normal)]()
+            produces
+                pure none
+            end
+        };
+        false -> split_top(inner, ",")
+    }
+}
+
+fn find_colon(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 1) == ":" of {
+            true -> i;
+            false -> find_colon(s, i + 1)
+        }
+    }
+}
+
+fn field_name(f: string) -> string {
+    c: int64 <- find_colon(f, 0);
+    case c < 0 of {
+        true -> f;
+        false -> substring(f, 0, c)
+    }
+}
+
+fn field_type(f: string) -> string {
+    c: int64 <- find_colon(f, 0);
+    case c < 0 of {
+        true -> "";
+        false -> substring(f, c + 1, length_bytes(f))
+    }
+}
+
+// The element type of `List[E, mem(S)]` (or `List[E]`).
+fn list_elem(t: string) -> string {
+    inner: string <- substring(t, 5, length_bytes(t) - 1);
+    parts: List[string, mem(normal)] <- split_top(inner, ",");
+    case parts of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+fn sum_variants(t: string) -> List[string, mem(normal)] {
+    split_top(t, "|")
+}
+
+fn atom_lit_name(t: string) -> string {
+    case starts(t, ":") of {
+        true -> substring(t, 1, length_bytes(t));
+        false -> t
+    }
+}
+
+// Insertion sort of `name:type` pieces by name, byte order: the wire order of a record's fields.
+fn insert_field(f: string, sorted: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case sorted of {
+        []: List[string, mem(normal)] -> {
+            sequence proc[mem(normal)]
+                out: List[string, mem(normal)] <- prepend[string, mem(normal)](f, sorted)
+            produces
+                pure out
+            end
+        };
+        [h: string, t: List[string, mem(normal)]] -> case field_name(f) < field_name(h) of {
+            true -> {
+                sequence proc[mem(normal)]
+                    out: List[string, mem(normal)] <- prepend[string, mem(normal)](f, sorted)
+                produces
+                    pure out
+                end
+            };
+            false -> {
+                sequence proc[mem(normal)]
+                    rest: List[string, mem(normal)] <- insert_field(f, t);
+                    out: List[string, mem(normal)] <- prepend[string, mem(normal)](h, rest)
+                produces
+                    pure out
+                end
+            }
+        }
+    }
+}
+
+fn sort_fields_from(fields: List[string, mem(normal)], sorted: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case fields of {
+        []: List[string, mem(normal)] -> sorted;
+        [h: string, t: List[string, mem(normal)]] -> sort_fields_from(t, insert_field(h, sorted))
+    }
+}
+
+fn sort_fields(fields: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        none: List[string, mem(normal)] <- empty[string, mem(normal)]();
+        out: List[string, mem(normal)] <- sort_fields_from(fields, none)
+    produces
+        pure out
+    end
+}
+
+// The wire discriminator of a sum variant: what decode can tell variants apart by (design §4.2,
+// E2404). Two variants with the same discriminator are indistinguishable.
+fn variant_discriminator(v: string) -> string {
+    k: string <- kind_of(v);
+    case k of {
+        "atom_lit" -> concat("atom:", atom_lit_name(v));
+        "atom" -> "atom:*";
+        "tagged" -> {
+            es: List[string, mem(normal)] <- tuple_elems(v);
+            case es of {
+                []: List[string, mem(normal)] -> "tag:";
+                [h: string, _t: List[string, mem(normal)]] -> concat("tag:", atom_lit_name(h))
+            }
+        };
+        "tuple" -> {
+            es: List[string, mem(normal)] <- tuple_elems(v);
+            n: int64 <- count_strings(es, 0);
+            concat("tuple:", int_text(n))
+        };
+        // One record variant per sum: on the wire it is the map among atoms and tuples (ETF
+        // peek_kind). A list or scalar variant cannot even be written as a binding type today
+        // (E1040 at the parser), so it is not a transportable variant.
+        "record" -> "map";
+        _: string -> concat("unsupported:", v)
+    }
+}
+
+fn strings_contain(xs: List[string, mem(normal)], s: string) -> boolean {
+    case xs of {
+        []: List[string, mem(normal)] -> false;
+        [h: string, t: List[string, mem(normal)]] -> case h == s of {
+            true -> true;
+            false -> strings_contain(t, s)
+        }
+    }
+}
+
+fn variants_distinct(vs: List[string, mem(normal)], seen: List[string, mem(normal)]) -> string {
+    case vs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            d: string <- variant_discriminator(h);
+            case starts(d, "unsupported:") of {
+                true -> concat("variant ", concat(h, " is not an atom or a tagged tuple, the sum variants a case can select (design §4.2)"));
+                false -> case strings_contain(seen, d) or (starts(d, "atom:") and strings_contain(seen, "atom:*")) or (d == "atom:*" and has_atom_discriminator(seen)) of {
+                true -> concat("variants of ", concat(h, " cannot be told apart on the wire"));
+                false -> {
+                    sequence proc[mem(normal)]
+                        seen2: List[string, mem(normal)] <- prepend[string, mem(normal)](d, seen)
+                    produces
+                        pure variants_distinct(t, seen2)
+                    end
+                }
+                }
+            }
+        }
+    }
+}
+
+fn has_atom_discriminator(seen: List[string, mem(normal)]) -> boolean {
+    case seen of {
+        []: List[string, mem(normal)] -> false;
+        [h: string, t: List[string, mem(normal)]] -> case starts(h, "atom:") of {
+            true -> true;
+            false -> has_atom_discriminator(t)
+        }
+    }
+}
+
+fn problems_in_list(ts: List[string, mem(normal)], path: string) -> string {
+    case ts of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            p: string <- transport_problem_at(h, path);
+            case length_bytes(p) > 0 of {
+                true -> p;
+                false -> problems_in_list(t, path)
+            }
+        }
+    }
+}
+
+fn field_types(fields: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case fields of {
+        []: List[string, mem(normal)] -> fields;
+        [h: string, t: List[string, mem(normal)]] -> {
+            sequence proc[mem(normal)]
+                rest: List[string, mem(normal)] <- field_types(t);
+                out: List[string, mem(normal)] <- prepend[string, mem(normal)](field_type(h), rest)
+            produces
+                pure out
+            end
+        }
+    }
+}
+
+fn tagged_payload(es: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case es of {
+        []: List[string, mem(normal)] -> es;
+        [_h: string, t: List[string, mem(normal)]] -> t
+    }
+}
+
+// "" when the normalized type `t` is transportable; otherwise why not, naming the component.
+fn transport_problem_at(t: string, path: string) -> string {
+    k: string <- kind_of(t);
+    case k of {
+        "other" -> concat(concat(concat("component ", t), " at "), concat(path, " is not transportable (design §4.2)"));
+        "slot" -> case slot_referent(t) == "rec" or length_bytes(path) == 0 of {
+            true -> concat(concat(concat("component ", t), " at "), concat(path, " is a recursive slot outside the tuple it recurses into (design §4.2)"));
+            false -> ""
+        };
+        "atom_lit" -> "";
+        "tuple" -> {
+            es: List[string, mem(normal)] <- tuple_elems(t);
+            problems_in_list(es, concat(path, "()"))
+        };
+        "tagged" -> {
+            es: List[string, mem(normal)] <- tuple_elems(t);
+            payload: List[string, mem(normal)] <- tagged_payload(es);
+            problems_in_list(payload, concat(path, "()"))
+        };
+        "record" -> {
+            fs: List[string, mem(normal)] <- record_fields(t);
+            ts: List[string, mem(normal)] <- field_types(fs);
+            problems_in_list(ts, concat(path, "{}"))
+        };
+        "list" -> transport_problem_at(list_elem(t), concat(path, "[]"));
+        "sum" -> {
+            sequence proc[mem(normal)]
+                vs: List[string, mem(normal)] <- sum_variants(t);
+                none: List[string, mem(normal)] <- empty[string, mem(normal)]();
+                dis: string <- variants_distinct(vs, none);
+                p: string <- case length_bytes(dis) > 0 of {
+                    true -> dis;
+                    false -> problems_in_list(vs, concat(path, "|"))
+                }
+            produces
+                pure p
+            end
+        };
+        _: string -> ""
+    }
+}
+
+fn transport_problem(t: string) -> string {
+    transport_problem_at(norm_type(t), "")
+}
+
+fn any_variable_sized(ts: List[string, mem(normal)]) -> boolean {
+    case ts of {
+        []: List[string, mem(normal)] -> false;
+        [h: string, t: List[string, mem(normal)]] -> case is_variable_sized(h) of {
+            true -> true;
+            false -> any_variable_sized(t)
+        }
+    }
+}
+
+// A type with a string or a list anywhere in it has no fixed size, so its declaration needs limits.
+fn is_variable_sized(t: string) -> boolean {
+    k: string <- kind_of(t);
+    case k of {
+        "string" -> true;
+        "list" -> true;
+        "slot" -> true;
+        "tuple" -> {
+            es: List[string, mem(normal)] <- tuple_elems(t);
+            any_variable_sized(es)
+        };
+        "tagged" -> {
+            es: List[string, mem(normal)] <- tuple_elems(t);
+            any_variable_sized(tagged_payload(es))
+        };
+        "record" -> {
+            fs: List[string, mem(normal)] <- record_fields(t);
+            any_variable_sized(field_types(fs))
+        };
+        "sum" -> {
+            vs: List[string, mem(normal)] <- sum_variants(t);
+            any_variable_sized(vs)
+        };
+        _: string -> false
+    }
+}
+
+fn digit_value(c: string) -> int64 {
+    case c of {
+        "0" -> 0; "1" -> 1; "2" -> 2; "3" -> 3; "4" -> 4;
+        "5" -> 5; "6" -> 6; "7" -> 7; "8" -> 8; "9" -> 9;
+        _: string -> -1
+    }
+}
+
+fn parse_decimal_from(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            d: int64 <- digit_value(substring(s, i, i + 1));
+            case d < 0 of {
+                true -> -1;
+                false -> parse_decimal_from(s, i + 1, acc * 10 + d)
+            }
+        }
+    }
+}
+
+// A non-negative decimal literal's value, or -1 when the text is not one.
+fn parse_decimal(s: string) -> int64 {
+    case length_bytes(s) == 0 of {
+        true -> -1;
+        false -> parse_decimal_from(s, 0, 0)
+    }
+}
+
+fn int_text_from(n: int64, acc: string) -> string {
+    case n == 0 of {
+        true -> acc;
+        false -> {
+            d: int64 <- n % 10;
+            c: string <- case d of {
+                0 -> "0"; 1 -> "1"; 2 -> "2"; 3 -> "3"; 4 -> "4";
+                5 -> "5"; 6 -> "6"; 7 -> "7"; 8 -> "8"; _: int64 -> "9"
+            };
+            int_text_from(n / 10, concat(c, acc))
+        }
+    }
+}
+
+// The decimal text of a non-negative int64.
+fn int_text(n: int64) -> string {
+    case n == 0 of {
+        true -> "0";
+        false -> case n < 0 of {
+            true -> concat("-", int_text_from(0 - n, ""));
+            false -> int_text_from(n, "")
+        }
+    }
+}
+
+// The wire protocols the language provides (design §8): one built-in module wire_<tag> each.
+// The wire protocols the language names (design §8): a build provides those its transport pack
+// lists; the others are E2410 at the call (sir_target_verify), not E2408.
+fn known_wire_format(fmt: string) -> boolean {
+    fmt == "etf" or fmt == "cbor"
+}
+
+// "etf" from the literal text `(:etf)` or `:etf`; "" for anything else.
+fn format_of_tag_text(tag: string) -> string {
+    t: string <- norm_type(tag);
+    inner: string <- case starts(t, "(") and ends(t, ")") of {
+        true -> strip_outer(t);
+        false -> t
+    };
+    case starts(inner, ":") of {
+        true -> substring(inner, 1, length_bytes(inner));
+        false -> ""
+    }
+}
+
+// T from a decode binding's surface type `(:ok, T) | (:rejected, atom)`; "" when it has another shape.
+fn decode_target_of_surface(surface: string) -> string {
+    ns: string <- norm_type(surface);
+    n: int64 <- length_bytes(ns);
+    case n > 23 and starts(ns, "(:ok,") and ends(ns, ")|(:rejected,atom)") of {
+        true -> substring(ns, 5, n - 18);
+        false -> ""
+    }
+}
+
+// ---- limits as text ---------------------------------------------------------------------------------
+// The limits of a decode (or recreate) call travel from the type checker to the derivation as one
+// string "max_bytes,max_depth,max_length,utf8" (design §4.1): compile-time constants, baked into the
+// derived decoder, so one (format, type, limits) triple is one derived family.
+
+fn limits_text(mb: int64, md: int64, ml: int64, utf8: boolean) -> string {
+    u: string <- case utf8 of { true -> "1"; false -> "0" };
+    concat(int_text(mb), concat(",", concat(int_text(md), concat(",", concat(int_text(ml), concat(",", u))))))
+}
+
+fn default_limits_text() -> string {
+    limits_text(1048576, 64, 1048576, false)
+}
+
+fn limits_field_from(s: string, i: int64, field: int64, start: int64) -> string {
+    case i >= length_bytes(s) of {
+        true -> case field == 0 of { true -> substring(s, start, i); false -> "" };
+        false -> case substring(s, i, i + 1) == "," of {
+            true -> case field == 0 of {
+                true -> substring(s, start, i);
+                false -> limits_field_from(s, i + 1, field - 1, i + 1)
+            };
+            false -> limits_field_from(s, i + 1, field, start)
+        }
+    }
+}
+
+// Field n (0-based) of a limits text.
+fn limits_field(s: string, n: int64) -> string {
+    limits_field_from(s, 0, n, 0)
+}
+
+fn limits_of_text(s: string, tt: string) -> { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean } {
+    full: string <- case length_bytes(s) == 0 of { true -> default_limits_text(); false -> s };
+    { found: true, type_text: tt, max_bytes: parse_decimal(limits_field(full, 0)), max_depth: parse_decimal(limits_field(full, 1)), max_length: parse_decimal(limits_field(full, 2)), utf8: limits_field(full, 3) == "1" }
+}
+
+// ---- recursive slots -------------------------------------------------------------------------------
+// A tuple element `ref?(L, S, rec)` names the tuple that holds it (specification §4.2.2). The walk
+// spells it expanded, `ref?(L, S, <the tuple>)`, as the language does in a binding, so a subtype's
+// text names its referent; `rec` then appears only inside that referent.
+
+fn expand_slots(es: List[string, mem(normal)], owner: string) -> List[string, mem(normal)] {
+    case es of {
+        []: List[string, mem(normal)] -> es;
+        [h: string, t: List[string, mem(normal)]] -> {
+            sequence proc[mem(normal)]
+                rest: List[string, mem(normal)] <- expand_slots(t, owner);
+                h2: string <- case starts(h, "ref?(") and slot_referent(h) == "rec" of {
+                    true -> concat(substring(h, 0, length_bytes(h) - 4), concat(owner, ")"));
+                    false -> h
+                };
+                out: List[string, mem(normal)] <- prepend[string, mem(normal)](h2, rest)
+            produces
+                pure out
+            end
+        }
+    }
+}
+
+fn slot_args(t: string) -> List[string, mem(normal)] {
+    split_top(substring(t, 5, length_bytes(t) - 1), ",")
+}
+
+fn nth_string(xs: List[string, mem(normal)], n: int64) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> case n == 0 of { true -> h; false -> nth_string(t, n - 1) }
+    }
+}
+
+// The referent of a slot type: "rec" when unexpanded, the owner tuple's text when expanded.
+fn slot_referent(t: string) -> string {
+    nth_string(slot_args(t), 2)
+}
+
+fn slot_lifetime(t: string) -> string {
+    nth_string(slot_args(t), 0)
+}
+
+fn has_slot(t: string) -> boolean {
+    k: string <- kind_of(t);
+    case k of {
+        "slot" -> true;
+        "tuple" -> any_slot(tuple_elems(t));
+        "tagged" -> any_slot(tagged_payload_types(tuple_elems(t)));
+        "record" -> any_slot(field_types(record_fields(t)));
+        "list" -> has_slot(list_elem(t));
+        "sum" -> any_slot(sum_variants(t));
+        _: string -> false
+    }
+}
+
+fn any_slot(ts: List[string, mem(normal)]) -> boolean {
+    case ts of {
+        []: List[string, mem(normal)] -> false;
+        [h: string, t: List[string, mem(normal)]] -> case has_slot(h) of { true -> true; false -> any_slot(t) }
+    }
+}
+
+fn tagged_payload_types(es: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case es of {
+        []: List[string, mem(normal)] -> es;
+        [_h: string, t: List[string, mem(normal)]] -> t
+    }
+}
+
+// The lifetime name the type's first slot uses, "" when the type has none.
+fn slot_lifetime_of_type(t: string) -> string {
+    k: string <- kind_of(t);
+    case k of {
+        "slot" -> slot_lifetime(t);
+        "tuple" -> first_slot_lifetime(tuple_elems(t));
+        "tagged" -> first_slot_lifetime(tagged_payload_types(tuple_elems(t)));
+        "record" -> first_slot_lifetime(field_types(record_fields(t)));
+        "list" -> slot_lifetime_of_type(list_elem(t));
+        "sum" -> first_slot_lifetime(sum_variants(t));
+        _: string -> ""
+    }
+}
+
+fn first_slot_lifetime(ts: List[string, mem(normal)]) -> string {
+    case ts of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            l: string <- slot_lifetime_of_type(h);
+            case length_bytes(l) > 0 of { true -> l; false -> first_slot_lifetime(t) }
+        }
+    }
+}

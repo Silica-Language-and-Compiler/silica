@@ -1,0 +1,182 @@
+// A (:tcp) loopback: a listening carrier and a connecting carrier in one program, the owners speaking
+// the carrier contract (design §6.2) with length-prefixed ETF frames (§5, §4.7). The client sends
+// (:ping, 7); the server decodes it, prints it and answers (:pong, 8); the client prints that and ends.
+module dangerous_tcp_loopback;
+
+use wire_etf;
+use wireframe;
+use carrier;
+use dangerous_sockets;
+use dangerous_tcp_carrier;
+use trial_wait_int64;
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+fn send_term(car: dangerous_actor_ref, v: (:ping, int64) | (:pong, int64)) -> boolean {
+    sequence proc[mem(normal), concurrency]
+        frame: string <- encode((:etf), v);
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, carrier@mtu(:tcp), carrier@boundaries(:tcp));
+        seg: string <- first_segment(segs);
+        sent: boolean <- cast(car, (:tx, seg, self()) impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn show_term(v: (:ping, int64) | (:pong, int64)) -> atom {
+    sequence
+        o: atom <- case v of {
+            (:ping, n: int64) -> {
+                sequence proc[device_io]
+                    _: atom <- print("ping ");
+                    _: atom <- print_int64(n);
+                    o2: atom <- println("")
+                produces pure o2 end
+            };
+            (:pong, n: int64) -> {
+                sequence proc[device_io]
+                    _: atom <- print("pong ");
+                    _: atom <- print_int64(n);
+                    o2: atom <- println("")
+                produces pure o2 end
+            }
+        }
+    produces
+        pure o
+    end
+}
+
+// The server's owner: on :link_up it starts the client side on the port the listener was given;
+// each received frame is decoded, shown and answered with (:pong, 8).
+fn server(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+          state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, credits: int64 })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, credits: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> case starts_with(info, "port:") of {
+            // bound: start the client against the port the listener got
+            true -> {
+                sequence proc[concurrency]
+                    cli_link: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    cli: actor_ref <- spawn({ car: cli_link, rx: wireframe@fresh(:stream), credits: 0 }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    _: boolean <- cast(cli_link, (:open, cli, concat("127.0.0.1:", substring(info, 5, length_bytes(info)))) impl ActorMessage {})
+                produces
+                    pure (:no_reply, state)
+                end
+            };
+            // a peer was accepted: receive against credit
+            false -> {
+                sequence proc[concurrency]
+                    _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {})
+                produces
+                    pure (:no_reply, state)
+                end
+            }
+        };
+        (:tx_credit, n: int64) -> (:no_reply, { car: state.car, rx: state.rx, credits: state.credits + n });
+        (:rx, segment: string) -> {
+            sequence proc[concurrency]
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, frame: string, r2: { mode: atom, expected: int64, pending: string }) -> {
+                        sequence proc[mem(normal), device_io]
+                            decoded: (:ok, (:ping, int64) | (:pong, int64)) | (:rejected, atom) <- decode((:etf), frame);
+                            _: atom <- case decoded of {
+                                (:ok, v: (:ping, int64) | (:pong, int64)) -> show_term(v);
+                                (:rejected, why: atom) -> print_atom(why)
+                            };
+                            _: boolean <- send_term(state.car, (:pong, 8))
+                        produces pure r2 end
+                    };
+                    (:rejected, why2: atom) -> {
+                        sequence proc[device_io]
+                            _: atom <- print_atom(why2)
+                        produces pure state.rx end
+                    }
+                };
+                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, rx: rx2, credits: state.credits })
+            end
+        };
+        (:tx_failed, why3: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print_atom(why3)
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, _why4: atom) -> (:no_reply, state)
+    }
+}
+
+// The client's owner: on :link_up it sends (:ping, 7); the answer is shown and the trial ends.
+fn client(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+          state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, credits: int64 })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, credits: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {});
+                _: boolean <- send_term(state.car, (:ping, 7))
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:tx_credit, n: int64) -> (:no_reply, { car: state.car, rx: state.rx, credits: state.credits + n });
+        (:rx, segment: string) -> {
+            sequence
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, frame: string, r2: { mode: atom, expected: int64, pending: string }) -> {
+                        sequence proc[mem(normal), concurrency, device_io]
+                            decoded: (:ok, (:ping, int64) | (:pong, int64)) | (:rejected, atom) <- decode((:etf), frame);
+                            _: atom <- case decoded of {
+                                (:ok, v: (:ping, int64) | (:pong, int64)) -> show_term(v);
+                                (:rejected, why: atom) -> print_atom(why)
+                            };
+                            _: atom <- println("done");
+                            _: boolean <- cast(state.car, :close impl ActorMessage {});
+                            _: boolean <- cast_exit(0)
+                        produces pure r2 end
+                    };
+                    (:rejected, why2: atom) -> {
+                        sequence proc[device_io]
+                            _: atom <- print_atom(why2)
+                        produces pure state.rx end
+                    }
+                }
+            produces
+                pure (:no_reply, { car: state.car, rx: rx2, credits: state.credits })
+            end
+        };
+        (:tx_failed, why3: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print_atom(why3)
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, _why4: atom) -> (:no_reply, state)
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                srv_link: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                srv: actor_ref <- spawn({ car: srv_link, rx: wireframe@fresh(:stream), credits: 0 }, server, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(srv_link, (:open, srv, "listen:0") impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

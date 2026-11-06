@@ -1,7 +1,7 @@
-# Transport serialization: the `Transportable`, `WireFormat` and `Carrier` traits
+# Transport serialization: the derived `encode`/`decode` and the `WireFormat` and `Carrier` traits
 
-**Status (2026-11-05): design only.** Nothing in this document exists in the compiler, its built-in modules or
-the trials. It is the design that controls the addition of wire transport to Silica: how a Silica value is
+**Status (2026-11-05): phases 0 and 1 implemented on Apple Silicon; see §14.** The rest of this document is
+the design that controls the addition of wire transport to Silica: how a Silica value is
 prepared for transport over TCP/IP and other links, in a form that lets the BEAM External Term Format (ETF) be
 the language's first wire protocol, lets the hardware of the ESP32-S3 port test board and Bluetooth carry the
 same frames, and lets other common protocols be added to the language in the same way. Branch:
@@ -40,19 +40,21 @@ type-directed walk this design reuses); the ETF reference,
 
 ## 0. Summary
 
-Transport is three separable concerns, each a trait, and one compiler derivation:
+Transport is three separable concerns, two of them traits, and one compiler derivation:
 
 | Concern | Trait | Who implements it | What it answers |
 | --- | --- | --- | --- |
-| What may cross | `Transportable` | the program, on its own inline types, with limits | which values can be encoded and decoded, and how large a decoded value may be |
+| What may cross | none: the derivation itself | the compiler, from the static type at each `encode` and `decode` call; the limits of a decode are its third argument | which values can be encoded and decoded, and how large a decoded value may be |
 | How bytes are spelled | `WireFormat` | the language: one built-in implementation per wire protocol, each a numbered subsection of the specification, ETF first; a program cannot add one | the byte encoding of every primitive and container |
 | How bytes travel | `Carrier` | the language and its ports: one built-in implementation per carrier tag such as `(:tcp)`, `(:uart1)` or `(:ble_gatt)`, hosted carriers in the compiler's shared tree, hardware carriers in the port's board tree; a program cannot add one | message boundaries, size limit, delivery guarantees, addressing |
 
-The compiler derives, for every `Transportable` type `T` and every format tag `F` a program uses,
+The compiler derives, for every type `T` and format tag `F` a program's `encode` and `decode` calls use (and, for `decode`, every set of limits),
 
 ```
 encode(F, x: T) -> string
 decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)
+decode(F, bytes: string, { max_bytes: N, max_depth: D, max_length: L }) -> (:ok, T) | (:rejected, atom)
+decode(F, bytes: string, { ... }, r: region(L, normal)) -> (:ok, T) | (:rejected, atom)    // T with ref?(L, S, rec) slots
 ```
 
 by walking the type, exactly as the message copier, the planned `recreate` and the planned `copy_to` walk it. The
@@ -91,7 +93,7 @@ a port can actually provide, and that is already decided by the device-actor and
 4. **Support expansion to other common protocols, as language.** CBOR, MessagePack, JSON, Protocol Buffers and
    a Silica-native compact format must each be addable to the language as one more built-in `WireFormat`
    implementation and one more specification subsection, with no change to the derivation or to any program's
-   `Transportable` declarations (§8).
+   `encode` and `decode` calls (§8).
 
 ---
 
@@ -102,9 +104,11 @@ a port can actually provide, and that is already decided by the device-actor and
    modules. A program declares what it transports; it does not define how bytes are spelled or how a link
    behaves. A new protocol or carrier is a change to the language, made in the compiler's tree with its own
    specification text, trials and roadmap chunk. The surface this adds to the language is small: no new value
-   types, no new effects, and no new syntax beyond the `impl Transportable for T { limits }` form the FFI
-   wrapper specification already uses for `Recreatable` (§7.7).
-2. **Three concerns, three traits, chosen independently.** A program picks a format and a carrier separately:
+   types, no new effects, and no new syntax: `encode` and `decode` are builtin calls, and the limits of a
+   `decode` are an argument of the call, exactly as the FFI wrapper specification's derived `recreate` takes
+   them (§7.7). Decided 2026-11-05 (§12): there is no marker trait to declare; what a program transports is
+   read from the types at its calls.
+2. **Three concerns, two traits, chosen independently.** A program picks a format and a carrier separately:
    ETF over TCP, ETF over UART1, CBOR over BLE. Nothing in a format knows about carriers, and nothing in a
    carrier knows about formats.
 3. **The frame is a `string`.** It is the one value kind that is a message part everywhere (§12.1.6 bars `buf`
@@ -171,45 +175,59 @@ adds two consumers of that descriptor, it does not add a second descriptor.
 
 ---
 
-## 4. `Transportable`: what may cross
+## 4. What may cross
 
-### 4.1 Declaration
+### 4.1 The call, and its limits
 
-A program establishes `Transportable` on an inline type with the `Recreatable` form of the FFI wrapper
-specification §7.7, limits included:
+Nothing is declared. A program calls `encode` and `decode` on its own inline types; the compiler reads the type
+at the call (§4.3) and derives the walk. A `decode` whose type is variable-sized carries its limits as a third
+argument, a record literal of integer literals:
 
 ```silica
-// A sensor reading.
-impl Transportable for (:reading, { x: int16, y: int16, z: int16, at_ms: uint64 });
+// A sensor reading: fixed-size, so decode needs no limits.
+r: (:ok, (:reading, { x: int16, y: int16, z: int16, at_ms: uint64 })) | (:rejected, atom) <- decode((:etf), frame);
 
-// A command with a variable-sized payload: limits are required.
-impl Transportable for { op: :set | :get | :clear, key: string, values: List[int64, normal] }
-    { max_bytes: 4096, max_depth: 4, max_length: 256 };
+// A command with a variable-sized payload: limits are required (E2402 without them).
+c: (:ok, { op: :set | :get | :clear, key: string, values: List[int64, normal] }) | (:rejected, atom)
+    <- decode((:etf), frame, { max_bytes: 4096, max_depth: 4, max_length: 256 });
 ```
 
 - `max_bytes`: the largest frame `decode` will read, in bytes. `encode` never produces a larger frame; if the
   value would exceed it, `encode` fails (§4.4).
-- `max_depth`: the deepest nesting `decode` will follow (tuples, records, lists and recursive slots count one
-  level each).
+- `max_depth`: the deepest nesting `decode` will follow (tuples, records and lists count one level each; a
+  recursive slot counts nothing of its own, the tuple it holds counts).
 - `max_length`: the longest list, string or buffer `decode` will build.
-- A fixed-size type (no `string`, no list, no recursive slot) needs no limits: its bounds are its own. A
-  variable-sized type without an applicable limit is a compile-time error (E2402 below).
+- Any subset may be given; the defaults are 1 MiB, depth 64, and `max_length` equal to `max_bytes`. A fixed-size
+  type (no `string`, no list, no recursive slot) needs no limits: its bounds are its own. A variable-sized type
+  without `max_bytes` is a compile-time error (E2402 below), as is a limits argument that is not a record literal
+  of literals: the limits are compile-time constants, baked into the derived decoder, so each distinct
+  (format, type, limits) triple is one derived function, selected at compile time like the format tag.
 
-**`Transportable` implies `Recreatable`.** `decode` is `recreate` applied to bytes rather than to a tainted
-in-memory value, with the same limits and the same rejection atoms. A type declared `Transportable` therefore
-also has `recreate` once ROADMAP chunk 13 lands; the two declarations use one syntax and one derivation, and a
-type may be declared either or both.
+**A recursive type decodes into the caller's region.** When `T` holds a `ref?(L, S, rec)` slot, `decode`
+takes a fourth argument, a `region(L, normal)` the caller allocated with the slot's lifetime, and every
+present slot of the result is an `alloc_rec` cell in that region; the caller owns the region and its
+lifetime as it owns any region it allocates (specification §12). A fourth argument to the decode of any
+other type is E2402, as is its absence for a recursive type. The limits stay the third argument.
 
-**Where.** `impl Transportable for T { ... }` appears at the top level of any module. One declaration per type
-per program; a second is a compile-time error. Component types need no declaration of their own: the walk
-covers the whole type, and the limits apply to the whole value.
+**`decode` and `recreate` are one mechanism.** `decode` is the `recreate` of the FFI wrapper specification §7.7
+applied to bytes rather than to a tainted in-memory value: the same type-directed walk, the same limits spelled
+the same way at the call, the same rejection atoms, and the same call-site rule for external-danger-touched
+input. Neither has a declaration; neither has a marker trait. When chunk 13 builds `recreate`, it is derived by
+the generator that derives `decode`, and §7.7 is kept in step with this section.
+
+**Why no declaration.** The earlier draft of this design declared each transported type once
+(`impl Transportable for T { limits }`) as the FFI draft declared `Recreatable`. The declaration gave the
+derivation nothing it could not read from the call; its only contents were the limits and an audit point, and
+it could be forgotten (then every call failed) or duplicated. The limits now live where they are used, the call
+site is the audit point (W2401), and a leftover `impl Transportable` or `impl Recreatable` is E2411 with the new
+spelling.
 
 ### 4.2 Which types are transportable
 
 The whole of specification §4, type by type. "Encodes as" names the abstract wire form; §4.6 and each format
 binding say how the format spells it.
 
-| Type (spec section) | Transportable | Encodes as | Decoding rule |
+| Type (spec section) | Crosses | Encodes as | Decoding rule |
 | --- | --- | --- | --- |
 | `unit` (§4.1.1) | yes | the unit value | accept only the unit form |
 | `boolean` (§4.1.2) | yes | boolean | accept only the two booleans |
@@ -249,7 +267,7 @@ decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)           proc[mem(norm
 - `T` is static. For `encode` it is the argument's type. For `decode` it is resolved from context exactly as
   `List[Collectable, S]` is (specification §8.2.4): the binding annotation, the parameter or return position, or
   the scrutinee of a `case`. A `decode` whose `T` cannot be resolved is E2403.
-- `T` must be `Transportable` (E2401, E2402).
+- `T` must be able to cross (E2401, E2404 at the call) and, when it is variable-sized, the call must give limits (E2402).
 - Both allocate, so they are called inside a `sequence proc[mem(normal)]` block. They declare no other effect.
 - `decode` never returns partial data, and `(:rejected, reason)` names the first check that failed.
 
@@ -547,9 +565,9 @@ with response, and the MTU is only known after `:link_up`.
 
 ### 6.6 The board's sensors and actuators as transportable values
 
-The board's hardware that is not a link appears in transport as typed values. The port ships, beside its board
-pack, `Transportable` declarations for a small vocabulary of board values so that a BEAM node and a Silica program
-agree on them without further declaration:
+The board's hardware that is not a link appears in transport as typed values. The port documents, beside its
+board pack, a small vocabulary of board value types and the limits a decoder of each should use, so that a BEAM
+node and a Silica program agree on them:
 
 | Hardware | Value type | Direction |
 | --- | --- | --- |
@@ -561,7 +579,7 @@ agree on them without further declaration:
 | buzzer | `(:tone, { hz: uint32, ms: uint32 })` | peer to board |
 | display | `(:text, { row: uint8, text: string })` with `max_length: 64` | peer to board |
 
-These are ordinary declarations in the port's `board_values.silica`; a program may ignore them and declare its own types, since `Transportable` is the one trait of the three a program implements.
+These are inline types written out in the port's `board_values.silica` as documentation and trial fixtures (there is nothing to declare, §4.1); a program may ignore them and use its own types.
 
 ---
 
@@ -597,7 +615,7 @@ change to the derivation, which is what keeps each such addition small:
 | CBOR (RFC 8949) | `(:cbor)` | `:keyed`, text-string keys | direct | definite lengths only at first (indefinite is `:unsupported`); tags 2/3 for 64-bit values outside the int range; `unit` as `null`, slot-empty as `null`; atoms as text strings |
 | MessagePack | `(:msgpack)` | `:keyed`, string keys | direct | `bin` for byte strings, `str` for `utf8: true` strings; atoms as `str` |
 | JSON (RFC 8259) | `(:json)` | `:keyed`, string keys | direct, with losses | text; byte strings as base64 text; integers above 2^53 lose precision in most readers, so encoding one fails the calling actor with `(:explicit, :json_precision)`; tuples as arrays; atoms as strings; `unit` as `null` |
-| Protocol Buffers | `(:protobuf)` | `:numbered` | needs one addition | fields are numbered, not named: the `Transportable` declaration gains an optional `fields: [...]` list assigning numbers, and `record_layout` gains `:numbered`, under which the walk passes the number instead of the name. Tuples encode as nested messages with fields 1..n. Decision 7 in §12 |
+| Protocol Buffers | `(:protobuf)` | `:numbered` | needs one addition | fields are numbered, not named: the `encode` and `decode` calls gain an optional `fields: [...]` entry in the limits record assigning numbers, and `record_layout` gains `:numbered`, under which the walk passes the number instead of the name. Tuples encode as nested messages with fields 1..n. Decision 7 in §12 |
 | Silica native | `(:silica_native)` | `:positional` | direct | the fastest Silica-to-Silica form: no keys, no tags for scalars, a 64-bit structural hash of the type string as the term prefix so that a mismatched type is `:bad_version` rather than garbage. The shape word of §3.7 is **not** used: it is numbered per build |
 | ASN.1 DER, Cap'n Proto, FlatBuffers | | | not planned | schema-driven formats with their own type languages; adding one would mean a translator in the language, not a `WireFormat` |
 
@@ -608,7 +626,7 @@ carrier over `(:tcp)`, say) is a roadmap decision taken protocol by protocol, un
 language, or not at all.
 
 The test of the expansion requirement is concrete: the second protocol in the tree (CBOR, §10 phase 6) must be
-added without a change to the derivation, to the trait, or to any trial program's `Transportable` declarations.
+added without a change to the derivation or to any trial program's `encode` and `decode` calls.
 Its whole cost must be its specification subsection, its implementation module and its trials.
 
 ---
@@ -645,6 +663,8 @@ All in the shared front end and the runtime of every port; none change an emitte
 | `join_bytes(parts: List[string, S]) -> string` | one-allocation concatenation for the fragment lists of §4.4 and §5 |
 | `bytes_of(parts: List[uint8, S]) -> string`, `byte_string(n: uint64, bytes: ...)` form to be settled | building a short fragment from computed bytes (a tag byte and a big-endian length). The ETF binding is written against whichever form is chosen; decision 8 in §12 |
 | `float64_to_bits(f: float64) -> uint64`, `float64_from_bits(b: uint64) -> float64`, and the `float32` pair | IEEE bytes on the wire. `float16` widens through `float32` |
+| `float16_to_float32(h: float16) -> float32`, `float32_to_float16(f: float32) -> float16` | the only conversions `float16` has; the walk widens a `float16` through `float32` to the `float64` on the wire and narrows it back by rounding |
+| `char_code(c: char) -> int64`, `char_of_code(n: int64) -> char` | a `char` crosses as its Unicode scalar value; the decoder range-checks the integer before `char_of_code` |
 | `atom_name(a: atom) -> string` | encode atoms by name. The runtime already keeps the names for printing; this exposes the table |
 | `atom_of_name(s: string) -> (:ok, atom) \| :none` | decode atoms by name. The compiler emits a sorted name table with binary search only for programs that decode into an atom-typed position, so programs that never do pay nothing |
 
@@ -655,8 +675,8 @@ bytes explicitly. No byte-swap builtin is added.
 
 | Code | Check |
 | --- | --- |
-| E2401 NotTransportable | a component of `T` is not transportable (§4.2); names the path |
-| E2402 TransportableLimitRequired | `T` is variable-sized and the declaration gives no applicable limit |
+| E2401 NotTransportable | a component of the `T` at an `encode` or `decode` call cannot cross (§4.2); names the path |
+| E2402 DecodeLimitRequired | `T` at a `decode` (or `recreate`) call is variable-sized and the call gives no `max_bytes`, or the limits argument is not a record literal of literals; also a recursive `T` without its region argument, or a region argument for a type without slots |
 | E2403 DecodeTargetUnresolved | `decode`'s result type cannot be resolved from context |
 | E2404 SumVariantsIndistinguishable | two variants of a sum in `T` share wire kind and tag or arity |
 | E2405 TagKeyedDuplicate / E2408 TagKeyedUnknown | two implementations for one format or carrier tag; a format or carrier tag with no implementation visible from the calling module |
@@ -664,19 +684,20 @@ bytes explicitly. No byte-swap builtin is added.
 | E2407 FrameExceedsMtu | `encode` of a type whose fixed size exceeds a literal carrier's `mtu` on an `:unreliable` carrier |
 | E2409 ClosedTraitImplemented | a program `impl fn` for `WireFormat` or `Carrier`, whatever the tag; the counterpart of E2239 for board-pack devices |
 | E2410 NotProvidedOnTarget | a carrier or protocol tag the target's transport pack does not list; raised by the target's emitter, as the device-prim rejection of device specification §10 is, wherever the tag appears, including in a function nothing calls |
-| W2401 | every `impl Transportable` is reported as an advisory warning, as every `impl Recreatable` is (§7.7 auditability), because each is a point where foreign bytes become values |
+| W2401 | every `decode` call is reported as an advisory warning, as every `recreate` call is (§7.7 auditability), because each is a point where foreign bytes become values |
+| E2411 MarkerTraitDeclared | a leftover `impl Transportable` or `impl Recreatable` declaration; the message gives the call form |
 
 ### 9.4 Where the work lands
 
 | Area | Work |
 | --- | --- |
-| lexer, parser | `impl Transportable for T { k: v, ... };` (the §7.7 form; shared with `Recreatable`); nothing else |
+| lexer, parser | nothing: `encode` and `decode` are builtin calls, and the limits are an ordinary record literal argument |
 | trait checker (`trait_checker_core.silica`, `type_checker/traits/`) | the tag-keyed rule of §9.1 with its open and closed cases; `WireFormat` and `Carrier` as closed built-in traits beside `DeviceDescription`; E2409 |
 | type checker | `encode` / `decode` as context-typed builtins (`type_checker_builtin_signatures.silica`, the `Collectable` resolution path in `type_checker_lists.silica` as the model); E2401 to E2408 |
 | SIR generator | the derivation of §4.4 and §4.5 as ordinary SIR, driven by the type descriptor of `terms/term_message_copy.silica`; shared with the `recreate` derivation of chunk 13 and the `copy_to` of chunk 15 when they are built, so that one walker serves all three |
 | emitters | no code-generation change: the derived code is ordinary functions. Each emitter reads its target's transport pack and rejects tags the pack does not list (E2410), the same shape as its device-prim rejection. The runtime of each port gains the six builtins of §9.2 (small; `byte_at` and `join_bytes` are a few instructions each) |
 | per-target transport packs (`emitter/<TARGET>/transport_pack.silica`) | one per target, flat tables (§6.0); the port notes record what each build provides; the porting checklists gain a "transport pack" item |
-| built-in modules (`compiler/stdlib/`, the language's modules shipped with the compiler, as `Supervisor.silica` and `DeviceDescription.silica` are today) | `Transportable.silica` (marker, like `Register32.silica`), `WireFormat.silica`, `Carrier.silica`, `WireFrame.silica`, `wire_etf.silica` (the ETF protocol, pure Silica), `actormessage.silica` entries for the §6.2 vocabulary. Each later protocol is one more `wire_<tag>.silica` here |
+| built-in modules (`compiler/stdlib/`, the language's modules shipped with the compiler, as `Supervisor.silica` and `DeviceDescription.silica` are today) | `WireFormat.silica`, `Carrier.silica`, `WireFrame.silica`, `wire_etf.silica` (the ETF protocol, pure Silica), `actormessage.silica` entries for the §6.2 vocabulary. Each later protocol is one more `wire_<tag>.silica` here |
 | hosted carriers (the compiler's shared tree) | `(:tcp)` and `(:udp)` connection and endpoint actors over the chunk 9 wrappers; `(:ble_gatt)` over a CoreBluetooth wrapper on macOS and a BlueZ wrapper on Linux, each a `dangerous_` module with its sidecar and exposure source (FFI wrapper specification §13, §14), maintained with the compiler |
 | board carriers (the port's board tree, beside the board pack) | the `(:uart1)` worker (plan item N) with the carrier contract; the contract retrofitted onto the existing UART0 and USB-Serial-JTAG workers; `(:i2c0)` and `(:sd_blocks)` as plan items G and I are done; `board_values.silica` (§6.6) |
 
@@ -689,10 +710,10 @@ on every suite with goldens refreshed under the usual rule, and a hosted phase e
 
 | Phase | Delivers | Closes when |
 | --- | --- | --- |
-| 0 | the builtins of §9.2; the tag-keyed rule of §9.1; the `impl Transportable for T { ... }` syntax; `Transportable`, `WireFormat`, `Carrier` marker and trait files; an empty transport pack per target and the E2410 rejection in each emitter | trials for each builtin (byte access, join, float bits, atom names both ways); error trials for E2405, E2408 and E2410 (a tag absent from the target's pack) |
+| 0 | the builtins of §9.2; the tag-keyed rule of §9.1; the `WireFormat` and `Carrier` trait files; an empty transport pack per target and the E2410 rejection in each emitter | trials for each builtin (byte access, join, float bits, atom names both ways); error trials for E2405, E2408 and E2410 (a tag absent from the target's pack) |
 | 1 | the derivation for every type of §4.2 with the `(:etf)` binding, scalars and containers, on Apple Silicon; the ETF byte goldens generated with `erl` | `transport_addition` suite: every row of §4.2 round-trips (`decode(encode(x)) == x`); every rejection atom of §4.3 has an error trial; the `term_to_binary` goldens match byte for byte; E2401 to E2404 and E2406 trials |
-| 2 | Linux AArch64 and x86-64 lock-step | the same suite green on both; fixed points |
-| 3 | `WireFrame`; the carrier contract; `(:tcp)`, `(:udp)` and `(:serial)` carriers over chunk 9 (its prerequisite); the hosted BEAM demo: a Silica program connects to a BEAM node's `gen_tcp` listener with `{packet, 4}` and exchanges terms | loopback trials Silica-to-Silica; a scripted `erl` peer trial run outside `make integrate` |
+| 2 | `WireFrame`; the carrier contract; `(:tcp)`, `(:udp)` and `(:serial)` carriers over chunk 9 (its prerequisite); the hosted BEAM demo: a Silica program connects to a BEAM node's `gen_tcp` listener with `{packet, 4}` and exchanges terms | loopback trials Silica-to-Silica; a scripted `erl` peer trial run outside `make integrate` |
+| 3 | Linux AArch64 and x86-64 lock-step | the same suite green on both; fixed points |
 | 4 | the board: `(:uart1)` carrier worker, the contract on the existing console workers, `board_values.silica`; the ETF-over-UART demo: accelerometer and button readings arrive in an Erlang shell through a port program on the host | board suite trials for the worker; the demo recorded in `board/README.md` as the other apps are |
 | 5 | `(:ble_gatt)` on macOS and Linux through Fifi; the board over an external UART BLE module (§6.5 item 2) | a Silica peripheral on one host and a Silica central on another exchange segmented frames; the board's readings reach a phone or laptop over BLE |
 | 6 | `(:cbor)` as the second protocol: its §16.4 subsection, `wire_cbor.silica`, goldens | added without a change to the derivation or the trait; the `transport_addition` suite runs its round-trip rows under both tags from one source |
@@ -700,7 +721,7 @@ on every suite with goldens refreshed under the usual rule, and a hosted phase e
 
 **Proposed ROADMAP row** (for Lee to place; chunk numbers are identifiers, not an order):
 
-> | 16 | **Transport serialization.** `Transportable` with limits, the compiler-derived `encode` and `decode`,
+> | 16 | **Transport serialization.** The compiler-derived `encode` and `decode` with call-site limits,
 > the `WireFormat` trait with the ETF binding, the `Carrier` trait and actor contract with framing, hosted
 > TCP/UDP/BLE carriers through Fifi and the board's UART1 carrier worker; CBOR as the second protocol. All of
 > it language, specified in §16.4 and shipped with the compiler.
@@ -720,12 +741,12 @@ on every suite with goldens refreshed under the usual rule, and a hosted phase e
 | §4.1.6 | `byte_at` beside `length_bytes` as a user-available byte operation; §5.3 and §22.7 list the new string builtins |
 | §4.1.7 | `atom_name` and `atom_of_name`; the sentence "No atom is created at run time" stands: `atom_of_name` only finds existing ones |
 | §15.1.4 | already names the two 32-bit halves for the wire; add that `actor_ref` encodes as (node, creation, child number, position) and decodes only for this node |
-| new §16.4 "Wire transport" | normative: the `Transportable` declaration, `encode` and `decode` signatures, the rejection atoms, where `decode` may be called, the abstract wire forms of §4.6, the `Carrier` trait and actor contract of §6, and the framing of §5. One numbered subsection per wire protocol, §16.4.1 being ETF with the table of §4.7; each later protocol adds the next subsection. One subsection on the transport pack (§6.0): the full vocabulary of carrier and protocol tags, the rule that a target provides a subset chosen per board or hosted environment, and E2410 |
+| new §16.4 "Wire transport" | normative: the `encode` and `decode` signatures with the limits argument, the rejection atoms, where `decode` may be called, the abstract wire forms of §4.6, the `Carrier` trait and actor contract of §6, and the framing of §5. One numbered subsection per wire protocol, §16.4.1 being ETF with the table of §4.7; each later protocol adds the next subsection. One subsection on the transport pack (§6.0): the full vocabulary of carrier and protocol tags, the rule that a target provides a subset chosen per board or hosted environment, and E2410 |
 | [porting_for_os_free_targets.md](porting_for_os_free_targets.md) §10 and the hosted porting checklists | the transport pack as part of the board-pack contract and of a hosted port |
 | §20.4 | sockets stay outside the language, reached through Fifi, as written. Add: "Transport is part of the language: the preparation of values for a link, the wire protocols and the carrier contract are defined in §16.4 and shipped with the compiler. A new wire protocol is an addition to this specification, not a library." |
 | §1.2 design principles | one line: transport and its protocols are language, as actors and regions are |
 | §22 | the builtins of §9.2 |
-| FFI wrapper specification §7.7 | `Transportable` implies `Recreatable`; `decode` is listed as the second validator, with the same call-site rule |
+| FFI wrapper specification §7.7 | `decode` and `recreate` are one mechanism (§4.1): no marker trait, limits as a call argument, one derivation, the same rejection atoms and call-site rule; `decode` is listed as the second validator |
 | device specification §5.2 | client messages to a carrier worker follow the §6.2 contract |
 
 ---
@@ -735,6 +756,15 @@ on every suite with goldens refreshed under the usual rule, and a hosted phase e
 **Decided (Lee, 2026-11-05): transport is part of the language, not a library.** New protocols are added to the
 language, in the compiler and the specification, never as program-level implementations. §1, §8, §9.1 and §11
 carry this decision; `WireFormat` and `Carrier` are closed traits because of it.
+
+**Decided (Lee, 2026-11-05): no marker traits.** `Transportable` and `Recreatable` are dropped; `encode`,
+`decode` and the future `recreate` are derived calls whose limits are an argument (§4.1), and §4.1 here and
+§7.7 of the FFI wrapper specification are kept as one mechanism.
+
+**Decided (Lee, 2026-11-05): the hosted carriers come before the Linux lock-step.** Phase 2 of §10 is
+`WireFrame`, the carrier contract and the TCP, UDP and serial carriers with the BEAM demo; phase 3 is the Linux
+AArch64 and x86-64 lock-step. Nothing in the carriers needs Linux, and the demo is wanted sooner; the Linux
+catch-up then covers the prims and the carriers together.
 
 **Decided (Lee, 2026-11-05): the transport set is per target.** Support for each transport type need not be in
 every compiler version; what a build includes is decided by its board or hosted environment and recorded in its
@@ -754,14 +784,16 @@ transport pack (§6.0), with E2410 for anything else. The tables of §6.3 and §
    `binary_to_term`, which creates atoms (and is why Erlang offers `safe`).
 6. **SIMD vectors are not transportable at first.** The fixed-width NEON types could encode as tuples of their
    elements; the scalable SVE types have no wire-stable width. Deferred.
-7. **Protocol Buffers need field numbers.** Add `fields: [...]` to the declaration and `:numbered` to
+7. **Protocol Buffers need field numbers.** Add `fields: [...]` to the limits record of the call and `:numbered` to
    `record_layout` when `(:protobuf)` is taken up (§8), not before.
 8. **The spelling of a computed-bytes fragment builtin (§9.2).** `bytes_of(List[uint8, S])` is simplest and
    costs a list per fragment; a fixed-arity `byte_string(n, b0, b1, ...)` form is cheaper for the common one-to-nine-byte
    fragments. The ETF binding needs one of them before phase 1.
 9. **Error-code numbers** (§9.3) are provisional until the diagnostics table assigns them.
 10. **Open: the node name and creation of a standalone program** (`nonode@nohost`, 0 proposed), and where a
-    program that is also a distribution node sets them (the distribution design).
+    program that is also a distribution node sets them (the distribution design). The ETF binding uses the
+    proposed pair since 2026-11-05: an `actor_ref` encodes as `NEW_PID_EXT` with that node and creation, and a
+    frame naming any other node or creation decodes to `:foreign_actor`.
 11. **Open: whether `encode` may be called on external-danger-touched data.** Proposed no: a tainted value is
     re-created first, then encoded, so taint never reaches the wire unexamined.
 12. **Open: the maximum `max_bytes` on the board.** A frame and its decoded value both live in the roughly 170 KB
@@ -779,9 +811,10 @@ commands from it. The same owner actor runs on the board over UART1 with a two-l
 ### 13.1 The shared vocabulary
 
 ```silica
-// readings.silica: the values both ends agree on. Fixed-size, so no limits are needed.
-impl Transportable for (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 });
-impl Transportable for (:led, { which: :single | :red | :green | :blue, on: boolean });
+// The values both ends agree on, spelled at each encode and decode call. Both are fixed-size, so
+// no decode needs limits:
+//   (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 })
+//   (:led, { which: :single | :red | :green | :blue, on: boolean })
 ```
 
 ### 13.2 The owner actor
@@ -947,3 +980,146 @@ Replace the carrier: `use uart1_carrier;` for `use tcp_carrier;`, `(:uart1)` for
 involved. The frames are the same bytes, and on the host an Erlang port program reading the serial line with
 `{packet, 4}` receives them unchanged. The readings themselves come from the I2C0 worker (plan item G) as
 `(:sample, ...)` casts instead of from a test cast in `main`.
+
+---
+
+## 14. Implementation status (2026-11-05, Apple Silicon)
+
+Phases 0 and 1 of §10 are in the tree and green on the Apple Silicon path; Linux lock-step (phase 3, after the hosted carriers of phase 2 by decision of 2026-11-05) is
+not started, and the other three targets' transport packs provide no protocol, so they answer E2410.
+
+**Builtins (§9.2), all pure, Apple Silicon emission in `emitter/apple_silicon_mac/terms/prims/prims_transport.silica`:**
+`byte_at`, `byte_slice`, `bytes_of` (a `List[int64, mem(normal)]` of byte values to a string),
+`join_bytes`, `atom_name`, `atom_index_of_name` (-1 when the program has no such atom) and `atom_of_bits`
+(these two replace the design's `atom_of_name`: a builtin answers a scalar, and the decoder turns the
+index into the atom), `float64_bits` / `float64_of_bits`, `float32_bits` / `float32_of_bits`,
+`float32_to_float64` / `float64_to_float32`, `float16_to_float32` / `float32_to_float16`, `char_code` /
+`char_of_code`, and the integer width conversions `to_int64`, `to_uint64`
+(any integer type in), `to_int8`, `to_int16`, `to_int32`, `to_uint8`, `to_uint16`, `to_uint32`
+(`int64` in, truncating). The byte builtins answer `int64`, not `uint8`, because the language has no
+implicit widening and byte arithmetic is written in `int64`. The atom helpers read the runtime unit's
+program-wide atom table, since a per-module table misses the atoms of units compiled later. Trial:
+`trials/transport_addition/transport_builtins`.
+
+**Declarations (§4.1):** none, since the decision of 2026-11-05. `type_checker_transport.silica` now only
+rejects a leftover `impl Transportable` or `impl Recreatable` (E2411). The checks on the type (E2401, E2404)
+and on the limits (E2402) happen at each call (`type_checker_expressions_wire.silica`); the limits travel to
+the derivation in the call's marker as the text `max_bytes,max_depth,max_length,utf8`, and one decode family
+is derived per (format, type, limits), named `__tr_decode_<fmt>_<type id>_l<limits>`. Defaults 1 MiB / 64 /
+`max_bytes`.
+
+**Calls (§4.3):** `encode(F, x)` and `decode(F, frame)` (`type_checker/expressions/type_checker_expressions_wire.silica`),
+E2403, E2408. F is the literal `(:etf)`; it is never a run-time value (a one-atom tagged tuple is
+not a usable value in the compilers today). `(:etf)` is an implicit `use wire_etf;` added by the parser,
+so the build order and the link see the dependency; a configuration must list
+`compiler/stdlib/wire_etf.silica` (the trial makefiles link it beside `Supervisor.silica`).
+
+**Derivation (§4.4, §4.5):** pass 1 lowers each call to `__tr_encode_<fmt>_<id>` / `__tr_decode_<fmt>_<id>`
+with a `tr_type_marker` prim naming the (format, type); `transport_pipeline.silica` then generates the
+family's source (`sir_generator/transport_derive.silica`), parses it, appends it to the unit and compiles
+the unit again. The source is kept beside the unit as `<unit>.derived`. Record fields decode in any key
+order through one slot parameter per field; an Erlang list of small integers (STRING_EXT) decodes into an
+integer list. Since 2026-11-05 the derivation also covers `float16` (widened through `float32` to the
+`float64` on the wire, narrowed back by rounding), `char` (its scalar value as an integer; surrogates and
+values above U+10FFFF are `:out_of_range`), `actor_ref` (`NEW_PID_EXT` with node `nonode@nohost` and
+creation 0 through the pure `actor_ref_bits` / `actor_ref_of_word`; any other node or creation is
+`:foreign_actor`), one record variant of a sum (the map among the atoms and tuples; the compiler was taught
+on the same day to let a variable of variant type flow into a binding of any inline sum, not only when the
+record is the first variant), and recursive slots (`ref?(L, S, rec)` inside a tuple: the atom `none` or the
+nested tuple on the wire; `decode` takes the caller's region as its fourth argument and rebuilds each
+present slot with `alloc_rec`; one family per (format, type, limits) carries the region through every
+decoder it derives). Not derived, because the language has no such value: a list or scalar variant of a
+sum (a binding cannot be annotated with one, E1040 at the parser) and a record with no fields (there is no
+empty record literal); both are E2401 naming the component. Trials: `transport_etf_scalars`,
+`transport_etf_list_sum` (`show_mixed`), `transport_etf_recursive`, and the rejections of
+`transport_etf_rejections`.
+
+**Specification text (§11):** landed 2026-11-05 in silica-specification.md: §1.2 (one principle line), §4.1.6
+(byte access), §4.1.7 (names at run time), §15.1.4 (the reference on the wire), the new §16.4 "Wire
+Transport" (§16.4.1 to §16.4.7: the calls and limits, the transportable types, the rejection atoms, the
+call-site rule and W2401, the closed protocol set and E2410, the ETF binding, the diagnostics), §20.4 (one
+paragraph) and §22.19 (the builtins). The carrier contract and framing (§5, §6) enter the specification
+with phase 2.
+
+**Phase 2, complete (2026-11-05), Apple Silicon** (closed by the §10 rule: the TCP and UDP loopback trials pass under `make integrate`, the BEAM demo runs outside it, the full tree is green but for the pre-existing failures noted above, and gen3 is byte-identical to gen2):
+
+- `WireFrame` (§5) is `compiler/stdlib/wireframe.silica`: `fresh(boundaries)`, `frame(frame, mtu, boundaries)`
+  and `unframe(state, segment, max_frame)`. The reassembly state is `{ mode: atom, expected: int64,
+  pending: string }` (the carrier's boundaries, the frame length once its prefix is known, the bytes so far),
+  not the `parts` list of §5; `unframe` answers one frame per call and is called again with an empty segment
+  to drain a second frame that arrived in the same segment. Segmentation uses frame_seq 0 (one frame in
+  flight per link in this phase).
+- The carrier properties (§6.1) are `compiler/stdlib/carrier.silica`: `mtu`, `boundaries`, `delivery`,
+  `addressing` and `provided` over the **atom** of the tag (`carrier@mtu(:tcp)`), because a one-atom
+  tagged tuple is not a run-time value in this language. The tag-keyed trait dispatch of §9.1 is not
+  built; the module is the closed set.
+- The socket wrappers (ROADMAP chunk 9, the part this phase needs) are `compiler/stdlib/net/silica_sockets.c`
+  with `silica_sockets_wrapper.meta` and the dangerous module `dangerous_sockets.silica`: TCP connect /
+  listen / accept, UDP bind / send / receive, a termios serial port, and read / write / close over any
+  descriptor, every call bounded by a timeout. Two FFI facts shaped them: a raw binding carries a
+  pointer-plus-length pair only as its sole parameters, so a wrapper that needs a string and scalars takes
+  the scalars first through `set_args` / `set_host`, kept per thread (a dangerous actor is its own thread);
+  and a receive is two calls, `recv_bytes` for the status and `take` for the bytes, because a string
+  result cannot carry a status. The trials build `libsilica_sockets.a` from the compiler tree as a fixture
+  (`trials/ffi_addition/fixtures.mk`) and a project places the sidecar under
+  `dangerous_exposure_source/sockets/`.
+- The carriers are library FFI workers: `dangerous_tcp_carrier`, `dangerous_udp_carrier` and
+  `dangerous_serial_carrier`, each one exported cast-only behaviour `carrier/2` that a program installs
+  with `spawn_dangerous` and opens with `(:open, owner, address)`: `"host:port"` connects, `"listen:port"`
+  listens on 127.0.0.1 and serves the first peer (port 0 picks a free port; `:link_up` carries
+  `"port:<n>"` once bound and `"peer:accepted"` once a peer is served; one connection per listening
+  carrier in this phase), `"host:port@local"` for a UDP endpoint, `"path@baud"` for a serial port. The
+  contract of §6.2 is spoken as written, with `int64` counts; a carrier polls its descriptor between
+  mailbox messages with a 20 ms timeout and delivers `:rx` only against the owner's `:credit`. Because
+  the language allows a `sequence proc[external_danger]` only as a function's root body, each carrier is
+  one sequence that chooses its work by the message and calls each wrapper at most once per message; a
+  descriptor it keeps in state crosses the taint boundary through `recreate`.
+- Four compiler changes the carriers needed, all general: `recreate(x)` exists for scalar types (one
+  mechanism with `decode`; a derived `(:ok, x)` whose result the taint checker treats as pure, E2406 on a
+  tainted input outside an `external_danger` block); an exported cast-only behaviour of a `dangerous_`
+  module counts as an FFI worker for the placement rules (§4.6 of the FFI wrapper specification), and a
+  worker body may be a `case` whose arms hold the blocks; and a foreign call that returns a struct by
+  value now gets its sret buffer from the binding's declared return type and answers a Silica record
+  (shape word first) built from the C struct; before, the return type was inferred from the parameters and
+  a tagged result of a scalar-argument wrapper faulted; and a `case` expression now carries its inferred
+  result type in the SIR when no expected type reaches it (`terms_helpers@sir_infer_case_type`), so a
+  cast whose tuple literal holds `(:link_up, case bound of { ... })` describes the string element to the
+  message copier as a string and not as a bare word. Before, the receiver read the sender's frame after
+  the carrier had reused it: the TCP loopback trapped in `starts_with` on most runs.
+- Trials: `trials/ffi_addition/app_transport_tcp_loopback` (`dangerous_tcp_loopback`: a listening and a
+  connecting carrier in one program exchange `(:ping, 7)` and `(:pong, 8)` as length-prefixed ETF frames;
+  `dangerous_udp_loopback`: two endpoints, a bare datagram one way). The serial carrier is compiled, not
+  run (no device on the integrate host). The BEAM demo of §13 is `programmer_tools/transport_beam_demo`
+  (`run_demo.sh`, outside `make integrate`): the Erlang peer receives the 48-byte `{accel, #{...}}` frame
+  of §13.4 and the program decodes the `{led, #{which => red, on => true}}` it answers. The specification
+  text is §16.4.8 (framing) and §16.4.9 (carriers). Deferred, each to the phase that first needs it: E2407 and the
+  `WireFrame` segmentation under a real BLE mtu to phase 5 (the first `:unreliable` carrier whose `mtu` a
+  fixed-size frame can exceed), and the Linux emitters' side of the FFI struct-result fix to phase 3.
+
+**Checks of §9.3 beyond the type walk:** E2406 (`decode` on external-danger-touched bytes outside a
+`sequence proc[external_danger]` block, in `ffi/ffi_taint_checker.silica`; trial
+`error_enforcement_addition/ffi_addition/error_app_ffi_result_cast/dangerous_decode_outside_external_danger`),
+E2409 (a program `impl WireFormat` or `impl Carrier`; trial `transport_err_closed_trait`), E2410 (a wire
+protocol the language names but this build's pack does not provide: `(:cbor)` is such a tag until phase 6,
+so `transport_err_not_on_target` exercises the rejection on Apple Silicon), and W2401 (printed once per
+decode family by `transport_pipeline`, naming the unit and the type; the derived calls carry no source
+position). Not checked: the handler that receives an FFI result cast is not yet a taint source
+(FFI wrapper specification §7.6 is open), so E2406 fires today only for a nested plain sequence inside an
+external-danger block.
+
+**ETF (§4.7):** `compiler/stdlib/wire_etf.silica`, pure Silica. Integers, floats, atoms, strings, tuples
+and lists encode byte for byte as `term_to_binary` writes them (checked against OTP 27 in the trials'
+goldens). Maps are written with keys in name order; OTP 26 and later write small maps in an undefined
+order, so map frames are compared by decoding, not byte for byte, and §4.4's "canonical" claim holds for
+Silica-to-Silica frames only. `WireFormat.silica` and `Carrier.silica` state the traits; the tag-keyed
+closed-trait rule (§9.1) is not enforced by the trait checker yet.
+
+**Packs (§6.0):** `emitter/<TARGET>/transport_pack.silica` with `provides_format` / `provides_carrier`;
+`sir_target_verify` answers E2410 for a protocol the pack does not list.
+
+**Trials:** `trials/transport_addition` (builtins, scalars, record, list and sum, rejections: every atom of
+§4.3 that phase 1 can produce) and the seven `transport_err_*` trials in `error_enforcement_addition`.
+Two language facts the trials met: a relational compare of two `uint64` values inside a let body
+compiled as a signed compare (the bound-let compare path of every emitter chose LT/GT/LE/GE for any
+integer; fixed 2026-11-05 with `cc_int_cond`, trial `uint64_addition/comparator_high_bit`, and
+wire_etf now compares plainly), and `rec` is a keyword, so a binding named `rec` is mis-typed.
