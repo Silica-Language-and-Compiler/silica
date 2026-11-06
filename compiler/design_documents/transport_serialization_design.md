@@ -54,6 +54,7 @@ The compiler derives, for every type `T` and format tag `F` a program's `encode`
 encode(F, x: T) -> string
 decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)
 decode(F, bytes: string, { max_bytes: N, max_depth: D, max_length: L }) -> (:ok, T) | (:rejected, atom)
+decode(F, bytes: string, { ... }, r: region(L, normal)) -> (:ok, T) | (:rejected, atom)    // T with ref?(L, S, rec) slots
 ```
 
 by walking the type, exactly as the message copier, the planned `recreate` and the planned `copy_to` walk it. The
@@ -193,14 +194,20 @@ c: (:ok, { op: :set | :get | :clear, key: string, values: List[int64, normal] })
 
 - `max_bytes`: the largest frame `decode` will read, in bytes. `encode` never produces a larger frame; if the
   value would exceed it, `encode` fails (§4.4).
-- `max_depth`: the deepest nesting `decode` will follow (tuples, records, lists and recursive slots count one
-  level each).
+- `max_depth`: the deepest nesting `decode` will follow (tuples, records and lists count one level each; a
+  recursive slot counts nothing of its own, the tuple it holds counts).
 - `max_length`: the longest list, string or buffer `decode` will build.
 - Any subset may be given; the defaults are 1 MiB, depth 64, and `max_length` equal to `max_bytes`. A fixed-size
   type (no `string`, no list, no recursive slot) needs no limits: its bounds are its own. A variable-sized type
   without `max_bytes` is a compile-time error (E2402 below), as is a limits argument that is not a record literal
   of literals: the limits are compile-time constants, baked into the derived decoder, so each distinct
   (format, type, limits) triple is one derived function, selected at compile time like the format tag.
+
+**A recursive type decodes into the caller's region.** When `T` holds a `ref?(L, S, rec)` slot, `decode`
+takes a fourth argument, a `region(L, normal)` the caller allocated with the slot's lifetime, and every
+present slot of the result is an `alloc_rec` cell in that region; the caller owns the region and its
+lifetime as it owns any region it allocates (specification §12). A fourth argument to the decode of any
+other type is E2402, as is its absence for a recursive type. The limits stay the third argument.
 
 **`decode` and `recreate` are one mechanism.** `decode` is the `recreate` of the FFI wrapper specification §7.7
 applied to bytes rather than to a tainted in-memory value: the same type-directed walk, the same limits spelled
@@ -656,6 +663,8 @@ All in the shared front end and the runtime of every port; none change an emitte
 | `join_bytes(parts: List[string, S]) -> string` | one-allocation concatenation for the fragment lists of §4.4 and §5 |
 | `bytes_of(parts: List[uint8, S]) -> string`, `byte_string(n: uint64, bytes: ...)` form to be settled | building a short fragment from computed bytes (a tag byte and a big-endian length). The ETF binding is written against whichever form is chosen; decision 8 in §12 |
 | `float64_to_bits(f: float64) -> uint64`, `float64_from_bits(b: uint64) -> float64`, and the `float32` pair | IEEE bytes on the wire. `float16` widens through `float32` |
+| `float16_to_float32(h: float16) -> float32`, `float32_to_float16(f: float32) -> float16` | the only conversions `float16` has; the walk widens a `float16` through `float32` to the `float64` on the wire and narrows it back by rounding |
+| `char_code(c: char) -> int64`, `char_of_code(n: int64) -> char` | a `char` crosses as its Unicode scalar value; the decoder range-checks the integer before `char_of_code` |
 | `atom_name(a: atom) -> string` | encode atoms by name. The runtime already keeps the names for printing; this exposes the table |
 | `atom_of_name(s: string) -> (:ok, atom) \| :none` | decode atoms by name. The compiler emits a sorted name table with binary search only for programs that decode into an atom-typed position, so programs that never do pay nothing |
 
@@ -667,7 +676,7 @@ bytes explicitly. No byte-swap builtin is added.
 | Code | Check |
 | --- | --- |
 | E2401 NotTransportable | a component of the `T` at an `encode` or `decode` call cannot cross (§4.2); names the path |
-| E2402 DecodeLimitRequired | `T` at a `decode` (or `recreate`) call is variable-sized and the call gives no `max_bytes`, or the limits argument is not a record literal of literals |
+| E2402 DecodeLimitRequired | `T` at a `decode` (or `recreate`) call is variable-sized and the call gives no `max_bytes`, or the limits argument is not a record literal of literals; also a recursive `T` without its region argument, or a region argument for a type without slots |
 | E2403 DecodeTargetUnresolved | `decode`'s result type cannot be resolved from context |
 | E2404 SumVariantsIndistinguishable | two variants of a sum in `T` share wire kind and tag or arity |
 | E2405 TagKeyedDuplicate / E2408 TagKeyedUnknown | two implementations for one format or carrier tag; a format or carrier tag with no implementation visible from the calling module |
@@ -703,8 +712,8 @@ on every suite with goldens refreshed under the usual rule, and a hosted phase e
 | --- | --- | --- |
 | 0 | the builtins of §9.2; the tag-keyed rule of §9.1; the `WireFormat` and `Carrier` trait files; an empty transport pack per target and the E2410 rejection in each emitter | trials for each builtin (byte access, join, float bits, atom names both ways); error trials for E2405, E2408 and E2410 (a tag absent from the target's pack) |
 | 1 | the derivation for every type of §4.2 with the `(:etf)` binding, scalars and containers, on Apple Silicon; the ETF byte goldens generated with `erl` | `transport_addition` suite: every row of §4.2 round-trips (`decode(encode(x)) == x`); every rejection atom of §4.3 has an error trial; the `term_to_binary` goldens match byte for byte; E2401 to E2404 and E2406 trials |
-| 2 | Linux AArch64 and x86-64 lock-step | the same suite green on both; fixed points |
-| 3 | `WireFrame`; the carrier contract; `(:tcp)`, `(:udp)` and `(:serial)` carriers over chunk 9 (its prerequisite); the hosted BEAM demo: a Silica program connects to a BEAM node's `gen_tcp` listener with `{packet, 4}` and exchanges terms | loopback trials Silica-to-Silica; a scripted `erl` peer trial run outside `make integrate` |
+| 2 | `WireFrame`; the carrier contract; `(:tcp)`, `(:udp)` and `(:serial)` carriers over chunk 9 (its prerequisite); the hosted BEAM demo: a Silica program connects to a BEAM node's `gen_tcp` listener with `{packet, 4}` and exchanges terms | loopback trials Silica-to-Silica; a scripted `erl` peer trial run outside `make integrate` |
+| 3 | Linux AArch64 and x86-64 lock-step | the same suite green on both; fixed points |
 | 4 | the board: `(:uart1)` carrier worker, the contract on the existing console workers, `board_values.silica`; the ETF-over-UART demo: accelerometer and button readings arrive in an Erlang shell through a port program on the host | board suite trials for the worker; the demo recorded in `board/README.md` as the other apps are |
 | 5 | `(:ble_gatt)` on macOS and Linux through Fifi; the board over an external UART BLE module (§6.5 item 2) | a Silica peripheral on one host and a Silica central on another exchange segmented frames; the board's readings reach a phone or laptop over BLE |
 | 6 | `(:cbor)` as the second protocol: its §16.4 subsection, `wire_cbor.silica`, goldens | added without a change to the derivation or the trait; the `transport_addition` suite runs its round-trip rows under both tags from one source |
@@ -752,6 +761,11 @@ carry this decision; `WireFormat` and `Carrier` are closed traits because of it.
 `decode` and the future `recreate` are derived calls whose limits are an argument (§4.1), and §4.1 here and
 §7.7 of the FFI wrapper specification are kept as one mechanism.
 
+**Decided (Lee, 2026-11-05): the hosted carriers come before the Linux lock-step.** Phase 2 of §10 is
+`WireFrame`, the carrier contract and the TCP, UDP and serial carriers with the BEAM demo; phase 3 is the Linux
+AArch64 and x86-64 lock-step. Nothing in the carriers needs Linux, and the demo is wanted sooner; the Linux
+catch-up then covers the prims and the carriers together.
+
 **Decided (Lee, 2026-11-05): the transport set is per target.** Support for each transport type need not be in
 every compiler version; what a build includes is decided by its board or hosted environment and recorded in its
 transport pack (§6.0), with E2410 for anything else. The tables of §6.3 and §6.4 are menus, not promises.
@@ -777,7 +791,9 @@ transport pack (§6.0), with E2410 for anything else. The tables of §6.3 and §
    fragments. The ETF binding needs one of them before phase 1.
 9. **Error-code numbers** (§9.3) are provisional until the diagnostics table assigns them.
 10. **Open: the node name and creation of a standalone program** (`nonode@nohost`, 0 proposed), and where a
-    program that is also a distribution node sets them (the distribution design).
+    program that is also a distribution node sets them (the distribution design). The ETF binding uses the
+    proposed pair since 2026-11-05: an `actor_ref` encodes as `NEW_PID_EXT` with that node and creation, and a
+    frame naming any other node or creation decodes to `:foreign_actor`.
 11. **Open: whether `encode` may be called on external-danger-touched data.** Proposed no: a tainted value is
     re-created first, then encoded, so taint never reaches the wire unexamined.
 12. **Open: the maximum `max_bytes` on the board.** A frame and its decoded value both live in the roughly 170 KB
@@ -969,7 +985,7 @@ involved. The frames are the same bytes, and on the host an Erlang port program 
 
 ## 14. Implementation status (2026-11-05, Apple Silicon)
 
-Phases 0 and 1 of §10 are in the tree and green on the Apple Silicon path; Linux lock-step (phase 2) is
+Phases 0 and 1 of §10 are in the tree and green on the Apple Silicon path; Linux lock-step (phase 3, after the hosted carriers of phase 2 by decision of 2026-11-05) is
 not started, and the other three targets' transport packs provide no protocol, so they answer E2410.
 
 **Builtins (§9.2), all pure, Apple Silicon emission in `emitter/apple_silicon_mac/terms/prims/prims_transport.silica`:**
@@ -977,7 +993,8 @@ not started, and the other three targets' transport packs provide no protocol, s
 `join_bytes`, `atom_name`, `atom_index_of_name` (-1 when the program has no such atom) and `atom_of_bits`
 (these two replace the design's `atom_of_name`: a builtin answers a scalar, and the decoder turns the
 index into the atom), `float64_bits` / `float64_of_bits`, `float32_bits` / `float32_of_bits`,
-`float32_to_float64` / `float64_to_float32`, and the integer width conversions `to_int64`, `to_uint64`
+`float32_to_float64` / `float64_to_float32`, `float16_to_float32` / `float32_to_float16`, `char_code` /
+`char_of_code`, and the integer width conversions `to_int64`, `to_uint64`
 (any integer type in), `to_int8`, `to_int16`, `to_int32`, `to_uint8`, `to_uint16`, `to_uint32`
 (`int64` in, truncating). The byte builtins answer `int64`, not `uint8`, because the language has no
 implicit widening and byte arithmetic is written in `int64`. The atom helpers read the runtime unit's
@@ -1002,10 +1019,93 @@ with a `tr_type_marker` prim naming the (format, type); `transport_pipeline.sili
 family's source (`sir_generator/transport_derive.silica`), parses it, appends it to the unit and compiles
 the unit again. The source is kept beside the unit as `<unit>.derived`. Record fields decode in any key
 order through one slot parameter per field; an Erlang list of small integers (STRING_EXT) decodes into an
-integer list. Not derived in this phase, each a compile-time E2401 naming the component: `float16`,
-`char`, `actor_ref` (needs the concurrency effect inside derived code), recursive slots, record, list and
-scalar variants of a sum (a case selects variants by atom and by tuple pattern only), and a record with
-no fields.
+integer list. Since 2026-11-05 the derivation also covers `float16` (widened through `float32` to the
+`float64` on the wire, narrowed back by rounding), `char` (its scalar value as an integer; surrogates and
+values above U+10FFFF are `:out_of_range`), `actor_ref` (`NEW_PID_EXT` with node `nonode@nohost` and
+creation 0 through the pure `actor_ref_bits` / `actor_ref_of_word`; any other node or creation is
+`:foreign_actor`), one record variant of a sum (the map among the atoms and tuples; the compiler was taught
+on the same day to let a variable of variant type flow into a binding of any inline sum, not only when the
+record is the first variant), and recursive slots (`ref?(L, S, rec)` inside a tuple: the atom `none` or the
+nested tuple on the wire; `decode` takes the caller's region as its fourth argument and rebuilds each
+present slot with `alloc_rec`; one family per (format, type, limits) carries the region through every
+decoder it derives). Not derived, because the language has no such value: a list or scalar variant of a
+sum (a binding cannot be annotated with one, E1040 at the parser) and a record with no fields (there is no
+empty record literal); both are E2401 naming the component. Trials: `transport_etf_scalars`,
+`transport_etf_list_sum` (`show_mixed`), `transport_etf_recursive`, and the rejections of
+`transport_etf_rejections`.
+
+**Specification text (§11):** landed 2026-11-05 in silica-specification.md: §1.2 (one principle line), §4.1.6
+(byte access), §4.1.7 (names at run time), §15.1.4 (the reference on the wire), the new §16.4 "Wire
+Transport" (§16.4.1 to §16.4.7: the calls and limits, the transportable types, the rejection atoms, the
+call-site rule and W2401, the closed protocol set and E2410, the ETF binding, the diagnostics), §20.4 (one
+paragraph) and §22.19 (the builtins). The carrier contract and framing (§5, §6) enter the specification
+with phase 2.
+
+**Phase 2, in progress (2026-11-05), Apple Silicon:**
+
+- `WireFrame` (§5) is `compiler/stdlib/wireframe.silica`: `fresh(boundaries)`, `frame(frame, mtu, boundaries)`
+  and `unframe(state, segment, max_frame)`. The reassembly state is `{ mode: atom, expected: int64,
+  pending: string }` (the carrier's boundaries, the frame length once its prefix is known, the bytes so far),
+  not the `parts` list of §5; `unframe` answers one frame per call and is called again with an empty segment
+  to drain a second frame that arrived in the same segment. Segmentation uses frame_seq 0 (one frame in
+  flight per link in this phase).
+- The carrier properties (§6.1) are `compiler/stdlib/carrier.silica`: `mtu`, `boundaries`, `delivery`,
+  `addressing` and `provided` over the **atom** of the tag (`carrier@mtu(:tcp)`), because a one-atom
+  tagged tuple is not a run-time value in this language. The tag-keyed trait dispatch of §9.1 is not
+  built; the module is the closed set.
+- The socket wrappers (ROADMAP chunk 9, the part this phase needs) are `compiler/stdlib/net/silica_sockets.c`
+  with `silica_sockets_wrapper.meta` and the dangerous module `dangerous_sockets.silica`: TCP connect /
+  listen / accept, UDP bind / send / receive, a termios serial port, and read / write / close over any
+  descriptor, every call bounded by a timeout. Two FFI facts shaped them: a raw binding carries a
+  pointer-plus-length pair only as its sole parameters, so a wrapper that needs a string and scalars takes
+  the scalars first through `set_args` / `set_host`, kept per thread (a dangerous actor is its own thread);
+  and a receive is two calls, `recv_bytes` for the status and `take` for the bytes, because a string
+  result cannot carry a status. The trials build `libsilica_sockets.a` from the compiler tree as a fixture
+  (`trials/ffi_addition/fixtures.mk`) and a project places the sidecar under
+  `dangerous_exposure_source/sockets/`.
+- The carriers are library FFI workers: `dangerous_tcp_carrier`, `dangerous_udp_carrier` and
+  `dangerous_serial_carrier`, each one exported cast-only behaviour `carrier/2` that a program installs
+  with `spawn_dangerous` and opens with `(:open, owner, address)`: `"host:port"` connects, `"listen:port"`
+  listens on 127.0.0.1 and serves the first peer (port 0 picks a free port; `:link_up` carries
+  `"port:<n>"` once bound and `"peer:accepted"` once a peer is served; one connection per listening
+  carrier in this phase), `"host:port@local"` for a UDP endpoint, `"path@baud"` for a serial port. The
+  contract of §6.2 is spoken as written, with `int64` counts; a carrier polls its descriptor between
+  mailbox messages with a 20 ms timeout and delivers `:rx` only against the owner's `:credit`. Because
+  the language allows a `sequence proc[external_danger]` only as a function's root body, each carrier is
+  one sequence that chooses its work by the message and calls each wrapper at most once per message; a
+  descriptor it keeps in state crosses the taint boundary through `recreate`.
+- Four compiler changes the carriers needed, all general: `recreate(x)` exists for scalar types (one
+  mechanism with `decode`; a derived `(:ok, x)` whose result the taint checker treats as pure, E2406 on a
+  tainted input outside an `external_danger` block); an exported cast-only behaviour of a `dangerous_`
+  module counts as an FFI worker for the placement rules (§4.6 of the FFI wrapper specification), and a
+  worker body may be a `case` whose arms hold the blocks; and a foreign call that returns a struct by
+  value now gets its sret buffer from the binding's declared return type and answers a Silica record
+  (shape word first) built from the C struct; before, the return type was inferred from the parameters and
+  a tagged result of a scalar-argument wrapper faulted; and a `case` expression now carries its inferred
+  result type in the SIR when no expected type reaches it (`terms_helpers@sir_infer_case_type`), so a
+  cast whose tuple literal holds `(:link_up, case bound of { ... })` describes the string element to the
+  message copier as a string and not as a bare word. Before, the receiver read the sender's frame after
+  the carrier had reused it: the TCP loopback trapped in `starts_with` on most runs.
+- Trials: `trials/ffi_addition/app_transport_tcp_loopback` (`dangerous_tcp_loopback`: a listening and a
+  connecting carrier in one program exchange `(:ping, 7)` and `(:pong, 8)` as length-prefixed ETF frames;
+  `dangerous_udp_loopback`: two endpoints, a bare datagram one way). The serial carrier is compiled, not
+  run (no device on the integrate host). The BEAM demo of §13 is `programmer_tools/transport_beam_demo`
+  (`run_demo.sh`, outside `make integrate`): the Erlang peer receives the 48-byte `{accel, #{...}}` frame
+  of §13.4 and the program decodes the `{led, #{which => red, on => true}}` it answers. The specification
+  text is §16.4.8 (framing) and §16.4.9 (carriers). Not done in this phase: E2407, the `WireFrame`
+  segmentation under a real BLE mtu (phase 5), and the Linux emitters' side of the FFI struct-result fix
+  (phase 3).
+
+**Checks of §9.3 beyond the type walk:** E2406 (`decode` on external-danger-touched bytes outside a
+`sequence proc[external_danger]` block, in `ffi/ffi_taint_checker.silica`; trial
+`error_enforcement_addition/ffi_addition/error_app_ffi_result_cast/dangerous_decode_outside_external_danger`),
+E2409 (a program `impl WireFormat` or `impl Carrier`; trial `transport_err_closed_trait`), E2410 (a wire
+protocol the language names but this build's pack does not provide: `(:cbor)` is such a tag until phase 6,
+so `transport_err_not_on_target` exercises the rejection on Apple Silicon), and W2401 (printed once per
+decode family by `transport_pipeline`, naming the unit and the type; the derived calls carry no source
+position). Not checked: the handler that receives an FFI result cast is not yet a taint source
+(FFI wrapper specification §7.6 is open), so E2406 fires today only for a nested plain sequence inside an
+external-danger block.
 
 **ETF (§4.7):** `compiler/stdlib/wire_etf.silica`, pure Silica. Integers, floats, atoms, strings, tuples
 and lists encode byte for byte as `term_to_binary` writes them (checked against OTP 27 in the trials'

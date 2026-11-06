@@ -59,6 +59,7 @@ FAIL_CASES := \
 	error_app_cast_worker/dangerous_spawn_registered_dangerous_behavior \
 	error_app_cast_worker/dangerous_client_not_cast_only \
 	error_app_ffi_result_cast/dangerous_taint_in_produces \
+	error_app_ffi_result_cast/dangerous_decode_outside_external_danger \
 	error_app_ffi_result_cast/dangerous_external_danger_message_boundary \
 	error_app_ffi_result_cast/dangerous_taint_device_io \
 	error_app_ffi_result_cast/dangerous_taint_region_escape \
@@ -222,6 +223,7 @@ compile-fail-goldens:
 				printf "$$base.silica\n" > "$$tmpdir/silica.config"; \
 				;; \
 		esac; \
+		if grep -q ':etf' "$(THIS_DIR)$$case.silica"; then ln -s "$(abspath $(THIS_DIR)../../../compiler/stdlib/wire_etf.silica)" "$$tmpdir/wire_etf.silica" && echo wire_etf.silica >> "$$tmpdir/silica.config"; fi; \
 		$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$(THIS_DIR)$$case.silica); \
 		(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,"$(SILICA_COMPILER)"); }) > "$$cur" 2>&1 || true; \
 		rm -rf "$$tmpdir"; \

@@ -116,8 +116,13 @@ fn param_types_for_outer_encoding(param_types: string) -> string {
     replace_pipe_with_comma_loop(param_types, 0, "")
 }
 
+// local~symbol~param types~return type. The declared return type travels with the binding so a
+// struct result of a scalar-argument wrapper (a tagged result) gets its sret buffer; before
+// 2026-11-05 the return type was inferred from the parameters alone and only a pointer-plus-length
+// pair was taken to return a struct.
 fn encode_one_binding(b: { local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }) -> string {
     pt_enc: string <- param_types_for_outer_encoding(b.param_types);
+    rt_enc: string <- param_types_for_outer_encoding(b.return_type);
     concat(
         concat(
             concat(
@@ -126,7 +131,7 @@ fn encode_one_binding(b: { local_name: string, c_symbol: string, meta_path: stri
             ),
             binding_field_sep()
         ),
-        pt_enc
+        concat(concat(pt_enc, binding_field_sep()), rt_enc)
     )
 }
 
@@ -179,8 +184,14 @@ fn parse_binding_entry(entry: string) -> (string, string, string, string) {
                 true -> ("", "", "", "");
                 false -> {
                     c_sym: string <- substring(rest1, 0, s2);
-                    pt: string <- substring_to_end(rest1, s2 + length_bytes(binding_field_sep()));
-                    rt: string <- inferred_return_type_from_param_types(pt);
+                    rest2: string <- substring_to_end(rest1, s2 + length_bytes(binding_field_sep()));
+                    s3: int64 <- find_field_sep(rest2, binding_field_sep(), 0);
+                    pt: string <- case s3 < 0 of { true -> rest2; false -> substring(rest2, 0, s3) };
+                    declared: string <- case s3 < 0 of { true -> ""; false -> substring_to_end(rest2, s3 + length_bytes(binding_field_sep())) };
+                    rt: string <- case length_bytes(declared) > 0 of {
+                        true -> declared;
+                        false -> inferred_return_type_from_param_types(pt)
+                    };
                     (local, c_sym, pt, rt)
                 }
             }
@@ -430,10 +441,21 @@ fn foreign_call_uses_heap_scratch(param_types: string, return_type: string, arg1
     needs_string_in_marshal(param_types, arg1_type) or (foreign_call_sret_bytes(return_type) > 0)
 }
 
+// X9 = a record shape word (atom_table shape_index_base + position, so usually above 65535).
+fn shape_const_lines(n: int64) -> string {
+    case n < 0 of {
+        true -> "    MOV X9, #0\n";
+        false -> case n < 65536 of {
+            true -> concat("    MOV X9, #", concat(atom_table@int64_to_decimal_string(n), "\n"));
+            false -> concat("    MOVZ X9, #", concat(atom_table@int64_to_decimal_string(n / 65536), concat(", LSL #16\n    MOVK X9, #", concat(atom_table@int64_to_decimal_string(n % 65536), "\n"))))
+        }
+    }
+}
+
 fn emit_foreign_user_call(
     term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
     dest: string,
-    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string }
+    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, sret_shape: int64, outer_reg: string }
 ) -> string {
     pre_barrier: string <- emitter_effects@barrier_before_call(ctx.call_effects);
     post_barrier: string <- emitter_effects@barrier_after_call(ctx.call_effects);
@@ -458,11 +480,21 @@ fn emit_foreign_user_call(
         true -> emit_string_out_unmarshal_heap();
         false -> ""
     };
-    // Load result (string handle) back into X0 before the destination move. For non-string
-    // returns the C call leaves the result in X0 already.
+    // A struct result that is not a string (a tagged result or any inline record, wrapper spec §8.2)
+    // came back in the sret scratch at [SP+32, SP+64), which pops with the scratch frame: copy it
+    // into a block of this frame (L_dyn_alloc keeps the scratch at the same SP offsets) and answer
+    // that block, as a record value is its address. AArch64 leaves X0 unspecified after an sret
+    // call, so X0 is never read for it (2026-11-05: the socket wrappers' tagged results faulted on
+    // X0 = the first argument).
+    struct_out: string <- case expects_string_out == false and ctx.sret_bytes > 0 of {
+        true -> concat("    MOV X16, #48\n    BL L_dyn_alloc\n", concat(shape_const_lines(ctx.sret_shape), "    STR X9, [X16]\n    LDP X9, X10, [SP, #32]\n    STP X9, X10, [X16, #8]\n    LDP X9, X10, [SP, #48]\n    STP X9, X10, [X16, #24]\n    MOV X0, X16\n"));
+        false -> ""
+    };
+    // Load result (string handle) back into X0 before the destination move. For scalar returns the
+    // C call leaves the result in X0 already.
     load_result: string <- case expects_string_out of {
         true -> "    LDR X0, [SP, #16]\n";
-        false -> ""
+        false -> struct_out
     };
     sret_cleanup: string <- case uses_heap of {
         true -> case ctx.sret_bytes > 0 of {

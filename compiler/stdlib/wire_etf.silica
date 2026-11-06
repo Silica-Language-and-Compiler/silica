@@ -38,6 +38,7 @@ export enc_float64/1;
 export enc_string/1;
 export enc_atom/1;
 export enc_atom_name/1;
+export enc_actor_ref/1;
 export tuple_header/1;
 export list_header/1;
 export list_tail/1;
@@ -51,6 +52,7 @@ export dec_boolean/2;
 export dec_unit/2;
 export dec_string/3;
 export dec_atom_name/2;
+export dec_actor_ref/2;
 export dec_tag/3;
 export dec_tuple_arity/2;
 export dec_list_length/2;
@@ -148,6 +150,32 @@ fn enc_atom(v: atom) -> string {
 fn enc_key(name: string) -> string {
     enc_atom_name(name)
 }
+
+// An actor reference (specification §15.1.4): NEW_PID_EXT (88) with this program's node name and
+// creation (design §12 decision 10: nonode@nohost, 0), id = the child number (low 32 bits of the
+// identity word), serial = the position (high 32 bits).
+fn node_name() -> string {
+    "nonode@nohost"
+}
+
+fn enc_actor_ref(w: int64) -> string {
+    u: uint64 <- to_uint64(w);
+    mask: uint64 <- 4294967295;
+    id: uint64 <- u band mask;
+    serial: uint64 <- u shr 32;
+    zero: uint64 <- 0;
+    join2(join2(b1(88), enc_atom_name(node_name())), join2(join2(be32_raw(id), be32_raw(serial)), be32_raw(zero)))
+}
+
+fn be32_raw(u: uint64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [byte_of(u, 24), byte_of(u, 16), byte_of(u, 8), byte_of(u, 0)];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
 
 fn enc_boolean(v: boolean) -> string {
     case v of {
@@ -602,6 +630,42 @@ fn dec_map_size(bs: string, pos: int64) -> (:ok, int64, int64) | (:rejected, ato
     }
 }
 
+// NEW_PID_EXT (88): node atom, id u32, serial u32, creation u32; PID_EXT (103) carries a one-byte
+// creation. A node name or creation that is not this program's is :foreign_actor (design §4.2).
+fn dec_actor_ref(bs: string, pos: int64) -> (:ok, int64, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> {
+            tag: int64 <- tag_at(bs, pos);
+            case tag == 88 or tag == 103 of {
+                false -> (:rejected, :bad_tag);
+                true -> case dec_atom_name(bs, pos + 1) of {
+                    (:rejected, why: atom) -> (:rejected, why);
+                    (:ok, node: string, p1: int64) -> {
+                        tail: int64 <- case tag == 88 of { true -> 12; false -> 9 };
+                        case have(bs, p1, tail) of {
+                            false -> (:rejected, :truncated);
+                            true -> {
+                                id: int64 <- u32be(bs, p1);
+                                serial: int64 <- u32be(bs, p1 + 4);
+                                creation: int64 <- case tag == 88 of { true -> u32be(bs, p1 + 8); false -> tag_at(bs, p1 + 8) };
+                                case node == node_name() and creation == 0 of {
+                                    false -> (:rejected, :foreign_actor);
+                                    true -> {
+                                        hi: uint64 <- to_uint64(serial) shl 32;
+                                        w: uint64 <- hi bor to_uint64(id);
+                                        (:ok, to_int64(w), p1 + tail)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn peek_kind(bs: string, pos: int64) -> atom {
     case have(bs, pos, 1) of {
         false -> :bad;
@@ -623,6 +687,8 @@ fn peek_kind(bs: string, pos: int64) -> atom {
             119 -> :atom;
             100 -> :atom;
             115 -> :atom;
+            88 -> :pid;
+            103 -> :pid;
             _: int64 -> :bad
         }
     }

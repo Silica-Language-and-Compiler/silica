@@ -1,0 +1,174 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// WireFrame (transport_serialization_design.md §5): the framing between encode and a carrier, one
+// framing chosen by the carrier's properties. Not a trait.
+//
+//   :stream carriers (TCP, UART): every frame travels as a 4-byte big-endian length followed by the
+//   bytes, the framing of gen_tcp {packet, 4}. unframe reassembles from any segmentation the carrier
+//   made, and answers one frame per call: call it again with an empty segment to drain a second
+//   frame that arrived in the same segment.
+//   :datagram carriers whose mtu holds the frame: the frame travels bare, one per segment.
+//   :datagram carriers with a smaller mtu (BLE): the frame is cut into segments of mtu bytes, each
+//   with a 4-byte header { frame_seq: uint16, index: uint16 }, bit 15 of index marking the last;
+//   unframe reassembles them in order. frame_seq is 0 in this phase (one frame in flight per link).
+//
+// The reassembly state is { mode: atom, expected: int64, pending: string }: mode is the carrier's
+// boundaries, expected the frame length once its prefix is known (0 before), pending the bytes
+// received so far. max_frame bounds what unframe will assemble (:too_large beyond it).
+
+export fresh/1;
+export frame/3;
+export unframe/3;
+
+fn fresh(boundaries: atom) -> { mode: atom, expected: int64, pending: string } {
+    { mode: boundaries, expected: 0, pending: "" }
+}
+
+fn u32_prefix(n: int64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [(n / 16777216) % 256, (n / 65536) % 256, (n / 256) % 256, n % 256];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn u16_pair(seq: int64, index: int64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [(seq / 256) % 256, seq % 256, (index / 256) % 256, index % 256];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn join2(a: string, b: string) -> string {
+    sequence proc[mem(normal)]
+        parts: List[string, mem(normal)] <- [a, b];
+        out: string <- join_bytes(parts)
+    produces
+        pure out
+    end
+}
+
+fn one(s: string) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        none: List[string, mem(normal)] <- empty[string, mem(normal)]();
+        out: List[string, mem(normal)] <- prepend[string, mem(normal)](s, none)
+    produces
+        pure out
+    end
+}
+
+// The segments of a frame, in sending order.
+fn frame(f: string, mtu: int64, boundaries: atom) -> List[string, mem(normal)] {
+    n: int64 <- length_bytes(f);
+    case boundaries == :stream of {
+        true -> one(join2(u32_prefix(n), f));
+        false -> case mtu == 0 or n <= mtu of {
+            true -> one(f);
+            false -> segments(f, mtu - 4, 0, n)
+        }
+    }
+}
+
+fn segments(f: string, payload: int64, index: int64, n: int64) -> List[string, mem(normal)] {
+    start: int64 <- index * payload;
+    stop: int64 <- case start + payload >= n of { true -> n; false -> start + payload };
+    last: boolean <- stop >= n;
+    hdr: string <- case last of { true -> u16_pair(0, index + 32768); false -> u16_pair(0, index) };
+    seg: string <- join2(hdr, byte_slice(f, start, stop));
+    case last of {
+        true -> one(seg);
+        false -> {
+            sequence proc[mem(normal)]
+                rest: List[string, mem(normal)] <- segments(f, payload, index + 1, n);
+                out: List[string, mem(normal)] <- prepend[string, mem(normal)](seg, rest)
+            produces
+                pure out
+            end
+        }
+    }
+}
+
+fn be32_at(s: string, i: int64) -> int64 {
+    ((byte_at(s, i) * 256 + byte_at(s, i + 1)) * 256 + byte_at(s, i + 2)) * 256 + byte_at(s, i + 3)
+}
+
+// One segment in; (:more, state), (:frame, frame, state) or (:rejected, atom) out.
+fn unframe(state: { mode: atom, expected: int64, pending: string }, segment: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
+    case state.mode == :stream of {
+        true -> unframe_stream(state.mode, state.expected, join2(state.pending, segment), max_frame);
+        false -> case length_bytes(segment) > max_frame of {
+            true -> (:rejected, :too_large);
+            false -> unframe_datagram(state, segment, max_frame)
+        }
+    }
+}
+
+fn unframe_stream(mode: atom, expected: int64, bytes_in: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
+    have: int64 <- length_bytes(bytes_in);
+    case expected == 0 and have < 4 of {
+        true -> (:more, { mode: mode, expected: 0, pending: bytes_in });
+        false -> {
+            want: int64 <- case expected == 0 of { true -> be32_at(bytes_in, 0); false -> expected };
+            case want > max_frame of {
+                true -> (:rejected, :too_large);
+                false -> case have >= 4 + want of {
+                    false -> (:more, { mode: mode, expected: want, pending: bytes_in });
+                    true -> (:frame, byte_slice(bytes_in, 4, 4 + want), { mode: mode, expected: 0, pending: byte_slice(bytes_in, 4 + want, have) })
+                }
+            }
+        }
+    }
+}
+
+// A datagram segment is a whole frame unless it carries a segmentation header: the first segment
+// of a frame (index 0 without the last bit, or a lone last segment at index 0) is told from a bare
+// frame only by the carrier's mtu, which the owner knows; this phase treats every datagram as bare
+// when the state holds nothing and as a segment when a reassembly is in progress or the segment
+// starts a multi-segment frame (index 0, last bit clear).
+fn unframe_datagram(state: { mode: atom, expected: int64, pending: string }, segment: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
+    n: int64 <- length_bytes(segment);
+    in_progress: boolean <- length_bytes(state.pending) > 0;
+    starts_multi: boolean <- n >= 4 and byte_at(segment, 0) == 0 and byte_at(segment, 1) == 0 and byte_at(segment, 2) == 0 and byte_at(segment, 3) == 0;
+    case in_progress or starts_multi of {
+        false -> (:frame, segment, { mode: state.mode, expected: 0, pending: "" });
+        true -> case n < 4 of {
+            true -> (:rejected, :truncated);
+            false -> {
+                index: int64 <- byte_at(segment, 2) * 256 + byte_at(segment, 3);
+                last: boolean <- index >= 32768;
+                idx: int64 <- case last of { true -> index - 32768; false -> index };
+                case idx != state.expected of {
+                    true -> (:rejected, :bad_tag);
+                    false -> {
+                        joined: string <- join2(state.pending, byte_slice(segment, 4, n));
+                        case length_bytes(joined) > max_frame of {
+                            true -> (:rejected, :too_large);
+                            false -> case last of {
+                                true -> (:frame, joined, { mode: state.mode, expected: 0, pending: "" });
+                                false -> (:more, { mode: state.mode, expected: idx + 1, pending: joined })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

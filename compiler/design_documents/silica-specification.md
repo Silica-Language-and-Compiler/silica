@@ -29,6 +29,7 @@ Silica is a functional systems programming language designed for AArch64 archite
 - **Region-Based Memory**: Safe memory management without garbage collection
 - **References Stay With Their Region**: A `ref` or `buf` is never separated from the region that contains the memory it refers to; the region's lifetime is part of the reference type
 - **Heap Is an Effect**: Allocating or growing region-backed storage is a `mem(<space>)` effect on a sequence, not an invisible runtime service
+- **Transport Is Language**: Preparing a value for a link, every wire protocol and every carrier are defined by this specification (§16.4) and shipped with the compiler, as actors and regions are; a new protocol is an addition to the language, never a program library
 - **Designed for Modern Chips**: First-class support for what current hardware actually exposes (AArch64, RISC-V, x86-64, and later targets), not a portable 1970s machine model
 - **LLM-Friendly and Human-Readable**: Syntax and semantics designed to be easily parseable by Large Language Models while remaining intuitive for human developers. This includes one way at the language level, no type aliases, explicit type annotations, unambiguous syntax patterns, consistent naming conventions, and clear structural patterns that reduce ambiguity in both automated analysis and human comprehension.
   - **One Way at the Language Level**: Each job has one language-level construct; programs vary by composing those constructs. This keeps generation choices at the composition layer.
@@ -3057,7 +3058,10 @@ three-byte string, and `length_bytes("\x00")` is `1`.
 
 Strings are commonly used to hold UTF-8 text, and the character-oriented
 operations in §5.3 interpret the bytes as UTF-8, but the type itself imposes no
-encoding constraint.
+encoding constraint. The bytes themselves are reachable one at a time with
+`byte_at` and as a slice with `byte_slice`, and a string is built from computed
+bytes with `bytes_of` and `join_bytes` (§22.19); these are the operations a wire
+protocol's decoder and encoder are written with (§16.4).
 
 ```
 type string
@@ -3073,6 +3077,11 @@ type atom
 Atoms are interned at compile time into a global atom table. Each unique atom name maps to a fixed integer index, so atom equality is a single integer comparison rather than a string comparison. Atoms require no runtime heap allocation.
 
 **One table per program (normative).** The atom table is program-wide. An atom has the same index in every compilation unit, so atoms passed between modules, in messages, in actor state, or matched in `case` patterns compare equal whenever their names are equal. An implementation that assigns atom indices per compilation unit must reconcile them when it links the program. No atom is created at run time.
+
+**Names at run time (§22.19).** `atom_name(a)` answers an atom's name without its colon, and
+`atom_index_of_name(s)` answers the index of the atom with that name, or -1 when the program has no such
+atom; `atom_of_bits(i)` is the atom at index `i`. No atom is created at run time: a name that arrives on a
+wire and matches no atom of the program is rejected by the decoder (§16.4.4), never interned.
 
 **Atom Literal Syntax:**
 ```silica
@@ -8589,6 +8598,12 @@ The `actor_ref` type is a primitive type (like `int` or `boolean`), representing
 
 `actor_id` returns the value, for printing, hashing, and putting on the wire. It is conventionally printed as `<position.child_number>`. A distribution layer carries it as two 32-bit fields; for example, the BEAM distribution protocol's id and serial.
 
+**On the wire (§16.4).** An `actor_ref` encodes as the identity word split into its two 32-bit fields,
+child number then position, with the program's node name and creation (`nonode@nohost` and 0 for a
+standalone program; the ETF binding writes `NEW_PID_EXT`). It decodes only when the node name and creation
+are this program's; any other is `:foreign_actor`. `actor_ref_bits` and `actor_ref_of_word` are the pure
+conversions between a reference and its word.
+
 **Positions.** A position identifies a **spawner**: a supervisor, any other actor that spawns actors, or the program's `main` (which is not an actor).
 
 - The compiler numbers the positions of every spawner visible in the program at build time, in tree order.
@@ -10449,6 +10464,210 @@ The `reply_to` field is optional - messages without it cannot be used for cast-b
 - **Cast Exception Handling**: `cast()` raises `actor_not_found` exception if the target actor has terminated
 - **Actor Reference Type**: `actor_ref` is a primitive type (like `int` or `boolean`), not parameterized by message type
 
+
+### 16.4 Wire Transport
+
+Values cross a link as **frames**, byte strings (§4.1.6) written and read by a **wire protocol** the
+language provides. Transport is three concerns: what may cross (a property of the type, read at each call),
+how bytes are spelled (a wire protocol, one built-in implementation per protocol tag, a closed set), and how
+bytes travel (a carrier, one built-in implementation per link tag, a closed set). This section is normative
+for the first two; carriers and framing are specified when they are built (transport_serialization_design.md
+§5 and §6). Decoding is validation: every received byte is untrusted input, and a decoder never answers
+partial data.
+
+#### 16.4.1 encode and decode
+
+```
+encode(F, x: T) -> string                                                proc[mem(normal)]
+decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)                 proc[mem(normal)]
+decode(F, bytes: string, { max_bytes: N, max_depth: D, max_length: L }) -> (:ok, T) | (:rejected, atom)
+decode(F, bytes: string, { ... }, r: region(L, normal)) -> (:ok, T) | (:rejected, atom)   // T with ref?(L, S, rec) slots
+```
+
+- `F` is a **protocol tag literal**, a one-atom tagged tuple such as `(:etf)`. It is never a run-time
+  value: the implementation is selected at compile time. A variable, or a tag the language does not name,
+  is E2408; a tag the language names but the build's target does not provide is E2410 (§16.4.6).
+- `T` is static. For `encode` it is the type of `x`. For `decode` it is resolved from context as a
+  `List[Collectable, S]` is (§8.2.4): the binding annotation, the parameter or return position, or the
+  scrutinee of a `case`; a `decode` whose `T` cannot be resolved is E2403.
+- `T` must be transportable (§16.4.2): E2401 names the first component that cannot cross, E2404 a sum whose
+  variants a decoder could not tell apart.
+- The **limits** are an optional third argument of `decode`: a record literal whose fields are integer
+  literals, any subset of `max_bytes`, `max_depth` and `max_length`, and `utf8: true` or `false`. They
+  are compile-time constants baked into the derived decoder, so one derived decoder exists per (protocol,
+  type, limits). `max_bytes` is the largest frame `decode` reads (default 1 MiB); `max_depth` the deepest
+  nesting it follows (tuples, records and lists count one level each; a recursive slot counts nothing of
+  its own, the tuple it holds counts; default 64); `max_length` the longest list, string or buffer it
+  builds (default `max_bytes`). A type whose size is not fixed (it holds a `string`, a list or a recursive
+  slot) requires `max_bytes`; its absence, a limits argument that is not a literal record, a region
+  argument for a type without slots, or a missing region for a type with slots, is E2402.
+- A type with a `ref?(L, S, rec)` slot (§4.2.2) decodes into a **region the caller owns**: the fourth
+  argument, `region(L, normal)` with the slot's lifetime; each present slot of the result is an
+  `alloc_rec` cell in that region.
+- Both builtins allocate (`mem(normal)`) and declare no other effect. The compiler derives their bodies
+  from `T`; a program never writes a protocol's bytes itself. There is nothing to declare: the earlier
+  marker traits `Transportable` and `Recreatable` are not part of the language, and an `impl` of either is
+  E2411. `decode` and the FFI wrapper specification's `recreate` (§7.7 there) are one mechanism: the same
+  type-directed walk, the same limits, the same rejection atoms and the same call-site rule.
+
+#### 16.4.2 Transportable types
+
+| Type (§4) | Crosses | On the wire |
+| --- | --- | --- |
+| `unit`, `boolean` | yes | the unit value; a boolean |
+| `int8` … `int64`, `uint8` … `uint64` | yes | an integer; narrowed on decode, out of range is `:out_of_range` |
+| `float16`, `float32`, `float64` | yes | a `float64`; narrowed by rounding, never rejected for precision |
+| `char` | yes | its Unicode scalar value as an integer; surrogates and values above U+10FFFF are `:out_of_range` |
+| `string` | yes | a byte string; longer than `max_length` is `:too_long`; `utf8: true` rejects malformed text with `:bad_utf8` |
+| `atom`, atom literal | yes | the atom's name; a name the program has no atom for is `:unknown_atom`, a literal position another name is `:bad_variant` |
+| tuple, tagged tuple | yes | a tuple; a tagged tuple carries its tag atom first; wrong arity or tag is `:bad_tag` |
+| record | yes | a keyed map, keys the field names in name order on encode and any order on decode; `:missing_field`, `:duplicate_field`, `:unknown_field` |
+| `List[T, S]` | yes | a list; longer than `max_length` is `:too_long` |
+| sum of atoms, tagged tuples and at most one record | yes | the variant's own form; a form matching no variant is `:bad_variant`; two variants with one wire form are E2404 |
+| recursive tuple with `ref?(L, S, rec)` slots | yes | each slot the empty marker or the nested tuple; rebuilt in the caller's region, depth-limited |
+| `actor_ref` | yes, this node only | the identity of §15.1.4 with node name and creation; a foreign node or creation is `:foreign_actor` |
+| function types, `proc[...]`, `lifetime`, `region`, `ref` outside a slot, `buf`, `device_window`, `dangerous_actor_ref`, `device_actor_ref`, `supervisor_ref`, `timer_ref`, `core_id`, `core_set`, SIMD vectors | **no** | E2401 |
+
+A list or scalar variant of a sum, and a record with no fields, cannot be written as a value in this
+language today and are E2401 naming the component.
+
+#### 16.4.3 Rejection atoms
+
+`decode` answers `(:rejected, reason)` naming the first check that failed, and never partial data:
+`:bad_version` (the frame does not start as the protocol requires), `:truncated`, `:trailing_bytes`,
+`:bad_tag`, `:too_large` (the frame exceeds `max_bytes`), `:too_deep`, `:too_long`, `:out_of_range`,
+`:bad_utf8`, `:unknown_atom`, `:bad_variant`, `:missing_field`, `:duplicate_field`, `:unknown_field`,
+`:foreign_actor`, `:unsupported` (a form the protocol defines but this language does not carry).
+
+#### 16.4.4 Where decode may be called
+
+Anywhere the frame is not external-danger-touched. On external-danger-touched bytes `decode` is permitted
+exactly where `recreate` is (FFI wrapper specification §7.7): inside a `sequence proc[external_danger]`
+block or the handler that receives an FFI result cast; elsewhere it is E2406. Its `(:ok, T)` result is
+structurally pure under the same rules as a re-created value: it may go into state, casts and replies, and
+remains barred from `hot_swap`, command execution and code loading. Every `decode` is a point where foreign
+bytes become values; the compiler reports each derived decoder as the advisory warning W2401.
+
+#### 16.4.5 Wire protocols
+
+A wire protocol is a numbered subsection of this section and one built-in module `wire_<tag>` shipped with
+the compiler, keyed by its tag. The set is closed: `WireFormat` and `Carrier` are traits a program cannot
+implement (E2409). The language names these tags: `(:etf)` (§16.4.6, the BEAM external term format) and
+`(:cbor)` (reserved; no build provides it yet). A build provides the protocols and carriers its target's
+transport pack lists; a tag the language names but the pack does not list is E2410 at the call, wherever
+the tag appears.
+
+#### 16.4.6 The ETF binding, `(:etf)`
+
+The BEAM external term format (OTP 26 and later; `term_to_binary` / `binary_to_term`). A frame is the
+version byte 131 followed by one term. Encoding writes the smallest form that holds the value; decoding
+accepts every listed form.
+
+| Value | Encodes as | Decodes from |
+| --- | --- | --- |
+| unit | `SMALL_TUPLE_EXT` (104) of arity 0 | an arity-0 tuple only |
+| boolean | the atoms `true` / `false` | those two atom names |
+| integer | `SMALL_INTEGER_EXT` (97) for 0..255; `INTEGER_EXT` (98) for the signed 32-bit range; `SMALL_BIG_EXT` (110) with up to 8 digit bytes otherwise | 97, 98, 110; `LARGE_BIG_EXT` (111) is `:out_of_range` or `:unsupported` |
+| float | `NEW_FLOAT_EXT` (70), IEEE big-endian | 70; `FLOAT_EXT` (99) is `:unsupported` |
+| char | as integer | as integer, then the range check |
+| string | `BINARY_EXT` (109) | 109; `STRING_EXT` (107, a byte list) and `NIL_EXT` (106) also decode into a `string` |
+| atom | `SMALL_ATOM_UTF8_EXT` (119) or `ATOM_UTF8_EXT` (118) | 119, 118, `ATOM_EXT` (100), `SMALL_ATOM_EXT` (115) |
+| tuple | `SMALL_TUPLE_EXT` (104) or `LARGE_TUPLE_EXT` (105); a tagged tuple's atom first | 104, 105 |
+| list | `LIST_EXT` (108) with a `NIL_EXT` tail; an empty list is `NIL_EXT` alone | 108 with a `NIL_EXT` tail (an improper list is `:bad_tag`); 106; `STRING_EXT` (107) decodes into an integer list |
+| record | `MAP_EXT` (116) with atom keys in field-name order | 116, keys in any order; keys must be atoms |
+| recursive slot | the atom `none` when empty; the nested tuple when present | the atom `none` (any other atom is `:bad_variant`) or a tuple |
+| actor reference | `NEW_PID_EXT` (88): node atom, id (child number), serial (position), creation | 88; `PID_EXT` (103) with a one-byte creation; node `nonode@nohost` and creation 0 only, else `:foreign_actor` |
+
+Records are maps, not Erlang records: an Erlang record is a tagged tuple, and a program that must speak to one
+declares a tagged tuple. Silica's unit is the empty tuple `{}`. OTP writes small maps in an undefined key
+order, so a map frame from Erlang is compared by decoding, and the byte-for-byte canonical form holds for
+Silica-to-Silica frames only.
+
+#### 16.4.8 Framing
+
+A frame is one encoded term. Carriers differ in whether they keep boundaries and how much they move at
+once, so the built-in module `wireframe` sits between `encode` and a carrier. It is not a trait: there is one
+framing, chosen by the carrier's properties, and protocols never see it.
+
+```
+wireframe@fresh(boundaries: atom) -> { mode: atom, expected: int64, pending: string }
+wireframe@frame(frame: string, mtu: int64, boundaries: atom) -> List[string, normal]
+wireframe@unframe(state: { mode: atom, expected: int64, pending: string }, segment: string, max_frame: int64)
+    -> (:more, state) | (:frame, string, state) | (:rejected, atom)
+```
+
+- On a carrier whose `boundaries` are `:stream` every frame travels as a 4-byte big-endian length followed
+  by the bytes, the framing of the BEAM distribution channel and of `gen_tcp` with `{packet, 4}`.
+- On a `:datagram` carrier whose `mtu` holds the frame, the frame travels bare, one per segment. When the
+  `mtu` is smaller, the frame is cut into segments of at most `mtu` bytes, each behind a 4-byte header
+  `{ frame_seq: uint16, index: uint16 }` with bit 15 of `index` marking the last, and reassembled in order.
+- `unframe` answers one frame per call and keeps what follows it; a caller drains a second frame that
+  arrived in the same segment by calling again with an empty segment. A frame longer than `max_frame` is
+  `:rejected` with `:too_large`; a segment out of order is `:bad_tag`.
+
+#### 16.4.9 Carriers
+
+A carrier is an actor the language provides, one built-in implementation per link tag, installed by the
+program with `spawn_dangerous` (hosted carriers are Fifi wrappers over the host's sockets and serial ports)
+and spoken to only through casts. `Carrier` is a closed trait (E2409); its properties are literals per tag,
+read through the built-in module `carrier` by the tag's atom:
+
+```
+carrier@mtu(c: atom) -> int64            // largest segment in bytes; 0 means unbounded
+carrier@boundaries(c: atom) -> atom      // :stream | :datagram | :storage
+carrier@delivery(c: atom) -> atom        // :reliable_ordered | :ordered_lossy | :unreliable
+carrier@addressing(c: atom) -> atom      // :none | :endpoint | :characteristic | :block
+carrier@provided(c: atom) -> boolean     // whether this build's target provides the carrier
+```
+
+**The carrier contract.** Every message is cast-only.
+
+| Direction | Message | Meaning |
+| --- | --- | --- |
+| program to carrier | `(:open, owner: actor_ref, address: string)` | bind or connect; `address` is carrier-specific text |
+| program to carrier | `(:tx, segment: string, from: actor_ref)` | send one segment; consumes one send credit |
+| program to carrier | `(:credit, n: int64)` | the owner will accept `n` more `:rx` messages |
+| program to carrier | `:close` | orderly close; the carrier answers `:link_down` |
+| carrier to owner | `(:link_up, info: string)` | connected or bound; `info` is carrier-specific |
+| carrier to owner | `(:rx, segment: string)` | one received segment; consumes one receive credit |
+| carrier to owner | `(:tx_credit, n: int64)` | the carrier can take `n` more `:tx` messages |
+| carrier to owner | `(:tx_failed, reason: atom)` | a segment was not sent (`:no_credit`, `:link_down`, `:too_long`) |
+| carrier to owner | `(:link_down, reason: atom)` | the link ended (`:closed`, `:reset`, `:timeout`, `:fault`) |
+
+Flow control is credit-based in both directions: nothing is pushed without credit. Ordering per sender is
+mailbox order. Failure is the carrier actor exiting with a reason, handled by links, monitors and supervisors
+like any actor. The bytes a hosted carrier delivers are external-danger-touched, so the owner's `decode` runs
+in the handler that receives them, where §16.4.4 permits it.
+
+**The hosted carriers** (Apple Silicon macOS in this phase; Linux follows):
+
+| Tag | Module and behaviour | `address` | `mtu` | `boundaries` | `delivery` |
+| --- | --- | --- | --- | --- | --- |
+| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 and serves the first peer (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound and `"peer:accepted"` once served) | 0 | `:stream` | `:reliable_ordered` |
+| `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx`, and the local port to bind (`:link_up` carries `"port:<n>"`) | 65507 | `:datagram` | `:unreliable` |
+| `:serial` | `dangerous_serial_carrier@carrier` | `"path@baud"`, raw 8N1 | 0 | `:stream` | `:reliable_ordered` |
+
+A carrier's initial state is the record its module's `initial/0` spells; a program writes that literal at
+its `spawn_dangerous` (a `dangerous_*` function cannot be called outside an `external_danger` block). The
+socket wrappers behind the hosted carriers are the dangerous module `dangerous_sockets` over
+`libsilica_sockets.a`, shipped with the compiler under `compiler/stdlib/net/`.
+
+#### 16.4.7 Diagnostics
+
+| Code | Check |
+| --- | --- |
+| E2401 | a component of `T` at an `encode` or `decode` call cannot cross; names the path |
+| E2402 | a variable-sized `T` decoded without `max_bytes`; a limits argument that is not a literal record; a region argument for a type without slots, or none for a type with slots |
+| E2403 | `decode`'s result type cannot be resolved from context |
+| E2404 | two variants of a sum in `T` share one wire form |
+| E2405 | two built-in implementations for one protocol or carrier tag (the compiler's own tree) |
+| E2406 | `decode` on external-danger-touched bytes outside an `external_danger` block or an FFI result-cast handler |
+| E2408 | a protocol tag that is not a literal, or that the language does not name |
+| E2409 | a program `impl` of `WireFormat` or `Carrier` |
+| E2410 | a protocol or carrier tag the build's target does not provide |
+| E2411 | an `impl Transportable` or `impl Recreatable` declaration |
+| W2401 | advisory: a decoder was derived; foreign bytes become values here |
+
 ## 17. Atomic Operations
 
 ### 17.1 Atomic Types and Memory Spaces
@@ -12278,6 +12497,10 @@ Monitors are specified in §15.4.8.6 and §15.4.8.7. When the target ends, the m
 ### 20.4 Networking
 
 Networking is not part of the Silica language. There are no built-in network types, operations, namespaces or runtime support for it. A program that needs sockets, TCP, UDP or any other network access reaches the host's networking through the Foreign Function Interface, Fifi (§26.3), exactly as it reaches any other foreign library: the foreign calls run inside guarded regions in dangerous actors (§15.4.13), and carry the effects the wrapper declares, which for network access include `network_io` (§9). The section number is kept so that existing references resolve; it has no further content.
+
+Transport is part of the language even though sockets are not: the preparation of values for a link, the
+wire protocols and the carrier contract are defined in §16.4 and shipped with the compiler. A new wire
+protocol or carrier is an addition to this specification and to the compiler, never a program library.
 
 ## 21. Architecture-Specific Modules
 
@@ -14893,6 +15116,31 @@ checked_int64_byte_size(count: int64, element_size: int64) -> (boolean, int64)
 
 Pure. `(true, result)` when the result fits in `int64`; `(false, _)` on overflow (§5.7).
 
+
+### 22.19 Wire Transport Builtins
+
+All pure (no effects), shared by every target; `encode` and `decode` themselves are §16.4.1.
+
+```
+byte_at(s: string, i: int64) -> int64                       // the byte at i; out of range is a run-time failure
+byte_slice(s: string, start: int64, end: int64) -> string    // bytes start..end-1
+bytes_of(parts: List[int64, S]) -> string                    // a string from byte values
+join_bytes(parts: List[string, S]) -> string                 // one-allocation concatenation
+atom_name(a: atom) -> string                                 // the name without its colon
+atom_index_of_name(s: string) -> int64                       // the atom's index, or -1
+atom_of_bits(i: int64) -> atom                               // the atom at index i
+float64_bits(f: float64) -> int64,  float64_of_bits(b: int64) -> float64
+float32_bits(f: float32) -> int64,  float32_of_bits(b: int64) -> float32
+float32_to_float64(f: float32) -> float64,  float64_to_float32(f: float64) -> float32
+float16_to_float32(h: float16) -> float32,  float32_to_float16(f: float32) -> float16
+char_code(c: char) -> int64,  char_of_code(n: int64) -> char
+to_int64(x: <any integer type>) -> int64,  to_uint64(x: <any integer type>) -> uint64
+to_int8(n: int64) -> int8 ... to_uint32(n: int64) -> uint32   // truncating width conversions
+actor_ref_bits(a: actor_ref) -> int64,  actor_ref_of_word(w: int64) -> actor_ref
+```
+
+The byte builtins answer `int64`, not `uint8`, because arithmetic on the result is what every decoder does
+next.
 ## 23. Runtime System
 
 ### 23.1 Execution Environment

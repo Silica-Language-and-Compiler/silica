@@ -89,6 +89,7 @@ ee-units: $(CUR_FAILS) $(SUB_TARGETS)
 	ln -s "$(THIS_DIR)ffi_addition/error_app_sidecar_metadata/dangerous_exposure_source/good_retains_data_ptr.meta" "$$tmpdir/dangerous_exposure_source/good_retains_data_ptr.meta"; \
 	$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$$base.silica); \
 	if grep -q ':etf' "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/wire_etf.silica)" "$$tmpdir/wire_etf.silica" && echo wire_etf.silica >> "$$tmpdir/silica.config"; fi; \
+	for tr in WireFormat Carrier; do if grep -q "use $$tr;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/$$tr.silica)" "$$tmpdir/$$tr.silica" && echo $$tr.silica >> "$$tmpdir/silica.config"; fi; done; \
 	(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(SILICA_COMPILER)); }) > "$$base.cur_fail" 2>&1 || true; \
 	rm -rf "$$tmpdir"; \
 	if diff -q "$$base.cur_fail" "$$gf" > /dev/null 2>&1; then \

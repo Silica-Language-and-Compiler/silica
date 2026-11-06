@@ -313,6 +313,9 @@ fn scalar_fragment(fmt: string, k: string, t: string) -> string {
         "uint64" -> concat(wire(fmt, "enc_uint64"), "(v)");
         "float64" -> concat(wire(fmt, "enc_float64"), "(v)");
         "float32" -> concat(wire(fmt, "enc_float64"), "(float32_to_float64(v))");
+        "float16" -> concat(wire(fmt, "enc_float64"), "(float32_to_float64(float16_to_float32(v)))");
+        "char" -> concat(wire(fmt, "enc_int64"), "(char_code(v))");
+        "actor_ref" -> concat(wire(fmt, "enc_actor_ref"), "(actor_ref_bits(v))");
         "string" -> concat(wire(fmt, "enc_string"), "(v)");
         "atom" -> concat(wire(fmt, "enc_atom"), "(v)");
         "atom_lit" -> j3(wire(fmt, "enc_atom_name"), "(", concat(q(transport_types@atom_lit_name(t)), ")"));
@@ -406,6 +409,10 @@ fn sum_enc_arms(fmt: string, tid: string, subs: List[string, mem(normal)], vs: L
             sep: string <- case length_bytes(rest) == 0 of { true -> "\n"; false -> ";\n" };
             arm: string <- case transport_types@kind_of(h) of {
                 "atom_lit" -> j7("        :", transport_types@atom_lit_name(h), " -> {\n", seq_open(), prepend_last("out", scalar_fragment(fmt, "atom_lit", h), "acc"), seq_close("out"), "        }");
+                "record" -> {
+                    fs: List[string, mem(normal)] <- transport_types@record_fields(h);
+                    j8("        { ", record_pattern(fs), " } -> {\n", "            sequence\n", j5("                rv: ", spell(h), " <- { ", record_literal(fs), " };\n"), j5("                out: List[string, mem(normal)] <- ", enc_fn(fmt, tid, index_of(subs, h)), "(rv, acc)\n", "", ""), seq_close("out"), "        }")
+                };
                 _: string -> {
                     es: List[string, mem(normal)] <- transport_types@tuple_elems(h);
                     tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
@@ -421,6 +428,7 @@ fn gen_enc(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, 
     kind: string <- transport_types@kind_of(t);
     head: string <- j6("fn ", enc_fn(fmt, tid, k), "(v: ", spell(t), ", acc: List[string, mem(normal)]) -> List[string, mem(normal)] {", "\n");
     body: string <- case kind of {
+        "slot" -> slot_enc_body(fmt, tid, subs, t);
         "tuple" -> j3("    case v of {\n", tuple_arm(fmt, tid, subs, "", transport_types@tuple_elems(t)), "\n    }\n");
         "tagged" -> {
             es: List[string, mem(normal)] <- transport_types@tuple_elems(t);
@@ -463,7 +471,7 @@ fn result_type(t: string) -> string {
 }
 
 fn dec_head(name: string, t: string) -> string {
-    j5("fn ", name, "(bs: string, pos: int64, depth: int64) -> ", result_type(t), " {\n")
+    j5("fn ", name, "(bs: string, pos: int64, depth: int64@RP@) -> ", result_type(t), " {\n")
 }
 
 fn reject_arm(r: string) -> string {
@@ -493,6 +501,9 @@ fn scalar_dec_body(fmt: string, k: string, t: string, lim: { found: boolean, typ
         "boolean" -> j3("    ", wire(fmt, "dec_boolean"), "(bs, pos)\n");
         "string" -> j5("    ", wire(fmt, "dec_string"), "(bs, pos, ", it(lim.max_length), ")\n");
         "float32" -> j5("    case ", wire(fmt, "dec_float64"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, f: float64, p0: int64) -> (:ok, float64_to_float32(f), p0)\n    }\n");
+        "float16" -> j5("    case ", wire(fmt, "dec_float64"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, f: float64, p0: int64) -> (:ok, float32_to_float16(float64_to_float32(f)), p0)\n    }\n");
+        "char" -> j5("    case ", wire(fmt, "dec_int64"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, w: int64, p0: int64) -> case w < 0 or w > 1114111 or (w >= 55296 and w <= 57343) of {\n            true -> (:rejected, :out_of_range);\n            false -> (:ok, char_of_code(w), p0)\n        }\n    }\n");
+        "actor_ref" -> j5("    case ", wire(fmt, "dec_actor_ref"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, w: int64, p0: int64) -> (:ok, actor_ref_of_word(w), p0)\n    }\n");
         "unit" -> j5("    case ", wire(fmt, "dec_unit"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, p0: int64) -> (:ok, (), p0)\n    }\n");
         "atom" -> j5("    case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, nm: string, p0: int64) -> {\n            i: int64 <- atom_index_of_name(nm);\n            case i < 0 of {\n                true -> (:rejected, :unknown_atom);\n                false -> (:ok, atom_of_bits(i), p0)\n            }\n        }\n    }\n");
         "atom_lit" -> j8("    case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n        ", reject_arm("r0"), "        (:ok, nm: string, p0: int64) -> case nm == ", q(transport_types@atom_lit_name(t)), " of {\n            true -> (:ok, :", concat(transport_types@atom_lit_name(t), ", p0);\n            false -> (:rejected, :bad_variant)\n        }\n    }\n"));
@@ -506,7 +517,7 @@ fn dec_chain(fmt: string, tid: string, subs: List[string, mem(normal)], es: List
         []: List[string, mem(normal)] -> j3(indent, final, "\n");
         [h: string, t: List[string, mem(normal)]] -> {
             inner: string <- dec_chain(fmt, tid, subs, t, i + 1, final, concat(indent, "    "));
-            j8(indent, j5("case ", dec_fn(fmt, tid, index_of(subs, h)), "(bs, p", it(i - 1), ", depth) of {\n"),
+            j8(indent, j5("case ", dec_fn(fmt, tid, index_of(subs, h)), "(bs, p", it(i - 1), ", depth@RA@) of {\n"),
                concat(indent, "    "), reject_arm(concat("r", it(i))),
                j7(indent, "    (:ok, ", bind_of(h, concat("x", it(i))), ": ", spell(h), ", p", concat(it(i), ": int64) ->\n")),
                inner, indent, "}\n")
@@ -540,7 +551,7 @@ fn tuple_final(tag: string, payload: List[string, mem(normal)]) -> string {
 // A payload decoder: the elements after a tuple's header (and tag), answering `result_t`.
 fn payload_fn(fmt: string, tid: string, subs: List[string, mem(normal)], name: string, tag: string, payload: List[string, mem(normal)], result_t: string) -> string {
     n: int64 <- count(payload, 0);
-    j5(j5("fn ", name, "(bs: string, p0: int64, depth: int64) -> ", result_type(result_t), " {\n"),
+    j5(j5("fn ", name, "(bs: string, p0: int64, depth: int64@RP@) -> ", result_type(result_t), " {\n"),
        dec_chain(fmt, tid, subs, payload, 1, tuple_final(tag, payload), "    "), "}\n", "", "")
 }
 
@@ -554,11 +565,24 @@ fn decs_fn(fmt: string, tid: string, k: int64, v: int64) -> string {
 
 fn tuple_dec_body(fmt: string, tid: string, k: int64, tag: string, arity: int64) -> string {
     tag_check: string <- case length_bytes(tag) > 0 of {
-        true -> j7("                true -> case ", wire(fmt, "dec_tag"), "(bs, p0, ", q(tag), ") of {\n                    ", reject_arm("rt"), j3("                    (:ok, pt: int64) -> ", decp_fn(fmt, tid, k), "(bs, pt, depth - 1)\n                }\n"));
-        false -> j3("                true -> ", decp_fn(fmt, tid, k), "(bs, p0, depth - 1)\n")
+        true -> j7("                true -> case ", wire(fmt, "dec_tag"), "(bs, p0, ", q(tag), ") of {\n                    ", reject_arm("rt"), j3("                    (:ok, pt: int64) -> ", decp_fn(fmt, tid, k), "(bs, pt, depth - 1@RA@)\n                }\n"));
+        false -> j3("                true -> ", decp_fn(fmt, tid, k), "(bs, p0, depth - 1@RA@)\n")
     };
     j8("    case depth <= 0 of {\n        true -> (:rejected, :too_deep);\n        false -> case ", wire(fmt, "dec_tuple_arity"), "(bs, pos) of {\n            ", reject_arm("r0"),
        j3("            (:ok, ar: int64, p0: int64) -> case ar == ", it(arity), " of {\n                false -> (:rejected, :bad_tag);\n"), tag_check, "            }\n        }\n    }\n", "")
+}
+
+// `f1: x_f1, f2: x_f2` for a record pattern (a unit field binds a discard).
+fn record_pattern(fields: List[string, mem(normal)]) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- record_pattern(t);
+            sep: string <- case length_bytes(rest) == 0 of { true -> ""; false -> ", " };
+            fname: string <- transport_types@field_name(h);
+            j5(fname, ": ", bind_of(transport_types@field_type(h), concat("x_", fname)), sep, rest)
+        }
+    }
 }
 
 fn record_literal(fields: List[string, mem(normal)]) -> string {
@@ -619,10 +643,10 @@ fn record_key_arms(fmt: string, tid: string, subs: List[string, mem(normal)], k:
             ftype: string <- transport_types@field_type(h);
             arm: string <- j8(j3("                ", q(fname), concat(" -> case s_", concat(fname, " of {\n"))),
                 j3("                    (:some, _d: ", spell(ftype), ") -> (:rejected, :duplicate_field);\n"),
-                j3("                    :none -> case ", dec_fn(fmt, tid, index_of(subs, ftype)), "(bs, pk, depth) of {\n                        "),
+                j3("                    :none -> case ", dec_fn(fmt, tid, index_of(subs, ftype)), "(bs, pk, depth@RA@) of {\n                        "),
                 reject_arm("r"),
                 j3(concat("                        (:ok, ", bind_of(ftype, "x")), concat(": ", spell(ftype)), ", p: int64) -> "),
-                j6("__tr_decm_", fmt, "_", tid, "_", concat(it(k), "(bs, p, depth, n - 1")),
+                j6("__tr_decm_", fmt, "_", tid, "_", concat(it(k), "(bs, p, depth@RA@, n - 1")),
                 concat(filled_args(all, fname, ftype), ")\n                    }\n                };\n"), "");
             concat(arm, rest)
         }
@@ -650,7 +674,7 @@ fn decm_fn(fmt: string, tid: string, k: int64) -> string {
 fn record_map_fn(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, t: string) -> string {
     fields: List[string, mem(normal)] <- transport_types@record_fields(t);
     final: string <- j3("(:ok, { ", record_literal(fields), " }, pos)");
-    head: string <- j7("fn ", decm_fn(fmt, tid, k), "(bs: string, pos: int64, depth: int64, n: int64", slot_params(fields), ") -> ", result_type(t), " {\n");
+    head: string <- j7("fn ", decm_fn(fmt, tid, k), "(bs: string, pos: int64, depth: int64@RP@, n: int64", slot_params(fields), ") -> ", result_type(t), " {\n");
     done: string <- j3("    case n == 0 of {\n        true ->\n", record_finish(fields, final, "            "), "        ;\n");
     more: string <- j8("        false -> case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n            ", reject_arm("rk"), "            (:ok, key: string, pk: int64) -> case key of {\n", record_key_arms(fmt, tid, subs, k, fields, fields), "                _: string -> (:rejected, :unknown_field)\n            }\n        }\n    }\n}\n", "");
     j3(head, done, more)
@@ -661,7 +685,7 @@ fn record_dec_body(fmt: string, tid: string, subs: List[string, mem(normal)], k:
     m: int64 <- count(fields, 0);
     j8("    case depth <= 0 of {\n        true -> (:rejected, :too_deep);\n        false -> case ", wire(fmt, "dec_map_size"), "(bs, pos) of {\n            ", reject_arm("r0"),
        j3("            (:ok, ms: int64, p0: int64) -> case ms > ", it(m), " of {\n                true -> (:rejected, :unknown_field);\n                false -> "),
-       j7(decm_fn(fmt, tid, k), "(bs, p0, depth - 1, ms", none_args(fields), ")\n            }\n        }\n    }\n", "", "", ""), "", "")
+       j7(decm_fn(fmt, tid, k), "(bs, p0, depth - 1@RA@, ms", none_args(fields), ")\n            }\n        }\n    }\n", "", "", ""), "", "")
 }
 
 fn last_of(xs: List[string, mem(normal)]) -> string {
@@ -686,7 +710,7 @@ fn list_dec_body(fmt: string, tid: string, k: int64, e: string, lim: { found: bo
     part1: string <- j5("    case depth <= 0 of {\n        true -> (:rejected, :too_deep);\n", bytes_arm, concat("case ", wire(fmt, "dec_list_length")), "(bs, pos) of {\n            ", reject_arm("r0"));
     part1b: string <- "            (:ok, n: int64, p0: int64) -> case n == 0 of {\n";
     part2: string <- j5("                true -> {\n                    sequence proc[mem(normal)]\n                        e: List[", le, ", mem(normal)] <- empty[", le, ", mem(normal)]()\n                    produces\n                        pure (:ok, e, p0)\n                    end\n                };\n");
-    part3: string <- j7("                false -> case n > ", it(lim.max_length), " of {\n                    true -> (:rejected, :too_long);\n                    false -> __tr_decl_", fmt, "_", tid, concat("_", concat(it(k), "(bs, p0, depth - 1, n)\n                }\n            }\n        }\n")));
+    part3: string <- j7("                false -> case n > ", it(lim.max_length), " of {\n                    true -> (:rejected, :too_long);\n                    false -> __tr_decl_", fmt, "_", tid, concat("_", concat(it(k), "(bs, p0, depth - 1@RA@, n)\n                }\n            }\n        }\n")));
     j5(part1, part1b, part2, part3, concat(bytes_close, "    }\n"))
 }
 
@@ -706,11 +730,11 @@ fn bytes_list_fn(fmt: string, tid: string, k: int64, e: string) -> string {
 fn list_walker_dec(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, e: string) -> string {
     le: string <- spell(e);
     name: string <- j6("__tr_decl_", fmt, "_", tid, "_", it(k));
-    j8(j5("fn ", name, "(bs: string, pos: int64, depth: int64, n: int64) -> (:ok, List[", le, ", mem(normal)], int64) | (:rejected, atom) {\n"),
+    j8(j5("fn ", name, "(bs: string, pos: int64, depth: int64@RP@, n: int64) -> (:ok, List[", le, ", mem(normal)], int64) | (:rejected, atom) {\n"),
        j5("    case n == 0 of {\n        true -> case ", wire(fmt, "dec_list_tail"), "(bs, pos) of {\n            ", reject_arm("rt"), j3("            (:ok, pt: int64) -> {\n                sequence proc[mem(normal)]\n                    e: List[", le, ", mem(normal)] <- empty[")),
        j3(le, ", mem(normal)]()\n                produces\n                    pure (:ok, e, pt)\n                end\n            }\n        };\n        false -> case ", dec_fn(fmt, tid, index_of(subs, e))),
-       j3("(bs, pos, depth) of {\n            ", reject_arm("r1"), j3("            (:ok, h: ", le, ", p1: int64) -> case ")),
-       j5(name, "(bs, p1, depth, n - 1) of {\n                ", reject_arm("r2"), "                (:ok, t: List[", concat(le, ", mem(normal)], p2: int64) -> {\n                    sequence proc[mem(normal)]\n                        out: List[")),
+       j3("(bs, pos, depth@RA@) of {\n            ", reject_arm("r1"), j3("            (:ok, h: ", le, ", p1: int64) -> case ")),
+       j5(name, "(bs, p1, depth@RA@, n - 1) of {\n                ", reject_arm("r2"), "                (:ok, t: List[", concat(le, ", mem(normal)], p2: int64) -> {\n                    sequence proc[mem(normal)]\n                        out: List[")),
        j3(le, ", mem(normal)] <- prepend[", concat(le, ", mem(normal)](h, t)\n                    produces\n                        pure (:ok, out, p2)\n                    end\n                }\n            }\n        }\n    }\n}\n")), "", "")
 }
 
@@ -730,6 +754,17 @@ fn sum_atom_arms(vs: List[string, mem(normal)]) -> string {
     }
 }
 
+// The `:map ->` arm of a sum decoder when the sum has a record variant.
+fn sum_map_arm(fmt: string, tid: string, k: int64, vs: List[string, mem(normal)], vi: int64) -> string {
+    case vs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> case transport_types@kind_of(h) == "record" of {
+            true -> j3("            :map -> ", decs_fn(fmt, tid, k, vi), "(bs, pos, depth - 1@RA@);\n");
+            false -> sum_map_arm(fmt, tid, k, t, vi + 1)
+        }
+    }
+}
+
 fn sum_tuple_arms(fmt: string, tid: string, k: int64, vs: List[string, mem(normal)], vi: int64) -> string {
     case vs of {
         []: List[string, mem(normal)] -> "";
@@ -740,7 +775,7 @@ fn sum_tuple_arms(fmt: string, tid: string, k: int64, vs: List[string, mem(norma
                     es: List[string, mem(normal)] <- transport_types@tuple_elems(h);
                     tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
                     arity: int64 <- count(es, 0);
-                    j8("                        ", q(tag), " -> case ar == ", it(arity), " of { false -> (:rejected, :bad_tag); true -> ", decs_fn(fmt, tid, k, vi), "(bs, pg, depth - 1) };\n", rest)
+                    j8("                        ", q(tag), " -> case ar == ", it(arity), " of { false -> (:rejected, :bad_tag); true -> ", decs_fn(fmt, tid, k, vi), "(bs, pg, depth - 1@RA@) };\n", rest)
                 };
                 false -> rest
             }
@@ -759,7 +794,12 @@ fn sum_variant_fns(fmt: string, tid: string, subs: List[string, mem(normal)], k:
                     tag: string <- case es of { []: List[string, mem(normal)] -> ""; [eh: string, _et: List[string, mem(normal)]] -> transport_types@atom_lit_name(eh) };
                     concat(payload_fn(fmt, tid, subs, decs_fn(fmt, tid, k, vi), tag, tagged_payload(es), sum_t), rest)
                 };
-                false -> rest
+                false -> case transport_types@kind_of(h) == "record" of {
+                    true -> concat(j8(j5("fn ", decs_fn(fmt, tid, k, vi), "(bs: string, p0: int64, depth: int64@RP@) -> ", result_type(sum_t), " {\n"),
+                        j3("    case ", dec_fn(fmt, tid, index_of(subs, h)), "(bs, p0, depth@RA@) of {\n        "), reject_arm("rr"),
+                        j5("        (:ok, rv: ", spell(h), ", p1: int64) -> {\n            sequence\n                sv: ", spell(sum_t), " <- rv\n            produces\n                pure (:ok, sv, p1)\n            end\n        }\n    }\n}\n"), "", "", "", ""), rest);
+                    false -> rest
+                }
             }
         }
     }
@@ -770,7 +810,7 @@ fn sum_dec_body(fmt: string, tid: string, k: int64, vs: List[string, mem(normal)
     part2: string <- j3("                (:ok, nm: string, pa: int64) -> case nm of {\n", sum_atom_arms(vs), "                    _: string -> (:rejected, :bad_variant)\n                }\n            };\n");
     part3: string <- j6("            :tuple -> case ", wire(fmt, "dec_tuple_arity"), "(bs, pos) of {\n                ", reject_arm("rt"), "                (:ok, ar: int64, pt: int64) -> case ", wire(fmt, "dec_atom_name"));
     part4: string <- j3("(bs, pt) of {\n                    ", reject_arm("rg"), "                    (:ok, tg: string, pg: int64) -> case tg of {\n");
-    part5: string <- j3(sum_tuple_arms(fmt, tid, k, vs, 0), "                        _: string -> (:rejected, :bad_variant)\n                    }\n                }\n            };\n", "            _: atom -> (:rejected, :bad_variant)\n        }\n    }\n");
+    part5: string <- j5(sum_tuple_arms(fmt, tid, k, vs, 0), "                        _: string -> (:rejected, :bad_variant)\n                    }\n                }\n            };\n", sum_map_arm(fmt, tid, k, vs, 0), "            _: atom -> (:rejected, :bad_variant)\n        }\n    }\n", "");
     j5(part1, part2, part3, part4, part5)
 }
 
@@ -778,6 +818,7 @@ fn gen_dec(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, 
     kind: string <- transport_types@kind_of(t);
     head: string <- dec_head(dec_fn(fmt, tid, k), t);
     body: string <- case kind of {
+        "slot" -> slot_dec_body(fmt, tid, subs, t);
         "tuple" -> tuple_dec_body(fmt, tid, k, "", count(transport_types@tuple_elems(t), 0));
         "tagged" -> {
             es: List[string, mem(normal)] <- transport_types@tuple_elems(t);
@@ -819,7 +860,10 @@ fn gen_subtypes(kind: string, fmt: string, tid: string, subs: List[string, mem(n
         [h: string, t: List[string, mem(normal)]] -> {
             one: string <- case kind == "decode" of {
                 true -> gen_dec(fmt, tid, subs, k, h, lim);
-                false -> gen_enc(fmt, tid, subs, k, h)
+                false -> case kind == "recreate" of {
+                    true -> "";
+                    false -> gen_enc(fmt, tid, subs, k, h)
+                }
             };
             concat(one, gen_subtypes(kind, fmt, tid, subs, t, k + 1, lim))
         }
@@ -846,13 +890,14 @@ fn gen_tops(kind: string, fmt: string, tid: string, tt: string, k0: int64, limit
         "    sequence proc[mem(normal)]\n        tail0: List[string, mem(normal)] <- empty[string, mem(normal)]();\n        parts: List[string, mem(normal)] <- ",
         enc_fn(fmt, tid, k0), concat(concat("(", arg_of(tt, "v")), ", tail0);\n"), prepend_line("whole", concat(wire(fmt, "term_prefix"), "()"), "parts"),
         "        out: string <- join_bytes(whole)\n    produces\n        pure out\n    end\n}\n", "", "");
-    dec: string <- j8(j5("fn ", derived_fn_name("decode", fmt, limits, tt), "(bs: string) -> (:ok, ", spell(tt), ") | (:rejected, atom) {\n"),
+    dec: string <- j8(j5("fn ", derived_fn_name("decode", fmt, limits, tt), "(bs: string@RP@) -> (:ok, ", spell(tt), ") | (:rejected, atom) {\n"),
         j3("    case length_bytes(bs) > ", it(lim.max_bytes), " of {\n        true -> (:rejected, :too_large);\n"),
         j3("        false -> case ", wire(fmt, "dec_prefix"), "(bs, 0) of {\n            "), reject_arm("r0"),
-        j7("            (:ok, p0: int64) -> case ", dec_fn(fmt, tid, k0), "(bs, p0, ", it(lim.max_depth), ") of {\n                ", reject_arm("r1"), j3(concat("                (:ok, ", value_pattern(tt)), ", p1: int64) -> case ", "")),
+        j7("            (:ok, p0: int64) -> case ", dec_fn(fmt, tid, k0), "(bs, p0, ", it(lim.max_depth), "@RA@) of {\n                ", reject_arm("r1"), j3(concat("                (:ok, ", value_pattern(tt)), ", p1: int64) -> case ", "")),
         j3(wire(fmt, "dec_end"), "(bs, p1) of {\n                    ", reject_arm("r2")),
         j3("                    (:ok, _p2: int64) -> (:ok, ", value_result(tt), ")\n                }\n            }\n        }\n    }\n}\n"), "");
-    case kind == "decode" of { true -> dec; false -> enc }
+    rc: string <- j5(j5("fn ", derived_fn_name("recreate", fmt, "", tt), "(", value_pattern(tt), ") -> (:ok, "), spell(tt), ") | (:rejected, atom) {\n    (:ok, ", value_result(tt), ")\n}\n");
+    case kind == "decode" of { true -> dec; false -> case kind == "recreate" of { true -> rc; false -> enc } }
 }
 
 fn reverse_strings(xs: List[string, mem(normal)], acc: List[string, mem(normal)]) -> List[string, mem(normal)] {
@@ -868,6 +913,52 @@ fn reverse_strings(xs: List[string, mem(normal)], acc: List[string, mem(normal)]
     }
 }
 
+
+// ---- recursive slots -------------------------------------------------------------------------------
+// A family whose type holds a `ref?(L, S, rec)` slot decodes into a region the caller passes
+// (design §4.1): every decoder of the family takes `r: region(L, normal)` after `depth` (the @RP@ /
+// @RA@ placeholders, filled per family in gen_family), a slot encodes as the atom `none` or the
+// nested tuple, and decode rebuilds a present slot with alloc_rec.
+
+fn find_from(s: string, pat: string, i: int64) -> int64 {
+    n: int64 <- length_bytes(s);
+    m: int64 <- length_bytes(pat);
+    case i + m > n of {
+        true -> -1;
+        false -> case substring(s, i, i + m) == pat of {
+            true -> i;
+            false -> find_from(s, pat, i + 1)
+        }
+    }
+}
+
+fn replace_all(s: string, pat: string, by: string) -> string {
+    i: int64 <- find_from(s, pat, 0);
+    case i < 0 of {
+        true -> s;
+        false -> j3(substring(s, 0, i), by, replace_all(substring(s, i + length_bytes(pat), length_bytes(s)), pat, by))
+    }
+}
+
+fn slot_enc_body(fmt: string, tid: string, subs: List[string, mem(normal)], t: string) -> string {
+    owner: string <- transport_types@slot_referent(t);
+    lt: string <- transport_types@slot_lifetime(t);
+    j8("    case v of {\n        :none -> {\n", seq_open(), prepend_last("out", j3(wire(fmt, "enc_atom_name"), "(", concat(q("none"), ")")), "acc"), seq_close("out"),
+       j5("        };\n        c: ref(", lt, ", normal, ", owner, ") -> {\n"), seq_open(),
+       j5("                node: ", owner, " <- read_ref(c);\n                out: List[string, mem(normal)] <- ", enc_fn(fmt, tid, index_of(subs, owner)), "(node, acc)\n"),
+       concat(seq_close("out"), "        }\n    }\n"))
+}
+
+fn slot_dec_body(fmt: string, tid: string, subs: List[string, mem(normal)], t: string) -> string {
+    owner: string <- transport_types@slot_referent(t);
+    lt: string <- transport_types@slot_lifetime(t);
+    j8(j5("    case ", wire(fmt, "peek_kind"), "(bs, pos) of {\n        :atom -> case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n            "), reject_arm("r0"),
+       j3("            (:ok, nm: string, p0: int64) -> case nm == \"none\" of {\n                true -> {\n                    sequence\n                        empty: ", t, " <- :none\n                    produces\n                        pure (:ok, empty, p0)\n                    end\n                };\n                false -> (:rejected, :bad_variant)\n            }\n        };\n"),
+       j3("        _: atom -> case ", dec_fn(fmt, tid, index_of(subs, owner)), "(bs, pos, depth@RA@) of {\n                "), reject_arm("r1"),
+       j5("                (:ok, node: ", owner, ", p1: int64) -> {\n                    sequence proc[mem(normal)]\n                        cell: ref(", lt, concat(concat(", normal, ", owner), ") <- alloc_rec(r, node);\n")),
+       j3("                        slot: ", t, " <- cell\n                    produces\n                        pure (:ok, slot, p1)\n                    end\n                }\n            }\n    }\n"), "")
+}
+
 fn gen_family(kind: string, fmt: string, tt: string, limits: string) -> string {
     sequence proc[mem(normal)]
         none: List[string, mem(normal)] <- empty[string, mem(normal)]();
@@ -876,7 +967,11 @@ fn gen_family(kind: string, fmt: string, tt: string, limits: string) -> string {
         tid: string <- family_id(kind, tt, limits);
         lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean } <- transport_types@limits_of_text(limits, tt);
         k0: int64 <- index_of(subs, tt);
-        text: string <- j3(gen_tops(kind, fmt, tid, tt, k0, limits, lim), gen_subtypes(kind, fmt, tid, subs, subs, 0, lim), "\n")
+        raw: string <- j3(gen_tops(kind, fmt, tid, tt, k0, limits, lim), gen_subtypes(kind, fmt, tid, subs, subs, 0, lim), "\n");
+        is_rec: boolean <- transport_types@has_slot(tt);
+        rp: string <- case is_rec of { true -> j3(", r: region(", transport_types@slot_lifetime_of_type(tt), ", normal)"); false -> "" };
+        ra: string <- case is_rec of { true -> ", r"; false -> "" };
+        text: string <- replace_all(replace_all(raw, "@RP@", rp), "@RA@", ra)
     produces
         pure text
     end

@@ -409,6 +409,12 @@ Calls to dangerous_* module functions must appear in the sequence portion of seq
 
 The worker behavior may be written as a function literal at the `spawn_dangerous` call site or as a named top-level function passed directly to `spawn_dangerous`. In both cases, the function containing the `external_danger` sequence must be the FFI worker behavior function supplied to `spawn_dangerous`.
 
+**Library workers (2026-11-05).** A `dangerous_*` module may export a cast-only behaviour function for
+other programs to install with `spawn_dangerous` (the hosted carriers of the transport design §6.3 are
+such libraries). Every exported cast-only behaviour of a `dangerous_*` module is an FFI worker behaviour
+for the rules above, and its body may be a `case` over the message whose arms hold the
+`external_danger` blocks, as well as one block as the whole body.
+
 **Parser failure**:
 
 ```text
@@ -1064,6 +1070,11 @@ A type without a limit field uses the type's own fixed bounds, and a variable-si
 rejected at compile time. The limits are compile-time constants baked into the derived function, exactly as the
 transport design's `decode` takes them (transport_serialization_design.md §4.1); `decode` is `recreate` applied
 to bytes, with the same rejection atoms and the same call-site rule, and both are derived by one generator.
+
+**Status (2026-11-05).** `recreate` exists for scalar types (integers, floats, `boolean`, `atom`,
+`char`, `actor_ref`): the derived function answers `(:ok, x)` and the taint checker treats the result as
+pure; a tainted input outside a permitted block is E2406. Composite types are ROADMAP chunk 13, derived by
+the generator that derives the transport `decode`.
 
 **The derived function.** For the type `T` at each call, the compiler derives:
 
