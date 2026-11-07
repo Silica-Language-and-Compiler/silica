@@ -167,11 +167,11 @@ integrate-run:
 			ko=$$((ko + 1)); failed=1; continue; \
 		fi; \
 		if [ -f "$(call SCOUT_FOR,$$stem)" ]; then \
-			{ { grep -q '^use trial_support_' "$$stem.silica" || [ -f "$$stem.no_stdin_exit" ] || printf 'exit\n'; } | ./$$stem 2>&1; echo $$?; } > "$$stem.sout"; \
-			if ! diff -Bw -q "$$stem.sout" "$(call SCOUT_FOR,$$stem)" > /dev/null 2>&1; then \
+			{ { grep -q '^use trial_support_' "$$stem.silica" || [ -f "$$stem.no_stdin_exit" ] || printf 'exit\n'; } | ./$$stem 2>&1; echo $$?; } > "$$stem$(SOUT_EXT)"; \
+			if ! diff -Bw -q "$$stem$(SOUT_EXT)" "$(call SCOUT_FOR,$$stem)" > /dev/null 2>&1; then \
 				echo "❌❌ $(MSG_PREFIX)$$stem .sout differs from .scout"; \
 				$(INTEGRATE_DOT_FAIL); \
-				diff -Bw "$$stem.sout" "$(call SCOUT_FOR,$$stem)" || true; \
+				diff -Bw "$$stem$(SOUT_EXT)" "$(call SCOUT_FOR,$$stem)" || true; \
 				ko=$$((ko + 1)); failed=1; \
 			else \
 				echo "✅✅ $(MSG_PREFIX)$$stem output matches .scout"; \
@@ -194,7 +194,7 @@ clean:
 		[ -f "$$s" ] || continue; \
 		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done; \
-	rm -f *.sams *.o *.iface *.sout silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts silica.config; \
+	rm -f *.sams *.o *.iface *$(SOUT_EXT) silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts silica.config; \
 	echo "✅ $(MSG_PREFIX)Clean complete"
 
 help:

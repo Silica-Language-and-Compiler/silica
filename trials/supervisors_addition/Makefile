@@ -224,7 +224,7 @@ integrate-run:
 		elif [ -x "$$base" ]; then \
 			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
 				if [ -f "$(THIS_DIR)run_integration_exit_after_marker.py" ]; then \
-					$(call INTEGRATE_EXEC_TRIAL,$(MSG_PREFIX)$$base,python3 "$(THIS_DIR)run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "done"); \
+					$(call INTEGRATE_EXEC_TRIAL,$(MSG_PREFIX)$$base,python3 "$(THIS_DIR)run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base$(SOUT_EXT)" "done"); \
 					if [ "$$integrate_killed" = 1 ]; then \
 						echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 						$(INTEGRATE_DOT_FAIL); \
@@ -237,14 +237,14 @@ integrate-run:
 					continue; \
 				fi; \
 				if [ -f "$$base.scout.normalized" ] && [ ! -f "$$base.scout.multiset" ]; then \
-					if [ -f "$(THIS_DIR)compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)"; then \
+					if [ -f "$(THIS_DIR)compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_normalized.sh" "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)"; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout normalized-compare differs from .scout"; \
 						$(INTEGRATE_DOT_FAIL); \
 						ko=$$((ko + 1)); failed=1; \
-					elif [ ! -f "$(THIS_DIR)compare_scout_normalized.sh" ] && ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+					elif [ ! -f "$(THIS_DIR)compare_scout_normalized.sh" ] && ! diff -Bw -q "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout (missing compare_scout_normalized.sh; used diff -Bw)"; \
 						$(INTEGRATE_DOT_FAIL); \
-						diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+						diff -Bw "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 						ko=$$((ko + 1)); failed=1; \
 					else \
 						echo "✅✅ $(MSG_PREFIX)$$base output normalized-matches .scout"; \
@@ -253,38 +253,38 @@ integrate-run:
 					fi; \
 				elif [ -f "$$base.scout.multiset" ]; then \
 					if [ -f "$$base.scout.alt" ]; then \
-						if [ -f "$(THIS_DIR)compare_scout_multiset_oneof.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset_oneof.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)" "$$base.scout.alt"; then \
+						if [ -f "$(THIS_DIR)compare_scout_multiset_oneof.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset_oneof.sh" "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" "$$base.scout.alt"; then \
 							echo "❌❌ $(MSG_PREFIX)$$base .sout multiset-compare differs from all of .scout .scout.alt"; \
 							$(INTEGRATE_DOT_FAIL); \
 							ko=$$((ko + 1)); failed=1; \
-						elif [ ! -f "$(THIS_DIR)compare_scout_multiset_oneof.sh" ] && ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+						elif [ ! -f "$(THIS_DIR)compare_scout_multiset_oneof.sh" ] && ! diff -Bw -q "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 							echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout (missing compare_scout_multiset_oneof.sh; used diff -Bw)"; \
 							$(INTEGRATE_DOT_FAIL); \
-							diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+							diff -Bw "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 							ko=$$((ko + 1)); failed=1; \
 						else \
 							echo "✅✅ $(MSG_PREFIX)$$base output multiset-matches a golden (.scout or .scout.alt)"; \
 							$(INTEGRATE_DOT_OK); \
 							ok=$$((ok + 1)); \
 						fi; \
-					elif [ -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)"; then \
+					elif [ -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset.sh" "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)"; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout multiset-compare differs from .scout"; \
 						$(INTEGRATE_DOT_FAIL); \
 						ko=$$((ko + 1)); failed=1; \
-					elif [ ! -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+					elif [ ! -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! diff -Bw -q "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout (missing compare_scout_multiset.sh; used diff -Bw)"; \
 						$(INTEGRATE_DOT_FAIL); \
-						diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+						diff -Bw "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 						ko=$$((ko + 1)); failed=1; \
 					else \
 						echo "✅✅ $(MSG_PREFIX)$$base output multiset-matches .scout"; \
 						$(INTEGRATE_DOT_OK); \
 						ok=$$((ok + 1)); \
 					fi; \
-				elif ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+				elif ! diff -Bw -q "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout"; \
 					$(INTEGRATE_DOT_FAIL); \
-					diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+					diff -Bw "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \
@@ -310,7 +310,7 @@ stress-j2:
 # *.scout.multiset, *.scout.alt, *.ascomp.
 clean:
 	@cd "$(THIS_DIR)" && \
-	rm -f *.sout traits/*.sams traits/*.o *.iface *.sams __silica_runtime.o && \
+	rm -f *$(SOUT_EXT) traits/*.sams traits/*.o *.iface *.sams __silica_runtime.o && \
 	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^traits/' | grep -v '^\.\./\.\./compiler/stdlib/'); do \
 		base=$${line%.silica}; \
 		$(call TRIAL_RM_UNTRACKED,"$$base"); rm -f "$$base.o"; \

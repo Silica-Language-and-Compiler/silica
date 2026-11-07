@@ -102,11 +102,12 @@ where to run (Enter = this Mac), and `TRIAL_TARGET=host|ESP32-S3_raw|both` answe
 ```
 make integrate TRIAL_TARGET=ESP32-S3_raw                       # the whole tree on the board
 make -C case_addition integrate TRIAL_TARGET=ESP32-S3_raw      # one suite on the board
-make integrate TRIAL_TARGET=both                               # this Mac, then the board
+make integrate TRIAL_TARGET=both                               # this Mac and the boards, in parallel
+make integrate TRIAL_TARGET=all                                # + the two remote Linux machines, all at once
 ```
 
-Only one trial run of any target can be in progress; a second one stops at once and names the
-run that holds `trials/.integrate.lock`. A board run compiles with
+Only one trial run PER TARGET can be in progress (`trials/.integrate.lock.<target>`); a second run of
+the same target stops at once and names the holder, runs of different targets overlap. A board run compiles with
 `binaries/silica-compiler-ESP32-S3_raw`, runs each program from the board's RAM, compares its output
 with the same `.scout` goldens, and writes its report to `.integrate_report.ESP32-S3_raw` without
 touching the host's files. Details, the skip list and the settings are in
@@ -187,8 +188,8 @@ trials themselves and removed by `make clean`):
 | `.integrate_results` | one line per check, in suites that run trials as make rules |
 | `.integrate_pass_marks`, `.integrate_fail_marks` | one byte appended per check; their sizes drive the live counters and their timestamps the watchdog (outermost directory only) |
 | `.integrate_running/` | one file per trial program currently running, for the watchdog (outermost directory only) |
-| `.integrate.lock/` | held by the trial run in progress, of any target (trials root only) |
-| `<trial>.<target>.sout`, `.cur_fail`, `.integrate_report.<target>` | a board run's outputs (see [targets/README.md](targets/README.md)); board work files are under `.target/` |
+| `.integrate.lock.<target>/` | held by the trial run of that target in progress (trials root only); the Mac host run's is `.integrate.lock.macos_applesilicon` |
+| `<trial>.<target>.sout`, `.cur_fail`, `.integrate_report.<target>`, `.integrate_log.<target>` | every run's own outputs, the host run's too (`macos_applesilicon`, `linux_aarch64`, `linux_x86_64`); a board run's (see [targets/README.md](targets/README.md)); board work files are under `.target/` |
 
 ordered_data_structures leaves compile each unit in a private `.sandbox/<unit>/`
 directory (removed when the unit finishes) and keep a content-addressed compile cache

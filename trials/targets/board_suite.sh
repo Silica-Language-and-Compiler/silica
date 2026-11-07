@@ -422,7 +422,7 @@ run_program() {
     # longer than BOARD_EXIT_DELAY to reach its marker (100,000 dispatches take tens of
     # seconds on the board) is then not cut short; a faster one gets `exit` as before.
     send=()
-    if [ -f "$gdir/$stem.wait_for_exit" ] || grep -q 'run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "done"' "$src/Makefile" 2>/dev/null; then
+    if [ -f "$gdir/$stem.wait_for_exit" ] || grep -q 'run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base$(SOUT_EXT)" "done"' "$src/Makefile" 2>/dev/null; then
         marker=done marker_count=1
         if [ -f "$gdir/$stem.wait_for_exit" ]; then
             marker=$(awk 'NF { if ($NF ~ /^[0-9]+$/) { m=$0; sub(/[ \t]+[0-9]+$/, "", m); print m } else print $0; exit } END { if (!NR) print "done" }' "$gdir/$stem.wait_for_exit")

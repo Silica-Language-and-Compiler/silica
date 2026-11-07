@@ -27,8 +27,8 @@
 #
 # Work area: <dir>, else a new directory under $TMPDIR (kept; its path is printed). The board's output is
 # written beside the trial as <stem>.<target>.sout, as in a suite run. --no-ascomp skips the
-# <stem>.<platform>.ascomp check (output only). Refuses to start while a `make integrate` run holds the
-# trial lock (trial_target.sh status). Exit status: 0 the trial passed, 1 it failed, 2 usage or setup.
+# <stem>.<platform>.ascomp check (output only). Takes the target's own trial lock and refuses to start
+# while a `make integrate` run of the same target holds it (trial_target.sh status); other targets are unaffected. Exit status: 0 the trial passed, 1 it failed, 2 usage or setup.
 
 set -u
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -63,7 +63,11 @@ tools="$repo_root/$TARGET_BOARD_DIR/tools"
 py="${BOARD_PYTHON:-$TARGET_PYTHON}"
 compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/silica-compiler-$target}"
 
-bash "$here/trial_target.sh" check "run_one_trial $target $suite/$stem" || exit 2
+# The per-target trial lock (trials/.integrate.lock.<target>): refuses while a run of this target is in
+# progress, and keeps one off while this trial runs; other targets are not affected.
+bash "$here/trial_target.sh" lock $$ "run_one_trial $target $suite/$stem" "$target" || exit 2
+trap 'bash "$here/trial_target.sh" unlock $$' EXIT
+trap 'exit 130' INT TERM
 [ -x "$compiler" ] || die "missing $compiler (cd compiler/src && make TARGET=$target)"
 [ -x "$py" ] || die "no Python at $py (set BOARD_PYTHON)"
 "$py" -c "import ${TARGET_PY_MODULES// /, }" 2>/dev/null || die "$py cannot import ${TARGET_PY_MODULES// /, }"

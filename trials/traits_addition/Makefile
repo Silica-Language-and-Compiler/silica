@@ -214,17 +214,17 @@ integrate-run:
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1;; esac; \
 	elif [ -x "$$base" ]; then \
-			$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,./$$base); \
+			$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base$(SOUT_EXT),./$$base); \
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
 				ko=$$((ko + 1)); failed=1; continue; \
 			fi; \
 			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
-				if ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+				if ! diff -Bw -q "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout"; \
 					$(INTEGRATE_DOT_FAIL); \
-					diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+					diff -Bw "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \
@@ -244,7 +244,7 @@ integrate-run:
 
 clean:
 	@cd "$(THIS_DIR)" && \
-	rm -f *.sout traits/*.sams traits/*.o *.iface *.sams __silica_runtime.o && \
+	rm -f *$(SOUT_EXT) traits/*.sams traits/*.o *.iface *.sams __silica_runtime.o && \
 	for line in $$(grep -v '^#' silica.config 2>/dev/null | grep -v '^$$' | grep -v '^\.trial_stdlib/' | grep -v '^traits/'); do \
 		base=$${line%.silica}; \
 		$(call TRIAL_RM_UNTRACKED,"$$base"); rm -f "$$base.o"; \

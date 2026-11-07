@@ -55,6 +55,14 @@ include $(_SILICA_COMPILER_MK_DIR)linux_host.mk
 include $(_SILICA_COMPILER_MK_DIR)../project_makefiles/platform/platforms.mk
 # (SILICA_HOST_EMIT_TARGET, SILICA_HOST_PLATFORM, SILICA_HOST_UNAME_S/_M are defined there.)
 
+# ---- Run files of a host run are named after the machine's own target -------------------
+# A trial run writes <trial>$(SOUT_EXT) (output), .integrate_report.<key> and .integrate_log.<key>, the
+# same <trial>.<target>.sout / .integrate_report.<target> scheme the board runs use, so no run's files
+# are another's. <key> is SOUT_TARGET: macos_applesilicon on the Mac, else the host's emit target
+# (linux_aarch64, linux_x86_64). The golden names (.scout, .ascomp, ...) are unchanged.
+SOUT_TARGET := $(if $(filter apple_silicon_mac,$(SILICA_HOST_EMIT_TARGET)),macos_applesilicon,$(SILICA_HOST_EMIT_TARGET))
+SOUT_EXT := .$(SOUT_TARGET).sout
+
 _SILICA_COMPILER_NAME := $(notdir $(SILICA_COMPILER))
 SILICA_EMIT_TARGET ?= $(if $(filter silica-compiler-%,$(_SILICA_COMPILER_NAME)),$(patsubst silica-compiler-%,%,$(_SILICA_COMPILER_NAME)),$(SILICA_HOST_EMIT_TARGET))
 
@@ -97,13 +105,32 @@ SCOUT_FOR = $(if $(SCOUT_EXT),$(_SCOUT_PICK_SH),$(1).scout)
 -include $(_SILICA_COMPILER_MK_DIR)platform/$(SILICA_EMIT_TARGET).mk
 
 # If silica-compiler is missing, run update_silica_compiler_link.bash and re-check.
+#
+# RULE: the link binaries/silica-compiler is never replaced while a host run of this machine is in
+# progress (a live process holds trials/.integrate.lock.<host key>, e.g. .integrate.lock.macos_applesilicon):
+# a trial run uses the link from its first trial to its last, and every nested suite, board run and remote
+# run started under it reads the same file. In that case this macro prints one line, leaves the link as it
+# is and uses the existing one. The test is `trial_target.sh hostbusy`, the same liveness test the lock
+# uses (a stale lock whose process is gone does not block). Holder = ENSURE_OWN_PID is the one exception:
+# a host run that has just taken its own lock may still relink, because no trial has started yet.
+#
+# ORDER: the `integrate` recipe (wrapper section below) therefore calls this macro itself instead of
+# having ensure-silica-compiler as a prerequisite. A host run takes its lock FIRST and then ensures (so a
+# second run starting meanwhile sees the lock and does not relink under it); a board or remote run, and
+# every nested suite, ensures with the host lock as the guard. Remaining window: a run that checked just
+# before another host run took its lock; the relink is a single quick `ln`, and that other run's own
+# ensure runs after its lock, so it still ends with a good link.
 define ENSURE_SILICA_COMPILER
+	ensure_busy=$$(bash "$(_INTEGRATE_TRIALS_ROOT)/targets/trial_target.sh" hostbusy "$$ENSURE_OWN_PID" 2>/dev/null); \
+	ensure_note() { echo "$(SILICA_COMPILER) left as is: a host trial run is in progress (pid $$ensure_busy); using the existing link."; }; \
 	if [ "$(SILICA_COMPILER)" = "$(_SILICA_COMPILER_SEED)" ] && [ -L "$(SILICA_COMPILER)" ] && [ -n "$(SILICA_HOST_PLATFORM)" ] \
 		&& case "$$(readlink "$(SILICA_COMPILER)")" in *-$(SILICA_HOST_PLATFORM)) false;; *) true;; esac; then \
+		if [ -n "$$ensure_busy" ]; then ensure_note; else \
 		echo "$(SILICA_COMPILER) -> $$(readlink "$(SILICA_COMPILER)") is not a $(SILICA_HOST_PLATFORM) build; relinking for this host..."; \
-		"$(UPDATE_SILICA_COMPILER_LINK)" "$(SILICA_HOST_PLATFORM)" || exit 1; \
+		"$(UPDATE_SILICA_COMPILER_LINK)" "$(SILICA_HOST_PLATFORM)" || exit 1; fi; \
 	fi; \
 	if [ ! -x "$(SILICA_COMPILER)" ]; then \
+		if [ -n "$$ensure_busy" ]; then ensure_note; echo "Missing $(SILICA_COMPILER) and it cannot be relinked during a host run."; exit 1; fi; \
 		echo "Missing $(SILICA_COMPILER); running update_silica_compiler_link.bash..."; \
 		"$(UPDATE_SILICA_COMPILER_LINK)" || exit 1; \
 		if [ ! -x "$(SILICA_COMPILER)" ]; then \
@@ -324,7 +351,8 @@ endif
 INTEGRATE_FILES := $(INTEGRATE_DIR).integrate_log $(INTEGRATE_DIR).integrate_report \
 	$(INTEGRATE_DIR).integrate_status $(INTEGRATE_DIR).integrate_start \
 	$(INTEGRATE_DIR).integrate_results $(INTEGRATE_DIR).integrate_skipped \
-	$(INTEGRATE_DIR).integrate_pass_marks $(INTEGRATE_DIR).integrate_fail_marks
+	$(INTEGRATE_DIR).integrate_pass_marks $(INTEGRATE_DIR).integrate_fail_marks \
+	$(INTEGRATE_DIR).integrate_report.$(SOUT_TARGET) $(INTEGRATE_DIR).integrate_log.$(SOUT_TARGET)
 INTEGRATE_RUNNING_DIR := $(INTEGRATE_DIR).integrate_running
 
 ifeq ($(origin JOBS),undefined)
@@ -425,7 +453,7 @@ integrate_killed=0; \
 $(call INTEGRATE_RSS_MARK,$(1)); \
 $(call INTEGRATE_TASKS_MARK,$(1)); \
 if [ -n "$$integrate_rss_mark" ]; then \
-perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' python3 "$(INTEGRATE_RSS_RUNNER)" "$(1)" "$$integrate_rss_mark" "$${integrate_rss_mark%.max_rss_mb}.sout" -- $(2) 7>&1 & integrate_pid=$$!; \
+perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' python3 "$(INTEGRATE_RSS_RUNNER)" "$(1)" "$$integrate_rss_mark" "$${integrate_rss_mark%.max_rss_mb}$(SOUT_EXT)" -- $(2) 7>&1 & integrate_pid=$$!; \
 else \
 perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' $$integrate_tasks_pfx $(2) & integrate_pid=$$!; \
 fi; \
@@ -448,27 +476,31 @@ INTEGRATE_KILLED_MSG = killed by the watchdog after $$SILICA_INTEGRATE_WATCHDOG_
 #   TRIAL_TARGET=host              this host (macOS, Linux x86-64 or AArch64), binaries/silica-compiler (what integrate always did)
 #   TRIAL_TARGET=<board target>    e.g. ESP32-S3_raw: compiled by binaries/silica-compiler-<target>,
 #                                  run on the board (targets/trial_target.sh does the whole run)
-#   TRIAL_TARGET=both              host, then every board target, one after the other
+#   TRIAL_TARGET=linux_aarch64 | linux_x86_64   the remote hosted machine of that name in
+#                                  .silica_build_hosts: sync, then `make integrate` there with its own compiler
+#   TRIAL_TARGET=all | both        every target / host plus the boards, IN PARALLEL; a list such as
+#                                  "ESP32-S3_raw linux_x86_64" or "a,b" runs those in parallel too
 # Without TRIAL_TARGET an interactive run asks (Enter = host); a run without a terminal, with
 # SILICA_TARGET_PROMPT=0, or with SILICA_COMPILER given on the command line (trials-gen1/gen2)
-# runs on the host without asking. Only one trial run of any target may be in progress: the
-# outermost integrate takes trials/.integrate.lock (runs started from a board run or a `both` run
-# share their parent's lock through SILICA_INTEGRATE_LOCK_PID, and never dispatch again:
-# SILICA_INTEGRATE_DISPATCHED). All of this happens before the directory's previous log and report
-# are touched, so a board run leaves the host's results alone.
+# runs on the host without asking. One trial run per TARGET: each target has its own lock,
+# trials/.integrate.lock.<target> (the host's is .integrate.lock.macos_applesilicon on the Mac), so
+# different targets run at the same time and two runs of one target are refused. The host run takes its
+# lock below; every other selection takes its locks in targets/trial_target.sh (`run`), whose pid then
+# stands for all of them: runs it starts share its locks through SILICA_INTEGRATE_LOCK_PID and never
+# dispatch again (SILICA_INTEGRATE_DISPATCHED). All of this happens before the directory's previous log and
+# report are touched, so a board or remote run leaves the host's results alone.
 #
 # Recipe lines that contain $(MAKE) are executed even under `make -n` (make passes -n
 # down instead), so every such line here and in the fan-out Makefiles carries nothing
 # but the sub-make and its output plumbing; file writes sit on their own lines. Under
 # -n the wrapper only forwards the dry run to integrate-run and writes nothing.
-integrate: ensure-silica-compiler
+integrate:
 ifneq (,$(findstring n,$(firstword -$(MAKEFLAGS))))
 	@$(MAKE) --no-print-directory -C "$(INTEGRATE_DIR)" -f "$(INTEGRATE_MAKEFILE)" integrate-run
 else
 	@if [ -z "$$SILICA_INTEGRATE_ROOT" ] && [ -z "$(TRIAL_MIRROR)" ] && [ -z "$$SILICA_INTEGRATE_DISPATCHED" ]; then \
 		tt="$(_INTEGRATE_TRIALS_ROOT)/targets/trial_target.sh"; \
 		trial_target="$(TRIAL_TARGET)"; \
-		if [ -z "$$SILICA_INTEGRATE_LOCK_PID" ]; then bash "$$tt" check "$(INTEGRATE_LABEL)" || exit 1; fi; \
 		if [ -z "$$trial_target" ]; then \
 			if [ "$(SILICA_TARGET_PROMPT)" != 0 ] && [ -z "$(filter command line,$(origin SILICA_COMPILER))" ]; then \
 				trial_target=$$(bash "$$tt" choose); \
@@ -476,12 +508,9 @@ else
 				trial_target=host; \
 			fi; \
 		fi; \
+		trial_target=$$(bash "$$tt" normalize "$$trial_target") || exit 1; \
 		if [ "$$trial_target" != host ]; then \
-			if [ -z "$$SILICA_INTEGRATE_LOCK_PID" ]; then \
-				bash "$$tt" lock $$$$ "$(INTEGRATE_LABEL)" "$$trial_target" || exit 1; \
-				export SILICA_INTEGRATE_LOCK_PID=$$$$; \
-				trap 'bash "$$tt" unlock $$$$' EXIT; trap 'exit 130' INT TERM; \
-			fi; \
+			ENSURE_OWN_PID=; $(ENSURE_SILICA_COMPILER); \
 			bash "$$tt" run "$$trial_target" "$(_INTEGRATE_DIR_NOSLASH)" "$(MAKE)"; \
 			exit $$?; \
 		fi; \
@@ -489,6 +518,7 @@ else
 	date +%s > "$(INTEGRATE_DIR).integrate_start"; \
 	rm -f "$(INTEGRATE_DIR).integrate_log" "$(INTEGRATE_DIR).integrate_status" "$(INTEGRATE_DIR).integrate_report" "$(INTEGRATE_DIR).integrate_skipped"; \
 	if [ -n "$$SILICA_INTEGRATE_ROOT" ]; then \
+		ENSURE_OWN_PID=; $(ENSURE_SILICA_COMPILER); \
 		export SILICA_INTEGRATE_ACTIVE=1; \
 		{ $(MAKE) --no-print-directory $(INTEGRATE_JOBFLAGS) -C "$(INTEGRATE_DIR)" -f "$(INTEGRATE_MAKEFILE)" integrate-run; \
 		  echo $$? > "$(INTEGRATE_DIR).integrate_status"; } 2>&1 | tee -a "$(INTEGRATE_DIR).integrate_log"; \
@@ -501,6 +531,8 @@ else
 		fi; \
 		release_lock() { if [ "$$own_lock" = 1 ]; then bash "$(_INTEGRATE_TRIALS_ROOT)/targets/trial_target.sh" unlock $$$$; own_lock=0; fi; }; \
 		trap 'release_lock' EXIT; \
+		: "Lock first, then ensure: this host run may relink the compiler (nothing has started); see ENSURE_SILICA_COMPILER."; \
+		ENSURE_OWN_PID=$$$$; $(ENSURE_SILICA_COMPILER); \
 		exec 9>&1; \
 		export SILICA_INTEGRATE_ACTIVE=1 SILICA_INTEGRATE_ROOT="$(_INTEGRATE_DIR_NOSLASH)" SILICA_INTEGRATE_WATCHDOG_MINUTES="$(INTEGRATE_WATCHDOG_MINUTES)"; \
 		rm -rf "$(INTEGRATE_RUNNING_DIR)"; mkdir -p "$(INTEGRATE_RUNNING_DIR)"; \
@@ -600,6 +632,7 @@ else elapsed=$$(printf '%ds' "$$el"); fi; \
 	fi; \
 	printf 'log: %s\n' "$(INTEGRATE_DIR).integrate_log"; \
 } > .integrate_report; \
+if [ -z "$(TRIAL_MIRROR)" ]; then cp .integrate_report ".integrate_report.$(SOUT_TARGET)"; cp .integrate_log ".integrate_log.$(SOUT_TARGET)" 2>/dev/null || true; fi; \
 if [ "$$SILICA_INTEGRATE_ROOT" = "$(_INTEGRATE_DIR_NOSLASH)" ]; then cat .integrate_report; fi; \
 [ "$$ko" -eq 0 ] && [ "$$st" -eq 0 ]
 endef

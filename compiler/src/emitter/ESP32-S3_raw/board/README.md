@@ -248,7 +248,7 @@ $B/tools/run_app.sh --build-only --keep silica_14_wbt_map   # image only, keep t
 3. runs it from the board's RAM with `tools/run_on_board.py` (nothing is written to flash unless
    `--flash` is given) while holding the board lock `trials/.board.lock` (flock, the lock the board
    trial runs take for each trial), and refuses to start while a board trial run holds
-   `trials/.integrate.lock`;
+   `trials/.integrate.lock.ESP32-S3_raw`;
 4. prints the run in `.sout` form on stdout -- the program's output, then its exit status on a line
    of its own -- with its own progress, the image sizes and the board's `[silica] stacks:` line on
    stderr;

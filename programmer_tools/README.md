@@ -55,8 +55,8 @@ Runs the full trial tree on each platform with that platform's own compiler. It 
 anything: each machine must already have a compiler at `binaries/silica-compiler`, and a raw target is
 driven from this machine with the cross compiler built for it.
 
-Remote machines run at the same time as each other; this machine and any board run one after another,
-because both take the tree-wide lock at `trials/.integrate.lock`. `--sync` syncs the tree to each
+Remote machines run at the same time as each other; this machine runs its own trials and then any
+board, because each takes its own per-target lock (`trials/.integrate.lock.<target>`). `--sync` syncs the tree to each
 remote machine first with `sync_to_hosts.sh`. `--board` includes a raw target, which
 is off by default because the board has to be plugged in. Short names `mac`, `pi`, `nix`, `esp32`,
 `all` and `hosted` are accepted anywhere a platform is.
@@ -134,7 +134,7 @@ would go (`--max-delete-pct`). `--push-preview` adds an `rsync -n -i` of the pus
 The push never sends build output or a run's transient files (the `SYNC_BUILD_EXCLUDES` list in
 `sync_excludes.sh`, plus the script's own list): `.sams`, `.iface`, `.o`, `.sout`, `.checked`, built
 trial executables, `silica.compile.inprogress` and `silica.compile.crashed`, `.integrate*` (logs,
-reports, marks, `.integrate_running/`, `.integrate.lock/`), `*.cur_*`, `*.tmp`,
+reports, marks, `.integrate_running/`, `.integrate.lock.<target>/`), `*.cur_*`, `*.tmp`,
 `.silica.config.units*`, `.cache/`, logs, `.trial_cache`, `.trial_stdlib`, `.target`, `.DS_Store`.
 Some files stay on purpose: tracked `*.golden_link_fail.clang.norm` goldens, `trials/.board.lock`, and
 `INTEGRATE_PENDING` markers still travel.

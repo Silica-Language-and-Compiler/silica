@@ -1,53 +1,130 @@
-# Trial targets: running the trials on a board
+# Trial targets: where `make integrate` runs the trials
 
-`make integrate` can run the trials in two places:
+`make integrate` can run the trials in several places, and in several places at once:
 
 | Target | Compiler | Where the programs run |
 | ------ | -------- | ---------------------- |
-| `host` | `binaries/silica-compiler` | this Mac (what `make integrate` always did) |
+| `host` | `binaries/silica-compiler` | this machine (the Mac: key `macos_applesilicon`; a Linux machine: its own `linux_*` key) |
+| `linux_aarch64` | the compiler built on that machine (`~/silica/binaries/silica-compiler` there) | the Raspberry Pi ("pix"), reached over ssh: remote hosted |
+| `linux_x86_64` | the compiler built on that machine | the x86-64 Linux machine ("nix"), reached over ssh: remote hosted |
 | `ESP32-S3_raw` | `binaries/silica-compiler-ESP32-S3_raw` | an ESP32-S3 board on USB, bare metal |
 | `STM32-L476RG_raw` | `binaries/silica-compiler-STM32-L476RG_raw` | an ST NUCLEO-L476RG over its ST-LINK, bare metal (see below) |
 
 A board target is defined by `<target>.conf` in this directory. The software each target needs is
-listed in [docs/required-software.md](../../docs/required-software.md).
+listed in [docs/required-software.md](../../docs/required-software.md). A remote hosted target is a
+line of `.silica_build_hosts` in the repository root (`<target> <user@host|local> <path>`, gitignored,
+mode 600, never committed or printed); `programmer_tools/build_all_platforms.sh` writes it.
 
 ## Choosing the target
 
 ```
 make integrate                                   # interactive: asks; Enter = host
-make integrate TRIAL_TARGET=host                 # this Mac, no question
+make integrate TRIAL_TARGET=host                 # this machine, no question
+make integrate TRIAL_TARGET=linux_x86_64         # the nix machine: sync, then its own run there
 make integrate TRIAL_TARGET=ESP32-S3_raw         # the board
-make integrate TRIAL_TARGET=both                 # host, then the board, one after the other
+make integrate TRIAL_TARGET=all                  # host + both remotes + both boards, all at the same time
+make integrate TRIAL_TARGET=both                 # host + the boards (the old spelling, now in parallel)
+make integrate TRIAL_TARGET="ESP32-S3_raw STM32-L476RG_raw linux_x86_64"    # a list (spaces or commas), in parallel
 make -C case_addition integrate TRIAL_TARGET=ESP32-S3_raw     # one suite on the board
 make integrate TRIAL_TARGET=ESP32-S3_raw TRIAL_SUITES="base list_addition"   # some suites
+make integrate TRIAL_TARGET=linux_aarch64 TRIAL_SUITES="base"                # some suites, on the Pi
 ```
 
 An interactive `make integrate` (in `trials/` or in a suite) asks first:
 
 ```
 Select the trial target (make integrate):
-  1) host  [default]   this Mac, binaries/silica-compiler
-  2) ESP32-S3_raw   ESP32-S3 board over USB (bare metal), binaries/silica-compiler-ESP32-S3_raw
-  3) both   host, then ESP32-S3_raw (one after the other)
-Number or name [host]:
+  1) host   this Mac (Apple Silicon), binaries/silica-compiler  [default]
+  2) linux_aarch64   Linux AArch64 (pix), remote hosted: sync, then its own binaries/silica-compiler
+  3) linux_x86_64   Linux x86-64 (nix), remote hosted: sync, then its own binaries/silica-compiler
+  4) ESP32-S3_raw   ESP32-S3 board over USB (bare metal), binaries/silica-compiler-ESP32-S3_raw
+  5) STM32-L476RG_raw   ST NUCLEO-L476RG over ST-LINK (bare metal), binaries/silica-compiler-STM32-L476RG_raw
+  6) all   every target above, at the same time (the host run, the remote runs and the boards)
+Number(s) or name(s) [host]:
 ```
 
-It never asks, and runs on the host, when there is no terminal (CI, `nohup`, pipes), with
-`SILICA_TARGET_PROMPT=0`, or when `SILICA_COMPILER=` is given on the command line (so
-`make trials-gen1` / `trials-gen2` behave as before).
+Several numbers or names may be typed. It never asks, and runs on the host, when there is no terminal
+(CI, `nohup`, pipes), with `SILICA_TARGET_PROMPT=0`, or when `SILICA_COMPILER=` is given on the command
+line (so `make trials-gen1` / `trials-gen2` behave as before).
 
-## One run at a time
+### Several targets at once
 
-Only one trial run, of any target, can be in progress. The first `make integrate` takes
-`trials/.integrate.lock`; a second one, host or board, stops at once and names the run that holds
-it:
+`all`, `both` and a list run every selected target at the same time, each with its own lock, log and
+report. Output of the runs goes to `trials/.target/<target>/.all.log` (the host's, to
+`.target/macos_applesilicon/.all.log`) instead of the terminal, and a combined summary ends the run:
 
 ```
-❌❌ another trial run is in progress: trials (target ESP32-S3_raw, started 2026-09-13 04:14:15, pid 52309).
+TARGET               STATUS   PASSED    FAILED    REPORT / REASON
+host                 PASS     1234      0         /Volumes/.../trials/.integrate_report.macos_applesilicon
+ESP32-S3_raw         FAIL     900       3         .../trials/.integrate_report.ESP32-S3_raw
+linux_aarch64        SKIPPED  -         -         ssh key authentication to the linux_aarch64 machine failed ...
 ```
 
-The lock is released when the run ends, including after Ctrl-C. A lock whose process no longer
-exists is taken over by the next run. `bash trials/targets/trial_target.sh status` shows the holder.
+(one row per target: PASS, FAIL or SKIPPED, the counts from its report, and the report path or the
+reason). The exit status is non-zero when any target failed. A target whose prerequisite is missing is
+SKIPPED with the reason and does not stop the others: no board attached or the board tools missing, the
+board compiler not built, the ssh key rejected (`ssh -o BatchMode=yes`, never a password prompt), a remote
+not listed in `.silica_build_hosts`, or another run of that same target in progress. A skip is not a failure.
+A single target that cannot run stops with the same message and a non-zero status.
+
+**Memory.** The host run peaks at 6-8 GB of RAM (the compiler units). Two host-compiler runs at once on
+one machine would need 12-16 GB, so a host run is never started twice (the lock refuses it); in `all`
+only one Mac host run exists, and the remote runs use the remote machines' memory.
+
+## One run per target
+
+Each target has its own lock, the directory `trials/.integrate.lock.<target>`, where `<target>` is the
+board target, the remote target, or for the host run the machine's own key (`macos_applesilicon`,
+`linux_aarch64`, `linux_x86_64`). The Mac host run, ESP32, Nucleo and the two remote runs can therefore all
+run at the same time. A second run of the SAME target, from any terminal, stops at once and names the
+holder:
+
+```
+❌❌ another trial run of target ESP32-S3_raw is in progress: trials (started 2026-09-13 04:14:15, pid 52309).
+```
+
+A lock is released when the run ends, including after Ctrl-C; one whose process no longer exists is
+taken over by the next run (an old single `trials/.integrate.lock/` directory from before this scheme is
+ignored and can be deleted). A multi-target run takes every selected lock with its own pid and the runs
+it starts share them (`SILICA_INTEGRATE_LOCK_PID`). `bash trials/targets/trial_target.sh status` lists the
+holders. `run_one_trial.sh` takes its target's lock too, so a one-trial board check can run beside the
+other target's integrate run.
+
+## Remote hosted targets
+
+`TRIAL_TARGET=linux_aarch64` (or `linux_x86_64`) does, from the Mac:
+
+1. `ssh -o BatchMode=yes ... true` to the machine; when key authentication fails the run stops (or the
+   target is skipped in a multi-target run) with a message, never a hang or a password prompt.
+2. Syncs this tree with `programmer_tools/sync_to_hosts.sh --apply --targets <target>` (pulls that
+   platform's goldens back, deletes what this tree no longer has, pushes; built artifacts and
+   `binaries/` are never touched). `TRIAL_REMOTE_SYNC=0` skips this step.
+3. Runs `cd ~/silica/trials && make integrate TRIAL_TARGET=host JOBS=... SDS_JOBS=...` on the machine (with
+   `TRIAL_SUITES` when given): the machine's own host run with its own compiler and its own lock there.
+   `JOBS` defaults match `programmer_tools/run_trials_all_platforms.sh` (Pi 2/1, nix 3/1; `PI_JOBS`,
+   `PI_SDS_JOBS`, `NIX_JOBS`, `NIX_SDS_JOBS` override).
+4. Streams the remote output (and keeps it in `trials/.target/<target>/.integrate_log`) and copies the
+   remote's `.integrate_report.<target>` to `trials/.integrate_report.<target>` here.
+
+`SILICA_REMOTE_DRY_RUN=1` checks ssh, runs the sync as a dry run (nothing changes anywhere) and prints
+the remote command instead of running it. If the Mac run is stopped, a remote run that already started
+keeps going on its machine (its own lock there refuses a second one).
+
+## What every run writes
+
+A run's files carry its target's name so no run can overwrite another's:
+
+| File | Written by |
+| ---- | ---------- |
+| `<trial>.<target>.sout` next to each trial | the host run (`<target>` = `macos_applesilicon`, `linux_aarch64` or `linux_x86_64`, the machine's own) and each board run |
+| `.integrate_report.<target>`, `.integrate_log.<target>` in the directory run (the trials root for a whole-tree run; a suite directory also gets its own) | every run; for a remote target the report is the remote's own |
+| `trials/.target/<target>/` | a board run's work area, a remote run's log and sync lists, a multi-target run's `.all.log` |
+
+The goldens keep their names (`<trial>.scout`, the unsuffixed `.ascomp` for Apple Silicon,
+`<trial>.<platform>.ascomp`). The plain `.integrate_report` / `.integrate_log` / `.integrate_*` files of a
+host run are that run's internal bookkeeping (the suites read each other's); the `.<target>` copies are
+the ones to read and the ones nothing else writes. Old `<trial>.sout` files from before this scheme are
+ignored (gitignored); delete them with `find trials -name '*.sout' -not -name '*.*.sout' -delete`.
 
 ## What a board run does
 
@@ -96,8 +173,8 @@ per suite) instead of as thousands of failures.
   ceiling") is host only and is ignored here: the board run compares output only, so a trial
   whose leak shows only in host RSS passes on the board when its output matches.
 - The board's own outputs are written next to each trial as `<trial>.<target>.sout` and
-  `<trial>.<target>.cur_fail`. Nothing the host run writes is touched: the host's `.sams`, `.sout`,
-  logs and reports stay as they were.
+  `<trial>.<target>.cur_fail`. Nothing the host run writes is touched: the host's `.sams`,
+  `<trial>.macos_applesilicon.sout` (its own key), logs and reports stay as they were.
 - The report is `trials/.integrate_report.<target>` (a suite run also leaves a copy in the suite);
   the full log is `trials/.target/<target>/.integrate_log`.
 
@@ -136,13 +213,13 @@ bash trials/targets/run_one_trial.sh STM32-L476RG_raw base test     # one trial,
 `run_one_trial.sh <target> <suite> <stem>` runs one program or compile-failure trial through
 `board_suite.sh` (`BOARD_ONLY_STEM`), prints the diff on a mismatch, keeps its work area (`--work <dir>`
 or a new directory under `$TMPDIR`) and works for both board targets. It refuses to start while a
-`make integrate` run holds the trial lock.
+`make integrate` run of the same target holds that target's lock.
 
 ## Settings
 
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
-| `TRIAL_TARGET` | ask, or `host` | `host`, a board target, or `both` |
+| `TRIAL_TARGET` | ask, or `host` | `host`, `linux_aarch64`, `linux_x86_64`, a board target, `all`, `both`, or a space/comma list of them (several run in parallel) |
 | `TRIAL_SUITES` | every suite | limit a tree run (host or board) to these suites, e.g. `make integrate TRIAL_TARGET=host TRIAL_SUITES="actors_addition base"`; a name that is not a suite is an error, and a named suite runs even if it has `INTEGRATE_PENDING` (whole-tree runs skip those). On the host the report and failure list cover only the named suites |
 | `BOARD_PORT` | the single USB serial port | the board's serial port |
 | `BOARD_MAC` | (none) | refuse any board with another MAC (ESP32; the STM32 driver ignores it) |
@@ -150,6 +227,9 @@ or a new directory under `$TMPDIR`) and works for both board targets. It refuses
 | `BOARD_ASCOMP` | (on) | `off`: skip the `<trial>.<platform>.ascomp` check |
 | `BOARD_SILICA_COMPILER` | `binaries/silica-compiler-<target>` | the board compiler |
 | `BOARD_PYTHON` | from `<target>.conf` | Python with esptool and pyserial (pyserial only for the STM32) |
+| `TRIAL_REMOTE_SYNC` | 1 | `0`: a remote run skips the sync step |
+| `SILICA_REMOTE_DRY_RUN` | (off) | `1`: a remote run checks ssh, dry-runs the sync, prints the remote command |
+| `SILICA_BUILD_HOSTS` | `.silica_build_hosts` in the repository root | the machine list |
 | `BOARD_TRIAL_TIMEOUT` | 300 | seconds a program may run on the board before it counts as hung |
 | `BOARD_FAIL_JOBS` | 4 | compile-failure trials compiled at once |
 
@@ -157,7 +237,7 @@ or a new directory under `$TMPDIR`) and works for both board targets. It refuses
 
 | File | Role |
 | ---- | ---- |
-| [trial_target.sh](trial_target.sh) | the lock, the menu, the preflight checks, and the board run |
+| [trial_target.sh](trial_target.sh) | the per-target locks, the menu, the selection (`all`, lists), the preflight checks, the board and remote runs, the combined summary |
 | [board_root.mk](board_root.mk), [board_suite.mk](board_suite.mk) | the board run's top level and one suite, on top of the shared integrate wrapper (`../silica_compiler.mk`): same progress line, watchdog, logs and report as a host run |
 | [board_suite.sh](board_suite.sh) | one suite on the board |
 | [run_one_trial.sh](run_one_trial.sh) | one trial on the board, through board_suite.sh |

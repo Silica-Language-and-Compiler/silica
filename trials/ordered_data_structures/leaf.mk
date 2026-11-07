@@ -40,7 +40,7 @@ POSITIVE_SILICA := $(sort $(patsubst $(THIS_DIR)%,%,$(filter-out $(_EXCLUDED_SIL
 
 # Remove stale assembly/link artifacts before compile (used inline — not via `clean` prerequisite).
 INTEGRATE_PRE_CLEAN = cd "$(THIS_DIR)" && \
-	rm -f .integrate_counts .integrate_results *.checked *.sams lib/*.sams *.o lib/*.o *.iface lib/*.iface __silica_runtime.o *.sout \
+	rm -f .integrate_counts .integrate_results *.checked *.sams lib/*.sams *.o lib/*.o *.iface lib/*.iface __silica_runtime.o *$(SOUT_EXT) \
 		silica.compile.order silica.needs_runtime silica.link && \
 	rm -rf $(LEAF_SANDBOX) && \
 	for s in *.sams; do \
@@ -379,17 +379,17 @@ if [ "$$linked" -ne 1 ] || [ ! -x "$$b" ]; then \
 	touch "$$b.checked"; exit 0; \
 fi; \
 echo "Running $$b..."; \
-$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$b,$$b.sout,./$$b); \
+$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$b,$$b$(SOUT_EXT),./$$b); \
 if [ "$$integrate_killed" = 1 ]; then \
 	echo "❌❌ $(MSG_PREFIX)$$b $(INTEGRATE_KILLED_MSG)"; \
 	$(INTEGRATE_DOT_FAIL); \
 	printf 'FAIL\t%s\tkilled by the watchdog; trial incomplete\n' "$$b" >> "$$res"; \
 elif [ -f "$(call SCOUT_FOR,$$b)" ]; then \
-	if ! diff -Bw -q "$$b.sout" "$(call SCOUT_FOR,$$b)" > /dev/null 2>&1; then \
+	if ! diff -Bw -q "$$b$(SOUT_EXT)" "$(call SCOUT_FOR,$$b)" > /dev/null 2>&1; then \
 		echo "❌❌ $(MSG_PREFIX)$$b .sout differs from .scout"; \
 		$(INTEGRATE_DOT_FAIL); \
-		diff -Bw "$$b.sout" "$(call SCOUT_FOR,$$b)" || true; \
-		printf 'FAIL\t%s\t.sout differs from .scout\n' "$$b" >> "$$res"; \
+		diff -Bw "$$b$(SOUT_EXT)" "$(call SCOUT_FOR,$$b)" || true; \
+		printf 'FAIL\t%s\t$(SOUT_EXT) differs from .scout\n' "$$b" >> "$$res"; \
 	else \
 		echo "✅✅ $(MSG_PREFIX)$$b output matches .scout"; \
 		$(INTEGRATE_DOT_OK); \
@@ -517,7 +517,7 @@ record-positive-golden: silica.config
 		base=$${trial%.silica}; \
 		$(call TRIAL_RM_UNTRACKED,"$$base"); rm -f "$$base.o"; \
 	done
-	@cd "$(THIS_DIR)" && rm -f __silica_runtime.o lib/*.o *.iface lib/*.iface *.sams lib/*.sams *.sout .integrate_counts
+	@cd "$(THIS_DIR)" && rm -f __silica_runtime.o lib/*.o *.iface lib/*.iface *.sams lib/*.sams *$(SOUT_EXT) .integrate_counts
 	@echo "✅ $(MSG_PREFIX)record-positive-golden complete"
 
 record-golden: record-positive-golden
@@ -528,7 +528,7 @@ clean:
 		[ -f "$$s" ] || continue; \
 		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done
-	@cd "$(THIS_DIR)" && rm -f *.sams lib/*.sams *.o lib/*.o *.iface lib/*.iface __silica_runtime.o __silica_runtime.sams.* *.checked .integrate_results smoke_harness_ready *.sout silica.config .integrate_counts silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link
+	@cd "$(THIS_DIR)" && rm -f *.sams lib/*.sams *.o lib/*.o *.iface lib/*.iface __silica_runtime.o __silica_runtime.sams.* *.checked .integrate_results smoke_harness_ready *$(SOUT_EXT) silica.config .integrate_counts silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link
 	@cd "$(THIS_DIR)" && rm -rf $(LEAF_SANDBOX)
 	@echo "✅ $(MSG_PREFIX)Clean complete"
 

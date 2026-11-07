@@ -34,7 +34,7 @@
 #                              "silica.compile.inprogress: open (2) ... No such file or directory"):
 #                              silica.compile.inprogress / .crashed (the compiler's per-unit markers),
 #                              .integrate* (logs, reports, counts, marks, the .integrate_running/ pid
-#                              directory and the .integrate.lock directory), *.tmp (make's write-then-mv
+#                              directory and the .integrate.lock.<target> directories), *.tmp (make's write-then-mv
 #                              files, .silica.config.units.tmp, silica.config.compiler.tmp),
 #                              .silica.config.units*, .cache/ (the iface cache), *.mklog *.gnorm *.ll *.bc
 #                              *.atom_rotext.expect .gen1_emission_stamp silica-compiler-gen3, .DS_Store.
