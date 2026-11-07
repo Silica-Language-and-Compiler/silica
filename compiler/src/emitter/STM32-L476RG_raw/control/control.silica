@@ -1,0 +1,114 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Control flow: function prologue/epilogue for the Cortex-M4F (STM32L476RG, Thumb-2).
+// Effect-aware: mem(atomic) gets a DMB barrier at entry and exit (DMB ISH on AArch64, spec §9.1.1).
+//
+// Frame size and home offsets are assembler symbols (SFRAME, SFP, SVR_*) that emitter_core defines in
+// front of the label once the body is known; see shared/arm_vr.silica (the frame macros) and
+// design_documents/ports/esp32s3_xtensa_port.md §3 for the model this target keeps.
+
+use emitter_effects;
+use arm_frame;
+
+export function_prologue/1;
+export function_epilogue_with_frame/0;
+export function_prologue_with_effects/2;
+export function_epilogue_with_effects/1;
+export function_tail_frame_release/1;
+export function_epilogue_tail_with_effects/2;
+
+// Section, label and FRAME_ENTER. Each function is in its own .text.<name> section, so the board link's
+// --gc-sections drops unused functions. Every function is a Thumb function (.thumb_func, %function: the
+// linker then sets bit 0 of every address taken of it, which BLX and BX need).
+// Incoming arguments arrive in r0-r5 (X0-X2), which is where every emitter path expects parameters --
+// as X0-X2 on AArch64 -- so there is nothing to move.
+//
+// Stack check and growth (the FRAME_ENTER macro of arm_vr xt_prelude_macros): the frame's would-be sp
+// is compared with this context's machine-stack limit, the word at TP+116 (VRG_MLIMIT, rt_actors.S:
+// the current stack chunk's guard band top plus the deepest runtime chain emitted code can call, so
+// the runtime frames below this one stay above the band too). Below it the frame, which holds
+// nothing yet, moves to the top of the next chunk: silica_rt_stack_grow takes the frame's size (r10)
+// and its real return address (r11), answers sp at the frame's base in the new chunk and r11 = the
+// address of silica_rt_chunk_return, which the frame then keeps as its return address; when it
+// returns, the chunk below is made current again and the real return address is jumped to
+// (actor_memory_budget_plan.md item F; the runtime's "Growable stacks"). In main, whose stacks are
+// fixed, the runtime raises the fatal overflow instead. The return address is kept at [sp, #SFRAME-4].
+//
+// The frame record (chunk15_stack_memory_design.md §3.1, phase 2; the board form in shared/arm_frame):
+// after FRAME_ENTER the prologue keeps SP at [X29, #0] and the caller's floor at [X29, #4], and
+// starts this frame's floor at SP (its dynamic part, on the auxiliary stack, is empty). [X29, #8]
+// takes the SP saved just before a user call (terms/call.silica).
+fn function_prologue(name: string) -> string {
+    head: string <- concat("    .section .text.", concat(name, concat(",\"ax\",%progbits\n    .align 2\n    .thumb_func\n    .type ", concat(name, concat(", %function\n", concat(name, ":\n    FRAME_ENTER SFRAME\n"))))));
+    concat(head, arm_frame@xt_frame_prologue_init())
+}
+
+// Integer result: X0 is already r0:r1, where the caller reads it. The caller's floor comes back and SP
+// goes back to its entry value: the non-adopting form (function_epilogue_tail_with_effects chooses
+// between the two).
+fn function_epilogue_with_frame() -> string {
+    concat(arm_frame@epilogue_sp_restore(), "    FRAME_LEAVE SFRAME\n")
+}
+
+// The end of an epilogue. `adopt` leaves SP where the body left it (at this frame's floor: its dynamic
+// part, with every node a result can still name, stays for the caller, which adopts or evacuates
+// [SP, its pre-call SP) after the call) and only puts the caller's floor back; otherwise SP goes back
+// to the entry value too (behaviours and main, whose callers are the runtime and the start code).
+fn function_epilogue_tail_with_effects(fn_effects: string, adopt: boolean) -> string {
+    base: string <- case adopt of {
+        true -> concat(arm_frame@epilogue_floor_restore(), "    FRAME_LEAVE SFRAME\n");
+        false -> function_epilogue_with_frame()
+    };
+    case has_atomic_effect(fn_effects) of {
+        true -> concat("    dmb sy\n", base);
+        false -> base
+    }
+}
+
+fn has_atomic_effect(fn_effects: string) -> boolean {
+    case emitter_effects@is_pure(fn_effects) of {
+        true -> false;
+        false -> emitter_effects@has_mem_atomic(fn_effects)
+    }
+}
+
+fn function_prologue_with_effects(name: string, fn_effects: string) -> string {
+    base: string <- function_prologue(name);
+    case has_atomic_effect(fn_effects) of {
+        true -> concat(base, "    dmb sy\n");
+        false -> base
+    }
+}
+
+fn function_epilogue_with_effects(fn_effects: string) -> string {
+    base: string <- function_epilogue_with_frame();
+    case has_atomic_effect(fn_effects) of {
+        true -> concat("    dmb sy\n", base);
+        false -> base
+    }
+}
+
+// This target keeps the ESP32-S3 shape: no tail transfer (a self tail call is a jump back to the body,
+// every other call a bl and return), so there is no frame to release before one: emitter_core never
+// takes the tail path on this target.
+fn function_tail_frame_release(fn_effects: string) -> string {
+    case has_atomic_effect(fn_effects) of {
+        true -> "    dmb sy\n";
+        false -> ""
+    }
+}

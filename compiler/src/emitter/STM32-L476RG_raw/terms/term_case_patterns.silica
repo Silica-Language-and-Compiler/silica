@@ -1,0 +1,1094 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Case-pattern matching emission (literals, records, list cons) for term cases.
+
+use atom_table;
+use record_shape;
+use const_dispatcher;
+use var;
+use prims_record;
+use prims_list;
+use prims_tuple;
+use reg_conventions;
+use term_reg_spill;
+use term_sir_helpers;
+use term_user_call_abi;
+use string_parse;
+use arm_isa;
+use arm_mem;
+use arm_float;
+
+export emit_shape_const/2;
+export case_emit_done_label/1;
+export case_emit_fb_label/1;
+export case_emit_branch_entry_label/2;
+export emit_case_pattern_check/7;
+export emit_record_case_pattern_asm/8;
+export emit_tuple_case_pattern_asm/7;
+export list_cons_tail_rebind_suffix/1;
+export emit_list_cons_pattern_loads/3;
+export emit_case_pick_scrut_reg/3;
+export emit_case_lit_reg_for_scrut/1;
+export emit_case_guard_reg_for_scrut/1;
+
+fn case_emit_done_label(case_name: string) -> string {
+    case length_bytes(case_name) > 0 of {
+        true -> concat(concat(concat("L_case_", case_name), "_"), "done");
+        false -> "L_case_done"
+    }
+}
+
+fn case_emit_fb_label(case_name: string) -> string {
+    case length_bytes(case_name) > 0 of {
+        true -> concat(concat(concat("L_case_", case_name), "_"), "fb");
+        false -> "L_case_fb"
+    }
+}
+
+fn case_emit_branch_entry_label(case_name: string, idx: int64) -> string {
+    idx_s: string <- atom_table@int64_to_decimal_string(idx);
+    case length_bytes(case_name) > 0 of {
+        true -> concat(concat(concat(concat("L_case_", case_name), "_br_"), idx_s), "");
+        false -> concat("L_case_br_", idx_s)
+    }
+}
+
+// AArch64 CMP uses Wn for 32-bit compare of low bits of Xn (matches bool scrutinee convention).
+
+fn scrut_reg_w_for_cmp(scrut_reg: string) -> string {
+    case length_bytes(scrut_reg) > 0 of {
+        true -> case substring(scrut_reg, 0, 1) == "X" of {
+            true -> concat("W", substring(scrut_reg, 1, length_bytes(scrut_reg)));
+            false -> scrut_reg
+        };
+        false -> scrut_reg
+    }
+}
+
+// Case (SIR kind 3): scrutinee in inner, branch list in right_expr (kind 7 chain of kind 8 branches).
+
+fn emit_case_pattern_check(branch: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, scrut_t: string, scrut_reg: string, lit_reg: string, fail_l: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }, outer_const: string) -> string {
+    pk: string <- term_sir_helpers@sir_term_root_node(branch).value;
+    ref_q_scrut: boolean <- is_ref_optional_scrut_type(scrut_t);
+    case ref_q_scrut and pk == "atom" of {
+        true -> case term_sir_helpers@sir_term_root_node(branch).name == ":none" or term_sir_helpers@sir_term_root_node(branch).name == "none" of {
+            true -> emit_ref_optional_none_atom_check(scrut_reg, lit_reg, fail_l, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, outer_const);
+            false -> ""
+        };
+        false -> case pk == "wild" of {
+            true -> case is_ref_inner_pattern_type(term_sir_helpers@sir_term_root_node(branch).type_name) of {
+                true -> emit_ref_optional_present_check(scrut_reg, lit_reg, fail_l, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, outer_const);
+                false -> ""
+            };
+            false -> case pk == "bind" of {
+                true -> case is_ref_inner_pattern_type(term_sir_helpers@sir_term_root_node(branch).type_name) of {
+                    true -> emit_ref_optional_present_check(scrut_reg, lit_reg, fail_l, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, outer_const);
+                    false -> ""
+                };
+                false -> emit_case_pattern_check_inner(branch, scrut_t, scrut_reg, lit_reg, fail_l, pools, outer_const)
+            }
+        }
+    }
+}
+
+fn is_ref_optional_scrut_type(scrut_t: string) -> boolean {
+    case length_bytes(scrut_t) >= 5 and substring(scrut_t, 0, 4) == "ref?" and substring(scrut_t, 4, 5) == "(" of {
+        true -> true;
+        false -> case length_bytes(scrut_t) >= 6 and substring(scrut_t, 0, 6) == ":none|" of {
+            true -> true;
+            false -> false
+        }
+    }
+}
+
+fn is_ref_inner_pattern_type(pat_type: string) -> boolean {
+    length_bytes(pat_type) >= 4 and substring(pat_type, 0, 3) == "ref" and substring(pat_type, 3, 4) == "("
+}
+
+fn emit_ref_optional_none_atom_check(scrut_reg: string, lit_reg: string, fail_l: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, outer_const: string) -> string {
+    syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("ref_none", "0");
+    ld: string <- const_dispatcher@emit_const(syn, lit_reg, table, literal_table, float64_literal_table, float32_literal_table, outer_const);
+    ln: string <- concat(ld, "\n");
+    concat(ln, arm_isa@xt_cmp_branch("NE", scrut_reg, lit_reg, fail_l))
+}
+
+fn emit_ref_optional_present_check(scrut_reg: string, lit_reg: string, fail_l: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, outer_const: string) -> string {
+    syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("ref_none", "0");
+    ld: string <- const_dispatcher@emit_const(syn, lit_reg, table, literal_table, float64_literal_table, float32_literal_table, outer_const);
+    ln: string <- concat(ld, "\n");
+    concat(ln, arm_isa@xt_cmp_branch("EQ", scrut_reg, lit_reg, fail_l))
+}
+
+fn emit_case_pattern_check_inner(branch: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, scrut_t: string, scrut_reg: string, lit_reg: string, fail_l: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }, outer_const: string) -> string {
+    pk: string <- term_sir_helpers@sir_term_root_node(branch).value;
+    case pk == "wild" of {
+        true -> "";
+        false -> case pk == "bind" of {
+            true -> "";
+            false -> case pk == "bool" of {
+                true -> {
+                    imm: string <- case term_sir_helpers@sir_term_root_node(branch).name == "true" of { true -> "1"; false -> "0" };
+                    wreg: string <- scrut_reg_w_for_cmp(scrut_reg);
+                    arm_isa@xt_cmp_branch("NE", wreg, concat("#", imm), fail_l)
+                };
+                false -> case pk == "int" of {
+                    true -> {
+                        syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const(scrut_t, term_sir_helpers@sir_term_root_node(branch).name);
+                        ld: string <- const_dispatcher@emit_const(syn, lit_reg, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, outer_const);
+                        ln: string <- concat(ld, "\n");
+                        (ra: string, rb: string) <- case reg_conventions@is_narrow_type(scrut_t) of {
+                            true -> (scrut_reg_w_for_cmp(scrut_reg), scrut_reg_w_for_cmp(lit_reg));
+                            false -> (scrut_reg, lit_reg)
+                        };
+                        concat(ln, arm_isa@xt_cmp_branch("NE", ra, rb, fail_l))
+                    };
+                    false -> case pk == "string" of {
+                        true -> {
+                            syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("string", term_sir_helpers@sir_term_root_node(branch).name);
+                            ld: string <- term_user_call_abi@emit_string_const(syn, lit_reg, pools.string_literal_table);
+                            str_save: string <- concat(arm_mem@xt_str(scrut_reg, "[SP, #-16]!"), concat(ld, "\n"));
+                            mov_x0_ln: string <- arm_isa@xt_mov("X0", scrut_reg);
+                            mov_x1_ln: string <- arm_isa@xt_mov("X1", lit_reg);
+                            bl_ln: string <- arm_isa@xt_call("silica_rt_string_eq");
+                            mov_bl: string <- concat(concat(mov_x0_ln, mov_x1_ln), bl_ln);
+                            cmp_bne: string <- arm_isa@xt_cmp_branch("EQ", "W12", "#0", fail_l);
+                            tail: string <- concat(arm_isa@xt_mov("W12", "W0"), concat(arm_mem@xt_ldr(scrut_reg, "[SP], #16"), cmp_bne));
+                            concat(concat(str_save, mov_bl), tail)
+                        };
+                        false -> case pk == "list_nil" of {
+                            true -> {
+                                arm_isa@xt_cbnz(scrut_reg, fail_l)
+                            };
+                            false -> case pk == "list_cons" of {
+                                true -> arm_isa@xt_cbz(scrut_reg, fail_l);
+                                false -> case pk == "atom" of {
+                                    true -> {
+                                        syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("atom", term_sir_helpers@sir_term_root_node(branch).name);
+                                        ld: string <- const_dispatcher@emit_const(syn, lit_reg, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, outer_const);
+                                        ln: string <- concat(ld, "\n");
+                                        concat(ln, arm_isa@xt_cmp_branch("NE", scrut_reg, lit_reg, fail_l))
+                                    };
+                                    false -> case pk == "tuple" of {
+                                        true -> {
+                                            (tuple_asm: string, _: string, _: string) <- emit_tuple_case_pattern_asm(branch, scrut_t, scrut_reg, lit_reg, fail_l, "", pools);
+                                            tuple_asm
+                                        };
+                                        false -> arm_isa@xt_b(fail_l)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Tuple case patterns (spec §3.5 tuple_pattern, §4.1.7 tagged tuples): `(:ok, n: int64) -> ...`,
+// `("/", "/") -> ...`, `(0, (:a, _: int64)) -> ...`. The SIR branch (kind 8, value "tuple") carries
+// the raw pattern text in .name. Each element is matched against its slot of the scrutinee tuple
+// (prims_tuple@tuple_field_start_byte_offset; a nested tuple or record is a pointer word, every
+// scalar is stored in its word): a string, atom, integer, float or boolean literal is compared,
+// `_` and `_: T` match anything, a nested tuple or record sub-pattern is matched through its pointer,
+// and a named element `n` / `n: T` is copied into a frame slot and bound as %n for the guard and the
+// arm body. A slot, not a register, is its home because the arm's own calls clobber every
+// caller-saved register; emitter_core@case_bind_slots reserves the slots through
+// prims_tuple@tuple_pattern_named_count, which classifies elements with the same
+// prims_tuple@tuple_pattern_elem_binds_name used here.
+// History: the selfhost first had no tuple arm at all (gen3 lost `//` comments), then compared only
+// string elements and emitted `B fail` for every other element, so `(:ok, n: int64)` never matched.
+// See trials/case_addition/tuple_pattern_atom_and_named_elements.
+
+// --- target instructions for tuple patterns (Xtensa, virtual registers) ---
+
+fn tuple_pat_ldr(dst: string, mem_ref: string) -> string {
+    arm_mem@xt_ldr(dst, mem_ref)
+}
+
+fn tuple_pat_cmp_ne(a: string, b: string, fail_l: string) -> string {
+    arm_isa@xt_cmp_branch("NE", a, b, fail_l)
+}
+
+fn tuple_pat_fcmp_ne(a: string, b: string, tmp: string, fail_l: string) -> string {
+    concat(arm_float@xt_fcmp_set(tmp, "NE", a, b), arm_isa@xt_cbnz(tmp, fail_l))
+}
+
+fn tuple_pat_b(fail_l: string) -> string {
+    arm_isa@xt_b(fail_l)
+}
+
+fn tuple_pat_push(r: string) -> string {
+    arm_mem@xt_str(r, "[SP, #-16]!")
+}
+
+fn tuple_pat_pop(r: string) -> string {
+    arm_mem@xt_ldr(r, "[SP], #16")
+}
+
+// silica_rt_string_eq is a runtime call: keep every GPR a tuple base or temp can live in
+// (X0-X7, X9, X10) across it.
+fn tuple_pat_string_call(tr: string, lit_reg: string, fail_l: string) -> string {
+    save_a: string <- concat(concat(tuple_pat_push("X0"), tuple_pat_push("X1")), concat(tuple_pat_push("X2"), tuple_pat_push("X3")));
+    save_b: string <- concat(concat(tuple_pat_push("X4"), tuple_pat_push("X5")), concat(tuple_pat_push("X6"), tuple_pat_push("X7")));
+    save_c: string <- concat(tuple_pat_push("X9"), tuple_pat_push("X10"));
+    args: string <- concat(arm_isa@xt_mov("X0", tr), arm_isa@xt_mov("X1", lit_reg));
+    call: string <- concat(arm_isa@xt_call("silica_rt_string_eq"), arm_isa@xt_mov("W12", "W0"));
+    restore_c: string <- concat(tuple_pat_pop("X10"), tuple_pat_pop("X9"));
+    restore_b: string <- concat(concat(tuple_pat_pop("X7"), tuple_pat_pop("X6")), concat(tuple_pat_pop("X5"), tuple_pat_pop("X4")));
+    restore_a: string <- concat(concat(tuple_pat_pop("X3"), tuple_pat_pop("X2")), concat(tuple_pat_pop("X1"), tuple_pat_pop("X0")));
+    concat(concat(concat(save_a, save_b), concat(save_c, args)), concat(concat(call, concat(restore_c, concat(restore_b, restore_a))), arm_isa@xt_cmp_branch("EQ", "W12", "#0", fail_l)))
+}
+
+fn tuple_pat_is_paren_wrapped(raw: string) -> boolean {
+    length_bytes(raw) >= 2 and substring(raw, 0, 1) == "(" and substring(raw, length_bytes(raw) - 1, length_bytes(raw)) == ")"
+}
+
+fn tuple_pat_elem_at(inner: string, idx: int64) -> string {
+    c: int64 <- prims_tuple@tuple_pattern_next_comma(inner, 0, false, 0);
+    case idx == 0 of {
+        true -> substring(inner, 0, c);
+        false -> case c < length_bytes(inner) of {
+            true -> tuple_pat_elem_at(substring(inner, c + 1, length_bytes(inner)), idx - 1);
+            false -> ""
+        }
+    }
+}
+
+fn tuple_pat_count(inner: string) -> int64 {
+    case length_bytes(inner) == 0 of {
+        true -> 0;
+        false -> {
+            c: int64 <- prims_tuple@tuple_pattern_next_comma(inner, 0, false, 0);
+            case c < length_bytes(inner) of {
+                true -> 1 + tuple_pat_count(substring(inner, c + 1, length_bytes(inner)));
+                false -> 1
+            }
+        }
+    }
+}
+
+fn tuple_pat_name_of(el: string) -> string {
+    colon: int64 <- tuple_pat_colon_at(el, 0);
+    substring(el, 0, colon)
+}
+
+fn tuple_pat_colon_at(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> case substring(s, i, i + 1) == ":" of {
+            true -> i;
+            false -> tuple_pat_colon_at(s, i + 1)
+        }
+    }
+}
+
+fn tuple_pat_w_view(reg: string) -> string {
+    concat("W", substring(reg, 1, length_bytes(reg)))
+}
+
+// Load the element into GPR tr: narrow types sign/zero-extended like a record field, everything else
+// (int64, pointers, float bits) as one word.
+fn tuple_pat_load_elem(et: string, tr: string, mem_ref: string) -> string {
+    emit_ldr_record_field(et, tr, mem_ref)
+}
+
+// A float literal element is loaded from the module's float literal pool: the pools add pattern
+// literals from the branch text (prims_tuple@tuple_pattern_float_literals), since pattern text is not a
+// SIR constant. The pool load uses X10 as its pointer, so X10 is reserved while elements are matched.
+fn tuple_pat_float_check(et: string, lit: string, tr: string, mem_ref: string, fail_l: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> string {
+    is64: boolean <- reg_conventions@is_float64_type(et);
+    is32: boolean <- reg_conventions@is_float32_type(et);
+    ea: string <- case is64 of { true -> "D16"; false -> case is32 of { true -> "S16"; false -> "H16" } };
+    eb: string <- case is64 of { true -> "D17"; false -> case is32 of { true -> "S17"; false -> "H17" } };
+    ld_elem: string <- tuple_pat_ldr(ea, mem_ref);
+    syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const(et, lit);
+    ld_lit: string <- const_dispatcher@emit_const(syn, eb, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, "");
+    concat(ld_elem, concat(concat(ld_lit, "\n"), tuple_pat_fcmp_ne(ea, eb, tr, fail_l)))
+}
+
+// The string compare is the only call a tuple pattern makes; tuple_pat_string_call saves exactly the
+// registers the target's helper clobbers, so every tuple base (the scrutinee is X1-X5, nested bases can
+// be any register) survives it.
+fn tuple_pat_string_check(content: string, tr: string, mem_ref: string, lit_reg: string, fail_l: string, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] }) -> string {
+    syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("string", content);
+    ld_lit: string <- concat(term_user_call_abi@emit_string_const(syn, lit_reg, string_literal_table), "\n");
+    concat(concat(tuple_pat_ldr(tr, mem_ref), ld_lit), tuple_pat_string_call(tr, lit_reg, fail_l))
+}
+
+fn emit_tuple_pat_elems(inner: string, tup_t: string, base: string, ctx: { lit_reg: string, fail_l: string }, idx: int64, acc: { held: string, binds: string }, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> (string, string, string) {
+    case idx >= tuple_pat_count(inner) of {
+        true -> ("", acc.held, acc.binds);
+        false -> {
+            el: string <- tuple_pat_elem_at(inner, idx);
+            (one: string, held1: string, binds1: string) <- emit_tuple_pat_elem(el, tup_t, base, ctx, idx, acc, pools);
+            (rest: string, held2: string, binds2: string) <- emit_tuple_pat_elems(inner, tup_t, base, ctx, idx + 1, { held: held1, binds: binds1 }, pools);
+            (concat(one, rest), held2, binds2)
+        }
+    }
+}
+
+fn emit_tuple_pat_elem(el: string, tup_t: string, base: string, ctx: { lit_reg: string, fail_l: string }, idx: int64, acc: { held: string, binds: string }, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> (string, string, string) {
+    et: string <- prims_record@strip_spaces_rt(prims_tuple@tuple_type_nth_element(tup_t, idx));
+    mem_ref: string <- var@reg_offset_for_byte(base, prims_tuple@tuple_field_start_byte_offset(tup_t, idx));
+    tr: string <- var@next_free_int_reg(acc.held);
+    c0: string <- case length_bytes(el) > 0 of { true -> substring(el, 0, 1); false -> "" };
+    case el == "_" or length_bytes(el) == 0 or (length_bytes(el) >= 2 and substring(el, 0, 2) == "_:") of {
+        true -> ("", acc.held, acc.binds);
+        false -> case c0 == "\"" of {
+            true -> (tuple_pat_string_check(extract_string_pat_content_emit(el), tr, mem_ref, ctx.lit_reg, ctx.fail_l, pools.string_literal_table), acc.held, acc.binds);
+            false -> case c0 == "(" of {
+                // Nested tuple: its slot holds a pointer. Keep that base register reserved while the
+                // nested elements are matched.
+                true -> {
+                    ld: string <- tuple_pat_ldr(tr, mem_ref);
+                    held_n: string <- concat(acc.held, var@reg_binding(concat("%__silica_tup_base", atom_table@int64_to_decimal_string(idx)), tr));
+                    variant_n: string <- sum_tuple_variant_for(el, et);
+                    guard_n: string <- emit_sum_atom_variant_guard(et, tr, ctx.lit_reg, ctx.fail_l, "", pools);
+                    disc_n: string <- emit_sum_discriminator_guard(et, variant_n, tr, ctx.lit_reg, ctx.fail_l, held_n, "", pools);
+                    (asm_n: string, held_o: string, binds_o: string) <- emit_tuple_pat_elems(substring(el, 1, length_bytes(el) - 1), variant_n, tr, ctx, 0, { held: held_n, binds: acc.binds }, pools);
+                    (concat(ld, concat(guard_n, concat(disc_n, asm_n))), held_o, binds_o)
+                };
+                false -> case c0 == "{" of {
+                    // Record sub-pattern: the slot holds the record pointer (boxed layout). A sum-typed
+                    // element is matched through the record variant the sub-pattern names.
+                    true -> {
+                        ld: string <- tuple_pat_ldr(tr, mem_ref);
+                        held_r: string <- concat(acc.held, var@reg_binding(concat("%__silica_tup_rec", atom_table@int64_to_decimal_string(idx)), tr));
+                        variant_r: string <- sum_record_variant_for(el, et);
+                        guard_r: string <- emit_sum_variant_guards(et, variant_r, tr, ctx.lit_reg, ctx.fail_l, held_r, "", pools);
+                        (asm_r: string, outer_r: string) <- emit_record_case_rem(prims_record@record_case_inner_body(el), variant_r, tr, 0, ctx.lit_reg, ctx.fail_l, held_r, pools);
+                        new_binds: string <- substring(outer_r, length_bytes(held_r), length_bytes(outer_r));
+                        (concat(ld, concat(guard_r, asm_r)), outer_r, concat(acc.binds, new_binds))
+                    };
+                    false -> case c0 == ":" of {
+                        true -> {
+                            syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("atom", el);
+                            ld_lit: string <- const_dispatcher@emit_const(syn, ctx.lit_reg, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, "");
+                            cmp: string <- concat("\n", tuple_pat_cmp_ne(tr, ctx.lit_reg, ctx.fail_l));
+                            (concat(emit_ldr_record_field("int64", tr, mem_ref), concat(ld_lit, cmp)), acc.held, acc.binds)
+                        };
+                        false -> case el == "true" or el == "false" of {
+                            true -> {
+                                imm: string <- case el == "true" of { true -> "1"; false -> "0" };
+                                cmp: string <- tuple_pat_cmp_ne(tuple_pat_w_view(tr), concat("#", imm), ctx.fail_l);
+                                (concat(emit_ldr_record_field("boolean", tr, mem_ref), cmp), acc.held, acc.binds)
+                            };
+                            false -> case (reg_conventions@is_float64_type(et) or reg_conventions@is_float32_type(et) or reg_conventions@is_float16_type(et)) and prims_tuple@tuple_pattern_is_number(el) of {
+                                true -> (tuple_pat_float_check(et, el, tr, mem_ref, ctx.fail_l, pools), acc.held, acc.binds);
+                                false -> case string_parse@is_integer_literal_text(el) of {
+                                    true -> {
+                                        syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const(et, el);
+                                        ld_lit: string <- const_dispatcher@emit_const(syn, ctx.lit_reg, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, "");
+                                        // A narrow element is extended into the low word only: compare words.
+                                        (ra: string, rb: string) <- case reg_conventions@is_narrow_type(et) of {
+                                            true -> (tuple_pat_w_view(tr), tuple_pat_w_view(ctx.lit_reg));
+                                            false -> (tr, ctx.lit_reg)
+                                        };
+                                        cmp: string <- concat("\n", tuple_pat_cmp_ne(ra, rb, ctx.fail_l));
+                                        (concat(emit_ldr_record_field(et, tr, mem_ref), concat(ld_lit, cmp)), acc.held, acc.binds)
+                                    };
+                                    false -> case prims_tuple@tuple_pattern_elem_binds_name(el) of {
+                                        true -> {
+                                            slot: string <- term_reg_spill@next_frame_spill_slot(acc.held);
+                                            nb: string <- var@reg_binding(concat("%", tuple_pat_name_of(el)), slot);
+                                            asm_b: string <- concat(tuple_pat_load_elem(et, tr, mem_ref), var@emit_str_mem_ref(tr, slot));
+                                            (asm_b, concat(acc.held, nb), concat(acc.binds, nb))
+                                        };
+                                        false -> (tuple_pat_b(ctx.fail_l), acc.held, acc.binds)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A sum scrutinee (`:none | (:found, uint32)`, spec §15.4.11.2) is one word: an atom index or a
+// tuple/record pointer. A tuple or record arm reads through that word, so the sum's atom variants are
+// excluded first; without this the arm only worked when an atom arm had already filtered them out.
+// See trials/case_addition/sum_tuple_arm_before_atom_arm.
+fn sum_bar_depth0(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> sum_bar_depth0(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> sum_bar_depth0(s, i + 1, depth - 1);
+                    false -> case c == "|" and depth == 0 of {
+                        true -> i;
+                        false -> sum_bar_depth0(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn sum_guard_cmp_eq(a: string, b: string, label: string) -> string {
+    arm_isa@xt_cmp_branch("EQ", a, b, label)
+}
+
+fn emit_sum_atom_variant_guard(scrut_t: string, scrut_reg: string, lit_reg: string, fail_l: string, outer_const: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> string {
+    emit_sum_atom_guard_alts(prims_tuple@tuple_pattern_strip_spaces(scrut_t, 0, ""), scrut_reg, lit_reg, fail_l, outer_const, pools)
+}
+
+fn emit_sum_atom_guard_alts(rest: string, scrut_reg: string, lit_reg: string, fail_l: string, outer_const: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> string {
+    bar: int64 <- sum_bar_depth0(rest, 0, 0);
+    head: string <- case bar < 0 of { true -> rest; false -> substring(rest, 0, bar) };
+    one: string <- case length_bytes(head) >= 2 and substring(head, 0, 1) == ":" of {
+        true -> {
+            syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("atom", head);
+            ld: string <- const_dispatcher@emit_const(syn, lit_reg, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, outer_const);
+            concat(concat(ld, "\n"), sum_guard_cmp_eq(scrut_reg, lit_reg, fail_l))
+        };
+        false -> ""
+    };
+    case bar < 0 of {
+        true -> one;
+        false -> concat(one, emit_sum_atom_guard_alts(substring(rest, bar + 1, length_bytes(rest)), scrut_reg, lit_reg, fail_l, outer_const, pools))
+    }
+}
+
+// A nested element of sum type has no lowered branch type: the tuple variant its sub-pattern names is
+// chosen here, by tag atom when the sub-pattern starts with one, else by arity.
+fn sum_tuple_variant_for(el: string, et: string) -> string {
+    inner: string <- substring(el, 1, length_bytes(el) - 1);
+    case sum_bar_depth0(et, 0, 0) < 0 of {
+        true -> et;
+        false -> sum_tuple_variant_scan(tuple_pat_elem_at(inner, 0), tuple_pat_count(inner), et, "")
+    }
+}
+
+fn sum_tuple_variant_scan(tag: string, arity: int64, rest: string, first_tuple: string) -> string {
+    bar: int64 <- sum_bar_depth0(rest, 0, 0);
+    head: string <- case bar < 0 of { true -> rest; false -> substring(rest, 0, bar) };
+    is_tuple: boolean <- length_bytes(head) >= 2 and substring(head, 0, 1) == "(";
+    tag_ok: boolean <- length_bytes(tag) == 0 or substring(tag, 0, 1) != ":" or prims_record@strip_spaces_rt(prims_tuple@tuple_type_nth_element(head, 0)) == tag;
+    first_seen: string <- case is_tuple and length_bytes(first_tuple) == 0 of { true -> head; false -> first_tuple };
+    case is_tuple and tag_ok and prims_tuple@count_type_elements(head) == arity of {
+        true -> head;
+        false -> case bar < 0 of {
+            true -> case length_bytes(first_seen) > 0 of { true -> first_seen; false -> rest };
+            false -> sum_tuple_variant_scan(tag, arity, substring(rest, bar + 1, length_bytes(rest)), first_seen)
+        }
+    }
+}
+
+// A record variant of a sum is a pointer like a tuple variant, so the sum's atom variants are
+// excluded first, as for a tuple arm. When the sum holds a record variant beside another pointer
+// variant (`:empty | (:pair, int64, int64) | { x: int64 }`, `{ x: int64 } | { y: string }`), each
+// pointer variant is told apart by the first word behind its pointer: a tuple variant's tag atom,
+// or a record variant's shape word (record_shape, the build-wide number of its field
+// names). The arm compares that word with its variant's atom or shape number before reading any
+// element or field.
+fn emit_sum_variant_guards(scrut_t: string, variant_t: string, scrut_reg: string, lit_reg: string, fail_l: string, held: string, outer_const: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> string {
+    atoms: string <- emit_sum_atom_variant_guard(scrut_t, scrut_reg, lit_reg, fail_l, outer_const, pools);
+    disc: string <- emit_sum_discriminator_guard(scrut_t, variant_t, scrut_reg, lit_reg, fail_l, held, outer_const, pools);
+    concat(atoms, disc)
+}
+
+// A shape number (record_shape) as an immediate: shapes live above 65535 (atom_table@shape_index_base).
+fn emit_shape_const(dest: string, n: int64) -> string {
+    arm_isa@xt_movi(dest, n)
+}
+
+fn emit_sum_discriminator_guard(scrut_t: string, variant_t: string, scrut_reg: string, lit_reg: string, fail_l: string, held: string, outer_const: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> string {
+    st: string <- prims_tuple@tuple_pattern_strip_spaces(scrut_t, 0, "");
+    disc: string <- sum_variant_discriminator_emit(variant_t);
+    case sum_bar_depth0(st, 0, 0) >= 0 and sum_has_record_variant_emit(st) and sum_pointer_variant_count_emit(st, 0) > 1 and length_bytes(disc) > 0 of {
+        false -> "";
+        true -> {
+            tr: string <- var@next_free_int_reg(concat(held, var@reg_binding("%__silica_sum_lit", lit_reg)));
+            ld_word: string <- tuple_pat_ldr(tr, var@reg_offset_for_byte(scrut_reg, 0));
+            syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("atom", disc);
+            ld_lit: string <- case prims_record@record_type_starts(prims_record@strip_spaces_rt(variant_t)) of {
+                true -> emit_shape_const(lit_reg, atom_table@atom_lexeme_to_index(pools.table, disc));
+                false -> const_dispatcher@emit_const(syn, lit_reg, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, outer_const)
+            };
+            concat(ld_word, concat(concat(ld_lit, "\n"), tuple_pat_cmp_ne(tr, lit_reg, fail_l)))
+        }
+    }
+}
+
+fn sum_variant_head_emit(rest: string) -> string {
+    bar: int64 <- sum_bar_depth0(rest, 0, 0);
+    case bar < 0 of {
+        true -> prims_record@strip_spaces_rt(rest);
+        false -> prims_record@strip_spaces_rt(substring(rest, 0, bar))
+    }
+}
+
+fn sum_variant_rest_emit(rest: string) -> string {
+    bar: int64 <- sum_bar_depth0(rest, 0, 0);
+    case bar < 0 of {
+        true -> "";
+        false -> substring(rest, bar + 1, length_bytes(rest))
+    }
+}
+
+fn sum_has_record_variant_emit(rest: string) -> boolean {
+    case length_bytes(rest) == 0 of {
+        true -> false;
+        false -> case prims_record@record_type_starts(sum_variant_head_emit(rest)) of {
+            true -> true;
+            false -> sum_has_record_variant_emit(sum_variant_rest_emit(rest))
+        }
+    }
+}
+
+fn sum_pointer_variant_count_emit(rest: string, acc: int64) -> int64 {
+    case length_bytes(rest) == 0 of {
+        true -> acc;
+        false -> {
+            head: string <- sum_variant_head_emit(rest);
+            case length_bytes(head) >= 2 and (substring(head, 0, 1) == "(" or substring(head, 0, 1) == "{") of {
+                true -> sum_pointer_variant_count_emit(sum_variant_rest_emit(rest), acc + 1);
+                false -> sum_pointer_variant_count_emit(sum_variant_rest_emit(rest), acc)
+            }
+        }
+    }
+}
+
+// A pointer variant's discriminating word, as an atom-table lexeme: a tuple variant's tag atom,
+// a record variant's shape lexeme.
+fn sum_variant_discriminator_emit(variant_t: string) -> string {
+    v: string <- prims_record@strip_spaces_rt(variant_t);
+    case prims_record@record_type_starts(v) of {
+        true -> record_shape@record_shape_lexeme(v);
+        false -> {
+            first: string <- case length_bytes(v) >= 2 and substring(v, 0, 1) == "(" of {
+                true -> prims_record@strip_spaces_rt(prims_tuple@tuple_type_nth_element(v, 0));
+                false -> ""
+            };
+            case length_bytes(first) >= 2 and substring(first, 0, 1) == ":" and sum_bar_depth0(first, 0, 0) < 0 of {
+                true -> first;
+                false -> ""
+            }
+        }
+    }
+}
+
+// The record variant a record sub-pattern of a sum-typed element matches: the first record variant
+// holding every field the sub-pattern names; a non-sum type is itself.
+fn sum_record_variant_for(el: string, et: string) -> string {
+    case sum_bar_depth0(et, 0, 0) < 0 of {
+        true -> et;
+        false -> sum_record_variant_scan(prims_record@record_case_inner_body(el), et)
+    }
+}
+
+fn sum_record_variant_scan(rem: string, rest: string) -> string {
+    head: string <- sum_variant_head_emit(rest);
+    case prims_record@record_type_starts(head) and record_pat_fields_in(rem, head) of {
+        true -> head;
+        false -> case sum_bar_depth0(rest, 0, 0) < 0 of {
+            true -> rest;
+            false -> sum_record_variant_scan(rem, sum_variant_rest_emit(rest))
+        }
+    }
+}
+
+fn record_pat_fields_in(rem: string, rec_t: string) -> boolean {
+    rin: string <- prims_record@strip_spaces_rt(rem);
+    case length_bytes(rin) == 0 of {
+        true -> true;
+        false -> {
+            (seg: string, rest: string) <- prims_record@record_case_field_step(rin);
+            (fname: string, sub: string) <- prims_record@record_field_segment_name_sub(seg);
+            case length_bytes(fname) > 0 and length_bytes(prims_record@find_field_type_in_record(rec_t, fname)) == 0 of {
+                true -> false;
+                false -> record_pat_fields_in(rest, rec_t)
+            }
+        }
+    }
+}
+
+fn emit_tuple_case_pattern_asm(branch: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, scrut_t: string, scrut_reg: string, lit_reg: string, fail_l: string, outer_reg: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> (string, string, string) {
+    raw: string <- prims_tuple@tuple_pattern_strip_spaces(term_sir_helpers@sir_term_root_node(branch).name, 0, "");
+    case tuple_pat_is_paren_wrapped(raw) and length_bytes(raw) > 2 of {
+        false -> (tuple_pat_b(fail_l), "", outer_reg);
+        true -> {
+            // A sum-typed scrutinee (`:none | (:some, int64)`, spec §15.4.11.2) is matched through the tuple
+            // variant this pattern names: terms_case_lowering stores that variant as the branch type, so a
+            // tuple-spelled branch type is the tuple to index. A plain tuple scrutinee has the same spelling in
+            // both places; only a non-tuple branch type falls back to the scrutinee type.
+            branch_t: string <- term_sir_helpers@sir_term_root_node(branch).type_name;
+            branch_ts: string <- prims_tuple@tuple_pattern_strip_spaces(branch_t, 0, "");
+            tup_t: string <- case length_bytes(branch_ts) >= 2 and substring(branch_ts, 0, 1) == "(" of { true -> branch_t; false -> scrut_t };
+            // The scrutinee, literal and float-pool (X10) registers stay reserved while element temps are picked.
+            held: string <- concat(outer_reg, concat(var@reg_binding("%__silica_tup_scrut", scrut_reg), concat(var@reg_binding("%__silica_tup_lit", lit_reg), var@reg_binding("%__silica_tup_fpool", "X10"))));
+            guard: string <- emit_sum_variant_guards(scrut_t, tup_t, scrut_reg, lit_reg, fail_l, held, outer_reg, pools);
+            (asm: string, _: string, binds: string) <- emit_tuple_pat_elems(substring(raw, 1, length_bytes(raw) - 1), tup_t, scrut_reg, { lit_reg: lit_reg, fail_l: fail_l }, 0, { held: held, binds: "" }, pools);
+            (concat(guard, asm), "", concat(outer_reg, binds))
+        }
+    }
+}
+
+fn case_close_quote_index_emit(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 1) == "\\" of {
+            true -> case i + 1 >= length_bytes(s) of {
+                true -> -1;
+                false -> case_close_quote_index_emit(s, i + 2)
+            };
+            false -> case substring(s, i, i + 1) == "\"" of {
+                true -> i;
+                false -> case_close_quote_index_emit(s, i + 1)
+            }
+        }
+    }
+}
+
+fn extract_string_pat_content_emit(s: string) -> string {
+    case length_bytes(s) < 2 of {
+        true -> "";
+        false -> case substring(s, 0, 1) == "\"" of {
+            true -> {
+                cq: int64 <- case_close_quote_index_emit(s, 1);
+                case cq < 0 of {
+                    true -> "";
+                    false -> substring(s, 1, cq)
+                }
+            };
+            false -> ""
+        }
+    }
+}
+
+fn emit_ldr_record_field(fty: string, dest_gpr: string, mem_ref: string) -> string {
+    case reg_conventions@is_narrow_type(fty) of {
+        true -> case fty of {
+            "int8" -> arm_mem@xt_ldrsb(concat("W", substring(dest_gpr, 1, length_bytes(dest_gpr))), mem_ref);
+            "uint8" -> arm_mem@xt_ldrb(concat("W", substring(dest_gpr, 1, length_bytes(dest_gpr))), mem_ref);
+            "int16" -> arm_mem@xt_ldrsh(concat("W", substring(dest_gpr, 1, length_bytes(dest_gpr))), mem_ref);
+            "uint16" -> arm_mem@xt_ldrh(concat("W", substring(dest_gpr, 1, length_bytes(dest_gpr))), mem_ref);
+            "boolean" -> arm_mem@xt_ldrb(concat("W", substring(dest_gpr, 1, length_bytes(dest_gpr))), mem_ref);
+            _: string -> arm_mem@xt_ldr(dest_gpr, mem_ref)
+        };
+        false -> arm_mem@xt_ldr(dest_gpr, mem_ref)
+    }
+}
+
+fn emit_record_field_subpat(sub_st: string, fty: string, scrut_reg: string, abs_off: int64, lit_reg: string, fail_l: string, outer_acc: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> (string, string) {
+    case sub_st == "_" of {
+        true -> ("", outer_acc);
+        false -> case prims_record@record_type_starts(sub_st) and prims_record@record_type_braces_balanced(sub_st) of {
+            true -> {
+                inner_rem: string <- prims_record@record_case_inner_body(sub_st);
+                // Boxed layout (prims_record header): the field holds a pointer to the nested
+                // record. Load it into a fresh register, keep that register reserved while the
+                // nested fields are matched, and match the sub-pattern from offset 0 of it. The outer
+                // scrutinee register is reserved as well: the nested bindings are taken from the same
+                // pool, and one landing on it destroyed the base of every later outer field.
+                // (The runtime-laid-out supervisor reply, whose nested record is spliced inline,
+                // is matched by emit_record_case_rem before it gets here.)
+                mem_ref: string <- var@reg_offset_for_byte(scrut_reg, abs_off);
+                keep_scrut: string <- concat(outer_acc, var@reg_binding("%__silica_rec_scrut", scrut_reg));
+                tr: string <- var@next_free_int_reg(keep_scrut);
+                ld_ptr: string <- emit_ldr_record_field("int64", tr, mem_ref);
+                held: string <- concat(keep_scrut, var@reg_binding("%__silica_nested_rec", tr));
+                variant_f: string <- sum_record_variant_for(sub_st, fty);
+                guard_f: string <- emit_sum_variant_guards(fty, variant_f, tr, lit_reg, fail_l, held, "", pools);
+                (asm_n: string, outer_n: string) <- emit_record_case_rem(inner_rem, variant_f, tr, 0, lit_reg, fail_l, held, pools);
+                (concat(ld_ptr, concat(guard_f, asm_n)), outer_n)
+            };
+            false -> case fty == "boolean" and (sub_st == "true" or sub_st == "false") of {
+                true -> {
+                    mem_ref: string <- var@reg_offset_for_byte(scrut_reg, abs_off);
+                    tr: string <- var@next_free_int_reg(outer_acc);
+                    imm: string <- case sub_st == "true" of { true -> "1"; false -> "0" };
+                    ld_ln: string <- emit_ldr_record_field(fty, tr, mem_ref);
+                    wtr: string <- scrut_reg_w_for_cmp(tr);
+                    (concat(ld_ln, arm_isa@xt_cmp_branch("NE", wtr, concat("#", imm), fail_l)), outer_acc)
+                };
+                false -> case string_parse@is_integer_literal_text(sub_st) of {
+                    true -> {
+                        mem_ref: string <- var@reg_offset_for_byte(scrut_reg, abs_off);
+                        tr: string <- var@next_free_int_reg(outer_acc);
+                        ld_field: string <- emit_ldr_record_field(fty, tr, mem_ref);
+                        syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const(fty, sub_st);
+                        ld_lit: string <- const_dispatcher@emit_const(syn, lit_reg, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, "");
+                        ln: string <- concat(ld_lit, "\n");
+                        (ra: string, rb: string) <- case reg_conventions@is_narrow_type(fty) of {
+                            true -> (scrut_reg_w_for_cmp(tr), scrut_reg_w_for_cmp(lit_reg));
+                            false -> (tr, lit_reg)
+                        };
+                        (concat(ld_field, concat(ln, arm_isa@xt_cmp_branch("NE", ra, rb, fail_l))), outer_acc)
+                    };
+                    false -> case substring(sub_st, 0, 1) == "\"" of {
+                        true -> case fty == "string" of {
+                            true -> {
+                                str_content: string <- extract_string_pat_content_emit(sub_st);
+                                mem_ref: string <- var@reg_offset_for_byte(scrut_reg, abs_off);
+                                tr: string <- var@next_free_int_reg(outer_acc);
+                                ld_f: string <- arm_mem@xt_ldr(tr, mem_ref);
+                                syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("string", str_content);
+                                ld_pat: string <- term_user_call_abi@emit_string_const(syn, lit_reg, pools.string_literal_table);
+                                str_save: string <- concat(arm_mem@xt_str(tr, "[SP, #-16]!"), concat(ld_pat, "\n"));
+                                mov_x0: string <- arm_isa@xt_mov("X0", tr);
+                                mov_x1: string <- arm_isa@xt_mov("X1", lit_reg);
+                                bl_ln: string <- arm_isa@xt_call("silica_rt_string_eq");
+                                cmp_bne: string <- arm_isa@xt_cmp_branch("EQ", "W12", "#0", fail_l);
+                                tail: string <- concat(arm_isa@xt_mov("W12", "W0"), concat(arm_mem@xt_ldr(tr, "[SP], #16"), cmp_bne));
+                                (concat(concat(concat(ld_f, str_save), concat(concat(mov_x0, mov_x1), concat(bl_ln, tail))), "\n"), outer_acc)
+                            };
+                            false -> (arm_isa@xt_b(fail_l), outer_acc)
+                        };
+                        false -> case substring(sub_st, 0, 1) == ":" of {
+                            true -> {
+                                mem_ref: string <- var@reg_offset_for_byte(scrut_reg, abs_off);
+                                tr: string <- var@next_free_int_reg(outer_acc);
+                                ld_f: string <- emit_ldr_record_field(fty, tr, mem_ref);
+                                syn: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@make_leaf_sir_const("atom", sub_st);
+                                ld_lit: string <- const_dispatcher@emit_const(syn, lit_reg, pools.table, pools.literal_table, pools.float64_literal_table, pools.float32_literal_table, "");
+                                ln: string <- concat(ld_lit, "\n");
+                                (concat(ld_f, concat(ln, arm_isa@xt_cmp_branch("NE", tr, lit_reg, fail_l))), outer_acc)
+                            };
+                            false -> {
+                                mem_ref: string <- var@reg_offset_for_byte(scrut_reg, abs_off);
+                                tr: string <- var@next_free_int_reg(outer_acc);
+                                ld_f: string <- emit_ldr_record_field(fty, tr, mem_ref);
+                                nb: string <- var@reg_binding(concat("%", sub_st), tr);
+                                (concat(ld_f, ""), concat(outer_acc, nb))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn emit_record_case_rem(rem: string, type_t: string, scrut_reg: string, base_off: int64, lit_reg: string, fail_l: string, outer_acc: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> (string, string) {
+    rin: string <- prims_record@strip_spaces_rt(rem);
+    case length_bytes(rin) == 0 of {
+        true -> ("", outer_acc);
+        false -> {
+            (seg: string, rest: string) <- prims_record@record_case_field_step(rin);
+            (fname: string, sub: string) <- prims_record@record_field_segment_name_sub(seg);
+            case length_bytes(fname) == 0 of {
+                true -> emit_record_case_rem(prims_record@strip_spaces_rt(rest), type_t, scrut_reg, base_off, lit_reg, fail_l, outer_acc, pools);
+                false -> {
+                    fo: int64 <- prims_record@offset_bytes_before_field(type_t, fname);
+                    fty: string <- prims_record@find_field_type_in_record(type_t, fname);
+                    inline_rem: boolean <- prims_record@record_type_keeps_inline_layout(type_t);
+                    abs_off: int64 <- case fo < 0 of {
+                        true -> -1;
+                        false -> base_off + fo
+                    };
+                    case length_bytes(fty) == 0 of {
+                        true -> {
+                            (ar: string, ou: string) <- emit_record_case_rem(rest, type_t, scrut_reg, base_off, lit_reg, fail_l, outer_acc, pools);
+                            (concat(arm_isa@xt_b(fail_l), ar), ou)
+                        };
+                        false -> {
+                            sub_st: string <- prims_record@strip_spaces_rt(sub);
+                            // The supervisor reply record is laid out inline by the actor runtime: a nested
+                            // record sub-pattern there is matched in place, at its absolute offset.
+                            (asm_f: string, outer_f: string) <- case inline_rem and prims_record@record_type_starts(sub_st) and prims_record@record_type_braces_balanced(sub_st) of {
+                                true -> emit_record_case_rem(prims_record@record_case_inner_body(sub_st), fty, scrut_reg, abs_off, lit_reg, fail_l, outer_acc, pools);
+                                false -> emit_record_field_subpat(sub_st, fty, scrut_reg, abs_off, lit_reg, fail_l, outer_acc, pools)
+                            };
+                            (asm_r: string, outer_r: string) <- emit_record_case_rem(rest, type_t, scrut_reg, base_off, lit_reg, fail_l, outer_f, pools);
+                            (concat(asm_f, asm_r), outer_r)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A record arm over a sum scrutinee (`:none | { id: uint32 }`): the branch type is the record
+// variant (terms_case_lowering); the sum's atom variants and other pointer variants are excluded
+// first (emit_sum_variant_guards), then the fields are matched through the pointer.
+fn emit_record_case_pattern_asm(branch: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, record_type_str: string, scrut_t: string, scrut_reg: string, lit_reg: string, fail_l: string, outer_reg: string, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }) -> (string, string, string) {
+    node: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(branch);
+    inner: string <- prims_record@record_case_inner_body(node.name);
+    held: string <- concat(outer_reg, concat(var@reg_binding("%__silica_rec_scrut", scrut_reg), var@reg_binding("%__silica_rec_lit", lit_reg)));
+    guard: string <- emit_sum_variant_guards(scrut_t, record_type_str, scrut_reg, lit_reg, fail_l, held, outer_reg, pools);
+    (asm_s: string, outer_s: string) <- emit_record_case_rem(inner, record_type_str, scrut_reg, 0, lit_reg, fail_l, outer_reg, pools);
+    (concat(guard, asm_s), "", outer_s)
+}
+
+// After list_cons (prepend) RHS, tail arg was emitted to X2 and emit_list_cons restores X2 to the
+// tail list pointer across malloc. Earlier |tailvar=R bindings may be stale (e.g. R=X0 clobbered).
+
+fn list_cons_tail_rebind_suffix(inner: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+    case term_sir_helpers@sir_term_root_node(inner).kind == 6 and term_sir_helpers@sir_term_root_node(inner).name == "list_cons" of {
+        true -> case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(inner, term_sir_helpers@sir_term_root_node(inner).right_expr)).kind == 1 of {
+            true -> var@reg_binding(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(inner, term_sir_helpers@sir_term_root_node(inner).right_expr)).name, "X2");
+            false -> ""
+        };
+        false -> ""
+    }
+}
+
+// List tail must not use X0/X1: callees return in X0 and use X0/X1 for args, so a tail bound there
+// is clobbered (e.g. case cons -> segment_energy(h) then recursive call on t).
+// Also must not use the scrutinee register (often X2): LDR tail, [scrut, #off] would clobber the cons cell.
+
+fn list_cons_tail_ptr_reg(ext_for_alloc: string, scrut_reg: string) -> string {
+    blocked: string <- concat(ext_for_alloc, concat("|__silica_tl0=X0|__silica_tl1=X1|__silica_scr=", scrut_reg));
+    cs: string <- term_reg_spill@spill_reg_chain_from_outer(blocked);
+    case length_bytes(cs) > 0 of {
+        true -> cs;
+        false -> var@next_free_int_reg(blocked)
+    }
+}
+
+// Chunk-based tail: call L_list_tail_helper(handle, elem_slot_bytes, chunk_data_bytes).
+// scrut_reg holds the handle.  Result goes to tr (via X0).
+// tr must not be X0 or X1 (list_cons_tail_ptr_reg blocks them).
+
+fn list_cons_emit_tail_call(scrut_reg: string, elem_slot_s: string, cdata_s: string, tr: string) -> string {
+    save: string <- concat(arm_mem@xt_stp("X0", "X1", "[SP, #-16]!"), concat(arm_mem@xt_stp("X2", "X3", "[SP, #-16]!"), arm_mem@xt_stp("X4", "X5", "[SP, #-16]!")));
+    setup: string <- concat(arm_isa@xt_mov("X0", scrut_reg), concat(arm_isa@xt_mov("X1", concat("#", elem_slot_s)), arm_isa@xt_mov("X2", concat("#", cdata_s))));
+    bl: string <- arm_isa@xt_call("silica_rt_list_tail");
+    mov_r: string <- arm_isa@xt_mov(tr, "X0");
+    restore: string <- concat(arm_mem@xt_ldp("X4", "X5", "[SP], #16"), concat(arm_mem@xt_ldp("X2", "X3", "[SP], #16"), arm_mem@xt_ldp("X0", "X1", "[SP], #16")));
+    concat(concat(save, setup), concat(bl, concat(mov_r, restore)))
+}
+
+fn list_cons_scalar_head_blocked(ext_for_alloc: string, scrut_reg: string) -> string {
+    base: string <- concat(ext_for_alloc, "|__silica_hd0=X0|__silica_hd10=X10|__silica_hd11=X11");
+    case length_bytes(scrut_reg) > 0 of {
+        true -> concat(base, concat("|__silica_scr=", scrut_reg));
+        false -> base
+    }
+}
+
+// Scalar list heads must not land in X0: cons-branch bodies often MOV tail into X0 for the first
+// BL arg (e.g. sum_int64_list(t, acc + h)) and clobber a head loaded there (structs_addition/07).
+
+fn list_cons_head_ptr_reg(head_t: string, ext_for_alloc: string, scrut_reg: string) -> string {
+    case reg_conventions@is_aggregate_struct_or_tuple_return_type(head_t) of {
+        true -> {
+            cs: string <- term_reg_spill@spill_reg_chain_from_outer(ext_for_alloc);
+            case length_bytes(cs) > 0 of {
+                true -> cs;
+                false -> var@next_free_int_reg(concat(ext_for_alloc, "|__silica_hd0=X0|__silica_hd1=X1|__silica_hd2=X2|__silica_hd3=X3|__silica_hd10=X10|__silica_hd11=X11"))
+            }
+        };
+        false -> {
+            blocked: string <- list_cons_scalar_head_blocked(ext_for_alloc, scrut_reg);
+            // Take a callee-saved register, the same way the tail and an aggregate head do.
+            // next_free_int_reg hands out X0-X15 first, so a scalar head landed in X1 and any call
+            // in the branch body destroyed it: `rest <- walk(t); length_bytes(h) + rest` measured whatever
+            // the callee left in X1. atom_rodata:emit_lexemes_rodata is that shape, which is why the
+            // selfhost emitted " 0 0" in place of every atom's bytes and no function bodies at all.
+            // See trials/codegen_regressions/list_head_call.silica.
+            cs: string <- term_reg_spill@spill_reg_chain_from_outer(blocked);
+            case length_bytes(cs) > 0 of {
+                true -> cs;
+                false -> {
+                    picked: string <- var@next_free_int_reg(blocked);
+                    case picked == "X0" of {
+                        true -> "X1";
+                        false -> picked
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Chunk-based head load: handle → chunk_ptr (+8) → cursor (+16) → element at [chunk + cursor].
+// Uses X10, X11 as temporaries to avoid conflicts with scrutinee in X2/X3.
+
+fn list_cons_emit_head_ldr(scrut_reg: string, head_t: string, dest: string) -> string {
+    ld_chunk: string <- arm_mem@xt_ldr("X10", concat("[", concat(scrut_reg, ", #8]")));
+    ld_cursor: string <- arm_mem@xt_ldr("X11", concat("[", concat(scrut_reg, ", #16]")));
+    add_addr: string <- arm_isa@xt_add("X10", "X10", "X11");
+    // Boxed layout: only a child-spec head is spliced into its cell (the actor runtime reads
+    // it there); every other aggregate head is a pointer word and is loaded like a scalar.
+    case prims_list@list_elem_is_inline_aggregate(head_t) of {
+        true -> concat(ld_chunk, concat(ld_cursor, concat(add_addr, arm_isa@xt_mov(dest, "X10"))));
+        false -> {
+            ed: string <- case reg_conventions@is_narrow_type(head_t) of {
+                true -> case length_bytes(dest) > 0 of {
+                    true -> case substring(dest, 0, 1) == "X" of {
+                        true -> concat("W", substring(dest, 1, length_bytes(dest)));
+                        false -> dest
+                    };
+                    false -> dest
+                };
+                false -> dest
+            };
+            ld: string <- case reg_conventions@is_narrow_type(head_t) of {
+                true -> case head_t of {
+                    "int8" -> arm_mem@xt_ldrsb(ed, "[X10]");
+                    "uint8" -> arm_mem@xt_ldrb(ed, "[X10]");
+                    "int16" -> arm_mem@xt_ldrsh(ed, "[X10]");
+                    "uint16" -> arm_mem@xt_ldrh(ed, "[X10]");
+                    _: string -> arm_mem@xt_ldr(ed, "[X10]")
+                };
+                false -> arm_mem@xt_ldr(dest, "[X10]")
+            };
+            concat(concat(ld_chunk, ld_cursor), concat(add_addr, ld))
+        }
+    }
+}
+
+// List cons pattern: term_sir_helpers@sir_term_root_node(branch).name is "%h|%t" (or _), sir_term_root_node(branch).type_name is "head_t|list_t" (SIR).
+// Chunk-based: head via handle→chunk→cursor→element; tail via L_list_tail_helper.
+
+fn emit_list_cons_pattern_loads(branch: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, scrut_reg: string, outer_reg: string) -> (string, string) {
+    pipe_n: int64 <- var@find_pipe_from(term_sir_helpers@sir_term_root_node(branch).name, 0);
+    case pipe_n < 0 of {
+        true -> ("", outer_reg);
+        false -> {
+            left_pat: string <- substring(term_sir_helpers@sir_term_root_node(branch).name, 0, pipe_n);
+            right_pat: string <- substring(term_sir_helpers@sir_term_root_node(branch).name, pipe_n + 1, length_bytes(term_sir_helpers@sir_term_root_node(branch).name));
+            pipe_t: int64 <- var@find_pipe_from(term_sir_helpers@sir_term_root_node(branch).type_name, 0);
+            head_t: string <- case pipe_t < 0 of {
+                true -> "";
+                false -> substring(term_sir_helpers@sir_term_root_node(branch).type_name, 0, pipe_t)
+            };
+            ext0: string <- outer_reg;
+            es: int64 <- prims_list@chunk_elem_slot_bytes(head_t);
+            cd: int64 <- prims_list@chunk_data_bytes(head_t);
+            es_s: string <- atom_table@int64_to_decimal_string(es);
+            cd_s: string <- atom_table@int64_to_decimal_string(cd);
+            (asm_out: string, ext_out: string) <- case left_pat == "_" of {
+                true -> case right_pat == "_" of {
+                    true -> ("", ext0);
+                    false -> {
+                        tr0: string <- list_cons_tail_ptr_reg(ext0, scrut_reg);
+                        nb_t0: string <- var@reg_binding(right_pat, tr0);
+                        t_ld0: string <- list_cons_emit_tail_call(scrut_reg, es_s, cd_s, tr0);
+                        (t_ld0, concat(ext0, nb_t0))
+                    }
+                };
+                false -> case right_pat == "_" of {
+                    true -> {
+                        hr_h: string <- list_cons_head_ptr_reg(head_t, ext0, scrut_reg);
+                        h_ld_h: string <- list_cons_emit_head_ldr(scrut_reg, head_t, hr_h);
+                        nb_hh: string <- var@reg_binding(left_pat, hr_h);
+                        (h_ld_h, concat(ext0, nb_hh))
+                    };
+                    false -> {
+                        tr_b: string <- list_cons_tail_ptr_reg(ext0, scrut_reg);
+                        nb_tb: string <- var@reg_binding(right_pat, tr_b);
+                        t_ld_b: string <- list_cons_emit_tail_call(scrut_reg, es_s, cd_s, tr_b);
+                        ext_tb: string <- concat(ext0, nb_tb);
+                        hr_b: string <- list_cons_head_ptr_reg(head_t, ext_tb, scrut_reg);
+                        h_ld_b: string <- list_cons_emit_head_ldr(scrut_reg, head_t, hr_b);
+                        nb_hb: string <- var@reg_binding(left_pat, hr_b);
+                        (concat(t_ld_b, h_ld_b), concat(ext_tb, nb_hb))
+                    }
+                }
+            };
+            (asm_out, ext_out)
+        }
+    }
+}
+
+fn emit_case_pick_scrut_reg(dest: string, outer_reg: string, bound_reg: string) -> string {
+    case dest == "X1" of {
+        true -> case var@is_reg_bound(outer_reg, "X2") of {
+            true -> case var@is_reg_bound(outer_reg, "X3") of {
+                true -> case var@is_reg_bound(outer_reg, "X4") of { true -> "X5"; false -> "X4" };
+                false -> "X3"
+            };
+            false -> case bound_reg == "X2" of {
+                true -> "X3";
+                false -> "X3"
+            }
+        };
+        false -> case dest == "X0" of {
+            true -> case var@is_reg_bound(outer_reg, "X2") of {
+                true -> case var@is_reg_bound(outer_reg, "X3") of {
+                    true -> case var@is_reg_bound(outer_reg, "X4") of { true -> "X5"; false -> "X4" };
+                    false -> "X3"
+                };
+                false -> case bound_reg == "X2" of {
+                    true -> "X3";
+                    false -> "X3"
+                }
+            };
+            // Result in X2 (e.g. third let hb): default scrutinee X1 would load base with MOV X1,X2 and
+            // clobber X1 holding another list primary (extended after prepend). Use X3+ like dest X0/X1.
+            false -> case dest == "X2" of {
+                true -> case var@is_reg_bound(outer_reg, "X3") of {
+                    true -> case var@is_reg_bound(outer_reg, "X4") of { true -> "X5"; false -> "X4" };
+                    false -> "X3"
+                };
+                false -> case var@is_reg_bound(outer_reg, "X1") of {
+                    true -> case var@is_reg_bound(outer_reg, "X3") of {
+                        true -> case var@is_reg_bound(outer_reg, "X4") of { true -> "X5"; false -> "X4" };
+                        false -> "X3"
+                    };
+                    false -> case var@is_reg_bound(outer_reg, "X2") of {
+                        true -> case var@is_reg_bound(outer_reg, "X3") of {
+                            true -> case var@is_reg_bound(outer_reg, "X4") of { true -> "X5"; false -> "X4" };
+                            false -> "X3"
+                        };
+                        false -> "X1"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn emit_case_lit_reg_for_scrut(scrut_reg: string) -> string {
+    case scrut_reg == "X1" of {
+        true -> "X3";
+        false -> case scrut_reg == "X2" of {
+            true -> "X3";
+            false -> case scrut_reg == "X3" of {
+                true -> "X4";
+                false -> case scrut_reg == "X4" of {
+                    true -> "X5";
+                    false -> case scrut_reg == "X5" of {
+                        true -> "X6";
+                        false -> "X2"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn emit_case_guard_reg_for_scrut(scrut_reg: string) -> string {
+    case scrut_reg == "X1" of {
+        true -> "X4";
+        false -> case scrut_reg == "X2" of {
+            true -> "X4";
+            false -> case scrut_reg == "X3" of {
+                true -> "X5";
+                false -> case scrut_reg == "X4" of {
+                    true -> "X6";
+                    false -> case scrut_reg == "X5" of {
+                        true -> "X7";
+                        false -> "X3"
+                    }
+                }
+            }
+        }
+    }
+}
+
