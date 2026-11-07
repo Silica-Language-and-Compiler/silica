@@ -494,6 +494,7 @@ silica_rt_atom_names:
 #define VRG_ARG          136    // an emitted reservation's size, for silica_rt_aux_grow
 #define VRG_FLOOR        140    // the running frame's floor (chunk 15: rt_frame.S; shared/xt_frame.silica)
 #define VRG_CCB          144    // the copier's control block of this core (rt_state.S)
+#define VRG_FFI          148    // 1 while a foreign call runs on this core (rt_ffi.S): a fault is :foreign_fault
 
 // ---------------------------------------------------------------------------------------------
 // Macros
@@ -3108,7 +3109,19 @@ silica_rt_actor_fault_hook:
     bne     a8, a9, 3f
     SCHED_UNLOCK a8, a9
     j       8f
-3:  movi    a7, 1006
+    // A fault raised while the actor's foreign call was running (rt_ffi.S silica_rt_ffi_call keeps this
+    // core's VRG_FFI word at 1 for the call) is the C code's, whatever the cause -- a bad address, an
+    // illegal instruction, a division by zero, a C stack overflow into the FFI chunk's guard band: the
+    // actor ends with failure_reason :foreign_fault, tag 5, as the hosted guarded region ends it
+    // (porting_for_os_free_targets.md §9.1 rule 2). The word is cleared here: the context is abandoned.
+3:  rur     a7, threadptr
+    l32i    a8, a7, VRG_FFI
+    beqz    a8, 4f
+    movi    a8, 0
+    s32i    a8, a7, VRG_FFI
+    movi    a8, 5
+    j       1f
+4:  movi    a7, 1006
     movi    a8, 3
     bne     a5, a7, 1f
     movi    a8, 4

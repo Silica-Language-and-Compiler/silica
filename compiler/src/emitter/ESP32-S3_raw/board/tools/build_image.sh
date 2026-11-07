@@ -23,7 +23,12 @@
 #    trial driver prepares the cache once per run with --prepare, before any parallel use.
 # -q prints nothing on success (the section sizes and the image path are otherwise printed).
 #
-# Sources are .S/.s hand-written assembly or .sams emitted by an ESP32-S3_raw silica-compiler.
+# Sources are .S/.s hand-written assembly, .sams emitted by an ESP32-S3_raw silica-compiler, .c files
+# (foreign-call wrappers, spec §20.4: compiled freestanding by the same toolchain's GCC, no C library
+# in the image beyond the memory functions of board/runtime/rt_ffi.S; BOARD_CFLAGS adds flags), and
+# prebuilt .o objects and .a archives for this triple (an archive built with xtensa-esp32s3-elf-ar
+# rcs; archives are placed after every object on the link line). BOARD_FFI_STACK=N sets the machine
+# stack a foreign call runs on (the link's _silica_ffi_stack_size; 4 KB when unset).
 # Produces <name>.elf, <name>.map, <name>.bin (flash at offset 0x0 with flash_image.sh) and
 # <name>.stack, the sizes chosen for main's two stacks. Actor stacks are chunks grown at run time
 # (actor_memory_budget_plan.md item F) and need nothing from the build.
@@ -76,8 +81,14 @@ fi
 # --auto-litpools is NOT used: literals go to .literal sections, which the link script puts in
 # front of .text (L32R only reaches backwards, 256 KB).
 ASFLAGS="-c -mlongcalls"
+# C wrappers: freestanding (no C library is linked; rt_ffi.S provides memcpy/memmove/memset/memcmp/
+# strlen), one section per function so --gc-sections keeps only what the program calls, literals in
+# .literal sections as for the runtime. A wrapper's own directory is on the include path.
+CFLAGS="-c -mlongcalls -Os -ffreestanding -ffunction-sections -fdata-sections -Wall -Wextra ${BOARD_CFLAGS:-}"
+ffi_defsym=""
+[ -n "${BOARD_FFI_STACK:-}" ] && ffi_defsym="-Wl,--defsym,_silica_ffi_stack_req=$BOARD_FFI_STACK"
 
-RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_board.S rt_device.S rt_string.S rt_list.S rt_float.S rt_ordering.S rt_actors.S rt_supervisors.S"
+RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_board.S rt_device.S rt_string.S rt_list.S rt_float.S rt_ordering.S rt_actors.S rt_supervisors.S rt_ffi.S"
 
 # Runtime objects: from the cache (assembled only when missing or older than the source; written
 # to a temporary name and renamed, so a concurrent reader never sees a partial object), or fresh.
@@ -108,20 +119,24 @@ if [ -z "$rtcache" ]; then
         objs="$objs $obj"
     done
 fi
+libs=""
 for src in "$@"; do
     n=$((n + 1))
     base=$(basename "$src")
     obj="$objdir/$n.${base%.*}.o"
     case "$src" in
         *.sams) "$CC" $ASFLAGS -x assembler "$src" -o "$obj" ;;
+        *.c)    "$CC" $CFLAGS -I"$(dirname "$src")" "$src" -o "$obj" ;;
+        *.o)    obj=$src ;;
+        *.a)    libs="$libs $src"; continue ;;
         *)      "$CC" $ASFLAGS "$src" -o "$obj" ;;
     esac
     objs="$objs $obj"
 done
 
 link() {   # the --defsym options must precede -T: the script tests DEFINED() on them
-    "$CC" -nostdlib -nostartfiles -Wl,--gc-sections "$@" -Wl,-T,"$RT/silica_esp32s3.ld" \
-        -Wl,-Map,"$out.map" -o "$out.elf" $objs -lgcc
+    "$CC" -nostdlib -nostartfiles -Wl,--gc-sections $ffi_defsym "$@" -Wl,-T,"$RT/silica_esp32s3.ld" \
+        -Wl,-Map,"$out.map" -o "$out.elf" $objs $libs -lgcc
 }
 
 # Pass 1: small main stacks, only to measure. Pass 2: main's stacks and the runtime reserve from

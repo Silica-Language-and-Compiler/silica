@@ -6,6 +6,7 @@
 | ------ | -------- | ---------------------- |
 | `host` | `binaries/silica-compiler` | this Mac (what `make integrate` always did) |
 | `ESP32-S3_raw` | `binaries/silica-compiler-ESP32-S3_raw` | an ESP32-S3 board on USB, bare metal |
+| `STM32-L476RG_raw` | `binaries/silica-compiler-STM32-L476RG_raw` | an ST NUCLEO-L476RG over its ST-LINK, bare metal (see below) |
 
 A board target is defined by `<target>.conf` in this directory. The software each target needs is
 listed in [docs/required-software.md](../../docs/required-software.md).
@@ -107,6 +108,36 @@ reason (`target:` the board cannot run it; `driver:` the board driver does not h
 layout yet). Subdirectories with their own Makefile (the multi-file trials under
 error_enforcement_addition) are skipped automatically. Skips are reported, never counted as passes.
 
+## Target STM32-L476RG_raw (ST NUCLEO-L476RG)
+
+```
+make integrate TRIAL_TARGET=STM32-L476RG_raw TRIAL_SUITES=base      # stage 1: base only
+bash trials/targets/run_one_trial.sh STM32-L476RG_raw base test     # one trial, same code path
+```
+
+- Prerequisites: Homebrew `openocd`, `stlink` (`st-info`) and `arm-none-eabi-gcc` (which brings
+  `arm-none-eabi-nm`), plus a Python with pyserial (the ESP-IDF environment, as for the ESP32).
+  The preflight checks them, then `st-info --probe` must show exactly one ST-LINK (serial
+  `066CFF343654393143174720`, or `BOARD_ST_SERIAL`); the probe line is `port chip serial`.
+- Port: `BOARD_PORT`, else `/dev/cu.usbmodem21103` when it exists, else the single `/dev/cu.usbmodem*`.
+  `/dev/cu.usbserial*` (the ESP32 board) is never a candidate, and `run_on_board.py` refuses it even
+  when named, so a stale `BOARD_PORT` meant for the ESP32 stops the run instead of reaching that board.
+- RAM only: `board/tools/run_on_board.py` opens the console, then runs OpenOCD (`reset halt`,
+  `load_image <elf>`, the wall clock `mww`, `resume <_start>`, `shutdown`). Nothing is written to flash.
+  Images are `.elf` (`TARGET_IMAGE_EXT=elf` in the conf; the ESP32 uses `.bin`).
+- Assembly goldens are `<trial>.st_nucleo.ascomp` (the `TARGET_ASCOMP_PLATFORM` of the conf, and the
+  `silica_golden_name_for_target` row of `project_makefiles/platform/platforms.mk`, which
+  `trials/silica_compiler.mk` uses for `ASCOMP_EXT`). They do not exist until `gen_board_ascomp.sh
+  STM32-L476RG_raw` writes them after a green run; before that every trial also reports
+  "has no .st_nucleo.ascomp file". `BOARD_ASCOMP=off` (or `run_one_trial.sh --no-ascomp`) compares output only.
+- [STM32-L476RG_raw.skip](STM32-L476RG_raw.skip) skips every suite but `base` for now (the runtime has no
+  message copier, call, failure reports yet); delete a suite's line to widen the run.
+
+`run_one_trial.sh <target> <suite> <stem>` runs one program or compile-failure trial through
+`board_suite.sh` (`BOARD_ONLY_STEM`), prints the diff on a mismatch, keeps its work area (`--work <dir>`
+or a new directory under `$TMPDIR`) and works for both board targets. It refuses to start while a
+`make integrate` run holds the trial lock.
+
 ## Settings
 
 | Variable | Default | Meaning |
@@ -114,9 +145,11 @@ error_enforcement_addition) are skipped automatically. Skips are reported, never
 | `TRIAL_TARGET` | ask, or `host` | `host`, a board target, or `both` |
 | `TRIAL_SUITES` | every suite | limit a tree run (host or board) to these suites, e.g. `make integrate TRIAL_TARGET=host TRIAL_SUITES="actors_addition base"`; a name that is not a suite is an error, and a named suite runs even if it has `INTEGRATE_PENDING` (whole-tree runs skip those). On the host the report and failure list cover only the named suites |
 | `BOARD_PORT` | the single USB serial port | the board's serial port |
-| `BOARD_MAC` | (none) | refuse any board with another MAC |
+| `BOARD_MAC` | (none) | refuse any board with another MAC (ESP32; the STM32 driver ignores it) |
+| `BOARD_ST_SERIAL` | the lab Nucleo's | STM32 target: the ST-LINK serial `--probe` must find |
+| `BOARD_ASCOMP` | (on) | `off`: skip the `<trial>.<platform>.ascomp` check |
 | `BOARD_SILICA_COMPILER` | `binaries/silica-compiler-<target>` | the board compiler |
-| `BOARD_PYTHON` | from `<target>.conf` | Python with esptool and pyserial |
+| `BOARD_PYTHON` | from `<target>.conf` | Python with esptool and pyserial (pyserial only for the STM32) |
 | `BOARD_TRIAL_TIMEOUT` | 300 | seconds a program may run on the board before it counts as hung |
 | `BOARD_FAIL_JOBS` | 4 | compile-failure trials compiled at once |
 
@@ -127,4 +160,5 @@ error_enforcement_addition) are skipped automatically. Skips are reported, never
 | [trial_target.sh](trial_target.sh) | the lock, the menu, the preflight checks, and the board run |
 | [board_root.mk](board_root.mk), [board_suite.mk](board_suite.mk) | the board run's top level and one suite, on top of the shared integrate wrapper (`../silica_compiler.mk`): same progress line, watchdog, logs and report as a host run |
 | [board_suite.sh](board_suite.sh) | one suite on the board |
+| [run_one_trial.sh](run_one_trial.sh) | one trial on the board, through board_suite.sh |
 | `<target>.conf`, `<target>.skip` | a board target and what it skips |

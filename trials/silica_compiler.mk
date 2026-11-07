@@ -71,7 +71,7 @@ SILICA_CROSS_NOTE := emit target $(SILICA_EMIT_TARGET) is not this host ($(SILIC
 # target keeps its own: the plain .ascomp is the original macOS (Darwin) golden, and every other
 # target's golden carries the target name, <stem>.<target>.ascomp, beside it. Recording a golden
 # writes the same name, so one checkout serves every target it has goldens for.
-ASCOMP_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),.ascomp,.$(SILICA_EMIT_TARGET).ascomp)
+ASCOMP_EXT := $(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),.ascomp,.$(call silica_golden_name_for_target,$(SILICA_EMIT_TARGET)).ascomp)
 
 # The error golden a trial is compared against: <stem>.<target>.golden_fail when it exists, else the
 # plain <stem>.golden_fail (the macOS golden). GOLDEN_FAIL_EXT is empty on the Mac.

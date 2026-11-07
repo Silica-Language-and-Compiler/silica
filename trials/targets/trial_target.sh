@@ -164,10 +164,12 @@ cmd_choose() {
     done
 }
 
-# Board port: $BOARD_PORT, else the single candidate; with several, ask (terminal) or fail.
+# Board port: $BOARD_PORT, else the target's TARGET_PORT_DEFAULT when that exists, else the single
+# candidate; with several, ask (terminal) or fail. $3 is TARGET_PORT_DEFAULT (may be empty).
 choose_port() {
-    local py=$1 runner=$2 ports=() p i answer
+    local py=$1 runner=$2 default=${3:-} ports=() p i answer
     if [ -n "${BOARD_PORT:-}" ]; then echo "$BOARD_PORT"; return 0; fi
+    if [ -n "$default" ] && [ -e "$default" ]; then echo "$default"; return 0; fi
     while IFS= read -r p; do [ -n "$p" ] && ports+=("$p"); done < <("$py" "$runner" --list-ports)
     if [ "${#ports[@]}" -eq 0 ]; then
         die "no board found: no USB serial port. Is the board plugged in and switched on? (Or set BOARD_PORT.)"
@@ -221,7 +223,8 @@ run_board() {
     local target=$1 dir=$2 make=$3
     local conf="$here/$target.conf"
     [ -f "$conf" ] || die "unknown trial target '$target' (defined: host $(board_targets | tr '\n' ' '))"
-    TARGET_DESCRIPTION=""; TARGET_BOARD_DIR=""; TARGET_PYTHON=""
+    TARGET_DESCRIPTION=""; TARGET_BOARD_DIR=""; TARGET_PYTHON=""; TARGET_ASCOMP_PLATFORM=""
+    TARGET_IMAGE_EXT="bin"; TARGET_PORT_DEFAULT=""; TARGET_PY_MODULES="esptool serial"; TARGET_TOOLS=""
     # shellcheck disable=SC1090
     . "$conf"
     local board_dir="$repo_root/$TARGET_BOARD_DIR"
@@ -235,22 +238,26 @@ run_board() {
     [ -x "$compiler" ] || die "missing $compiler.
    Build and publish it: cd compiler/src && make TARGET=$target
    (or point BOARD_SILICA_COMPILER at a built compiler)."
-    [ -x "$py" ] || die "no Python with esptool at $py (the ESP-IDF Python environment; see $reqs, or set BOARD_PYTHON)."
-    "$py" -c 'import esptool, serial' 2>/dev/null || die "$py cannot import esptool and pyserial (see $reqs)."
+    [ -x "$py" ] || die "no Python with ${TARGET_PY_MODULES// / and } at $py (see $reqs, or set BOARD_PYTHON)."
+    "$py" -c "import ${TARGET_PY_MODULES// /, }" 2>/dev/null || die "$py cannot import ${TARGET_PY_MODULES// / and } (see $reqs)."
+    local tool
+    for tool in $TARGET_TOOLS; do
+        command -v "$tool" > /dev/null 2>&1 || die "$tool not found on PATH (needed by trial target $target; see $reqs)."
+    done
     [ -f "$tools/run_on_board.py" ] && [ -f "$tools/build_image.sh" ] || die "board tools missing under $tools"
 
     local suites=() s
     while IFS= read -r s; do [ -n "$s" ] && suites+=("$s"); done < <(suites_of "$dir")
 
     local port probe
-    port=$(choose_port "$py" "$tools/run_on_board.py") || exit 1
+    port=$(choose_port "$py" "$tools/run_on_board.py" "$TARGET_PORT_DEFAULT") || exit 1
     probe=$("$py" "$tools/run_on_board.py" --probe --port "$port" ${BOARD_MAC:+--expect-mac "$BOARD_MAC"} 2>&1) \
         || die "board check failed: ${probe#run_on_board: }"
 
     rm -rf "$mirror"
     mkdir -p "$mirror"
     sh "$tools/build_image.sh" -r "$mirror/.rt" --prepare > "$mirror/.rt.log" 2>&1 \
-        || die "cannot assemble the board runtime (is the Xtensa toolchain installed? see $reqs):
+        || die "cannot assemble the board runtime (is the target's toolchain installed? see $reqs):
 $(head -5 "$mirror/.rt.log")"
 
     # --- skip list: whole suites and single trials ---
@@ -305,8 +312,12 @@ $(head -5 "$mirror/.rt.log")"
         printf '  A board run of the whole tree takes hours; the host is kept awake while it runs (where caffeinate or systemd-inhibit exists).\n'
     fi
 
+    # BOARD_ASCOMP=off: output only, no assembly-golden check (a target whose .ascomp goldens are not written yet)
+    local ascomp_platform="$TARGET_ASCOMP_PLATFORM"
+    [ "${BOARD_ASCOMP:-}" != off ] || ascomp_platform=""
     export TRIAL_TARGET="$target" BOARD_PORT="$port" BOARD_SILICA_COMPILER="$compiler" BOARD_PYTHON="$py" \
-        BOARD_TOOLS="$tools" BOARD_RT_CACHE="$mirror/.rt" TRIALS_ROOT="$trials_root"
+        BOARD_TOOLS="$tools" BOARD_RT_CACHE="$mirror/.rt" TRIALS_ROOT="$trials_root" \
+        BOARD_ASCOMP_PLATFORM="$ascomp_platform" BOARD_IMAGE_EXT="$TARGET_IMAGE_EXT"
     # TRIAL_TARGET goes on the command line: a TRIAL_TARGET given to the user's make is passed down
     # in MAKEFLAGS and would override both the environment and the generated makefile.
     local st
