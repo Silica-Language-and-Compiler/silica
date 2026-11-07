@@ -1,0 +1,702 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The BEAM External Term Format, the language's first wire protocol (transport_serialization_design.md
+// §4.7): the `(:etf)` implementation of WireFormat, built in, called by the compiler-derived
+// encode / decode walk. Encoding is term_to_binary/1 as OTP 26 and later write it, no options
+// (the newest tag of every family, map keys in name order); decoding accepts what
+// binary_to_term/1 produces for the same values, older atom tags included. Integers wider than
+// 64 bits, compressed terms, atom cache references, bit binaries, funs, ports and references are
+// `:unsupported`. Every decoder reads at a cursor and never reads past the frame: a short frame is
+// `:truncated`.
+//
+// Tags (erl_ext_dist): 131 version, 70 NEW_FLOAT_EXT, 97 SMALL_INTEGER_EXT, 98 INTEGER_EXT,
+// 100 ATOM_EXT, 104 SMALL_TUPLE_EXT, 105 LARGE_TUPLE_EXT, 106 NIL_EXT, 107 STRING_EXT,
+// 108 LIST_EXT, 109 BINARY_EXT, 110 SMALL_BIG_EXT, 111 LARGE_BIG_EXT, 115 SMALL_ATOM_EXT,
+// 116 MAP_EXT, 118 ATOM_UTF8_EXT, 119 SMALL_ATOM_UTF8_EXT.
+
+export term_prefix/0;
+export enc_unit/0;
+export enc_boolean/1;
+export enc_int64/1;
+export enc_uint64/1;
+export enc_float64/1;
+export enc_string/1;
+export enc_atom/1;
+export enc_atom_name/1;
+export enc_actor_ref/1;
+export tuple_header/1;
+export list_header/1;
+export list_tail/1;
+export map_header/1;
+export enc_key/1;
+export dec_prefix/2;
+export dec_int64/2;
+export dec_uint64/2;
+export dec_float64/2;
+export dec_boolean/2;
+export dec_unit/2;
+export dec_string/3;
+export dec_atom_name/2;
+export dec_actor_ref/2;
+export dec_tag/3;
+export dec_tuple_arity/2;
+export dec_list_length/2;
+export dec_list_tail/2;
+export dec_map_size/2;
+export dec_key/3;
+export peek_kind/2;
+export dec_end/2;
+
+// ---- fragments -------------------------------------------------------------------------------------
+
+fn b1(a: int64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [a];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn b2(a: int64, b: int64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [a, b];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn b3(a: int64, b: int64, c: int64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [a, b, c];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn byte_of(u: uint64, shift: int64) -> int64 {
+    mask: uint64 <- 255;
+    m: uint64 <- (u shr shift) band mask;
+    to_int64(m)
+}
+
+// tag, then the low 32 bits of u, big-endian.
+fn be32(tag: int64, u: uint64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [tag, byte_of(u, 24), byte_of(u, 16), byte_of(u, 8), byte_of(u, 0)];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+// tag, then the 64 bits of u, big-endian.
+fn be64(tag: int64, u: uint64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [tag, byte_of(u, 56), byte_of(u, 48), byte_of(u, 40), byte_of(u, 32), byte_of(u, 24), byte_of(u, 16), byte_of(u, 8), byte_of(u, 0)];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn join2(a: string, b: string) -> string {
+    sequence proc[mem(normal)]
+        xs: List[string, mem(normal)] <- [a, b];
+        out: string <- join_bytes(xs)
+    produces
+        pure out
+    end
+}
+
+fn term_prefix() -> string {
+    b1(131)
+}
+
+fn enc_unit() -> string {
+    b2(104, 0)
+}
+
+fn enc_atom_name(name: string) -> string {
+    n: int64 <- length_bytes(name);
+    hdr: string <- case n <= 255 of {
+        true -> b2(119, n);
+        false -> b3(118, n / 256, n % 256)
+    };
+    join2(hdr, name)
+}
+
+fn enc_atom(v: atom) -> string {
+    enc_atom_name(atom_name(v))
+}
+
+fn enc_key(name: string) -> string {
+    enc_atom_name(name)
+}
+
+// An actor reference (specification §15.1.4): NEW_PID_EXT (88) with this program's node name and
+// creation (design §12 decision 10: nonode@nohost, 0), id = the child number (low 32 bits of the
+// identity word), serial = the position (high 32 bits).
+fn node_name() -> string {
+    "nonode@nohost"
+}
+
+fn enc_actor_ref(w: int64) -> string {
+    u: uint64 <- to_uint64(w);
+    mask: uint64 <- 4294967295;
+    id: uint64 <- u band mask;
+    serial: uint64 <- u shr 32;
+    zero: uint64 <- 0;
+    join2(join2(b1(88), enc_atom_name(node_name())), join2(join2(be32_raw(id), be32_raw(serial)), be32_raw(zero)))
+}
+
+fn be32_raw(u: uint64) -> string {
+    sequence proc[mem(normal)]
+        xs: List[int64, mem(normal)] <- [byte_of(u, 24), byte_of(u, 16), byte_of(u, 8), byte_of(u, 0)];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+
+fn enc_boolean(v: boolean) -> string {
+    case v of {
+        true -> enc_atom_name("true");
+        false -> enc_atom_name("false")
+    }
+}
+
+// The number of bytes in the magnitude m (at least 1).
+fn digit_count(m: uint64, acc: int64) -> int64 {
+    zero: uint64 <- 0;
+    case m == zero of {
+        true -> case acc == 0 of { true -> 1; false -> acc };
+        false -> digit_count(m shr 8, acc + 1)
+    }
+}
+
+// The little-endian digits d(i) .. d(0) of m prepended onto acc.
+fn digits_from(m: uint64, i: int64, acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    case i < 0 of {
+        true -> acc;
+        false -> {
+            sequence proc[mem(normal)]
+                acc2: List[int64, mem(normal)] <- prepend[int64, mem(normal)](byte_of(m, 8 * i), acc)
+            produces
+                pure digits_from(m, i - 1, acc2)
+            end
+        }
+    }
+}
+
+// SMALL_BIG_EXT of a magnitude and sign (0 positive, 1 negative): 110, n, sign, n digits.
+fn small_big(sign: int64, m: uint64) -> string {
+    sequence proc[mem(normal)]
+        n: int64 <- digit_count(m, 0);
+        none: List[int64, mem(normal)] <- empty[int64, mem(normal)]();
+        digits: List[int64, mem(normal)] <- digits_from(m, n - 1, none);
+        with_sign: List[int64, mem(normal)] <- prepend[int64, mem(normal)](sign, digits);
+        with_n: List[int64, mem(normal)] <- prepend[int64, mem(normal)](n, with_sign);
+        xs: List[int64, mem(normal)] <- prepend[int64, mem(normal)](110, with_n);
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn enc_int64(v: int64) -> string {
+    case v >= 0 and v <= 255 of {
+        true -> b2(97, v);
+        false -> case v >= -2147483648 and v <= 2147483647 of {
+            true -> be32(98, to_uint64(v));
+            false -> case v < 0 of {
+                true -> {
+                    neg: int64 <- 0 - v;
+                    small_big(1, to_uint64(neg))
+                };
+                false -> small_big(0, to_uint64(v))
+            }
+        }
+    }
+}
+
+// Integers are written in the smallest ETF form that holds them (§4.3 of the design).
+fn enc_uint64(v: uint64) -> string {
+    small_max: uint64 <- 255;
+    int_max: uint64 <- 2147483647;
+    case v <= small_max of {
+        true -> b2(97, to_int64(v));
+        false -> case v <= int_max of {
+            true -> be32(98, v);
+            false -> small_big(0, v)
+        }
+    }
+}
+
+fn enc_float64(v: float64) -> string {
+    bits: int64 <- float64_bits(v);
+    be64(70, to_uint64(bits))
+}
+
+fn enc_string(v: string) -> string {
+    n: int64 <- length_bytes(v);
+    join2(be32(109, to_uint64(n)), v)
+}
+
+fn tuple_header(arity: int64) -> string {
+    case arity <= 255 of {
+        true -> b2(104, arity);
+        false -> be32(105, to_uint64(arity))
+    }
+}
+
+fn list_header(n: int64) -> string {
+    case n == 0 of {
+        true -> b1(106);
+        false -> be32(108, to_uint64(n))
+    }
+}
+
+fn list_tail(n: int64) -> string {
+    case n == 0 of {
+        true -> "";
+        false -> b1(106)
+    }
+}
+
+fn map_header(n: int64) -> string {
+    be32(116, to_uint64(n))
+}
+
+// ---- cursor decoders --------------------------------------------------------------------------------
+
+// The byte at pos as an int64 through a function the type checker can infer the type of in a case
+// scrutinee or an arithmetic operand (a builtin call there is not inferred).
+fn tag_at(bs: string, pos: int64) -> int64 {
+    byte_at(bs, pos)
+}
+
+fn have(bs: string, pos: int64, n: int64) -> boolean {
+    pos >= 0 and pos + n <= length_bytes(bs)
+}
+
+fn u32be(bs: string, pos: int64) -> int64 {
+    tag_at(bs, pos) * 16777216 + tag_at(bs, pos + 1) * 65536 + tag_at(bs, pos + 2) * 256 + tag_at(bs, pos + 3)
+}
+
+fn i32be(bs: string, pos: int64) -> int64 {
+    u: int64 <- u32be(bs, pos);
+    case u >= 2147483648 of {
+        true -> u - 4294967296;
+        false -> u
+    }
+}
+
+fn u64be(bs: string, pos: int64, i: int64, acc: uint64) -> uint64 {
+    case i >= 8 of {
+        true -> acc;
+        false -> {
+            b: int64 <- tag_at(bs, pos + i);
+            u64be(bs, pos, i + 1, (acc shl 8) bor to_uint64(b))
+        }
+    }
+}
+
+// The little-endian magnitude of n digit bytes at pos.
+fn big_mag(bs: string, pos: int64, i: int64, n: int64, acc: uint64) -> uint64 {
+    case i >= n of {
+        true -> acc;
+        false -> {
+            b: int64 <- tag_at(bs, pos + i);
+            big_mag(bs, pos, i + 1, n, acc bor (to_uint64(b) shl (8 * i)))
+        }
+    }
+}
+
+fn fits_int64(m: uint64) -> boolean {
+    zero: uint64 <- 0;
+    (m shr 63) == zero
+}
+
+fn fits_negative_int64(m: uint64) -> boolean {
+    one: uint64 <- 1;
+    fits_int64(m) or m == (one shl 63)
+}
+
+fn dec_prefix(bs: string, pos: int64) -> (:ok, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) == 131 of {
+            true -> (:ok, pos + 1);
+            false -> (:rejected, :bad_version)
+        }
+    }
+}
+
+fn dec_small_big_int64(bs: string, pos: int64) -> (:ok, int64, int64) | (:rejected, atom) {
+    case have(bs, pos, 3) of {
+        false -> (:rejected, :truncated);
+        true -> {
+            n: int64 <- tag_at(bs, pos + 1);
+            sign: int64 <- tag_at(bs, pos + 2);
+            case n > 8 of {
+                true -> (:rejected, :unsupported);
+                false -> case have(bs, pos, 3 + n) of {
+                    false -> (:rejected, :truncated);
+                    true -> {
+                        zero: uint64 <- 0;
+                        m: uint64 <- big_mag(bs, pos + 3, 0, n, zero);
+                        case sign == 0 of {
+                            true -> case fits_int64(m) of {
+                                true -> (:ok, to_int64(m), pos + 3 + n);
+                                false -> (:rejected, :out_of_range)
+                            };
+                            false -> case fits_negative_int64(m) of {
+                                true -> (:ok, 0 - to_int64(m), pos + 3 + n);
+                                false -> (:rejected, :out_of_range)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn dec_int64(bs: string, pos: int64) -> (:ok, int64, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) of {
+            97 -> case have(bs, pos, 2) of {
+                true -> (:ok, tag_at(bs, pos + 1), pos + 2);
+                false -> (:rejected, :truncated)
+            };
+            98 -> case have(bs, pos, 5) of {
+                true -> (:ok, i32be(bs, pos + 1), pos + 5);
+                false -> (:rejected, :truncated)
+            };
+            110 -> dec_small_big_int64(bs, pos);
+            111 -> (:rejected, :unsupported);
+            _: int64 -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_uint64(bs: string, pos: int64) -> (:ok, uint64, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) of {
+            97 -> case have(bs, pos, 2) of {
+                true -> {
+                    b: int64 <- tag_at(bs, pos + 1);
+                    (:ok, to_uint64(b), pos + 2)
+                };
+                false -> (:rejected, :truncated)
+            };
+            98 -> case have(bs, pos, 5) of {
+                false -> (:rejected, :truncated);
+                true -> {
+                    w: int64 <- i32be(bs, pos + 1);
+                    case w < 0 of {
+                        true -> (:rejected, :out_of_range);
+                        false -> (:ok, to_uint64(w), pos + 5)
+                    }
+                }
+            };
+            110 -> case have(bs, pos, 3) of {
+                false -> (:rejected, :truncated);
+                true -> {
+                    n: int64 <- tag_at(bs, pos + 1);
+                    sign: int64 <- tag_at(bs, pos + 2);
+                    case n > 8 of {
+                        true -> (:rejected, :unsupported);
+                        false -> case sign != 0 of {
+                            true -> (:rejected, :out_of_range);
+                            false -> case have(bs, pos, 3 + n) of {
+                                false -> (:rejected, :truncated);
+                                true -> {
+                                    zero: uint64 <- 0;
+                                    (:ok, big_mag(bs, pos + 3, 0, n, zero), pos + 3 + n)
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            111 -> (:rejected, :unsupported);
+            _: int64 -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_float64(bs: string, pos: int64) -> (:ok, float64, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) of {
+            70 -> case have(bs, pos, 9) of {
+                false -> (:rejected, :truncated);
+                true -> {
+                    zero: uint64 <- 0;
+                    u: uint64 <- u64be(bs, pos + 1, 0, zero);
+                    (:ok, float64_of_bits(to_int64(u)), pos + 9)
+                }
+            };
+            99 -> (:rejected, :unsupported);
+            _: int64 -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_atom_name(bs: string, pos: int64) -> (:ok, string, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> {
+            tag: int64 <- tag_at(bs, pos);
+            case tag == 119 or tag == 115 of {
+                true -> case have(bs, pos, 2) of {
+                    false -> (:rejected, :truncated);
+                    true -> {
+                        n: int64 <- tag_at(bs, pos + 1);
+                        case have(bs, pos, 2 + n) of {
+                            false -> (:rejected, :truncated);
+                            true -> (:ok, byte_slice(bs, pos + 2, pos + 2 + n), pos + 2 + n)
+                        }
+                    }
+                };
+                false -> case tag == 118 or tag == 100 of {
+                    true -> case have(bs, pos, 3) of {
+                        false -> (:rejected, :truncated);
+                        true -> {
+                            n: int64 <- tag_at(bs, pos + 1) * 256 + tag_at(bs, pos + 2);
+                            case have(bs, pos, 3 + n) of {
+                                false -> (:rejected, :truncated);
+                                true -> (:ok, byte_slice(bs, pos + 3, pos + 3 + n), pos + 3 + n)
+                            }
+                        }
+                    };
+                    false -> (:rejected, :bad_tag)
+                }
+            }
+        }
+    }
+}
+
+fn dec_boolean(bs: string, pos: int64) -> (:ok, boolean, int64) | (:rejected, atom) {
+    case dec_atom_name(bs, pos) of {
+        (:rejected, r: atom) -> (:rejected, r);
+        (:ok, nm: string, p: int64) -> case nm == "true" of {
+            true -> (:ok, true, p);
+            false -> case nm == "false" of {
+                true -> (:ok, false, p);
+                false -> (:rejected, :bad_tag)
+            }
+        }
+    }
+}
+
+fn dec_unit(bs: string, pos: int64) -> (:ok, int64) | (:rejected, atom) {
+    case have(bs, pos, 2) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) == 104 and tag_at(bs, pos + 1) == 0 of {
+            true -> (:ok, pos + 2);
+            false -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_string(bs: string, pos: int64, max_len: int64) -> (:ok, string, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) of {
+            109 -> case have(bs, pos, 5) of {
+                false -> (:rejected, :truncated);
+                true -> {
+                    n: int64 <- u32be(bs, pos + 1);
+                    case n > max_len of {
+                        true -> (:rejected, :too_long);
+                        false -> case have(bs, pos, 5 + n) of {
+                            false -> (:rejected, :truncated);
+                            true -> (:ok, byte_slice(bs, pos + 5, pos + 5 + n), pos + 5 + n)
+                        }
+                    }
+                }
+            };
+            107 -> case have(bs, pos, 3) of {
+                false -> (:rejected, :truncated);
+                true -> {
+                    n: int64 <- tag_at(bs, pos + 1) * 256 + tag_at(bs, pos + 2);
+                    case n > max_len of {
+                        true -> (:rejected, :too_long);
+                        false -> case have(bs, pos, 3 + n) of {
+                            false -> (:rejected, :truncated);
+                            true -> (:ok, byte_slice(bs, pos + 3, pos + 3 + n), pos + 3 + n)
+                        }
+                    }
+                }
+            };
+            106 -> (:ok, "", pos + 1);
+            _: int64 -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_tag(bs: string, pos: int64, name: string) -> (:ok, int64) | (:rejected, atom) {
+    case dec_atom_name(bs, pos) of {
+        (:rejected, r: atom) -> (:rejected, r);
+        (:ok, nm: string, p: int64) -> case nm == name of {
+            true -> (:ok, p);
+            false -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_key(bs: string, pos: int64, name: string) -> (:ok, int64) | (:rejected, atom) {
+    case dec_atom_name(bs, pos) of {
+        (:rejected, r: atom) -> (:rejected, r);
+        (:ok, nm: string, p: int64) -> case nm == name of {
+            true -> (:ok, p);
+            false -> (:rejected, :unknown_field)
+        }
+    }
+}
+
+fn dec_tuple_arity(bs: string, pos: int64) -> (:ok, int64, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) of {
+            104 -> case have(bs, pos, 2) of {
+                true -> (:ok, tag_at(bs, pos + 1), pos + 2);
+                false -> (:rejected, :truncated)
+            };
+            105 -> case have(bs, pos, 5) of {
+                true -> (:ok, u32be(bs, pos + 1), pos + 5);
+                false -> (:rejected, :truncated)
+            };
+            _: int64 -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_list_length(bs: string, pos: int64) -> (:ok, int64, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) of {
+            106 -> (:ok, 0, pos + 1);
+            108 -> case have(bs, pos, 5) of {
+                true -> (:ok, u32be(bs, pos + 1), pos + 5);
+                false -> (:rejected, :truncated)
+            };
+            107 -> (:rejected, :unsupported);
+            _: int64 -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_list_tail(bs: string, pos: int64) -> (:ok, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) == 106 of {
+            true -> (:ok, pos + 1);
+            false -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+fn dec_map_size(bs: string, pos: int64) -> (:ok, int64, int64) | (:rejected, atom) {
+    case have(bs, pos, 5) of {
+        false -> (:rejected, :truncated);
+        true -> case tag_at(bs, pos) == 116 of {
+            true -> (:ok, u32be(bs, pos + 1), pos + 5);
+            false -> (:rejected, :bad_tag)
+        }
+    }
+}
+
+// NEW_PID_EXT (88): node atom, id u32, serial u32, creation u32; PID_EXT (103) carries a one-byte
+// creation. A node name or creation that is not this program's is :foreign_actor (design §4.2).
+fn dec_actor_ref(bs: string, pos: int64) -> (:ok, int64, int64) | (:rejected, atom) {
+    case have(bs, pos, 1) of {
+        false -> (:rejected, :truncated);
+        true -> {
+            tag: int64 <- tag_at(bs, pos);
+            case tag == 88 or tag == 103 of {
+                false -> (:rejected, :bad_tag);
+                true -> case dec_atom_name(bs, pos + 1) of {
+                    (:rejected, why: atom) -> (:rejected, why);
+                    (:ok, node: string, p1: int64) -> {
+                        tail: int64 <- case tag == 88 of { true -> 12; false -> 9 };
+                        case have(bs, p1, tail) of {
+                            false -> (:rejected, :truncated);
+                            true -> {
+                                id: int64 <- u32be(bs, p1);
+                                serial: int64 <- u32be(bs, p1 + 4);
+                                creation: int64 <- case tag == 88 of { true -> u32be(bs, p1 + 8); false -> tag_at(bs, p1 + 8) };
+                                case node == node_name() and creation == 0 of {
+                                    false -> (:rejected, :foreign_actor);
+                                    true -> {
+                                        hi: uint64 <- to_uint64(serial) shl 32;
+                                        w: uint64 <- hi bor to_uint64(id);
+                                        (:ok, to_int64(w), p1 + tail)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn peek_kind(bs: string, pos: int64) -> atom {
+    case have(bs, pos, 1) of {
+        false -> :bad;
+        true -> case tag_at(bs, pos) of {
+            97 -> :integer;
+            98 -> :integer;
+            110 -> :integer;
+            111 -> :integer;
+            70 -> :float;
+            99 -> :float;
+            109 -> :binary;
+            107 -> :binary;
+            106 -> :list;
+            108 -> :list;
+            104 -> :tuple;
+            105 -> :tuple;
+            116 -> :map;
+            118 -> :atom;
+            119 -> :atom;
+            100 -> :atom;
+            115 -> :atom;
+            88 -> :pid;
+            103 -> :pid;
+            _: int64 -> :bad
+        }
+    }
+}
+
+fn dec_end(bs: string, pos: int64) -> (:ok, int64) | (:rejected, atom) {
+    case pos == length_bytes(bs) of {
+        true -> (:ok, pos);
+        false -> (:rejected, :trailing_bytes)
+    }
+}

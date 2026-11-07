@@ -1,0 +1,227 @@
+# Makefile for the transport trials (transport_serialization_design.md): wire protocols and the
+# transport builtins. The built-in wire_etf module is linked into .trial_stdlib/ as Supervisor is.
+# Uses silica-compiler (Phase 2) to generate assembly, then assembles and links
+# No Rust code - only silica-compiler + assembler + linker
+#
+# silica-compiler reads silica.config and outputs .sams (assembly) files.
+# Assembler: clang -c (Rust toolchain does not ship a standalone assembler)
+# Linker: rust-lld if available, else clang
+
+THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+include $(THIS_DIR)../silica_compiler.mk
+
+# Rust toolchain linker (rust-lld) - optional override
+RUST_SYSROOT := $(shell rustc --print sysroot 2>/dev/null)
+RUST_TARGET := $(shell rustc -vV 2>/dev/null | sed -n "s/^host: *//p")
+RUST_LLD := $(RUST_SYSROOT)/lib/rustlib/$(RUST_TARGET)/bin/rust-lld
+
+# Use rust-lld if it exists, otherwise clang for linking
+LINKER := $(shell test -x "$(RUST_LLD)" && echo "$(RUST_LLD)" || echo "clang")
+ASSEMBLER := clang
+
+# macOS: linker flags for minimal executable (when using rust-lld)
+MACOS_SDK := $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
+MACOS_MIN_VERSION := 26.0
+ASFLAGS_macos := -mmacosx-version-min=$(MACOS_MIN_VERSION)
+LDFLAGS_rust-lld := -arch arm64 -platform_version macos $(MACOS_MIN_VERSION) $(MACOS_MIN_VERSION) -syslibroot $(MACOS_SDK) -lSystem -e main
+LDFLAGS_clang := -Wl,-e,main -Wl,-macos_version_min,$(MACOS_MIN_VERSION)
+
+TRIAL_DIR := $(notdir $(patsubst %/,%,$(THIS_DIR)))
+MSG_PREFIX := $(TRIAL_DIR)/
+
+
+.DEFAULT_GOAL := all
+.PHONY: all clean assembly objects executables integrate help silica.config
+
+all: executables
+
+# Stage 1: Rebuild silica.config (all *.silica under this directory, relative paths)
+silica.config:
+	@cd "$(THIS_DIR)" && find "$$PWD" -maxdepth 1 -type f -name '*.silica' | LC_ALL=C sort | sed "s|^$$PWD/||" > silica.config && $(TRIAL_SUPPORT_CONFIG) && mkdir -p .trial_stdlib && ln -sfn ../../../compiler/stdlib/wire_etf.silica .trial_stdlib/wire_etf.silica && echo .trial_stdlib/wire_etf.silica >> silica.config
+
+# Stage 2: silica-compiler generates .sams (reads silica.config)
+assembly: clean silica.config
+	@echo "Compiling with silica-compiler..."
+	@rm -f *.sams silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link __silica_runtime.sams; \
+	$(RUN_SILICA_COMPILER)
+	@echo "✅ $(MSG_PREFIX)Assembly generated"
+
+# Stage 3: Assemble .sams -> .o (no Rust code, clang assembler only)
+objects: assembly
+	@for sams in *.sams; do \
+		[ -f "$$sams" ] || continue; \
+	base=$${sams%.sams}; \
+	echo "Assembling: $$sams -> $$base.o"; \
+	$(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler $$sams -o $$base.o; \
+	done
+
+# Stage 4: Link .o -> executable (rust-lld or clang)
+executables: objects
+	@$(TRIAL_SUPPORT_ASSEMBLE); \
+	[ -f .trial_stdlib/wire_etf.sams ] && { $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler .trial_stdlib/wire_etf.sams -o .trial_stdlib/wire_etf.o || echo "❌❌ assembling wire_etf failed"; }; \
+	for o in *.o; do \
+	[ -f "$$o" ] || continue; \
+	base=$${o%.o}; \
+[ "$$base" = "__silica_runtime" ] && continue; \
+runtime_obj=""; \
+[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
+	[ -f ".trial_stdlib/wire_etf.o" ] && runtime_obj="$$runtime_obj .trial_stdlib/wire_etf.o"; \
+	if test -x "$(RUST_LLD)"; then \
+		$(RUST_LLD) -flavor darwin -o $$base $$o $$runtime_obj $(LDFLAGS_rust-lld) && echo "  ✅ $(MSG_PREFIX)$$base (rust-lld)"; \
+	else \
+		$(ASSEMBLER) $$o $$runtime_obj -o $$base $(LDFLAGS_clang) && echo "  ✅ $(MSG_PREFIX)$$base (clang)"; \
+	fi; \
+	done
+
+# integrate: compile .silica per silica.config, diff .sams vs .ascomp, run binaries, diff .sout vs .scout
+integrate-run:
+	@$(MAKE) -f "$(THIS_DIR)Makefile" clean
+	@$(MAKE) -f "$(THIS_DIR)Makefile" silica.config
+	@rm -f .integrate_counts; ok=0; ko=0; failed=0; \
+	if [ ! -s silica.config ]; then \
+		echo "❌❌ $(MSG_PREFIX)silica.config missing after generation"; \
+		$(INTEGRATE_DOT_FAIL); \
+		printf '%d %d\n' 0 1 > .integrate_counts; \
+		exit 1; \
+	fi; \
+	rm -f *.sams *.iface silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link __silica_runtime.sams; \
+	echo "Compiling with silica-compiler..."; \
+	if ! { $(call RUN_SILICA_COMPILER_ISOLATING_WITH,$(abspath $(SILICA_COMPILER))); }; then \
+		echo "❌❌ $(MSG_PREFIX)compilation failed"; \
+		$(INTEGRATE_DOT_FAIL); \
+		printf '%d %d\n' 0 1 > .integrate_counts; \
+		exit 1; \
+	fi; \
+	$(call INTEGRATE_COMPILE_REJECTS,$(MSG_PREFIX)); \
+	for sams in *.sams; do \
+		[ -f "$$sams" ] || continue; \
+		base=$${sams%.sams}; \
+	[ "$$base" = "__silica_runtime" ] && continue; \
+	[ "$$base" = "__silica_runtime" ] && continue; \
+		if [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
+			echo "❌❌ $(MSG_PREFIX)$$base has no .ascomp file"; \
+			$(INTEGRATE_DOT_FAIL); \
+			ko=$$((ko + 1)); failed=1; \
+		elif ! diff -Bw -q "$$sams" "$$base$(ASCOMP_EXT)" > /dev/null 2>&1; then \
+			echo "❌❌ $(MSG_PREFIX)$$base .sams differs from .ascomp"; \
+			$(INTEGRATE_DOT_FAIL); \
+			diff -Bw "$$sams" "$$base$(ASCOMP_EXT)" || true; \
+			ko=$$((ko + 1)); failed=1; \
+		else \
+			echo "✅✅ $(MSG_PREFIX)$$base assembly matches .ascomp"; \
+			$(INTEGRATE_DOT_OK); \
+			ok=$$((ok + 1)); \
+		fi; \
+	done; \
+	for sams in *.sams; do \
+		[ -f "$$sams" ] || continue; \
+		base=$${sams%.sams}; \
+		echo "Assembling $$sams..."; \
+		if ! $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler $$sams -o $$base.o; then \
+		echo "❌❌ $(MSG_PREFIX)$$base assemble failed"; \
+		$(INTEGRATE_DOT_FAIL); \
+		bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
+	fi; \
+	done; \
+	$(TRIAL_SUPPORT_ASSEMBLE); \
+	[ -f .trial_stdlib/wire_etf.sams ] && { $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler .trial_stdlib/wire_etf.sams -o .trial_stdlib/wire_etf.o || echo "❌❌ assembling wire_etf failed"; }; \
+	for o in *.o; do \
+		[ -f "$$o" ] || continue; \
+		base=$${o%.o}; \
+	[ "$$base" = "__silica_runtime" ] && continue; \
+	runtime_obj=""; \
+	[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
+	runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
+	[ -f ".trial_stdlib/wire_etf.o" ] && runtime_obj="$$runtime_obj .trial_stdlib/wire_etf.o"; \
+		echo "Linking $$base..."; \
+		if test -x "$(RUST_LLD)"; then \
+			if ! $(RUST_LLD) -flavor darwin -o $$base $$o $$runtime_obj $(LDFLAGS_rust-lld); then \
+			echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
+			$(INTEGRATE_DOT_FAIL); \
+			bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
+		fi; \
+		else \
+			if ! $(ASSEMBLER) $$o $$runtime_obj -o $$base $(LDFLAGS_clang); then \
+			echo "❌❌ $(MSG_PREFIX)$$base link failed"; \
+			$(INTEGRATE_DOT_FAIL); \
+			bf="$$bf $$base "; ko=$$((ko + 1)); failed=1; \
+		fi; \
+		fi; \
+	done; \
+	for exe in *.sams; do \
+		[ -f "$$exe" ] || continue; \
+		base=$${exe%.sams}; \
+	[ "$$base" = "__silica_runtime" ] && continue; \
+	[ "$$base" = "__silica_runtime" ] && continue; \
+		if [ ! -x "$$base" ]; then \
+			case "$$bf" in *" $$base "*) echo "$(MSG_PREFIX)$$base not run: assemble/link failed (reported above)";; *) \
+			echo "❌❌ $(MSG_PREFIX)$$base missing executable (assemble/link failed earlier)"; \
+			$(INTEGRATE_DOT_FAIL); \
+			ko=$$((ko + 1)); failed=1;; esac; \
+		elif [ -x "$$base" ]; then \
+			$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,./$$base); \
+			if [ "$$integrate_killed" = 1 ]; then \
+				echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
+				$(INTEGRATE_DOT_FAIL); \
+				ko=$$((ko + 1)); failed=1; continue; \
+			fi; \
+			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
+				if ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout"; \
+					$(INTEGRATE_DOT_FAIL); \
+					diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+					ko=$$((ko + 1)); failed=1; \
+				else \
+					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \
+					$(INTEGRATE_DOT_OK); \
+					ok=$$((ok + 1)); \
+				fi; \
+			else \
+				echo "❌❌ $(MSG_PREFIX)$$base has no .scout file"; \
+				$(INTEGRATE_DOT_FAIL); \
+				ko=$$((ko + 1)); failed=1; \
+			fi; \
+		fi; \
+	done; \
+	[ "$$failed" -ne 0 ] && [ "$$ko" -eq 0 ] && ko=$$((ko + 1)); \
+	if [ -d "$(THIS_DIR)app_wide_atom" ] && [ -f "$(THIS_DIR)app_wide_atom/Makefile" ]; then \
+		if $(MAKE) -C "$(THIS_DIR)app_wide_atom" integrate; then :; else failed=1; fi; \
+		sf="$(THIS_DIR)app_wide_atom/.integrate_counts"; \
+		if [ -f "$$sf" ]; then \
+			read sub_ok sub_ko < "$$sf" || true; \
+			ok=$$((ok + $${sub_ok:-0})); \
+			ko=$$((ko + $${sub_ko:-0})); \
+		fi; \
+	fi; \
+	printf '%d %d\n' "$$ok" "$$ko" > .integrate_counts; \
+	exit $$failed
+
+clean:
+	@for s in *.sams; do \
+		[ -f "$$s" ] || continue; \
+		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
+	done
+	rm -f *.sams *.o *.iface silica.config silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts
+	rm -rf .trial_stdlib
+	@echo "✅ $(MSG_PREFIX)Clean complete"
+
+help:
+	@echo "Makefile - Silica assembly build (no Rust code)"
+	@echo "=============================================="
+	@echo "Uses: silica-compiler -> .sams -> .o -> executable"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all         - Build executables (default)"
+	@echo "  assembly    - Run silica-compiler (generates .sams)"
+	@echo "  objects     - Assemble .sams to .o"
+	@echo "  executables - Full build: assembly + link"
+	@echo "  integrate   - Compile, diff .sams vs .ascomp, run, diff .sout vs .scout"
+	@echo "  clean       - Remove .sams, .o, executables"
+	@echo "  help        - Show this help"
+	@echo ""
+	@echo "Config: silica.config — top-level *.silica in this folder (subtrial app_wide_atom has its own config)"
+	@echo "Linker: $(LINKER)"
+
+# Under -j, `clean` and `silica.config` must not run side by side (clean deletes the config).
+silica.config: | clean

@@ -21,11 +21,16 @@ include $(THIS_DIR)../silica_compiler.mk
 TRIAL_DIR := $(notdir $(patsubst %/,%,$(THIS_DIR)))
 MSG_PREFIX := $(TRIAL_DIR)/
 
+# Compile-only checks over the ESP32-S3 board apps (compiler/src/emitter/ESP32-S3_raw/board/apps).
+# Device-specific trials are not run on Apple (2026-11-06); the Linux runs keep them, with their
+# own <stem>.<target>.golden_fail goldens.
+DEVICE_APP_TRIALS := device_uart_hello_trial device_discarded_peek_trial device_cast_registered_trial device_client_result_trial device_fault_lines_trial device_fault_lines_registered_trial device_gpio_button_trial device_window_param_survives_let_trial device_led_row_constant_heap_trial
+
 # Multi-file trials (subdir Makefile generates silica.config on integrate).
 SUB_TRIALS      := ffi_addition module_duplicate_name_trial module_nonexported_callee_trial module_cycle_trial unqualified_import_call_one_use_trial unqualified_import_call_two_modules_trial unqualified_import_call_no_use_trial qualified_call_module_name_case_mismatch_trial qualified_call_wrong_arg_count_trial qualified_call_too_many_args_trial qualified_call_literal_out_of_range_trial qualified_call_literal_negative_trial qualified_call_hex_literal_out_of_range_trial qualified_call_hex_literal_uint8_just_over_trial qualified_call_negative_hex_literal_int8_just_under_trial supervisor_agent_type_invalid_atom_trial supervisor_duplicate_child_id_trial standard_data_structures \
 	device_peek_missing_marker_trial device_poke_missing_marker_trial device_peek_marker_type_trial device_peek_marker_width_trial device_poke_read_only_trial device_peek_write_only_trial device_register_not_described_trial device_description_second_trial device_description_not_literal_trial device_description_duplicate_name_trial device_description_bad_width_trial device_description_misaligned_trial device_description_overlap_trial device_description_bad_access_trial device_description_empty_trial description_outside_device_module_trial device_module_uses_dangerous_trial main_uses_device_module_trial device_hosted_rejection_trial \
 	board_pack_tag_described_trial board_pack_tag_described_bad_body_trial board_pack_wrong_pack_module_trial \
-	device_uart_hello_trial device_discarded_peek_trial device_cast_registered_trial device_client_result_trial device_fault_lines_trial device_fault_lines_registered_trial device_gpio_button_trial device_window_param_survives_let_trial device_led_row_constant_heap_trial \
+	$(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,$(DEVICE_APP_TRIALS)) \
 	e2236_supervisor_without_reporter_trial e2236_supervisor_before_registration_trial e2236_helper_starts_supervisor_trial e2236_lib_start_without_reporter_trial e2236_lib_start_through_local_call_trial \
 	cast_check_supervisor_child_trial cast_check_cross_module_trial cast_check_cross_module_param_trial
 
@@ -88,6 +93,8 @@ ee-units: $(CUR_FAILS) $(SUB_TARGETS)
 	mkdir -p "$$tmpdir/dangerous_exposure_source"; \
 	ln -s "$(THIS_DIR)ffi_addition/error_app_sidecar_metadata/dangerous_exposure_source/good_retains_data_ptr.meta" "$$tmpdir/dangerous_exposure_source/good_retains_data_ptr.meta"; \
 	$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$$base.silica); \
+	if grep -q ':etf' "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/wire_etf.silica)" "$$tmpdir/wire_etf.silica" && echo wire_etf.silica >> "$$tmpdir/silica.config"; fi; \
+	for tr in WireFormat Carrier; do if grep -q "use $$tr;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/$$tr.silica)" "$$tmpdir/$$tr.silica" && echo $$tr.silica >> "$$tmpdir/silica.config"; fi; done; \
 	(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(SILICA_COMPILER)); }) > "$$base.cur_fail" 2>&1 || true; \
 	rm -rf "$$tmpdir"; \
 	if diff -q "$$base.cur_fail" "$$gf" > /dev/null 2>&1; then \

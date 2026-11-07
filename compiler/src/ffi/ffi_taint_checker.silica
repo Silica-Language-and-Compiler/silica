@@ -160,7 +160,12 @@ fn expr_is_scalar_tainted(expr: { nodes: List[{ kind: int64, value: string, name
                     false -> case node.kind == 4 of {
                         true -> case is_dangerous_qualified_call(node.name) of {
                             true -> 1;
-                            false -> expr_is_scalar_tainted_pair(parser_ast@expr_at(expr, node.inner), parser_ast@expr_at(expr, node.right_expr), scalar_env)
+                            // decode and recreate are the validators of §7.7: their (:ok, T) is structurally
+                            // pure. Outside an external_danger block a tainted input is E2406 instead.
+                            false -> case node.name == "decode" or node.name == "recreate" of {
+                                true -> 0;
+                                false -> expr_is_scalar_tainted_pair(parser_ast@expr_at(expr, node.inner), parser_ast@expr_at(expr, node.right_expr), scalar_env)
+                            }
                         };
                         false -> case node.kind == 6 of {
                             true -> expr_is_scalar_tainted(parser_ast@expr_at(expr, node.inner), scalar_env);
@@ -323,6 +328,21 @@ fn check_cast_or_call_boundary(call_expr: { nodes: List[{ kind: int64, value: st
     }
 }
 
+// The frame argument (the second) of a decode call: the chain is call.inner = arg1 and
+// call.right_expr = a nameless call node whose inner is arg2.
+fn validator_input_expr(call_expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(call_expr);
+    right_e: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- parser_ast@expr_at(call_expr, node.right_expr);
+    right_node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(right_e);
+    case node.name == "recreate" of {
+        true -> parser_ast@expr_at(call_expr, node.inner);
+        false -> case right_node.kind == 4 and right_node.name == "" of {
+            true -> parser_ast@expr_at(right_e, right_node.inner);
+            false -> right_e
+        }
+    }
+}
+
 fn walk_expr_taint_checks(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, scalar_env: List[string, mem(normal)], region_env: List[string, mem(normal)], in_external_danger: int64, is_ffi_worker: int64, restricted_seq: int64, ffi_cast_budget: int64) -> (int64, int64) {
     case expr.root < 0 of {
         true -> (0, ffi_cast_budget);
@@ -331,7 +351,9 @@ fn walk_expr_taint_checks(expr: { nodes: List[{ kind: int64, value: string, name
             case node.kind < 0 of {
                 true -> (0, ffi_cast_budget);
                 false -> case node.kind == 4 of {
-                    true -> {
+                    true -> case (node.name == "decode" or node.name == "recreate") and in_external_danger == 0 and expr_is_boundary_tainted(validator_input_expr(expr), scalar_env, region_env) == 1 of {
+                    true -> (print_taint_type_error("E2406", node.location, concat(node.name, " on external-danger-touched data is permitted only inside a sequence proc[external_danger] block or the handler that receives an FFI result cast (FFI wrapper specification §7.7, transport design §4.3)")), ffi_cast_budget);
+                    false -> {
                         msg: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 } <- cast_or_call_payload_expr(expr);
                         payload_tainted: int64 <- expr_is_boundary_tainted(msg, scalar_env, region_env);
                         allow_ffi: int64 <- case in_external_danger == 1 of {
@@ -377,6 +399,7 @@ fn walk_expr_taint_checks(expr: { nodes: List[{ kind: int64, value: string, name
                                 }
                             }
                         }
+                    }
                     };
                     false -> case node.kind == 6 of {
                         true -> {

@@ -16,19 +16,14 @@ MSG_PREFIX := $(TRIAL_DIR)/
 ARCH := arm64
 MACOS_MIN_VERSION := 26.0
 ASFLAGS := -mmacosx-version-min=$(MACOS_MIN_VERSION)
-RUST_SYSROOT := $(shell rustc --print sysroot 2>/dev/null)
-RUST_TARGET := $(shell rustc -vV 2>/dev/null | sed -n "s/^host: *//p")
-RUST_LLD := $(RUST_SYSROOT)/lib/rustlib/$(RUST_TARGET)/bin/rust-lld
-MACOS_SDK := $(shell xcrun --sdk macosx --show-sdk-path 2>/dev/null)
-LDFLAGS_rust-lld := -arch $(ARCH) -platform_version macos $(MACOS_MIN_VERSION) $(MACOS_MIN_VERSION) -syslibroot $(MACOS_SDK) -lSystem -e main
 LDFLAGS_clang := -Wl,-e,main -Wl,-macos_version_min,$(MACOS_MIN_VERSION)
 
-# Link-fail stderr shape differs between rust-lld, Apple ld (via clang) and GNU ld; match the
-# linker this host actually uses.
+# Link-fail stderr shape differs between Apple ld (via clang) and GNU ld; match the linker this
+# host uses. Apple links with clang only: rust-lld is not supported there.
 ifeq ($(shell uname -s),Linux)
   LINK_FAIL_GOLDEN_SUFFIX := .gnu-ld
 else
-  LINK_FAIL_GOLDEN_SUFFIX := $(shell test -x "$(RUST_LLD)" && echo .rust-lld || echo .clang)
+  LINK_FAIL_GOLDEN_SUFFIX := .clang
 endif
 
 FAIL_CASES := \
@@ -59,6 +54,7 @@ FAIL_CASES := \
 	error_app_cast_worker/dangerous_spawn_registered_dangerous_behavior \
 	error_app_cast_worker/dangerous_client_not_cast_only \
 	error_app_ffi_result_cast/dangerous_taint_in_produces \
+	error_app_ffi_result_cast/dangerous_decode_outside_external_danger \
 	error_app_ffi_result_cast/dangerous_external_danger_message_boundary \
 	error_app_ffi_result_cast/dangerous_taint_device_io \
 	error_app_ffi_result_cast/dangerous_taint_region_escape \
@@ -113,11 +109,7 @@ link-fail:
 		( cd "$$tmpdir" && \
 			runtime_obj=""; \
 			[ -f __silica_runtime.o ] && runtime_obj=__silica_runtime.o; \
-			if test -x "$(RUST_LLD)"; then \
-				"$(RUST_LLD)" -flavor darwin -o "$$base" "$$base.o" $$runtime_obj $$link_archives $(LDFLAGS_rust-lld); \
-			else \
-				clang "$$base.o" $$runtime_obj $$link_archives -o "$$base" $(LDFLAGS_clang); \
-			fi ) > "$$cur" 2>&1; \
+			clang "$$base.o" $$runtime_obj $$link_archives -o "$$base" $(LDFLAGS_clang) ) > "$$cur" 2>&1; \
 		link_st=$$?; \
 		rm -rf "$$tmpdir"; \
 		if [ "$$link_st" -eq 0 ]; then \
@@ -222,6 +214,7 @@ compile-fail-goldens:
 				printf "$$base.silica\n" > "$$tmpdir/silica.config"; \
 				;; \
 		esac; \
+		if grep -q ':etf' "$(THIS_DIR)$$case.silica"; then ln -s "$(abspath $(THIS_DIR)../../../compiler/stdlib/wire_etf.silica)" "$$tmpdir/wire_etf.silica" && echo wire_etf.silica >> "$$tmpdir/silica.config"; fi; \
 		$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$(THIS_DIR)$$case.silica); \
 		(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,"$(SILICA_COMPILER)"); }) > "$$cur" 2>&1 || true; \
 		rm -rf "$$tmpdir"; \
@@ -305,7 +298,7 @@ help:
 	@echo "compile-fail-goldens recompiles FAIL_CASES and diffs .cur_fail vs .golden_fail."
 	@echo "diff-fail-goldens diffs existing .cur_fail vs .golden_fail without recompiling."
 	@echo "link-fail runs compile-then-link cases that must fail at Stage 3."
-	@echo "  Link stderr is matched per linker: .golden_link_fail.clang or .golden_link_fail.rust-lld."
+	@echo "  Link stderr is matched per linker: .golden_link_fail.clang (Apple ld via clang) or .golden_link_fail.gnu-ld (Linux)."
 	@echo "archive-missing runs compile failure when a referenced prebuilt archive is absent."
 	@echo ""
 	@echo "Note: trials/ffi_addition (parent) is the success-path harness (.scout goldens)."

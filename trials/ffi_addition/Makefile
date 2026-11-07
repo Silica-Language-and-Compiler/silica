@@ -58,6 +58,7 @@ APP_DIRS := \
 	app_foreign_call_from_deep_stack \
 	app_process_fatal_paths \
 	app_dangerous_spawn_thread_limit \
+	app_transport_tcp_loopback \
 	app_retained_buf_keep_state_area \
 	app_frame_buf_nonretaining_wrapper
 
