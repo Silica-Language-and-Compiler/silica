@@ -470,9 +470,12 @@ silica_rt_halt:
 // details too; run_on_board.py passes that text to its stderr) one diagnostic reports how deep
 // main's two stacks went, against their per-image sizes:
 //   [silica] stacks: machine <high-water>/<size> aux <high-water>/<size> actors <n> actor-max
-//   machine <bytes> aux <bytes> sup-max machine <bytes> aux <bytes>
+//   machine <bytes> aux <bytes> sup-max machine <bytes> aux <bytes> heap: in use <U> free <F> in
+//   <N> blocks largest <L> untouched <T> of <S> used: <size>x<count> ... other <K>
 // The high-water mark is the distance from the top to the lowest non-zero word (both stacks start
-// zeroed: rt_start.S step 4, .bss); the actor figures are rt_actors.S silica_rt_actor_stacks_report.
+// zeroed: rt_start.S step 4, .bss); the actor figures are rt_actors.S silica_rt_actor_stacks_report,
+// the heap figures rt_heap.S silica_rt_heap_summary (one line: run_on_board.py keeps the first line
+// after the marker).
     .align  4
     .global silica_rt_exit
     .type   silica_rt_exit, @function
@@ -496,6 +499,7 @@ silica_rt_exit:
     movi    a10, _silica_main_aux_size
     call8   silica_rt_print_u32
     call8   silica_rt_actor_stacks_report   // rt_actors.S: the actors' deepest stacks
+    call8   silica_rt_heap_summary          // rt_heap.S: " heap: in use U free F ... used: SxC ..."
     movi    a10, 10
     call8   silica_rt_putc
     call8   silica_rt_halt
@@ -580,6 +584,7 @@ silica_rt_abort_with:
 
     FAILURE_ENTRY silica_rt_buf_bounds_failed, silica_registry_atom_buf_bounds, silica_rt_reason_buf_bounds
     FAILURE_ENTRY silica_rt_buf_invalid_failed, silica_registry_atom_buf_invalid, silica_rt_reason_buf_invalid
+    FAILURE_ENTRY silica_rt_region_alloc_failed, silica_registry_atom_out_of_memory, silica_rt_reason_out_of_memory
     FAILURE_ENTRY silica_rt_list_index_failed, silica_registry_atom_list_index, silica_rt_reason_list_index
 
 // a2 = reason, a0 = return address of the CALL8 into the entry. Never returns.
@@ -854,6 +859,8 @@ silica_rt_reason_buf_bounds:
     .asciz  "buffer index out of bounds"
 silica_rt_reason_list_index:
     .asciz  "list index out of range"
+silica_rt_reason_out_of_memory:
+    .asciz "out of memory"
 silica_rt_reason_arena_key:
     .asciz  "canonical arena key is zero"
 silica_rt_reason_arena_full:

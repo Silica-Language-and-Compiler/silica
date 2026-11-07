@@ -77,7 +77,7 @@ fi
 # front of .text (L32R only reaches backwards, 256 KB).
 ASFLAGS="-c -mlongcalls"
 
-RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_board.S rt_device.S rt_string.S rt_list.S rt_float.S rt_ordering.S rt_actors.S rt_supervisors.S"
+RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_board.S rt_device.S rt_string.S rt_list.S rt_float.S rt_ordering.S rt_actors.S rt_supervisors.S"
 
 # Runtime objects: from the cache (assembled only when missing or older than the source; written
 # to a temporary name and renamed, so a concurrent reader never sees a partial object), or fresh.

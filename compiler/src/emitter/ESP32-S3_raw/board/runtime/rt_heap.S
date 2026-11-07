@@ -27,11 +27,11 @@
 // payload is zeroed on every allocation, because reused memory is dirty and the emitted code reads
 // the high words of fresh slots as zero.
 //
-// Regions hand back their memory here (silica_rt_region_destroy, called by the emitter's scope-exit
-// release like the host's malloc/free helpers), which is what lets a loop that allocates and drops
-// a region every iteration run indefinitely; before, free was a no-op and such loops exhausted the
-// heap. Exhaustion is still a runtime abort ("[silica] abort: heap exhausted at 0x...", status 71)
-// rather than a NULL the caller might not check.
+// Since chunk 15 (chunk15_stack_memory_design.md §2.7, §9.3) emitted code never allocates here: a
+// frame's values live in its dynamic part (rt_frame.S) and an actor's state in its state chain
+// (rt_state.S). The heap serves the runtime's own blocks: stack chunks, state chunks, ACBs, message
+// nodes, mailbox buffers, timers and tables. Exhaustion is a runtime abort ("[silica] abort: heap
+// exhausted at 0x...", status 71) rather than a NULL the caller might not check.
 //
 // Both LX7 cores allocate (rt_actors.S runs actors on both): the free list and the bump pointer are
 // guarded by one spin lock (S32C1I, the shape of rt_actors.S's FREE_LOCK). It is a leaf lock: nothing
@@ -40,17 +40,10 @@
 //
 //   silica_rt_heap_init()          reset the bump pointer and the free list (called once by rt_start)
 //   silica_rt_alloc(size) -> ptr   8-byte aligned, zeroed; size is a 32-bit byte count; aborts when
-//                                  the heap is exhausted (also silica_rt_region_alloc / _raw_alloc)
+//                                  the heap is exhausted
 //   silica_rt_alloc_or_null(size)  the same, returning 0 instead of aborting
 //   silica_rt_free(ptr)            return a block; 0, a pointer outside the heap and a block that is
 //                                  not allocated (a double free) are ignored
-//   silica_rt_region_destroy(r)    free a region's extension chain and its handle (also
-//                                  silica_rt_region_free); a canonical arena is left alone, as on the host
-//   silica_rt_heap_used() -> bytes in allocated blocks (headers included): the span below the bump
-//                                  pointer less what sits on the free list; the heap_used() builtin
-//   silica_rt_state_release(old, new, nbytes)   free an actor's previous state block unless the
-//                                  new state still reaches it, see below
-//   silica_rt_region_grow / silica_rt_region_contains   region blocks, see below
 
 #define HEAP_USED 0x5A11CA1D
 
@@ -173,24 +166,187 @@ silica_rt_heap_take:
     retw
     .size   silica_rt_heap_take, . - silica_rt_heap_take
 
+// The aliases silica_rt_region_alloc / silica_rt_raw_alloc (the implicit heap's allocations) are gone
+// with chunk 15 (chunk15_stack_memory_design.md §9.3): emitted code allocates in its frame
+// (rt_frame.S) and the heap serves only the runtime's own blocks. Note for anyone reading an abort
+// address: with the aliases in place a symboliser named the "heap exhausted" site silica_rt_region_alloc
+// (the same address), which read as a per-message region allocation that no longer exists.
     .align  4
     .global silica_rt_alloc
-    .global silica_rt_region_alloc
-    .global silica_rt_raw_alloc
-    .set    silica_rt_region_alloc, silica_rt_alloc    // the emitter's aggregate/pair allocations
-    .set    silica_rt_raw_alloc, silica_rt_alloc       // alloc_region's first block
     .type   silica_rt_alloc, @function
 silica_rt_alloc:
-    entry   a1, 32
+    entry   a1, 48
     mov     a10, a2
     call8   silica_rt_heap_take
     beqz    a10, 1f
     mov     a2, a10
     movi    a3, 0                 // the high word of the pair the emitter reads as X0
     retw
-1:  call8   silica_rt_abort_heap_exhausted   // runtime abort, status 71; allocates nothing
-    retw
+1:  call8   silica_rt_abort_heap_exhausted   // runtime abort, status 71; allocates nothing. The heap's
+    retw                                     // state goes out after the exit marker (silica_rt_heap_summary)
     .size   silica_rt_alloc, . - silica_rt_alloc
+
+// silica_rt_heap_summary(): the heap's state, appended to the exit diagnostic (rt_console.S
+// silica_rt_exit, after the exit marker, so it is never part of the program's output and
+// run_on_board.py hands it to the harness log as the board diagnostic):
+//   " heap: in use U free F in N blocks largest L untouched T of S used: SxC SxC ... other K"
+// U near S says the heap was eaten, F large with L small that it was fragmented, and the used
+// blocks counted by size (the first 16 distinct sizes, the rest under "other") name the kind of
+// block that filled it: 2064 a state chunk (rt_state.S SCH_FIRST + header), 4176 / 592 a first
+// machine / auxiliary stack chunk (rt_actors.S, 80 of header and alignment slack), 56 a message
+// node, a message buffer its measured size. Lock-free: at the exit the other core may have been
+// stopped while it held the heap lock, so nothing here may wait for it; every walk is bounded (a
+// torn or corrupt header ends the walk instead of looping).
+// Frame: [0] free bytes, [4] blocks, [8] largest, [12] bump.
+    .section .rodata.silica_rt_heap, "a"
+silica_rt_heap_line_1:  .asciz  " heap: in use "
+silica_rt_heap_line_3:  .asciz  " free "
+silica_rt_heap_line_4:  .asciz  " in "
+silica_rt_heap_line_5:  .asciz  " blocks largest "
+silica_rt_heap_line_6:  .asciz  " untouched "
+silica_rt_heap_line_7:  .asciz  " of "
+silica_rt_heap_line_8:  .asciz  " used:"
+silica_rt_heap_line_9:  .asciz  " other "
+silica_rt_heap_line_sp: .asciz  " "
+silica_rt_heap_line_x:  .asciz  "x"
+    .section .bss.silica_rt_heap, "aw", @nobits
+    .align  4
+silica_rt_heap_hist:                      // 16 (size, count) pairs of allocated blocks
+    .space  16 * 8
+silica_rt_heap_hist_other:
+    .space  4
+    .section .text.silica_rt_heap, "ax"
+    .literal_position
+    .align  4
+    .global silica_rt_heap_summary
+    .type   silica_rt_heap_summary, @function
+silica_rt_heap_summary:
+    entry   a1, 48
+    movi    a3, silica_rt_heap_free_head
+    l32i    a3, a3, 0
+    movi    a4, 0                 // free bytes
+    movi    a5, 0                 // free blocks
+    movi    a6, 0                 // the largest
+    movi    a2, 100000            // at most this many links (a corrupt list ends the walk)
+1:  beqz    a3, 2f
+    beqz    a2, 2f
+    addi    a2, a2, -1
+    l32i    a7, a3, 0
+    add     a4, a4, a7
+    addi    a5, a5, 1
+    bgeu    a6, a7, 11f
+    mov     a6, a7
+11: l32i    a3, a3, 4
+    j       1b
+2:  movi    a3, silica_rt_heap_next
+    l32i    a3, a3, 0
+    s32i    a4, a1, 0
+    s32i    a5, a1, 4
+    s32i    a6, a1, 8
+    s32i    a3, a1, 12
+    movi    a10, silica_rt_heap_line_1
+    call8   silica_rt_puts
+    l32i    a10, a1, 12           // in use = bump - start - free
+    movi    a8, _silica_heap_start
+    sub     a10, a10, a8
+    l32i    a8, a1, 0
+    sub     a10, a10, a8
+    call8   silica_rt_print_u32
+    movi    a10, silica_rt_heap_line_3
+    call8   silica_rt_puts
+    l32i    a10, a1, 0
+    call8   silica_rt_print_u32
+    movi    a10, silica_rt_heap_line_4
+    call8   silica_rt_puts
+    l32i    a10, a1, 4
+    call8   silica_rt_print_u32
+    movi    a10, silica_rt_heap_line_5
+    call8   silica_rt_puts
+    l32i    a10, a1, 8
+    call8   silica_rt_print_u32
+    movi    a10, silica_rt_heap_line_6
+    call8   silica_rt_puts
+    movi    a10, _silica_heap_end  // untouched = end - bump
+    l32i    a8, a1, 12
+    sub     a10, a10, a8
+    call8   silica_rt_print_u32
+    movi    a10, silica_rt_heap_line_7
+    call8   silica_rt_puts
+    movi    a10, _silica_heap_end  // the heap's size
+    movi    a8, _silica_heap_start
+    sub     a10, a10, a8
+    call8   silica_rt_print_u32
+    call8   silica_rt_heap_used_by_size
+    retw
+    .size   silica_rt_heap_summary, . - silica_rt_heap_summary
+
+// silica_rt_heap_used_by_size(): " used: SxC SxC ... other K" for the allocated blocks between the
+// heap's start and its bump pointer, walked by their headers ([0] size, [4] HEAP_USED while
+// allocated). Lock-free and bounded as silica_rt_heap_summary.
+    .align  4
+    .type   silica_rt_heap_used_by_size, @function
+silica_rt_heap_used_by_size:
+    entry   a1, 32
+    movi    a10, silica_rt_heap_hist
+    movi    a11, 16 * 8 + 4
+    call8   silica_rt_zero_block
+    movi    a2, _silica_heap_start
+    movi    a3, silica_rt_heap_next
+    l32i    a3, a3, 0
+    movi    a7, HEAP_USED
+1:  bgeu    a2, a3, 5f
+    l32i    a4, a2, 0             // the block's size
+    movi    a5, 16
+    bltu    a4, a5, 5f            // a corrupt header (sizes are at least 16): stop
+    l32i    a5, a2, 4
+    bne     a5, a7, 4f            // free: skip
+    movi    a6, silica_rt_heap_hist
+    movi    a9, 0
+2:  l32i    a5, a6, 0
+    beqz    a5, 3f                // an empty entry takes this size
+    beq     a5, a4, 3f
+    addi    a6, a6, 8
+    addi    a9, a9, 1
+    movi    a5, 16
+    bltu    a9, a5, 2b
+    movi    a6, silica_rt_heap_hist_other
+    l32i    a5, a6, 0
+    addi    a5, a5, 1
+    s32i    a5, a6, 0
+    j       4f
+3:  s32i    a4, a6, 0
+    l32i    a5, a6, 4
+    addi    a5, a5, 1
+    s32i    a5, a6, 4
+4:  add     a2, a2, a4
+    j       1b
+5:  movi    a10, silica_rt_heap_line_8
+    call8   silica_rt_puts
+    movi    a2, silica_rt_heap_hist
+    movi    a3, 0
+6:  l32i    a4, a2, 0
+    beqz    a4, 7f
+    movi    a10, silica_rt_heap_line_sp
+    call8   silica_rt_puts
+    l32i    a10, a2, 0
+    call8   silica_rt_print_u32
+    movi    a10, silica_rt_heap_line_x
+    call8   silica_rt_puts
+    l32i    a10, a2, 4
+    call8   silica_rt_print_u32
+    addi    a2, a2, 8
+    addi    a3, a3, 1
+    movi    a4, 16
+    bltu    a3, a4, 6b
+7:  movi    a4, silica_rt_heap_hist_other
+    l32i    a4, a4, 0
+    beqz    a4, 8f
+    movi    a10, silica_rt_heap_line_9
+    call8   silica_rt_puts
+    mov     a10, a4
+    call8   silica_rt_print_u32
+8:  retw
+    .size   silica_rt_heap_used_by_size, . - silica_rt_heap_used_by_size
 
 // silica_rt_alloc_or_null(size) -> ptr or 0: the same allocation without the exhaustion abort, for
 // the actor stack reservation, whose failure has its own rule (spec §15.1.2.2; rt_actors.S).
@@ -209,8 +365,6 @@ silica_rt_alloc_or_null:
 // silica_rt_free(ptr). a4 = block base, a5 = its size; a3 = the link being followed, a6/a7 scratch.
     .align  4
     .global silica_rt_free
-    .global silica_rt_region_free
-    .set    silica_rt_region_free, silica_rt_region_destroy   // region release: the whole chain
     .type   silica_rt_free, @function
 silica_rt_free:
     entry   a1, 32
@@ -285,248 +439,7 @@ silica_rt_free:
 // the handle), [16] next extension block, [24] this block's own data end; data from +32. Fields
 // are 8-byte slots with the high word 0, as the emitted code reads them.
 //
-// silica_rt_region_destroy(region): free every extension block on the [region + 16] chain, then the
-// handle. A null handle is a no-op, so a moved-out region is safe to skip. A canonical arena
-// (rt_ordering.S: silica_rt_canonical_arena_lookup) is process-shared and belongs to the arena table,
-// which hands the same block to every lookup of its key; a function that received one as a parameter
-// destroys it like any region at scope exit, so a block registered in the table is left untouched,
-// as the host's helper does.
-    .align  4
-    .global silica_rt_region_destroy
-    .type   silica_rt_region_destroy, @function
-silica_rt_region_destroy:
-    entry   a1, 32
-    beqz    a2, 4f
-    movi    a3, silica_rt_canonical_arena_table   // 512 x (key: 8, region: 8)
-    movi    a4, 512
-1:  l32i    a5, a3, 8
-    beq     a5, a2, 4f
-    addi    a3, a3, 16
-    addi    a4, a4, -1
-    bnez    a4, 1b
-    l32i    a3, a2, 16
-2:  beqz    a3, 3f
-    l32i    a4, a3, 16
-    mov     a10, a3
-    call8   silica_rt_free
-    mov     a3, a4
-    j       2b
-3:  mov     a10, a2
-    call8   silica_rt_free
-4:  retw
-    .size   silica_rt_region_destroy, . - silica_rt_region_destroy
-
-// silica_rt_region_grow: called from the middle of an emitted allocation sequence when the current
-// block is full. Convention inherited from the AArch64 helper: the region is X1 (here a4), the
-// request is X7 (in this core's register block, THREADPTR + 32); every register the caller holds
-// is preserved (a2-a7 untouched, a8-a15 are the caller's own scratch). A block holds at least 4096
-// data bytes, or the 16-byte-rounded request when that is larger.
-//
-// Both cores may grow one canonical arena, so growth is serialized by silica_rt_region_lock (the
-// shape of HEAP_LOCK; silica_rt_alloc's own heap lock nests inside it as a leaf). Under the lock
-// the request is checked again, because the other core may already have attached a block this
-// request fits; then the sentinel 0x80000000 (above every data address, and bump + request cannot
-// wrap) is parked in the bump so no concurrent reservation (the emitted S32C1I loop,
-// prims_memory@emit_region_bump_check) can land in the old block while the new one is being
-// published, the block is chained, its end stored, and the bump last, with memw between so a
-// reservation that reads the new bump reads the new end.
-    .align  4
-    .global silica_rt_region_grow
-    .type   silica_rt_region_grow, @function
-silica_rt_region_grow:
-    entry   a1, 48
-    rur     a8, threadptr
-    l32i    a9, a8, 32            // X7 = the request
-    addi    a9, a9, 15
-    movi    a8, -16
-    and     a9, a9, a8            // data bytes, rounded up to 16
-    movi    a8, 4096
-    bgeu    a9, a8, 1f
-    mov     a9, a8
-1:  s32i    a9, a1, 0             // keep the size across the call
-    movi    a8, silica_rt_region_lock
-2:  movi    a10, 0
-    wsr     a10, scompare1
-    movi    a10, 1
-    s32c1i  a10, a8, 0
-    bnez    a10, 2b
-    rur     a8, threadptr         // under the lock: does the request fit now?
-    l32i    a10, a8, 32
-    l32i    a11, a4, 0            // bump
-    l32i    a12, a4, 8            // end
-    add     a10, a11, a10
-    bgeu    a12, a10, 5f          // end >= bump + request: the other core grew it; retry
-    movi    a10, 0x80000000       // sentinel: nothing reserves in the old block from here
-    s32i    a10, a4, 0
-    memw
-    addi    a10, a9, 32
-    call8   silica_rt_alloc       // never returns 0 (exhaustion aborts)
-    l32i    a9, a1, 0
-    addi    a8, a10, 32           // data start
-    add     a9, a8, a9            // data end
-    s32i    a9, a10, 24           // block's own span end
-    l32i    a11, a4, 16           // chain the block in front of the region's extensions
-    s32i    a11, a10, 16
-    memw
-    s32i    a10, a4, 16
-    s32i    a9, a4, 8             // the end first
-    memw
-    s32i    a8, a4, 0             // then the bump: the region now reserves in the new block
-5:  memw
-    movi    a8, silica_rt_region_lock
-    movi    a9, 0
-    s32i    a9, a8, 0
-    memw
-    retw
-    .size   silica_rt_region_grow, . - silica_rt_region_grow
-
-// silica_rt_region_contains: ref X1 (a4), region X2 (a6) -> X5 (register block + 16) = 1 when the ref
-// lies in the region's first block or any extension block; everything else preserved.
-    .align  4
-    .global silica_rt_region_contains
-    .type   silica_rt_region_contains, @function
-silica_rt_region_contains:
-    entry   a1, 32
-    addi    a8, a6, 32            // first block: [region + 32, [region + 24])
-    l32i    a9, a6, 24
-    bltu    a4, a8, 2f
-    bltu    a4, a9, 3f
-2:  l32i    a8, a6, 16            // extension blocks
-1:  beqz    a8, 4f
-    addi    a9, a8, 32
-    bltu    a4, a9, 5f
-    l32i    a9, a8, 24
-    bltu    a4, a9, 3f
-5:  l32i    a8, a8, 16
-    j       1b
-3:  movi    a8, 1
-    j       6f
-4:  movi    a8, 0
-6:  rur     a9, threadptr
-    s32i    a8, a9, 16
-    movi    a8, 0
-    s32i    a8, a9, 20
-    retw
-    .size   silica_rt_region_contains, . - silica_rt_region_contains
-
-    .align  4
-    .global silica_rt_heap_used
-    .type   silica_rt_heap_used, @function
-silica_rt_heap_used:
-    entry   a1, 32
-    HEAP_LOCK a8, a9
-    movi    a3, silica_rt_heap_next
-    l32i    a2, a3, 0
-    movi    a4, _silica_heap_start
-    sub     a2, a2, a4
-    movi    a3, silica_rt_heap_free_head
-    l32i    a4, a3, 0
-1:  beqz    a4, 2f
-    l32i    a5, a4, 0
-    sub     a2, a2, a5
-    l32i    a4, a4, 4
-    j       1b
-2:  HEAP_UNLOCK a8, a9
-    movi    a3, 0
-    retw
-    .size   silica_rt_heap_used, . - silica_rt_heap_used
-
-// silica_rt_heap_is_block(p) -> 1 when p is the payload of an allocated block. Leaf.
-    .align  4
-silica_rt_heap_is_block:
-    entry   a1, 32
-    movi    a4, 0
-    beqz    a2, 9f
-    movi    a3, _silica_heap_start
-    bltu    a2, a3, 9f
-    movi    a3, _silica_heap_end
-    bgeu    a2, a3, 9f
-    addi    a5, a2, -8
-    l32i    a3, a5, 4
-    movi    a6, HEAP_USED
-    bne     a3, a6, 9f
-    movi    a4, 1
-9:  mov     a2, a4
-    retw
-    .size   silica_rt_heap_is_block, . - silica_rt_heap_is_block
-
-// silica_rt_heap_reaches(target, block, nbytes, depth) -> 1 when target is one of the 8-byte
-// slots of block, or of a heap block one of those slots names, up to depth levels further down.
-// A heap block is scanned over its whole payload; anything else over nbytes (0: not at all), so
-// a word that is a scalar or an address outside the heap is never followed. Slots hold a 32-bit
-// address in the low word with the high word zero, as the emitted code lays composites out.
-// Recursion bounded by `depth` (silica_rt_state_release passes 4): at most five frames of this
-// function plus silica_rt_heap_is_block below the deepest. tools/main_stack_bound.py reads the
-// declared bound instead of walking the recursion.
-    .set    silica_rt_heap_reaches__stack_bound, 5 * 32 + 32
-    .align  4
-    .global silica_rt_heap_reaches             // rt_supervisors.S silica_rt_init_owners_reach
-silica_rt_heap_reaches:
-    entry   a1, 32
-    movi    a6, 65536
-    bltu    a3, a6, 8f            // an atom index or a small scalar names nothing
-    mov     a10, a3
-    call8   silica_rt_heap_is_block
-    beqz    a10, 1f
-    addi    a6, a3, -8
-    l32i    a4, a6, 0
-    addi    a4, a4, -8            // the payload
-1:  beqz    a4, 8f
-    add     a7, a3, a4            // a7 = end
-    mov     a6, a3                // a6 = cursor
-2:  bgeu    a6, a7, 8f
-    l32i    a8, a6, 0
-    beq     a8, a2, 9f
-    beqz    a5, 3f
-    mov     a10, a2
-    mov     a11, a8
-    movi    a12, 0
-    addi    a13, a5, -1
-    call8   silica_rt_heap_reaches
-    bnez    a10, 9f
-3:  addi    a6, a6, 8
-    j       2b
-8:  movi    a2, 0
-    retw
-9:  movi    a2, 1
-    retw
-    .size   silica_rt_heap_reaches, . - silica_rt_heap_reaches
-
-// silica_rt_state_release(X0 old, X1 new, X2 nbytes): called by the emitted behaviour epilogue
-// after it installed `new` as the actor's state (nbytes = the shell size of new's type, used
-// when new is not a heap block), and by rt_actors.S for a message copy once the behaviour has
-// read it (nbytes 0). `old` goes back to the heap unless it is not an allocated block (an atom,
-// a frame-region or rodata address, a block already freed), is `new` itself, is still reachable
-// from new -- its slots, and the slots of the blocks they name, four levels down; the emitter
-// moves one level, so a state that packs its predecessor keeps it alive -- or is the spec init
-// a supervised child's row keeps for restarts (rt_supervisors.S ROW_INIT).
-#define ACB_ROW  76
-#define ROW_INIT 24
-    .align  4
-    .global silica_rt_state_release
-    .type   silica_rt_state_release, @function
-silica_rt_state_release:
-    entry   a1, 32
-    beqz    a2, 9f
-    beq     a2, a4, 9f
-    mov     a10, a2
-    call8   silica_rt_heap_is_block
-    beqz    a10, 9f
-    call8   silica_rt_current_actor
-    beqz    a10, 1f
-    l32i    a5, a10, ACB_ROW
-    beqz    a5, 1f
-    l32i    a5, a5, ROW_INIT
-    beq     a5, a2, 9f
-1:  mov     a10, a2
-    mov     a11, a4
-    mov     a12, a6
-    movi    a13, 4
-    call8   silica_rt_heap_reaches
-    bnez    a10, 9f
-    mov     a10, a2
-    call8   silica_rt_free
-9:  movi    a2, 0
-    movi    a3, 0
-    retw
-    .size   silica_rt_state_release, . - silica_rt_state_release
+// The region runtime of the implicit heap (region_destroy, region_grow, region_contains, heap_used,
+// heap_is_block, heap_reaches, state_release) went with chunk 15: regions are lifetime witnesses
+// (chunk15_stack_memory_design.md §3.2), a frame's allocations live in its dynamic part (rt_frame.S) and
+// an actor's state in its state chain (rt_state.S).

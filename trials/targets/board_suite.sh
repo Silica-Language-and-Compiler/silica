@@ -102,6 +102,15 @@ if [ "${1:-}" = "--fail-one" ]; then
         ln -sfn "$TRIALS_ROOT/../compiler/stdlib/Supervisor.silica" "$tmp/Supervisor.silica"
         printf '%s\n' "$m.silica" Supervisor.silica >> "$tmp/silica.config"
     done
+    # Sidecar .meta files named by wrapper_meta "<rel path>"; the host (error_enforcement_addition/Makefile)
+    # links them into its scratch dir at the same relative path from <suite>/ffi_addition/error_app_sidecar_metadata/
+    for rel in $(sed -nE 's/^wrapper_meta "([^"]+)";.*/\1/p' "$src/$stem.silica"); do
+        meta="$src/ffi_addition/error_app_sidecar_metadata/$rel"
+        if [ -f "$meta" ]; then
+            mkdir -p "$tmp/$(dirname "$rel")"
+            ln -sfn "$meta" "$tmp/$rel"
+        fi
+    done
     ( cd "$tmp" && run_compiler ) > "$work/build/$stem.cur_fail" 2>&1
     rm -rf "$tmp"
     cp "$work/build/$stem.cur_fail" "$src/$stem.$target.cur_fail"

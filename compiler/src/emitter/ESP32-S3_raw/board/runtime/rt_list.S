@@ -60,7 +60,7 @@ silica_rt_list_tail:
     beqz    a3, 8f
     bgeu    a7, a6, 2f            // past this chunk's data area
     movi    a10, 24
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     s32i    a3, a10, 0
     s32i    a5, a10, 8
     s32i    a7, a10, 16
@@ -71,10 +71,12 @@ silica_rt_list_tail:
     l32i    a5, a5, 0             // next chunk
     beqz    a5, 8f
     movi    a10, 24
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     s32i    a3, a10, 0
-    s32i    a5, a10, 8            // cursor 0: the chunk is full from the front
-    mov     a2, a10
+    s32i    a5, a10, 8
+    movi    a8, 0
+    s32i    a8, a10, 16           // cursor 0: the chunk is full from the front (the hosted helper's
+    mov     a2, a10               // STR XZR, [X0, #16]; the block is zeroed, the store says so)
     movi    a3, 0
     retw
 8:  movi    a2, 0
@@ -159,6 +161,10 @@ silica_rt_list_prepend:
     beqz    a6, 5f                // nil tail: new chunk
     l32i    a8, a6, 16            // tail cursor
     beqz    a8, 5f                // no room in front of the tail's first element
+    l32i    a10, a6, 8            // in place only on this context's auxiliary stack (chunk 15):
+    call8   silica_rt_in_aux_chain    // a state-chain or buffer chunk must not point at a frame node
+    l32i    a8, a6, 16
+    beqz    a10, 8f
     l32i    a9, a6, 8
     add     a11, a9, a3           // chunk + data bytes: [next chunk][claim]
     l32i    a10, a11, 8           // claim = lowest data offset already handed out
@@ -169,7 +175,7 @@ silica_rt_list_prepend:
     sub     a9, a9, a2            // the slot just before the tail's first element
     STORE_ELEMENT
     movi    a10, 24
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     l32i    a8, a6, 0
     addi    a8, a8, 1
     s32i    a8, a10, 0
@@ -184,7 +190,7 @@ silica_rt_list_prepend:
 // Copy-on-write: copy the old list's part of its chunk (cursor .. chunk end) into a fresh chunk at
 // the same offsets, inherit the old chunk's successor, and put the element just in front of it.
 8:  addi    a10, a3, 16
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     s32i    a10, a1, 8            // new chunk
     l32i    a9, a6, 8             // old chunk
     l32i    a8, a6, 16            // old cursor
@@ -205,7 +211,7 @@ silica_rt_list_prepend:
     add     a9, a10, a11
     STORE_ELEMENT
     movi    a10, 24
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     l32i    a8, a6, 0
     addi    a8, a8, 1
     s32i    a8, a10, 0
@@ -218,7 +224,7 @@ silica_rt_list_prepend:
     movi    a3, 0
     retw
 5:  addi    a10, a3, 16           // a new chunk, the element in its last slot
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     s32i    a10, a1, 8
     add     a9, a10, a3
     sub     a11, a3, a2
@@ -231,7 +237,7 @@ silica_rt_list_prepend:
     add     a11, a8, a3
     s32i    a9, a11, 0
 6:  movi    a10, 24
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     movi    a8, 1
     beqz    a6, 7f
     l32i    a8, a6, 0

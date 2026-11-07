@@ -1,0 +1,197 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The frame's dynamic part on the ESP32-S3 (chunk15_stack_memory_design.md §2.6, §3.1-§3.5; the board
+// re-expression of the Mac's L_dyn_alloc / L_adopt / L_ev_frame sites, phase 9).
+//
+// On this target the emitter's SP is the auxiliary stack, a chain of heap chunks (rt_actors.S "Growable
+// stacks"), and the fixed part of a frame is the a1 frame ENTRY allocates (xt_vr). The DYNAMIC part of a
+// frame -- every value that may escape: frame allocations, adopted and evacuated results -- lies on the
+// auxiliary stack between the frame's FLOOR and its transient pushes, exactly as on the hosted targets:
+//
+//   floor   the lowest byte of the dynamic part; everything below it down to SP is transient pushes
+//           (argument slabs, operand parks), addressed only relative to SP. The running frame's floor is
+//           the word at THREADPTR + 140 (VRG_FLOOR, rt_actors.S), one per core like SP itself: a
+//           prologue saves the caller's floor in its frame record and starts its own at SP, an epilogue
+//           puts the caller's back (xt_frame_prologue_init / epilogue_floor_restore), and a context switch
+//           saves and restores it with SP (ACB_CTX_FLOOR).
+//   frame record   16 bytes above the [X29, #-N] slot area (xt_frame_header reserves them), four
+//           32-bit words (an SP or a floor is a 32-bit address here; the hosted record is four 8-byte
+//           words at [X29, #0/#8/#16/#24]):
+//           [X29, #0] SP at entry (the non-adopting epilogue's restore: behaviours and main),
+//           [X29, #4] the caller's floor, [X29, #8] SP just before a user call, [X29, #12] unused.
+//           The record was 32 bytes until 2026-11-06: 16 bytes per frame on a 1000-deep recursion
+//           was 16 KB of machine chunks (compiler_addition/region_grow).
+//
+// The runtime does the work (board/runtime/rt_frame.S), reading the size or the pre-call SP from
+// VRG_ARG (THREADPTR + 136) so that X0-X2 stay in a10-a15 across the CALL8:
+//   silica_rt_dyn_alloc   VRG_ARG = n (a multiple of 16) -> VRG_ARG = the block [floor - n, floor); the
+//                         transient pushes move down under it (SP and their contents together) and the
+//                         floor goes down by n; a block that does not fit the chunk takes the next one
+//   silica_rt_adopt       VRG_ARG = the pre-call SP: [SP, pre-call SP), the callee's frame and dynamic
+//                         part, becomes the bottom of this frame's dynamic part (design §3.3 (a)); the
+//                         transient pushes move below it. Nothing left (SP == pre-call SP) means SP stays.
+//   silica_rt_ev_frame    X0 = value, X1 = KIND, X2 = AUX of its root descriptor entry, X3 = the pre-call
+//                         SP -> X0 = the value with every node of it that lies in the callee's frames
+//                         copied below this frame's floor (design §3.3 (b), §3.5; one pass on the board
+//                         when the copies fit this chunk, else a fresh chunk); the callee's chunks go back.
+// Scratch: a8, a9 (and a2 as a store temp of the XS32 macro in the prologue, where a2-a7 are dead).
+
+use xt_vr;
+use xt_isa;
+use xt_mem;
+
+export frame_record_bytes/0;
+export vrg_floor_off/0;
+export xt_frame_prologue_init/0;
+export epilogue_floor_restore/0;
+export epilogue_sp_restore/0;
+export dyn_alloc_asm/2;
+export precall_sp_save_asm/0;
+export postcall_sp_restore_asm/0;
+export adopt_asm/0;
+export ev_frame_asm/1;
+export floor_reset_asm/0;
+export sp_to_floor_asm/0;
+export floor_to_vr_asm/1;
+export vr_to_floor_asm/1;
+export dyn_release_asm/0;
+
+fn ins(op: string, args: string) -> string {
+    xt_vr@xt_ins(op, args)
+}
+
+// Bytes of the frame record above the slot area ([X29, #0] .. [X29, #16)).
+fn frame_record_bytes() -> int64 {
+    16
+}
+
+// THREADPTR offset of the running frame's floor (rt_actors.S VRG_FLOOR).
+fn vrg_floor_off() -> int64 {
+    140
+}
+
+fn vsp_off_s() -> string {
+    xt_vr@xt_itos(xt_vr@vr_vsp_off())
+}
+
+fn arg_off_s() -> string {
+    "136"
+}
+
+fn floor_off_s() -> string {
+    xt_vr@xt_itos(vrg_floor_off())
+}
+
+// Prologue, after the argument moves (a2-a7 dead): [X29, #0] = SP, [X29, #4] = the caller's floor, and
+// this frame's floor starts at SP (its dynamic part is empty).
+fn xt_frame_prologue_init() -> string {
+    concat(concat(xt_vr@tp_load("a8"), concat(ins("l32i", concat("a9, a8, ", vsp_off_s())), ins("XS32", "a9, SFP, a2"))),
+        concat(concat(ins("l32i", concat("a9, a8, ", floor_off_s())), ins("XS32", "a9, SFP+4, a2")),
+            concat(ins("l32i", concat("a9, a8, ", vsp_off_s())), ins("s32i", concat("a9, a8, ", floor_off_s())))))
+}
+
+// Epilogue: the caller's floor comes back. SP is wherever the body left it (its dynamic part stays for
+// the caller, which adopts, evacuates or drops it): the adopting epilogue of every ordinary function.
+fn epilogue_floor_restore() -> string {
+    concat(xt_vr@tp_load("a8"), concat(ins("XL32", "a9, SFP+4"), ins("s32i", concat("a9, a8, ", floor_off_s()))))
+}
+
+// The non-adopting epilogue (behaviours, main): the floor comes back and SP goes back to its entry value,
+// popping every auxiliary chunk the frame took (xt_vr vr_put: the restore check).
+fn epilogue_sp_restore() -> string {
+    concat(epilogue_floor_restore(), concat(ins("XL32", "a9, SFP"), xt_vr@vr_put("SP", "a9", "a9")))
+}
+
+// A frame allocation of `size` bytes ("#n", a multiple of 16, or a VR holding one) into VR `dest`:
+// the block's address. X0-X2, X9, X10 and the register block's X3-X8 survive (the runtime writes none
+// of them); only the VR written and a8/a9 change.
+fn dyn_alloc_asm(size: string, dest: string) -> string {
+    load: string <- case xt_isa@xt_is_imm(size) of {
+        true -> ins("movi", concat("a8, ", xt_vr@xt_itos(xt_isa@xt_imm_value(size))));
+        false -> xt_vr@vr_lo_load(size, "a8")
+    };
+    lo: string <- case xt_isa@xt_is_imm(size) of {
+        true -> "a8";
+        false -> xt_vr@vr_lo_reg(size, "a8")
+    };
+    pass: string <- concat(xt_vr@tp_load("a9"), ins("s32i", concat(lo, concat(", a9, ", arg_off_s()))));
+    call: string <- ins("call8", "silica_rt_dyn_alloc");
+    take: string <- concat(xt_vr@tp_load("a9"), concat(ins("l32i", concat("a8, a9, ", arg_off_s())), ins("movi", "a9, 0")));
+    concat(concat(load, pass), concat(call, concat(take, xt_vr@vr_put(dest, "a8", "a9"))))
+}
+
+// [X29, #8] = SP, just before a user call (the boundary its adoption or evacuation works against).
+fn precall_sp_save_asm() -> string {
+    concat(xt_vr@tp_load("a8"), concat(ins("l32i", concat("a9, a8, ", vsp_off_s())), ins("XS32", "a9, SFP+8, a2")))
+}
+
+// SP = [X29, #8]: after a call whose result names nothing in the callee's frame (a scalar).
+fn postcall_sp_restore_asm() -> string {
+    concat(ins("XL32", "a9, SFP+8"), xt_vr@vr_put("SP", "a9", "a9"))
+}
+
+// Adopt [SP, [X29, #8]) into this frame's dynamic part.
+fn adopt_asm() -> string {
+    concat(concat(xt_vr@tp_load("a8"), ins("XL32", "a9, SFP+8")), concat(ins("s32i", concat("a9, a8, ", arg_off_s())), ins("call8", "silica_rt_adopt")))
+}
+
+// Before a user call that emitter_core@dr_call_nodes lists (`_dyr`): nothing live names a node of this
+// frame's dynamic part once the arguments are in registers (every name the continuation reads, and
+// every argument, is a frame-free scalar), so the dynamic part is garbage. When the transient part is
+// empty (SP == the floor: no slab or operand park is in flight; a tuple-result slab pushed before the
+// arguments keeps SP below the floor, and the sequence then does nothing) SP and the floor go back to
+// the frame's entry SP, popping every auxiliary chunk the dynamic part took (vr_put's restore check),
+// and the pre-call SP recorded next is that entry SP. A non-tail recursion that binds and sends a
+// message per level then keeps one message's worth of auxiliary stack, not one per level
+// (timers_addition/cancelled_timers_release_messages: 1000 levels on main's fixed auxiliary stack).
+// a8 and a9 only; X0-X2 in a10-a15 survive (silica_rt_aux_release keeps them). Local label 3 is not
+// used by vr_put (1 and 2).
+fn dyn_release_asm() -> string {
+    test: string <- concat(xt_vr@tp_load("a8"), concat(ins("l32i", concat("a9, a8, ", floor_off_s())), concat(ins("l32i", concat("a8, a8, ", vsp_off_s())), ins("bne", "a8, a9, 3f"))));
+    reset: string <- concat(ins("XL32", "a9, SFP"), concat(xt_vr@tp_load("a8"), concat(ins("s32i", concat("a9, a8, ", floor_off_s())), xt_vr@vr_put("SP", "a9", "a9"))));
+    concat(test, concat(reset, "3:\n"))
+}
+
+// Evacuate the result in X0 through the root-word descriptor `<label>_0` (its entry at +16: KIND at +16,
+// AUX at +24; the pointer words are the low words of the 8-byte slots): X1 = KIND, X2 = AUX, X3 = the
+// pre-call SP; the runtime answers X0 = the value with its new nodes copied under this frame's floor.
+fn ev_frame_asm(label: string) -> string {
+    desc: string <- concat(ins("movi", concat("a8, ", concat(label, "_0"))), concat(ins("l32i", "a12, a8, 16"), concat(ins("l32i", "a13, a8, 20"), concat(ins("l32i", "a14, a8, 24"), ins("l32i", "a15, a8, 28")))));
+    x3: string <- concat(xt_vr@tp_load("a9"), concat(ins("XL32", "a8, SFP+8"), concat(ins("s32i", "a8, a9, 0"), concat(ins("movi", "a8, 0"), ins("s32i", "a8, a9, 4")))));
+    concat(desc, concat(x3, ins("call8", "silica_rt_ev_frame")))
+}
+
+// The floor goes back to SP (a TCO restart that drops the iteration's dynamic part with its slabs).
+fn floor_reset_asm() -> string {
+    concat(xt_vr@tp_load("a8"), concat(ins("l32i", concat("a9, a8, ", vsp_off_s())), ins("s32i", concat("a9, a8, ", floor_off_s()))))
+}
+
+// SP = the floor (a TCO restart that keeps the dynamic part: only the transient pushes go).
+fn sp_to_floor_asm() -> string {
+    concat(xt_vr@tp_load("a8"), concat(ins("l32i", concat("a9, a8, ", floor_off_s())), xt_vr@vr_put("SP", "a9", "a9")))
+}
+
+// VR = the floor (the Mac's `LDR Xn, [X29, #16]`).
+fn floor_to_vr_asm(dest: string) -> string {
+    concat(xt_vr@tp_load("a8"), concat(ins("l32i", concat("a9, a8, ", floor_off_s())), concat(ins("movi", "a8, 0"), xt_vr@vr_put(dest, "a9", "a8"))))
+}
+
+// The floor = VR's low word (the Mac's `STR Xn, [X29, #16]`).
+fn vr_to_floor_asm(src: string) -> string {
+    concat(xt_vr@vr_lo_load(src, "a8"), concat(xt_vr@tp_load("a9"), ins("s32i", concat(xt_vr@vr_lo_reg(src, "a8"), concat(", a9, ", floor_off_s())))))
+}

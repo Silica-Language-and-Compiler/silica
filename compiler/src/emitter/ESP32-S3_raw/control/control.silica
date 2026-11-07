@@ -22,12 +22,14 @@
 // front of the label once the body is known; see design_documents/ports/esp32s3_xtensa_port.md §3.
 
 use emitter_effects;
+use xt_frame;
 
 export function_prologue/1;
 export function_epilogue_with_frame/0;
 export function_prologue_with_effects/2;
 export function_epilogue_with_effects/1;
 export function_tail_frame_release/1;
+export function_epilogue_tail_with_effects/2;
 
 // Section, label and ENTRY. Each function is in its own .text.<name> section (its L32R literals go to
 // the matching .literal.<name> the assembler derives), so the board link's --gc-sections drops unused
@@ -47,15 +49,37 @@ export function_tail_frame_release/1;
 // alloca exception handler reads to tell the call size when the caller's window has been spilled.
 // In main, whose stacks are fixed, the runtime raises the fatal overflow instead. a8-a11 are scratch
 // here; a2-a7, the incoming arguments, survive the call.
+//
+// The frame record (chunk15_stack_memory_design.md §3.1, phase 2; the board form in shared/xt_frame):
+// after the argument moves the prologue keeps SP at [X29, #0] and the caller's floor at [X29, #4], and
+// starts this frame's floor at SP (its dynamic part, on the auxiliary stack, is empty). [X29, #8]
+// takes the SP saved just before a user call (terms/call.silica).
 fn function_prologue(name: string) -> string {
     head: string <- concat("    .section .text.", concat(name, concat(",\"ax\",@progbits\n    .align 4\n", concat(name, ":\n    entry a1, SFRAME\n"))));
     check: string <- "    rur a8, threadptr\n    l32i a8, a8, 116\n    bgeu a1, a8, 1f\n    addi a8, a8, -32\n    movsp a1, a8\n    movi a10, SFRAME\n    mov a11, a0\n    call8 silica_rt_stack_grow\n    mov a0, a11\n    movsp a1, a10\n1:\n";
-    concat(head, concat(check, "    mov a10, a2\n    mov a11, a3\n    mov a12, a4\n    mov a13, a5\n    mov a14, a6\n    mov a15, a7\n"))
+    concat(head, concat(check, concat("    mov a10, a2\n    mov a11, a3\n    mov a12, a4\n    mov a13, a5\n    mov a14, a6\n    mov a15, a7\n", xt_frame@xt_frame_prologue_init())))
 }
 
-// Integer result: X0 (a10:a11) goes back in a2:a3, which the caller sees as its a10:a11.
+// Integer result: X0 (a10:a11) goes back in a2:a3, which the caller sees as its a10:a11. The caller's
+// floor comes back and SP goes back to its entry value: the non-adopting form (function_epilogue_tail_with_effects
+// chooses between the two).
 fn function_epilogue_with_frame() -> string {
-    "    mov a2, a10\n    mov a3, a11\n    retw\n"
+    concat(xt_frame@epilogue_sp_restore(), "    mov a2, a10\n    mov a3, a11\n    retw\n")
+}
+
+// The end of an epilogue. `adopt` leaves SP where the body left it (at this frame's floor: its dynamic
+// part, with every node a result can still name, stays for the caller, which adopts or evacuates
+// [SP, its pre-call SP) after the call) and only puts the caller's floor back; otherwise SP goes back
+// to the entry value too (behaviours and main, whose callers are the runtime and the start code).
+fn function_epilogue_tail_with_effects(fn_effects: string, adopt: boolean) -> string {
+    base: string <- case adopt of {
+        true -> concat(xt_frame@epilogue_floor_restore(), "    mov a2, a10\n    mov a3, a11\n    retw\n");
+        false -> function_epilogue_with_frame()
+    };
+    case has_atomic_effect(fn_effects) of {
+        true -> concat("    memw\n", base);
+        false -> base
+    }
 }
 
 fn has_atomic_effect(fn_effects: string) -> boolean {
