@@ -119,6 +119,13 @@ if [ "${1:-}" = "--fail-one" ]; then
         ln -sfn "$TRIALS_ROOT/../compiler/stdlib/Supervisor.silica" "$tmp/Supervisor.silica"
         printf '%s\n' "$m.silica" Supervisor.silica >> "$tmp/silica.config"
     done
+    # error_enforcement_addition/Makefile stages WireFormat/Carrier for `use` lines
+    for tr in WireFormat Carrier; do
+        if grep -q "use $tr;" "$src/$stem.silica"; then
+            ln -sfn "$TRIALS_ROOT/../compiler/stdlib/$tr.silica" "$tmp/$tr.silica"
+            echo "$tr.silica" >> "$tmp/silica.config"
+        fi
+    done
     # Sidecar .meta files named by wrapper_meta "<rel path>"; the host (error_enforcement_addition/Makefile)
     # links them into its scratch dir at the same relative path from <suite>/ffi_addition/error_app_sidecar_metadata/
     for rel in $(sed -nE 's/^wrapper_meta "([^"]+)";.*/\1/p' "$src/$stem.silica"); do
@@ -261,7 +268,9 @@ while IFS= read -r m; do
     ln -s "$f" "src/$b.silica"
     modules+=("$b")
     staged=$((staged + 1))
-done < <(sed -n 's#.*echo *"\(\.\./\.\./compiler/[^"]*\.silica\)".*#\1#p' "$src/Makefile" 2>/dev/null | LC_ALL=C sort -u)
+# Also the form transport_addition's Makefile uses (ln -sfn ../../../compiler/stdlib/<Module>.silica
+# .trial_stdlib/<Module>.silica, written relative to .trial_stdlib/): one ../ is dropped to read it from $src.
+done < <(sed -n -e 's#.*echo *"\(\.\./\.\./compiler/[^"]*\.silica\)".*#\1#p' -e 's#.*ln -sfn *\.\./\(\.\./\.\./compiler/[^ ]*\.silica\) *\.trial_stdlib/.*#\1#p' "$src/Makefile" 2>/dev/null | LC_ALL=C sort -u)
 
 # Item M: the trial-support modules the suite's programs use (trials/lib_trial_support), and the
 # Supervisor trait they implement, staged as support modules the way TRIAL_SUPPORT_CONFIG adds them
@@ -521,6 +530,12 @@ if [ "${#appdirs[@]}" -gt 0 ]; then
     for app in "${appdirs[@]}"; do
         adir="$src/$app"
         app_programs=() app_modules=() app_skipped=0
+        reason=$(skip_reason "$app")
+        if [ -n "$reason" ]; then
+            printf 'SKIP: %s%s/ (%s)\n' "$prefix" "$app" "$reason"
+            skipped=$((skipped + 1))
+            continue
+        fi
         for f in $(cd "$adir" && ls ./*.silica 2>/dev/null | sed 's|^\./||' | LC_ALL=C sort); do
             stem=${f%.silica}
             reason=$(skip_reason "$stem")

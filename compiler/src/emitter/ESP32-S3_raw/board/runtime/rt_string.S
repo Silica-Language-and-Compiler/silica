@@ -98,8 +98,10 @@ silica_rt_string_bad:
 1:  j       1b
 
 // silica_rt_string_alloc(n): a fresh string of n bytes (data at +24, zeroed, NUL after the last byte).
-// Local: a2 = byte count, result a2 = string.
+// a2 = byte count, result a2 = string. Global for rt_transport.S (bytes_of, join_bytes), which fills
+// the bytes itself.
     .align  4
+    .global silica_rt_string_alloc
     .type   silica_rt_string_alloc, @function
 silica_rt_string_alloc:
     entry   a1, 32

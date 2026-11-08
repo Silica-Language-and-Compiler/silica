@@ -88,7 +88,7 @@ CFLAGS="-c -mlongcalls -Os -ffreestanding -ffunction-sections -fdata-sections -W
 ffi_defsym=""
 [ -n "${BOARD_FFI_STACK:-}" ] && ffi_defsym="-Wl,--defsym,_silica_ffi_stack_req=$BOARD_FFI_STACK"
 
-RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_board.S rt_device.S rt_string.S rt_list.S rt_float.S rt_ordering.S rt_actors.S rt_supervisors.S rt_ffi.S"
+RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_board.S rt_device.S rt_string.S rt_list.S rt_transport.S rt_float.S rt_ordering.S rt_actors.S rt_supervisors.S rt_ffi.S"
 
 # Runtime objects: from the cache (assembled only when missing or older than the source; written
 # to a temporary name and renamed, so a concurrent reader never sees a partial object), or fresh.

@@ -93,7 +93,10 @@ fn is_subeffect(sub: { name: string, parameter: string, location: { file: string
    normal_writethrough <: atomic (transitive)
    normal_noncacheable <: atomic (transitive) -}
 fn is_mem_subeffect(sub_param: string, super_param: string) -> boolean {
-    case sub_param == super_param of {
+    // mem(any) is the allocation requirement of a transport operation (effect_checker_core
+    // mem_any_parameter): any declared mem(...) kind satisfies it (needed <: declared), and a
+    // declared mem(...) of any kind counts as used by it (declared <: used, the E3010 direction).
+    case sub_param == super_param or sub_param == effect_checker_core@mem_any_parameter() or super_param == effect_checker_core@mem_any_parameter() of {
         true -> true;
         false -> case sub_param of {
             "normal" -> super_param == "atomic";
@@ -136,13 +139,44 @@ fn all_effects_subsumed(needed_effects: List[{ name: string, parameter: string, 
         true -> effect_checker_core@effect_check_ok();
         false -> case is_effect_subsumed(needed_effects.head, declared) of {
             true -> all_effects_subsumed(needed_effects.tail, declared);
-            false -> effect_checker_core@effect_check_err(
-                "E3002",
-                needed_effects.head.location,
-                concat("Effect not declared in caller: ", effect_checker_core@effect_name_to_string(needed_effects.head)),
-                "sect9.3.1"
-            )
+            false -> case is_transport_effect(needed_effects.head) of {
+                true -> effect_checker_core@effect_check_err(
+                    "E3013",
+                    needed_effects.head.location,
+                    e3013_message(),
+                    "sect9.3.1"
+                );
+                false -> effect_checker_core@effect_check_err(
+                    "E3002",
+                    needed_effects.head.location,
+                    concat("Effect not declared in caller: ", needed_effect_display(needed_effects.head)),
+                    "sect9.3.1"
+                )
+            }
         }
+    }
+}
+
+// --- Transport operations (transport_serialization_design.md §9.2, specification §16.4) ---
+
+fn is_transport_effect(eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> boolean {
+    effect_checker_core@normalize_effect(eff).name == "transport"
+}
+
+{- E3013 TransportEffectMissing: a sequence calls a transport operation but its proc[...] does not
+   name transport. The allocation side of the operation is the ordinary E3002 / E3001 (any mem(...)
+   kind satisfies it); this code is only about the transport effect. -}
+fn e3013_message() -> string {
+    "Transport operation without the transport effect: this sequence calls encode, decode, recreate, byte_at, byte_slice, bytes_of or join_bytes but its proc[...] does not declare transport. Add transport beside the sequence's allocation effect, e.g. proc[mem(normal), transport] (any mem(...) kind satisfies the allocation these operations need)"
+}
+
+{- The text of a needed effect in a message: the transport operations need a memory effect of any
+   kind, written mem(<any kind>) rather than the internal mem(any) parameter. -}
+fn needed_effect_display(eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> string {
+    norm: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- effect_checker_core@normalize_effect(eff);
+    case norm.name == "mem" and norm.parameter == effect_checker_core@mem_any_parameter() of {
+        true -> "mem(<any kind>)";
+        false -> effect_checker_core@effect_name_to_string(eff)
     }
 }
 
@@ -185,32 +219,54 @@ fn context_for_decl_params(ctx: { fn_env: List[{ name: string, effects: List[{ n
 
 {- Build E3001 message; when the missing effect is device_io or mem, add a suggestion. -}
 fn e3001_message(fn_name: string, eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> string {
-    base: string <- concat("Function '", concat(fn_name, concat("' uses effect ", concat(effect_checker_core@effect_name_to_string(eff), " but does not declare it in its signature"))));
+    base: string <- concat("Function '", concat(fn_name, concat("' uses effect ", concat(needed_effect_display(eff), " but does not declare it in its signature"))));
     norm: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- effect_checker_core@normalize_effect(eff);
     case norm.name == "device_io" of {
         true -> concat(base, ". Add proc[device_io] to the function signature, or remove any use of print, print_string, println, print_int64, print_int32, print_int16, print_int8, print_float64, print_boolean, print_atom, read_lines, file_exists, append_file, or delete_file");
         false -> case norm.name == "mem" of {
-            true -> concat(base, concat(". Add proc[mem(", concat(norm.parameter, ")] for region operations (alloc_region, alloc_ref, read_ref, write_ref, alloc_rec, build) and list operations (literals, empty, prepend, remove_head, length, map, filter, reduce)")));
-            false -> case norm.name == "concurrency" of {
-                true -> concat(base, ". Add proc[concurrency] for actor operations (spawn, spawn_registered, spawn_registered_supervisor, spawn_linked, link, monitor, demonitor, call, cast, send, self, recv, pin_actor_to_*, unpin_actor, remove_actor, set_actor_priority, get_cpu_topology, get_efficiency_cores, get_performance_cores, get_core_capabilities, etc.) per spec Section 15.4.8.3-15.4.8.7, Section 22.4, Section 16.1, and Section 22.10 (CPU Affinity; supervisors Phases B/C/D/E/F/G: ingress, exit payloads, behavior-only spawn/link, Phase E runtime restart/child_spec/escalation, runtime→FailureReporter unwind, and Phase G link/monitor/demonitor / DOWN / cascading shutdown do not add a separate effect—routing is runtime-only)");
-                false -> base
+            true -> concat(base, concat(". Add proc[mem(", concat(mem_kind_hint(norm.parameter), ")] for region operations (alloc_region, alloc_ref, read_ref, write_ref, alloc_rec, build) and list operations (literals, empty, prepend, remove_head, length, map, filter, reduce)")));
+            false -> case norm.name == "transport" of {
+                true -> concat(base, transport_hint());
+                false -> case norm.name == "concurrency" of {
+                    true -> concat(base, ". Add proc[concurrency] for actor operations (spawn, spawn_registered, spawn_registered_supervisor, spawn_linked, link, monitor, demonitor, call, cast, send, self, recv, pin_actor_to_*, unpin_actor, remove_actor, set_actor_priority, get_cpu_topology, get_efficiency_cores, get_performance_cores, get_core_capabilities, etc.) per spec Section 15.4.8.3-15.4.8.7, Section 22.4, Section 16.1, and Section 22.10 (CPU Affinity; supervisors Phases B/C/D/E/F/G: ingress, exit payloads, behavior-only spawn/link, Phase E runtime restart/child_spec/escalation, runtime→FailureReporter unwind, and Phase G link/monitor/demonitor / DOWN / cascading shutdown do not add a separate effect—routing is runtime-only)");
+                    false -> base
+                }
             }
         }
     }
 }
 
+{- The hint appended to an E3001 that names transport (a transport operation outside a sequence, or
+   in a function body with no sequence): the operations, the effect, and that any mem(...) kind
+   satisfies their allocation. -}
+{- The mem kind an E3001 hint suggests: the one the operation named, or normal when the operation
+   accepts any kind (the transport operations' mem(any) requirement). -}
+fn mem_kind_hint(param: string) -> string {
+    case param == effect_checker_core@mem_any_parameter() of {
+        true -> "normal";
+        false -> param
+    }
+}
+
+fn transport_hint() -> string {
+    ". encode, decode, recreate, byte_at, byte_slice, bytes_of and join_bytes are transport operations: call them inside a sequence-produces pure-end block whose proc[...] declares transport beside its allocation effect, e.g. proc[mem(normal), transport] (any mem(...) kind satisfies the allocation)"
+}
+
 {- E3001 message for effectful code outside a SEQUENCE block.
    The fix is to wrap in a do proc[effect] ... end block, not to add proc to the function signature. -}
 fn e3001_outside_sequence_message(fn_name: string, eff: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> string {
-    base: string <- concat("Function '", concat(fn_name, concat("' uses effect ", concat(effect_checker_core@effect_name_to_string(eff), " but the effectful code is not inside a sequence block"))));
+    base: string <- concat("Function '", concat(fn_name, concat("' uses effect ", concat(needed_effect_display(eff), " but the effectful code is not inside a sequence block"))));
     norm: { name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- effect_checker_core@normalize_effect(eff);
     case norm.name == "device_io" of {
         true -> concat(base, ". Add proc[device_io] to a sequence-produces pure-end block (do proc[device_io] ... end)");
         false -> case norm.name == "mem" of {
-            true -> concat(base, concat(". Add proc[mem(", concat(norm.parameter, ")] to a sequence-produces pure-end block for region operations (alloc_region, alloc_ref, read_ref, write_ref, alloc_rec, build) and list operations (literals, empty, prepend, remove_head, length, map, filter, reduce)")));
+            true -> concat(base, concat(". Add proc[mem(", concat(mem_kind_hint(norm.parameter), ")] to a sequence-produces pure-end block for region operations (alloc_region, alloc_ref, read_ref, write_ref, alloc_rec, build) and list operations (literals, empty, prepend, remove_head, length, map, filter, reduce)")));
             false -> case norm.name == "concurrency" of {
                 true -> concat(base, ". Add proc[concurrency] to a sequence-produces pure-end block for actor operations (spawn, spawn_registered, spawn_registered_supervisor, spawn_linked, link, monitor, demonitor, call, cast, send, self, recv, pin_actor_to_*, unpin_actor, remove_actor, set_actor_priority, etc.; spec Section 15.4.8.3-15.4.8.7, Section 22.4, Section 16.1) and Section 22.10 CPU Affinity (supervisors Phases B/C/D/E/F/G: no separate effect for ingress, exit-notification plumbing, Phase E automatic restart, FailureReporter unwind delivery, or Phase G link/monitor/demonitor and DOWN/ingress vs standard mailbox—runtime only)");
-                false -> concat(base, ". Add the appropriate effect to a sequence-produces pure-end block")
+                false -> case norm.name == "transport" of {
+                    true -> concat(base, transport_hint());
+                    false -> concat(base, ". Add the appropriate effect to a sequence-produces pure-end block")
+                }
             }
         }
     }
