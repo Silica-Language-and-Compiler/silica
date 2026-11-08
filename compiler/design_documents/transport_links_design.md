@@ -53,7 +53,45 @@ Phases (§9): A hosted link naming, B UART on the ESP32-S3, C UART on the Nucleo
     former open question 4). Forcing traffic through the interface with per-OS socket options (`IP_BOUND_IF` on
     macOS, `SO_BINDTODEVICE` on Linux) is a possible later option, not part of phase A.
 
-Open questions 1, 2 and 4 are resolved by decisions 8 to 10; the remaining questions keep their numbers (§12).
+11. **Hosted `(:ethernet, n)` and `(:wifi, n)` stay** (Lee, 2026-11-08, resolving open question 3). The link syntax is
+    identical on hosted targets and boards. A hosted target accepts the same tags and resolves them through the host:
+    `(:ethernet, n)` and `(:wifi, n)` mean the n-th interface the OS classifies as that family, by interface
+    enumeration (`getifaddrs`), and when no such interface exists the carrier fails at open with the supervised exit
+    `(:explicit, :link_unavailable)` (§3.2). `(:loopback)` and `(:interface, name)` remain valid on hosts. The hosted
+    `provides_link` answers true for every tag the hosted target supports.
+12. **No pin overrides** (Lee, 2026-11-08, resolving open question 5). Pins come only from the board pack; a program
+    cannot pass pins (§4).
+13. **UART settings: 8N1 stays fixed for now** (Lee, 2026-11-08, resolving open question 7). Parity, stop bits and flow
+    control are deferred to later.
+14. **No link-specific backoff** (Lee, 2026-11-08, resolving open question 8). The default supervisor restart policy
+    applies to an absent or unplugged link (§6.3).
+15. **No send-and-receive on the boards** (Lee, 2026-11-08, resolving open question 10). A TX-to-RX jumper is not
+    guaranteed on the test boards, so a loopback or round-trip UART trial is not an approach, and no board trial does
+    both send and receive. Board UART trials are limited to compile-time and assembly checks, diagnostics, and at
+    most one direction against the Mac serial peer. Host trials may keep full loopback (§10).
+16. **The hosted packs are brought up to date together with their `provides_link` rows in phase A** (Lee, 2026-11-08,
+    resolving open question 12), not left to `Carrier.silica` alone (§5.1).
+17. **UART instances per board; the console is never a link; no UART sharing** (Lee, 2026-11-08, resolving open
+    question 6). ESP32-S3_raw exposes **UART1 and UART2** as links; UART0 is the console and is rejected.
+    STM32-L476RG_raw exposes **USART1** first; USART2 is the console (the ST-LINK virtual COM port) and is rejected;
+    further instances such as USART3 are added to the pack later, once their pins are confirmed against the
+    NUCLEO-L476RG user manual and the STM32L476 datasheet. A link naming the console instance is rejected **at compile
+    time** with **E2412 LinkNotProvidedOnTarget**; no new sub-code is added, and the message says the instance is the
+    console (§5.2). **Any sharing of a UART instance is rejected at compile time**: two carriers or links naming the
+    same UART instance in one program give **E2415 LinkInstanceConflict**, and a UART instance used as the console or
+    by another subsystem (printing, failure banners, peek/poke apps) gives E2415 as well, naming the other user. The
+    pin assignments in the pack are **to be verified against the board documentation when the pack rows are written**
+    (phase B for the ESP32-S3, phase C for the Nucleo); this document does not fix pin numbers beyond those it
+    already quotes.
+18. **No polling on hosted targets** (Lee, 2026-11-08, resolving open question 9). If the interface is absent when the
+    carrier opens, the carrier fails at once with `(:explicit, :link_unavailable)` and the supervisor's default
+    restart policy provides the retry; if the interface disappears while running, the socket error becomes the failure
+    (the `:link_lost` path). No poll-interval constant exists (§3.2).
+
+Open questions 1 to 10 and 12 are resolved by decisions 8 to 18 (11 and 13 were resolved in place in §12): decisions 8 to 10 resolve questions 1, 2 and 4;
+decisions 11 to 16 resolve questions 3, 5, 7, 8, 10 and 12 (decision 11 for 3, 12 for 5, 13 for 7, 14 for 8, 15 for
+10, 16 for 12); decision 17 resolves question 6; decision 18 resolves question 9. Decision numbers and question
+numbers are different series, and the question numbers are kept (§12).
 
 ## 2. Existing vocabulary this builds on
 
@@ -94,8 +132,8 @@ carriers):
 | --- | --- | --- | --- |
 | `(:loopback)` | none | `:tcp`, `:udp` | hosted: bind or connect on the host's loopback interface |
 | `(:interface, name: atom or string)` | interface name | `:tcp`, `:udp` | hosted: bind to the named OS interface (`"en0"`, `"eth0"`, `"wlan0"`) |
-| `(:ethernet, n: uint32)` | instance | `:tcp`, `:udp` | hosted: the family "any wired interface"; boards (phase D): the RMII/SPI MAC instance n |
-| `(:wifi, n: uint32)` | instance | `:tcp`, `:udp` | hosted: the family "any wireless interface"; boards (phase D): the Wi-Fi station n |
+| `(:ethernet, n: uint32)` | instance | `:tcp`, `:udp` | hosted: the n-th interface the OS classifies as wired (interface enumeration); boards (phase D): the RMII/SPI MAC instance n |
+| `(:wifi, n: uint32)` | instance | `:tcp`, `:udp` | hosted: the n-th interface the OS classifies as wireless (interface enumeration); boards (phase D): the Wi-Fi station n |
 | `(:uart, n: uint32, baud: uint32)` | UART instance, baud | `:serial` | board: UART n at baud b, 8N1, no flow control; hosted: not provided (a hosted serial port is `(:serial_port, path, baud)`) |
 | `(:serial_port, path: string, baud: uint32)` | OS device path, baud | `:serial` | hosted: a termios port; today's `(:serial)` carrier with its `"path@baud"` address split out |
 | `(:usb_cdc, n: uint32)` | instance | `:serial` | board, later (plan item L) |
@@ -112,13 +150,22 @@ therefore only says **which interface family the carrier's socket binds to**:
 - `(:interface, "en0")`: bind to the address of that interface (`getifaddrs` lookup at `:open`) so traffic uses it.
   If the interface is absent or has no address at `:open`, the carrier fails (§6.3), exactly as a board link that
   fails to come up.
-- `(:ethernet, n)` and `(:wifi, n)`: pick the n-th interface of that family by the OS's own classification (the
-  interface list order; the family from `getifaddrs` flags and the system's interface type). Hosted instance numbers
-  are only as stable as the OS's enumeration, so portable programs name `(:interface, "...")`; see open question 3.
+- `(:ethernet, n)` and `(:wifi, n)` (decision 11, Lee, 2026-11-08): the link syntax is identical on hosted targets and
+  boards, and the hosted target accepts the same tags and resolves them through the host. **Rule:** the carrier picks
+  the n-th interface (counting from 0, in interface enumeration order) that the OS classifies as that family, using
+  `getifaddrs` and the system's interface type. If the OS cannot give such a link a number or a family, or fewer than
+  n+1 interfaces of that family exist, the carrier fails at `:open` with the supervised exit `(:explicit,
+  :link_unavailable)` (§6.3), exactly as for an absent `(:interface, name)`. Hosted instance numbers are only as
+  stable as the OS's enumeration, so a program that needs a fixed interface still names `(:interface, "...")`, which
+  remains valid on hosts together with `(:loopback)`. The tags are never dropped on hosts.
   `(:interface, name)` is bind to that interface's address (decision 10), not a forced route.
 - The bring-up actor on a hosted target is the carrier actor itself (the OS did the work). There is no separate
   bring-up actor, no `device_io` effect, and no configuration table: the interface name in the declaration is the
   whole configuration. TCP and UDP behaviour is as in `dangerous_tcp_carrier` and `dangerous_udp_carrier` today.
+  **No polling** (decision 18, Lee, 2026-11-08): the merged actor never waits for an interface to appear. If the
+  interface is absent at `:open`, the carrier fails at once with `(:explicit, :link_unavailable)` and the supervisor's
+  default restart policy provides the retry; if the interface disappears while running, the socket error becomes the
+  failure (the `:link_lost` path, §6.3). No poll-interval constant exists.
 
 ### 3.3 Syntax proposal
 
@@ -168,8 +215,9 @@ carried_on host_line: (:serial) (:uart, 1, 115200);
 // boundaries(host_line) is :stream, so every frame gets a length prefix (transport design §5).
 ```
 
-The Nucleo version is the same file with `(:uart, 2, 115200)` for the ST-LINK virtual COM port, or another instance
-the Nucleo pack lists.
+The Nucleo version is the same file with `(:uart, 1, 115200)` (USART1, the first instance the Nucleo pack provides,
+decision 17). The ST-LINK virtual COM port is USART2, the console, and is not available as a link: `(:uart, 2, ...)`
+is rejected at compile time (§5.2).
 
 **Example 3: a rejected link.** The Nucleo's transport pack does not list `(:wifi, 0)`; a hosted target does not list
 `(:uart, ...)`:
@@ -181,7 +229,7 @@ carried_on lan: (:tcp) (:wifi, 0);
 
 // on STM32-L476RG_raw:
 // error E2412 LinkNotProvidedOnTarget at dangerous_bad_link, carried_on lan:
-//   link (:wifi, 0) is not provided by target STM32-L476RG_raw; the board pack lists: (:uart, 1..3)
+//   link (:wifi, 0) is not provided by target STM32-L476RG_raw; this target provides: (:uart, 1)
 ```
 
 ### 3.4 Where the link properties are answered
@@ -223,9 +271,9 @@ to know the board (decision 2), configuration is not a second declaration in the
 Rules:
 
 1. **Pins come from the board pack and are not a declaration parameter.** `(:uart, 1, 115200)` means the pins the
-   board pack lists for UART 1. A program cannot override them in phase B or C: a pin override is a board-pack
-   edit, since "programmers know their boards". An alternative (an optional pin pair parameter, with a pack
-   `pin_ok(link, pin)` check) is open question 5.
+   board pack lists for UART 1. A program cannot pass pins and there are no pin overrides *(Resolved 2026-11-08,
+   Lee: pins come only from the board pack.)* A board wired differently is a board-pack edit, since "programmers
+   know their boards". The optional pin-pair parameter with a pack `pin_ok(link, pin)` check is dropped.
 2. **The config unit is data, not code.** `board_config.silica` is a module of exported pure functions, in the shape of
    the board pack (`wifi_ssid(n: uint32) -> string`, `wifi_key(n: uint32) -> string`, `ip_mode(n: uint32) -> atom`
    with `:dhcp` or `:static`). The bring-up actor reads them. The compiler reads them as data; they never appear
@@ -249,7 +297,7 @@ export provides_link/2;
 // link: the tag name ("uart"); instance: the instance number (0 where the link has none).
 fn provides_link(link: string, instance: uint32) -> boolean {
     case link of {
-        "uart" -> instance == 1 or instance == 0;   // ESP32-S3_raw phase B: UART1 only; UART0 is the console
+        "uart" -> instance == 1 or instance == 2;   // ESP32-S3_raw phase B: UART1 and UART2; UART0 is the console (rejected)
         _: string -> false
     }
 }
@@ -259,10 +307,15 @@ The rows by target and phase:
 
 | Target | Phase | `provides_link` rows | Notes |
 | --- | --- | --- | --- |
-| apple_silicon_mac, linux_aarch64, linux_x86_64 | A | `loopback`, `interface`, `ethernet n`, `wifi n`, `serial_port` | instance rows are answered at run time by the OS; the compile-time check is only that the tag exists |
-| ESP32-S3_raw | B | `uart 1` | UART0 is the console (`rt_console.S`) and must not be claimed; UART2 deferred until its pins are in the board pack |
-| STM32-L476RG_raw | C | `uart 1`, `uart 3` | USART2 is the console (ST-LINK virtual COM port); which of USART1/3 reach a header is a board-pack question (open question 6) |
+| apple_silicon_mac, linux_aarch64, linux_x86_64 | A | `loopback`, `interface`, `ethernet n`, `wifi n`, `serial_port` | answers true for every tag the hosted target supports (decision 11); instance rows are resolved at run time through the host (§3.2), so the compile-time check is only that the tag exists and an absent interface fails at carrier open with `(:explicit, :link_unavailable)` |
+| ESP32-S3_raw | B | `uart 1`, `uart 2` | UART0 is the console (`rt_console.S`) and is rejected at compile time (E2412, console message); the pins of UART1 and UART2 are verified against the board documentation when the phase B pack rows are written (decision 17) |
+| STM32-L476RG_raw | C | `uart 1` | USART2 is the console (ST-LINK virtual COM port) and is rejected at compile time (E2412, console message); USART3 and others are added later once their pins are confirmed against the NUCLEO-L476RG user manual and the datasheet; USART1's pins are verified when the phase C pack rows are written (decision 17) |
 | both boards | D, later | `wifi`, `ethernet` | out of scope (§8) |
+
+**The hosted packs are brought up to date together with their `provides_link` rows in phase A** (decision 16, Lee,
+2026-11-08). The macOS and Linux packs today answer `false` for every carrier tag and leave the hosted carriers to
+`Carrier.silica`; phase A makes their `provides_carrier` rows match what the hosted carriers provide and adds the
+`provides_link` rows above in the same change, so the pack is the one place the compiler asks, as on the boards.
 
 The existing `provides_carrier(tag)` row for `"serial"` becomes `true` on the targets that provide a link for it, so
 E2410 keeps its meaning (the kind is provided) and the new E2412 says the hardware is not.
@@ -276,10 +329,10 @@ rows below, in the style of the §9.3 table; the diagnostics table at implementa
 
 | Code | Check |
 | --- | --- |
-| E2412 LinkNotProvidedOnTarget | a carrier declaration names a link the target's transport pack does not list; raised by the target's emitter (as E2410 is), wherever the declaration appears, including one nothing uses. Message: `link (:uart, 2) is not provided by target ESP32-S3_raw; this target provides: (:uart, 1)`. Names the module, the carrier, the link and the target |
+| E2412 LinkNotProvidedOnTarget | a carrier declaration names a link the target's transport pack does not list; raised by the target's emitter (as E2410 is), wherever the declaration appears, including one nothing uses. Message: `link (:uart, 3) is not provided by target ESP32-S3_raw; this target provides: (:uart, 1), (:uart, 2)`. Names the module, the carrier, the link and the target. **Console instance (decision 17):** the same code, no separate sub-code; the pack knows the console instance and the message says so: `link (:uart, 0) is the console of target ESP32-S3_raw and cannot be used as a link; this target provides: (:uart, 1), (:uart, 2)` (Nucleo: `link (:uart, 2) is the console of target STM32-L476RG_raw (the ST-LINK virtual COM port) ...; this target provides: (:uart, 1)`) |
 | E2413 LinkUnknown | a link tag not in the language's link vocabulary (a misspelling), raised by the shared front end for every target, as E2408 is for carriers |
 | E2414 LinkCarrierMismatch | the link cannot carry the carrier's kind (`:tcp` on `(:uart, 1, 115200)`, `:serial` on `(:wifi, 0)`) |
-| E2415 LinkInstanceConflict | two carrier declarations in one application name the same link tag and instance (decision 6). Message names both |
+| E2415 LinkInstanceConflict | two carrier declarations in one application name the same link tag and instance (decision 6); also a UART instance that another subsystem uses (the console, printing, failure banners, peek/poke apps; decision 17), so no UART instance is ever shared. Message names both users |
 | E2416 LinkConfigMissing | the link needs a configuration function (`board_config.silica`, §4) that is not defined; names the function. Phase D |
 | E2417 LinkParameterInvalid | a link parameter fails the pack's check: baud out of the UART's range, a non-literal instance or baud (the declaration is pure and literal-only, as limits records are), an interface name that is not a literal |
 
@@ -335,10 +388,12 @@ needs a Fifi stack (lwIP), that part is `external_danger` and `dangerous_`-prefi
   actor failure (fault 70 conventions apply only to `main` and trusted runtime), a runtime abort (71) only when
   `main` runs the failing check.
 - **What the supervisor does.** Under the normal supervisor policy (restart count and restart interval of the
-  existing supervisors, backoff via the SYSTIMER restart clock on boards), the supervisor restarts the bring-up actor;
+  existing supervisors, restart timing via the SYSTIMER restart clock on boards), the supervisor restarts the bring-up actor;
   if it exceeds its restart budget, the supervisor itself fails as any supervisor does (the application then
   handles it at the root, or `main` sees the process fault 70 / abort 71 convention). A program wanting different
   behaviour (give up after N, fall back to another link) uses the supervisor policy, not a check in the sender.
+  There is **no link-specific backoff** *(Resolved 2026-11-08, Lee.)*: the default supervisor restart policy applies
+  to an absent or unplugged link, including a cable that is simply unplugged.
 - **What the carrier actor does.** The carrier actor is the owner-facing end and is told by messages, not by return
   values:
   - **On `:link_ready`** (from the bring-up actor): the carrier sends `(:link_up, info)` to its owner, grants send credit
@@ -393,10 +448,12 @@ Explicitly not designed in detail now. What it would need, listed so the declara
   budget note). **STM32-L476RG**: no on-chip Ethernet MAC or Wi-Fi radio; it needs an external module
   (ESP-AT over UART, or a SPI Ethernet chip such as the W5500), so the "link" there is the module, a different
   link tag (`(:esp_at, n)`, `(:spi_ethernet, n)`).
-- **Bring-up actor logic**: association, DHCP, reconnect with backoff, using §6, and the `board_config.silica` rules of §4
+- **Bring-up actor logic**: association, DHCP, reconnect under the default supervisor restart policy (no link-specific
+  backoff, §6.3), using §6, and the `board_config.silica` rules of §4
   (E2416).
 - **A TLS and trust story** (`tls_quantum_safe_future.md`) before any carrier leaves a lab network.
-- **Hosted instance numbers** for `(:wifi, n)` and `(:ethernet, n)` get a stable meaning (open question 3).
+- **Hosted instance numbers** for `(:wifi, n)` and `(:ethernet, n)` follow the interface-enumeration rule of §3.2
+  (decision 11); a stronger, stable numbering is not planned.
 
 None of this is built in phases A to C, and a program naming `(:wifi, n)` on a board gets E2412.
 
@@ -404,9 +461,9 @@ None of this is built in phases A to C, and a program naming `(:wifi, n)` on a b
 
 | Phase | Scope | Work | Closes when |
 | --- | --- | --- | --- |
-| **A. Hosted link naming** | Mac, Linux AArch64, Linux x86-64 | parse and check `carried_on ... (...)`; `Link.silica`; `provides_link` in the three hosted packs; `(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`, `(:serial_port, path, baud)`; `spawn_dangerous_carrier` taking a declaration; the TCP, UDP and serial carriers take the interface and the path from the declaration; E2412 to E2415, E2417; docs in transport design §6.3 and a new specification subsection | the existing loopback and serial trials pass with a declaration in place of the module and address strings; the new link trials pass |
-| **B. UART on the ESP32-S3** | ESP32-S3_raw | `(:uart, 1, baud)` in the pack; board pack `uart_tx_pin(n)`, `uart_rx_pin(n)`; the UART1 worker (plan item N) with the carrier contract; the bring-up actor (§6) and the failure atoms; `board_values.silica` demo of transport design §10 phase 4 | the ETF-over-UART demo runs; board link trials pass; `make integrate` for the target is green |
-| **C. UART on the Nucleo** | STM32-L476RG_raw | `(:uart, 1|3, baud)`; Nucleo board pack indexed pins; the USART worker; the same bring-up actor logic; Mac `(:serial_port, ...)` against the ST-LINK port as the peer | the same trials as phase B pass on the Nucleo |
+| **A. Hosted link naming** | Mac, Linux AArch64, Linux x86-64 | parse and check `carried_on ... (...)`; `Link.silica`; the three hosted packs brought up to date together with their `provides_link` rows (decision 16); `(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`, `(:serial_port, path, baud)`; `spawn_dangerous_carrier` taking a declaration; the TCP, UDP and serial carriers take the interface and the path from the declaration; E2412 to E2415, E2417; docs in transport design §6.3 and a new specification subsection | the existing loopback and serial trials pass with a declaration in place of the module and address strings; the new link trials pass |
+| **B. UART on the ESP32-S3** | ESP32-S3_raw | `(:uart, 1|2, baud)` in the pack (UART0, the console, rejected; pins verified against the board documentation when the rows are written); board pack `uart_tx_pin(n)`, `uart_rx_pin(n)`; the UART1 worker (plan item N) with the carrier contract; the bring-up actor (§6) and the failure atoms; `board_values.silica` demo of transport design §10 phase 4 | the one-direction ETF-over-UART demo (board sends to the Mac peer) runs; the board link trials of §10 (compile-time, assembly, diagnostics, at most one direction) pass; `make integrate` for the target is green |
+| **C. UART on the Nucleo** | STM32-L476RG_raw | `(:uart, 1, baud)` (USART2, the console, rejected; USART3 and others later; pins verified against the NUCLEO-L476RG user manual and datasheet when the rows are written); Nucleo board pack indexed pins; the USART worker; the same bring-up actor logic; Mac `(:serial_port, ...)` against the ST-LINK port as the peer | the same trials as phase B (no board trial does both send and receive) pass on the Nucleo |
 | **D. Network links on boards** | both boards | §8 | decided later |
 
 Each phase ends with its own trials; the all-trials-every-version constraint holds, so goldens are hand-derived and
@@ -432,22 +489,45 @@ the `TRIAL_TARGET` driver; goldens hand-derived.
   `link_carrier_mismatch` (E2414: `:tcp` on `(:uart, 1, 115200)`), `link_instance_conflict` (E2415: two carriers on
   `(:uart, 1, ...)`), `link_parameter_invalid` (E2417: non-literal baud).
 - `link_interface_absent` (run-time): `(:interface, "nope0")`; asserts the carrier ends with `(:explicit,
-  :link_unavailable)` and that a supervisor restart is counted.
+  :link_unavailable)` and that a supervisor restart is counted under the default restart policy.
+- `link_family_absent` (run-time): `(:wifi, 7)` (and `(:ethernet, 7)`), an instance no host has; asserts the same
+  `(:explicit, :link_unavailable)` exit at open (decision 11) and a counted restart.
+- `app_transport_family_link` (success, host-dependent, outside `make integrate` like the serial trial): `(:ethernet,
+  0)` or `(:wifi, 0)` on a host that has such an interface.
+- Host trials may keep full loopback: send and receive together are tested here, on `(:loopback)` and the loopback
+  interface, and only here (see the board rule below).
 
 **Phase B (ESP32-S3, board trials):**
 
-- `uart1_link_echo`: carrier on `(:uart, 1, 115200)` frames a value and the board's loopback jumper (TX35 to RX36)
-  returns it; success output matches.
-- `uart1_link_failure_restart`: forces a bring-up failure (a documented fault injection in the UART worker) and asserts
-  restart under the supervisor and a second `:link_ready` at the carrier (a second `(:link_up, info)` at the owner); no process exit.
-- `uart1_stream_framing`: a frame larger than the FIFO (128) crosses, proving the length-prefix path (§7).
+**Board rule (decision 15, Lee, 2026-11-08):** there is no guarantee of a TX-to-RX jumper on the test boards, so a
+loopback or round-trip UART trial is not an approach, and send and receive together are **not** tested on boards.
+Board UART trials are limited to (a) compile-time and assembly checks, (b) diagnostics, and (c) at most one direction
+against the Mac `(:serial_port, ...)` peer. No board trial does both send and receive; the receive side and the full
+round trip are covered by host trials only.
+
+- `uart1_link_assembly`: a program with a carrier declared on `(:uart, 1, 115200)` compiles for the target, and the
+  emitted assembly matches the hand-derived golden (the UART1 window, the pin and baud setup taken from the board
+  pack). No run on the board.
+- `uart1_stream_framing` (one direction, board to Mac): the board only **sends** a frame larger than the FIFO (128)
+  through the carrier, and the Mac peer reads and checks it, proving the length-prefix path (§7). The board never
+  receives in this trial.
+- Not a board trial: `uart1_link_failure_restart`. Forcing a bring-up failure with a fault injection and waiting for a
+  second `:link_ready` needs no UART traffic but is not a compile-time, assembly or diagnostic check, so it is not in
+  the board set; supervised restart on link failure is proved by the hosted `link_interface_absent` and
+  `link_family_absent` trials, and the board bring-up actor's restart path is covered at compile time and by
+  assembly only. Likewise there is no `uart1_link_echo` and no jumper-based trial.
 - Error trials: `link_not_provided_wifi_esp32s3` (E2412 for `(:wifi, 0)`), `link_uart0_console_reserved`
-  (E2412 for `(:uart, 0, ...)`).
+  (E2412 for `(:uart, 0, ...)`), `link_err_console_instance` (E2412 with the console message, for the console UART0;
+  may be the same unit as `link_uart0_console_reserved`, in which case that name stands), `link_err_uart_shared`
+  (E2415: two carriers on `(:uart, 1, ...)`, and a second unit with a carrier on a UART instance another subsystem
+  uses; decision 17).
 - A `provides_link` table trial for the pack itself (pure function answers).
 
-**Phase C (Nucleo):** the phase B trials with the Nucleo's instances; `link_not_provided_uart2_console` (E2412 for
-the console USART); Mac-to-Nucleo frame exchange through the ST-LINK port, recorded in the board README like the other
-apps.
+**Phase C (Nucleo):** the phase B trials with the Nucleo's instances, under the same board rule (assembly, diagnostics
+and at most one direction; no trial does both send and receive); `link_not_provided_uart2_console` (E2412 for the
+console USART), `link_err_console_instance` (the same rejection, named as in phase B; one unit serves both names) and
+`link_err_uart_shared` (E2415 for two carriers on `(:uart, 1, ...)`); a one-direction frame exchange against the Mac peer through the ST-LINK port, recorded in the board
+README like the other apps.
 
 **Phase D:** none defined.
 
@@ -464,38 +544,46 @@ apps.
 
 ## 12. Open questions
 
-Questions 1, 2 and 4 were resolved on 2026-11-08 (decisions 8 to 10); numbers are kept so references stay stable.
-Eight remain (3, 5 to 10 and 12); 11 and 13 are resolved.
+Questions 1, 2 and 4 were resolved on 2026-11-08 (decisions 8 to 10), and 3, 5, 7, 8, 10 and 12 on 2026-11-08 by Lee
+(decisions 11 to 16), and question 6 on 2026-11-08 by Lee (decision 17); numbers are kept so references stay stable.
+No open questions remain; all are resolved.
 
 
 1. *(Resolved: decision 8.)*
 2. *(Resolved: decision 9.)*
-3. **Hosted `(:ethernet, n)` and `(:wifi, n)`.** The OS gives no stable numbering and no portable family
-   classification (macOS `en0` is either; Linux names vary). Options: drop them on hosted targets in phase A and keep
-   only `(:loopback)` and `(:interface, name)`; or define family by `getifaddrs` flags. Not decided.
+3. *(Resolved 2026-11-08, Lee.)* **Hosted `(:ethernet, n)` and `(:wifi, n)`.** The tags are not dropped on hosts: the
+   link syntax stays identical on hosted targets and boards. If the OS cannot reliably give such links a number or
+   family, the hosted target still accepts the same tags and resolves them through the host: the n-th interface the
+   OS classifies as that family, via interface enumeration, failing at carrier open with the supervised exit
+   `(:explicit, :link_unavailable)` when absent (§3.2). `(:loopback)` and `(:interface, name)` remain valid on hosts.
+   `provides_link` for hosted answers true for all hosted-supported tags (§5.1).
 4. *(Resolved: decision 10.)*
-5. **Pin overrides.** The decision keeps pins in the board pack. Whether a program may pass pins (with a pack
-   `pin_ok` check) for boards wired differently is open.
-6. **Which UART instances each board provides.** ESP32-S3: UART0 console, UART1 header (35/36); UART2 not in the draft
-   board pack. Nucleo: USART2 console; whether USART1 (PA9/PA10) and USART3 reach headers on the NUCLEO-L476RG
-   Arduino or Morpho connectors needs the board manual; the Nucleo pack lists the window names but no pins for them.
-7. **UART settings beyond baud.** 8N1, no flow control is hard-coded as in the hosted serial carrier. Parity, stop bits and
-   RTS/CTS are a link parameter later or never.
-8. **Restart budget when the link is physically absent.** A bring-up that fails immediately restarts until the
-   supervisor's budget is exhausted and then fails the supervisor. Whether the default supervisor policy suits a
-   board with a cable that is simply unplugged, or a link-specific backoff is needed, is not decided by anything in
-   the repo.
-9. **Effect of the bring-up actor on the number of dangerous-actor threads on hosted targets.** Each dangerous actor is
-   an OS thread; one bring-up actor per link on a hosted target is avoided by merging roles (§3.2), but what the
-   merged actor does while waiting on an absent interface (poll interval) is open.
-10. **Trial hardware.** The UART loopback trial assumes a TX-to-RX jumper on the board under test. Whether the shared
-    test boards will have the jumper fitted, or the trials use the Mac `(:serial_port, ...)` peer instead, is
-    Lee's call.
+5. *(Resolved 2026-11-08, Lee.)* **Pin overrides.** There are no pin overrides: pins come only from the board pack,
+   and a program cannot pass pins (§4).
+6. *(Resolved 2026-11-08, Lee; decision 17.)* **Which UART instances each board provides.** ESP32-S3_raw: UART1 and
+   UART2 (UART0 is the console, rejected). STM32-L476RG_raw: USART1 first (USART2 is the console, rejected; USART3 and
+   others added later once confirmed against the user manual and datasheet). A link naming the console instance is
+   E2412 at compile time; any sharing of a UART instance is E2415. Pins are verified against the board documentation
+   when the pack rows are written (phase B, phase C).
+7. *(Resolved 2026-11-08, Lee.)* **UART settings beyond baud.** Parity, stop bits and flow control are deferred
+   (later); 8N1, no flow control stays fixed for now, as in the hosted serial carrier.
+8. *(Resolved 2026-11-08, Lee.)* **Restart budget when the link is physically absent.** There is no link-specific
+   backoff: the default supervisor restart policy applies to an absent or unplugged link (§6.3).
+9. *(Resolved 2026-11-08, Lee.)* **Effect of the bring-up actor on the number of dangerous-actor threads on hosted
+   targets.** One bring-up actor per link on a hosted target is avoided by merging roles (§3.2). There is no polling:
+   if the interface is absent when the carrier opens, the carrier fails at once with `(:explicit, :link_unavailable)`
+   and the supervisor's default restart policy provides the retry; if the interface disappears while running, the
+   socket error becomes the failure (the `:link_lost` path). No poll interval constant exists.
+10. *(Resolved 2026-11-08, Lee.)* **Trial hardware.** There is no guarantee of a TX-to-RX jumper on the test boards,
+    so a loopback or round-trip UART trial is not an approach, and send and receive together are not tested on boards.
+    Board UART trials are limited to compile-time and assembly checks, diagnostics, and at most one direction against
+    the Mac `(:serial_port, ...)` peer; no board trial does both send and receive. Host trials may keep full loopback
+    (§10).
 11. **Diagnostic numbers.** Resolved 2026-11-08: E2412 to E2417 are used as the provisional numbers (§5.2). The E2406 and
     E2407 numbers of the transport design are still provisional.
-12. **Where `provides_link` for the hosted targets lives.** The hosted carriers are provided through `Carrier.silica`
-    and the Mac, Linux packs answer `false` for every carrier tag (their comments say the carrier tags are provided "as
-    on the Mac"). `provides_link` could follow the same split or the packs could be brought up to date together.
+12. *(Resolved 2026-11-08, Lee.)* **Where `provides_link` for the hosted targets lives.** The hosted packs (macOS,
+    Linux) are brought up to date together with their `provides_link` rows in phase A, not left to `Carrier.silica`
+    alone (§5.1, §9).
 13. *(Resolved 2026-11-08, Lee.)* **Naming of the hardware-level events.** The bring-up actor's events to the carrier are
     `:link_ready` and `:link_lost` and its exit reason is `(:explicit, :link_lost)`, so they do not share names with the
     owner-facing `:link_up` and `:link_down` of the carrier contract (§6.3). Likewise the built-in carriers' `:tcp`,

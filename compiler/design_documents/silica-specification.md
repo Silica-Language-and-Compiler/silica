@@ -10695,12 +10695,16 @@ is the planned replacement for installing a carrier through `spawn_dangerous` wi
 **The transport pack (planned).** Each target's transport pack gains `provides_link(link: string, instance: uint32)
 -> boolean`, flat tables like `provides_carrier`, never overridden by a program. The pack lists what the target
 provides; configuration that is fixed by the board (UART pins, windows) lives in the board pack and is not a
-declaration parameter.
+declaration parameter: pins come only from the board pack and a program cannot pass pins. A UART link is 8N1 with no
+flow control; parity, stop bits and flow control are deferred.
 
 **Meaning by target.** On a hosted target the OS owns the hardware and brings the interface up. `(:loopback)` binds or
 connects on the host's loopback address; `(:interface, name)` binds to the address of the named interface (portable;
 forcing traffic through the interface with per-OS socket options is a possible later option); `(:ethernet, n)` and
-`(:wifi, n)` pick the n-th interface of that family, and instance numbers are only as stable as the OS's enumeration;
+`(:wifi, n)` keep the same syntax as on boards and pick the n-th interface the OS classifies as that family, by
+interface enumeration; instance numbers are only as stable as the OS's enumeration, and when no such interface exists
+the carrier fails at open with `(:explicit, :link_unavailable)`; the hosted `provides_link` answers true for every tag
+the hosted target supports;
 `(:serial_port, path, baud)` names a termios port. There is no separate bring-up actor on a host: the carrier actor is
 it. On a board the carrier is served by a **bring-up actor**, a dangerous actor under a supervisor that owns the
 link: it brings it up (clock, pins, UART configure), watches it and reconnects. Wi-Fi and Ethernet on boards are
@@ -10708,7 +10712,7 @@ later and out of scope.
 
 **Link failure (planned).** A link failure is a supervised actor failure. The bring-up actor, or on a host the carrier
 actor, ends with an exit reason (for example `(:explicit, :link_unavailable)`), and the supervisor restarts it under
-the ordinary policy of §15.4.11; the carrier then reports `:link_up` again. It is not a value the sender checks, and
+the ordinary policy of §15.4.11 (there is no link-specific backoff); the carrier then reports `:link_up` again. It is not a value the sender checks, and
 it never exits the process (§15.4.11, runtime_failure_reporting.md). A carrier in the declaration's own terms is one
 carrier per link instance.
 
@@ -10717,10 +10721,10 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 
 | Code (planned) | Check |
 | --- | --- |
-| E2412 | a carrier declaration names a link the target's transport pack does not provide; raised wherever the declaration appears |
+| E2412 | a carrier declaration names a link the target's transport pack does not provide (including a UART instance that is the target's console); raised wherever the declaration appears |
 | E2413 | a link tag the language does not name |
 | E2414 | the link cannot carry the carrier's kind (`:tcp` on `(:uart, 1, 115200)`) |
-| E2415 | two carrier declarations in one application name the same link tag and instance |
+| E2415 | two carrier declarations in one application name the same link tag and instance, or a UART instance another subsystem uses (the console, printing, failure banners) |
 | E2416 | the link needs a board configuration function that is not defined (phase D) |
 | E2417 | a link parameter is not a literal or fails the pack's check (baud out of range, non-literal instance or interface name) |
 
