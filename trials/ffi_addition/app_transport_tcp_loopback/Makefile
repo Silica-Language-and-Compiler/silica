@@ -2,7 +2,7 @@ THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 APP_TRIAL_DIR := $(abspath $(THIS_DIR))
 APP_LABEL := app_transport_tcp_loopback
 APP_EXECUTABLES := dangerous_tcp_loopback dangerous_udp_loopback
-APP_LINK_OBJECTS := wire_etf.o wireframe.o carrier.o dangerous_sockets.o dangerous_tcp_carrier.o dangerous_udp_carrier.o
+APP_LINK_OBJECTS := wire_etf.o wireframe.o Carrier.o dangerous_sockets.o dangerous_tcp_carrier.o dangerous_udp_carrier.o
 
 include $(abspath $(THIS_DIR)/../common_app.mk)
 
