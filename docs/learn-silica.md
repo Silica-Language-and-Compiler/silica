@@ -196,6 +196,9 @@ Built-in effects:
 | `hot_swap`        | dynamic code load                                     |
 | `register_rwr`    | MMIO; only inside `spawn_device` behaviors            |
 | `external_danger` | outbound FFI; only inside `spawn_dangerous` behaviors |
+| `transport`       | wire transport: `encode`, `decode`, `recreate`, and the byte builtins `byte_at`, `byte_slice`, `bytes_of`, `join_bytes`; declared beside an allocation effect of any `mem(...)` kind, `proc[mem(normal), transport]` |
+
+Transport is part of the language, not a library, and the `transport` effect is how the compiler checks it. A planned way to name the hardware a carrier runs on, such as a UART or a network interface, is in [transport_links_design.md](../compiler/design_documents/transport_links_design.md); none of it is implemented yet.
 
 Print helpers require `device_io`. In Python, `print` is an ordinary call. Here the sequence that prints must admit the effect. The print builtins are `print_string`, `print_int64`, `print_boolean`, `print_char`, `println` and `println_stderr`; each returns the atom `:ok`, so a print that is not the last step is written `_: atom <- print_int64(n);` (a bare `println("x");` statement is also accepted). `wait_for_exit()` needs `device_io` as well, because it reads standard input.
 

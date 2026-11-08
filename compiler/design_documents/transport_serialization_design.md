@@ -258,8 +258,8 @@ path to it (`.values[]` or `.2`), as the lifetime errors name their path.
 ### 4.3 Derived functions
 
 ```
-encode(F, x: T) -> string                                          proc[mem(normal)]
-decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)           proc[mem(normal)]
+encode(F, x: T) -> string                                          proc[mem(<any kind>), transport]
+decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)           proc[mem(<any kind>), transport]
 ```
 
 - `F` is a format tag literal, `(:etf)`. A variable is a compile-time error: the implementation is selected at
@@ -268,7 +268,13 @@ decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)           proc[mem(norm
   `List[Collectable, S]` is (specification §8.2.4): the binding annotation, the parameter or return position, or
   the scrutinee of a `case`. A `decode` whose `T` cannot be resolved is E2403.
 - `T` must be able to cross (E2401, E2404 at the call) and, when it is variable-sized, the call must give limits (E2402).
-- Both allocate, so they are called inside a `sequence proc[mem(normal)]` block. They declare no other effect.
+- Both are transport operations (decided 2026-11-07): the sequence that calls them declares the `transport`
+  effect beside its allocation effect, `sequence proc[mem(normal), transport]`. The allocation effect may be
+  any `mem(...)` kind the language has; `mem(normal)` is not special. A call in a sequence without
+  `transport` is E3013; without any `mem(...)` the ordinary E3002; a `transport` nothing in the block needs
+  is the ordinary E3010. Effects stay local (specification §9.3.1 rule 4): a caller of a function that
+  encodes declares nothing. The same rule covers the byte-string builtins of §9.2 (`byte_at`, `byte_slice`,
+  `bytes_of`, `join_bytes`); the scalar bit and width conversions of §9.2 stay pure.
 - `decode` never returns partial data, and `(:rejected, reason)` names the first check that failed.
 
 **Rejection atoms** (a superset of §7.7's, fixed so trials can name them):
@@ -581,6 +587,21 @@ node and a Silica program agree on them:
 
 These are inline types written out in the port's `board_values.silica` as documentation and trial fixtures (there is nothing to declare, §4.1); a program may ignore them and use its own types.
 
+### 6.7 Links: the hardware under a carrier
+
+A carrier names how bytes travel (its kind: `:tcp`, `:udp`, `:serial`). The **link** is the hardware layer under it:
+the OS interface on a host, or the UART, Wi-Fi station or Ethernet MAC on a board. The carrier declaration names the
+link, in a new top-level form `carried_on name: (:kind) (:link, params...);`, for example
+`carried_on host_line: (:serial) (:uart, 1, 115200);` (the head `carried_on` leaves the built-in module `carrier` unaffected
+and becomes a reserved word when the grammar phase lands; `spawn_dangerous_carrier(<name>)` is the planned replacement
+for installing a carrier through `spawn_dangerous` with an address string). Each target's transport pack (§6.0) lists the links the
+target provides, as it lists carriers, and a link the target cannot provide is a compile-time error (planned
+E2412 to E2417). A link failure is a supervised actor failure, not a value the sender checks. The order of phases is
+A hosted link naming, B UART on the ESP32-S3, C UART on the Nucleo, D network links on boards (later). **Nothing in
+this subsection is implemented**; the design (accepted for phase A planning) is
+[transport_links_design.md](transport_links_design.md) and the planned specification text is §16.4.9.
+
+
 ---
 
 ## 7. Toward the BEAM distribution protocol
@@ -860,7 +881,7 @@ fn send_reading(state: { link: dangerous_actor_ref, credits: uint32,
                 x: int16, y: int16, z: int16, at: uint64)
     -> { link: dangerous_actor_ref, credits: uint32,
          rx: { expected: uint64, parts: List[string, normal] } } {
-    sequence proc[mem(normal), concurrency]
+    sequence proc[mem(normal), concurrency, transport]
         frame: string <- encode((:etf), (:accel, { x: x, y: y, z: z, at_ms: at }));
         segments: List[string, normal] <- wireframe@frame(frame, carrier@mtu((:tcp)), carrier@boundaries((:tcp)));
         cast_dangerous(state.link, (:tx, head(segments), self()));
@@ -904,7 +925,7 @@ fn apply_command(frame: string,
                           rx: { expected: uint64, parts: List[string, normal] } })
     -> { link: dangerous_actor_ref, credits: uint32,
          rx: { expected: uint64, parts: List[string, normal] } } {
-    sequence proc[mem(normal), concurrency]
+    sequence proc[mem(normal), concurrency, transport]
         decoded: (:ok, (:led, { which: :single | :red | :green | :blue, on: boolean })) | (:rejected, atom)
             <- decode((:etf), frame);
         case decoded of {
@@ -988,6 +1009,18 @@ involved. The frames are the same bytes, and on the host an Erlang port program 
 Phases 0 and 1 of §10 are in the tree and green on the Apple Silicon path; Linux lock-step (phase 3, after the hosted carriers of phase 2 by decision of 2026-11-05) is
 not started, and the other three targets' transport packs provide no protocol, so they answer E2410.
 
+**The `transport` effect (2026-11-07, Lee).** `encode`, `decode`, `recreate` and the byte-string builtins
+`byte_at`, `byte_slice`, `bytes_of`, `join_bytes` require the new built-in effect `transport` on the sequence
+that calls them, beside an allocation effect of any `mem(...)` kind (`effect_checker_core@builtin_fn_effects`
+answers `[mem(any), transport]`, where the internal `mem(any)` parameter is matched by
+`effect_checker_capabilities@is_mem_subeffect` against every declared kind in both directions; a program cannot
+write `mem(any)`). A missing `transport` is E3013 (`effect_checker_capabilities`), a missing allocation effect
+stays E3002, an unneeded `transport` stays E3010; effects stay local. `wire_etf`, `wireframe` and the three
+carriers declare it (their pure decoders reach the byte builtins through one-binding `transport` sequences,
+`tag_at` / `slice` / `at`), and the derived encoders (`transport_derive`) declare it where they call
+`join_bytes` and `byte_at`. The scalar conversions of §9.2 (`atom_name`, `float64_bits`, `to_int64`, ...) stay
+pure; `recreate` keeps its allocation classification (none) and needs `transport` alone.
+
 **Builtins (§9.2), all pure, Apple Silicon emission in `emitter/apple_silicon_mac/terms/prims/prims_transport.silica`:**
 `byte_at`, `byte_slice`, `bytes_of` (a `List[int64, mem(normal)]` of byte values to a string),
 `join_bytes`, `atom_name`, `atom_index_of_name` (-1 when the program has no such atom) and `atom_of_bits`
@@ -1036,7 +1069,7 @@ empty record literal); both are E2401 naming the component. Trials: `transport_e
 
 **Specification text (§11):** landed 2026-11-05 in silica-specification.md: §1.2 (one principle line), §4.1.6
 (byte access), §4.1.7 (names at run time), §15.1.4 (the reference on the wire), the new §16.4 "Wire
-Transport" (§16.4.1 to §16.4.7: the calls and limits, the transportable types, the rejection atoms, the
+Transport" (§16.4.1 to §16.4.6 and §16.4.10: the calls and limits, the transportable types, the rejection atoms, the
 call-site rule and W2401, the closed protocol set and E2410, the ETF binding, the diagnostics), §20.4 (one
 paragraph) and §22.19 (the builtins). The carrier contract and framing (§5, §6) enter the specification
 with phase 2.
@@ -1092,7 +1125,7 @@ with phase 2.
   run (no device on the integrate host). The BEAM demo of §13 is `programmer_tools/transport_beam_demo`
   (`run_demo.sh`, outside `make integrate`): the Erlang peer receives the 48-byte `{accel, #{...}}` frame
   of §13.4 and the program decodes the `{led, #{which => red, on => true}}` it answers. The specification
-  text is §16.4.8 (framing) and §16.4.9 (carriers). Deferred, each to the phase that first needs it: E2407 and the
+  text is §16.4.7 (framing) and §16.4.8 (carriers). Deferred, each to the phase that first needs it: E2407 and the
   `WireFrame` segmentation under a real BLE mtu to phase 5 (the first `:unreliable` carrier whose `mtu` a
   fixed-size frame can exceed), and the Linux emitters' side of the FFI struct-result fix to phase 3.
 
