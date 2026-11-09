@@ -108,18 +108,28 @@ PA2/PA3 (AF7), 115200 8N1, polled, the Nucleo's ST-LINK virtual COM port (`/dev/
 | `rt_start.S` | `_start`: VTOR, FPU, clock, console, zeroing, register block, runtime init, markers | the two-pass per-image main-stack bound (`main_stack_bound.py`) |
 | `rt_console.S` | USART2, putc/write/puts, print_i64/u64/bool/char/string, exit marker, `exit` line reader, runtime aborts (71), fatal report (70) | |
 | `rt_heap.S` | first-fit heap with coalescing, zeroed blocks, the exit summary | |
-| `rt_frame.S` | `dyn_alloc`, `adopt`, `frame_alloc`, `in_aux_chain`, aux chunk append/publish | **`ev_frame` (the copier)** |
-| `rt_state.S` | scalar / undescribed `state_install`, `state_dispatch_end` | **the copier**: described states, `message_buffer`, `message_forward`, `reply_place`, retire, compaction |
-| `rt_string.S` | every string routine | |
+| `rt_frame.S` | `dyn_alloc`, `adopt`, `frame_alloc`, `in_aux_chain`, aux chunk append/publish, `ev_frame` (the evacuation of a function's result through the copier: in an actor into a fresh auxiliary chunk after the deepest one, in main into scratch below the callee's SP then moved up under p; 2026-11-09) | |
+| `rt_state.S` | scalar / undescribed `state_install`, `state_dispatch_end`; **the copier in frame mode** (`frame_measure` / `frame_copy`: the descriptor walk over every kind, the source-to-copy table, the bump placement with a relocation delta; the chain mode, `CCB_OMODE 1` / `CCB_DMODE 1`, aborts "not yet ported") | described states and the state chain, `message_buffer`, `message_forward`, `reply_place`, retire, compaction |
+| `rt_string.S` | every string routine; the UTF-8 classes are the hosts' (a sequence start counts one character and skips its lead length, a stray continuation byte or 0xF8..0xFF counts one by itself; `substring` advances by the same classes) | |
 | `rt_list.S` | length, tail, at, prepend (in place and copy-on-write) | |
 | `rt_transport.S` | the transport builtins that touch a string or a list (`silica_rt_tr_*`: byte_at, byte_slice, bytes_of, join_bytes, atom_name, atom_index_of_name); the scalar ones are register work in the emitter's `prims_transport.silica` | the transport_addition suite itself (skipped on this board) |
 | `rt_actors.S` | init, scheduler loop, context switch, chunk chains + growth entries, spawn (plain, linked, supervisor trampoline wait), cast / send / registered casts, registries as tables, `wait_for_exit` / `cast_exit`, reporter registration, clocks, `remove_actor`, `stop_self_normal`, benign pinning/link returns | **call / call_registered**, actor failure handling and reports (a fault is process-fatal), `recv`, kill/fail, supervision ingress, timers, priorities, policies, stack release policies (chunks kept until the actor ends), the identity table (an `actor_ref` is the ACB address) |
 | `rt_supervisors.S` | `materialize_init_children` (flags record, child rows, each child registered by id), `count_children` | restarts, shutdown, `start_child` and the `call_supervisor` operations, exit reports |
-| `rt_support.S` | checked int64 add/add1/mul, `h2f`/`f2h`, `trunc_f32/f64`, `map_device_check`, memcpy/memmove/memset/memcmp/strlen, LED + delay helpers | `print_f64/f32/f16`, ordering identities, FFI (`ffi_call`, string in/out) |
+| `rt_support.S` | checked int64 add/add1/mul, `h2f`/`f2h`, `trunc_f32/f64`, `map_device_check`, memcpy/memmove/memset/memcmp/strlen, LED + delay helpers | ordering identities, FFI (`ffi_call`, string in/out) |
+| `rt_float.S` | `print_f64` (soft float, the host's 15-digit algorithm with an exact FCVTZS-style double -> int64), `print_f32` (FPU, 7 digits), `print_f16` (widened; `nan`/`inf`/`-inf` as words), `f16_to_i32` (a float16 `main`'s exit code) | |
 | `rt_stubs.S` | one aborting stub per unported entry, so every program links (`tools/list_runtime_stubs.sh` regenerates the list) | |
 
 A stub aborts with `[silica] abort: runtime entry not yet ported to STM32-L476RG_raw at 0x<pc>`
 (status 71) at the first use.
+
+**The copier's machine stack.** The copier recurses through the descriptors (at most 13 levels;
+`term_message_copy` caps the depth at 12) on the running context's machine stack, about 80 bytes a
+level in Thumb-2 (`rt_sc_val` 56 + `rt_sc_fields` 20), under 1.2 KB in all with `ev_frame`'s own
+frame. It is not given a stack of its own and no bound is declared per image (the ESP32's
+`main_stack_bound.py` is not ported): the conservative choice was to stay inside the reserve every
+machine chunk already keeps below its limit for runtime chains, `_silica_rt_depth_reserve` (512 B,
+`--defsym _silica_rt_depth_req`) + `MCHUNK_HEADROOM` (1,024 B). A measure and a copy that disagree
+abort with "copier overrun" rather than write past the destination.
 
 ## Building an image
 

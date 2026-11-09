@@ -76,7 +76,7 @@ defsyms=""
 [ -n "${BOARD_MAIN_AUX:-}" ] && defsyms="$defsyms -Wl,--defsym,_silica_main_aux_req=$BOARD_MAIN_AUX"
 [ -n "${BOARD_FFI_STACK:-}" ] && defsyms="$defsyms -Wl,--defsym,_silica_ffi_stack_req=$BOARD_FFI_STACK"
 
-RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_string.S rt_list.S rt_transport.S rt_support.S rt_actors.S rt_supervisors.S rt_stubs.S"
+RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_string.S rt_list.S rt_transport.S rt_support.S rt_float.S rt_actors.S rt_supervisors.S rt_stubs.S"
 
 objs=""
 if [ -n "$rtcache" ]; then

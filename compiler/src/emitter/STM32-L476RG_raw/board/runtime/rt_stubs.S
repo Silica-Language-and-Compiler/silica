@@ -54,7 +54,6 @@
     STUB silica_rt_cancel_timer
     STUB silica_rt_child_table_first_ref
     STUB silica_rt_child_table_row_ref
-    STUB silica_rt_f16_to_i32
     STUB silica_rt_fail_self
     STUB silica_rt_ffi_call
     STUB silica_rt_ffi_string_in
@@ -70,9 +69,6 @@
     STUB silica_rt_ordering_env_next
     STUB silica_rt_ordering_identity_make
     STUB silica_rt_ordering_identity_same
-    STUB silica_rt_print_f16
-    STUB silica_rt_print_f32
-    STUB silica_rt_print_f64
     STUB silica_rt_region_alloc
     STUB silica_rt_region_grow
     STUB silica_rt_report_reason

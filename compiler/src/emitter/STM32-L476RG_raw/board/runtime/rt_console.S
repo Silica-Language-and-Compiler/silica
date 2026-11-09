@@ -476,6 +476,7 @@ silica_rt_print_string_stderr:
     ABORT_ENTRY silica_rt_badarith, silica_rt_reason_badarith
     ABORT_ENTRY silica_rt_case_clause, silica_rt_reason_case_clause
     ABORT_ENTRY silica_rt_unsupported, silica_rt_reason_unsupported
+    ABORT_ENTRY silica_rt_abort_copier_overrun, silica_rt_reason_copier_overrun
 
 // silica_rt_abort_body(r0 = reason, lr = the site's return address): the report, status 71, halt.
     FUNC silica_rt_abort_body
@@ -604,6 +605,8 @@ silica_rt_reason_badarith:
     .asciz  "badarith"
 silica_rt_reason_case_clause:
     .asciz  "case_clause"
+silica_rt_reason_copier_overrun:
+    .asciz  "copier overrun (the measure and the copy disagree)"
     .global silica_rt_reason_unsupported
 silica_rt_reason_unsupported:
     .asciz  "runtime entry not yet ported to STM32-L476RG_raw"
