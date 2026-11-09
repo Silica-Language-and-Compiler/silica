@@ -151,7 +151,7 @@ a port can actually provide, and that is already decided by the device-actor and
   frame : string               the encoded term, version prefix included
         |
         v
-  wireframe@frame(frame, carrier@mtu((:uart1)))      framing: length prefix, segmentation (§5)
+  wireframe@frame(frame, carrier@mtu((:uart1)), carrier@boundaries((:uart1)))   framing: length prefix, segmentation (§5)
         |
         v
   cast(carrier_actor, (:tx, segment, self()))        the carrier actor contract (§6.2)
@@ -478,7 +478,9 @@ required {
 `Carrier` is a **closed tag-keyed trait** (§9.1): its implementations are the language's, one per carrier tag,
 written in the compiler's tree (hosted carriers) or the port's board tree (hardware carriers), and the body of each
 method is a literal. A program names a tag; it cannot implement one. `WireFormat` is closed in the same way. The
-tag identifies the carrier: `(:tcp)`, `(:uart1)`, `(:ble_gatt)`.
+tag identifies the carrier: `(:tcp)`, `(:uart1)`, `(:ble_gatt)`. As an expression, `(:tcp)` is a parenthesised
+atom literal and denotes the atom `:tcp`, so a program writes the tag as the design does, `carrier@mtu((:tcp))`,
+and the bare atom `carrier@mtu(:tcp)` names the same row (§14).
 
 ### 6.2 The carrier actor contract
 
@@ -489,7 +491,7 @@ way down" (§4.6) made concrete. All messages are cast-only (`:no_reply`), as de
 
 | Direction | Message | Meaning |
 | --- | --- | --- |
-| program to carrier | `(:open, owner: actor_ref, address: string)` | bind or connect; `address` is carrier-specific text (`"10.0.0.2:4369"`, `""` for a UART, a characteristic UUID for BLE) |
+| program to carrier | `(:open, owner: actor_ref, address: string)` | bind or connect; `address` is carrier-specific text (`"10.0.0.2:4369"`, `"listen:4369"` to listen, `""` for a UART, a characteristic UUID for BLE). On a connection a listener accepted (next table) `address` is ignored: the peer is already there, and the sender becomes the connection's owner |
 | program to carrier | `(:tx, segment: string, from: actor_ref)` | send one segment; consumes one send credit |
 | program to carrier | `(:credit, n: uint32)` | the owner will accept n more `:rx` messages |
 | program to carrier | `(:close)` | orderly close; the carrier ends after `:link_down` |
@@ -504,6 +506,24 @@ credit, and the receive window a TCP carrier advertises follows the owner's `:cr
 sender is mailbox order. Failure is the carrier actor exiting with a reason, handled by links, monitors and
 supervisors like any actor; a program that needs the link back restarts the carrier under its supervisor.
 
+**Listeners.** A carrier whose `addressing` is `:endpoint` and whose `boundaries` are `:stream` may be opened to
+listen instead of connect (`(:tcp)`: `"listen:<port>"`). A listener carries no bytes itself: it answers
+`(:link_up, info)` once bound, and for every peer it accepts it spawns **one connection carrier** holding that
+peer, a carrier actor like any other, and tells its owner about it. The owner decides who owns each connection
+by opening it, the way `gen_tcp:controlling_process/2` hands an accepted socket to the process that will read
+it, so a program that serves many peers gives each one an actor of its own and never has to tell their `:rx`
+messages apart.
+
+| Direction | Message | Meaning |
+| --- | --- | --- |
+| listener to owner | `(:accepted, conn: dangerous_actor_ref, info: string)` | a peer was accepted into the connection carrier `conn`, which holds the peer and waits; `info` is carrier-specific (`"peer:accepted"` for TCP in this phase) |
+| program to connection | `(:open, owner: actor_ref, "")` | the sender adopts the accepted connection: it receives the connection's `(:link_up, info)` and `(:tx_credit, n)` at once, then its `:rx`, `:tx_credit`, `:tx_failed` and `:link_down`, exactly as the owner of a connecting carrier does |
+| program to listener | `:close` | closes the listening socket only, answered by `(:link_down, :closed)`; the connections it spawned live on until each is closed or its peer goes away |
+
+Until a connection is opened it polls nothing and the peer's bytes wait in the socket. A connection a listener
+spawned is a dangerous actor the program did not spawn (the listener's `spawn_dangerous`, not linked to the
+listener); a `:close` to it, or its peer closing, ends it like a connecting carrier.
+
 The ETF frames of §4 and the segments of §5 are `string`s, so every message above is `ActorMessage` by a
 type-level `impl` in the built-in `actormessage.silica`, and a program writes no marker for them.
 
@@ -514,7 +534,7 @@ not list the same rows (BLE on a headless server, for instance).
 
 | Tag | Provided by | `mtu` | `boundaries` | `delivery` | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor spawns one per accepted peer |
+| `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor (`"listen:<port>"`) spawns one per accepted peer and announces it with `(:accepted, conn, info)` (§6.2) |
 | `(:udp)` | the same wrappers | 65507 | `:datagram` | `:unreliable` | an endpoint actor per bound port |
 | `(:serial)` | a dangerous actor over a Fifi wrapper of the host's serial port (termios on macOS and Linux) | 0 | `:stream` | `:reliable_ordered` | `address` is the device path (`/dev/cu.usbserial-10`, `/dev/cu.usbmodem101`) and line settings. This is the host end of the board's USB-UART, USB-Serial-JTAG and USB CDC carriers, so a Mac and the board exchange frames Silica to Silica with no Erlang in between |
 | `(:ble_gatt)` | a dangerous actor over a Fifi wrapper of the host's Bluetooth stack (CoreBluetooth on macOS, BlueZ D-Bus on Linux) | negotiated ATT_MTU minus 3 (20 by default, up to 244 after MTU exchange; a characteristic value is at most 512 bytes) | `:datagram` | `:ordered_lossy` for notifications, `:reliable_ordered` for indications and writes with response | `address` is a characteristic UUID; `:link_up` carries the negotiated MTU |
@@ -1049,10 +1069,15 @@ with phase 2.
   not the `parts` list of §5; `unframe` answers one frame per call and is called again with an empty segment
   to drain a second frame that arrived in the same segment. Segmentation uses frame_seq 0 (one frame in
   flight per link in this phase).
-- The carrier properties (§6.1) are `compiler/stdlib/carrier.silica`: `mtu`, `boundaries`, `delivery`,
-  `addressing` and `provided` over the **atom** of the tag (`carrier@mtu(:tcp)`), because a one-atom
-  tagged tuple is not a run-time value in this language. The tag-keyed trait dispatch of §9.1 is not
-  built; the module is the closed set.
+- The carrier properties (§6.1) are `compiler/stdlib/Carrier.silica`: `mtu`, `boundaries`, `delivery`,
+  `addressing` and `provides` (renamed from `provided` on 2026-11-09: `provided` is a keyword, so the
+  call could never be parsed), each a `case` over the tag's atom. The parameter type is `atom` because a
+  one-atom tagged tuple is not a run-time value in this language; the design's spelling `carrier@mtu((:tcp))`
+  works all the same, since the parser reads `(:tcp)` as a parenthesised atom literal (expression kind 2)
+  whose value is the atom `:tcp`, and the bare `carrier@mtu(:tcp)` names the same row. Both forms compile to
+  the same code (checked 2026-11-09 with no compiler change; trial `transport_addition/transport_carrier_tags`
+  reads every property of every hosted tag both ways and frames with them). The tag-keyed trait dispatch of
+  §9.1 is not built; the module is the closed set.
 - The socket wrappers (ROADMAP chunk 9, the part this phase needs) are `compiler/stdlib/net/silica_sockets.c`
   with `silica_sockets_wrapper.meta` and the dangerous module `dangerous_sockets.silica`: TCP connect /
   listen / accept, UDP bind / send / receive, a termios serial port, and read / write / close over any
@@ -1066,14 +1091,24 @@ with phase 2.
 - The carriers are library FFI workers: `dangerous_tcp_carrier`, `dangerous_udp_carrier` and
   `dangerous_serial_carrier`, each one exported cast-only behaviour `carrier/2` that a program installs
   with `spawn_dangerous` and opens with `(:open, owner, address)`: `"host:port"` connects, `"listen:port"`
-  listens on 127.0.0.1 and serves the first peer (port 0 picks a free port; `:link_up` carries
-  `"port:<n>"` once bound and `"peer:accepted"` once a peer is served; one connection per listening
-  carrier in this phase), `"host:port@local"` for a UDP endpoint, `"path@baud"` for a serial port. The
-  contract of §6.2 is spoken as written, with `int64` counts; a carrier polls its descriptor between
-  mailbox messages with a 20 ms timeout and delivers `:rx` only against the owner's `:credit`. Because
-  the language allows a `sequence proc[external_danger]` only as a function's root body, each carrier is
-  one sequence that chooses its work by the message and calls each wrapper at most once per message; a
-  descriptor it keeps in state crosses the taint boundary through `recreate`.
+  listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound),
+  `"host:port@local"` for a UDP endpoint, `"path@baud"` for a serial port. The contract of §6.2 is
+  spoken as written, with `int64` counts; a carrier polls its descriptor between mailbox messages with a
+  20 ms timeout and delivers `:rx` only against the owner's `:credit`. Because the language allows a
+  `sequence proc[external_danger]` only as a function's root body, each carrier is one sequence that
+  chooses its work by the message and calls each wrapper at most once per message; a descriptor it keeps
+  in state crosses the taint boundary through `recreate`.
+- The listener behaviour of §6.2 (2026-11-09; until then a listening carrier served the first peer
+  only and then became that connection): a `(:tcp)` listener keeps listening, and on each accept it
+  calls `spawn_dangerous` on its own behaviour with a state holding the accepted descriptor (the
+  placement checker allows the call inside an FFI worker's `external_danger` body) and casts
+  `(:accepted, conn, "peer:accepted")` to its owner. The spawned connection's state is told apart by
+  `fd >= 0` with neither `up` nor `listening`; its `(:open, owner, _)` sets the owner, answers
+  `:link_up` and `(:tx_credit, 8)` and starts its polling. The initial-state record is unchanged, so
+  programs spawn a carrier as before. The peer address is not yet reported (the wrappers have no
+  `getpeername`), hence `"peer:accepted"` in both messages. Trials: `transport_addition/app_transport_tcp_listener`
+  (one listener, two peers in turn, a session actor per connection) and the loopback trial below, whose
+  server now opens the accepted connection through a session actor.
 - Four compiler changes the carriers needed, all general: `recreate(x)` exists for scalar types (one
   mechanism with `decode`; a derived `(:ok, x)` whose result the taint checker treats as pure, E2406 on a
   tainted input outside an `external_danger` block); an exported cast-only behaviour of a `dangerous_`
@@ -1118,7 +1153,9 @@ closed-trait rule (§9.1) is not enforced by the trait checker yet.
 `sir_target_verify` answers E2410 for a protocol the pack does not list.
 
 **Trials:** `trials/transport_addition` (builtins, scalars, record, list and sum, rejections: every atom of
-§4.3 that phase 1 can produce) and the seven `transport_err_*` trials in `error_enforcement_addition`.
+§4.3 that phase 1 can produce; `transport_carrier_tags` for the carrier properties and framing by tag; the
+sub-trial `app_transport_tcp_listener` for the listener of §6.2) and the seven `transport_err_*` trials in
+`error_enforcement_addition`.
 Two language facts the trials met: a relational compare of two `uint64` values inside a let body
 compiled as a signed compare (the bound-let compare path of every emitter chose LT/GT/LE/GE for any
 integer; fixed 2026-11-05 with `cc_int_cond`, trial `uint64_addition/comparator_high_bit`, and

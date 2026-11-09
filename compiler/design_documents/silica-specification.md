@@ -10610,14 +10610,15 @@ wireframe@unframe(state: { mode: atom, expected: int64, pending: string }, segme
 A carrier is an actor the language provides, one built-in implementation per link tag, installed by the
 program with `spawn_dangerous` (hosted carriers are Fifi wrappers over the host's sockets and serial ports)
 and spoken to only through casts. `Carrier` is a closed trait (E2409); its properties are literals per tag,
-read through the built-in module `carrier` by the tag's atom:
+read through the built-in module `carrier` by the tag's atom (the design's `carrier@mtu((:tcp))` is the same
+call: `(:tcp)` as an expression is a parenthesised atom literal):
 
 ```
 carrier@mtu(c: atom) -> int64            // largest segment in bytes; 0 means unbounded
 carrier@boundaries(c: atom) -> atom      // :stream | :datagram | :storage
 carrier@delivery(c: atom) -> atom        // :reliable_ordered | :ordered_lossy | :unreliable
 carrier@addressing(c: atom) -> atom      // :none | :endpoint | :characteristic | :block
-carrier@provided(c: atom) -> boolean     // whether this build's target provides the carrier
+carrier@provides(c: atom) -> boolean     // whether this build's target provides the carrier (`provided` is a keyword)
 ```
 
 **The carrier contract.** Every message is cast-only.
@@ -10633,17 +10634,23 @@ carrier@provided(c: atom) -> boolean     // whether this build's target provides
 | carrier to owner | `(:tx_credit, n: int64)` | the carrier can take `n` more `:tx` messages |
 | carrier to owner | `(:tx_failed, reason: atom)` | a segment was not sent (`:no_credit`, `:link_down`, `:too_long`) |
 | carrier to owner | `(:link_down, reason: atom)` | the link ended (`:closed`, `:reset`, `:timeout`, `:fault`) |
+| listener to owner | `(:accepted, conn: dangerous_actor_ref, info: string)` | a listening carrier accepted a peer into the connection carrier `conn`, which holds the peer and waits for its own `(:open, owner, "")`; the sender of that `:open` becomes the connection's owner and receives its `:link_up`, credits, `:rx` and `:link_down` as the owner of a connecting carrier does |
 
 Flow control is credit-based in both directions: nothing is pushed without credit. Ordering per sender is
 mailbox order. Failure is the carrier actor exiting with a reason, handled by links, monitors and supervisors
 like any actor. The bytes a hosted carrier delivers are external-danger-touched, so the owner's `decode` runs
 in the handler that receives them, where §16.4.4 permits it.
 
+A carrier opened to listen (`"listen:<port>"` on `:tcp`) carries no bytes itself: it answers `:link_up` once
+bound and `(:accepted, conn, info)` for every peer, each in a connection carrier of its own, so a program that
+serves many peers gives each connection an owner of its own. `:close` to a listener closes the listening
+socket only; the connections it spawned live on.
+
 **The hosted carriers** (Apple Silicon macOS in this phase; Linux follows):
 
 | Tag | Module and behaviour | `address` | `mtu` | `boundaries` | `delivery` |
 | --- | --- | --- | --- | --- | --- |
-| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 and serves the first peer (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound and `"peer:accepted"` once served) | 0 | `:stream` | `:reliable_ordered` |
+| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound) and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
 | `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx`, and the local port to bind (`:link_up` carries `"port:<n>"`) | 65507 | `:datagram` | `:unreliable` |
 | `:serial` | `dangerous_serial_carrier@carrier` | `"path@baud"`, raw 8N1 | 0 | `:stream` | `:reliable_ordered` |
 
