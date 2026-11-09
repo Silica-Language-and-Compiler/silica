@@ -1,0 +1,164 @@
+// ESP32-S3 port app 32: one ETF frame over the UART1 carrier (transport_esp32s3_wifi_plan.md stage 1;
+// transport_serialization_design.md §6.4 (:uart1), §10 phase 4; transport_links_design.md phase B).
+// The owner actor opens the (:uart1) carrier (device_lib/device_esp32s3_uart1, TX GPIO35, RX GPIO36,
+// 115200 8N1), and on :link_up encodes (:accel, { x: 1, y: -2, z: 512, at_ms: 1000 }) with
+// encode((:etf), ...), frames it with the carrier's properties (a 4-byte length prefix on a :stream
+// carrier: 52 bytes for the 48-byte term of design §13.4) and casts it as one :tx. When the carrier
+// returns the credit the frame is in the FIFO, so the owner closes the carrier and ends the program
+// after :link_down. The board only sends (links design decision 15): the Mac peer is
+// programmer_tools/transport_uart1_demo (the (:serial) carrier, or the Erlang peer behind the bridge).
+// Expected console: "link up uart1@115200", "tx credit 8", "sent 52 bytes", "link down :closed", status 0.
+// A bring-up failure prints "link down fault" and ends with status 1 (the carrier's exit reason,
+// (:explicit, :link_unavailable) or :link_timeout, reaches the FailureReporter).
+use device_esp32s3_uart1;
+use wire_etf;
+use wireframe;
+use Carrier;
+use Supervisor;
+
+impl AppSupervisor for Supervisor;
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+// The reading as one framed segment: the (:uart1) row is mtu 0 and :stream, so the frame gets the length
+// prefix and is never segmented (design §5, links design §7).
+fn reading_segment() -> string {
+    sequence proc[mem(normal), transport]
+        frame: string <- encode((:etf), (:accel, { x: 1, y: 0 - 2, z: 512, at_ms: 1000 }));
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu((:uart1)), Carrier@boundaries((:uart1)));
+        seg: string <- first_segment(segs)
+    produces
+        pure seg
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { car: device_actor_ref, sent: int64 }) -> (:no_reply, { car: device_actor_ref, sent: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("link up ");
+                _: atom <- println(info);
+                seg: string <- reading_segment();
+                _: boolean <- cast_device(state.car, (:tx, seg, self()) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, sent: length_bytes(seg) })
+            end
+        };
+        (:tx_credit, n: int64) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- case n == 1 of {
+                    true -> {
+                        _: atom <- print("sent ");
+                        _: atom <- print_int64(state.sent);
+                        _: atom <- println(" bytes");
+                        _: boolean <- cast_device(state.car, :close impl ActorMessage {});
+                        :ok
+                    };
+                    false -> {
+                        _: atom <- print("tx credit ");
+                        _: atom <- print_int64(n);
+                        println("")
+                    }
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_failed, why: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print("tx failed ");
+                _: atom <- print_atom(why);
+                _: atom <- println("")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:link_down, why2: atom) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- print("link down ");
+                _: atom <- print_atom(why2);
+                _: atom <- println("");
+                _: boolean <- case why2 == :closed of {
+                    true -> cast_exit(0);
+                    false -> cast_exit(1)
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+// The app's work, run by the supervisor's one worker: spawn the carrier worker and the owner, open the link.
+fn app_worker(msg: atom, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        car: device_actor_ref <- spawn_device(:idle, device_esp32s3_uart1@uart1_carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        me: actor_ref <- spawn({ car: car, sent: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_device(car, (:open, me, "") impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 1 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)] <- [
+            { id: :app_worker, agent_type: :worker, initial_state: initial_state, behavior: app_worker, restart: :transient, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_registered(:app_worker, (:start) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

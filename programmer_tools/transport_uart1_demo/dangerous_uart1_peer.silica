@@ -1,0 +1,127 @@
+// The Mac end of the UART1 demo (transport_esp32s3_wifi_plan.md stage 1): the hosted (:serial) carrier
+// (dangerous_serial_carrier, termios 115200 8N1) opened on the USB-serial adapter wired to the board's
+// UART1 header reads the one frame the board program silica_32_transport_uart1_etf sends, reassembles
+// it with wireframe@unframe (the 4-byte length prefix of a :stream carrier) and decodes the ETF term
+// into (:accel, { x, y, z, at_ms }). Run it through run_peer.sh, which puts the port path in place of
+// the placeholder below. The same bytes are what the Erlang peer of transport_beam_demo reads behind
+// serial_to_tcp_bridge.py.
+module dangerous_uart1_peer;
+
+use wire_etf;
+use wireframe;
+use Carrier;
+use dangerous_sockets;
+use dangerous_serial_carrier;
+use trial_wait_int64;
+
+fn show_reading(r: { x: int16, y: int16, z: int16, at_ms: uint64 }) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("accel x=");
+        _: atom <- print_int64(to_int64(r.x));
+        _: atom <- print(" y=");
+        _: atom <- print_int64(to_int64(r.y));
+        _: atom <- print(" z=");
+        _: atom <- print_int64(to_int64(r.z));
+        _: atom <- print(" at_ms=");
+        _: atom <- print_int64(to_int64(r.at_ms));
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64 })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("serial open ");
+                _: atom <- println(info);
+                _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:rx, segment: string) -> {
+            sequence proc[concurrency]
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                code2: int64 <- case un of {
+                    (:more, _r0: { mode: atom, expected: int64, pending: string }) -> state.code;
+                    (:frame, frame0: string, _r3: { mode: atom, expected: int64, pending: string }) -> {
+                        sequence proc[mem(normal), device_io, concurrency, transport]
+                            _: atom <- print("frame ");
+                            _: atom <- print_int64(length_bytes(frame0));
+                            _: atom <- println(" bytes");
+                            decoded: (:ok, (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 })) | (:rejected, atom) <- decode((:etf), frame0);
+                            code: int64 <- case decoded of {
+                                (:ok, (:accel, r: { x: int16, y: int16, z: int16, at_ms: uint64 })) -> {
+                                    _: atom <- show_reading(r);
+                                    0
+                                };
+                                (:rejected, why: atom) -> {
+                                    _: atom <- print("rejected ");
+                                    _: atom <- print_atom(why);
+                                    _: atom <- println("");
+                                    2
+                                }
+                            };
+                            _: boolean <- cast(state.car, :close impl ActorMessage {})
+                        produces pure code end
+                    };
+                    (:rejected, _why1: atom) -> 3
+                };
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, _frame: string, r2: { mode: atom, expected: int64, pending: string }) -> r2;
+                    (:rejected, why2: atom) -> {
+                        sequence proc[device_io, concurrency]
+                            _: atom <- print("framing rejected ");
+                            _: atom <- print_atom(why2);
+                            _: atom <- println("");
+                            _: boolean <- cast_exit(3)
+                        produces pure state.rx end
+                    }
+                };
+                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, rx: rx2, code: code2 })
+            end
+        };
+        (:tx_failed, why3: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print_atom(why3)
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, why4: atom) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- print("link down ");
+                _: atom <- print_atom(why4);
+                _: atom <- println("");
+                _: boolean <- case why4 == :closed of {
+                    true -> cast_exit(state.code);
+                    false -> cast_exit(1)
+                }
+            produces pure (:no_reply, state) end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false }, dangerous_serial_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries((:serial))), code: 4 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(car, (:open, me, "/dev/cu.usbserial-PLACEHOLDER@115200") impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
