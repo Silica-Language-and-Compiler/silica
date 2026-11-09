@@ -117,7 +117,7 @@ numbers are different series, and the question numbers are kept (§12).
   §15.4.11 include `(:explicit, <atom>)`.
 - **Name hazard.** `link`, `monitor` and `demonitor` are lexer keywords (actor links), and "carrier" also names a
   hosted runtime carrier thread and the built-in module `carrier`. The declaration therefore uses the head
-  `carried_on` (Lee, 2026-11-08): the clash with the module `carrier` (`carrier@mtu(...)`) is resolved, because the
+  `carried_on` (Lee, 2026-11-08): the clash with the module `carrier` (`Carrier@mtu(...)`) is resolved, because the
   module keeps its name and `carrier` does not become a keyword, and `link` is never a surface word. `carried_on`
   becomes a reserved word when the grammar phase lands. Prose says "link" for the new concept.
 

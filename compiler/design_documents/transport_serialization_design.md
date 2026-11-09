@@ -151,7 +151,7 @@ a port can actually provide, and that is already decided by the device-actor and
   frame : string               the encoded term, version prefix included
         |
         v
-  wireframe@frame(frame, carrier@mtu((:uart1)))      framing: length prefix, segmentation (§5)
+  wireframe@frame(frame, Carrier@mtu((:uart1)))      framing: length prefix, segmentation (§5)
         |
         v
   cast(carrier_actor, (:tx, segment, self()))        the carrier actor contract (§6.2)
@@ -883,7 +883,7 @@ fn send_reading(state: { link: dangerous_actor_ref, credits: uint32,
          rx: { expected: uint64, parts: List[string, normal] } } {
     sequence proc[mem(normal), concurrency, transport]
         frame: string <- encode((:etf), (:accel, { x: x, y: y, z: z, at_ms: at }));
-        segments: List[string, normal] <- wireframe@frame(frame, carrier@mtu((:tcp)), carrier@boundaries((:tcp)));
+        segments: List[string, normal] <- wireframe@frame(frame, Carrier@mtu((:tcp)), Carrier@boundaries((:tcp)));
         cast_dangerous(state.link, (:tx, head(segments), self()));
     produces
         pure { link: state.link, credits: state.credits - 1, rx: state.rx }
@@ -996,7 +996,7 @@ On the wire it is preceded by `00 00 00 30`. The reply `{led, #{which => red, on
 ### 13.5 The same owner on the board
 
 Replace the carrier: `use uart1_carrier;` for `use tcp_carrier;`, `(:uart1)` for `(:tcp)` in the two
-`carrier@` calls, and `device_actor_ref` with `cast_device` for the link's type and casts. The module loses its
+`Carrier@` calls, and `device_actor_ref` with `cast_device` for the link's type and casts. The module loses its
 `dangerous_` prefix and gains the `device_` prefix, since the carrier is now a device worker and no Fifi is
 involved. The frames are the same bytes, and on the host an Erlang port program reading the serial line with
 `{packet, 4}` receives them unchanged. The readings themselves come from the I2C0 worker (plan item G) as
@@ -1008,6 +1008,21 @@ involved. The frames are the same bytes, and on the host an Erlang port program 
 
 Phases 0 and 1 of §10 are in the tree and green on the Apple Silicon path; Linux lock-step (phase 3, after the hosted carriers of phase 2 by decision of 2026-11-05) is
 not started, and the other three targets' transport packs provide no protocol, so they answer E2410.
+
+**Status 2026-11-08 (all targets).** The §9.2 builtins and the derived `encode`/`decode` are now emitted on the
+two Linux targets (`emitter/linux_*/terms/prims/prims_transport.silica`) and on both boards
+(`emitter/ESP32-S3_raw` and `emitter/STM32-L476RG_raw`: `terms/prims/prims_transport.silica` for the scalar
+builtins, `board/runtime/rt_transport.S` for the ones that touch a string or a list). Every target's transport
+pack provides the `etf` format; no board provides a carrier yet, so a board program that names a carrier is
+rejected at compile time as not provided on the target, and the carrier loopback apps are not run on boards (a board
+runs one application at a time, and there is no TX-to-RX jumper to rely on, per the links design). The ETF format
+module is reached only by an explicit `use wire_etf;`; nothing adds it implicitly. Derived transport source is
+numbered separately from the user's source: its case labels carry a per-declaration tag (`d<index>`) so a derived
+label can never collide with a user label at the same byte offset (trial `transport_derived_case_label_collision`).
+The trials `transport_addition` and the `transport_err_*` family run on the hosted targets; the boards skip them
+until board carriers exist (`trials/targets/<board>.skip`). The carrier module's file is `Carrier.silica`
+(`Carrier@mtu(...)`), spelled with a capital everywhere, because the case-sensitive Linux hosts cannot resolve the
+lowercase spelling.
 
 **The `transport` effect (2026-11-07, Lee).** `encode`, `decode`, `recreate` and the byte-string builtins
 `byte_at`, `byte_slice`, `bytes_of`, `join_bytes` require the new built-in effect `transport` on the sequence
@@ -1083,7 +1098,7 @@ with phase 2.
   to drain a second frame that arrived in the same segment. Segmentation uses frame_seq 0 (one frame in
   flight per link in this phase).
 - The carrier properties (§6.1) are `compiler/stdlib/carrier.silica`: `mtu`, `boundaries`, `delivery`,
-  `addressing` and `provided` over the **atom** of the tag (`carrier@mtu(:tcp)`), because a one-atom
+  `addressing` and `provided` over the **atom** of the tag (`Carrier@mtu(:tcp)`), because a one-atom
   tagged tuple is not a run-time value in this language. The tag-keyed trait dispatch of §9.1 is not
   built; the module is the closed set.
 - The socket wrappers (ROADMAP chunk 9, the part this phase needs) are `compiler/stdlib/net/silica_sockets.c`

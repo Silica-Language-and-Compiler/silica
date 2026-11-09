@@ -10622,11 +10622,11 @@ and spoken to only through casts. `Carrier` is a closed trait (E2409); its prope
 read through the built-in module `carrier` by the tag's atom:
 
 ```
-carrier@mtu(c: atom) -> int64            // largest segment in bytes; 0 means unbounded
-carrier@boundaries(c: atom) -> atom      // :stream | :datagram | :storage
-carrier@delivery(c: atom) -> atom        // :reliable_ordered | :ordered_lossy | :unreliable
-carrier@addressing(c: atom) -> atom      // :none | :endpoint | :characteristic | :block
-carrier@provided(c: atom) -> boolean     // whether this build's target provides the carrier
+Carrier@mtu(c: atom) -> int64            // largest segment in bytes; 0 means unbounded
+Carrier@boundaries(c: atom) -> atom      // :stream | :datagram | :storage
+Carrier@delivery(c: atom) -> atom        // :reliable_ordered | :ordered_lossy | :unreliable
+Carrier@addressing(c: atom) -> atom      // :none | :endpoint | :characteristic | :block
+Carrier@provided(c: atom) -> boolean     // whether this build's target provides the carrier
 ```
 
 **The carrier contract.** Every message is cast-only.
