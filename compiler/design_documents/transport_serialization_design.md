@@ -542,7 +542,7 @@ not list the same rows (BLE on a headless server, for instance).
 | --- | --- | --- | --- | --- | --- |
 | `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor (`"listen:<port>"`) spawns one per accepted peer and announces it with `(:accepted, conn, info)` (§6.2) |
 | `(:udp)` | the same wrappers | 65507 | `:datagram` | `:unreliable` | an endpoint actor per bound port |
-| `(:serial)` | a dangerous actor over a Fifi wrapper of the host's serial port (termios on macOS and Linux) | 0 | `:stream` | `:reliable_ordered` | `address` is the device path (`/dev/cu.usbserial-10`, `/dev/cu.usbmodem101`) and line settings. This is the host end of the board's USB-UART, USB-Serial-JTAG and USB CDC carriers, so a Mac and the board exchange frames Silica to Silica with no Erlang in between |
+| `(:serial)` | a dangerous actor over a Fifi wrapper of the host's serial port (termios on macOS and Linux) | 0 | `:stream` | `:reliable_ordered` | `address` is the device path (`/dev/cu.usbserial-10`, `/dev/cu.usbmodem101`) and line settings. This is the host end of the board's USB-UART, USB-Serial-JTAG and USB CDC carriers, so a Mac and the board exchange frames Silica to Silica with no Erlang in between. The wrapper does not flush the port's input at open, which this path needs (§14, board carrier notes) |
 | `(:ble_gatt)` | a dangerous actor over a Fifi wrapper of the host's Bluetooth stack (CoreBluetooth on macOS, BlueZ D-Bus on Linux) | negotiated ATT_MTU minus 3 (20 by default, up to 244 after MTU exchange; a characteristic value is at most 512 bytes) | `:datagram` | `:ordered_lossy` for notifications, `:reliable_ordered` for indications and writes with response | `address` is a characteristic UUID; `:link_up` carries the negotiated MTU |
 | `(:unix_dgram)` | later, if [IPC_OS.md](IPC_OS.md) is ever built | per OS | `:datagram` | `:reliable_ordered` | cross-process actors on one host |
 
@@ -559,8 +559,8 @@ reads are not external-danger-touched, so `decode` may run anywhere the frame re
 | Tag | Hardware (board doc) | `mtu` | `boundaries` | `delivery` | State of the worker | Notes |
 | --- | --- | --- | --- | --- | --- | --- |
 | `(:uart0)` | **USB-UART**: the CP2102N bridge on the USB-UART jack to UART0 (GPIO43/44); the host sees a USB serial device | 0 | `:stream` | `:reliable_ordered` (no flow control: lossy under sustained load) | exists (`device_esp32s3_uart.silica`, `:puts`) | shared with the runtime console; frames interleave with prints, documented not prevented (plan principle 4). For bring-up and for programs that give up the console |
-| `(:uart1)` | UART1 header (TX GPIO35, RX GPIO36) | 0 | `:stream` | `:reliable_ordered` | plan item N | **the first board carrier.** A host bridges it to its network, or an Erlang port program reads it directly: the ETF-over-UART demo (§10) |
-| `(:usb_serial_jtag)` | the native USB-C jack through the fixed-function USB-Serial-JTAG controller | 0 | `:stream` | `:reliable_ordered` | exists (item F worker, `:puts`/`:getc`) | the second console; enumerates as 303A:1001. Device role only; shares GPIO19/20 and the internal PHY with the OTG controller (next row), so a program owns one of the two |
+| `(:uart1)` | UART1 header (TX GPIO35, RX GPIO36) | 0 | `:stream` | `:reliable_ordered` | exists (`device_esp32s3_uart1.silica`, stage 1 of [transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md), 2026-11-09; plan item N) | **the first board carrier.** The pack row `provides_carrier "uart1"` and the window `:esp32s3_uart1` are in the ESP32-S3 pack; the board sends (`silica_32_transport_uart1_etf`), the Mac peer is `programmer_tools/transport_uart1_demo` (the hosted `(:serial)` carrier, or the Erlang peer behind `serial_to_tcp_bridge.py`). A host bridges it to its network, or an Erlang port program reads it directly: the ETF-over-UART demo (§10) |
+| `(:usb_serial_jtag)` | the native USB-C jack through the fixed-function USB-Serial-JTAG controller | 0 | `:stream` | `:reliable_ordered` | exists, both directions (`device_esp32s3_usb_serial_jtag.silica` `usb_serial_jtag_carrier`, beside the item F console worker in the same module; stage S-A of [transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md) §8, 2026-11-09) | **the first board carrier with a peer on the wire:** the pack row `provides_carrier "usb_serial_jtag"` is in the ESP32-S3 pack; `silica_33_transport_usb_serial_jtag_etf` sends an accelerometer frame and decodes the LED reply, the Mac peer is `programmer_tools/transport_usb_serial_jtag_demo` (the hosted `(:serial)` carrier, or the Erlang peer behind `serial_to_tcp_bridge.py`), seen on the board both ways. The second console; enumerates as 303A:1001; no line speed (the host's baud is ignored). Device role only; shares GPIO19/20 and the internal PHY with the OTG controller (next row), so a program owns one of the two. The host must not toggle DTR/RTS on the port ((0, 1) resets the chip) and must not flush its input at open (the board's frame is already in the driver) |
 | `(:usb_cdc)` | **USB CDC, dual role (DRD)**: the native USB-C jack through the USB OTG controller, CDC-ACM class. Device role: the board enumerates as a CDC-ACM serial port on a host. Host role: the board is the USB host and talks to an attached CDC-ACM device (another board, a modem). The role is chosen at `:open` (`address` is `"device"` or `"host"`, optionally with a VID:PID to accept) and reported in `:link_up` | 0 (CDC-ACM is a byte stream; the stack packs it into 64-byte full-speed bulk packets below the carrier) | `:stream` | `:reliable_ordered` | not started: plan items K (interrupts), H (DMA) and L (the USB OTG stack: enumeration, descriptors, endpoints, control transfers, and the host-side enumeration for DRD) | the PHY is routed to the OTG controller instead of USB-Serial-JTAG by a board-pack register (eFuse `USB_PHY_SEL` 0 leaves it on USB-Serial-JTAG at reset), and the two controllers' windows are owned by different workers, so a program maps one, never both. Host role may need GPIO control of the board's `pd_switch` / `dm_pd_switch` power-role lines (plan §6, open). The carrier is the CDC-ACM layer of the item L stack; CDC-NCM/ECM over the same stack is the network link of plan §4.6, not this carrier |
 | `(:spi2)`, `(:spi3)` | SPI2 (display) and SPI3 (SD card) controllers, both as master | 64 (the controller's data buffer) | `:datagram` | `:reliable_ordered` | SPI2 driver exists (item A) | a carrier only toward an SPI peer that speaks the §5 segment protocol; the display and the SD card are not peers (next row) |
 | `(:sd_blocks)` | SD card on SPI3 | 512 | `:storage` | `:reliable_ordered` | plan item I | a **storage carrier**: `:tx` appends a frame to the block log, `:rx` replays frames from it. `address` is a block range. Logging ETF-encoded readings to the card is the use |
@@ -1033,9 +1033,11 @@ not started, and the other three targets' transport packs provide no protocol, s
 two Linux targets (`emitter/linux_*/terms/prims/prims_transport.silica`) and on both boards
 (`emitter/ESP32-S3_raw` and `emitter/STM32-L476RG_raw`: `terms/prims/prims_transport.silica` for the scalar
 builtins, `board/runtime/rt_transport.S` for the ones that touch a string or a list). Every target's transport
-pack provides the `etf` format; no board provides a carrier yet, so a board program that names a carrier is
-rejected at compile time as not provided on the target, and the carrier loopback apps are not run on boards (a board
-runs one application at a time, and there is no TX-to-RX jumper to rely on, per the links design). The ETF format
+pack provides the `etf` format; the ESP32-S3 pack provides one carrier, `(:uart1)` (stage 1 of the Wi-Fi plan,
+2026-11-09: a device worker, not a `dangerous_` actor, so a board program reaches it with `spawn_device` and
+`cast_device`), the Nucleo none; the hosted carrier modules are `dangerous_` FFI actors the boards cannot build, and
+the carrier loopback apps are not run on boards (a board runs one application at a time, and there is no TX-to-RX
+jumper to rely on, per the links design). The ETF format
 module is reached only by an explicit `use wire_etf;`; nothing adds it implicitly. Derived transport source is
 numbered separately from the user's source: its case labels carry a per-declaration tag (`d<index>`) so a derived
 label can never collide with a user label at the same byte offset (trial `transport_derived_case_label_collision`).
@@ -1208,3 +1210,33 @@ Two language facts the trials met: a relational compare of two `uint64` values i
 compiled as a signed compare (the bound-let compare path of every emitter chose LT/GT/LE/GE for any
 integer; fixed 2026-11-05 with `cc_int_cond`, trial `uint64_addition/comparator_high_bit`, and
 wire_etf now compares plainly), and `rec` is a keyword, so a binding named `rec` is mis-typed.
+
+**Implementation notes: the ESP32-S3 serial carriers (2026-11-09).** Learned building the `(:uart1)` carrier (stage 1) and the
+`(:usb_serial_jtag)` carrier (stage S-A) of [transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md), and run on a
+real board with both Mac peers. They bind later work on any serial-like carrier.
+
+- **A host tool must not flush its input at open.** The board sends its frame before the Mac opens the port, and the
+  frame is already in the macOS driver's buffer. pyserial 3.5's `open()` ends with `tcflush(TCIFLUSH)` and silently
+  drops it: the first Erlang run read 0 bytes while the Silica peer read the same frame. The hosted `(:serial)` C
+  wrapper does not flush, so the Silica peer needed no change; `serial_to_tcp_bridge.py` opens in two steps with the
+  flush disabled. Any new host-side tool for this path follows the same rule (§6.3 `(:serial)` row, §6.4 USB rows).
+- **The board may send first.** A `:tx` of at most 64 bytes (the controller's IN FIFO) completes with no host reading
+  and waits in the FIFO until the Mac opens the port. A frame over 64 bytes needs a reading host: with the port closed
+  the carrier waits about 10 s (tunable, `tx_wait_polls`), then reports `(:tx_failed, :link_down)`,
+  `(:link_down, :fault)` and exits with `(:explicit, :link_lost)`. The bound is long on purpose, so a Mac peer started
+  seconds after the board still gets the frame.
+- **A host closing the port is not a `:link_down`.** DTR state and USB suspend are not visible in the USB-Serial-JTAG
+  register set, so the carrier cannot tell. Detection of a vanished host needs an application-level frame or timeout.
+- **A device worker cannot be a supervisor child** (`flavor` has no `:device`), so the board carriers are spawned by
+  their owner and restarted by the program, not by a supervisor policy (links design §6.4 describes the supervised
+  form; it waits for a `:device` flavor).
+- **Golden fragility.** Atom indices in a board assembly golden are assigned across a suite's whole compile set, so
+  adding a module to a suite renumbers `movi` immediates in every `.esp32_s3.ascomp` of that suite. Adding the USB
+  modules regenerated the UART1 golden. Goldens come from the compiler's own output; expect a regeneration whenever a
+  suite stages another driver.
+- **Not done yet:** the `Carrier.silica` rows for `(:uart1)` and `(:usb_serial_jtag)` (the defaults mtu 0, `:stream`,
+  `:reliable_ordered` are already right; `addressing` and `provides` are deferred because that module has Linux
+  assembly goldens that cannot be regenerated on the Mac), the `(:uart0)` carrier (the console shares UART0), and the
+  `carried_on` link declaration (links design phase A). The ESP32-S3 cross compiler binary is one pack row behind the
+  source (`provides_carrier` for the two carriers); nothing reads that row yet, so it is harmless, and the 77 minute
+  rebuild waits until something does.

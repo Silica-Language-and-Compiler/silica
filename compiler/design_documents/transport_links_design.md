@@ -1,6 +1,13 @@
 # Transport links: the hardware a carrier runs on
 
-Status: design accepted for phase A planning; nothing implemented (2026-11-08). It extends
+Status: design accepted for phase A planning; nothing of the `carried_on` grammar, `Link.silica` or E2412 to
+E2417 is implemented (2026-11-08). Of phase B, the ESP32-S3 UART1 worker with the §6.2 carrier contract and the §6
+failure atoms exists since 2026-11-09 (stage 1 of [transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md),
+`emitter/ESP32-S3_raw/board/apps/device_lib/device_esp32s3_uart1.silica`, reached through `spawn_device` until the
+declaration form lands), and so does the `(:usb_serial_jtag)` carrier of stage S-A (`device_lib/device_esp32s3_usb_serial_jtag.silica`, both
+directions, run on a real board with the Silica and Erlang peers). Still open for the hosted and board links: the `carried_on` grammar,
+`Link.silica`, the `Carrier.silica` rows and `provides` for both carriers, E2412 to E2417, `(:uart, 0, baud)` (the console), and the
+supervised form of the bring-up (a device worker cannot be a supervisor child yet). It extends
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below), §6 (carriers),
 §6.0 (the transport pack) and §9.3 (diagnostics), and uses the device and FFI rules of specification §20.4 and
 [runtime_failure_reporting.md](runtime_failure_reporting.md). Decisions marked **Decided** are Lee's; the rest of the
