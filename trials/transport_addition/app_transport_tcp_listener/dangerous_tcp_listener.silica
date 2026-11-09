@@ -1,0 +1,239 @@
+// A (:tcp) listener serving several peers (design §6.2, §6.3): one listening carrier, and two clients
+// that connect to it one after the other. For each accepted peer the listener spawns a connection
+// carrier and tells its owner (:accepted, conn, info); the owner gives every connection a session
+// actor of its own, which opens the connection, decodes the (:ping, n) it carries as a
+// length-prefixed ETF frame (§5, §4.7) and answers (:pong, n + 1). The clients print the answers.
+module dangerous_tcp_listener;
+
+use wire_etf;
+use wireframe;
+use Carrier;
+use dangerous_sockets;
+use dangerous_tcp_carrier;
+use trial_wait_int64;
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+fn send_term(car: dangerous_actor_ref, v: (:ping, int64) | (:pong, int64)) -> boolean {
+    sequence proc[mem(normal), concurrency, transport]
+        frame: string <- encode((:etf), v);
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu((:tcp)), Carrier@boundaries((:tcp)));
+        seg: string <- first_segment(segs);
+        sent: boolean <- cast(car, (:tx, seg, self()) impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn show_term(v: (:ping, int64) | (:pong, int64)) -> atom {
+    sequence
+        o: atom <- case v of {
+            (:ping, n: int64) -> {
+                sequence proc[device_io]
+                    _: atom <- print("ping ");
+                    _: atom <- print_int64(n);
+                    o2: atom <- println("")
+                produces pure o2 end
+            };
+            (:pong, n: int64) -> {
+                sequence proc[device_io]
+                    _: atom <- print("pong ");
+                    _: atom <- print_int64(n);
+                    o2: atom <- println("")
+                produces pure o2 end
+            }
+        }
+    produces
+        pure o
+    end
+}
+
+fn ping_value(v: (:ping, int64) | (:pong, int64)) -> int64 {
+    case v of {
+        (:ping, n: int64) -> n;
+        (:pong, n: int64) -> n
+    }
+}
+
+// The owner of one accepted connection: opens it, then answers every (:ping, n) with (:pong, n + 1).
+fn session(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+           state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string } })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string } }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:rx, segment: string) -> {
+            sequence proc[concurrency]
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, frame: string, r2: { mode: atom, expected: int64, pending: string }) -> {
+                        sequence proc[mem(normal), device_io, transport]
+                            decoded: (:ok, (:ping, int64) | (:pong, int64)) | (:rejected, atom) <- decode((:etf), frame);
+                            _: atom <- case decoded of {
+                                (:ok, v: (:ping, int64) | (:pong, int64)) -> show_term(v);
+                                (:rejected, why: atom) -> print_atom(why)
+                            };
+                            _: boolean <- case decoded of {
+                                (:ok, v2: (:ping, int64) | (:pong, int64)) -> send_term(state.car, (:pong, ping_value(v2) + 1));
+                                (:rejected, _why2: atom) -> true
+                            }
+                        produces pure r2 end
+                    };
+                    (:rejected, why3: atom) -> {
+                        sequence proc[device_io]
+                            _: atom <- print_atom(why3)
+                        produces pure state.rx end
+                    }
+                };
+                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, rx: rx2 })
+            end
+        };
+        (:tx_failed, why4: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print_atom(why4)
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, _why5: atom) -> (:no_reply, state)
+    }
+}
+
+// A client: on :link_up it sends (:ping, n); the answer is shown, the connection closed and the
+// coordinator told.
+fn client(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+          state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, n: int64, boss: actor_ref })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, n: int64, boss: actor_ref }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {});
+                _: boolean <- send_term(state.car, (:ping, state.n))
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:rx, segment: string) -> {
+            sequence
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, frame: string, r2: { mode: atom, expected: int64, pending: string }) -> {
+                        sequence proc[mem(normal), concurrency, device_io, transport]
+                            decoded: (:ok, (:ping, int64) | (:pong, int64)) | (:rejected, atom) <- decode((:etf), frame);
+                            _: atom <- case decoded of {
+                                (:ok, v: (:ping, int64) | (:pong, int64)) -> show_term(v);
+                                (:rejected, why: atom) -> print_atom(why)
+                            };
+                            _: boolean <- cast(state.car, :close impl ActorMessage {});
+                            _: boolean <- cast(state.boss, (:client_done, state.n) impl ActorMessage {})
+                        produces pure r2 end
+                    };
+                    (:rejected, why2: atom) -> {
+                        sequence proc[device_io]
+                            _: atom <- print_atom(why2)
+                        produces pure state.rx end
+                    }
+                }
+            produces
+                pure (:no_reply, { car: state.car, rx: rx2, n: state.n, boss: state.boss })
+            end
+        };
+        (:tx_failed, why3: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print_atom(why3)
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, _why4: atom) -> (:no_reply, state)
+    }
+}
+
+// The listener's owner: starts the first client once the listener is bound, gives each accepted
+// connection a session, starts the second client when the first is done, and ends the trial after
+// the second.
+fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:client_done, int64) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+               state: { car: dangerous_actor_ref, port: string })
+    -> (:no_reply, { car: dangerous_actor_ref, port: string }) {
+    case msg of {
+        (:link_up, info: string) -> case starts_with(info, "port:") of {
+            true -> {
+                sequence proc[concurrency]
+                    port: string <- substring(info, 5, length_bytes(info));
+                    link1: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    cli1: actor_ref <- spawn({ car: link1, rx: wireframe@fresh(Carrier@boundaries((:tcp))), n: 7, boss: self() }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    _: boolean <- cast(link1, (:open, cli1, concat("127.0.0.1:", port)) impl ActorMessage {})
+                produces
+                    pure (:no_reply, { car: state.car, port: port })
+                end
+            };
+            false -> (:no_reply, state)
+        };
+        (:accepted, conn: dangerous_actor_ref, _info: string) -> {
+            sequence proc[concurrency]
+                ses: actor_ref <- spawn({ car: conn, rx: wireframe@fresh(Carrier@boundaries((:tcp))) }, session, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(conn, (:open, ses, "") impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:client_done, n: int64) -> case n == 7 of {
+            true -> {
+                sequence proc[concurrency]
+                    link2: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    cli2: actor_ref <- spawn({ car: link2, rx: wireframe@fresh(Carrier@boundaries((:tcp))), n: 9, boss: self() }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    _: boolean <- cast(link2, (:open, cli2, concat("127.0.0.1:", state.port)) impl ActorMessage {})
+                produces
+                    pure (:no_reply, state)
+                end
+            };
+            false -> {
+                sequence proc[concurrency, device_io]
+                    _: boolean <- cast(state.car, :close impl ActorMessage {});
+                    _: atom <- println("done");
+                    _: boolean <- cast_exit(0)
+                produces
+                    pure (:no_reply, state)
+                end
+            }
+        };
+        (:tx_credit, _n2: int64) -> (:no_reply, state);
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_failed, why: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print_atom(why)
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, _why2: atom) -> (:no_reply, state)
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                lst: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                boss: actor_ref <- spawn({ car: lst, port: "" }, coordinator, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(lst, (:open, boss, "listen:0") impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
