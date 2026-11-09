@@ -29,8 +29,8 @@
 # Remote machines are reached with public/private key ssh in batch mode; no password is ever typed.
 # Set the key up with ssh-keygen and ssh-copy-id, and check it with `ssh -o BatchMode=yes host true`.
 #
-# This machine runs its own trials, and the board runs after it: both take trials/.integrate.lock,
-# one trial run per machine. Remote machines run at the same time as each other.
+# This machine runs its own trials, and the board runs after it: both take their own per-target lock (trials/.integrate.lock.<target>),
+# one trial run per target. Remote machines run at the same time as each other.
 #
 # Logs and each platform's .integrate_report land in the log directory, and one summary table is
 # printed at the end. The exit status is 0 only when every platform passed.
@@ -240,7 +240,7 @@ run_remote() {  # $1 = target
         "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host ${jobs:+JOBS=$jobs} SDS_JOBS=$sds" \
         > "$log" 2>&1
     rc=$?
-    ssh -o BatchMode=yes "$conn" "cat $rpath/trials/.integrate_report" > "$LOG_DIR/$t.report" 2>/dev/null
+    ssh -o BatchMode=yes "$conn" "cd $rpath/trials && { cat .integrate_report.$t 2>/dev/null || cat .integrate_report; }" > "$LOG_DIR/$t.report" 2>/dev/null
     echo "$rc" > "$LOG_DIR/$t.rc"
     return $rc
 }
@@ -253,7 +253,11 @@ run_here() {  # $1 = target, $2 = TRIAL_TARGET value
     ( cd "$REPO/trials" && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET="$tt" \
         ${jobs:+JOBS=$jobs} SDS_JOBS="$sds" ) > "$log" 2>&1
     rc=$?
-    cp "$REPO/trials/.integrate_report" "$LOG_DIR/$t.report" 2>/dev/null
+    # A host run's report is named after the machine's target (macos_applesilicon on the Mac), a board's after the board.
+    hk="$t"; [ "$t" = apple_silicon_mac ] && hk=macos_applesilicon
+    cp "$REPO/trials/.integrate_report.$hk" "$LOG_DIR/$t.report" 2>/dev/null \
+        || cp "$REPO/trials/.integrate_report.$t" "$LOG_DIR/$t.report" 2>/dev/null \
+        || cp "$REPO/trials/.integrate_report" "$LOG_DIR/$t.report" 2>/dev/null
     echo "$rc" > "$LOG_DIR/$t.rc"
     return $rc
 }
@@ -261,7 +265,7 @@ run_here() {  # $1 = target, $2 = TRIAL_TARGET value
 pids=(); tags=()
 for t in $RUN_REMOTE; do run_remote "$t" & pids+=($!); tags+=("$t"); done
 
-# This machine, then the board: both take trials/.integrate.lock.
+# This machine, then the board: each takes its own per-target lock.
 [ "$RUN_NATIVE" = 1 ] && run_here "$HOST_TARGET" host
 for t in $RUN_RAW; do run_here "$t" "$t"; done
 

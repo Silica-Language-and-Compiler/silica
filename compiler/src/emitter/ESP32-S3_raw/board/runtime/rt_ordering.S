@@ -40,11 +40,6 @@
     .balign 8
 silica_rt_ordering_env_next:
     .space  8
-    .global silica_rt_canonical_arena_table   // read by rt_heap.S: region_destroy leaves an arena alone
-silica_rt_canonical_arena_table:        // 512 x (key: 8, region: 8)
-    .space  8192
-silica_rt_canonical_arena_count:
-    .space  8
 
     .section .text.silica_rt_ordering, "ax"
     .literal_position
@@ -87,10 +82,8 @@ silica_rt_ordering_identity_make:
 
     .align  4
     .global silica_rt_ordering_identity_same
-    .global silica_rt_canonical_arena_same
     .type   silica_rt_ordering_identity_same, @function
 silica_rt_ordering_identity_same:
-silica_rt_canonical_arena_same:
     entry   a1, 32
     xor     a2, a2, a4
     xor     a3, a3, a5
@@ -130,66 +123,6 @@ silica_rt_ordering_bundle_make:
 // a probe that sees the key sees the region. A core that found an empty slot takes the lock and
 // probes again from the start (a11 = 1 while it holds the lock): the other core may have inserted
 // the same key in between, and the table changes only under the lock.
-    .align  4
-    .global silica_rt_canonical_arena_lookup
-    .type   silica_rt_canonical_arena_lookup, @function
-silica_rt_canonical_arena_lookup:
-    entry   a1, 32
-    beqz    a2, 8f
-    movi    a11, 0                // 1 once this call holds silica_rt_region_lock
-7:  movi    a3, silica_rt_canonical_arena_table
-    extui   a4, a2, 0, 9          // slot
-    movi    a5, 0                 // probes
-1:  movi    a8, 512
-    bgeu    a5, a8, 9f
-    slli    a6, a4, 4
-    add     a6, a3, a6            // entry address
-    l32i    a7, a6, 0
-    beqz    a7, 3f                // empty
-    bne     a7, a2, 2f
-    l32i    a8, a6, 4             // same key (both words)
-    beqz    a8, 4f
-2:  addi    a4, a4, 1
-    extui   a4, a4, 0, 9
-    addi    a5, a5, 1
-    j       1b
-3:  bnez    a11, 5f               // under the lock already: insert here
-    movi    a8, silica_rt_region_lock
-6:  movi    a9, 0
-    wsr     a9, scompare1
-    movi    a9, 1
-    s32c1i  a9, a8, 0
-    bnez    a9, 6b
-    movi    a11, 1
-    j       7b                    // probe again, now under the lock
-5:  movi    a10, 4128
-    call8   silica_rt_alloc
-    movi    a11, 1                // the call returned a3 = 0 into a11; 5 is reached only under the lock
-    addi    a8, a10, 32           // bump
-    s32i    a8, a10, 0
-    movi    a9, 4128
-    add     a9, a10, a9           // end, and the block's own data end
-    s32i    a9, a10, 8
-    s32i    a9, a10, 24
-    s32i    a10, a6, 8            // region first
-    memw
-    s32i    a2, a6, 0             // key last (high word 0)
-    movi    a8, silica_rt_canonical_arena_count
-    l32i    a9, a8, 0
-    addi    a9, a9, 1
-    s32i    a9, a8, 0
-4:  l32i    a2, a6, 8
-    movi    a3, 0
-    beqz    a11, 10f
-    memw
-    movi    a8, silica_rt_region_lock
-    s32i    a3, a8, 0
-    memw
-10: retw
-8:  call8   silica_rt_abort_arena_key
-9:  call8   silica_rt_abort_arena_full
-    retw
-    .size   silica_rt_canonical_arena_lookup, . - silica_rt_canonical_arena_lookup
 
 // --- checked int64 ---------------------------------------------------------------------------
 // The sum overflows when both operands have the same sign and the result's sign differs.

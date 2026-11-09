@@ -98,13 +98,15 @@ silica_rt_string_bad:
 1:  j       1b
 
 // silica_rt_string_alloc(n): a fresh string of n bytes (data at +24, zeroed, NUL after the last byte).
-// Local: a2 = byte count, result a2 = string.
+// a2 = byte count, result a2 = string. Global for rt_transport.S (bytes_of, join_bytes), which fills
+// the bytes itself.
     .align  4
+    .global silica_rt_string_alloc
     .type   silica_rt_string_alloc, @function
 silica_rt_string_alloc:
     entry   a1, 32
     addi    a10, a2, 25
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     movi    a8, -1
     s32i    a8, a10, 0
     s32i    a8, a10, 4
@@ -115,6 +117,17 @@ silica_rt_string_alloc:
     movi    a3, 0
     retw
     .size   silica_rt_string_alloc, . - silica_rt_string_alloc
+
+// silica_rt_copy_bytes(a2 = src, a3 = dst, a4 = n): byte copy, no overlap. For the runtime's own
+// builders (rt_actors.S silica_rt_actor_deliver_unwind_report writes the report text into its block).
+    .align  4
+    .global silica_rt_copy_bytes
+    .type   silica_rt_copy_bytes, @function
+silica_rt_copy_bytes:
+    entry   a1, 32
+    COPY_BYTES a2, a3, a4
+    retw
+    .size   silica_rt_copy_bytes, . - silica_rt_copy_bytes
 
     .align  4
     .global silica_rt_string_from_bytes

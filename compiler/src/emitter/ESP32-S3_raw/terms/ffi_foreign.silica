@@ -15,13 +15,49 @@
    limitations under the License.
 -}
 
-// Phase 8: lower foreign c_wrapper calls to direct AAPCS64 BL symbols; string in/out marshaling.
+// Foreign c_wrapper calls on the ESP32-S3 (spec §20.4; FFI wrapper spec §6; porting_for_os_free_targets.md
+// §9.1; chunk15_stack_memory_design.md §7). The C side is compiled by the same Espressif
+// xtensa-esp32s3-elf GCC that assembles and links the image, so emitted code and C share the windowed
+// ABI: a CALL8's arguments are the caller's a10-a15 (the callee's a2-a7), 64-bit values in even-aligned
+// register pairs, results in a2-a5; an aggregate larger than 16 bytes is returned through a hidden
+// pointer passed as the first argument. The emitter's X0-X2 already live in a10-a15 (shared/xt_vr), but a
+// C argument list is laid out by C's rules (a narrow value takes one word, a double an even pair), so
+// every call goes through one shape: the CALL BLOCK.
+//
+// The call block is 64 bytes of the auxiliary stack (the emitter's SP; reserved by emit_foreign_sret_setup
+// before the arguments are evaluated, as the hosted scratch frame is, and popped after the call):
+//   [SP+0, SP+24)   the six argument words a2-a7 of the C callee, in C order
+//   [SP+24]         the C function's address
+//   [SP+28]         the result mode: 0 a scalar in a2:a3, 1 a struct of up to 16 bytes in a2-a5 (stored
+//                   at +32 by the runtime), 2 a struct returned through the hidden pointer at word 0
+//   [SP+32, SP+64)  the returned struct (modes 1 and 2), zeroed before the call
+// Emitted code fills the block, leaves its address in VRG_ARG and calls silica_rt_ffi_call
+// (board/runtime/rt_ffi.S), which loads a10-a15 from it and calls the C function with CALLX8. In an actor
+// the runtime first moves to a machine-stack chunk of the actor's own chain with _silica_ffi_stack_size
+// bytes free below the call (the growth path every emitted prologue uses: rt_actors.S "Growable stacks"),
+// so the foreign frames never run into the chunk the Silica frames are on and a C stack overflow hits
+// that chunk's guard band like any other; the chunk goes back when the call returns. The runtime marks
+// the core "in foreign code" for the call: a CPU exception raised meanwhile ends the actor with
+// failure_reason :foreign_fault (tag 5, silica_rt_actor_fault_hook), the board's form of the hosted
+// guarded region (no setjmp, porting §9.1 rule 2). The result comes back in a10:a11 = X0, as every call's.
+//
+// Marshalling, as the hosted emitters do it: a `string` argument for a `name_ptr: uint8, name_len: uint64`
+// pair is copied with a NUL into a block of the caller's frame (silica_rt_ffi_string_in, a frame
+// allocation that pops with the frame; FFI wrapper spec §6.1) and crosses as pointer and length; a
+// `buf(L, S, uint8, N)` crosses as its data pointer and its count word (§6.2); a struct result holding
+// a `_ptr`/`_len` pair expected as a string is copied into a fresh frame string
+// (silica_rt_ffi_string_out). Nothing is allocated on the heap. What the target does not lower is refused
+// with an `.error` line, the tree's convention for unsupported constructs: more than six argument words,
+// a record or tuple argument, a float16, and a record result that is not consumed as a string.
 
 use var;
 use emitter_effects;
 use reg_conventions;
-use atom_table;
-use ffi_foreign_runtime_asm;
+use term_sir_helpers;
+use control;
+use xt_vr;
+use xt_isa;
+use xt_mem;
 
 export encode_bindings_for_outer/1;
 export lookup_from_outer/2;
@@ -34,56 +70,7 @@ export emit_foreign_sret_setup/1;
 export emit_foreign_scratch_setup_string_in_only/0;
 export foreign_call_uses_heap_scratch/3;
 export needs_string_in_marshal/2;
-export emit_foreign_tail_call/4;
-
-
-// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
-fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
-    sequence proc[mem(normal)]
-        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
-    produces
-        pure result
-    end
-}
-
-fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
-    case nodes.is_nil of {
-        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
-        false -> case idx <= 0 of {
-            true -> nodes.head;
-            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
-        }
-    }
-}
-
-
-fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
-    case idx < 0 of {
-        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
-        false -> {
-            n: int64 <- sir_term_nodes_len(nodes);
-            case idx >= n of {
-                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
-                false -> {
-                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
-                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
-                }
-            }
-        }
-    }
-}
-
-
-fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
-    case term.root < 0 of {
-        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
-        false -> sir_term_node_at(term.nodes, term.root)
-    }
-}
-
-fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
-    { nodes: term.nodes, root: idx }
-}
+export emit_foreign_tail_call/3;
 
 fn binding_field_sep() -> string {
     "~"
@@ -116,6 +103,11 @@ fn param_types_for_outer_encoding(param_types: string) -> string {
     replace_pipe_with_comma_loop(param_types, 0, "")
 }
 
+// local~symbol~param types~declared result type. The fourth field is this target's: the hosted encoding
+// infers the result from the parameter list (a pointer-length pair means the text result struct), which
+// on AArch64 only costs an unused X8; here the result decides the C argument layout (a hidden pointer
+// shifts every argument), so the declared type travels with the binding. A record type's text holds
+// no "~", ";" or "|".
 fn encode_one_binding(b: { local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }) -> string {
     pt_enc: string <- param_types_for_outer_encoding(b.param_types);
     concat(
@@ -126,7 +118,7 @@ fn encode_one_binding(b: { local_name: string, c_symbol: string, meta_path: stri
             ),
             binding_field_sep()
         ),
-        pt_enc
+        concat(pt_enc, concat(binding_field_sep(), b.return_type))
     )
 }
 
@@ -179,8 +171,15 @@ fn parse_binding_entry(entry: string) -> (string, string, string, string) {
                 true -> ("", "", "", "");
                 false -> {
                     c_sym: string <- substring(rest1, 0, s2);
-                    pt: string <- substring_to_end(rest1, s2 + length_bytes(binding_field_sep()));
-                    rt: string <- inferred_return_type_from_param_types(pt);
+                    rest2: string <- substring_to_end(rest1, s2 + length_bytes(binding_field_sep()));
+                    s3: int64 <- find_field_sep(rest2, binding_field_sep(), 0);
+                    pt: string <- case s3 < 0 of { true -> rest2; false -> substring(rest2, 0, s3) };
+                    declared: string <- case s3 < 0 of { true -> ""; false -> substring_to_end(rest2, s3 + length_bytes(binding_field_sep())) };
+                    // the declared result when the binding carries one; the hosted inference otherwise
+                    rt: string <- case length_bytes(declared) > 0 of {
+                        true -> declared;
+                        false -> inferred_return_type_from_param_types(pt)
+                    };
                     (local, c_sym, pt, rt)
                 }
             }
@@ -220,12 +219,10 @@ fn lookup_from_outer(outer_reg: string, local_name: string) -> (boolean, string,
     lookup_in_encoded(enc, local_name)
 }
 
-fn mach_o_c_symbol(c_symbol: string) -> string {
-    concat("_", c_symbol)
-}
-
+// ELF symbols carry no underscore prefix. `.extern` is accepted and ignored by GNU as; the lines name the
+// C functions the module binds, for a reader of the .sams.
 fn emit_one_extern(c_symbol: string) -> string {
-    concat(concat(".extern ", mach_o_c_symbol(c_symbol)), "\n")
+    concat(concat(".extern ", c_symbol), "\n")
 }
 
 fn emit_extern_loop(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], acc: string) -> string {
@@ -236,9 +233,7 @@ fn emit_extern_loop(bindings: List[{ local_name: string, c_symbol: string, meta_
 }
 
 fn emit_extern_directives(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> string {
-    guarded: string <- ".extern _silica_rt_ffi_guarded_enter\n.extern _silica_rt_ffi_guarded_exit\n.extern _silica_rt_ffi_guarded_setjmp\n.extern _silica_rt_ffi_guarded_fault_finish\n";
-    arena: string <- ".extern _silica_rt_ffi_arena_bump\n";
-    concat(concat(guarded, arena), emit_extern_loop(bindings, ""))
+    emit_extern_loop(bindings, "")
 }
 
 fn module_uses_foreign_calls(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)]) -> boolean {
@@ -248,8 +243,9 @@ fn module_uses_foreign_calls(bindings: List[{ local_name: string, c_symbol: stri
     }
 }
 
+// The helpers are in the board runtime (rt_ffi.S), linked with every image: nothing is emitted per module.
 fn emit_foreign_runtime_helpers() -> string {
-    ffi_foreign_runtime_asm@emit_ffi_foreign_runtime_helpers()
+    ""
 }
 
 fn param_types_are_ptr_len_pair(param_types: string) -> boolean {
@@ -306,12 +302,28 @@ fn return_type_has_ptr_len_out_fields(return_type: string) -> boolean {
     }
 }
 
-fn foreign_return_uses_sret(return_type: string) -> boolean {
-    reg_conventions@is_aggregate_struct_or_tuple_return_type(return_type)
+fn foreign_return_is_aggregate(return_type: string) -> boolean {
+    case return_type == "ptr_len_struct" of {
+        true -> true;
+        false -> reg_conventions@is_aggregate_struct_or_tuple_return_type(return_type)
+    }
 }
 
 fn needs_string_in_marshal(param_types: string, arg1_type: string) -> boolean {
     param_types_are_ptr_len_pair(param_types) and arg1_type == "string"
+}
+
+// A buf(L, Space, uint8, N) argument for a pointer-plus-length pair (wrapper spec §6.1, §6.2). The buffer
+// crosses into C only as pointer and length, for the call (Lee 2026-11-01).
+fn needs_buf_in_marshal(param_types: string, arg1_type: string) -> boolean {
+    param_types_are_ptr_len_pair(param_types) and is_uint8_buf_type(arg1_type)
+}
+
+fn is_uint8_buf_type(t: string) -> boolean {
+    case length_bytes(t) >= 4 of {
+        true -> substring(t, 0, 4) == "buf(" and type_text_contains(t, "uint8");
+        false -> false
+    }
 }
 
 fn needs_string_out_unmarshal(return_type: string, expected_type: string) -> boolean {
@@ -320,89 +332,463 @@ fn needs_string_out_unmarshal(return_type: string, expected_type: string) -> boo
 
 fn foreign_call_expects_string(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, return_type: string, outer_reg: string) -> boolean {
     fn_ret: string <- var@find_sp_binding(outer_reg, "_fnret");
-    case needs_string_out_unmarshal(return_type, sir_term_root_node(term).type_name) of {
+    case needs_string_out_unmarshal(return_type, term_sir_helpers@sir_term_root_node(term).type_name) of {
         true -> true;
         false -> needs_string_out_unmarshal(return_type, fn_ret)
     }
 }
 
-fn emit_foreign_bl_line(c_symbol: string) -> string {
-    concat(concat("    BL ", mach_o_c_symbol(c_symbol)), "\n")
+// 32 for an aggregate result (the block's struct area), 0 for a scalar. The call site reserves the call
+// block for every foreign call (emit_foreign_sret_setup) whatever the count.
+fn foreign_call_sret_bytes(return_type: string) -> int64 {
+    case foreign_return_is_aggregate(return_type) of {
+        true -> 32;
+        false -> 0
+    }
 }
 
-fn emit_guarded_preserver_save() -> string {
-    "    SUB SP, SP, #80\n    STP X0, X1, [SP, #0]\n    STP X2, X3, [SP, #16]\n    STP X4, X5, [SP, #32]\n    STP X6, X7, [SP, #48]\n    STR X8, [SP, #64]\n"
+// Every foreign call takes the call block.
+fn foreign_call_uses_heap_scratch(_param_types: string, _return_type: string, _arg1_type: string) -> boolean {
+    true
 }
 
-fn emit_guarded_preserver_restore_args() -> string {
-    "    LDR X8, [SP, #64]\n    LDP X6, X7, [SP, #48]\n    LDP X4, X5, [SP, #32]\n    LDP X2, X3, [SP, #16]\n    LDP X0, X1, [SP, #0]\n"
+fn call_block_bytes() -> int64 {
+    64
 }
 
-fn emit_guarded_preserver_restore_result() -> string {
-    "    LDR X0, [SP, #0]\n    ADD SP, SP, #80\n"
+// Pre-call setup, emitted before the arguments are evaluated: the call block on the auxiliary stack.
+fn emit_foreign_sret_setup(_sret_bytes: int64) -> string {
+    xt_vr@vsp_adjust(0 - call_block_bytes())
 }
 
-fn emit_guarded_foreign_call_lines(c_symbol: string) -> string {
-    save: string <- emit_guarded_preserver_save();
-    enter_line: string <- "    BL _silica_rt_ffi_guarded_enter\n";
-    setjmp_line: string <- "    BL _silica_rt_ffi_guarded_setjmp\n    CBNZ X0, 1f\n";
-    restore_args: string <- emit_guarded_preserver_restore_args();
-    call_line: string <- emit_foreign_bl_line(c_symbol);
-    stash_result: string <- "    STR X0, [SP, #0]\n";
-    exit_line: string <- "    BL _silica_rt_ffi_guarded_exit\n";
-    restore_result: string <- emit_guarded_preserver_restore_result();
-    skip_fault: string <- "    B 2f\n";
-    fault_line: string <- "1:\n    BL _silica_rt_ffi_guarded_fault_finish\n2:\n";
-    part1: string <- concat(save, enter_line);
-    part2: string <- concat(setjmp_line, restore_args);
-    part3: string <- concat(call_line, stash_result);
-    part4: string <- concat(exit_line, restore_result);
-    part5: string <- concat(concat(part4, skip_fault), fault_line);
-    concat(concat(part1, part2), concat(part3, part5))
+fn emit_foreign_scratch_setup_string_in_only() -> string {
+    emit_foreign_sret_setup(0)
 }
 
-fn emit_result_mov(dest: string) -> string {
-    case dest == "X0" or dest == "W0" or dest == "D0" or dest == "S0" or dest == "H0" of {
-        true -> "";
-        false -> case length_bytes(dest) > 0 of {
-            true -> {
-                prefix: string <- substring(dest, 0, 1);
-                src: string <- case prefix == "D" or prefix == "S" or prefix == "H" of {
-                    true -> concat(prefix, "0");
-                    false -> case prefix == "W" of {
-                        true -> "W0";
-                        false -> "X0"
-                    }
-                };
-                op: string <- case prefix == "D" or prefix == "S" or prefix == "H" of {
-                    true -> "FMOV";
-                    false -> "MOV"
-                };
-                concat(concat(concat(concat("\n    ", op), " "), dest), concat(", ", src))
-            };
-            false -> ""
+fn ins(op: string, args: string) -> string {
+    xt_vr@xt_ins(op, args)
+}
+
+fn itos(n: int64) -> string {
+    xt_vr@xt_itos(n)
+}
+
+fn error_line(msg: string) -> string {
+    concat(".error \"ESP32-S3: ", concat(msg, "\"\n"))
+}
+
+// --- the C layout of an ABI record (FFI wrapper spec §6.8) -----------------------------------------
+
+fn c_size_of_scalar(t: string) -> int64 {
+    case t == "int64" or t == "uint64" or t == "float64" of {
+        true -> 8;
+        false -> case t == "int32" or t == "uint32" or t == "float32" of {
+            true -> 4;
+            false -> case t == "int16" or t == "uint16" of {
+                true -> 2;
+                false -> case t == "int8" or t == "uint8" or t == "boolean" of {
+                    true -> 1;
+                    false -> 0
+                }
+            }
         }
     }
 }
 
+fn align_up(n: int64, a: int64) -> int64 {
+    case a <= 1 of {
+        true -> n;
+        false -> (n + a - 1) / a * a
+    }
+}
+
+fn strip_spaces_from(s: string, i: int64, acc: string) -> string {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            ch: string <- substring(s, i, i + 1);
+            case ch == " " of {
+                true -> strip_spaces_from(s, i + 1, acc);
+                false -> strip_spaces_from(s, i + 1, concat(acc, ch))
+            }
+        }
+    }
+}
+
+// The field list of "{ a: T, b: U }" without braces or spaces: "a:T,b:U". "" when the text is not a
+// flat record of scalar fields (a nested record, a tuple field, a sum).
+fn record_field_text(return_type: string) -> string {
+    s: string <- strip_spaces_from(return_type, 0, "");
+    n: int64 <- length_bytes(s);
+    case n >= 2 and substring(s, 0, 1) == "{" and substring(s, n - 1, n) == "}" of {
+        false -> "";
+        true -> {
+            inner: string <- substring(s, 1, n - 1);
+            case type_text_contains(inner, "{") or type_text_contains(inner, "(") or type_text_contains(inner, "|") of {
+                true -> "";
+                false -> inner
+            }
+        }
+    }
+}
+
+fn field_name_of(field: string) -> string {
+    c: int64 <- find_field_sep(field, ":", 0);
+    case c < 0 of {
+        true -> field;
+        false -> substring(field, 0, c)
+    }
+}
+
+fn field_type_of(field: string) -> string {
+    c: int64 <- find_field_sep(field, ":", 0);
+    case c < 0 of {
+        true -> "";
+        false -> substring_to_end(field, c + 1)
+    }
+}
+
+fn name_ends_with(name: string, suffix: string) -> boolean {
+    n: int64 <- length_bytes(name);
+    m: int64 <- length_bytes(suffix);
+    case n >= m of {
+        true -> substring(name, n - m, n) == suffix;
+        false -> false
+    }
+}
+
+// A `name_ptr: uint8` field is a C pointer (4 bytes here) when the record also has `name_len`.
+fn field_is_pointer(fields: string, field: string) -> boolean {
+    name: string <- field_name_of(field);
+    case field_type_of(field) == "uint8" and name_ends_with(name, "_ptr") of {
+        false -> false;
+        true -> {
+            stem: string <- substring(name, 0, length_bytes(name) - 4);
+            type_text_contains(concat(",", concat(fields, ",")), concat(",", concat(stem, "_len:")))
+        }
+    }
+}
+
+fn field_c_size(fields: string, field: string) -> int64 {
+    case field_is_pointer(fields, field) of {
+        true -> 4;
+        false -> c_size_of_scalar(field_type_of(field))
+    }
+}
+
+// Walks the fields from byte `off`, aligning each as C does (every scalar at its own size), and answers
+// (the offset of the field named `want`, the struct size). -1 for a field not found; a size of -1 for a
+// field type C has no mapping for.
+fn walk_fields(fields: string, rest: string, off: int64, max_align: int64, want: string) -> (int64, int64) {
+    case length_bytes(rest) == 0 of {
+        true -> (-1, align_up(off, max_align));
+        false -> {
+            sep: int64 <- find_field_sep(rest, ",", 0);
+            field: string <- case sep < 0 of { true -> rest; false -> substring(rest, 0, sep) };
+            more: string <- case sep < 0 of { true -> ""; false -> substring_to_end(rest, sep + 1) };
+            size: int64 <- field_c_size(fields, field);
+            case size == 0 of {
+                true -> (-1, -1);
+                false -> {
+                    at: int64 <- align_up(off, size);
+                    ma: int64 <- case size > max_align of { true -> size; false -> max_align };
+                    (found: int64, total: int64) <- walk_fields(fields, more, at + size, ma, want);
+                    case field_name_of(field) == want of {
+                        true -> (at, total);
+                        false -> (found, total)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn c_struct_size(fields: string) -> int64 {
+    (_: int64, total: int64) <- walk_fields(fields, fields, 0, 1, "");
+    total
+}
+
+fn c_field_offset(fields: string, want: string) -> int64 {
+    (found: int64, _: int64) <- walk_fields(fields, fields, 0, 1, want);
+    found
+}
+
+// The first field whose name ends in `suffix` ("" when none).
+fn field_named_with_suffix(rest: string, suffix: string) -> string {
+    case length_bytes(rest) == 0 of {
+        true -> "";
+        false -> {
+            sep: int64 <- find_field_sep(rest, ",", 0);
+            field: string <- case sep < 0 of { true -> rest; false -> substring(rest, 0, sep) };
+            more: string <- case sep < 0 of { true -> ""; false -> substring_to_end(rest, sep + 1) };
+            name: string <- field_name_of(field);
+            case name_ends_with(name, suffix) of {
+                true -> name;
+                false -> field_named_with_suffix(more, suffix)
+            }
+        }
+    }
+}
+
+// The string result struct: (C size, tag offset or -1, pointer offset, length offset). The "ptr_len_struct"
+// form (a binding whose declared result the SIR did not record) is the wrapper spec's canonical text
+// result `{ tag: int64, text_ptr: uint8, text_len: uint64, error_code: int64 }`: 32 bytes, 0/8/16.
+fn string_result_layout(return_type: string) -> (int64, int64, int64, int64) {
+    case return_type == "ptr_len_struct" of {
+        true -> (32, 0, 8, 16);
+        false -> {
+            fields: string <- record_field_text(return_type);
+            case length_bytes(fields) == 0 of {
+                true -> (-1, -1, -1, -1);
+                false -> {
+                    tag_name: string <- case c_field_offset(fields, "tag") >= 0 of {
+                        true -> "tag";
+                        false -> case c_field_offset(fields, "status") >= 0 of { true -> "status"; false -> "" }
+                    };
+                    tag_off: int64 <- case length_bytes(tag_name) == 0 of { true -> -1; false -> c_field_offset(fields, tag_name) };
+                    ptr_name: string <- field_named_with_suffix(fields, "_ptr");
+                    len_name: string <- field_named_with_suffix(fields, "_len");
+                    (c_struct_size(fields), tag_off, c_field_offset(fields, ptr_name), c_field_offset(fields, len_name))
+                }
+            }
+        }
+    }
+}
+
+// --- staging the C argument words into the call block (a9 = the block) ------------------------------
+
+fn block_word_store(reg: string, w: int64) -> string {
+    ins("s32i", concat(reg, concat(", a9, ", itos(w * 4))))
+}
+
+// The low word of VR `src` into block word w (a2 is the temp; a global home is read through threadptr).
+fn stage_lo(src: string, w: int64) -> string {
+    concat(xt_vr@vr_lo_load(src, "a2"), block_word_store(xt_vr@vr_lo_reg(src, "a2"), w))
+}
+
+fn stage_hi(src: string, w: int64) -> string {
+    concat(xt_vr@vr_hi_load(src, "a3"), block_word_store(xt_vr@vr_hi_reg(src, "a3"), w))
+}
+
+fn even_up(w: int64) -> int64 {
+    align_up(w, 2)
+}
+
+fn is_c_narrow(t: string) -> boolean {
+    reg_conventions@is_narrow_type(t) or t == "boolean"
+}
+
+fn param_takes_fp_slot(t: string) -> boolean {
+    t == "float64" or t == "float32"
+}
+
+// One declared C parameter of type t from the Silica argument in GPR slot g / FP slot f (the registers
+// term_user_call_abi assigns: X/W for integers and booleans, D/S for floats), stored from block word w.
+// (asm, the next free word, an error text or "").
+fn stage_one(t: string, g: int64, f: int64, w: int64) -> (string, int64, string) {
+    case t == "int64" or t == "uint64" of {
+        true -> {
+            w0: int64 <- even_up(w);
+            src: string <- concat("X", itos(g));
+            (concat(stage_lo(src, w0), stage_hi(src, w0 + 1)), w0 + 2, "")
+        };
+        false -> case t == "float64" of {
+            true -> {
+                w0: int64 <- even_up(w);
+                src: string <- concat("D", itos(f));
+                (concat(stage_lo(src, w0), stage_hi(src, w0 + 1)), w0 + 2, "")
+            };
+            false -> case t == "float32" of {
+                true -> (stage_lo(concat("S", itos(f)), w), w + 1, "");
+                false -> case is_c_narrow(t) of {
+                    true -> (stage_lo(concat("W", itos(g)), w), w + 1, "");
+                    false -> ("", w, concat("a foreign parameter of type ", concat(t, " is not supported on this target (int8..int64, uint8..uint64, boolean, float32, float64, and a uint8/uint64 pointer-length pair for a string or buf)")))
+                }
+            }
+        }
+    }
+}
+
+fn stage_params(pt: string, g: int64, f: int64, w: int64) -> (string, int64, string) {
+    case length_bytes(pt) == 0 of {
+        true -> ("", w, "");
+        false -> {
+            sep: int64 <- find_field_sep(pt, param_type_sep(), 0);
+            head: string <- case sep < 0 of { true -> pt; false -> substring(pt, 0, sep) };
+            rest: string <- case sep < 0 of { true -> ""; false -> substring_to_end(pt, sep + 1) };
+            (asm1: string, w1: int64, err1: string) <- stage_one(head, g, f, w);
+            case length_bytes(err1) > 0 of {
+                true -> ("", w1, err1);
+                false -> {
+                    g1: int64 <- case param_takes_fp_slot(head) of { true -> g; false -> g + 1 };
+                    f1: int64 <- case param_takes_fp_slot(head) of { true -> f + 1; false -> f };
+                    (asm2: string, w2: int64, err2: string) <- stage_params(rest, g1, f1, w1);
+                    (concat(asm1, asm2), w2, err2)
+                }
+            }
+        }
+    }
+}
+
+// A pointer-length pair from the marshalled X0 (the pointer) and X1 (the byte count): the pointer word,
+// then the count in an even pair.
+fn stage_ptr_len(w: int64) -> (string, int64, string) {
+    wl: int64 <- even_up(w + 1);
+    (concat(stage_lo("X0", w), concat(stage_lo("X1", wl), stage_hi("X1", wl + 1))), wl + 2, "")
+}
+
+fn stage_arguments(param_types: string, arg1_type: string, w: int64) -> (string, int64, string) {
+    case needs_string_in_marshal(param_types, arg1_type) or needs_buf_in_marshal(param_types, arg1_type) of {
+        true -> stage_ptr_len(w);
+        false -> case param_types_are_ptr_len_pair(param_types) of {
+            true -> ("", w, "a uint8/uint64 pointer-length pair takes a string or a buf(L, S, uint8, N) argument");
+            false -> stage_params(param_types, 0, 0, w)
+        }
+    }
+}
+
+// a9 = SP, the call block.
+fn block_base_load() -> string {
+    concat(xt_vr@tp_load("a9"), ins("l32i", concat("a9, a9, ", itos(xt_vr@vr_vsp_off()))))
+}
+
+fn zero_words_from(w: int64, n: int64) -> string {
+    case n <= 0 of {
+        true -> "";
+        false -> concat(block_word_store("a8", w), zero_words_from(w + 1, n - 1))
+    }
+}
+
+// The struct area zeroed, the result mode at +28 and, for a hidden-pointer result, the area's address in
+// word 0.
+fn stage_result_area(mode: int64) -> string {
+    case mode == 0 of {
+        true -> concat(ins("movi", "a8, 0"), block_word_store("a8", 7));
+        false -> {
+            zero: string <- concat(ins("movi", "a8, 0"), zero_words_from(8, 8));
+            mode_line: string <- concat(ins("movi", concat("a8, ", itos(mode))), block_word_store("a8", 7));
+            ptr: string <- case mode == 2 of {
+                true -> concat(ins("addi", "a8, a9, 32"), block_word_store("a8", 0));
+                false -> ""
+            };
+            concat(zero, concat(mode_line, ptr))
+        }
+    }
+}
+
+// The C function's address at +24 and the block's address in VRG_ARG, then the runtime call.
+fn stage_target_and_call(c_symbol: string) -> string {
+    addr: string <- concat(ins("movi", concat("a8, ", xt_isa@xt_sym(c_symbol))), block_word_store("a8", 6));
+    arg: string <- concat(xt_vr@tp_load("a8"), ins("s32i", "a9, a8, 136"));
+    concat(addr, concat(arg, ins("call8", "silica_rt_ffi_call")))
+}
+
+// X0 = the string handle: silica_rt_ffi_string_in copies its bytes and a NUL into a block of this frame
+// and answers X0 = the block, X1 = the byte count (a2-a5 of the callee: the windowed ABI's four result
+// words).
 fn emit_string_in_marshal() -> string {
-    // Copies Silica string into the per-actor FFI arena (X0=ptr, X1=len, X2=0).
-    "    BL _silica_rt_ffi_string_in\n"
+    ins("call8", "silica_rt_ffi_string_in")
 }
 
-fn emit_string_in_cleanup() -> string {
-    ""
+// X0 = the buffer value, which points at the data with the count word just below it (prims_memory
+// emit_alloc_buf; alloc_buf_retained's node has the same shape): the count, the byte length for uint8
+// elements, goes to X1.
+fn emit_buf_in_marshal() -> string {
+    xt_mem@xt_ldr("X1", "[X0, #-8]")
 }
 
-fn emit_string_out_unmarshal_heap() -> string {
-    // sret struct lives in the FFI arena at scratch[+0]. Helper copies C bytes into a Silica
-    // string handle and leaves arena/sret storage for the next guarded-call reset.
-    "    LDR X0, [SP, #0]\n    BL _silica_rt_ffi_string_out_and_free\n    STR X0, [SP, #16]\n    STR XZR, [SP, #0]\n"
+// X0 = a fresh frame string built from the struct at +32: silica_rt_ffi_string_out(struct, tag offset,
+// pointer offset, length offset).
+fn emit_string_out_unmarshal(tag_off: int64, ptr_off: int64, len_off: int64) -> string {
+    base: string <- concat(block_base_load(), concat(ins("addi", "a10, a9, 32"), ins("movi", "a11, 0")));
+    offs: string <- concat(ins("movi", concat("a12, ", itos(tag_off))), concat(ins("movi", concat("a13, ", itos(ptr_off))), ins("movi", concat("a14, ", itos(len_off)))));
+    concat(base, concat(offs, ins("call8", "silica_rt_ffi_string_out")))
 }
 
-// Returns true when this FFI call needs the 32-byte scratch frame (string and/or sret).
-fn foreign_call_uses_heap_scratch(param_types: string, return_type: string, arg1_type: string) -> boolean {
-    needs_string_in_marshal(param_types, arg1_type) or (foreign_call_sret_bytes(return_type) > 0)
+// The C result (a10:a11 = X0) into dest: an integer or boolean through X0/W0, a float's bits into the
+// D/S home (soft-float doubles come back as a pair, floats as one word).
+fn emit_result_mov(dest: string) -> string {
+    c: string <- xt_vr@vr_class(dest);
+    case c == "D" or c == "S" or c == "H" of {
+        true -> xt_vr@vr_put(dest, "a10", "a11");
+        false -> case c == "W" of {
+            true -> xt_isa@xt_mov(dest, "W0");
+            false -> case c == "X" of {
+                true -> xt_isa@xt_mov(dest, "X0");
+                false -> ""
+            }
+        }
+    }
+}
+
+// A narrow or boolean C result is one word: the high word of X0 is cleared so a W0 read and an X-wide
+// move of it agree.
+fn narrow_result_fix(return_type: string) -> string {
+    case is_c_narrow(return_type) or return_type == "float32" of {
+        true -> ins("movi", "a11, 0");
+        false -> ""
+    }
+}
+
+fn result_mode(return_type: string, expects_string: boolean) -> (int64, string) {
+    case foreign_return_is_aggregate(return_type) of {
+        false -> (0, "");
+        true -> case expects_string of {
+            false -> (0, "a foreign call returning a record or tuple is supported on this target only as a text result consumed as a string (a tag, name_ptr: uint8, name_len: uint64 record)");
+            true -> {
+                (size: int64, _: int64, ptr_off: int64, len_off: int64) <- string_result_layout(return_type);
+                case size < 0 or ptr_off < 0 or len_off < 0 of {
+                    true -> (0, concat("the result record ", concat(return_type, " has no C layout this target lowers (flat scalar fields with a name_ptr: uint8 / name_len: uint64 pair)")));
+                    false -> case size > 32 of {
+                        true -> (0, "a result record larger than 32 bytes is not supported on this target");
+                        false -> case size > 16 of {
+                            true -> (2, "");
+                            false -> (1, "")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn foreign_call_body(
+    term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
+    dest: string,
+    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string }
+) -> string {
+    expects_string: boolean <- foreign_call_expects_string(term, ctx.return_type, ctx.outer_reg);
+    (mode: int64, mode_err: string) <- result_mode(ctx.return_type, expects_string);
+    first_word: int64 <- case mode == 2 of { true -> 1; false -> 0 };
+    (args_asm: string, words: int64, args_err: string) <- stage_arguments(ctx.param_types, ctx.arg1_type, first_word);
+    case length_bytes(mode_err) > 0 of {
+        true -> error_line(mode_err);
+        false -> case length_bytes(args_err) > 0 of {
+            true -> error_line(args_err);
+            false -> case words > 6 of {
+                true -> error_line(concat("a foreign call with more than six argument words is not supported on this target (", concat(ctx.c_symbol, ")")));
+                false -> {
+                    marshal: string <- case needs_string_in_marshal(ctx.param_types, ctx.arg1_type) of {
+                        true -> emit_string_in_marshal();
+                        false -> case needs_buf_in_marshal(ctx.param_types, ctx.arg1_type) of {
+                            true -> emit_buf_in_marshal();
+                            false -> ""
+                        }
+                    };
+                    stage: string <- concat(block_base_load(), concat(stage_result_area(mode), concat(args_asm, stage_target_and_call(ctx.c_symbol))));
+                    string_out: string <- case expects_string and mode > 0 of {
+                        true -> {
+                            (_: int64, tag_off: int64, ptr_off: int64, len_off: int64) <- string_result_layout(ctx.return_type);
+                            emit_string_out_unmarshal(tag_off, ptr_off, len_off)
+                        };
+                        false -> narrow_result_fix(ctx.return_type)
+                    };
+                    pop: string <- xt_vr@vsp_adjust(call_block_bytes());
+                    concat(marshal, concat(stage, concat(string_out, concat(pop, emit_result_mov(dest)))))
+                }
+            }
+        }
+    }
 }
 
 fn emit_foreign_user_call(
@@ -413,34 +799,6 @@ fn emit_foreign_user_call(
     pre_barrier: string <- emitter_effects@barrier_before_call(ctx.call_effects);
     post_barrier: string <- emitter_effects@barrier_after_call(ctx.call_effects);
     eff_comment: string <- emitter_effects@effect_annotation(ctx.call_effects);
-    expects_string_out: boolean <- foreign_call_expects_string(term, ctx.return_type, ctx.outer_reg);
-    uses_heap: boolean <- foreign_call_uses_heap_scratch(ctx.param_types, ctx.return_type, ctx.arg1_type);
-    string_in: string <- case needs_string_in_marshal(ctx.param_types, ctx.arg1_type) of {
-        true -> emit_string_in_marshal();
-        false -> ""
-    };
-    // After string_in (which BLs into a runtime helper), X8 may have been clobbered.
-    // Reload from the heap-alloc'd sret pointer stored at scratch[+0].
-    reload_x8: string <- case ctx.sret_bytes > 0 of {
-        true -> "    LDR X8, [SP, #0]\n";
-        false -> ""
-    };
-    bl: string <- emit_guarded_foreign_call_lines(ctx.c_symbol);
-    string_out: string <- case expects_string_out of {
-        true -> emit_string_out_unmarshal_heap();
-        false -> ""
-    };
-    // Load result (string handle) back into X0 before the destination move. For non-string
-    // returns the C call leaves the result in X0 already.
-    load_result: string <- case expects_string_out of {
-        true -> "    LDR X0, [SP, #16]\n";
-        false -> ""
-    };
-    sret_cleanup: string <- case uses_heap of {
-        true -> "    ADD SP, SP, #32\n";
-        false -> ""
-    };
-    result_mov: string <- emit_result_mov(dest);
     with_comment: string <- case length_bytes(eff_comment) > 0 of {
         true -> concat(eff_comment, "\n");
         false -> ""
@@ -449,58 +807,17 @@ fn emit_foreign_user_call(
         true -> concat(with_comment, concat(pre_barrier, "\n"));
         false -> with_comment
     };
-    // sret_setup was emitted by the caller (emit_generic_user_call_asm_inner) before args_asm,
-    // matching the non-FFI path; do not re-emit here.
+    // sret_setup (the call block) was emitted by the caller before the arguments; not re-emitted here.
     _: string <- ctx.sret_setup;
-    body: string <- concat(concat(concat(concat(concat(string_in, reload_x8), bl), string_out), load_result), concat(sret_cleanup, result_mov));
-    concat(concat(with_pre, body), concat("\n", post_barrier))
+    concat(concat(with_pre, foreign_call_body(term, dest, ctx)), concat("\n", post_barrier))
 }
 
-fn foreign_call_sret_bytes(return_type: string) -> int64 {
-    case return_type == "ptr_len_struct" of {
-        true -> 32;
-        false -> case return_type_has_ptr_len_out_fields(return_type) of {
-            true -> 32;
-            false -> case foreign_return_uses_sret(return_type) of {
-                true -> 32;
-                false -> 0
-            }
-        }
-    }
-}
-
-// Pre-call setup: reserves a 32-byte scratch frame and, when sret_bytes > 0, bumps 32 bytes
-// from the per-actor FFI arena and stores the pointer at scratch[+0].
-// Scratch layout:
-//   [SP+0]  = sret arena ptr (0 when no sret)
-//   [SP+8]  = reserved
-//   [SP+16] = result Silica string handle (filled in by string-out helper)
-//   [SP+24] = padding (reserved for keeping 16-byte alignment)
-fn emit_foreign_sret_setup(sret_bytes: int64) -> string {
-    case sret_bytes > 0 of {
-        true -> "    SUB SP, SP, #32\n    STR XZR, [SP, #8]\n    STR XZR, [SP, #16]\n    STR XZR, [SP, #24]\n    MOV X0, #32\n    BL _silica_rt_ffi_arena_bump\n    STR X0, [SP, #0]\n    MOV X8, X0\n";
-        false -> ""
-    }
-}
-
-// Variant for the string-in/scalar-out case (no sret): reserves the scratch frame.
-fn emit_foreign_scratch_setup_string_in_only() -> string {
-    "    SUB SP, SP, #32\n    STR XZR, [SP, #0]\n    STR XZR, [SP, #8]\n    STR XZR, [SP, #16]\n    STR XZR, [SP, #24]\n"
-}
-
-fn emit_foreign_tail_call(c_symbol: string, call_effects: string, fn_effects: string, frame_release: string) -> string {
-    pre_barrier: string <- emitter_effects@barrier_before_call(call_effects);
-    eff_comment: string <- emitter_effects@effect_annotation(call_effects);
-    bl: string <- emit_guarded_foreign_call_lines(c_symbol);
-    // BL returns from C; unlike Silica tail BR, we must RET to our caller (kind-5 epilogue is omitted).
-    ret_line: string <- "    RET\n";
-    with_comment: string <- case length_bytes(eff_comment) > 0 of {
-        true -> concat(eff_comment, "\n");
-        false -> ""
-    };
-    with_pre: string <- case length_bytes(pre_barrier) > 0 of {
-        true -> concat(with_comment, concat(pre_barrier, concat("\n", frame_release)));
-        false -> concat(with_comment, frame_release)
-    };
-    concat(concat(with_pre, bl), ret_line)
+// A foreign call in a function's tail position: the call into X0, then the function's non-adopting
+// epilogue (a C result names nothing in this frame).
+fn emit_foreign_tail_call(
+    term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
+    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string },
+    fn_effects: string
+) -> string {
+    concat(emit_foreign_user_call(term, "X0", ctx), control@function_epilogue_with_effects(fn_effects))
 }

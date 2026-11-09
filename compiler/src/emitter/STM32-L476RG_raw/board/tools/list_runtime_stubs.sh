@@ -1,0 +1,14 @@
+#!/bin/sh
+# Prints the silica_rt_* entries the emitter tree references that board/runtime/*.S does not define:
+# the list rt_stubs.S must carry (regenerate it when an entry is ported or the emitter grows one).
+#   list_runtime_stubs.sh            the missing names, one per line
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+tree="$here/../.."
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+grep -rhoE '_?silica_(rt_[a-z0-9_]+|pid_registry_init|dangerous_pid_registry_init|device_pid_registry_init)' --include='*.silica' "$tree" \
+    | sed 's/^_//' | grep -v '^silica_rt_atom_name\|^silica_rt_string_$\|^silica_rt_list_$\|_tag$\|^silica_rt_sup_self_error_atom$' | sort -u > "$tmp/needed"
+cd "$here/../runtime"
+{ grep -hoE '^\s*(FUNC|STUB|RETURN_ZERO|UNPORTED|CAST_REGISTERED|REGISTER_NAMED|REQUIRE_FREE|ABORT_ENTRY|FAULT_VECTOR)\s+[A-Za-z0-9_]+' *.S | awk '{print $2}'
+  grep -hoE '^\s*\.global\s+\S+' *.S | awk '{print $2}'; } | sort -u > "$tmp/defined"
+comm -23 "$tmp/needed" "$tmp/defined"

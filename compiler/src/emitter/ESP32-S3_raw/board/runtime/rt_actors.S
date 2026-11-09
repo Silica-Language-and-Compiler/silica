@@ -199,9 +199,21 @@
 #define ACB_ID           128    // the actor's identity (spec §15.1.4): child number, then position
 #define ACB_SPOS         136    // its spawner record: position + 1 (0 none yet)
 #define ACB_SNEXT        140    //   and the next child number it gives (a row child's is in its row)
-#define ACB_DEFER        144    // deferred-free block: [0] count, [4..] up to DEFER_CAP blocks
-#define ACB_SIZE         152
-#define DEFER_CAP        30
+// Chunk 15 (chunk15_stack_memory_design.md §2.6, §4; rt_state.S): the state chain and what the
+// behaviour epilogue records for the dispatch end. The first five are 8-byte slots emitted code writes
+// (terms/prims/prims_actors.silica acb_sdesc .. acb_slogn: the low word is the value).
+#define ACB_SDESC        144    // the new state's root-word descriptor (0: a scalar or undescribed state)
+#define ACB_SFLAGS       152    // the state-release proof flag: 0 unproven, 1 proven, 2 proven + drain the log
+#define ACB_SRETAIN      160    // 1: the dispatch's message buffer is kept (an undescribed word may point into it)
+#define ACB_RSLOT        168    // the result slot the dispatch passed in X2 (the epilogue's "is this the dispatch's result")
+#define ACB_SLOGN        176    // the release log's entry count
+#define ACB_SCHAIN       184    // the state chain's first chunk (rt_state.S)
+#define ACB_SCUR         188    // its current chunk
+#define ACB_SLOG         192    // the release log block
+#define ACB_SBYTES       196    // state bytes live
+#define ACB_SPOLICY      200    // the state policy (bits 4-5 of the spawn's policy word) and the compaction request (bit 8)
+#define ACB_CTX_FLOOR    204    // the frame floor (VRG_FLOOR) of the parked context
+#define ACB_SIZE         208
 #define BP_DEPTH         16     // a cast's back-pressure (silica_rt_cast_backpressure): queue depth,
 #define BP_WAIT_TICKS    3200000  // and the longest wait per cast: 200 ms of the 16 MHz system timer
 #define ROW_SPOS         96     // rt_supervisors.S: a row child's spawner record, kept across restarts
@@ -243,7 +255,7 @@
 // \rd = the actor's lowered reservation (0 default): the policy word without its algorithm nibble.
 .macro ACB_RESERVE_LD rd, acb, rt
     l32i    \rd, \acb, ACB_POLICY
-    movi    \rt, -16
+    movi    \rt, -64                   // bits 0-3 the algorithm, 4-5 the state policy (decision 40)
     and     \rd, \rd, \rt
 .endm
 
@@ -268,8 +280,13 @@
 #define MSG_CALLER       20
 #define MSG_REPLY        24
 #define MSG_INGRESS_KIND 32
-#define MSG_PAYLOAD_OWNED 36
-#define MSG_SIZE         48
+#define MSG_PAYLOAD_OWNED 36    // 1: the payload lies in the node's mailbox buffer (freed with it), 2: a report
+#define MSG_BUF_BLOCK    40     // the mailbox buffer (chunk 15 phase 4a: rt_state.S silica_rt_message_buffer)
+#define MSG_BUF_BYTES    44
+#define MSG_PARK_SP      48     // a call node (design §5.3): the caller's SP, floor and auxiliary chunk as
+#define MSG_PARK_FLOOR   52     // it parked (written before the node is enqueued); the replier places the
+#define MSG_PARK_CHUNK   56     // reply from them and writes back the SP, floor and chunk the caller resumes with
+#define MSG_SIZE         64
 
 #define CORE_RQ_HEAD     0
 #define CORE_RQ_TAIL     12
@@ -394,8 +411,17 @@ silica_registry_atom_killed:
     .word   -1
     // (:explicit, :stack_exhausted) for a stack-guard hit (silica_rt_actor_fault_hook); -1 in a
     // hand-written image, so the report's reason line prints :unknown there
-    .weak   silica_registry_atom_stack_exhausted
-silica_registry_atom_stack_exhausted:
+    .weak   silica_registry_atom_reservation_exceeded
+silica_registry_atom_reservation_exceeded:
+    .word   -1
+    .weak   silica_registry_atom_out_of_memory
+silica_registry_atom_out_of_memory:
+    .word   -1
+    .weak   silica_registry_atom_state_too_large
+silica_registry_atom_state_too_large:
+    .word   -1
+    .weak   silica_registry_atom_stack_reserve_failed
+silica_registry_atom_stack_reserve_failed:
     .word   -1
     .weak   silica_registry_atom_restart_breach
 silica_registry_atom_restart_breach:
@@ -466,6 +492,9 @@ silica_rt_atom_names:
 #define VRG_MCHUNK       128    // the running context's current machine chunk
 #define VRG_ACHUNK       132    // ... and auxiliary chunk
 #define VRG_ARG          136    // an emitted reservation's size, for silica_rt_aux_grow
+#define VRG_FLOOR        140    // the running frame's floor (chunk 15: rt_frame.S; shared/xt_frame.silica)
+#define VRG_CCB          144    // the copier's control block of this core (rt_state.S)
+#define VRG_FFI          148    // 1 while a foreign call runs on this core (rt_ffi.S): a fault is :foreign_fault
 
 // ---------------------------------------------------------------------------------------------
 // Macros
@@ -932,14 +961,8 @@ silica_rt_free_acb:
     s32i    a3, a2, ACB_RING
     mov     a10, a5
     call8   silica_rt_free
-3:  l32i    a5, a2, ACB_DEFER           // and the deferred-free block, with what it still holds (the
-    beqz    a5, 31f                     // actor's context is gone, so are the scopes they died with)
-    mov     a10, a2
-    call8   silica_rt_defer_flush
-    movi    a3, 0
-    s32i    a3, a2, ACB_DEFER
-    mov     a10, a5
-    call8   silica_rt_free
+3:  mov     a10, a2                     // the state chain and the release log go back
+    call8   silica_rt_state_chain_free_all
 31: FREE_LOCK a8, a9
     movi    a3, silica_rt_acb_free
     l32i    a4, a3, 0
@@ -1000,6 +1023,7 @@ silica_rt_exit_payload_free:
 
 // silica_rt_alloc_node() -> zeroed message node
     .align  4
+    .global silica_rt_alloc_node
 silica_rt_alloc_node:
     entry   a1, 32
     FREE_LOCK a8, a9
@@ -1047,49 +1071,16 @@ silica_rt_node_release_payload:
     beq     a3, a4, 1f                  // drain prints it (silica_rt_report_drain_at_exit)
     movi    a3, 0
     s32i    a3, a2, MSG_PAYLOAD_OWNED
-    l32i    a10, a2, MSG_PAYLOAD
+    l32i    a10, a2, MSG_BUF_BLOCK
+    beqz    a10, 1f
+    s32i    a3, a2, MSG_BUF_BLOCK
+    s32i    a3, a2, MSG_BUF_BYTES
     call8   silica_rt_free
 1:  retw
     .size   silica_rt_node_release_payload, . - silica_rt_node_release_payload
 
 // silica_rt_state_adopt(X0 acb) -> X0 acb: the state block now in ACB_STATE is the actor's own
 // (the emitted behaviour epilogue just installed a moved copy), so the actor's end frees it.
-    .align  4
-    .global silica_rt_state_adopt
-    .type   silica_rt_state_adopt, @function
-silica_rt_state_adopt:
-    entry   a1, 32
-    beqz    a2, 1f
-    movi    a3, 1
-    s8i     a3, a2, ACB_STATE_OWNED
-1:  movi    a3, 0
-    retw
-    .size   silica_rt_state_adopt, . - silica_rt_state_adopt
-
-// silica_rt_state_adopt_ref(X0 actor_ref) -> X0 actor_ref: the same for the initial state spawn just
-// moved into a new actor. Spawn returns the actor's identity (§15.1.4), never its ACB, so the
-// reference is resolved under the scheduler lock; an actor already recycled is not found and its
-// identity no longer resolves, so nothing is marked.
-    .align  4
-    .global silica_rt_state_adopt_ref
-    .type   silica_rt_state_adopt_ref, @function
-silica_rt_state_adopt_ref:
-    entry   a1, 32
-    SCHED_LOCK a8, a9
-    mov     a10, a2
-    mov     a11, a3
-    call8   silica_rt_idt_find_locked
-    beqz    a11, 1f
-    movi    a4, 1
-    s8i     a4, a11, ACB_STATE_OWNED
-1:  SCHED_UNLOCK a8, a9
-    retw
-    .size   silica_rt_state_adopt_ref, . - silica_rt_state_adopt_ref
-
-// silica_rt_sb_require(acb) -> the actor's supervision block, allocated now if it had none. Called
-// by spawn for an actor with a start trampoline, by the ingress enqueue for any other actor that
-// receives an exit notice (an add_child parent), and by the child-table paths for the running
-// actor. Allocation is fine under the scheduler lock (rt_heap.S). The block is freed with the ACB.
     .align  4
     .global silica_rt_sb_require
 silica_rt_sb_require:
@@ -1107,6 +1098,7 @@ silica_rt_sb_require:
 
 // silica_rt_zero_block(base, bytes): 4-byte granularity.
     .align  4
+    .global silica_rt_zero_block
 silica_rt_zero_block:
     entry   a1, 32
     movi    a6, 0
@@ -1394,12 +1386,16 @@ silica_rt_ctx_switch:
     rur     a4, threadptr               // this core's register block: the emitter's SP lives there
     l32i    a5, a4, VRG_VSP
     s32i    a5, a2, ACB_CTX_VSP
+    l32i    a5, a4, VRG_FLOOR           // the frame floor goes with SP (chunk 15, rt_frame.S)
+    s32i    a5, a2, ACB_CTX_FLOOR
     l32i    a5, a4, VRG_MCHUNK          // and the chunks the leaving context is in
     s32i    a5, a2, ACB_MCUR
     l32i    a5, a4, VRG_ACHUNK
     s32i    a5, a2, ACB_ACUR
     l32i    a5, a3, ACB_CTX_VSP
     s32i    a5, a4, VRG_VSP
+    l32i    a5, a3, ACB_CTX_FLOOR
+    s32i    a5, a4, VRG_FLOOR
     // stack guards and limits for the context about to run, from its current chunks (the
     // scheduler keeps the previous ones, disarmed: it runs no emitted code)
     movi    a6, 0
@@ -1466,8 +1462,9 @@ silica_rt_ctx_switch:
 //              self-tail-call stub's) pops as many chunks as the target is above. Both keep the
 //              caller's a2-a7, where the emitter has X0-X2 across a reservation.
 //
-// Growth never fails as such: the heap exhausted is a runtime abort (the host's out-of-memory
-// outcome, spec §15.1.2.2 "Memory Exhaustion"); a lowered reservation reached ends the actor with
+// Growth that finds no heap for the next chunk ends the actor with (:explicit, :out_of_memory)
+// (chunk 15 design decision 39; silica_rt_region_alloc_failed, which in main is the runtime abort
+// "out of memory"); a lowered reservation reached ends the actor with
 // (:explicit, :stack_exhausted) through a store into the guard band on purpose, so the watchpoint
 // raises the debug exception a real overflow would; in main, whose stacks are fixed, a limit
 // crossed is the same fatal fault as before. Release, by the five algorithms, is the scheduler's
@@ -1547,6 +1544,7 @@ silica_rt_chunks_to_heap_from:
 // silica_rt_chunks_free_from(chunk): chunk and every chunk above it go back to the stack free
 // list (the link of the chunk below is the caller's to clear).
     .align  4
+    .global silica_rt_chunks_free_from
 silica_rt_chunks_free_from:
     entry   a1, 32
 1:  beqz    a2, 9f
@@ -1598,6 +1596,7 @@ silica_rt_chain_trim:
 // exhausted; -1 when the actor's lowered reservation would be passed (a chunk under a lowered
 // reservation is cut to what the reservation has left, so the cap is reached exactly).
     .align  4
+    .global silica_rt_chunk_next
 silica_rt_chunk_next:
     entry   a1, 64
     s32i    a2, a1, 0                   // acb
@@ -1730,7 +1729,11 @@ silica_rt_stack_grow:
     and     a4, a4, a7
     or      a3, a3, a4
     retw
-7:  call8   silica_rt_abort_heap_exhausted
+7:  // no heap for the chunk: the actor ends with (:explicit, :out_of_memory) (chunk 15 design
+    // decision 39: :out_of_memory under the default reservation; silica_rt_region_alloc_failed,
+    // rt_console.S, which aborts the program in main); the trap's chain runs in the reserve below
+    // the parked frame, which is what the reserve is sized for
+    call8   silica_rt_region_alloc_failed
 8:  // the fault: a store into the current chunk's guard band (main's chunk header names main's band)
     l32i    a4, a5, CH_BAND
     movi    a3, 0
@@ -1867,7 +1870,7 @@ silica_rt_aux_grow:
     l32i    a6, a1, 16
     l32i    a7, a1, 20
     retw
-7:  call8   silica_rt_abort_heap_exhausted
+7:  call8   silica_rt_region_alloc_failed   // as silica_rt_stack_grow: (:explicit, :out_of_memory)
 8:  l32i    a4, a5, CH_BAND
     movi    a3, 0
     s32i    a3, a4, 0
@@ -1950,7 +1953,18 @@ silica_rt_actor_stacks_prepare:
 13: movi    a6, MCHUNK_FIRST
     bgeu    a6, a4, 1f
     mov     a4, a6
-1:  s32i    a4, a1, 4
+1:  // The first machine chunk must hold its limit: the band, the runtime reserve the limit keeps
+    // above it (silica_rt_chunk_take's extra below) and the headroom a frame starts in. With the
+    // reserve larger than MCHUNK_FIRST less those (rt_depth 2560-2800 in current images), the limit
+    // lay ABOVE the chunk's top and the first prologue parked its frame there -- in the heap block
+    // next to the chunk -- before calling silica_rt_stack_grow, whose frames and window spills then
+    // overwrote that block (free-list links, a supervisor's start trampoline return address).
+    movi    a6, _silica_rt_depth_reserve + CH_USABLE_OFF + MCHUNK_HEADROOM + 255
+    movi    a7, -256
+    and     a6, a6, a7
+    bgeu    a4, a6, 14f
+    mov     a4, a6
+14: s32i    a4, a1, 4
     s32i    a5, a1, 8
     l32i    a3, a2, ACB_MCHAIN
     bnez    a3, 2f
@@ -2213,6 +2227,7 @@ silica_rt_ctx_prepare:
     addi    a7, a4, -128
     s32i    a7, a2, ACB_CTX_A1
     s32i    a5, a2, ACB_CTX_VSP
+    s32i    a5, a2, ACB_CTX_FLOOR       // an empty dynamic part at the first dispatch
     retw
     .size   silica_rt_ctx_prepare, . - silica_rt_ctx_prepare
 
@@ -2600,8 +2615,6 @@ silica_rt_actor_main:
     mov     a11, a3
     mov     a12, a1
     call8   silica_rt_run_behaviour
-    mov     a10, a2                     // the fresh records this dispatch deferred are dead now
-    call8   silica_rt_defer_flush       // (term_message_copy |_dfr)
     l32i    a3, a1, 24
     // the message copy is dropped now that the behaviour has read it, unless the new state packs it
     // or (the report) the behaviour sent it on to another actor
@@ -2611,15 +2624,27 @@ silica_rt_actor_main:
     s32i    a5, a3, MSG_PAYLOAD_OWNED
     movi    a5, 2
     bne     a4, a5, 45f
-    l32i    a10, a3, MSG_PAYLOAD
-    call8   silica_rt_report_end
+    l32i    a10, a3, MSG_PAYLOAD        // the report: handle_report is done with it (the owner
+    call8   silica_rt_report_end        // record is cleared); its block is the mailbox buffer below.
+    l32i    a3, a1, 24                  // A report sent on was copied by the copier, so the block
+                                        // goes back whatever report_end answers.
+45: // the mailbox buffer (chunk 15 phase 4a): freed now that the dispatch end has placed the new
+    // state's nodes, unless the behaviour's epilogue marked the buffer retained (ACB_SRETAIN: an
+    // undescribed word of the state may point into it; it is then kept for the actor's life)
+    l32i    a4, a2, ACB_SRETAIN
+    movi    a5, 0
+    s32i    a5, a2, ACB_SRETAIN
+    bnez    a4, 46f
+    l32i    a10, a3, MSG_BUF_BLOCK
+    beqz    a10, 42f
+    s32i    a5, a3, MSG_BUF_BLOCK
+    s32i    a5, a3, MSG_BUF_BYTES
+    call8   silica_rt_free
     l32i    a3, a1, 24
-    bnez    a10, 42f
-45: l32i    a10, a3, MSG_PAYLOAD
-    l32i    a12, a2, ACB_STATE
-    movi    a14, 0
-    call8   silica_rt_state_release
-    l32i    a3, a1, 24
+    j       42f
+46: movi    a5, 0
+    s32i    a5, a3, MSG_BUF_BLOCK
+    s32i    a5, a3, MSG_BUF_BYTES
 42: l32i    a4, a3, MSG_KIND
     movi    a5, 0
     s32i    a5, a2, ACB_ACTIVE_CALL
@@ -2678,6 +2703,18 @@ silica_rt_spawn_waiter_wake:
     .align  4
 silica_rt_run_behaviour:
     entry   a1, 32
+    // chunk 15 phase 3c: the convention word's proof bit (0x5C1AC0F5 / F6, bit 2) is the dispatch's
+    // proof flag (ACB_SFLAGS; the epilogue may raise it to 2), and the result slot the behaviour writes
+    // its tuple into is recorded (ACB_RSLOT) for the epilogue's buffer retires
+    l32i    a8, a2, ACB_CONV
+    extui   a8, a8, 2, 1
+    s32i    a8, a2, ACB_SFLAGS
+    movi    a9, 0
+    s32i    a9, a2, ACB_SFLAGS + 4
+    s32i    a4, a2, ACB_RSLOT
+    s32i    a9, a2, ACB_RSLOT + 4
+    s32i    a9, a2, ACB_SDESC
+    s32i    a9, a2, ACB_SDESC + 4
     l32i    a10, a3, MSG_PAYLOAD
     l32i    a11, a3, MSG_PAYLOAD + 4
     l32i    a12, a2, ACB_STATE
@@ -2686,13 +2723,14 @@ silica_rt_run_behaviour:
     movi    a15, 0
     l32i    a8, a2, ACB_BEH
     callx8  a8
+    mov     a5, a10                     // a5 = the result tuple
     // The layout follows the tuple's own tag (the image's :reply / :no_reply atoms, emitted by the
     // compiler as silica_rt_reply_tag / silica_rt_no_reply_tag, -1 when unused), not the message
     // kind: a cast that reaches a call-style behaviour (an untraced reference, a registry name,
     // FailureReporter delivery) keeps the returned state and drops the reply, and a call to a
     // cast-style behaviour gets 0. The runtime-internal behaviours write neither tag and keep the
     // message-kind rule.
-    l32i    a4, a10, 0
+    l32i    a4, a5, 0
     movi    a6, silica_rt_reply_tag
     l32i    a6, a6, 0
     beq     a4, a6, 2f
@@ -2703,18 +2741,20 @@ silica_rt_run_behaviour:
     movi    a6, 1
     bne     a4, a6, 1f
 2:  // (:reply, value, state): reply at +8 (a call only), state at +16
-    l32i    a12, a10, 16
-    l32i    a13, a10, 20
-    s32i    a12, a2, ACB_STATE
-    s32i    a13, a2, ACB_STATE + 4
     l32i    a4, a3, MSG_KIND
     movi    a6, 1
     bne     a4, a6, 4f
-    l32i    a12, a10, 8
-    l32i    a13, a10, 12
+    l32i    a12, a5, 8
+    l32i    a13, a5, 12
     s32i    a12, a3, MSG_REPLY
     s32i    a13, a3, MSG_REPLY + 4
-4:  retw
+4:  mov     a10, a2                     // the dispatch end places the new state (rt_state.S)
+    l32i    a11, a5, 16
+    l32i    a12, a5, 20
+    call8   silica_rt_state_dispatch_end
+    s32i    a10, a2, ACB_STATE
+    s32i    a11, a2, ACB_STATE + 4
+    retw
 3:  // a cast-style result to a call: the reply is 0
     l32i    a4, a3, MSG_KIND
     movi    a6, 1
@@ -2723,10 +2763,12 @@ silica_rt_run_behaviour:
     s32i    a12, a3, MSG_REPLY
     s32i    a12, a3, MSG_REPLY + 4
 1:  // (:no_reply, state): state at +8
-    l32i    a12, a10, 8
-    l32i    a13, a10, 12
-    s32i    a12, a2, ACB_STATE
-    s32i    a13, a2, ACB_STATE + 4
+    mov     a10, a2
+    l32i    a11, a5, 8
+    l32i    a12, a5, 12
+    call8   silica_rt_state_dispatch_end
+    s32i    a10, a2, ACB_STATE
+    s32i    a11, a2, ACB_STATE + 4
     retw
     .size   silica_rt_run_behaviour, . - silica_rt_run_behaviour
 
@@ -2766,6 +2808,7 @@ silica_rt_actor_exit_body:
     entry   a1, 48
     s32i    a3, a1, 0                   // [a1+0] the root note may print (below)
     movi    a3, 0
+    s32i    a3, a1, 4                   // [a1+4] reports queued for this actor as the FailureReporter
     s8i     a3, a2, ACB_ALIVE
     // a supervisor that ends inside its start trampoline (its init failed) is marked: its spawner,
     // still waiting in spawn, gets no live actor, and its exit notice holds the ACB (TR_NOTICE)
@@ -2845,14 +2888,10 @@ silica_rt_actor_exit_body:
     l32i    a4, a3, MSG_PAYLOAD_OWNED
     movi    a5, 2
     bne     a4, a5, 14f
-    movi    a5, 0
-    s32i    a5, a3, MSG_PAYLOAD_OWNED
+    movi    a5, 1                       // the report: the owner record cleared, then its block
+    s32i    a5, a3, MSG_PAYLOAD_OWNED   // (the mailbox buffer) back as any message copy's
     l32i    a10, a3, MSG_PAYLOAD
     call8   silica_rt_report_end
-    bnez    a10, 15f
-    l32i    a10, a3, MSG_PAYLOAD
-    call8   silica_rt_free
-    j       15f
 14: mov     a10, a3
     call8   silica_rt_node_release_payload
 15: mov     a10, a3
@@ -2861,7 +2900,19 @@ silica_rt_actor_exit_body:
     beqz    a3, 4f
     l32i    a4, a3, MSG_NEXT
     s32i    a4, a2, ACB_MB_HEAD
-    mov     a10, a3
+    // a report queued for this actor as the FailureReporter (MSG_PAYLOAD_OWNED 2) is kept aside and
+    // written once the lock is dropped (55: below), as the hosts write a report queued for a
+    // reporter that dies: left for the exit drain it was never seen while main waited in
+    // wait_for_exit for the harness's exit line, which waits for that report
+    // (actors_addition/failure_reporter_fails_mid_report hung on the board, 2026-11-06)
+    l32i    a4, a3, MSG_PAYLOAD_OWNED
+    movi    a5, 2
+    bne     a4, a5, 21f
+    l32i    a4, a1, 4
+    s32i    a4, a3, MSG_NEXT
+    s32i    a3, a1, 4
+    j       2b
+21: mov     a10, a3
     call8   silica_rt_node_release_payload
     l32i    a4, a3, MSG_KIND
     movi    a5, 1
@@ -2882,6 +2933,23 @@ silica_rt_actor_exit_body:
     s32i    a4, a6, SB_IN_TAIL
     s32i    a4, a6, SB_IN_DEPTH
 51: SCHED_UNLOCK a8, a9
+    // the reports queued for this actor as the FailureReporter (2: above): each is written to the
+    // console once and taken off the pending list (silica_rt_report_write_block), then its block
+    // (the mailbox buffer) and its node go back; a5 (the ingress) and a7 are kept across the calls
+55: l32i    a3, a1, 4
+    beqz    a3, 56f
+    l32i    a4, a3, MSG_NEXT
+    s32i    a4, a1, 4
+    l32i    a10, a3, MSG_PAYLOAD
+    call8   silica_rt_report_write_block
+    movi    a4, 1                       // now an ordinary message copy: its block goes back
+    s32i    a4, a3, MSG_PAYLOAD_OWNED
+    mov     a10, a3
+    call8   silica_rt_node_release_payload
+    mov     a10, a3
+    call8   silica_rt_free_node
+    j       55b
+56:
     // notices never served go back, their payloads too (a payload holding an actor lets go of it,
     // which may recycle that ACB: outside the lock)
 52: beqz    a5, 54f
@@ -2909,14 +2977,9 @@ silica_rt_actor_exit_body:
     mov     a10, a2
     mov     a11, a3
     call8   silica_rt_registry_forget
-7:  // the state block the actor owns (silica_rt_state_adopt) goes back; a state that is still a
-    // spawner's or a row's is not the actor's to free
-    l8ui    a3, a2, ACB_STATE_OWNED
-    beqz    a3, 71f
-    movi    a3, 0
-    s8i     a3, a2, ACB_STATE_OWNED
-    l32i    a10, a2, ACB_STATE
-    call8   silica_rt_free
+7:  // the state chain (chunk 15, rt_state.S) goes back with the actor
+    mov     a10, a2                     // the state chain and the release log go back (rt_state.S)
+    call8   silica_rt_state_chain_free_all
     movi    a3, 0
     s32i    a3, a2, ACB_STATE
 71: mov     a10, a2
@@ -3046,7 +3109,19 @@ silica_rt_actor_fault_hook:
     bne     a8, a9, 3f
     SCHED_UNLOCK a8, a9
     j       8f
-3:  movi    a7, 1006
+    // A fault raised while the actor's foreign call was running (rt_ffi.S silica_rt_ffi_call keeps this
+    // core's VRG_FFI word at 1 for the call) is the C code's, whatever the cause -- a bad address, an
+    // illegal instruction, a division by zero, a C stack overflow into the FFI chunk's guard band: the
+    // actor ends with failure_reason :foreign_fault, tag 5, as the hosted guarded region ends it
+    // (porting_for_os_free_targets.md §9.1 rule 2). The word is cleared here: the context is abandoned.
+3:  rur     a7, threadptr
+    l32i    a8, a7, VRG_FFI
+    beqz    a8, 4f
+    movi    a8, 0
+    s32i    a8, a7, VRG_FFI
+    movi    a8, 5
+    j       1f
+4:  movi    a7, 1006
     movi    a8, 3
     bne     a5, a7, 1f
     movi    a8, 4
@@ -3054,7 +3129,7 @@ silica_rt_actor_fault_hook:
     // xt_runtime_registry_words publishes for this build (-1 in a hand-written image: :unknown).
     // Without it the tag said explicit but ACB_REASON_ATOM kept whatever the slot held, so the
     // report's reason line and a supervisor's failure_reason carried an atom nobody chose.
-    movi    a7, silica_registry_atom_stack_exhausted
+    movi    a7, silica_registry_atom_reservation_exceeded
     l32i    a7, a7, 0
     s16i    a7, a6, ACB_REASON_ATOM
 1:  s8i     a8, a6, ACB_REASON_TAG
@@ -3087,6 +3162,8 @@ silica_rt_actor_fault_hook:
     rur     a4, threadptr
     l32i    a5, a3, ACB_CTX_VSP
     s32i    a5, a4, VRG_VSP
+    l32i    a5, a3, ACB_CTX_FLOOR
+    s32i    a5, a4, VRG_FLOOR
     movi    a5, 0
     wsr     a5, dbreakc0
     wsr     a5, dbreakc1
@@ -3115,7 +3192,7 @@ silica_rt_actor_fault_hook:
     .global silica_rt_actor_spawn
     .type   silica_rt_actor_spawn, @function
 silica_rt_actor_spawn:
-    entry   a1, 48
+    entry   a1, 64
     rur     a8, threadptr
     l32i    a9, a8, 0                   // X3 trampoline
     s32i    a9, a1, 0
@@ -3125,6 +3202,8 @@ silica_rt_actor_spawn:
     s32i    a9, a1, 8                   // agent type
     s32i    a9, a1, 12                  // row
     s32i    a9, a1, 16                  // no supervisor to inherit a reserve from
+    l32i    a9, a8, 24                  // X6 the initial state's descriptor (chunk 15 phase 3b)
+    s32i    a9, a1, 20
     mov     a10, a2
     mov     a11, a3
     mov     a12, a4
@@ -3171,7 +3250,7 @@ silica_rt_actor_spawn_dangerous_linked:
     .global silica_rt_actor_spawn_linked_acb
     .type   silica_rt_actor_spawn_linked_acb, @function
 silica_rt_actor_spawn_linked_acb:
-    entry   a1, 48
+    entry   a1, 64
     rur     a8, threadptr
     l32i    a9, a8, 8                   // X4 trampoline
     s32i    a9, a1, 0
@@ -3184,6 +3263,10 @@ silica_rt_actor_spawn_linked_acb:
     s32i    a9, a1, 16
     movi    a9, 0
     s32i    a9, a8, 16                  // consumed: a later plain spawn must not inherit from it
+    l32i    a9, a8, 32                  // X7 the initial state's descriptor (chunk 15 phase 3b)
+    s32i    a9, a1, 20
+    movi    a9, 0
+    s32i    a9, a8, 32
     mov     a10, a2
     mov     a11, a3
     mov     a12, a4
@@ -3232,9 +3315,15 @@ silica_rt_spawn_common:
     srli    a6, a5, 4
     movi    a8, 0x5C1AC0F
     bne     a6, a8, 63f
+    // The low nibble: bits 0-1 the convention, bit 2 the state-release proof (chunk 15 phase 3c,
+    // 0x5C1AC0F5 / F6; silica_rt_run_behaviour reads the bit). The whole nibble is kept; a nibble
+    // whose convention bits are 0 or 3 is not checked. Before, any nibble above 2 was dropped to 0,
+    // so a proven behaviour had no convention and a cast to a call-only actor was enqueued.
     extui   a4, a5, 0, 4
-    bltui   a4, 3, 63f
-    movi    a4, 0
+    extui   a6, a5, 0, 2
+    beqz    a6, 62f
+    bltui   a6, 3, 63f
+62: movi    a4, 0
 63: s32i    a4, a2, ACB_CONV
     l32i    a7, a1, 20                  // extra
     l32i    a3, a7, 4
@@ -3249,6 +3338,20 @@ silica_rt_spawn_common:
     // printed). The host records it the same way (prims_actors_runtime_asm, ACB #192).
     l32i    a3, a7, 16
     s32i    a3, a2, ACB_SUP
+    l32i    a3, a7, 4                   // the state policy (decision 40): bits 4-5 of the policy word
+    extui   a3, a3, 4, 2
+    slli    a3, a3, 4
+    s32i    a3, a2, ACB_SPOLICY
+    // chunk 15 phase 3b (design §5.4): a described initial state is copied into the child's state
+    // chain now (rt_state.S silica_rt_state_install), before anything can run it
+    l32i    a5, a7, 20
+    beqz    a5, 64f
+    mov     a10, a2
+    l32i    a11, a1, 0
+    l32i    a12, a1, 4
+    mov     a13, a5
+    call8   silica_rt_state_install
+64:
     // Identity (§15.1.4): numbered by its spawner -- the supervisor for a row child, else the running
     // actor (main when there is none) -- and entered in the identity table before it can run. A
     // supervisor takes its own position now, in its spawner's order. [a1+24] keeps the identity for
@@ -3716,6 +3819,7 @@ silica_rt_enqueue_by_id:
     l8ui    a5, a2, ACB_ALIVE
     beqz    a5, 68f
     l32i    a5, a2, ACB_CONV            // a cast to a call-only actor (§16.2.6.4): nothing enqueued
+    extui   a5, a5, 0, 2                // the convention bits under the proof bit
     beqi    a5, 1, 67f
     movi    a5, 0
     s32i    a5, a4, MSG_NEXT
@@ -3739,22 +3843,47 @@ silica_rt_enqueue_by_id:
     retw
     .size   silica_rt_enqueue_by_id, . - silica_rt_enqueue_by_id
 
-// silica_rt_cast_try(X0 reference, X1 message, X2 payload owned) -> 1 enqueued, 0 no live actor, 2 the
-// target is call-only (§16.2.6.4) (either way the message is dropped: a record copy it owned goes
-// back; a report (2) stays listed for the exit drain).
+// silica_rt_cast_try(X0 reference, X1 message, X2 the mailbox buffer's bytes, X3 its block (0, 0:
+// an inline message; chunk 15 phase 4a, silica_rt_message_buffer)) -> 1 enqueued, 0 no live actor,
+// 2 the target is call-only (§16.2.6.4) (either way the message is dropped: the buffer goes back;
+// a report stays listed for the exit drain).
+// silica_rt_cast_report_try: the same for the FailureReporter's report (silica_rt_actor_deliver_
+// unwind_report): X1 = X3 = the heap block holding the report string, X2 its bytes; the node's
+// payload is marked 2 (a report: silica_rt_report_begin at its dispatch, the block freed after
+// handle_report as a mailbox buffer). Frame: [0] the owned mark for a block (1 or 2).
+    .align  4
+    .global silica_rt_cast_report_try
+    .type   silica_rt_cast_report_try, @function
+silica_rt_cast_report_try:
+    entry   a1, 48
+    movi    a8, 2
+    s32i    a8, a1, 0
+    j       silica_rt_cast_try_body
+    .size   silica_rt_cast_report_try, . - silica_rt_cast_report_try
+
     .align  4
     .global silica_rt_cast_try
     .type   silica_rt_cast_try, @function
 silica_rt_cast_try:
-    entry   a1, 32
+    entry   a1, 48
+    movi    a8, 1
+    s32i    a8, a1, 0
+silica_rt_cast_try_body:
     mov     a10, a4
     call8   silica_rt_report_escape_check
-    mov     a7, a6
+    rur     a8, threadptr
+    l32i    a7, a8, 0                   // X3 = the mailbox buffer's block (chunk 15 phase 4a), X2 its bytes
     call8   silica_rt_alloc_node
-    mov     a6, a10                     // a6 = node
-    s32i    a4, a6, MSG_PAYLOAD
-    s32i    a5, a6, MSG_PAYLOAD + 4
-    s32i    a7, a6, MSG_PAYLOAD_OWNED
+    mov     a8, a10                     // a8 = node
+    s32i    a4, a8, MSG_PAYLOAD
+    s32i    a5, a8, MSG_PAYLOAD + 4
+    s32i    a7, a8, MSG_BUF_BLOCK
+    s32i    a6, a8, MSG_BUF_BYTES
+    movi    a9, 0
+    beqz    a7, 60f
+    l32i    a9, a1, 0                   // 1 a message copy, 2 a report
+60: s32i    a9, a8, MSG_PAYLOAD_OWNED
+    mov     a6, a8                      // a6 = node
     mov     a10, a2
     mov     a11, a3
     mov     a12, a6
@@ -3766,9 +3895,8 @@ silica_rt_cast_try:
 61: mov     a2, a10                     // 1 dead, 2 convention mismatch
     mov     a10, a6
     call8   silica_rt_free_node
-    movi    a5, 1
-    bne     a7, a5, 62f
-    mov     a10, a4
+    beqz    a7, 62f
+    mov     a10, a7
     call8   silica_rt_free
 62: addi    a2, a2, -1                  // -> 0 / 2
     slli    a2, a2, 1
@@ -3854,85 +3982,6 @@ silica_rt_enqueue_ingress:
 // Leaves the caller's X0-X2 (its a10-a15: a2-a7 here) and everything else of the caller as they
 // were, so the emitted call needs no save or restore around it.
     .align  4
-    .global silica_rt_defer_free
-    .type   silica_rt_defer_free, @function
-silica_rt_defer_free:
-    entry   a1, 48
-    s32i    a2, a1, 0
-    s32i    a3, a1, 4
-    s32i    a4, a1, 8
-    s32i    a5, a1, 12
-    s32i    a6, a1, 16
-    s32i    a7, a1, 20
-    rur     a8, threadptr
-    l32i    a9, a8, 40
-    beqz    a9, 9f
-    s32i    a9, a1, 24
-    call8   silica_rt_current_actor
-    beqz    a10, 9f                     // main or a scheduler: no dispatch end to free it at
-    mov     a2, a10
-    l32i    a3, a2, ACB_DEFER
-    bnez    a3, 1f
-    movi    a10, 4 + DEFER_CAP * 4
-    call8   silica_rt_alloc_or_null     // zeroed: count 0
-    beqz    a10, 9f
-    mov     a3, a10
-    s32i    a3, a2, ACB_DEFER
-1:  l32i    a4, a3, 0
-    movi    a5, DEFER_CAP
-    bgeu    a4, a5, 9f                  // full: this one is left
-    addx4   a5, a4, a3
-    l32i    a6, a1, 24
-    s32i    a6, a5, 4
-    addi    a4, a4, 1
-    s32i    a4, a3, 0
-9:  l32i    a2, a1, 0
-    l32i    a3, a1, 4
-    l32i    a4, a1, 8
-    l32i    a5, a1, 12
-    l32i    a6, a1, 16
-    l32i    a7, a1, 20
-    retw
-    .size   silica_rt_defer_free, . - silica_rt_defer_free
-
-// silica_rt_defer_flush(acb): frees every block the actor deferred and empties its deferred block.
-    .align  4
-    .global silica_rt_defer_flush
-    .type   silica_rt_defer_flush, @function
-silica_rt_defer_flush:
-    entry   a1, 32
-    l32i    a3, a2, ACB_DEFER
-    beqz    a3, 9f
-    l32i    a4, a3, 0
-    beqz    a4, 9f
-    movi    a5, 0
-    s32i    a5, a3, 0
-    addi    a5, a3, 4                   // a5 = cursor, a6 = end
-    addx4   a6, a4, a5
-1:  l32i    a10, a5, 0
-    call8   silica_rt_free
-    addi    a5, a5, 4
-    bltu    a5, a6, 1b
-9:  retw
-    .size   silica_rt_defer_flush, . - silica_rt_defer_flush
-
-// ---------------------------------------------------------------------------------------------
-// Cast back-pressure (2026-10-27). Nothing preempts a sender on this target, so a context that
-// casts in a loop without yielding (main sending a burst, an actor fanning out) queues every
-// message before the receiver runs, and the board's heap -- a few hundred KB -- holds far fewer
-// than a host's memory does (bees_regions_addition/bees_sd7_message_region_released: 100,000
-// messages of ~4 KB each). So a cast or send from emitted code (silica_rt_actor_cast /
-// silica_rt_actor_send; the runtime's own report casts go through silica_rt_cast_try directly and
-// never wait) waits after enqueueing while all of these hold: the heap is more than half in use,
-// the receiver has BP_DEPTH or more messages queued, the receiver is another context that will
-// drain them (ready, running on the other core, or at its dispatch boundary -- not suspended in a
-// call or waiting, which may be waiting on this very sender), and the sender has waited less than
-// BP_WAIT_TICKS for this cast. Waiting is the call's yield point (silica_rt_yield_if_ready): the
-// receiver, when it is on this core, runs in the meantime. Nothing is dropped and nothing is
-// reordered; only when the sender continues changes, and only under memory pressure.
-
-// silica_rt_cast_backpressure(lo, hi): lo/hi = the receiver's identity (§15.1.4).
-    .align  4
     .global silica_rt_cast_backpressure
     .type   silica_rt_cast_backpressure, @function
 silica_rt_cast_backpressure:
@@ -3970,12 +4019,6 @@ silica_rt_cast_backpressure:
     j       3b
 4:  SCHED_UNLOCK a8, a9
     bltu    a6, a7, 9f                  // a short queue: carry on
-    call8   silica_rt_heap_used
-    movi    a4, _silica_heap_end
-    movi    a5, _silica_heap_start
-    sub     a4, a4, a5
-    srli    a4, a4, 1
-    bltu    a10, a4, 9f                 // the heap is at most half used: carry on
     call8   silica_rt_timer_now_ticks
     l32i    a4, a1, 12
     bnez    a4, 5f
@@ -4060,18 +4103,38 @@ silica_rt_actor_call:
     s32i    a3, a1, 8                   // lock that enqueues, so a recycle in between cannot misdeliver
     mov     a10, a4
     call8   silica_rt_report_escape_check
-    s32i    a6, a1, 0
+    s32i    a6, a1, 0                   // X2 = the mailbox buffer's bytes (chunk 15 phase 4c)
+    rur     a8, threadptr
+    l32i    a9, a8, 0                   // X3 = its block
+    s32i    a9, a1, 12
     call8   silica_rt_alloc_node
     mov     a6, a10                     // a6 = node
     movi    a7, 1
     s32i    a7, a6, MSG_KIND
     s32i    a4, a6, MSG_PAYLOAD
     s32i    a5, a6, MSG_PAYLOAD + 4
-    l32i    a7, a1, 0
-    s32i    a7, a6, MSG_PAYLOAD_OWNED
+    l32i    a7, a1, 12
+    s32i    a7, a6, MSG_BUF_BLOCK
+    l32i    a8, a1, 0
+    s32i    a8, a6, MSG_BUF_BYTES
+    movi    a8, 0
+    beqz    a7, 10f
+    movi    a8, 1
+10: s32i    a8, a6, MSG_PAYLOAD_OWNED
     call8   silica_rt_current
     mov     a7, a10                     // a7 = me
     s32i    a7, a6, MSG_CALLER
+    // the parked SP, floor and auxiliary chunk the replier places the reply from (design §5.3):
+    // published here, before the node can be seen, not read from the ACB's context words, which
+    // this context's own switch-out writes later and the replier on the other core may race
+    // (every reply then landed under the same stale SP: a bound reply was overwritten by the next)
+    rur     a8, threadptr
+    l32i    a9, a8, VRG_VSP
+    s32i    a9, a6, MSG_PARK_SP
+    l32i    a9, a8, VRG_FLOOR
+    s32i    a9, a6, MSG_PARK_FLOOR
+    l32i    a9, a8, VRG_ACHUNK
+    s32i    a9, a6, MSG_PARK_CHUNK
     SCHED_LOCK a8, a9
     l32i    a10, a1, 4
     l32i    a11, a1, 8
@@ -4081,6 +4144,7 @@ silica_rt_actor_call:
     l8ui    a4, a2, ACB_ALIVE
     beqz    a4, 8f
     l32i    a4, a2, ACB_CONV            // a call to a cast-only actor (§16.2.6.4): nothing enqueued
+    extui   a4, a4, 0, 2                // the convention bits under the proof bit
     beqi    a4, 2, 7f
     movi    a4, 0
     s32i    a4, a6, MSG_NEXT
@@ -4102,7 +4166,20 @@ silica_rt_actor_call:
     beqz    a4, 4f
     movi    a5, 0
     s32i    a5, a7, ACB_WAIT_NODE
-    l32i    a2, a6, MSG_REPLY
+    // the reply lies at the bottom of this frame's dynamic part: SP, the floor and, when the
+    // replier appended one, the auxiliary chunk come from the node (the call site adopts [SP, p))
+    rur     a8, threadptr
+    l32i    a9, a6, MSG_PARK_SP
+    s32i    a9, a8, VRG_VSP
+    l32i    a9, a6, MSG_PARK_FLOOR
+    s32i    a9, a8, VRG_FLOOR
+    l32i    a9, a6, MSG_PARK_CHUNK
+    l32i    a5, a8, VRG_ACHUNK
+    beq     a9, a5, 31f
+    s32i    a9, a7, ACB_ACUR
+    mov     a10, a9
+    call8   silica_rt_aux_publish_chunk
+31: l32i    a2, a6, MSG_REPLY
     l32i    a3, a6, MSG_REPLY + 4
     mov     a10, a6
     call8   silica_rt_free_node
@@ -4849,7 +4926,22 @@ silica_rt_get_registry_actor:
 
 // The registry behaviour, in the emitted-function ABI: X0 = message record {op, name, pid} (its
 // shape word, then three 8-byte slots), X1 = state (the table), X2 = the reply tuple buffer;
-// returns X0 = that buffer with [+8] = a heap pair (status atom, actor_ref) and [+16] = the state.
+// returns X0 = that buffer with [+8] = the pair (status atom, actor_ref) and [+16] = the state.
+// The pair is built in the registry actor's frame (chunk 15: no heap behind a reply) and placed
+// into the blocked caller's stack by silica_rt_reply_place through its descriptor, as the emitted
+// behaviour epilogue places a user reply; the caller's call site adopts it.
+    .section .rodata
+    .balign 16
+silica_rt_pair_word2_desc_root:         // root-word form: one AGG entry (rt_state.S)
+    .quad   1, -1
+    .quad   4
+    .word   silica_rt_pair_word2_desc, 0
+silica_rt_pair_word2_desc:              // the aggregate: two word fields
+    .quad   2, -1
+    .quad   0, 0
+    .quad   0, 0
+    .section .text.silica_rt_actors, "ax"
+    .literal_position
     .align  4
     .global silica_rt_pid_registry_beh
     .type   silica_rt_pid_registry_beh, @function
@@ -4857,7 +4949,7 @@ silica_rt_pid_registry_beh:
     entry   a1, 32
     mov     a7, a6                      // a7 = reply buffer
     movi    a10, 16
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     mov     a6, a10                     // a6 = pair
     l32i    a3, a2, 8                   // op
     l32i    a5, a2, 16                  // name
@@ -4937,10 +5029,14 @@ silica_rt_pid_registry_beh:
     call8   silica_rt_acb_ident
     s32i    a10, a6, 8
     s32i    a11, a6, 12
+    mov     a10, a6                     // the pair into the blocked caller's stack (a cast that
+    movi    a11, 0                      // reached the registry: the pair stays in the frame)
+    movi    a12, silica_rt_pair_word2_desc_root
+    call8   silica_rt_reply_place
     movi    a8, 0
     s32i    a8, a7, 0
     s32i    a8, a7, 4
-    s32i    a6, a7, 8
+    s32i    a10, a7, 8
     s32i    a8, a7, 12
     s32i    a4, a7, 16
     s32i    a8, a7, 20
@@ -5192,7 +5288,7 @@ silica_rt_list_from_words:
     mov     a6, a2                      // a6 = n
     mov     a7, a3                      // a7 = words
     movi    a10, 24
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     mov     a5, a10                     // a5 = handle
     s32i    a6, a5, 0
     // first chunk holds n mod 2 == 1 ? one element at slot 1 : two elements
@@ -5203,7 +5299,7 @@ silica_rt_list_from_words:
     s32i    a3, a5, 16
 1:  beqz    a2, 8f
     movi    a10, 24
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     bnez    a4, 2f
     s32i    a10, a5, 8
     j       3f
@@ -5243,7 +5339,7 @@ silica_rt_core_info_record:
     entry   a1, 32
     mov     a6, a2
     movi    a10, 40
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     movi    a8, SHAPE_CORE_INFO
     s32i    a8, a10, 0
     s32i    a6, a10, 8
@@ -5298,13 +5394,13 @@ silica_rt_get_cpu_topology:
     mov     a11, a1
     call8   silica_rt_list_from_words
     mov     a6, a10                     // cores list
-    movi    a10, 16
-    call8   silica_rt_alloc
+    movi    a10, 16                     // the records in the running frame (chunk 15 design §9.1:
+    call8   silica_rt_frame_alloc       // runtime-built records; the call site adopts them)
     movi    a8, SHAPE_CACHE_HIERARCHY
     s32i    a8, a10, 0
     mov     a7, a10                     // cache_hierarchy { levels: nil }
     movi    a10, 32
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     movi    a8, SHAPE_CPU_TOPOLOGY
     s32i    a8, a10, 0
     s32i    a6, a10, 8
@@ -5971,11 +6067,11 @@ silica_rt_report_reason:
     retw
     .size   silica_rt_report_reason, . - silica_rt_report_reason
 
-// The FailureReporter's report is a heap string the message owns (MSG_PAYLOAD_OWNED 2): the
-// reporter's dispatch frees it once handle_report has returned, as it frees a record message copy
-// (silica_rt_state_release: kept when the new state still reaches it), and also keeps it when
-// handle_report sent it on to another actor -- a send, cast or call with it while it is being
-// handled marks it escaped.
+// The FailureReporter's report is a string in a heap block that is the report message's mailbox
+// buffer (MSG_PAYLOAD_OWNED 2, silica_rt_cast_report_try): the reporter's dispatch frees it once
+// handle_report has returned, as it frees any message copy's buffer (a state that packs the report
+// was given its own copy by the dispatch end; a report sent on was copied by the message copier).
+// The owner record below says which report handle_report is running on, for the exit drain.
 // silica_rt_report_begin(X0 report): handle_report is about to run on it.
     .align  4
     .global silica_rt_report_begin
@@ -6047,6 +6143,27 @@ silica_rt_report_list_take:
 4:  movi    a3, 0
     retw
     .size   silica_rt_report_list_take, . - silica_rt_report_list_take
+
+// silica_rt_report_write_block(X0 report block): a report queued for a FailureReporter that ended
+// before handling it goes to the console once, as the exit drain writes one (the block is a Silica
+// string: data at +8, length at +16), and off the pending list, so the drain does not write it
+// again. The block itself is the caller's to free. Called by silica_rt_actor_exit_body outside the
+// scheduler lock (the list take locks).
+    .align  4
+    .global silica_rt_report_write_block
+    .type   silica_rt_report_write_block, @function
+silica_rt_report_write_block:
+    entry   a1, 32
+    mov     a3, a2
+    mov     a10, a2
+    call8   silica_rt_report_list_take
+    l32i    a10, a3, 8
+    movi    a11, 0
+    l32i    a12, a3, 16
+    movi    a13, 0
+    call8   silica_rt_write
+    retw
+    .size   silica_rt_report_write_block, . - silica_rt_report_write_block
 
 // silica_rt_root_report_and_note(a2 = a root supervisor's ACB): its failure report and the root
 // note. With a registered FailureReporter the note goes first: the reporter prints the report on
@@ -6191,7 +6308,7 @@ silica_rt_report_end:
     .global silica_rt_actor_deliver_unwind_report
     .type   silica_rt_actor_deliver_unwind_report, @function
 silica_rt_actor_deliver_unwind_report:
-    entry   a1, 32
+    entry   a1, 48                      // [0] the caller's X3, [4] the report block's bytes
     // the buffer is shared by both cores: composed and written (or cast) under the console lock,
     // which is re-entrant on this core for the write and never held across a switch (a cast is an
     // enqueue, not a yield)
@@ -6247,25 +6364,45 @@ silica_rt_actor_deliver_unwind_report:
     l32i    a8, a2, ACB_ID + 4
     beq     a7, a8, 4f
 61:
-    // silica_rt_string_from_bytes(X0 bytes, X1 count) and silica_rt_actor_cast(X0 actor, X1
-    // message, X2 owned) take 64-bit arguments, a register pair each, so X1 is a12:a13 in both
-    // calls. With the count and then the string in a11 (X0's high word), the string was built
-    // from a stale length and the reporter received a null message: no reporter could read a
-    // report (actors_addition/failure_reporter_root_only hung on the board).
+    // The report string is the reporter's MAILBOX BUFFER (chunk 15 design §2.7: a message copy in
+    // flight lives in a heap block the receiving mailbox owns, freed at its dispatch end): one heap
+    // block holding a Silica string header (rt_string.S layout) and the text. It is not a frame
+    // string (silica_rt_string_from_bytes allocates in the running frame, which is the dying
+    // actor's or the scheduler's and is gone before the reporter runs: the reporter read
+    // "not a Silica string", or a garbled report). The block is listed until handle_report takes
+    // it (silica_rt_report_begin), so the exit drain prints what the reporter never handled.
+    addi    a10, a4, 24 + 1 + 15        // header 24, the text, its NUL, rounded to 16
+    movi    a8, -16
+    and     a10, a10, a8
+    s32i    a10, a1, 4                  // [4] the block's bytes
+    call8   silica_rt_alloc             // zeroed
+    mov     a7, a10                     // a7 = the block = the report string
+    movi    a8, -1
+    s32i    a8, a7, 0                   // tag
+    s32i    a8, a7, 4
+    addi    a8, a7, 24
+    s32i    a8, a7, 8                   // data
+    s32i    a4, a7, 16                  // length
     mov     a10, a5
-    movi    a11, 0
+    mov     a11, a8
     mov     a12, a4
-    movi    a13, 0
-    call8   silica_rt_string_from_bytes
-    mov     a7, a10                     // a7 = the report string
-    call8   silica_rt_report_list_add   // listed until handle_report takes it (a10 = the string)
+    call8   silica_rt_copy_bytes
+    mov     a10, a7
+    call8   silica_rt_report_list_add   // listed until handle_report takes it
+    rur     a8, threadptr
+    l32i    a9, a8, 0                   // X3 is the caller's: kept around the cast
+    s32i    a9, a1, 0
+    s32i    a7, a8, 0                   // X3 = the block (the mailbox buffer)
     mov     a12, a7                     // X1 = the report string
     movi    a13, 0
-    movi    a14, 2                      // X2 = 2: the message owns the report (freed after
-    movi    a15, 0                      // handle_report returns, see silica_rt_report_end)
+    l32i    a14, a1, 4                  // X2 = the buffer's bytes
+    movi    a15, 0
     l32i    a10, a6, 0                  // X0 = the reporter's identity; cast_try: an ended reporter
     l32i    a11, a6, 4                  // is no failure of the dying actor's, the text is written
-    call8   silica_rt_cast_try
+    call8   silica_rt_cast_report_try   // the node's payload marked 2: a report
+    rur     a8, threadptr
+    l32i    a9, a1, 0
+    s32i    a9, a8, 0
     beqi    a10, 1, 9f                  // 0 ended, 2 a call-only reporter (§16.2.6.4): no enqueue,
     mov     a10, a7                     // not cast: it is written below instead (§15.4.13.4)
     call8   silica_rt_report_list_take
@@ -6386,7 +6523,7 @@ silica_rt_get_actor_memory_usage:
     movi    a3, 0
     mov     a6, a2
     movi    a10, 40
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     mov     a2, a10
     movi    a3, 0
     movi    a4, SHAPE_ACTOR_MEMORY
@@ -6436,8 +6573,8 @@ silica_rt_get_actor_memory_usage:
 #define TMR_DL          12
 #define TMR_TGT         20
 #define TMR_MSG         28
-#define TMR_OWNED       36
-#define TMR_THUNK       40
+#define TMR_OWNED       36      // the message's mailbox buffer block (chunk 15 stage 4e), 0 inline
+#define TMR_THUNK       40      // its bytes
 #define TMR_SIZE        48
 #define TMR_SYSTIMER_CONF  0x60023000
 #define TMR_SYSTIMER_OP    0x60023004
@@ -6612,8 +6749,10 @@ silica_rt_timer_prepare:
     s32i    a3, a8, TMR_TGT + 4
     s32i    a4, a8, TMR_MSG
     s32i    a5, a8, TMR_MSG + 4
-    s32i    a6, a8, TMR_OWNED
-    s32i    a7, a8, TMR_THUNK
+    s32i    a6, a8, TMR_THUNK           // X2 = the buffer's bytes
+    rur     a9, threadptr
+    l32i    a9, a9, 0                   // X3 = its block
+    s32i    a9, a8, TMR_OWNED
     mov     a2, a8
     movi    a3, 0
     retw
@@ -6625,14 +6764,8 @@ silica_rt_timer_prepare:
     .type   silica_rt_timer_release, @function
 silica_rt_timer_release:
     entry   a1, 32
-    l32i    a3, a2, TMR_THUNK
-    beqz    a3, 1f
-    l32i    a10, a2, TMR_MSG
-    l32i    a11, a2, TMR_MSG + 4
-    callx8  a3
-1:  l32i    a3, a2, TMR_OWNED
-    beqz    a3, 2f
-    l32i    a10, a2, TMR_MSG
+    l32i    a10, a2, TMR_OWNED          // a timer that will not deliver frees its buffer with the record
+    beqz    a10, 2f
     call8   silica_rt_free
 2:  mov     a10, a2
     call8   silica_rt_free
@@ -6653,8 +6786,16 @@ silica_rt_timer_fire:
     l32i    a5, a2, TMR_MSG + 4
     s32i    a4, a6, MSG_PAYLOAD
     s32i    a5, a6, MSG_PAYLOAD + 4
-    l32i    a7, a2, TMR_OWNED
-    s32i    a7, a6, MSG_PAYLOAD_OWNED
+    l32i    a7, a2, TMR_OWNED           // the node takes the buffer
+    s32i    a7, a6, MSG_BUF_BLOCK
+    l32i    a8, a2, TMR_THUNK
+    s32i    a8, a6, MSG_BUF_BYTES
+    movi    a8, 0
+    beqz    a7, 11f
+    movi    a8, 1
+11: s32i    a8, a6, MSG_PAYLOAD_OWNED
+    movi    a8, 0
+    s32i    a8, a2, TMR_OWNED
     l32i    a10, a2, TMR_TGT
     l32i    a11, a2, TMR_TGT + 4
     mov     a12, a6
@@ -6674,12 +6815,13 @@ silica_rt_timer_fire:
 // from the caller (§22.14.2), so the message is ordered before anything the caller sends next; its
 // number is already fired. A target that has ended means a timer cancelled already: released, never
 // found. Otherwise the record is linked in deadline order (after equal deadlines: first armed, first
-// delivered). Frame: +0/+4 delay, +8 record, +12/+16 number, +20/+24 now.
+// delivered). Frame: +0/+4 delay, +8 record, +12/+16 number, +20/+24 now (64 bytes: the locals must
+// lie below the window save areas at [32, 64), which the overflow handler writes).
     .align  4
     .global silica_rt_send_after
     .type   silica_rt_send_after, @function
 silica_rt_send_after:
-    entry   a1, 48
+    entry   a1, 64
     s32i    a2, a1, 0
     s32i    a3, a1, 4
     s32i    a4, a1, 8

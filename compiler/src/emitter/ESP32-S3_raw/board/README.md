@@ -25,6 +25,7 @@ netlist; the supplied pin sheet has the RGB red pin wrong (1 instead of 2).
 | `runtime/rt_console.S` | UART0 output (raw FIFO writes), the `print_*` routines (`*_stderr` is the same routine: one console), `exit`, the runtime-abort entries (`silica_rt_abort_*`), `badarith` / `case_clause`, the fatal fault report; UART0 input: the `exit` line reader core 0's scheduler polls (`silica_rt_console_poll_exit_line`) |
 | `runtime/rt_string.S` | String routines (`silica_rt_string_*`): concat, lengths, eq/cmp, predicates, substring |
 | `runtime/rt_list.S` | List routines (`silica_rt_list_*`): length, tail, at, prepend over the emitter's chunked lists |
+| `runtime/rt_transport.S` | The transport builtins that touch a string or a list (`silica_rt_tr_*`: byte_at, byte_slice, bytes_of, join_bytes, atom_name, atom_index_of_name; transport_serialization_design.md §9.2); the emitter's `terms/prims/prims_transport.silica` calls them, the scalar transport prims are register work there |
 | `runtime/rt_float.S` | Float printing (host digit algorithm, including the host's `FCVTZS` behaviour on nan/inf; float64 via libgcc, float32 on the FPU), half conversions, truncation, float16 → int32 for a float16 exit code |
 | `runtime/rt_ordering.S` | Ordering identity tokens, canonical arenas (stdlib data structures), checked int64 add/mul |
 | `runtime/rt_heap.S` | Heap: first-fit free list with coalescing over a bump top (8-byte block headers); `silica_rt_free` and region release (`silica_rt_region_destroy`, the extension chain too) give memory back; exhaustion is a runtime abort |
@@ -248,7 +249,7 @@ $B/tools/run_app.sh --build-only --keep silica_14_wbt_map   # image only, keep t
 3. runs it from the board's RAM with `tools/run_on_board.py` (nothing is written to flash unless
    `--flash` is given) while holding the board lock `trials/.board.lock` (flock, the lock the board
    trial runs take for each trial), and refuses to start while a board trial run holds
-   `trials/.integrate.lock`;
+   `trials/.integrate.lock.ESP32-S3_raw`;
 4. prints the run in `.sout` form on stdout -- the program's output, then its exit status on a line
    of its own -- with its own progress, the image sizes and the board's `[silica] stacks:` line on
    stderr;

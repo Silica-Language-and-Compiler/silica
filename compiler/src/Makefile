@@ -27,9 +27,10 @@ THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 include $(THIS_DIR)emit_target.mk
 
 BINARIES_DIR := $(abspath $(THIS_DIR)../../binaries)
-# ESP32-S3 cross compiler is built by the latest Mac build (binaries/silica-compiler) because the
-# seed is too old for the board pack's sum return types; every other target is built by the seed.
-ifeq ($(TARGET),ESP32-S3_raw)
+# The board cross compilers (ESP32-S3_raw, STM32-L476RG_raw) are built by the latest Mac build
+# (binaries/silica-compiler) because the seed is too old for the board packs' sum return types;
+# every other target is built by the seed.
+ifneq ($(filter ESP32-S3_raw STM32-L476RG_raw,$(TARGET)),)
 SILICA_COMPILER ?= $(BINARIES_DIR)/silica-compiler
 else
 SILICA_COMPILER ?= $(BINARIES_DIR)/seed-compiler

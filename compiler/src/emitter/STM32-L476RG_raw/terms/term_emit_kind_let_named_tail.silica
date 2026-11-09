@@ -1,0 +1,140 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Let-kind emission, named-binding arm -- second stage.
+// Continues the binding chain from term_emit_kind_let_named; the eleven scalars
+// that cross the seam arrive as parameters.
+
+use prims_tuple;
+use reg_conventions;
+use string_parse;
+use term_aggregate_helpers;
+use term_let_helpers;
+use term_reg_spill;
+use term_sir_helpers;
+use var;
+use arm_isa;
+
+export emit_kind_let_named_tail/6;
+
+// The value's own home (callee-saved register or X29 frame slot) is what the body reads;
+// the [SP, #k] slab alias is only for a value with no home (a spilled tuple root made
+// tp_is_reg_b false and handed the body `[SP, #8]` for an element living at [X29, #-144]).
+fn lnt_body_bound(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, st: { rhs_reg: string, rhs_asm: string, rhs_bind_b: string, mov_spill_b: string, packs_escape_b: boolean, iap_b: string, va_b: string, proj_tvs: string, tp_is_reg_b: boolean, alloc_bytes: int64, res_binding: string }) -> string {
+    case st.packs_escape_b of {
+                                true -> st.rhs_bind_b;
+                                false -> case st.tp_is_reg_b of {
+                                    true -> st.rhs_bind_b;
+                                    false -> case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).kind == 6 and term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).name == "tuple_proj" and length_bytes(st.proj_tvs) > 0 and var@is_callee_saved_reg(st.rhs_bind_b) == false and var@is_frame_slot_ref(st.rhs_bind_b) == false of {
+                                        true -> {
+                                            pix_b: int64 <- string_parse@string_to_int64(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).right_expr)).value);
+                                            byte_b: int64 <- prims_tuple@tuple_field_start_byte_offset(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).inner)).type_name, pix_b);
+                                            var@sp_offset_for_byte(byte_b)
+                                        };
+                                        false -> st.rhs_bind_b
+                                    }
+                                }
+                            }
+}
+
+fn lnt_reg_binding_inner(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, st: { rhs_reg: string, rhs_asm: string, rhs_bind_b: string, mov_spill_b: string, packs_escape_b: boolean, iap_b: string, va_b: string, proj_tvs: string, tp_is_reg_b: boolean, alloc_bytes: int64, res_binding: string }, bound: { bound_name: string, bound_reg: string, outer_reg: string, debug: boolean }) -> string {
+    case st.packs_escape_b of {
+                                true -> concat("|", concat(term_sir_helpers@sir_term_root_node(term).name, concat("=", st.rhs_bind_b)));
+                                false -> case st.tp_is_reg_b of {
+                                    true -> case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).kind == 6 and term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).name == "tuple_proj" and length_bytes(st.proj_tvs) > 0 of {
+                                        true -> {
+                                            pix_r: int64 <- string_parse@string_to_int64(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).right_expr)).value);
+                                            byte_r: int64 <- prims_tuple@tuple_field_start_byte_offset(term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).inner)).type_name, pix_r);
+                                            {
+                                                  // Mint THROUGH THE BASE POINTER when the projected-from
+                                                  // aggregate lives behind one. A static [SP, #off] is only
+                                                  // valid while the aggregate occupies its original slot; once
+                                                  // that slot is released the offset addresses freed memory
+                                                  // below SP (decompose_nested_bare read b at [SP, #-16]).
+                                                  base_nm_r: string <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).inner)).name;
+                                                  base_pr_r: string <- case length_bytes(base_nm_r) > 0 of {
+                                                      true -> var@find_last_sp_binding(bound.outer_reg, concat("_ptr.", base_nm_r));
+                                                      false -> ""
+                                                  };
+                                                  base_rg_r: string <- case length_bytes(base_nm_r) > 0 of {
+                                                      true -> var@find_last_sp_binding(bound.outer_reg, concat("_va.", base_nm_r));
+                                                      false -> ""
+                                                  };
+                                                  base_rb_r: int64 <- var@parse_x29_neg_offset_bytes(base_rg_r);
+                                                  // The element's own home wins when it has one: after the spill the value
+                                                  // lives in a callee-saved register (or an X29 frame slot), and that is
+                                                  // the binding every later reader and the register allocator must see.
+                                                  // Recording only the through-pointer alias here left the home register
+                                                  // invisible to liveness (a rebound %_td_0 took n's X22) and left the
+                                                  // reader dependent on the base register outliving its own binding
+                                                  // (b took X20, n was then read from [X20, #8]) -- decompose_nested_bare.
+                                                  case var@is_callee_saved_reg(st.rhs_bind_b) or var@is_frame_slot_ref(st.rhs_bind_b) of {
+                                                      true -> concat("|", concat(term_sir_helpers@sir_term_root_node(term).name, concat("=", st.rhs_bind_b)));
+                                                  false -> case length_bytes(base_pr_r) > 0 and var@is_memory_ref(base_pr_r) == false and var@is_callee_saved_reg(base_pr_r) of {
+                                                      true -> concat("|", concat(term_sir_helpers@sir_term_root_node(term).name, concat("=", var@reg_offset_for_byte(base_pr_r, byte_r))));
+                                                      false -> case base_rb_r > 0 of {
+                                                          true -> concat("|", concat(term_sir_helpers@sir_term_root_node(term).name, concat("=", var@fp_offset_for_byte(byte_r, 0, base_rb_r))));
+                                                          false -> concat("|", concat(term_sir_helpers@sir_term_root_node(term).name, concat("=", var@sp_offset_for_byte(byte_r))))
+                                                      }
+                                                  }
+                                                  }
+                                              }
+                                        };
+                                        false -> concat("|", concat(term_sir_helpers@sir_term_root_node(term).name, concat("=", st.rhs_bind_b)))
+                                    };
+                                    false -> ""
+                                }
+                            }
+}
+
+fn emit_kind_let_named_tail(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, bound: { bound_name: string, bound_reg: string, outer_reg: string, debug: boolean }, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, int64_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int32_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int16_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int8_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }, emit_child: fn({ nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, string, { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, int64_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int32_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int16_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int8_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }, { bound_name: string, bound_reg: string, outer_reg: string, debug: boolean }) -> string, st: { rhs_reg: string, rhs_asm: string, rhs_bind_b: string, mov_spill_b: string, packs_escape_b: boolean, iap_b: string, va_b: string, proj_tvs: string, tp_is_reg_b: boolean, alloc_bytes: int64, res_binding: string }) -> string {
+                            body_bound: string <- lnt_body_bound(term, st);
+                            tuple_elem_count_b: int64 <- case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).kind == 1 and reg_conventions@is_tuple_type(term_sir_helpers@sir_term_root_node(term).type_name) of { true -> prims_tuple@count_type_elements(term_sir_helpers@sir_term_root_node(term).type_name); false -> 0 };
+                            ptr_binding_inner: string <- case (term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).kind == 1 or (term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).kind == 6 and term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).name == "tuple_proj")) and reg_conventions@is_tuple_type(term_sir_helpers@sir_term_root_node(term).type_name) and length_bytes(st.rhs_reg) > 0 and substring(st.rhs_reg, 0, 1) != "[" of {
+                                true -> case tuple_elem_count_b > 2 of {
+                                    true -> concat("|_ptr.", concat(term_sir_helpers@sir_term_root_node(term).name, "=X12"));
+                                    false -> concat("|_ptr.", concat(term_sir_helpers@sir_term_root_node(term).name, concat("=", st.rhs_bind_b)))
+                                };
+                                false -> ""
+                            };
+                            save_base_b: string <- case tuple_elem_count_b > 2 and length_bytes(st.rhs_reg) > 0 and substring(st.rhs_reg, 0, 1) != "[" of {
+                                true -> arm_isa@xt_mov("X12", st.rhs_bind_b);
+                                false -> ""
+                            };
+                            reg_binding_inner: string <- lnt_reg_binding_inner(term, st, bound);
+                            new_outer_raw: string <- case st.packs_escape_b or st.tp_is_reg_b of {
+                                true -> {
+                                    nob_r: string <- var@base_reg_of(bound.outer_reg);
+                                    nosp_r: string <- var@strip_name_family(var@extract_sp_bindings(bound.outer_reg), term_sir_helpers@sir_term_root_node(term).name);
+                                    concat(nob_r, concat(nosp_r, reg_binding_inner))
+                                };
+                                false -> var@build_outer_with_sp(bound.bound_name, bound.bound_reg, bound.outer_reg, term_sir_helpers@sir_term_root_node(term).name, term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner), st.rhs_bind_b)
+                            };
+                            nob: string <- var@base_reg_of(new_outer_raw);
+                            nosp: string <- var@extract_sp_bindings(new_outer_raw);
+                            // The base register must lead the string (base|name=reg|...): putting the
+                            // |_res= reservation first glued the base onto it (|_res=X21X20|...), so the
+                            // reservation never matched and base_reg_of read "" for every later let.
+                            new_outer: string <- concat(nob, concat(st.res_binding, concat(st.va_b, concat(st.iap_b, concat(nosp, ptr_binding_inner)))));
+                            outer_for_body_pre: string <- term_reg_spill@outer_append_id_ret_tuple_sret(term, concat(new_outer, term_let_helpers@list_cons_tail_rebind_suffix(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner))), bound.outer_reg);
+                            outer_for_body: string <- outer_for_body_pre;
+                            body_asm: string <- emit_child(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr),  dest, pools,  { bound_name: term_sir_helpers@sir_term_root_node(term).name, bound_reg: body_bound, outer_reg: outer_for_body, debug: bound.debug });
+                            // Chunk 15 phase 2: nothing is promoted, popped or destroyed at the let's end (see let_top).
+                            let_prefix_b: string <- concat(concat(concat(st.rhs_asm, "\n"), st.mov_spill_b), save_base_b);
+                            let_tail_b: string <- "\n";
+                            var@strip_mov_x2_x1_then_x1_x2_at_seams(let_prefix_b, body_asm, let_tail_b)
+                        }

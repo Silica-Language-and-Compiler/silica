@@ -158,17 +158,17 @@ integrate-run:
 		$(INTEGRATE_DOT_FAIL); \
 		ko=$$((ko + 1)); failed=1;; esac; \
 	elif [ -x "$$base" ]; then \
-			$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,./$$base); \
+			$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base$(SOUT_EXT),./$$base); \
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
 				ko=$$((ko + 1)); failed=1; continue; \
 			fi; \
 			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
-				if ! bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+				if ! bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout (normalized compare)"; \
 					$(INTEGRATE_DOT_FAIL); \
-					bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+					bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \

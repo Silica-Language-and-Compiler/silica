@@ -18,7 +18,12 @@
 // List prim emission: list_nil, list_cons, list_length, list_head, list_remove_head
 // list_implementation_design.md §4–§9: chunk-based spine; immutable handles, mutable chunks.
 //
-// List handle (24 bytes, heap-allocated; pointer = 0 for nil):
+// Chunk 15 phase 2 (design §3.7): handles and chunks are frame blocks of the calling function:
+// the board runtime routines (rt_list.S silica_rt_list_prepend / _tail) take them from the
+// running frame's dynamic part through silica_rt_dyn_alloc (rt_frame.S), so nothing comes from the
+// heap and no caller-provided block is passed as the hosted emitters pass X15.
+//
+// List handle (24 bytes; pointer = 0 for nil):
 //   [0..8)   = length  (int64, total list length)
 //   [8..16)  = chunk_ptr (pointer to first data chunk)
 //   [16..24) = cursor   (byte offset of first element within chunk data area)
@@ -38,14 +43,15 @@ use prims_record;
 use atom_table;
 use xt_isa;
 use xt_mem;
+use xt_frame;
 
 export is_list_prim/1;
+export list_elem_type_from_list_t/1;
 export emit_prim_op/2;
 export module_uses_list_prims/1;
 export emit_list_helpers/0;
 export emit_list_at_helper/0;
 export module_uses_list_at/1;
-export emit_region_alloc_stub/0;
 export list_element_payload_bytes/1;
 export chunk_elem_slot_bytes/1;
 export chunk_data_bytes/1;
@@ -339,9 +345,14 @@ fn chunk_elem_slot_bytes(elem_t: string) -> int64 {
             // record spliced into the cell: child-spec lists (+8 for the hidden trampoline word in
             // the initial_state form) and the supervisor's which_children list of child-info
             // records (_silica_rt_supervisor_which_children writes 32-byte cells).
+            // (Child specs: see below.)
             visible_bytes: int64 <- prims_record@record_type_list_cons_payload_bytes(elem_t);
+            // A child-spec cell is the whole 88-byte record whether or not the spec spells its
+            // state_policy field (phase 3a: optional): shape, seven fields, state_policy@64, the
+            // hidden trampoline@72 and the hidden initial-state descriptor@80 (phase 3b;
+            // term_child_spec@child_spec_field_abi_offset).
             case element_type_is_child_spec_record(elem_t) of {
-                true -> visible_bytes + 8;
+                true -> 88;
                 false -> case element_type_is_runtime_inline_record(elem_t) of {
                     true -> visible_bytes;
                     false -> 8
@@ -437,19 +448,19 @@ fn list_head_box_copy_words(i: int64, words: int64) -> string {
     }
 }
 
-// Box the aggregate head in X1 before the prepend: copy it to the region and leave the copy's
-// pointer in X1, keeping X2 (the tail). The cell then stores that word. Copying (rather than
-// storing the pointer we were handed) is what keeps a let-bound, frame-resident record safe in
-// the list after the frame is gone, exactly as the old inline memcpy did.
+// Box the aggregate head in X1 before the prepend: copy it into a block of this frame and leave the
+// copy's pointer in X1, keeping X2 (the tail). The cell then stores that word; the block travels with
+// the list by adoption or evacuation (chunk 15 phase 2).
 fn emit_list_head_box(nbytes: int64) -> string {
     case nbytes <= 0 of {
         true -> "";
         false -> {
-            save: string <- xt_mem@xt_stp("X1", "X2", "[SP, #-16]!");
-            alloc: string <- concat(xt_isa@xt_movi("X0", nbytes), xt_isa@xt_call("_silica_rt_region_alloc"));
-            restore: string <- xt_mem@xt_ldp("X1", "X2", "[SP], #16");
+            // A frame copy (chunk 15 phase 2): the block comes from this frame's dynamic part
+            // (shared/xt_frame dyn_alloc_asm keeps X1, the head, and X2, the tail).
+            n16: int64 <- (nbytes + 15) / 16 * 16;
+            alloc: string <- xt_frame@dyn_alloc_asm(concat("#", atom_table@int64_to_decimal_string(n16)), "X0");
             copy: string <- list_head_box_copy_words(0, nbytes / 8);
-            concat(save, concat(alloc, concat(restore, concat(copy, xt_isa@xt_mov("X1", "X0")))))
+            concat(alloc, concat(copy, xt_isa@xt_mov("X1", "X0")))
         }
     }
 }
@@ -604,10 +615,5 @@ fn emit_list_at_helper() -> string {
 }
 
 fn emit_list_helpers() -> string {
-    ""
-}
-
-// silica_rt_region_alloc is part of the board runtime (rt_heap.S); nothing to append.
-fn emit_region_alloc_stub() -> string {
     ""
 }

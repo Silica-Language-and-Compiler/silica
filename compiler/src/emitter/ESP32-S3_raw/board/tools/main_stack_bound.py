@@ -67,6 +67,7 @@ import sys
 ROM_LOW, ROM_HIGH = 0x40000000, 0x40060000   # the ESP32-S3 ROM's code window
 ROM_CALL_DEPTH = 256                           # allowance for one ROM call (ets_delay_us, ets_set_appcpu_boot_addr: shallow C)
 VSP_OFFSET = 112                               # VRG_VSP: the auxiliary stack pointer in the per-core register block
+ARG_OFFSET = 136                               # VRG_ARG: the argument word a runtime call reads (silica_rt_dyn_alloc's byte count)
 
 RETURNS = {"retw", "retw.n", "ret", "ret.n", "rfi", "rfe", "rfde", "rfwo", "rfwu", "rfdo", "rfdd", "ill", "ill.n"}
 CALLS = {"call8", "call4", "call12", "call0"}
@@ -280,16 +281,29 @@ def aux_usage(b, is_runtime):
     b.aux, b.aux_unknown = 0, None
     if is_runtime(b.name):
         return
-    sym = {}                # register -> ("vsp", delta) | ("const", value)
+    sym = {}                # register -> ("vsp", delta) | ("const", value) | ("frame", k) | ("a1", k)
     tp = set()              # registers holding the per-core register block (rur.threadptr)
+    pending_arg = None      # the value stored into the argument word since the last call: int, "?" (untracked) or None
     prev_end = None
     for ins in b.reached:
         op, args = ins.op, ins.args
         if prev_end is not None and ins.addr != prev_end:
-            sym.clear(); tp.clear()           # a gap: the straight line was broken
+            sym.clear(); tp.clear(); pending_arg = None   # a gap: the straight line was broken
         prev_end = ins.addr + ins.size
         if op in CALLS or op in XCALLS or op in ("j", "jx") or op in RETURNS or op in LOOPS or (op.startswith("b") and op not in ("break", "break.n")):
-            sym.clear(); tp.clear()
+            if op in CALLS:
+                if "<silica_rt_dyn_alloc>" in args:
+                    # a frame allocation: the runtime lowers the floor and the pointer by the byte count
+                    # in the argument word, which the walk cannot see inside the call
+                    if isinstance(pending_arg, int):
+                        b.aux += pending_arg
+                    else:
+                        b.aux_unknown = b.aux_unknown or "frame allocation of an untracked size at 0x%x (%s)" % (ins.addr, b.name)
+                elif "<silica_rt_ev_frame>" in args:
+                    # copies a result whose size is only known at run time under the floor
+                    b.aux_unknown = b.aux_unknown or "evacuation of a result of run-time size at 0x%x (%s)" % (ins.addr, b.name)
+                # silica_rt_adopt changes nothing
+            sym.clear(); tp.clear(); pending_arg = None
             continue
         if op == "rur.threadptr":
             r = args.strip()
@@ -301,10 +315,19 @@ def aux_usage(b, is_runtime):
             continue
         if op in ("s32i", "s32i.n") and m and m.group(2) in tp and int(m.group(3), 0) == VSP_OFFSET:
             v = sym.get(m.group(1))
-            if v is None or v[0] != "vsp":
+            if v is not None and v[0] == "frame":
+                pass                      # a restore from the frame record: it never deepens the stack
+            elif v is None or v[0] != "vsp":
                 b.aux_unknown = b.aux_unknown or "store to the auxiliary stack pointer at 0x%x (%s) with an untracked value" % (ins.addr, b.name)
             elif v[1] < 0:
                 b.aux += -v[1]
+            continue
+        if op in ("s32i", "s32i.n") and m and m.group(2) in tp and int(m.group(3), 0) == ARG_OFFSET:
+            v = sym.get(m.group(1))
+            pending_arg = v[1] if v is not None and v[0] == "const" else "?"
+            continue
+        if op in ("l32i", "l32i.n") and m and (m.group(2) == "a1" or (sym.get(m.group(2)) or ("",))[0] == "a1"):
+            sym[m.group(1)] = ("frame", int(m.group(3), 0)); tp.discard(m.group(1))   # a frame-record value
             continue
         if op in ("movi", "movi.n"):
             m2 = re.match(r"(a\d+),\s*(-?\d+|-?0x[0-9a-f]+)$", args)
@@ -315,7 +338,9 @@ def aux_usage(b, is_runtime):
             d, s, k = m.group(1), m.group(2), int(m.group(3), 0)
             if op == "addmi":
                 k <<= 8
-            v = sym.get(s)
+            v = sym.get(s) or (("a1", 0) if s == "a1" and d != "a1" else None)
+            if v and v[0] == "frame":
+                v = None
             if v:
                 sym[d] = (v[0], v[1] + k)
             else:

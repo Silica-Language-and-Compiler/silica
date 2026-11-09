@@ -196,7 +196,7 @@ integrate-run:
 					if [ -f "$(THIS_DIR)run_integration_exit_after_marker.py" ]; then \
 						marker=$$(awk 'NF { print $$1; found=1; exit } END { if (!found) print "done" }' "$$base.wait_for_exit"); \
 						marker_count=$$(awk 'NF { print ($$2 == "" ? 1 : $$2); found=1; exit } END { if (!found) print 1 }' "$$base.wait_for_exit"); \
-						$(call INTEGRATE_EXEC_TRIAL,$(MSG_PREFIX)$$base,env SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) $$(cat "$$base.env" 2>/dev/null) python3 "$(THIS_DIR)run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base.sout" "$$marker" "$$marker_count"); \
+						$(call INTEGRATE_EXEC_TRIAL,$(MSG_PREFIX)$$base,env SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) $$(cat "$$base.env" 2>/dev/null) python3 "$(THIS_DIR)run_integration_exit_after_marker.py" "$(THIS_DIR)" "$$base" "$$base$(SOUT_EXT)" "$$marker" "$$marker_count"); \
 						if [ "$$integrate_killed" = 1 ]; then \
 							echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 							$(INTEGRATE_DOT_FAIL); \
@@ -209,7 +209,7 @@ integrate-run:
 						continue; \
 					fi; \
 				else \
-					$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,env SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) $$(cat "$$base.env" 2>/dev/null) ./$$base); \
+					$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base$(SOUT_EXT),env SILICA_CARRIER_COUNT=$(SILICA_CARRIER_COUNT) $$(cat "$$base.env" 2>/dev/null) ./$$base); \
 					if [ "$$integrate_killed" = 1 ]; then \
 						echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 						$(INTEGRATE_DOT_FAIL); \
@@ -218,24 +218,24 @@ integrate-run:
 				fi; \
 				multiset=0; [ -f "$$base.scout.multiset" ] && multiset=1; \
 				if [ "$$multiset" = 1 ]; then \
-					if [ -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)"; then \
+					if [ -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! "$(SHELL)" "$(THIS_DIR)compare_scout_multiset.sh" "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)"; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout multiset-compare differs from .scout"; \
 						$(INTEGRATE_DOT_FAIL); \
 						ko=$$((ko + 1)); failed=1; \
-					elif [ ! -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+					elif [ ! -f "$(THIS_DIR)compare_scout_multiset.sh" ] && ! diff -Bw -q "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 						echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout (missing compare_scout_multiset.sh; used diff -Bw)"; \
 						$(INTEGRATE_DOT_FAIL); \
-						diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+						diff -Bw "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 						ko=$$((ko + 1)); failed=1; \
 					else \
 						echo "✅✅ $(MSG_PREFIX)$$base output multiset-matches .scout"; \
 						$(INTEGRATE_DOT_OK); \
 						ok=$$((ok + 1)); \
 					fi; \
-				elif ! bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+				elif ! bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout (normalized compare)"; \
 					$(INTEGRATE_DOT_FAIL); \
-					bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+					bash "$(THIS_DIR)compare_scout_normalized.sh" "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \
@@ -259,7 +259,7 @@ clean:
 		[ -f "$$s" ] || continue; \
 		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done; \
-	rm -f *.sams *.o *.iface *.sout silica.config silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts; \
+	rm -f *.sams *.o *.iface *$(SOUT_EXT) silica.config silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts; \
 	echo "✅ $(MSG_PREFIX)Clean complete"
 
 help:

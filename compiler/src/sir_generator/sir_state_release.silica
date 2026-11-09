@@ -29,7 +29,16 @@
 // the return type (sr_state_type), not from param_types, whose `|` separator is also the sum spelling.
 // OLD names denote the old state or a part of it reached only through projections: the
 // parameter, every let whose value is an Old name or a record_proj / tuple_proj chain over one, and
-// every `bind` arm over such a scrutinee. The proof holds when, in every arm of the body, the new state
+// every `bind` arm over such a scrutinee. The Old set is a set of names, so a name is trusted only while
+// its binding is in scope: a let (or bind arm) that rebinds a name to a value that is not Old removes
+// the name for the walk of its body and marks it (`~name`), and a marked name is dropped from the set
+// once the walk is over. Every tuple decomposition names its root `%_td_0` (tuple_decompose), so a
+// behaviour that decomposes both its state and its message binds `%_td_0` twice; without the scoping a
+// part of the message projected from the second `%_td_0` passed as a part of the old state (found
+// 2026-11-06: actors_addition/failure_reports_kept_and_forwarded's logger kept every report string in
+// its state chain and exhausted the board heap). For the same reason a reference to a let-bound name is
+// resolved to the innermost let of that name whose body holds the reference (sr_find_let_value_at), not
+// to the first let of the name. The proof holds when, in every arm of the body, the new state
 // (the third element of the result tuple, the second for :no_reply) is
 //   * an Old name or a projection of one (the whole state, or a part of it, passed through), or
 //   * a record_make / tuple_make whose pointer-carrying operands are each a projection of an Old name
@@ -39,7 +48,8 @@
 // user call ("'f' is not a logging updater": no logging updater exists before the stdlib's phase 5, so
 // every update is unproven, which is the conservative side of P4), any other fresh value ("slot 'q' is
 // replaced without an update": its old nodes could never be released, §4.1 "what release does not
-// cover"), the same projection kept twice, a record / tuple / list pattern over the old state ("hides
+// cover"; a projection of a value that is not Old, a part of the message, says "by a part of '%msg'"),
+// the same projection kept twice, a record / tuple / list pattern over the old state ("hides
 // its parts", as mc_case_arms_step poisons with "!"), a result that is a call or a shape not analysed.
 // A write_ref anywhere in the body is unproven too: a frame value written into an old state cell is
 // not reached by the evacuation (§4.3 step 1 leaves old nodes alone); §6.3's E2302 takes this over in
@@ -132,6 +142,60 @@ fn sr_add_both(set: string, name: string) -> string {
     case sr_starts_with(name, "%") of {
         true -> sr_add(sr_add(set, name), substring(name, 1, length_bytes(name)));
         false -> sr_add(sr_add(set, name), concat("%", name))
+    }
+}
+
+// The set without name (",a,b," without "b" is ",a,"); a name that is not in it leaves it as it is.
+fn sr_remove(set: string, name: string) -> string {
+    case length_bytes(name) == 0 of {
+        true -> set;
+        false -> {
+            p: int64 <- sr_find_from(set, concat(",", concat(name, ",")), 0);
+            case p < 0 of {
+                true -> set;
+                false -> concat(substring(set, 0, p), substring(set, p + length_bytes(name) + 1, length_bytes(set)))
+            }
+        }
+    }
+}
+
+fn sr_remove_both(set: string, name: string) -> string {
+    case sr_starts_with(name, "%") of {
+        true -> sr_remove(sr_remove(set, name), substring(name, 1, length_bytes(name)));
+        false -> sr_remove(sr_remove(set, name), concat("%", name))
+    }
+}
+
+// A name rebound to a value that is not Old: out of the set for the walk of the binding's body, and
+// marked (`~name`, both spellings) so that sr_strip_marked drops it once the walk is over, since the
+// name alone no longer says which binding a reference means. No SIR name starts with '~'.
+fn sr_mark_rebound(set: string, name: string) -> string {
+    bare: string <- sr_strip_pct(name);
+    case length_bytes(bare) == 0 of {
+        true -> set;
+        false -> sr_add(sr_add(sr_remove_both(set, name), concat("~", bare)), concat("~%", bare))
+    }
+}
+
+// The entries of set from the comma at pos, without the marks and without every name that carries one.
+fn sr_strip_marked(set: string, pos: int64, acc: string) -> string {
+    case pos + 1 >= length_bytes(set) of {
+        true -> acc;
+        false -> {
+            e: int64 <- sr_find_from(set, ",", pos + 1);
+            case e < 0 of {
+                true -> acc;
+                false -> {
+                    entry: string <- substring(set, pos + 1, e);
+                    mark: string <- concat("~", entry);
+                    acc1: string <- case sr_starts_with(entry, "~") or sr_in_set(set, mark) of {
+                        true -> acc;
+                        false -> sr_add(acc, entry)
+                    };
+                    sr_strip_marked(set, e, acc1)
+                }
+            }
+        }
     }
 }
 
@@ -493,9 +557,12 @@ fn sr_old_step(nodes: List[{ kind: int64, type_name: string, value: string, name
         true -> old;
         false -> {
             n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
-            old1: string <- case n.kind == 2 and sr_is_old_proj(nodes, n.inner, old) of {
-                true -> sr_add_both(old, n.name);
-                false -> old
+            old1: string <- case n.kind == 2 of {
+                false -> old;
+                true -> case sr_is_old_proj(nodes, n.inner, old) of {
+                    true -> sr_add_both(old, n.name);
+                    false -> sr_mark_rebound(old, n.name)
+                }
             };
             old2: string <- case n.kind == 3 of {
                 true -> sr_old_arms(nodes, n.right_expr, sr_is_old_proj(nodes, n.inner, old1), old1);
@@ -524,7 +591,10 @@ fn sr_old_arms(nodes: List[{ kind: int64, type_name: string, value: string, name
                             true -> sr_add_both(old, a.name);
                             false -> case scrut_old and (a.value == "record" or a.value == "tuple" or a.value == "list_cons") of {
                                 true -> sr_add(old, "!");
-                                false -> old
+                                false -> case a.value == "bind" of {
+                                    true -> sr_mark_rebound(old, a.name);
+                                    false -> old
+                                }
                             }
                         };
                         sr_old_step(nodes, a.right_expr, sr_old_step(nodes, a.inner, old1))
@@ -570,6 +640,94 @@ fn sr_find_let_value(nodes: List[{ kind: int64, type_name: string, value: string
     }
 }
 
+// The subtree at root holds the node target (every child of a node is its inner or its right_expr).
+fn sr_contains(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64, target: int64, depth: int64) -> boolean {
+    case root < 0 or target < 0 or depth > 1024 of {
+        true -> false;
+        false -> case root == target of {
+            true -> true;
+            false -> {
+                n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, root);
+                sr_contains(nodes, n.inner, target, depth + 1) or sr_contains(nodes, n.right_expr, target, depth + 1)
+            }
+        }
+    }
+}
+
+fn sr_let_binds(let_name: string, name: string) -> boolean {
+    let_name == name or concat("%", let_name) == name or let_name == concat("%", name)
+}
+
+// The innermost let named `name` whose body holds the node `site` (its index), or best when none does:
+// the binding a reference at `site` means. One name can have several lets (every tuple decomposition
+// names its root %_td_0), and a let inside another's body is the nearer one.
+fn sr_find_let_scoped(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], i: int64, n: int64, name: string, site: int64, best: int64) -> int64 {
+    case i >= n of {
+        true -> best;
+        false -> {
+            e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, i);
+            here: boolean <- e.kind == 2 and sr_let_binds(e.name, name) and sr_contains(nodes, e.right_expr, site, 0);
+            nearer: boolean <- case here of {
+                false -> false;
+                true -> case best < 0 of {
+                    true -> true;
+                    false -> {
+                        b: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, best);
+                        sr_contains(nodes, b.right_expr, i, 0)
+                    }
+                }
+            };
+            next_best: int64 <- case nearer of {
+                true -> i;
+                false -> best
+            };
+            sr_find_let_scoped(nodes, i + 1, n, name, site, next_best)
+        }
+    }
+}
+
+// The value (its node index) of the let a reference at `site` to `name` means: the innermost let of the
+// name around the reference; when no let of the name holds it, the first let of the name; else -1.
+fn sr_find_let_value_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], name: string, site: int64) -> int64 {
+    n: int64 <- sr_nodes_len(nodes);
+    best: int64 <- sr_find_let_scoped(nodes, 0, n, name, site, -1);
+    case best < 0 of {
+        true -> sr_find_let_value(nodes, 0, n, name);
+        false -> {
+            b: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, best);
+            b.inner
+        }
+    }
+}
+
+// The name at the root of a projection chain, with a decomposition temporary (%_td_N) followed to the
+// value it decomposes and a user call named by its function: what W2300 prints for a part kept without
+// an update. "?" for a shape not followed.
+fn sr_proj_root(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64, depth: int64) -> string {
+    case idx < 0 or depth > 32 of {
+        true -> "?";
+        false -> {
+            a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
+            case a.kind == 1 of {
+                true -> case sr_starts_with(a.name, "%_td_") of {
+                    false -> a.name;
+                    true -> {
+                        v: int64 <- sr_find_let_value_at(nodes, a.name, idx);
+                        sr_proj_root(nodes, v, depth + 1)
+                    }
+                };
+                false -> case a.kind == 6 and (a.name == "record_proj" or a.name == "tuple_proj") of {
+                    true -> sr_proj_root(nodes, a.inner, depth + 1);
+                    false -> case a.kind == 4 or a.kind == 5 of {
+                        true -> a.name;
+                        false -> "?"
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---- the new state -----------------------------------------------------------------------------
 
 // The result positions of the body, through lets and case arms, to the state element of each result
@@ -583,7 +741,7 @@ fn sr_check_result(nodes: List[{ kind: int64, type_name: string, value: string, 
                 2 -> sr_check_result(nodes, n.right_expr, reply_form, old, depth + 1);
                 3 -> sr_check_result_arms(nodes, n.right_expr, reply_form, old, depth + 1);
                 1 -> {
-                    v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), n.name);
+                    v: int64 <- sr_find_let_value_at(nodes, n.name, idx);
                     case v < 0 of {
                         true -> concat("the result is '", concat(n.name, "', whose value is not analysed"));
                         false -> sr_check_result(nodes, v, reply_form, old, depth + 1)
@@ -653,7 +811,7 @@ fn sr_check_operands(nodes: List[{ kind: int64, type_name: string, value: string
             n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
             case n.kind of {
                 1 -> {
-                    v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), n.name);
+                    v: int64 <- sr_find_let_value_at(nodes, n.name, idx);
                     case v < 0 of {
                         true -> concat("the new state is '", concat(n.name, "', whose value is not analysed"));
                         false -> sr_check_state(nodes, v, old, depth + 1)
@@ -749,13 +907,19 @@ fn sr_check_operand(nodes: List[{ kind: int64, type_name: string, value: string,
                             true -> concat("'", concat(o.name, "' is not a logging updater"));
                             false -> case o.kind == 1 of {
                                 true -> {
-                                    v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), o.name);
+                                    v: int64 <- sr_find_let_value_at(nodes, o.name, idx);
                                     case v < 0 of {
                                         true -> concat("slot '", concat(slot, concat("' is replaced without an update (by '", concat(o.name, "')"))));
                                         false -> sr_check_operand(nodes, v, slot, old, depth + 1)
                                     }
                                 };
-                                false -> concat("slot '", concat(slot, "' is replaced without an update"))
+                                false -> case o.kind == 6 and (o.name == "record_proj" or o.name == "tuple_proj") of {
+                                    true -> {
+                                        root_name: string <- sr_proj_root(nodes, idx, 0);
+                                        concat("slot '", concat(slot, concat("' is replaced without an update (by a part of '", concat(root_name, "')"))))
+                                    };
+                                    false -> concat("slot '", concat(slot, "' is replaced without an update"))
+                                }
                             }
                         }
                     }
@@ -777,7 +941,7 @@ fn sr_state_keys(nodes: List[{ kind: int64, type_name: string, value: string, na
                     true -> concat(acc, concat(sr_norm_key(nodes, idx, 0), ","));
                     false -> case n.kind == 1 of {
                         true -> {
-                            v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), n.name);
+                            v: int64 <- sr_find_let_value_at(nodes, n.name, idx);
                             case v < 0 of { true -> acc; false -> sr_state_keys(nodes, v, old, depth + 1, acc) }
                         };
                         false -> case n.kind == 6 and n.name == "record_make" of {
@@ -838,13 +1002,13 @@ fn sr_strip_pct(name: string) -> string {
     }
 }
 
-// The key of an Old name: the key of the projection a let binds it to, else of the scrutinee a bind arm
-// binds it to, else the name itself (the parameter).
-fn sr_norm_root(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], name: string, depth: int64) -> string {
+// The key of an Old name referenced at node `site`: the key of the projection the let in scope binds it
+// to, else of the scrutinee a bind arm binds it to, else the name itself (the parameter).
+fn sr_norm_root(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], name: string, site: int64, depth: int64) -> string {
     case depth > 16 of {
         true -> "?";
         false -> {
-            v: int64 <- sr_find_let_value(nodes, 0, sr_nodes_len(nodes), name);
+            v: int64 <- sr_find_let_value_at(nodes, name, site);
             case v >= 0 of {
                 true -> sr_norm_key(nodes, v, depth + 1);
                 false -> {
@@ -867,7 +1031,7 @@ fn sr_norm_key(nodes: List[{ kind: int64, type_name: string, value: string, name
         false -> {
             a: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sr_node_at(nodes, idx);
             case a.kind == 1 of {
-                true -> sr_norm_root(nodes, a.name, depth);
+                true -> sr_norm_root(nodes, a.name, idx, depth);
                 false -> case a.kind == 6 and a.name == "record_proj" of {
                     true -> concat(sr_norm_key(nodes, a.inner, depth + 1), concat(".", a.value));
                     false -> case a.kind == 6 and a.name == "tuple_proj" of {
@@ -954,7 +1118,8 @@ fn behaviour_release_reason(fn_val: { name: string, return_type: string, effects
                                 }
                             }
                         };
-                        old: string <- sr_old_closure(fn_val.body.nodes, fn_val.body.root, old0, 8);
+                        closed: string <- sr_old_closure(fn_val.body.nodes, fn_val.body.root, old0, 8);
+                        old: string <- sr_strip_marked(closed, 0, ",");
                         case sr_in_set(old, "!") of {
                             true -> concat("a pattern on '", concat(pname, "' hides its parts"));
                             false -> case sr_has_prim(fn_val.body.nodes, 0, sr_nodes_len(fn_val.body.nodes), "write_ref") of {

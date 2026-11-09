@@ -1,0 +1,688 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Memory region prim emission: alloc_region, alloc_ref, alloc_rec, read_ref, write_ref,
+// alloc_buf, alloc_buf_retained, buf_load, buf_store, read_buf, write_buf, fresh_lifetime, ref_eq, retire
+// sir_design_spec §7.4, §7.5; silica-specification §12.1.2
+//
+// Chunk 15 (chunk15_stack_memory_design.md §3.2, phase 9 on this target): an allocation into a region
+// in a normal memory space is a FRAME allocation, a block of the running function's dynamic part on
+// the auxiliary stack (shared/xt_frame dyn_alloc_asm -> rt_frame.S silica_rt_dyn_alloc), and the
+// region handle is a lifetime witness that is never dereferenced (alloc_region answers X29). The
+// implicit heap, _silica_rt_region_alloc and the heap-promote helpers are gone from emitted code.
+//
+// An atomic or device region keeps a block with the bump layout: [0:8]=bump, [8:16]=end of the block,
+// [16:24]=extension chain (always 0 now), [24:32]=this block's own data end; data at offset 32. The
+// block itself is a frame allocation of the function that executes alloc_region (4128 bytes). A
+// request the block cannot hold is a frame allocation of the executing function (path 3 of the bump
+// check); nothing is chained and the heap is never reached.
+
+use prims_tuple;
+use atom_table;
+use arm_isa;
+use arm_mem;
+use arm_frame;
+
+export is_memory_prim/1;
+export emit_prim_op/2;
+export emit_buf_bounds_check/3;
+export emit_buf_store/3;
+export module_uses_region_allocation/1;
+export module_uses_alloc_region/1;
+export emit_region_helpers/0;
+export emit_frame_helpers/0;
+export emit_evacuation_helper/0;
+
+
+// Local SIRTerm arena helpers (sir_ast node accessors are not exported).
+fn sir_term_nodes_len(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        result: int64 <- length[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)](nodes)
+    produces
+        pure result
+    end
+}
+
+fn sir_term_node_at_from_head(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case nodes.is_nil of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> case idx <= 0 of {
+            true -> nodes.head;
+            false -> sir_term_node_at_from_head(nodes.tail, idx - 1)
+        }
+    }
+}
+
+
+fn sir_term_node_at(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], idx: int64) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case idx < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> {
+            n: int64 <- sir_term_nodes_len(nodes);
+            case idx >= n of {
+                true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+                false -> {
+                    e: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- list_nth(nodes, n - 1 - idx);
+                    { kind: e.kind, type_name: e.type_name, value: e.value, name: e.name, inner: e.inner, right_expr: e.right_expr }
+                }
+            }
+        }
+    }
+}
+
+
+fn sir_term_root_node(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } {
+    case term.root < 0 of {
+        true -> { kind: -1, type_name: "", value: "", name: "", inner: -1, right_expr: -1 };
+        false -> sir_term_node_at(term.nodes, term.root)
+    }
+}
+
+fn sir_term_at(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, idx: int64) -> { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } {
+    { nodes: term.nodes, root: idx }
+}
+
+fn is_memory_prim(name: string) -> boolean {
+    name == "alloc_region" or name == "alloc_ref" or name == "alloc_rec" or name == "read_ref" or name == "write_ref" or name == "alloc_buf" or name == "alloc_buf_retained" or name == "buf_load" or name == "buf_store" or name == "read_buf" or name == "write_buf" or name == "fresh_lifetime" or name == "ref_eq" or name == "retire"
+}
+
+// ref_eq(a, b): X1 = ref A, X2 = ref B -> boolean in dest (pointer identity).
+fn emit_ref_eq(dest: string) -> string {
+    concat(arm_isa@xt_cmp_set("W5", "EQ", "X1", "X2"), arm_isa@xt_mov(dest, "X5"))
+}
+
+// alloc_region(space) in an atomic or device space (a normal space gets the witness, emit_prim_op):
+// the region's block is a frame allocation of the function that executes the prim (design §3.8), so
+// it is released with that frame; nothing is taken from the heap. The block is the 4128 bytes the heap
+// form used: a 32-byte header and 4096 bytes of cells.
+// Region layout, unchanged: [base+0]=bump (starts at base+32), [base+8]=end, [base+16]=extensions,
+// [base+24]=span end. Operands: X1 = space (unused). X4 and X5 are the scratch the heap form used.
+fn emit_alloc_region(dest: string) -> string {
+    alloc: string <- arm_frame@dyn_alloc_asm("#4128", "X4");
+    add_bump: string <- arm_isa@xt_add("X5", "X4", "#32");
+    str_bump: string <- arm_mem@xt_str("X5", "[X4]");
+    mov_arena_sz: string <- arm_isa@xt_mov("X5", "#4128");
+    add_end: string <- arm_isa@xt_add("X5", "X4", "X5");
+    str_end: string <- arm_mem@xt_str("X5", "[X4, #8]");
+    // No extension blocks, and the block's span ends where its bump limit does.
+    str_no_ext: string <- arm_mem@xt_str("XZR", "[X4, #16]");
+    str_span_end: string <- arm_mem@xt_str("X5", "[X4, #24]");
+    mov_dest: string <- arm_isa@xt_mov(dest, "X4");
+    part2: string <- concat(alloc, concat(add_bump, str_bump));
+    part3: string <- concat(part2, concat(mov_arena_sz, concat(add_end, str_end)));
+    part4: string <- concat(part3, concat(str_no_ext, str_span_end));
+    concat(part4, mov_dest)
+}
+
+// The bounds check every region allocation shares. `bump_math` must leave the current block's bump
+// in X3, its end in X4 and bump+request in X5; it is emitted a second time after a growth because
+// the new block's bump has to be read again.
+//
+// Nothing is moved into place for the call: L_region_grow reads the region from X1 and the size
+// from X5 - X3, all of which the check just computed and is about to recompute anyway. Setting up
+// argument registers instead would corrupt the caller on exactly the rare path that is hardest to
+// notice -- the emitter stages call arguments in X0-X7, so a `MOV X6, X1` here destroys a staged
+// argument, but only in the runs where the region happened to fill up.
+//
+// The retry uses a numeric local label so the sites need no unique names: `1f` binds to the `1:`
+// this function emits right after the grow call, and nothing can be emitted in between.
+// The reservation every region allocation shares. `size_math` must leave the request in bytes in
+// X7 (X7-X9 are scratch in every prim sequence: alloc_buf already computes its byte count there).
+// Afterwards X3 is the start of the reserved bytes, X4 the block's end and X5 the new bump (all
+// three in the core's register block, high words 0), and the bump is already published: the sites
+// must not store it again.
+//
+// The bump is moved with S32C1I (design region_memory_safety_design.md §9.4, H1): a canonical
+// arena is shared by both cores, and two actors allocating in the same arena from the two cores
+// used to read one bump, each write bump+size, and hand out the same cell. The compare-and-swap
+// also makes a growth safe: silica_rt_region_grow (rt_heap.S) parks a sentinel (0x80000000, above
+// every data address) in the bump before it publishes the new block, so a reservation that read
+// the old bump either sees a request that cannot fit or finds the word changed under its S32C1I
+// and starts over; the grow stores the end before the bump with memw between.
+//
+// Hand-written Thumb-2: X1 is r2 (its low word, the only one an address has), r8/r12/r10/r11 are the
+// scratch registers every arm_mem access uses and lr (dead inside a body) holds the STREX status; the
+// LDREX/STREX pair keeps the bump atomic against an interrupt handler (one core here). Numeric local
+// labels, so the sites need no unique names: 2 is the retry, 3 the frame block, 1 the exit.
+//
+// A request the block cannot hold (path 3) is a frame allocation of the executing function, of any
+// size (chunk 15; Lee 2026-11-01: heap is not to be used, only stack): X7 rounded up to 16 is taken
+// from the frame's dynamic part and X3 is its start, so the site continues as after a reservation.
+// The bump is left alone, so no concurrent reservation is affected. Such a block lives with the
+// executing frame and reaches the caller only by return (evacuation), as an allocation into a normal
+// region does (design §3.8). The heap path through silica_rt_region_grow is gone.
+fn emit_region_bump_check(size_math: string) -> string {
+    load_size: string <- "2:\n    ldr r10, [r9, #32]\n";
+    attempt: string <- "    ldrex r8, [r2]\n    ldr r12, [r2, #8]\n    add r11, r8, r10\n    cmp r12, r11\n    blo.w 3f\n    strex lr, r11, [r2]\n    cmp lr, #0\n    bne.w 2b\n";
+    publish: string <- "    add r11, r8, r10\n    str r8, [r9, #0]\n    str r12, [r9, #8]\n    str r11, [r9, #16]\n    movw r11, #0\n    str r11, [r9, #4]\n    str r11, [r9, #12]\n    str r11, [r9, #20]\n    b.w 1f\n";
+    frame_block: string <- concat("3:\n", concat(arm_isa@xt_add("X16", "X7", "#15"), concat(arm_isa@xt_and("X16", "X16", "#-16"), concat(arm_frame@dyn_alloc_asm("X16", "X3"), "1:\n"))));
+    concat(size_math, concat(load_size, concat(attempt, concat(publish, frame_block))))
+}
+
+fn memory_type_contains(h: string, needle: string) -> boolean {
+    memory_type_contains_from(h, needle, 0)
+}
+
+// Chunk 15 phase 2 (design §3.2): an allocation into a region in a normal memory space is a frame
+// allocation, the region handle a lifetime witness that is not read. An atomic or device region keeps
+// its block and bump words; that block is itself a frame allocation (emit_alloc_region).
+fn alloc_in_frame(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    v: string <- sir_term_root_node(term).value;
+    memory_type_contains(v, "atomic") == false and memory_type_contains(v, "device") == false
+}
+
+// alloc_ref(r, scalar) in a frame: a 16-byte cell, the value at +0 and +8 zero (the evacuation's
+// forwarding word, term_message_copy kind 2).
+fn emit_alloc_ref_scalar_frame(dest: string) -> string {
+    concat(arm_frame@dyn_alloc_asm("#16", "X16"), concat(arm_mem@xt_str("X2", "[X16]"), concat(arm_mem@xt_str("XZR", "[X16, #8]"), arm_isa@xt_mov(dest, "X16"))))
+}
+
+fn memory_type_is_tuple(type_name: string) -> boolean {
+    length_bytes(type_name) >= 2 and substring(type_name, 0, 1) == "("
+}
+
+fn memory_value_is_tuple_like(value: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    node: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(value);
+    case memory_type_is_tuple(node.type_name) of {
+        true -> true;
+        false -> node.kind == 6 and node.name == "tuple_make"
+    }
+}
+
+fn memory_tuple_word_count(value: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
+    node: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(value);
+    case node.kind == 6 and node.name == "tuple_make" of {
+        true -> prims_tuple@count_flat_elements(value);
+        false -> prims_tuple@count_type_elements(node.type_name)
+    }
+}
+
+// alloc_ref(region, scalar): bump-allocate one cell in region, store value, return ref.
+// Operands: X1 = region base, X2 = value. Region [X1]=bump, [X1+8]=end.
+// Bounds check: if bump+8 > end, grow the region and allocate from the new block.
+fn emit_alloc_ref_scalar(dest: string) -> string {
+    mov_size: string <- arm_isa@xt_mov("X7", "#8");
+    mov_ref: string <- arm_isa@xt_mov("X4", "X3");
+    str_val: string <- arm_mem@xt_str("X2", "[X3]");
+    mov_dest: string <- arm_isa@xt_mov(dest, "X4");
+    check: string <- emit_region_bump_check(mov_size);
+    alloc: string <- concat(concat(mov_ref, str_val), mov_dest);
+    concat(check, alloc)
+}
+
+// alloc_ref(region, tuple): reserve a ref cell plus a stable copy of the
+// complete tuple in the region. The ref cell contains the tuple address, so
+// read_ref still uses one load and the temporary tuple stack slab does not escape.
+fn emit_alloc_ref_tuple(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    emit_alloc_rec(term, dest)
+}
+
+fn emit_alloc_ref(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    case memory_type_is_tuple(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name) of {
+        true -> emit_alloc_ref_tuple(term, dest);
+        false -> case alloc_in_frame(term) of {
+            true -> emit_alloc_ref_scalar_frame(dest);
+            false -> emit_alloc_ref_scalar(dest)
+        }
+    }
+}
+
+// read_ref(ref): load value from ref
+// Operands: X1 = ref (pointer)
+fn emit_read_ref(dest: string) -> string {
+    arm_mem@xt_ldr(dest, "[X1]")
+}
+
+fn emit_write_ref_tuple_copy_words(word_index: int64, word_count: int64) -> string {
+    emit_alloc_rec_copy_words(word_index, word_count)
+}
+
+// write_ref(ref, scalar): store value at ref
+// Operands: X1 = ref, X2 = value. Returns unit.
+fn emit_write_ref_scalar(dest: string) -> string {
+    concat(arm_mem@xt_str("X2", "[X1]"), "")
+}
+
+// write_ref(ref, tuple): copy the tuple words into the region-owned payload
+// already referenced by the cell. This keeps read_ref's one-load representation
+// and avoids publishing a transient stack tuple pointer.
+fn emit_write_ref_tuple(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    tuple_count: int64 <- memory_tuple_word_count(sir_term_at(term, sir_term_root_node(term).right_expr));
+    tuple_bytes: int64 <- prims_tuple@flat_alloc_size(tuple_count);
+    payload: string <- arm_mem@xt_ldr("X6", "[X1]");
+    copy: string <- emit_write_ref_tuple_copy_words(0, tuple_bytes / 8);
+    concat(payload, copy)
+}
+
+fn emit_write_ref(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    case memory_value_is_tuple_like(sir_term_at(term, sir_term_root_node(term).right_expr)) of {
+        true -> emit_write_ref_tuple(term, dest);
+        false -> emit_write_ref_scalar(dest)
+    }
+}
+
+// alloc_buf(region, N): bump-allocate buffer of N elements within region.
+// Operands: X1 = region, X2 = N (element count). Rejects negative N, byte-size overflow, and arena overflow.
+fn elem_size_shift_from_buf_type(buf_type: string) -> int64 {
+    case memory_type_contains(buf_type, "int8") of {
+        true -> 0;
+        false -> case memory_type_contains(buf_type, "uint8") of {
+            true -> 0;
+            false -> case memory_type_contains(buf_type, "int16") of {
+                true -> 1;
+                false -> case memory_type_contains(buf_type, "uint16") of {
+                    true -> 1;
+                    false -> case memory_type_contains(buf_type, "int32") of {
+                        true -> 2;
+                        false -> case memory_type_contains(buf_type, "uint32") of {
+                            true -> 2;
+                            false -> 3
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn elem_size_bytes_from_buf_type(buf_type: string) -> int64 {
+    shift: int64 <- elem_size_shift_from_buf_type(buf_type);
+    case shift of {
+        0 -> 1;
+        1 -> 2;
+        2 -> 4;
+        _: int64 -> 8
+    }
+}
+
+// Layout (spec §12.3.3, §15.4.5.5): one length word, then the elements. The buffer value points at
+// element 0 and the element count sits in the word just below it, so every buf_load / buf_store
+// checks its index against [buf, #-8] in constant time whatever scope the buffer came from (a
+// parameter's type may name its size N by an identifier that is not in scope there). The whole
+// block is rounded up to 8 bytes so the next allocation in the region stays word-aligned.
+fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    elem_bytes: int64 <- elem_size_bytes_from_buf_type(sir_term_root_node(term).type_name);
+    eb: string <- int64_to_str(elem_bytes);
+    neg_check: string <- emit_abort_when("LT", "X2", "#0", "silica_rt_buf_invalid_failed");
+    mov_elem: string <- arm_isa@xt_mov("X8", concat("#", eb));
+    mul_bytes: string <- arm_isa@xt_mul("X7", "X2", "X8");
+    mul_ov: string <- concat(arm_isa@xt_sdiv("X9", "X7", "X8"), emit_abort_when("NE", "X9", "X2", "silica_rt_buf_invalid_failed"));
+    // X7 = element bytes + 8 (the length word), rounded up to a multiple of 8: the request the
+    // reservation takes.
+    with_len: string <- concat(arm_isa@xt_add("X7", "X7", "#15"), concat(arm_isa@xt_lsr("X7", "X7", "#3"), arm_isa@xt_lsl("X7", "X7", "#3")));
+    mov_buf: string <- arm_isa@xt_mov("X4", "X3");
+    store_len: string <- concat(arm_mem@xt_str("X2", "[X4]"), arm_isa@xt_add("X4", "X4", "#8"));
+    mov_dest: string <- arm_isa@xt_mov(dest, "X4");
+    size_calc1: string <- concat(neg_check, mov_elem);
+    size_calc: string <- concat(size_calc1, concat(mul_bytes, concat(mul_ov, with_len)));
+    case alloc_in_frame(term) of {
+        // A frame buffer: X7 bytes (length word included) rounded to 16, the elements zeroed.
+        true -> {
+            frame_alloc: string <- concat(arm_isa@xt_add("X16", "X7", "#15"), concat(arm_isa@xt_and("X16", "X16", "#-16"), concat(arm_frame@dyn_alloc_asm("X16", "X4"), concat(arm_mem@xt_str("X2", "[X4]"), arm_isa@xt_add("X4", "X4", "#8")))));
+            zero: string <- concat(arm_isa@xt_sub("X8", "X7", "#8"), concat(arm_isa@xt_mov("X9", "X4"), concat("1:\n", concat(arm_isa@xt_cbz("X8", "2f"), concat(arm_mem@xt_str("XZR", "[X9], #8"), concat(arm_isa@xt_sub("X8", "X8", "#8"), concat(arm_isa@xt_b("1b"), "2:\n")))))));
+            concat(size_calc, concat(frame_alloc, concat(zero, mov_dest)))
+        };
+        false -> {
+            check: string <- emit_region_bump_check(size_calc);
+            alloc: string <- concat(concat(mov_buf, store_len), mov_dest);
+            concat(check, alloc)
+        }
+    }
+}
+
+// alloc_buf_retained(n) (chunk 15 phase 7, the pin rule of Lee 2026-11-01; design §7): a uint8 buffer
+// for a foreign parameter the sidecar declares `retains`; a node of the dangerous actor's STATE, so its
+// address is stable for the actor's life. On this target the state is a chain of heap chunks disjoint
+// from every frame (design §2.6), so the node is taken from the state chain at once
+// (rt_state.S silica_rt_state_retain_node: X0 = n -> X0 = the element pointer, the count at [buf, #-8]
+// and the bytes zeroed; 0 when there is no current actor), with no pending list: the dispatch end sees
+// it as an old node and keeps it. Operands as alloc_buf's region-less form: X1 = the lifetime witness
+// (unused), X2 = n. A 0 answer ends the actor through silica_rt_region_alloc_failed.
+fn emit_alloc_buf_retained(dest: string) -> string {
+    neg_check: string <- emit_abort_when("LT", "X2", "#0", "silica_rt_buf_invalid_failed");
+    call: string <- concat(arm_isa@xt_mov("X0", "X2"), arm_isa@xt_call("silica_rt_state_retain_node"));
+    fail: string <- concat(arm_isa@xt_cbnz("X0", "1f"), concat(arm_isa@xt_call("silica_rt_region_alloc_failed"), "1:\n"));
+    concat(neg_check, concat(call, concat(fail, arm_isa@xt_mov(dest, "X0"))))
+}
+
+// Abort through the runtime when `cond` holds for a, b: a short branch over a BL into the abort
+// entry, both inside the function's own section. The old shape, `bnez a8, L_buf_invalid` to one
+// stub emitted after the last function, stopped assembling once every function got its own
+// .text.<name> section (control.silica function_prologue): an Xtensa conditional branch reaches
+// +-2 KB (BNEZ) or +-128 B (two-register forms) and carries no relocation, so the assembler cannot
+// resolve one into another section ("jump target out of range; no usable trampoline found"). CALL8
+// is relocated (and -mlongcalls covers any distance), and `1f` binds to the `1:` emitted right behind
+// the call, so no label leaves the section. The abort entry reads its a0 for the banner, so the
+// report names the function that failed rather than a shared stub.
+fn emit_abort_when(cond: string, a: string, b: string, abort_entry: string) -> string {
+    concat(arm_isa@xt_cmp_flag(cond, a, b), concat("    cmp r10, #0\n    beq.w 1f\n", concat(arm_isa@xt_call(abort_entry), "1:\n")))
+}
+
+fn int64_to_str(n: int64) -> string {
+    case n of {
+        0 -> "0";
+        1 -> "1";
+        2 -> "2";
+        3 -> "3";
+        4 -> "4";
+        8 -> "8";
+        _: int64 -> "8"
+    }
+}
+
+// Bounds check before every buf_load / buf_store (spec §12.3.3): X1 = buffer, X2 = index. The
+// element count is the word below element 0 (emit_alloc_buf). One unsigned compare rejects both an
+// index at or past the length and a negative index. X17 is scratch here: nothing is live in it
+// across a buffer access. The abort is inline (emit_abort_when), never a branch out of the section.
+fn emit_buf_bounds_check(_term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, _outer_reg: string, _label_sfx: string) -> string {
+    concat(arm_mem@xt_ldr("X17", "[X1, #-8]"), emit_abort_when("HS", "X2", "X17", "silica_rt_buf_bounds_failed"))
+}
+
+fn memory_type_contains_from(h: string, needle: string, i: int64) -> boolean {
+    case length_bytes(needle) == 0 of {
+        true -> true;
+        false -> case i + length_bytes(needle) > length_bytes(h) of {
+            true -> false;
+            false -> case substring(h, i, i + length_bytes(needle)) == needle of {
+                true -> true;
+                false -> memory_type_contains_from(h, needle, i + 1)
+            }
+        }
+    }
+}
+
+fn w_reg_from_gpr(reg: string) -> string {
+    case length_bytes(reg) > 0 of {
+        true -> case substring(reg, 0, 1) == "X" of {
+            true -> concat("W", substring(reg, 1, length_bytes(reg)));
+            false -> reg
+        };
+        false -> reg
+    }
+}
+
+// buf_load(buf, index): load from buf[index] after optional bounds check in caller wrapper.
+fn emit_buf_load(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    wd: string <- w_reg_from_gpr(dest);
+    case sir_term_root_node(term).type_name of {
+        "int8" -> arm_mem@xt_ldrsb(wd, "[X1, X2]");
+        "uint8" -> arm_mem@xt_ldrb(wd, "[X1, X2]");
+        "int16" -> arm_mem@xt_ldrsh(wd, "[X1, X2, LSL #1]");
+        "uint16" -> arm_mem@xt_ldrh(wd, "[X1, X2, LSL #1]");
+        "int32" -> arm_mem@xt_ldr(wd, "[X1, X2, LSL #2]");
+        "uint32" -> arm_mem@xt_ldr(wd, "[X1, X2, LSL #2]");
+        _: string -> arm_mem@xt_ldr(dest, "[X1, X2, LSL #3]")
+    }
+}
+
+fn buf_store_value_type(tuple_type: string) -> string {
+    case memory_type_contains(tuple_type, "int8") of {
+        true -> "int8";
+        false -> case memory_type_contains(tuple_type, "uint8") of {
+            true -> "uint8";
+            false -> case memory_type_contains(tuple_type, "int16") of {
+                true -> "int16";
+                false -> case memory_type_contains(tuple_type, "uint16") of {
+                    true -> "uint16";
+                    false -> case memory_type_contains(tuple_type, "int32") of {
+                        true -> "int32";
+                        false -> case memory_type_contains(tuple_type, "uint32") of {
+                            true -> "uint32";
+                            false -> "int64"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// buf_store(buf, index, value): store value at buf[index]
+// Operands: X1 = buf, X2 = pointer to tuple(index, value) from tuple_make.
+fn emit_buf_store(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, outer_reg: string) -> string {
+    value_type: string <- buf_store_value_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name);
+    ldr_val: string <- case value_type of {
+        "int8" -> arm_mem@xt_ldrsb("W3", "[X2, #8]");
+        "uint8" -> arm_mem@xt_ldrb("W3", "[X2, #8]");
+        "int16" -> arm_mem@xt_ldrsh("W3", "[X2, #8]");
+        "uint16" -> arm_mem@xt_ldrh("W3", "[X2, #8]");
+        "int32" -> arm_mem@xt_ldr("W3", "[X2, #8]");
+        "uint32" -> arm_mem@xt_ldr("W3", "[X2, #8]");
+        _: string -> arm_mem@xt_ldr("X3", "[X2, #8]")
+    };
+    ldr_idx: string <- arm_mem@xt_ldr("X2", "[X2]");
+    bounds: string <- emit_buf_bounds_check(term, outer_reg, dest);
+    str_asm: string <- case value_type of {
+        "int8" -> arm_mem@xt_strb("W3", "[X1, X2]");
+        "uint8" -> arm_mem@xt_strb("W3", "[X1, X2]");
+        "int16" -> arm_mem@xt_strh("W3", "[X1, X2, LSL #1]");
+        "uint16" -> arm_mem@xt_strh("W3", "[X1, X2, LSL #1]");
+        "int32" -> arm_mem@xt_str("W3", "[X1, X2, LSL #2]");
+        "uint32" -> arm_mem@xt_str("W3", "[X1, X2, LSL #2]");
+        _: string -> arm_mem@xt_str("X3", "[X1, X2, LSL #3]")
+    };
+    concat(concat(concat(ldr_val, ldr_idx), bounds), str_asm)
+}
+
+// fresh_lifetime(): returns unique lifetime value. No args.
+// Stack-based: use SP as unique identifier (each call has distinct SP).
+fn emit_fresh_lifetime(dest: string) -> string {
+    arm_isa@xt_mov(dest, "SP")
+}
+
+fn emit_alloc_rec_copy_words(word_index: int64, word_count: int64) -> string {
+    case word_index >= word_count of {
+        true -> "";
+        false -> {
+            offset: string <- atom_table@int64_to_decimal_string(word_index * 8);
+            load: string <- arm_mem@xt_ldr("X7", concat("[X2, #", concat(offset, "]")));
+            store: string <- arm_mem@xt_str("X7", concat("[X6, #", concat(offset, "]")));
+            concat(concat(load, store), emit_alloc_rec_copy_words(word_index + 1, word_count))
+        }
+    }
+}
+
+// alloc_rec(region, tuple_value): reserve one ref cell plus a stable copy of the
+// complete tuple. The ref cell contains the tuple address, so read_ref retains the same one-load
+// representation as alloc_ref. tuple_value is a temporary stack slab and must never escape directly.
+fn emit_alloc_rec(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    case alloc_in_frame(term) of {
+        true -> emit_alloc_rec_frame(term, dest);
+        false -> emit_alloc_rec_region(term, dest)
+    }
+}
+
+// alloc_rec in a frame: one block of 8 + payload bytes, rounded to 16; the cell word at +0 points at
+// the payload copy at +8 (the layout the copier and the evacuation read as kind 3). The words come
+// from the value itself when it is a tuple literal (memory_tuple_word_count), as for write_ref.
+fn emit_alloc_rec_frame(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    tuple_count: int64 <- memory_tuple_word_count(sir_term_at(term, sir_term_root_node(term).right_expr));
+    tuple_bytes: int64 <- prims_tuple@flat_alloc_size(tuple_count);
+    n16: int64 <- (tuple_bytes + 8 + 15) / 16 * 16;
+    alloc: string <- arm_frame@dyn_alloc_asm(concat("#", atom_table@int64_to_decimal_string(n16)), "X4");
+    payload: string <- concat(arm_isa@xt_add("X6", "X4", "#8"), arm_mem@xt_str("X6", "[X4]"));
+    copy: string <- emit_alloc_rec_copy_words(0, tuple_bytes / 8);
+    concat(concat(concat(alloc, payload), copy), arm_isa@xt_mov(dest, "X4"))
+}
+
+fn emit_alloc_rec_region(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    tuple_count: int64 <- memory_tuple_word_count(sir_term_at(term, sir_term_root_node(term).right_expr));
+    tuple_bytes: int64 <- prims_tuple@flat_alloc_size(tuple_count);
+    allocation_bytes: int64 <- tuple_bytes + 8;
+    allocation_text: string <- atom_table@int64_to_decimal_string(allocation_bytes);
+    mov_size: string <- arm_isa@xt_mov("X7", concat("#", allocation_text));
+    bounds: string <- emit_region_bump_check(mov_size);
+    retain_ref: string <- arm_isa@xt_mov("X4", "X3");
+    payload: string <- concat(arm_isa@xt_add("X6", "X3", "#8"), arm_mem@xt_str("X6", "[X4]"));
+    copy: string <- emit_alloc_rec_copy_words(0, tuple_bytes / 8);
+    mov_dest: string <- arm_isa@xt_mov(dest, "X4");
+    concat(concat(concat(concat(bounds, retain_ref), payload), copy), mov_dest)
+}
+
+// A buffer access aborts inline (emit_buf_bounds_check), so reading a buffer the module was passed
+// counts as region use for the same reason an allocation does: the gates below report it.
+fn is_buf_access_prim(name: string) -> boolean {
+    name == "buf_load" or name == "read_buf" or name == "buf_store" or name == "write_buf"
+}
+
+// Descends into the children of every kind rather than a list of the kinds that were expected to
+// have any. It used to name kinds 2..6 and so never looked inside a case branch (kinds 7 and 8): a
+// program whose only allocation sat in a case arm reported no region use, the helpers were left
+// out, and the module failed to assemble on an undefined L_region_grow.
+// See trials/codegen_regressions/region_grow.silica.
+fn term_has_region_allocation(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> case sir_term_root_node(term).kind == 6 and (sir_term_root_node(term).name == "alloc_ref" or sir_term_root_node(term).name == "alloc_buf" or sir_term_root_node(term).name == "alloc_buf_retained" or sir_term_root_node(term).name == "alloc_rec" or is_buf_access_prim(sir_term_root_node(term).name)) of {
+            true -> true;
+            false -> case term_has_region_allocation(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_region_allocation(sir_term_at(term, sir_term_root_node(term).right_expr))
+            }
+        }
+    }
+}
+
+fn region_allocation_in_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> boolean {
+    case fns.is_nil of {
+        true -> false;
+        false -> case term_has_region_allocation(fns.head.body) of {
+            true -> true;
+            false -> region_allocation_in_functions(fns.tail)
+        }
+    }
+}
+
+fn module_uses_region_allocation(sir_module: { module_name: string, used_modules: List[string, mem(normal)], exports: List[{ fn_name: string, arity: string }, mem(normal)], export_trait_names: List[string, mem(normal)], marker_impl_types: List[string, mem(normal)], supervisor_impl_types: List[string, mem(normal)], supervisor_phase_e: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], failure_reporter_impl_types: List[string, mem(normal)], required_method_sigs: List[{ name: string, param_names: string, param_types: string, return_type: string, effects: string }, mem(normal)], runtime_dependencies: List[string, mem(normal)], is_dangerous_module: boolean, wrapper_meta_paths: List[string, mem(normal)], foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], link_libraries: List[string, mem(normal)], functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] }) -> boolean {
+    region_allocation_in_functions(sir_module.functions)
+}
+
+// True when some function has an alloc_region prim (kept for emitter_core's module gates).
+fn term_has_alloc_region(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term.root < 0 of {
+        true -> false;
+        false -> case sir_term_root_node(term).kind == 6 and sir_term_root_node(term).name == "alloc_region" of {
+            true -> true;
+            false -> case term_has_alloc_region(sir_term_at(term, sir_term_root_node(term).inner)) of {
+                true -> true;
+                false -> term_has_alloc_region(sir_term_at(term, sir_term_root_node(term).right_expr))
+            }
+        }
+    }
+}
+
+fn alloc_region_in_functions(fns: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)]) -> boolean {
+    case fns.is_nil of {
+        true -> false;
+        false -> case term_has_alloc_region(fns.head.body) of {
+            true -> true;
+            false -> alloc_region_in_functions(fns.tail)
+        }
+    }
+}
+
+fn module_uses_alloc_region(sir_module: { module_name: string, used_modules: List[string, mem(normal)], exports: List[{ fn_name: string, arity: string }, mem(normal)], export_trait_names: List[string, mem(normal)], marker_impl_types: List[string, mem(normal)], supervisor_impl_types: List[string, mem(normal)], supervisor_phase_e: List[{ actor_type: string, init_return_sir: string, init_return_type_name: string }, mem(normal)], failure_reporter_impl_types: List[string, mem(normal)], required_method_sigs: List[{ name: string, param_names: string, param_types: string, return_type: string, effects: string }, mem(normal)], runtime_dependencies: List[string, mem(normal)], is_dangerous_module: boolean, wrapper_meta_paths: List[string, mem(normal)], foreign_bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], link_libraries: List[string, mem(normal)], functions: List[{ name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, mem(normal)] }) -> boolean {
+    alloc_region_in_functions(sir_module.functions)
+}
+
+// Region release, growth and containment were board runtime routines (rt_heap.S); growth and release
+// are gone with the heap path (chunk 15), containment stays for the atomic and device blocks. The
+// aborts a buffer sequence can raise are CALL8s into board/runtime/rt_console.S placed at the failing
+// site by emit_abort_when, so nothing is emitted per module here.
+fn emit_region_helpers() -> string {
+    ""
+}
+
+// The frame allocation, adoption and evacuation routines are board runtime code on this target
+// (board/runtime/rt_frame.S: silica_rt_dyn_alloc, silica_rt_adopt, silica_rt_ev_frame; shared/xt_frame
+// emits the calls), not text pasted into each module as on the hosted targets. The functions stay so
+// emitter_core's module assembly is the same shape.
+fn emit_frame_helpers() -> string {
+    ""
+}
+
+fn emit_evacuation_helper() -> string {
+    ""
+}
+
+fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    case sir_term_root_node(term).name of {
+        "alloc_region" -> case alloc_in_frame(term) of {
+            // The lifetime witness (design §3.2): the allocating frame's X29, never dereferenced.
+            true -> arm_isa@xt_mov(dest, "X29");
+            false -> emit_alloc_region(dest)
+        };
+        "alloc_ref" -> emit_alloc_ref(term, dest);
+        "alloc_rec" -> emit_alloc_rec(term, dest);
+        "read_ref" -> emit_read_ref(dest);
+        "write_ref" -> emit_write_ref(term, dest);
+        "alloc_buf" -> emit_alloc_buf(term, dest);
+        "alloc_buf_retained" -> emit_alloc_buf_retained(dest);
+        "buf_load" -> emit_buf_load(term, dest);
+        "buf_store" -> emit_buf_store(term, dest, "");
+        "read_buf" -> emit_buf_load(term, dest);
+        "write_buf" -> emit_buf_store(term, dest, "");
+        "fresh_lifetime" -> emit_fresh_lifetime(dest);
+        "ref_eq" -> emit_ref_eq(dest);
+        "retire" -> emit_retire(term);
+        _: string -> concat(".error \"unsupported memory prim: ", concat(sir_term_root_node(term).name, "\"\n"))
+    }
+}
+
+// retire(r) (chunk 15 phase 3c, chunk15_stack_memory_design.md §4.2): X1 = the ref. The node's size is
+// static, the state copier's (rt_state.S): a one-word cell is 8 bytes, an alloc_rec cell is its payload
+// tuple rounded to 16 plus the 8-byte cell word, which is what the free list of that size handed out
+// or will hand out. The runtime logs the node only during a proven dispatch and only when it lies in
+// the state chain. Result unit: nothing is written to the destination.
+fn retire_node_bytes(ref_type: string) -> int64 {
+    open: int64 <- memory_find_from(ref_type, "(", 0);
+    case open < 0 of {
+        true -> 8;
+        false -> {
+            elem: string <- memory_trim_spaces(prims_tuple@tuple_type_nth_element(substring(ref_type, open, length_bytes(ref_type)), 2));
+            case length_bytes(elem) > 0 and substring(elem, 0, 1) == "(" of {
+                true -> ((prims_tuple@count_type_elements(elem) * 8 + 15) / 16) * 16 + 8;
+                false -> 8
+            }
+        }
+    }
+}
+
+fn memory_find_from(s: string, ch: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> -1;
+        false -> case substring(s, i, i + 1) == ch of {
+            true -> i;
+            false -> memory_find_from(s, ch, i + 1)
+        }
+    }
+}
+
+fn memory_trim_spaces(s: string) -> string {
+    case length_bytes(s) > 0 and substring(s, 0, 1) == " " of {
+        true -> memory_trim_spaces(substring(s, 1, length_bytes(s)));
+        false -> case length_bytes(s) > 0 and substring(s, length_bytes(s) - 1, length_bytes(s)) == " " of {
+            true -> memory_trim_spaces(substring(s, 0, length_bytes(s) - 1));
+            false -> s
+        }
+    }
+}
+
+fn emit_retire(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+    n: int64 <- retire_node_bytes(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name);
+    concat(arm_isa@xt_mov("X0", "X1"), concat(arm_isa@xt_movi("X1", n), arm_isa@xt_call("silica_rt_state_retire")))
+}

@@ -69,6 +69,12 @@ def make_probe(path):
     return ty
 
 
+import platform as _platform
+# The target key a host run names its outputs after: macos_applesilicon, linux_aarch64, linux_x86_64.
+HOST_SOUT_TARGET = ('macos_applesilicon' if _platform.system() == 'Darwin'
+                    else 'linux_' + ('aarch64' if _platform.machine() in ('aarch64', 'arm64') else 'x86_64'))
+
+
 def parse_sout(sout_path):
     raw = open(sout_path, encoding='utf-8', errors='surrogateescape').read()
     lines = raw.rstrip('\n').split('\n')
@@ -115,8 +121,9 @@ def main():
         base = path[:-len('.silica')]
         key = os.path.relpath(path, mirror)
         rec = {'ret_type': ty, 'value': None, 'status': None, 'baseline_ok': False}
-        if os.path.exists(base + '.sout'):
-            p = parse_sout(base + '.sout')
+        sout = base + '.' + HOST_SOUT_TARGET + '.sout'   # the host run's own name (trials/targets/README.md)
+        if os.path.exists(sout):
+            p = parse_sout(sout)
             if p:
                 original, value, status = p
                 rec['value'] = value
