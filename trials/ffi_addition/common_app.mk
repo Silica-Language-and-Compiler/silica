@@ -5,12 +5,20 @@
 #   APP_LINK_OBJECTS - optional extra .o files to link with each executable (e.g. stub modules)
 APP_LINK_OBJECTS ?=
 
-FFI_TRIAL_DIR := $(abspath $(APP_TRIAL_DIR)/..)
+# The suite directory that holds the fixtures and the run helpers: ffi_addition for the apps that
+# live beside this file; an app in another suite (transport_addition/app_transport_tcp_listener)
+# sets FFI_TRIAL_DIR to ffi_addition before including, and APP_EXPOSURE_LINK to the relative path
+# from its own directory to the platform's dangerous_exposure_source view.
+FFI_TRIAL_DIR ?= $(abspath $(APP_TRIAL_DIR)/..)
 include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))../silica_compiler.mk
 FIXTURES_DIR := $(FFI_TRIAL_DIR)/fixtures
 SILICA_LINK_SH := $(abspath $(FFI_TRIAL_DIR)/../silica_link.sh)
 
 include $(FFI_TRIAL_DIR)/fixtures.mk
+
+# Relative when the view sits beside the app (every app under ffi_addition/), so a tree synced to
+# another host does not carry a link into this host's absolute path.
+APP_EXPOSURE_LINK ?= $(patsubst $(abspath $(APP_TRIAL_DIR)/..)/%,../%,$(FFI_SOURCE_VIEW))
 
 .PHONY: fixtures
 fixtures: ffi-wrapper-archives
@@ -31,9 +39,7 @@ define APP_INTEGRATE_BODY
 	@# -n as well as -f: without it, BSD ln follows an existing symlink-to-directory and
 	@# writes the new link INSIDE the fixtures directory, which corrupts the fixtures for
 	@# every other app in the suite.
-	@# Relative when the view sits beside the app (every app under ffi_addition/), so a tree
-	@# synced to another host does not carry a link into this host's absolute path.
-	@ln -sfn "$(patsubst $(abspath $(APP_TRIAL_DIR)/..)/%,../%,$(FFI_SOURCE_VIEW))" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
+	@ln -sfn "$(APP_EXPOSURE_LINK)" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
 	@test -f "$(FFI_LEGACY_ARCHIVE)" || { echo "  ❌ $(APP_LABEL): missing $(FFI_LEGACY_ARCHIVE) (run make fixtures)"; exit 1; }
 	@for ar in $(FFI_WRAPPER_ARCHIVES); do \
 		test -f "$$ar" || { echo "  ❌ $(APP_LABEL): missing wrapper archive $$ar (run make fixtures)"; exit 1; }; \

@@ -1,6 +1,8 @@
 // A (:tcp) loopback: a listening carrier and a connecting carrier in one program, the owners speaking
-// the carrier contract (design §6.2) with length-prefixed ETF frames (§5, §4.7). The client sends
-// (:ping, 7); the server decodes it, prints it and answers (:pong, 8); the client prints that and ends.
+// the carrier contract (design §6.2) with length-prefixed ETF frames (§5, §4.7). The listener hands
+// the accepted peer to a connection carrier of its own (:accepted); the server opens it through a
+// session actor. The client sends (:ping, 7); the session decodes it, prints it and answers
+// (:pong, 8); the client prints that and ends.
 module dangerous_tcp_loopback;
 
 use wire_etf;
@@ -20,7 +22,7 @@ fn first_segment(xs: List[string, mem(normal)]) -> string {
 fn send_term(car: dangerous_actor_ref, v: (:ping, int64) | (:pong, int64)) -> boolean {
     sequence proc[mem(normal), concurrency]
         frame: string <- encode((:etf), v);
-        segs: List[string, mem(normal)] <- wireframe@frame(frame, carrier@mtu(:tcp), carrier@boundaries(:tcp));
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, carrier@mtu((:tcp)), carrier@boundaries((:tcp)));
         seg: string <- first_segment(segs);
         sent: boolean <- cast(car, (:tx, seg, self()) impl ActorMessage {})
     produces
@@ -51,9 +53,9 @@ fn show_term(v: (:ping, int64) | (:pong, int64)) -> atom {
     end
 }
 
-// The server's owner: on :link_up it starts the client side on the port the listener was given;
-// each received frame is decoded, shown and answered with (:pong, 8).
-fn server(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+// The listener's owner: on :link_up it starts the client side on the port the listener was given;
+// each accepted connection gets a session actor, which opens it.
+fn server(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
           state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, credits: int64 })
     -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, credits: int64 }) {
     case msg of {
@@ -62,20 +64,46 @@ fn server(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_f
             true -> {
                 sequence proc[concurrency]
                     cli_link: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-                    cli: actor_ref <- spawn({ car: cli_link, rx: wireframe@fresh(:stream), credits: 0 }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    cli: actor_ref <- spawn({ car: cli_link, rx: wireframe@fresh(carrier@boundaries((:tcp))), credits: 0 }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                     _: boolean <- cast(cli_link, (:open, cli, concat("127.0.0.1:", substring(info, 5, length_bytes(info)))) impl ActorMessage {})
                 produces
                     pure (:no_reply, state)
                 end
             };
-            // a peer was accepted: receive against credit
-            false -> {
-                sequence proc[concurrency]
-                    _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {})
-                produces
-                    pure (:no_reply, state)
-                end
-            }
+            false -> (:no_reply, state)
+        };
+        // a peer was accepted into a connection carrier of its own: a session owns it
+        (:accepted, conn: dangerous_actor_ref, _info: string) -> {
+            sequence proc[concurrency]
+                ses: actor_ref <- spawn({ car: conn, rx: wireframe@fresh(carrier@boundaries((:tcp))), credits: 0 }, session, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(conn, (:open, ses, "") impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:tx_credit, n: int64) -> (:no_reply, { car: state.car, rx: state.rx, credits: state.credits + n });
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_failed, why3: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print_atom(why3)
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, _why4: atom) -> (:no_reply, state)
+    }
+}
+
+// The accepted connection's owner: opens it with receive credit; each received frame is decoded,
+// shown and answered with (:pong, 8).
+fn session(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+           state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, credits: int64 })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, credits: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
         };
         (:tx_credit, n: int64) -> (:no_reply, { car: state.car, rx: state.rx, credits: state.credits + n });
         (:rx, segment: string) -> {
@@ -169,7 +197,7 @@ fn main() -> int64 {
         _: boolean <- trial_wait_int64@run(fn() -> int64 {
             sequence proc[concurrency]
                 srv_link: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-                srv: actor_ref <- spawn({ car: srv_link, rx: wireframe@fresh(:stream), credits: 0 }, server, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                srv: actor_ref <- spawn({ car: srv_link, rx: wireframe@fresh(carrier@boundaries((:tcp))), credits: 0 }, server, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                 _: boolean <- cast(srv_link, (:open, srv, "listen:0") impl ActorMessage {})
             produces
                 pure 0

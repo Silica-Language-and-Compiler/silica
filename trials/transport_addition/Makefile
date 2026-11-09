@@ -1,5 +1,7 @@
-# Makefile for the transport trials (transport_serialization_design.md): wire protocols and the
-# transport builtins. The built-in wire_etf module is linked into .trial_stdlib/ as Supervisor is.
+# Makefile for the transport trials (transport_serialization_design.md): wire protocols, the
+# transport builtins, the carrier properties and framing. The built-in modules the trials use
+# (STDLIB_MODS) are linked into .trial_stdlib/ as Supervisor is. The TCP listener trial, which
+# links the socket wrappers, is the sub-trial app_transport_tcp_listener (SUB_TRIALS).
 # Uses silica-compiler (Phase 2) to generate assembly, then assembles and links
 # No Rust code - only silica-compiler + assembler + linker
 #
@@ -29,6 +31,11 @@ LDFLAGS_clang := -Wl,-e,main -Wl,-macos_version_min,$(MACOS_MIN_VERSION)
 TRIAL_DIR := $(notdir $(patsubst %/,%,$(THIS_DIR)))
 MSG_PREFIX := $(TRIAL_DIR)/
 
+# The language's built-in modules (compiler/stdlib) the flat trials here link.
+STDLIB_MODS := wire_etf wireframe carrier
+# Sub-trials with a Makefile of their own, run after the flat trials and counted with them.
+SUB_TRIALS := app_transport_tcp_listener
+
 
 .DEFAULT_GOAL := all
 .PHONY: all clean assembly objects executables integrate help silica.config
@@ -37,7 +44,7 @@ all: executables
 
 # Stage 1: Rebuild silica.config (all *.silica under this directory, relative paths)
 silica.config:
-	@cd "$(THIS_DIR)" && find "$$PWD" -maxdepth 1 -type f -name '*.silica' | LC_ALL=C sort | sed "s|^$$PWD/||" > silica.config && $(TRIAL_SUPPORT_CONFIG) && mkdir -p .trial_stdlib && ln -sfn ../../../compiler/stdlib/wire_etf.silica .trial_stdlib/wire_etf.silica && echo .trial_stdlib/wire_etf.silica >> silica.config
+	@cd "$(THIS_DIR)" && find "$$PWD" -maxdepth 1 -type f -name '*.silica' | LC_ALL=C sort | sed "s|^$$PWD/||" > silica.config && $(TRIAL_SUPPORT_CONFIG) && mkdir -p .trial_stdlib && for m in $(STDLIB_MODS); do ln -sfn ../../../compiler/stdlib/$$m.silica .trial_stdlib/$$m.silica && echo .trial_stdlib/$$m.silica >> silica.config; done
 
 # Stage 2: silica-compiler generates .sams (reads silica.config)
 assembly: clean silica.config
@@ -58,7 +65,7 @@ objects: assembly
 # Stage 4: Link .o -> executable (rust-lld or clang)
 executables: objects
 	@$(TRIAL_SUPPORT_ASSEMBLE); \
-	[ -f .trial_stdlib/wire_etf.sams ] && { $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler .trial_stdlib/wire_etf.sams -o .trial_stdlib/wire_etf.o || echo "❌❌ assembling wire_etf failed"; }; \
+	for m in $(STDLIB_MODS); do [ -f .trial_stdlib/$$m.sams ] && { $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler .trial_stdlib/$$m.sams -o .trial_stdlib/$$m.o || echo "❌❌ assembling $$m failed"; }; done; \
 	for o in *.o; do \
 	[ -f "$$o" ] || continue; \
 	base=$${o%.o}; \
@@ -66,7 +73,7 @@ executables: objects
 runtime_obj=""; \
 [ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
 runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
-	[ -f ".trial_stdlib/wire_etf.o" ] && runtime_obj="$$runtime_obj .trial_stdlib/wire_etf.o"; \
+	for m in $(STDLIB_MODS); do [ -f ".trial_stdlib/$$m.o" ] && runtime_obj="$$runtime_obj .trial_stdlib/$$m.o"; done; \
 	if test -x "$(RUST_LLD)"; then \
 		$(RUST_LLD) -flavor darwin -o $$base $$o $$runtime_obj $(LDFLAGS_rust-lld) && echo "  ✅ $(MSG_PREFIX)$$base (rust-lld)"; \
 	else \
@@ -125,7 +132,7 @@ integrate-run:
 	fi; \
 	done; \
 	$(TRIAL_SUPPORT_ASSEMBLE); \
-	[ -f .trial_stdlib/wire_etf.sams ] && { $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler .trial_stdlib/wire_etf.sams -o .trial_stdlib/wire_etf.o || echo "❌❌ assembling wire_etf failed"; }; \
+	for m in $(STDLIB_MODS); do [ -f .trial_stdlib/$$m.sams ] && { $(ASSEMBLER) $(ASFLAGS_macos) -c -x assembler .trial_stdlib/$$m.sams -o .trial_stdlib/$$m.o || echo "❌❌ assembling $$m failed"; }; done; \
 	for o in *.o; do \
 		[ -f "$$o" ] || continue; \
 		base=$${o%.o}; \
@@ -133,7 +140,7 @@ integrate-run:
 	runtime_obj=""; \
 	[ -f "__silica_runtime.o" ] && runtime_obj="__silica_runtime.o"; \
 	runtime_obj="$$runtime_obj $(call TRIAL_SUPPORT_OBJ,$$base.silica)"; \
-	[ -f ".trial_stdlib/wire_etf.o" ] && runtime_obj="$$runtime_obj .trial_stdlib/wire_etf.o"; \
+	for m in $(STDLIB_MODS); do [ -f ".trial_stdlib/$$m.o" ] && runtime_obj="$$runtime_obj .trial_stdlib/$$m.o"; done; \
 		echo "Linking $$base..."; \
 		if test -x "$(RUST_LLD)"; then \
 			if ! $(RUST_LLD) -flavor darwin -o $$base $$o $$runtime_obj $(LDFLAGS_rust-lld); then \
@@ -185,15 +192,16 @@ integrate-run:
 		fi; \
 	done; \
 	[ "$$failed" -ne 0 ] && [ "$$ko" -eq 0 ] && ko=$$((ko + 1)); \
-	if [ -d "$(THIS_DIR)app_wide_atom" ] && [ -f "$(THIS_DIR)app_wide_atom/Makefile" ]; then \
-		if $(MAKE) -C "$(THIS_DIR)app_wide_atom" integrate; then :; else failed=1; fi; \
-		sf="$(THIS_DIR)app_wide_atom/.integrate_counts"; \
+	for sub in $(SUB_TRIALS); do \
+		[ -f "$(THIS_DIR)$$sub/Makefile" ] || continue; \
+		if $(MAKE) -C "$(THIS_DIR)$$sub" integrate; then :; else failed=1; fi; \
+		sf="$(THIS_DIR)$$sub/.integrate_counts"; \
 		if [ -f "$$sf" ]; then \
 			read sub_ok sub_ko < "$$sf" || true; \
 			ok=$$((ok + $${sub_ok:-0})); \
 			ko=$$((ko + $${sub_ko:-0})); \
 		fi; \
-	fi; \
+	done; \
 	printf '%d %d\n' "$$ok" "$$ko" > .integrate_counts; \
 	exit $$failed
 
@@ -204,6 +212,7 @@ clean:
 	done
 	rm -f *.sams *.o *.iface silica.config silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts
 	rm -rf .trial_stdlib
+	@for sub in $(SUB_TRIALS); do [ -f "$(THIS_DIR)$$sub/Makefile" ] && $(MAKE) --no-print-directory -C "$(THIS_DIR)$$sub" clean; done; true
 	@echo "✅ $(MSG_PREFIX)Clean complete"
 
 help:
@@ -220,7 +229,7 @@ help:
 	@echo "  clean       - Remove .sams, .o, executables"
 	@echo "  help        - Show this help"
 	@echo ""
-	@echo "Config: silica.config — top-level *.silica in this folder (subtrial app_wide_atom has its own config)"
+	@echo "Config: silica.config — top-level *.silica in this folder (each SUB_TRIALS directory has its own)"
 	@echo "Linker: $(LINKER)"
 
 # Under -j, `clean` and `silica.config` must not run side by side (clean deletes the config).
