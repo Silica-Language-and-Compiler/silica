@@ -95,6 +95,8 @@ ee-units: $(CUR_FAILS) $(SUB_TARGETS)
 	$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$$base.silica); \
 	if grep -q ':etf' "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/wire_etf.silica)" "$$tmpdir/wire_etf.silica" && echo wire_etf.silica >> "$$tmpdir/silica.config"; fi; \
 	for tr in WireFormat Carrier; do if grep -q "use $$tr;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/$$tr.silica)" "$$tmpdir/$$tr.silica" && echo $$tr.silica >> "$$tmpdir/silica.config"; fi; done; \
+	if grep -q "use dangerous_sockets;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../ffi_addition/fixtures/build/apple_silicon_mac/dangerous_exposure_source/sockets)" "$$tmpdir/dangerous_exposure_source/sockets"; fi; \
+	for pair in carrier:Carrier wireframe:wireframe dangerous_sockets:dangerous_sockets dangerous_tcp_carrier:dangerous_tcp_carrier; do m=$${pair%%:*}; f=$${pair##*:}; if grep -q "use $$m;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/$$f.silica)" "$$tmpdir/$$m.silica" && echo $$m.silica >> "$$tmpdir/silica.config"; fi; done; \
 	(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(SILICA_COMPILER)); }) > "$$base.cur_fail" 2>&1 || true; \
 	rm -rf "$$tmpdir"; \
 	if diff -q "$$base.cur_fail" "$$gf" > /dev/null 2>&1; then \
