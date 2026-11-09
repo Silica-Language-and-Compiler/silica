@@ -52,7 +52,7 @@
 #   BOARD_PORT, BOARD_MAC, XTENSA_BIN, ESPTOOL   as for run_on_board.py and build_image.sh
 #
 # The board is used under the same lock as the board trial runs (trials/.board.lock, flock), and
-# the script refuses to start while a board trial run holds trials/.integrate.lock.
+# the script refuses to start while a board trial run holds trials/.integrate.lock.ESP32-S3_raw.
 #
 # Exit status: 0 the run matched expected.scout (or ran, when there is none); 1 the output differs
 # from expected.scout; 2 usage; 3 no exit marker before the timeout; 4 the board is unavailable;
@@ -222,12 +222,12 @@ if [ "$build_only" = 1 ]; then
 fi
 
 # --- board -------------------------------------------------------------------------------------------
-# A board trial run holds trials/.integrate.lock for its whole length and takes the board lock per
+# A board trial run holds trials/.integrate.lock.ESP32-S3_raw for its whole length and takes the board lock per
 # trial only, so check the run lock too: between two trials the board lock is free.
-owner="$TRIALS/.integrate.lock/owner"
+owner="$TRIALS/.integrate.lock.ESP32-S3_raw/owner"
 if [ -f "$owner" ]; then
     IFS=$'\t' read -r opid otarget _ < "$owner"
-    if [ -n "${opid:-}" ] && [ "${otarget:-host}" != host ] && kill -0 "$opid" 2>/dev/null; then
+    if [ -n "${opid:-}" ] && kill -0 "$opid" 2>/dev/null; then
         die "a board trial run is in progress (target $otarget, pid $opid); try again when it ends" 7
     fi
 fi

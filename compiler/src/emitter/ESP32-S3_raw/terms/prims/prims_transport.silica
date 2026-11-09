@@ -1,0 +1,199 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Transport builtins (transport_serialization_design.md §9.2), ESP32-S3 emission: the byte,
+// list-join, atom-name, float-bit and integer-width prims the wire protocols are written with. The
+// hosted emitters' file of the same name (apple_silicon_mac, linux_*) over this target's virtual
+// registers (shared/xt_isa, xt_mem, xt_float): every line is built by the xt_* helpers, so the
+// operand parking, the moves and the conversions are the ones every other prim uses here.
+//
+// Operands are evaluated by emit_child into X0 (D0 / S0 / H0 for floats) one at a time; for the two-
+// and three-operand prims the earlier operands are parked on the auxiliary stack while the later
+// ones are evaluated, then popped into X0, X1, X2 (the Silica pair positions a10:a11, a12:a13,
+// a14:a15, so a CALL8 needs no moves). The six prims that read or build a string or walk a list are
+// board runtime routines (board/runtime/rt_transport.S, silica_rt_tr_*), as the string and list
+// prims are on this target; nothing is emitted into the module for them. They answer in X0; a string
+// they build is a fresh 24-byte-header block in the running frame's dynamic part
+// (silica_rt_frame_alloc, the contract of silica_rt_string_concat), which is why emitter_core counts
+// tr_byte_slice, tr_bytes_of, tr_join_bytes and tr_atom_name among the frame-allocating prims.
+//
+// The scalar prims are register work: a float's bits are its VR home (xt_mov copies them), the
+// conversions go through xt_float (libgcc / the FPU / silica_rt_h2f, f2h), and the width changes are
+// xt_ext. atom_of_bits is the identity move: an atom is its table index (spec §4.1.7).
+
+use term_sir_helpers;
+use reg_conventions;
+use xt_isa;
+use xt_mem;
+use xt_float;
+
+export is_transport_prim/1;
+export emit_transport_prim/5;
+
+fn is_transport_prim(name: string) -> boolean {
+    name == "tr_byte_at" or name == "tr_byte_slice" or name == "tr_bytes_of" or name == "tr_join_bytes"
+        or name == "tr_atom_name" or name == "tr_atom_index" or name == "tr_atom_of_bits"
+        or name == "tr_f64_bits" or name == "tr_f64_of_bits" or name == "tr_f32_bits" or name == "tr_f32_of_bits"
+        or name == "tr_f32_to_f64" or name == "tr_f64_to_f32" or name == "tr_f16_to_f32" or name == "tr_f32_to_f16"
+        or name == "tr_char_code" or name == "tr_char_of_code"
+        or name == "tr_to_int64" or name == "tr_to_uint64" or name == "tr_narrow" or name == "tr_type_marker"
+}
+
+fn transport_arg_count(name: string) -> int64 {
+    case name of {
+        "tr_byte_at" -> 2;
+        "tr_byte_slice" -> 3;
+        _: string -> 1
+    }
+}
+
+// The register the one operand of a unary prim is evaluated into.
+fn unary_operand_reg(name: string) -> string {
+    case name of {
+        "tr_f64_bits" -> "D0";
+        "tr_f64_to_f32" -> "D0";
+        "tr_f32_bits" -> "S0";
+        "tr_f32_to_f64" -> "S0";
+        "tr_f32_to_f16" -> "S0";
+        "tr_f16_to_f32" -> "H0";
+        _: string -> "X0"
+    }
+}
+
+fn reg_number(dest: string) -> string {
+    case length_bytes(dest) > 1 of {
+        true -> substring(dest, 1, length_bytes(dest));
+        false -> ""
+    }
+}
+
+// Move the helper's X0 / D0 / S0 / H0 / W0 answer into dest, spelled for the result type. A W write
+// clears the high word of the home, as on AArch64 (xt_vr vr_put).
+fn move_result(dest: string, result_type: string) -> string {
+    n: string <- reg_number(dest);
+    case reg_conventions@is_float64_type(result_type) of {
+        true -> case n == "0" of { true -> ""; false -> xt_isa@xt_mov(concat("D", n), "D0") };
+        false -> case reg_conventions@is_float32_type(result_type) of {
+            true -> case n == "0" of { true -> ""; false -> xt_isa@xt_mov(concat("S", n), "S0") };
+            false -> case reg_conventions@is_float16_type(result_type) of {
+            true -> case n == "0" of { true -> ""; false -> xt_isa@xt_mov(concat("H", n), "H0") };
+            false -> case reg_conventions@is_narrow_type(result_type) of {
+                true -> case n == "0" of { true -> ""; false -> xt_isa@xt_mov(concat("W", n), "W0") };
+                false -> case dest == "X0" or dest == "W0" or length_bytes(n) == 0 of {
+                    true -> "";
+                    false -> case substring(dest, 0, 1) == "W" of {
+                        true -> xt_isa@xt_mov(concat("W", n), "W0");
+                        false -> xt_isa@xt_mov(concat("X", n), "X0")
+                    }
+                }
+            }
+        }
+    }
+    }
+}
+
+// Widen a narrow or unsigned integer in X0's low word to the int64 (or uint64) in X0 by its source type.
+fn widen_lines(source_type: string) -> string {
+    case source_type of {
+        "int8" -> xt_isa@xt_ext("SXTB", "X0", "X0");
+        "int16" -> xt_isa@xt_ext("SXTH", "X0", "X0");
+        "int32" -> xt_isa@xt_ext("SXTW", "X0", "X0");
+        "uint8" -> xt_isa@xt_ext("UXTB", "X0", "X0");
+        "uint16" -> xt_isa@xt_ext("UXTH", "X0", "X0");
+        "uint32" -> xt_isa@xt_ext("UXTW", "X0", "X0");
+        _: string -> ""
+    }
+}
+
+// Cut the int64 in X0 to the narrow width named by the prim's result type, sign- or zero-extended
+// in the low word with the high word cleared, as the narrow prims keep their values (a W write).
+fn narrow_lines(result_type: string) -> string {
+    case result_type of {
+        "int8" -> xt_isa@xt_ext("SXTB", "W0", "X0");
+        "int16" -> xt_isa@xt_ext("SXTH", "W0", "X0");
+        "int32" -> xt_isa@xt_ext("UXTW", "W0", "X0");
+        "uint8" -> xt_isa@xt_ext("UXTB", "W0", "X0");
+        "uint16" -> xt_isa@xt_ext("UXTH", "W0", "X0");
+        "uint32" -> xt_isa@xt_ext("UXTW", "W0", "X0");
+        _: string -> ""
+    }
+}
+
+fn op_lines(name: string, value: string, result_type: string) -> string {
+    case name of {
+        "tr_byte_at" -> xt_isa@xt_call("silica_rt_tr_byte_at");
+        "tr_byte_slice" -> xt_isa@xt_call("silica_rt_tr_byte_slice");
+        "tr_bytes_of" -> xt_isa@xt_call("silica_rt_tr_bytes_of");
+        "tr_join_bytes" -> xt_isa@xt_call("silica_rt_tr_join_bytes");
+        "tr_atom_name" -> xt_isa@xt_call("silica_rt_tr_atom_name");
+        "tr_atom_index" -> xt_isa@xt_call("silica_rt_tr_atom_index");
+        "tr_atom_of_bits" -> "";
+        // FMOV X0, D0 and back: the bits of the home, both words.
+        "tr_f64_bits" -> xt_isa@xt_mov("X0", "D0");
+        "tr_f64_of_bits" -> xt_isa@xt_mov("D0", "X0");
+        // FMOV W0, S0: the low word, high word zero; FMOV S0, W0: the low word.
+        "tr_f32_bits" -> xt_isa@xt_mov("X0", "S0");
+        "tr_f32_of_bits" -> xt_isa@xt_mov("S0", "X0");
+        "tr_f32_to_f64" -> xt_float@xt_fcvt("D0", "S0");
+        "tr_f64_to_f32" -> xt_float@xt_fcvt("S0", "D0");
+        "tr_f16_to_f32" -> xt_float@xt_fcvt("S0", "H0");
+        "tr_f32_to_f16" -> xt_float@xt_fcvt("H0", "S0");
+        // MOV W0, W0: a char is its scalar value in the low word.
+        "tr_char_code" -> xt_isa@xt_ext("UXTW", "X0", "X0");
+        "tr_char_of_code" -> xt_isa@xt_ext("UXTW", "X0", "X0");
+        "tr_to_int64" -> widen_lines(value);
+        "tr_to_uint64" -> widen_lines(value);
+        "tr_narrow" -> narrow_lines(result_type);
+        _: string -> ""
+    }
+}
+
+fn emit_transport_prim(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, bound: { bound_name: string, bound_reg: string, outer_reg: string, debug: boolean }, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, int64_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int32_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int16_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int8_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }, emit_child: fn({ nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, string, { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, int64_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int32_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int16_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int8_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }, { bound_name: string, bound_reg: string, outer_reg: string, debug: boolean }) -> string) -> string {
+    root: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+    case root.name == "tr_type_marker" of {
+        // The marker (transport_derive) only names the (format, type) a call needs; its value is
+        // the operand itself.
+        true -> emit_child(term_sir_helpers@sir_term_at(term, root.inner), dest, pools, bound);
+        false -> emit_transport_prim_op(term, dest, bound, pools, emit_child)
+    }
+}
+
+fn emit_transport_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, bound: { bound_name: string, bound_reg: string, outer_reg: string, debug: boolean }, pools: { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, int64_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int32_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int16_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int8_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }, emit_child: fn({ nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, string, { table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, int64_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int32_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int16_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, int8_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float64_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, float32_literal_table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, values: List[string, mem(normal)] }, string_literal_table: { is_empty: boolean, values: List[string, mem(normal)] } }, { bound_name: string, bound_reg: string, outer_reg: string, debug: boolean }) -> string) -> string {
+    root: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(term);
+    n: int64 <- transport_arg_count(root.name);
+    arg1: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, root.inner);
+    args_asm: string <- case n of {
+        1 -> concat(emit_child(arg1, unary_operand_reg(root.name), pools, bound), "\n");
+        2 -> {
+            arg2: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, root.right_expr);
+            a1: string <- concat(emit_child(arg1, "X0", pools, bound), concat("\n", xt_mem@xt_str("X0", "[SP, #-16]!")));
+            a2: string <- concat(emit_child(arg2, "X0", pools, bound), concat("\n", xt_isa@xt_mov("X1", "X0")));
+            concat(a1, concat(a2, xt_mem@xt_ldr("X0", "[SP], #16")))
+        };
+        _: int64 -> {
+            rest: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(term, root.right_expr);
+            rest_root: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(rest);
+            arg2: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(rest, rest_root.inner);
+            arg3: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 } <- term_sir_helpers@sir_term_at(rest, rest_root.right_expr);
+            a1: string <- concat(emit_child(arg1, "X0", pools, bound), concat("\n", xt_mem@xt_str("X0", "[SP, #-16]!")));
+            a2: string <- concat(emit_child(arg2, "X0", pools, bound), concat("\n", xt_mem@xt_str("X0", "[SP, #-16]!")));
+            a3: string <- concat(emit_child(arg3, "X0", pools, bound), concat("\n", xt_isa@xt_mov("X2", "X0")));
+            concat(a1, concat(a2, concat(a3, concat(xt_mem@xt_ldr("X1", "[SP], #16"), xt_mem@xt_ldr("X0", "[SP], #16")))))
+        }
+    };
+    concat(args_asm, concat(op_lines(root.name, root.value, root.type_name), move_result(dest, root.type_name)))
+}

@@ -109,7 +109,7 @@
 #define ROW_FLAVOR       64
 #define ROW_TRAMP        72
 #define ROW_NEXT         80
-#define ROW_INIT_BYTES   88
+#define ROW_DESC         88     // the initial state's descriptor (chunk 15 phase 4d: the row's spec buffer)
 #define ROW_STOPPING     92
 #define ROW_SPOS         96     // the child's spawner record (position + 1, next child number): kept
 #define ROW_SNEXT        100    //   across the child's restarts (spec §15.1.4, §15.4.12.1)
@@ -125,9 +125,10 @@
 #define SPEC_RESTART     40
 #define SPEC_SHUTDOWN    48
 #define SPEC_FLAVOR      56
-#define SPEC_TRAMP       64
-#define SPEC_INIT_BYTES  68
-#define SPEC_LIST_CHUNK  72
+#define SPEC_STATE_POLICY 64    // chunk 15 (terms/term_child_spec.silica): the hosted layout
+#define SPEC_TRAMP       72
+#define SPEC_DESC        80     // the initial state's root-word descriptor (0: as it is)
+#define SPEC_LIST_CHUNK  88
 
 // Reserved shape numbers of the records this runtime builds (emitter record_shape.silica,
 // atom_table.silica seed_actor_runtime_atoms): the word every record starts with.
@@ -424,24 +425,6 @@ silica_rt_supervisor_spawn_child_row_by_flavor:
     s32i    a5, a1, 0
     movi    a4, 0
     s32i    a4, a1, 4
-    l32i    a4, a6, ROW_INIT_BYTES
-    beqz    a4, 2f
-    movi    a9, 65536
-    bltu    a5, a9, 2f                  // an atom alternative of a sum-typed init is a value
-    mov     a10, a4
-    call8   silica_rt_alloc
-    mov     a8, a5                      // copy the shell word by word
-    mov     a9, a10
-    add     a4, a5, a4
-1:  bgeu    a8, a4, 11f
-    l32i    a3, a8, 0
-    s32i    a3, a9, 0
-    addi    a8, a8, 4
-    addi    a9, a9, 4
-    j       1b
-11: s32i    a10, a1, 0
-    movi    a3, 1
-    s32i    a3, a1, 4
 2:  rur     a8, threadptr               // this core's register block (X3.. at 0)
     s32i    a6, a8, 0                   // X3 = row
     movi    a9, 0
@@ -450,6 +433,10 @@ silica_rt_supervisor_spawn_child_row_by_flavor:
     s32i    a9, a8, 8                   // X4 = trampoline
     movi    a9, 0
     s32i    a9, a8, 12
+    l32i    a9, a6, ROW_DESC
+    s32i    a9, a8, 32                  // X7 = the init's descriptor: state_install copies it (chunk 15)
+    movi    a9, 0
+    s32i    a9, a8, 36
     s32i    a7, a8, 16                  // X5 = the supervisor whose stack reserve the child inherits
     s32i    a9, a8, 20
     l32i    a10, a1, 0
@@ -473,14 +460,8 @@ silica_rt_supervisor_spawn_child_row_by_flavor:
     s32i    a5, a6, ROW_CHILD
     movi    a9, 0
     s32i    a9, a6, ROW_CHILD + 4
-    l32i    a9, a1, 4
-    beqz    a9, 8f
-    l32i    a10, a1, 0
-    call8   silica_rt_free
     j       8f
 3:  s32i    a7, a5, ACB_SUP
-    l32i    a9, a1, 4
-    s8i     a9, a5, ACB_STATE_OWNED
     s32i    a5, a6, ROW_CHILD
     movi    a9, 0
     s32i    a9, a6, ROW_CHILD + 4
@@ -570,8 +551,8 @@ silica_rt_fill_row_from_spec:
     s32i    a4, a2, ROW_FLAVOR
     l32i    a4, a3, SPEC_TRAMP
     s32i    a4, a2, ROW_TRAMP
-    l32i    a4, a3, SPEC_INIT_BYTES
-    s32i    a4, a2, ROW_INIT_BYTES
+    l32i    a4, a3, SPEC_DESC
+    s32i    a4, a2, ROW_DESC
     movi    a4, 0
     s32i    a4, a2, ROW_STOPPING
     s32i    a4, a2, ROW_SPOS            // a new child for this row: a fresh spawner record
@@ -653,11 +634,7 @@ silica_rt_supervisor_materialize_init_children:
     movi    a4, 0
     addi    a2, a2, -1
     j       3b
-9:  mov     a10, a6
-    l32i    a11, a1, 4
-    l32i    a12, a1, 8
-    call8   silica_rt_init_result_release
-    movi    a2, 0
+9:  movi    a2, 0
     movi    a3, 0
     mov     a10, a6
     call8   silica_rt_child_table_leave
@@ -677,93 +654,6 @@ silica_rt_supervisor_materialize_init_children:
 // nothing is freed when any of those owner blocks reaches the handle or one of the chunks (four
 // levels down, as there). Each spec list `init` builds was leaked before this, about a kilobyte for
 // ten specs on every supervisor start and restart (actor_memory_budget_plan.md item A, §13).
-    .align  4
-    .global silica_rt_init_result_release
-    .type   silica_rt_init_result_release, @function
-silica_rt_init_result_release:
-    entry   a1, 48
-    mov     a6, a2                      // a6 = supervisor
-    mov     a7, a3                      // a7 = flags record (0: flat shape, none)
-    mov     a5, a4                      // a5 = list handle (0: none)
-    beqz    a7, 1f
-    mov     a10, a6
-    mov     a11, a7
-    call8   silica_rt_init_owners_reach
-    bnez    a10, 9f
-1:  beqz    a5, 4f
-    mov     a10, a6
-    mov     a11, a5
-    call8   silica_rt_init_owners_reach
-    bnez    a10, 9f
-    l32i    a8, a5, 8                   // the chunks, in list order
-2:  beqz    a8, 3f
-    s32i    a8, a1, 0
-    mov     a10, a6
-    mov     a11, a8
-    call8   silica_rt_init_owners_reach
-    bnez    a10, 9f
-    l32i    a8, a1, 0
-    l32i    a8, a8, SPEC_LIST_CHUNK
-    j       2b
-3:  l32i    a8, a5, 8                   // nothing outside reaches the list: free chunks, then the handle
-5:  beqz    a8, 6f
-    l32i    a9, a8, SPEC_LIST_CHUNK
-    s32i    a9, a1, 0
-    mov     a10, a8
-    call8   silica_rt_free
-    l32i    a8, a1, 0
-    j       5b
-6:  mov     a10, a5
-    call8   silica_rt_free
-4:  beqz    a7, 9f
-    mov     a10, a7
-    call8   silica_rt_free
-9:  movi    a2, 0
-    movi    a3, 0
-    retw
-    .size   silica_rt_init_result_release, . - silica_rt_init_result_release
-
-// silica_rt_init_owners_reach(sup, block) -> 1 when the supervisor's own initial state (ACB_STATE,
-// when it is a heap block) or a row's composite initial state (ROW_INIT with ROW_INIT_BYTES set)
-// reaches `block` within four levels (rt_heap.S silica_rt_heap_reaches). Walks the rows inside the
-// caller's child_table_enter bracket.
-    .align  4
-    .global silica_rt_init_owners_reach
-    .type   silica_rt_init_owners_reach, @function
-silica_rt_init_owners_reach:
-    entry   a1, 48
-    mov     a6, a2                      // a6 = supervisor
-    mov     a7, a3                      // a7 = block
-    l32i    a4, a6, ACB_STATE
-    mov     a10, a7
-    mov     a11, a4
-    movi    a12, 0
-    movi    a13, 4
-    call8   silica_rt_heap_reaches
-    bnez    a10, 8f
-    l32i    a5, a6, ACB_SB
-    beqz    a5, 9f
-    l32i    a5, a5, SB_CT_HEAD
-1:  beqz    a5, 9f
-    l32i    a4, a5, ROW_INIT_BYTES
-    beqz    a4, 2f
-    s32i    a5, a1, 0
-    mov     a10, a7
-    l32i    a11, a5, ROW_INIT
-    mov     a12, a4
-    movi    a13, 4
-    call8   silica_rt_heap_reaches
-    l32i    a5, a1, 0
-    bnez    a10, 8f
-2:  l32i    a5, a5, ROW_NEXT
-    j       1b
-8:  movi    a2, 1
-    movi    a3, 0
-    retw
-9:  movi    a2, 0
-    movi    a3, 0
-    retw
-    .size   silica_rt_init_owners_reach, . - silica_rt_init_owners_reach
 
 // silica_rt_supervisor_start_child_in(sup, spec) -> child: reuse the first tombstone row or append.
     .align  4
@@ -1424,14 +1314,14 @@ silica_rt_supervisor_maybe_restart:
 // in the record's own 64-byte block, at +48), and :unknown otherwise (since 2026-10-23 no exit carries
 // tag 1: a division by zero is 2, a kill is 4 with :killed). child is the identity the notice
 // carries (payload+40); new_child is the row's current child (ROW_CID) when restarted, else child.
-// The cast owns the block (silica_rt_cast_try's X2 = 1): the receiver's dispatch frees it, as it
-// frees any record copy a cast made, and a sink that has ended or is call-only gets nothing (the
-// block goes back there). The supervisor never waits.
+// The block is the message's mailbox buffer (silica_rt_cast_try's X2 = its bytes, X3 = the block):
+// the receiver's dispatch frees it, as it frees any message copy a cast made, and a sink that has
+// ended or is call-only gets nothing (the block goes back there). The supervisor never waits.
     .align  4
     .global silica_rt_sup_exit_report
     .type   silica_rt_sup_exit_report, @function
 silica_rt_sup_exit_report:
-    entry   a1, 48
+    entry   a1, 64
     beqz    a4, 9f                      // no row: the notice was not handled as a child exit
     l32i    a6, a2, ACB_SB
     beqz    a6, 9f
@@ -1483,12 +1373,23 @@ silica_rt_sup_exit_report:
     l32i    a9, a4, ROW_CID + 4
 3:  s32i    a8, a6, 40
     s32i    a9, a6, 44
-    l32i    a10, a1, 0                  // cast to the sink, owned: the receiver's dispatch frees the
-    l32i    a11, a1, 4                  // block (1 enqueued; else it went back in silica_rt_cast_try)
+    // cast to the sink: the block is the message's MAILBOX BUFFER (chunk 15 phase 4a: X2 its bytes,
+    // X3 its block), freed by the receiver's dispatch end (1 enqueued; else it went back in
+    // silica_rt_cast_try). X3 is the caller's register-block word: kept around the cast.
+    rur     a8, threadptr
+    l32i    a9, a8, 0
+    s32i    a9, a1, 20
+    s32i    a6, a8, 0
+    l32i    a10, a1, 0
+    l32i    a11, a1, 4
     mov     a12, a6
     movi    a13, 0
-    movi    a14, 1
+    movi    a14, 64
+    movi    a15, 0
     call8   silica_rt_cast_try
+    rur     a8, threadptr
+    l32i    a9, a1, 20
+    s32i    a9, a8, 0
 9:  movi    a2, 0
     movi    a3, 0
     retw
@@ -1521,6 +1422,7 @@ silica_rt_supervisor_set_report_sink:
     l8ui    a4, a10, ACB_ALIVE
     beqz    a4, 8f                      // ended
     l32i    a4, a10, ACB_CONV
+    extui   a4, a4, 0, 2                // the convention bits under the phase 3c proof bit
     beqi    a4, 1, 8f                   // call-only (§16.2.6.4)
     mov     a10, a6
     call8   silica_rt_sb_require
@@ -1704,7 +1606,7 @@ silica_rt_supervisor_get_child_info:
     call8   silica_rt_live_row_by_id      // no live row with the id: an empty record
     mov     a5, a10
     movi    a10, 40
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     mov     a2, a10
     movi    a3, 0
     movi    a4, SHAPE_CHILD_INFO
@@ -1826,7 +1728,7 @@ silica_rt_supervisor_which_children:
     l32i    a4, a5, ROW_CHILD
     beqz    a4, 8f
     movi    a10, 56
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     mov     a2, a10                     // a2 = chunk
     movi    a4, SHAPE_CHILD_INFO
     s32i    a4, a2, 0
@@ -1844,7 +1746,7 @@ silica_rt_supervisor_which_children:
     l32i    a4, a7, 8
     s32i    a4, a2, 48
 2:  movi    a10, 24
-    call8   silica_rt_alloc
+    call8   silica_rt_frame_alloc
     movi    a4, 1
     beqz    a7, 3f
     l32i    a4, a7, 0

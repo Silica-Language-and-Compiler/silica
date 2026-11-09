@@ -169,12 +169,12 @@ integrate-run:
 			ko=$$((ko + 1)); failed=1; continue; \
 		fi; \
 		if [ -f "$(call SCOUT_FOR,$$stem)" ]; then \
-			{ { grep -q '^use trial_support_' "$$stem.silica" || [ -f "$$stem.no_stdin_exit" ] || printf 'exit\n'; } | ./$$stem 2>&1; echo $$?; } > "$$stem.sout"; \
+			{ { grep -q '^use trial_support_' "$$stem.silica" || [ -f "$$stem.no_stdin_exit" ] || printf 'exit\n'; } | ./$$stem 2>&1; echo $$?; } > "$$stem$(SOUT_EXT)"; \
 			if [ -f "$$stem.scout.multiset" ]; then set -- bash "$(THIS_DIR)compare_scout_multiset.sh"; else set -- diff -Bw; fi; \
-			if ! "$$@" "$$stem.sout" "$(call SCOUT_FOR,$$stem)" > /dev/null 2>&1; then \
+			if ! "$$@" "$$stem$(SOUT_EXT)" "$(call SCOUT_FOR,$$stem)" > /dev/null 2>&1; then \
 				echo "❌❌ $(MSG_PREFIX)$$stem .sout differs from .scout"; \
 				$(INTEGRATE_DOT_FAIL); \
-				"$$@" "$$stem.sout" "$(call SCOUT_FOR,$$stem)" || true; \
+				"$$@" "$$stem$(SOUT_EXT)" "$(call SCOUT_FOR,$$stem)" || true; \
 				ko=$$((ko + 1)); failed=1; \
 			else \
 				echo "✅✅ $(MSG_PREFIX)$$stem output matches .scout"; \
@@ -197,7 +197,7 @@ clean:
 		[ -f "$$s" ] || continue; \
 		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done; \
-	rm -f *.sams *.o *.iface *.sout silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts silica.config; \
+	rm -f *.sams *.o *.iface *$(SOUT_EXT) silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts silica.config; \
 	echo "✅ $(MSG_PREFIX)Clean complete"
 
 help:

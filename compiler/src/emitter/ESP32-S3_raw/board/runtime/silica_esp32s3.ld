@@ -48,6 +48,10 @@ _silica_fault_stack_size = 0x800;
 _silica_main_stack_size  = DEFINED(_silica_main_stack_req) ? _silica_main_stack_req : 0x20000;
 _silica_main_aux_size    = DEFINED(_silica_main_aux_req)   ? _silica_main_aux_req   : 0x10000;
 _silica_rt_depth_reserve = DEFINED(_silica_rt_depth_req)   ? _silica_rt_depth_req   : 0x400;
+/* The machine stack a foreign (C) call gets, below the frame that makes it, on a chunk of the calling
+   actor's own stack chain taken for the call (rt_ffi.S silica_rt_ffi_call; tools/build_image.sh
+   --defsym _silica_ffi_stack_req from BOARD_FFI_STACK). 4 KB by default. */
+_silica_ffi_stack_size   = DEFINED(_silica_ffi_stack_req)  ? _silica_ffi_stack_req  : 0x1000;
 
 MEMORY
 {

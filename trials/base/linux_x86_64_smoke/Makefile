@@ -66,13 +66,13 @@ ifeq ($(PLATFORM),linux_x86_64)
 		printf '%d %d\n' 0 1 > .integrate_counts; exit 1; \
 	fi; \
 	echo "Running ./hello"; \
-	./hello > hello.sout 2>&1; rc=$$?; printf '%s\n' "$$rc" >> hello.sout; \
-	if diff -Bw -q hello.sout hello.scout > /dev/null 2>&1; then \
+	./hello > hello$(SOUT_EXT) 2>&1; rc=$$?; printf '%s\n' "$$rc" >> hello$(SOUT_EXT); \
+	if diff -Bw -q hello$(SOUT_EXT) hello.scout > /dev/null 2>&1; then \
 		echo "✅✅ $(MSG_PREFIX)hello output matches .scout"; \
 		printf '%d %d\n' 1 0 > .integrate_counts; \
 	else \
 		echo "❌❌ $(MSG_PREFIX)hello .sout differs from .scout"; \
-		diff -Bw hello.sout hello.scout || true; \
+		diff -Bw hello$(SOUT_EXT) hello.scout || true; \
 		printf '%d %d\n' 0 1 > .integrate_counts; exit 1; \
 	fi
 else
@@ -80,7 +80,7 @@ else
 endif
 
 clean:
-	@cd "$(THIS_DIR)" && rm -f hello.o hello hello.sout .integrate_counts
+	@cd "$(THIS_DIR)" && rm -f hello.o hello hello$(SOUT_EXT) .integrate_counts
 	@echo "✅ $(MSG_PREFIX)Clean complete"
 
 help:

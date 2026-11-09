@@ -144,16 +144,16 @@ integrate-run:
 		ko=$$((ko + 1)); failed=1;; esac; \
 	elif [ -x "$$base" ]; then \
 			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
-				$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,./$$base); \
+				$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base$(SOUT_EXT),./$$base); \
 				if [ "$$integrate_killed" = 1 ]; then \
 					echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 					$(INTEGRATE_DOT_FAIL); \
 					ko=$$((ko + 1)); failed=1; continue; \
 				fi; \
-				if ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+				if ! diff -Bw -q "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout"; \
 					$(INTEGRATE_DOT_FAIL); \
-					diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+					diff -Bw "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \
@@ -181,7 +181,7 @@ clean:
 		[ -f "$$s" ] || continue; \
 		$(call TRIAL_RM_UNTRACKED,"$${s%.sams}"); \
 	done; \
-	rm -f *.sams *.o *.iface *.sout silica.config silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts; \
+	rm -f *.sams *.o *.iface *$(SOUT_EXT) silica.config silica.compile.order silica.needs_runtime silica.atoms silica.shapes silica.link .integrate_counts; \
 	echo "✅ $(MSG_PREFIX)Clean complete"
 
 help:

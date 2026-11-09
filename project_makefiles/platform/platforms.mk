@@ -32,7 +32,18 @@ SILICA_TARGET_ROWS := \
 	apple_silicon_mac:macos-applesilicon \
 	linux_aarch64:linux-aarch64 \
 	linux_x86_64:linux-x86_64 \
-	ESP32-S3_raw:-
+	ESP32-S3_raw:- \
+	STM32-L476RG_raw:-
+
+# emit_target:golden_name    the name a target's per-target trial goldens carry, <stem>.<name>.ascomp /
+# .scout / .golden_fail (trials/silica_compiler.mk ASCOMP_EXT), when it is not the target's own name:
+# the ST NUCLEO-L476RG board target records its assembly goldens as <stem>.st_nucleo.ascomp
+# (Lee, 2026-11-07). A target without a row uses its emit-target name, as before.
+SILICA_GOLDEN_NAME_ROWS := \
+	STM32-L476RG_raw:st_nucleo
+
+# $(call silica_golden_name_for_target,<emit target>) -> the golden name (the target itself by default).
+silica_golden_name_for_target = $(or $(word 2,$(subst :, ,$(firstword $(filter $(1):%,$(SILICA_GOLDEN_NAME_ROWS))))),$(1))
 
 SILICA_EMIT_TARGETS := $(foreach r,$(SILICA_TARGET_ROWS),$(word 1,$(subst :, ,$(r))))
 SILICA_HOST_PLATFORMS := $(sort $(foreach r,$(SILICA_HOST_ROWS),$(word 4,$(subst :, ,$(r)))))
@@ -60,7 +71,8 @@ SILICA_HOST_PLATFORM_FRAGMENT := $(if $(SILICA_HOST_EMIT_TARGET),$(SILICA_PLATFO
 #   make -s -f project_makefiles/platform/platforms.mk platforms          -> one id per line
 #   make -s -f project_makefiles/platform/platforms.mk emit-targets       -> one target per line
 #   make -s -f project_makefiles/platform/platforms.mk platform-for-target TARGET=linux_x86_64
-.PHONY: host-platform host-emit-target platforms emit-targets platform-for-target
+#   make -s -f project_makefiles/platform/platforms.mk golden-name-for-target TARGET=STM32-L476RG_raw -> st_nucleo
+.PHONY: host-platform host-emit-target platforms emit-targets platform-for-target golden-name-for-target
 host-platform:
 	@printf '%s\n' '$(SILICA_HOST_PLATFORM)'
 host-emit-target:
@@ -71,3 +83,5 @@ emit-targets:
 	@printf '%s\n' $(SILICA_EMIT_TARGETS)
 platform-for-target:
 	@printf '%s\n' '$(call silica_platform_for_target,$(TARGET))'
+golden-name-for-target:
+	@printf '%s\n' '$(call silica_golden_name_for_target,$(TARGET))'

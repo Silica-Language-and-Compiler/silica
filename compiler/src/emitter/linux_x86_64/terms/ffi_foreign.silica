@@ -118,10 +118,14 @@ fn param_types_for_outer_encoding(param_types: string) -> string {
     replace_pipe_with_comma_loop(param_types, 0, "")
 }
 
-// Entry: local~c_symbol~param_types~return_class. The return class is "word" for a declared scalar
-// result (int*, uint*, float*, boolean) and "rec" otherwise; see inferred_return_type_from_param_types.
+// Entry: local~c_symbol~param_types~return_type. The declared return type travels with the binding
+// (as on the Mac since 2026-11-05) so a struct result of a scalar-argument wrapper (a tagged result)
+// gets its sret buffer and a declared scalar result (int*, uint*, float*, boolean) takes none; before,
+// this target carried only a "word" / "rec" return class and inferred a "rec" result's type from the
+// parameters, so only a pointer-plus-length pair was taken to return a struct.
 fn encode_one_binding(b: { local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }) -> string {
     pt_enc: string <- param_types_for_outer_encoding(b.param_types);
+    rt_enc: string <- param_types_for_outer_encoding(b.return_type);
     concat(
         concat(
             concat(
@@ -133,28 +137,8 @@ fn encode_one_binding(b: { local_name: string, c_symbol: string, meta_path: stri
             ),
             pt_enc
         ),
-        concat(binding_field_sep(), return_class_of(b.return_type))
+        concat(binding_field_sep(), rt_enc)
     )
-}
-
-fn return_class_of(return_type: string) -> string {
-    case declared_return_is_word(return_type) of {
-        true -> "word";
-        false -> "rec"
-    }
-}
-
-fn declared_return_is_word(t: string) -> boolean {
-    case t == "boolean" of {
-        true -> true;
-        false -> case length_bytes(t) >= 3 and substring(t, 0, 3) == "int" of {
-            true -> true;
-            false -> case length_bytes(t) >= 4 and substring(t, 0, 4) == "uint" of {
-                true -> true;
-                false -> length_bytes(t) >= 5 and substring(t, 0, 5) == "float"
-            }
-        }
-    }
 }
 
 fn encode_bindings_loop(bindings: List[{ local_name: string, c_symbol: string, meta_path: string, return_type: string, param_names: string, param_types: string }, mem(normal)], acc: string) -> string {
@@ -212,12 +196,12 @@ fn parse_binding_entry(entry: string) -> (string, string, string, string) {
                         true -> rest2;
                         false -> substring(rest2, 0, s3)
                     };
-                    rclass: string <- case s3 < 0 of {
-                        true -> "rec";
+                    declared: string <- case s3 < 0 of {
+                        true -> "";
                         false -> substring_to_end(rest2, s3 + length_bytes(binding_field_sep()))
                     };
-                    rt: string <- case rclass == "word" of {
-                        true -> "int64";
+                    rt: string <- case length_bytes(declared) > 0 of {
+                        true -> declared;
                         false -> inferred_return_type_from_param_types(pt)
                     };
                     (local, c_sym, pt, rt)
@@ -324,11 +308,12 @@ fn type_text_contains(s: string, needle: string) -> boolean {
     }
 }
 
-// A pointer-plus-length parameter pair with a record result is the ptr/len/tag result record, returned
-// in memory (sret). A declared scalar result (return class "word", e.g. silica_call_only_sum's int64
-// over a buf pointer and length) comes back in rax and takes no hidden sret pointer: System V passes
-// that pointer in rdi, so a wrong sret moves every argument up one register (the C callee then read the
-// buffer pointer as its length and faulted). AArch64's X8 is beside the arguments, so the Mac never saw it.
+// The fallback when a binding carries no declared return type: a pointer-plus-length parameter pair
+// is taken to return the ptr/len/tag result record, in memory (sret), anything else a word. A declared
+// scalar result (e.g. silica_call_only_sum's int64 over a buf pointer and length) comes back in rax and
+// takes no hidden sret pointer: System V passes that pointer in rdi, so a wrong sret moves every
+// argument up one register (the C callee then read the buffer pointer as its length and faulted).
+// AArch64's X8 is beside the arguments, so the Mac never saw it.
 fn inferred_return_type_from_param_types(param_types: string) -> string {
     case param_types_are_ptr_len_pair(param_types) of {
         true -> "ptr_len_struct";
@@ -563,10 +548,19 @@ fn foreign_call_uses_heap_scratch(param_types: string, return_type: string, arg1
     needs_string_in_marshal(param_types, arg1_type) or (foreign_call_sret_bytes(return_type) > 0)
 }
 
+// r10 (X9) = a record shape word (atom_table shape_index_base + position, so usually above 65535);
+// `mov r64, imm64` takes any value.
+fn shape_const_lines(n: int64) -> string {
+    case n < 0 of {
+        true -> "    mov r10, 0\n";
+        false -> concat("    mov r10, ", concat(atom_table@int64_to_decimal_string(n), "\n"))
+    }
+}
+
 fn emit_foreign_user_call(
     term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
     dest: string,
-    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string }
+    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, sret_shape: int64, outer_reg: string }
 ) -> string {
     pre_barrier: string <- emitter_effects@barrier_before_call(ctx.call_effects);
     post_barrier: string <- emitter_effects@barrier_after_call(ctx.call_effects);
@@ -593,11 +587,21 @@ fn emit_foreign_user_call(
         true -> emit_string_out_unmarshal_heap();
         false -> ""
     };
-    // Load result (string handle) back into X0 before the destination move. For non-string
-    // returns the C call leaves the result in X0 already.
+    // A struct result that is not a string (a tagged result or any inline record, wrapper spec §8.2)
+    // came back in the sret scratch at [rsp+32, rsp+64), which pops with the scratch frame: copy it
+    // into a 48-byte block of this frame (L_dyn_alloc moves the scratch with rsp, so it keeps its
+    // rsp-relative offsets) and answer that block, as a record value is its address. The C callee
+    // returned the scratch address in rax, which x86_call_c moved into rdi; it is never read for it
+    // (the Mac emitter's 2026-11-05 fix: the socket wrappers' tagged results).
+    struct_out: string <- case expects_string_out == false and ctx.sret_bytes > 0 of {
+        true -> concat("    mov eax, 48\n    call L_dyn_alloc\n", concat(shape_const_lines(ctx.sret_shape), "    mov QWORD PTR [rax], r10\n    mov r10, QWORD PTR [rsp + 32]\n    mov QWORD PTR [rax + 8], r10\n    mov r10, QWORD PTR [rsp + 40]\n    mov QWORD PTR [rax + 16], r10\n    mov r10, QWORD PTR [rsp + 48]\n    mov QWORD PTR [rax + 24], r10\n    mov r10, QWORD PTR [rsp + 56]\n    mov QWORD PTR [rax + 32], r10\n    mov rdi, rax\n"));
+        false -> ""
+    };
+    // Load result (string handle) back into X0 before the destination move. For scalar returns the
+    // C call leaves the result in X0 already.
     load_result: string <- case expects_string_out of {
         true -> x86_mem@x86_ldr("X0", "[SP, #16]");
-        false -> ""
+        false -> struct_out
     };
     sret_cleanup: string <- case uses_heap of {
         true -> case ctx.sret_bytes > 0 of {

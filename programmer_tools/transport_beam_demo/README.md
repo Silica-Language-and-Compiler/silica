@@ -7,7 +7,7 @@ connects to an Erlang node's `gen_tcp` listener, sends one accelerometer reading
 - `dangerous_telemetry.silica`: the program. A `(:tcp)` carrier (`dangerous_tcp_carrier`) is installed with
   `spawn_dangerous` and opened against `127.0.0.1:<port>`; on `:link_up` the owner grants receive credit and
   sends `(:accel, { x: 1, y: -2, z: 512, at_ms: 1000 })` through `encode((:etf), ...)` and
-  `wireframe@frame(frame, carrier@mtu((:tcp)), carrier@boundaries((:tcp)))`, the carrier tag spelled as the
+  `wireframe@frame(frame, Carrier@mtu((:tcp)), Carrier@boundaries((:tcp)))`, the carrier tag spelled as the
   design spells it; the reply segment is reassembled with `wireframe@unframe` and decoded into
   `(:led, { which: :single | :red | :green | :blue, on: boolean })`. The program is the connecting end. The
   same carrier opened with `"listen:<port>"` is a listener: it announces every peer it accepts with

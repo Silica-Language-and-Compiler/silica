@@ -32,7 +32,7 @@ TRIAL_DIR := $(notdir $(patsubst %/,%,$(THIS_DIR)))
 MSG_PREFIX := $(TRIAL_DIR)/
 
 # The language's built-in modules (compiler/stdlib) the flat trials here link.
-STDLIB_MODS := wire_etf wireframe carrier
+STDLIB_MODS := wire_etf wireframe Carrier
 # Sub-trials with a Makefile of their own, run after the flat trials and counted with them.
 SUB_TRIALS := app_transport_tcp_listener
 
@@ -167,17 +167,17 @@ integrate-run:
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1;; esac; \
 		elif [ -x "$$base" ]; then \
-			$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base.sout,./$$base); \
+			$(call INTEGRATE_RUN_TRIAL,$(MSG_PREFIX)$$base,$$base$(SOUT_EXT),./$$base); \
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(MSG_PREFIX)$$base $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
 				ko=$$((ko + 1)); failed=1; continue; \
 			fi; \
 			if [ -f "$(call SCOUT_FOR,$$base)" ]; then \
-				if ! diff -Bw -q "$$base.sout" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
+				if ! diff -Bw -q "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" > /dev/null 2>&1; then \
 					echo "❌❌ $(MSG_PREFIX)$$base .sout differs from .scout"; \
 					$(INTEGRATE_DOT_FAIL); \
-					diff -Bw "$$base.sout" "$(call SCOUT_FOR,$$base)" || true; \
+					diff -Bw "$$base$(SOUT_EXT)" "$(call SCOUT_FOR,$$base)" || true; \
 					ko=$$((ko + 1)); failed=1; \
 				else \
 					echo "✅✅ $(MSG_PREFIX)$$base output matches .scout"; \

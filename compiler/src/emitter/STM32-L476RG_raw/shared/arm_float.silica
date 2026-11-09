@@ -1,0 +1,385 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Floating point over virtual registers on the Cortex-M4F (FPv4-SP: single precision only).
+//
+//   float32 (S VRs)  add/sub/mul/div, compares and int32 conversions on the FPU (s0-s3 are scratch;
+//                    a float VR's bits live in its home, so VMOV moves them in and out); 64-bit integer
+//                    conversions through libgcc (__aeabi_l2f, __aeabi_f2lz, ...)
+//   float64 (D VRs)  soft float through libgcc's AEABI routines (__aeabi_dadd ... __aeabi_dcmplt), as
+//                    GCC does on this chip
+//   float16 (H VRs)  the toolchain has no _Float16 here, so halves convert through the runtime
+//                    (silica_rt_h2f / silica_rt_f2h) and compute in float32
+// A float VR's bits live in its home exactly as on AArch64 (D: 8 bytes, S: low 4, H: low 2), so FMOV is
+// a plain bit copy (xt_mov). libgcc follows the AAPCS: a double is the pair r0:r1 (r2:r3 for the second),
+// a float one register; r0-r3, r12 and lr are clobbered. Every libgcc call saves and restores X0 and X1
+// (r0-r3) around itself in the SVR_LC area (32 bytes: X0-X1 at 0..15, a spare word at 16 for the
+// half-precision path); X2 (r4:r5) and X9 (r6:r7) survive as AAPCS callee-saved registers.
+
+use arm_vr;
+use arm_isa;
+
+export xt_fop/4;
+export xt_fneg/2;
+export xt_fabs/2;
+export xt_fcmp_flag/3;
+export xt_fcmp_set/4;
+export xt_fcvt/2;
+export xt_scvtf/2;
+export xt_ucvtf/2;
+export xt_fcvtzs/2;
+export xt_fcvtzu/2;
+export xt_frintz/2;
+export xt_fclass/3;
+
+fn ins(op: string, args: string) -> string {
+    arm_vr@xt_ins(op, args)
+}
+
+fn ins2(op: string, a: string, b: string) -> string {
+    ins(op, concat(a, concat(", ", b)))
+}
+
+fn ins3(op: string, a: string, b: string, c: string) -> string {
+    ins(op, concat(a, concat(", ", concat(b, concat(", ", c)))))
+}
+
+fn mov_unless(d: string, s: string) -> string {
+    case d == s of {
+        true -> "";
+        false -> ins2("mov", d, s)
+    }
+}
+
+// Low 32 bits of a float VR into `reg` (S bits, or the D low word).
+fn lo_into(v: string, reg: string) -> string {
+    concat(arm_vr@vr_lo_load(v, reg), mov_unless(reg, arm_vr@vr_lo_reg(v, reg)))
+}
+
+fn hi_into(v: string, reg: string) -> string {
+    concat(arm_vr@vr_hi_load(v, reg), mov_unless(reg, arm_vr@vr_hi_reg(v, reg)))
+}
+
+// libgcc call with the operands already staged in r10, r11, r8, r12 (in AAPCS order r0..r3) and the
+// result copied out of r0:r1 into r10:r11 after the call, then X0 and X1 restored.
+fn staged_call(fname: string, nargs: int64) -> string {
+    args: string <- case nargs of {
+        1 -> ins2("mov", "r0", "r10");
+        2 -> concat(ins2("mov", "r0", "r10"), ins2("mov", "r1", "r11"));
+        3 -> concat(concat(ins2("mov", "r0", "r10"), ins2("mov", "r1", "r11")), ins2("mov", "r2", "r8"));
+        _: int64 -> concat(concat(ins2("mov", "r0", "r10"), ins2("mov", "r1", "r11")), concat(ins2("mov", "r2", "r8"), ins2("mov", "r3", "r12")))
+    };
+    concat(concat(arm_isa@lc_save(), concat(args, ins("bl", fname))), concat(concat(ins2("mov", "r10", "r0"), ins2("mov", "r11", "r1")), arm_isa@lc_restore()))
+}
+
+// --- arithmetic ------------------------------------------------------------------------------
+
+fn d_libname(op: string) -> string {
+    case op of {
+        "add" -> "__aeabi_dadd"; "sub" -> "__aeabi_dsub"; "mul" -> "__aeabi_dmul"; _: string -> "__aeabi_ddiv"
+    }
+}
+
+fn s_fpu_op(op: string) -> string {
+    case op of {
+        "add" -> "vadd.f32"; "sub" -> "vsub.f32"; "mul" -> "vmul.f32"; _: string -> "vdiv.f32"
+    }
+}
+
+// dest = a <op> b, op in add/sub/mul/div; precision from dest's class (D, S or H).
+fn xt_fop(op: string, dest: string, a: string, b: string) -> string {
+    c: string <- arm_vr@vr_class(dest);
+    case c == "D" of {
+        true -> {
+            stage: string <- concat(concat(lo_into(a, "r10"), hi_into(a, "r11")), concat(lo_into(b, "r8"), hi_into(b, "r12")));
+            concat(concat(stage, staged_call(d_libname(op), 4)), arm_vr@vr_put(dest, "r10", "r11"))
+        };
+        false -> case c == "S" of {
+            true -> fop_s(op, dest, a, b);
+            false -> fop_h(op, dest, a, b)
+        }
+    }
+}
+
+// s0 = s1 <op> s2 on the FPU, the operands' bits moved in from r10 and r11.
+fn fpu_binop(op: string) -> string {
+    concat(concat(ins2("vmov", "s1", "r10"), ins2("vmov", "s2", "r11")), concat(ins3(s_fpu_op(op), "s0", "s1", "s2"), ins2("vmov", "r10", "s0")))
+}
+
+fn fop_s(op: string, dest: string, a: string, b: string) -> string {
+    load: string <- concat(lo_into(a, "r10"), lo_into(b, "r11"));
+    concat(concat(load, fpu_binop(op)), arm_vr@vr_put(dest, "r10", "r10"))
+}
+
+// Half precision: widen both operands to float32 through the runtime, compute, narrow the result.
+fn fop_h(op: string, dest: string, a: string, b: string) -> string {
+    widen_a: string <- concat(lo_into(a, "r10"), staged_call("silica_rt_h2f", 1));
+    keep_a: string <- ins("XS32", "r10, SVR_LC+16, r11");
+    widen_b: string <- concat(lo_into(b, "r10"), staged_call("silica_rt_h2f", 1));
+    reload_a: string <- concat(ins2("mov", "r11", "r10"), ins("XL32", "r10, SVR_LC+16"));
+    narrow: string <- staged_call("silica_rt_f2h", 1);
+    concat(concat(concat(widen_a, keep_a), concat(widen_b, reload_a)), concat(concat(fpu_binop(op), narrow), arm_vr@vr_put(dest, "r10", "r10")))
+}
+
+// Sign-bit operations are exact bit operations at every precision.
+fn xt_fneg(dest: string, a: string) -> string {
+    c: string <- arm_vr@vr_class(dest);
+    case c == "D" of {
+        true -> concat(concat(concat(lo_into(a, "r10"), hi_into(a, "r11")), ins("eor", "r11, r11, #0x80000000")), arm_vr@vr_put(dest, "r10", "r11"));
+        false -> case c == "H" of {
+            true -> concat(concat(lo_into(a, "r10"), ins("eor", "r10, r10, #0x8000")), arm_vr@vr_put(dest, "r10", "r10"));
+            false -> concat(concat(lo_into(a, "r10"), ins("eor", "r10, r10, #0x80000000")), arm_vr@vr_put(dest, "r10", "r10"))
+        }
+    }
+}
+
+fn xt_fabs(dest: string, a: string) -> string {
+    c: string <- arm_vr@vr_class(dest);
+    case c == "D" of {
+        true -> concat(concat(concat(lo_into(a, "r10"), hi_into(a, "r11")), ins("bic", "r11, r11, #0x80000000")), arm_vr@vr_put(dest, "r10", "r11"));
+        false -> case c == "H" of {
+            true -> concat(concat(lo_into(a, "r10"), ins("bic", "r10, r10, #0x8000")), arm_vr@vr_put(dest, "r10", "r10"));
+            false -> concat(concat(lo_into(a, "r10"), ins("bic", "r10, r10, #0x80000000")), arm_vr@vr_put(dest, "r10", "r10"))
+        }
+    }
+}
+
+// --- compares --------------------------------------------------------------------------------
+//
+// FCMP a, b followed by a condition: flag (0/1) in r10. Ordered compares: any NaN operand makes every
+// condition false except NE (AArch64: NE is "not equal or unordered").
+
+// The AEABI double compares answer 0/1 themselves, false for an unordered pair (NE below inverts EQ).
+fn d_cmp_lib(cond: string) -> string {
+    case cond of {
+        "EQ" -> "__aeabi_dcmpeq"; "NE" -> "__aeabi_dcmpeq"; "LT" -> "__aeabi_dcmplt"; "MI" -> "__aeabi_dcmplt";
+        "LE" -> "__aeabi_dcmple"; "LS" -> "__aeabi_dcmple"; "GT" -> "__aeabi_dcmpgt"; "GE" -> "__aeabi_dcmpge";
+        _: string -> "__aeabi_dcmpge"
+    }
+}
+
+fn d_cmp_result(cond: string) -> string {
+    case cond == "NE" of {
+        true -> ins("eor", "r10, r10, #1");
+        false -> ""
+    }
+}
+
+// After VCMP + VMRS: the Thumb condition that holds exactly when the AArch64 condition does, NaN
+// included (unordered sets N=0 Z=0 C=1 V=1: MI, LS, GT, GE and EQ are false there, NE true).
+fn s_cond(cond: string) -> string {
+    case cond of {
+        "EQ" -> "eq"; "NE" -> "ne"; "LT" -> "mi"; "MI" -> "mi"; "LE" -> "ls"; "LS" -> "ls"; "GT" -> "gt";
+        _: string -> "ge"
+    }
+}
+
+fn s_cond_inverse(c: string) -> string {
+    case c of {
+        "eq" -> "ne"; "ne" -> "eq"; "mi" -> "pl"; "ls" -> "hi"; "gt" -> "le"; _: string -> "lt"
+    }
+}
+
+// s1 = a bits (r10), s2 = b bits (r11): compare and set r10 = 0/1.
+fn s_flag(cond: string) -> string {
+    c: string <- s_cond(cond);
+    cmp: string <- concat(concat(ins2("vmov", "s1", "r10"), ins2("vmov", "s2", "r11")), concat(ins2("vcmp.f32", "s1", "s2"), ins2("vmrs", "APSR_nzcv", "fpscr")));
+    set: string <- concat(ins("ite", c), concat(ins(concat("mov", c), "r10, #1"), ins(concat("mov", s_cond_inverse(c)), "r10, #0")));
+    concat(cmp, set)
+}
+
+fn xt_fcmp_flag(cond: string, a: string, b: string) -> string {
+    c: string <- arm_vr@vr_class(a);
+    case c == "D" of {
+        true -> concat(concat(concat(lo_into(a, "r10"), hi_into(a, "r11")), concat(lo_into(b, "r8"), hi_into(b, "r12"))), concat(staged_call(d_cmp_lib(cond), 4), d_cmp_result(cond)));
+        false -> case c == "S" of {
+            true -> concat(concat(lo_into(a, "r10"), lo_into(b, "r11")), s_flag(cond));
+            false -> {
+                wa: string <- concat(lo_into(a, "r10"), concat(staged_call("silica_rt_h2f", 1), ins("XS32", "r10, SVR_LC+16, r11")));
+                wb: string <- concat(lo_into(b, "r10"), concat(staged_call("silica_rt_h2f", 1), concat(ins2("mov", "r11", "r10"), ins("XL32", "r10, SVR_LC+16"))));
+                concat(concat(wa, wb), s_flag(cond))
+            }
+        }
+    }
+}
+
+fn xt_fcmp_set(dest: string, cond: string, a: string, b: string) -> string {
+    concat(xt_fcmp_flag(cond, a, b), concat(ins("movw", "r11, #0"), arm_vr@vr_put(dest, "r10", "r11")))
+}
+
+// --- conversions -----------------------------------------------------------------------------
+
+// FCVT between precisions.
+fn xt_fcvt(dest: string, a: string) -> string {
+    dc: string <- arm_vr@vr_class(dest);
+    ac: string <- arm_vr@vr_class(a);
+    case dc == ac of {
+        true -> arm_isa@xt_mov(dest, a);
+        false -> case dc == "D" and ac == "S" of {
+            true -> concat(concat(lo_into(a, "r10"), staged_call("__aeabi_f2d", 1)), arm_vr@vr_put(dest, "r10", "r11"));
+            false -> case dc == "S" and ac == "D" of {
+                true -> concat(concat(concat(lo_into(a, "r10"), hi_into(a, "r11")), staged_call("__aeabi_d2f", 2)), arm_vr@vr_put(dest, "r10", "r10"));
+                false -> case dc == "S" and ac == "H" of {
+                    true -> concat(concat(lo_into(a, "r10"), staged_call("silica_rt_h2f", 1)), arm_vr@vr_put(dest, "r10", "r10"));
+                    false -> case dc == "H" and ac == "S" of {
+                        true -> concat(concat(lo_into(a, "r10"), staged_call("silica_rt_f2h", 1)), arm_vr@vr_put(dest, "r10", "r10"));
+                        false -> case dc == "D" of {
+                            // H -> D through S
+                            true -> concat(concat(concat(lo_into(a, "r10"), staged_call("silica_rt_h2f", 1)), staged_call("__aeabi_f2d", 1)), arm_vr@vr_put(dest, "r10", "r11"));
+                            // D -> H through S
+                            false -> concat(concat(concat(concat(lo_into(a, "r10"), hi_into(a, "r11")), staged_call("__aeabi_d2f", 2)), staged_call("silica_rt_f2h", 1)), arm_vr@vr_put(dest, "r10", "r10"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn int_source_words(a: string) -> string {
+    concat(lo_into(a, "r10"), case arm_vr@vr_class(a) == "X" of {
+        true -> hi_into(a, "r11");
+        false -> ""
+    })
+}
+
+// SCVTF: signed integer (W or X) -> float.
+fn xt_scvtf(dest: string, a: string) -> string {
+    wide: boolean <- arm_vr@vr_class(a) == "X";
+    dc: string <- arm_vr@vr_class(dest);
+    case dc == "D" of {
+        true -> concat(concat(int_source_words(a), staged_call(case wide of { true -> "__aeabi_l2d"; false -> "__aeabi_i2d" }, case wide of { true -> 2; false -> 1 })), arm_vr@vr_put(dest, "r10", "r11"));
+        false -> {
+            f: string <- case wide of {
+                true -> staged_call("__aeabi_l2f", 2);
+                false -> concat(ins2("vmov", "s0", "r10"), concat(ins2("vcvt.f32.s32", "s0", "s0"), ins2("vmov", "r10", "s0")))
+            };
+            narrow: string <- case dc == "H" of {
+                true -> staged_call("silica_rt_f2h", 1);
+                false -> ""
+            };
+            concat(concat(int_source_words(a), concat(f, narrow)), arm_vr@vr_put(dest, "r10", "r10"))
+        }
+    }
+}
+
+// UCVTF: unsigned integer -> float.
+fn xt_ucvtf(dest: string, a: string) -> string {
+    wide: boolean <- arm_vr@vr_class(a) == "X";
+    dc: string <- arm_vr@vr_class(dest);
+    case dc == "D" of {
+        true -> concat(concat(int_source_words(a), staged_call(case wide of { true -> "__aeabi_ul2d"; false -> "__aeabi_ui2d" }, case wide of { true -> 2; false -> 1 })), arm_vr@vr_put(dest, "r10", "r11"));
+        false -> {
+            f: string <- case wide of {
+                true -> staged_call("__aeabi_ul2f", 2);
+                false -> concat(ins2("vmov", "s0", "r10"), concat(ins2("vcvt.f32.u32", "s0", "s0"), ins2("vmov", "r10", "s0")))
+            };
+            narrow: string <- case dc == "H" of {
+                true -> staged_call("silica_rt_f2h", 1);
+                false -> ""
+            };
+            concat(concat(int_source_words(a), concat(f, narrow)), arm_vr@vr_put(dest, "r10", "r10"))
+        }
+    }
+}
+
+// Float source (D, S or H) into r10 (S bits) or r10:r11 (D bits), H widened to S first.
+fn float_source(a: string) -> string {
+    ac: string <- arm_vr@vr_class(a);
+    case ac == "D" of {
+        true -> concat(lo_into(a, "r10"), hi_into(a, "r11"));
+        false -> case ac == "H" of {
+            true -> concat(lo_into(a, "r10"), staged_call("silica_rt_h2f", 1));
+            false -> lo_into(a, "r10")
+        }
+    }
+}
+
+// FCVTZS: float -> signed integer, rounding toward zero (VCVT.S32.F32 truncates; AEABI's *z routines too).
+fn xt_fcvtzs(dest: string, a: string) -> string {
+    wide: boolean <- arm_vr@vr_class(dest) == "X";
+    is_d: boolean <- arm_vr@vr_class(a) == "D";
+    conv: string <- case is_d of {
+        true -> staged_call(case wide of { true -> "__aeabi_d2lz"; false -> "__aeabi_d2iz" }, 2);
+        false -> case wide of {
+            true -> staged_call("__aeabi_f2lz", 1);
+            false -> concat(ins2("vmov", "s0", "r10"), concat(ins2("vcvt.s32.f32", "s0", "s0"), ins2("vmov", "r10", "s0")))
+        }
+    };
+    concat(concat(float_source(a), conv), arm_vr@vr_put(dest, "r10", "r11"))
+}
+
+// FCVTZU: float -> unsigned integer, rounding toward zero.
+fn xt_fcvtzu(dest: string, a: string) -> string {
+    wide: boolean <- arm_vr@vr_class(dest) == "X";
+    is_d: boolean <- arm_vr@vr_class(a) == "D";
+    conv: string <- case is_d of {
+        true -> staged_call(case wide of { true -> "__aeabi_d2ulz"; false -> "__aeabi_d2uiz" }, 2);
+        false -> case wide of {
+            true -> staged_call("__aeabi_f2ulz", 1);
+            false -> concat(ins2("vmov", "s0", "r10"), concat(ins2("vcvt.u32.f32", "s0", "s0"), ins2("vmov", "r10", "s0")))
+        }
+    };
+    concat(concat(float_source(a), conv), arm_vr@vr_put(dest, "r10", "r11"))
+}
+
+// FRINTZ: round toward zero to an integral value of the same precision (runtime, exact for all inputs).
+fn xt_frintz(dest: string, a: string) -> string {
+    ac: string <- arm_vr@vr_class(a);
+    case ac == "D" of {
+        true -> concat(concat(concat(lo_into(a, "r10"), hi_into(a, "r11")), staged_call("silica_rt_trunc_f64", 2)), arm_vr@vr_put(dest, "r10", "r11"));
+        false -> case ac == "H" of {
+            true -> concat(concat(float_source(a), concat(staged_call("silica_rt_trunc_f32", 1), staged_call("silica_rt_f2h", 1))), arm_vr@vr_put(dest, "r10", "r10"));
+            false -> concat(concat(lo_into(a, "r10"), staged_call("silica_rt_trunc_f32", 1)), arm_vr@vr_put(dest, "r10", "r10"))
+        }
+    }
+}
+
+// is_nan / is_inf / is_finite (kind "nan", "inf", "finite") on the bits: with the sign cleared, a value is
+// infinite when it equals the infinity pattern, NaN when above it, finite when below. Result 0/1 in dest.
+// r10 = the magnitude bits, r8 = the infinity pattern.
+fn class_flag32(kind: string) -> string {
+    cmp: string <- ins2("cmp", "r10", "r8");
+    case kind of {
+        "nan" -> concat(cmp, concat(ins("ite", "hi"), concat(ins("movhi", "r10, #1"), ins("movls", "r10, #0"))));
+        "finite" -> concat(cmp, concat(ins("ite", "lo"), concat(ins("movlo", "r10, #1"), ins("movhs", "r10, #0"))));
+        _: string -> concat(cmp, concat(ins("ite", "eq"), concat(ins("moveq", "r10, #1"), ins("movne", "r10, #0"))))
+    }
+}
+
+// Float64: r10 = low word, r11 = high word with the sign cleared, r8 = 0x7ff00000.
+fn class_flag64(kind: string) -> string {
+    case kind of {
+        "finite" -> concat(ins2("cmp", "r11", "r8"), concat(ins("ite", "lo"), concat(ins("movlo", "r10, #1"), ins("movhs", "r10, #0"))));
+        // the high word the pattern and the low word zero
+        "inf" -> concat(concat(ins3("eor", "r11", "r11", "r8"), ins("orrs", "r10, r10, r11")), concat(ins("ite", "eq"), concat(ins("moveq", "r10, #1"), ins("movne", "r10, #0"))));
+        // high above infinity, or high equal to it with a non-zero low word
+        _: string -> concat(concat(ins2("cmp", "r11", "r8"), concat(ins("bhi.w", "90f"), concat(ins("bne.w", "91f"), concat(ins("cmp", "r10, #0"), ins("beq.w", "91f"))))), concat("90:\n", concat(ins("movw", "r10, #1"), concat(ins("b.w", "92f"), concat("91:\n", concat(ins("movw", "r10, #0"), "92:\n"))))))
+    }
+}
+
+fn xt_fclass(dest: string, kind: string, a: string) -> string {
+    c: string <- arm_vr@vr_class(a);
+    flag: string <- case c == "D" of {
+        true -> concat(concat(concat(lo_into(a, "r10"), hi_into(a, "r11")), ins("bic", "r11, r11, #0x80000000")), concat(arm_vr@movi32("r8", 2146435072), class_flag64(kind)));
+        false -> case c == "H" of {
+            true -> concat(concat(lo_into(a, "r10"), concat(ins("bic", "r10, r10, #0x8000"), arm_vr@movi32("r8", 31744))), class_flag32(kind));
+            false -> concat(concat(lo_into(a, "r10"), concat(ins("bic", "r10, r10, #0x80000000"), arm_vr@movi32("r8", 2139095040))), class_flag32(kind))
+        }
+    };
+    concat(flag, concat(ins("movw", "r11, #0"), arm_vr@vr_put(dest, "r10", "r11")))
+}

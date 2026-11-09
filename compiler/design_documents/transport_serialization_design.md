@@ -151,7 +151,7 @@ a port can actually provide, and that is already decided by the device-actor and
   frame : string               the encoded term, version prefix included
         |
         v
-  wireframe@frame(frame, carrier@mtu((:uart1)), carrier@boundaries((:uart1)))   framing: length prefix, segmentation (§5)
+  wireframe@frame(frame, Carrier@mtu((:uart1)), Carrier@boundaries((:uart1)))   framing: length prefix, segmentation (§5)
         |
         v
   cast(carrier_actor, (:tx, segment, self()))        the carrier actor contract (§6.2)
@@ -258,8 +258,8 @@ path to it (`.values[]` or `.2`), as the lifetime errors name their path.
 ### 4.3 Derived functions
 
 ```
-encode(F, x: T) -> string                                          proc[mem(normal)]
-decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)           proc[mem(normal)]
+encode(F, x: T) -> string                                          proc[mem(<any kind>), transport]
+decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)           proc[mem(<any kind>), transport]
 ```
 
 - `F` is a format tag literal, `(:etf)`. A variable is a compile-time error: the implementation is selected at
@@ -268,7 +268,13 @@ decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)           proc[mem(norm
   `List[Collectable, S]` is (specification §8.2.4): the binding annotation, the parameter or return position, or
   the scrutinee of a `case`. A `decode` whose `T` cannot be resolved is E2403.
 - `T` must be able to cross (E2401, E2404 at the call) and, when it is variable-sized, the call must give limits (E2402).
-- Both allocate, so they are called inside a `sequence proc[mem(normal)]` block. They declare no other effect.
+- Both are transport operations (decided 2026-11-07): the sequence that calls them declares the `transport`
+  effect beside its allocation effect, `sequence proc[mem(normal), transport]`. The allocation effect may be
+  any `mem(...)` kind the language has; `mem(normal)` is not special. A call in a sequence without
+  `transport` is E3013; without any `mem(...)` the ordinary E3002; a `transport` nothing in the block needs
+  is the ordinary E3010. Effects stay local (specification §9.3.1 rule 4): a caller of a function that
+  encodes declares nothing. The same rule covers the byte-string builtins of §9.2 (`byte_at`, `byte_slice`,
+  `bytes_of`, `join_bytes`); the scalar bit and width conversions of §9.2 stay pure.
 - `decode` never returns partial data, and `(:rejected, reason)` names the first check that failed.
 
 **Rejection atoms** (a superset of §7.7's, fixed so trials can name them):
@@ -479,8 +485,8 @@ required {
 written in the compiler's tree (hosted carriers) or the port's board tree (hardware carriers), and the body of each
 method is a literal. A program names a tag; it cannot implement one. `WireFormat` is closed in the same way. The
 tag identifies the carrier: `(:tcp)`, `(:uart1)`, `(:ble_gatt)`. As an expression, `(:tcp)` is a parenthesised
-atom literal and denotes the atom `:tcp`, so a program writes the tag as the design does, `carrier@mtu((:tcp))`,
-and the bare atom `carrier@mtu(:tcp)` names the same row (§14).
+atom literal and denotes the atom `:tcp`, so a program writes the tag as the design does, `Carrier@mtu((:tcp))`,
+and the bare atom `Carrier@mtu(:tcp)` names the same row (§14).
 
 ### 6.2 The carrier actor contract
 
@@ -600,6 +606,21 @@ node and a Silica program agree on them:
 | display | `(:text, { row: uint8, text: string })` with `max_length: 64` | peer to board |
 
 These are inline types written out in the port's `board_values.silica` as documentation and trial fixtures (there is nothing to declare, §4.1); a program may ignore them and use its own types.
+
+### 6.7 Links: the hardware under a carrier
+
+A carrier names how bytes travel (its kind: `:tcp`, `:udp`, `:serial`). The **link** is the hardware layer under it:
+the OS interface on a host, or the UART, Wi-Fi station or Ethernet MAC on a board. The carrier declaration names the
+link, in a new top-level form `carried_on name: (:kind) (:link, params...);`, for example
+`carried_on host_line: (:serial) (:uart, 1, 115200);` (the head `carried_on` leaves the built-in module `carrier` unaffected
+and becomes a reserved word when the grammar phase lands; `spawn_dangerous_carrier(<name>)` is the planned replacement
+for installing a carrier through `spawn_dangerous` with an address string). Each target's transport pack (§6.0) lists the links the
+target provides, as it lists carriers, and a link the target cannot provide is a compile-time error (planned
+E2412 to E2417). A link failure is a supervised actor failure, not a value the sender checks. The order of phases is
+A hosted link naming, B UART on the ESP32-S3, C UART on the Nucleo, D network links on boards (later). **Nothing in
+this subsection is implemented**; the design (accepted for phase A planning) is
+[transport_links_design.md](transport_links_design.md) and the planned specification text is §16.4.9.
+
 
 ---
 
@@ -880,9 +901,9 @@ fn send_reading(state: { link: dangerous_actor_ref, credits: uint32,
                 x: int16, y: int16, z: int16, at: uint64)
     -> { link: dangerous_actor_ref, credits: uint32,
          rx: { expected: uint64, parts: List[string, normal] } } {
-    sequence proc[mem(normal), concurrency]
+    sequence proc[mem(normal), concurrency, transport]
         frame: string <- encode((:etf), (:accel, { x: x, y: y, z: z, at_ms: at }));
-        segments: List[string, normal] <- wireframe@frame(frame, carrier@mtu((:tcp)), carrier@boundaries((:tcp)));
+        segments: List[string, normal] <- wireframe@frame(frame, Carrier@mtu((:tcp)), Carrier@boundaries((:tcp)));
         cast_dangerous(state.link, (:tx, head(segments), self()));
     produces
         pure { link: state.link, credits: state.credits - 1, rx: state.rx }
@@ -924,7 +945,7 @@ fn apply_command(frame: string,
                           rx: { expected: uint64, parts: List[string, normal] } })
     -> { link: dangerous_actor_ref, credits: uint32,
          rx: { expected: uint64, parts: List[string, normal] } } {
-    sequence proc[mem(normal), concurrency]
+    sequence proc[mem(normal), concurrency, transport]
         decoded: (:ok, (:led, { which: :single | :red | :green | :blue, on: boolean })) | (:rejected, atom)
             <- decode((:etf), frame);
         case decoded of {
@@ -995,7 +1016,7 @@ On the wire it is preceded by `00 00 00 30`. The reply `{led, #{which => red, on
 ### 13.5 The same owner on the board
 
 Replace the carrier: `use uart1_carrier;` for `use tcp_carrier;`, `(:uart1)` for `(:tcp)` in the two
-`carrier@` calls, and `device_actor_ref` with `cast_device` for the link's type and casts. The module loses its
+`Carrier@` calls, and `device_actor_ref` with `cast_device` for the link's type and casts. The module loses its
 `dangerous_` prefix and gains the `device_` prefix, since the carrier is now a device worker and no Fifi is
 involved. The frames are the same bytes, and on the host an Erlang port program reading the serial line with
 `{packet, 4}` receives them unchanged. The readings themselves come from the I2C0 worker (plan item G) as
@@ -1007,6 +1028,33 @@ involved. The frames are the same bytes, and on the host an Erlang port program 
 
 Phases 0 and 1 of §10 are in the tree and green on the Apple Silicon path; Linux lock-step (phase 3, after the hosted carriers of phase 2 by decision of 2026-11-05) is
 not started, and the other three targets' transport packs provide no protocol, so they answer E2410.
+
+**Status 2026-11-08 (all targets).** The §9.2 builtins and the derived `encode`/`decode` are now emitted on the
+two Linux targets (`emitter/linux_*/terms/prims/prims_transport.silica`) and on both boards
+(`emitter/ESP32-S3_raw` and `emitter/STM32-L476RG_raw`: `terms/prims/prims_transport.silica` for the scalar
+builtins, `board/runtime/rt_transport.S` for the ones that touch a string or a list). Every target's transport
+pack provides the `etf` format; no board provides a carrier yet, so a board program that names a carrier is
+rejected at compile time as not provided on the target, and the carrier loopback apps are not run on boards (a board
+runs one application at a time, and there is no TX-to-RX jumper to rely on, per the links design). The ETF format
+module is reached only by an explicit `use wire_etf;`; nothing adds it implicitly. Derived transport source is
+numbered separately from the user's source: its case labels carry a per-declaration tag (`d<index>`) so a derived
+label can never collide with a user label at the same byte offset (trial `transport_derived_case_label_collision`).
+The trials `transport_addition` and the `transport_err_*` family run on the hosted targets; the boards skip them
+until board carriers exist (`trials/targets/<board>.skip`). The carrier module's file is `Carrier.silica`
+(`Carrier@mtu(...)`), spelled with a capital everywhere, because the case-sensitive Linux hosts cannot resolve the
+lowercase spelling.
+
+**The `transport` effect (2026-11-07, Lee).** `encode`, `decode`, `recreate` and the byte-string builtins
+`byte_at`, `byte_slice`, `bytes_of`, `join_bytes` require the new built-in effect `transport` on the sequence
+that calls them, beside an allocation effect of any `mem(...)` kind (`effect_checker_core@builtin_fn_effects`
+answers `[mem(any), transport]`, where the internal `mem(any)` parameter is matched by
+`effect_checker_capabilities@is_mem_subeffect` against every declared kind in both directions; a program cannot
+write `mem(any)`). A missing `transport` is E3013 (`effect_checker_capabilities`), a missing allocation effect
+stays E3002, an unneeded `transport` stays E3010; effects stay local. `wire_etf`, `wireframe` and the three
+carriers declare it (their pure decoders reach the byte builtins through one-binding `transport` sequences,
+`tag_at` / `slice` / `at`), and the derived encoders (`transport_derive`) declare it where they call
+`join_bytes` and `byte_at`. The scalar conversions of §9.2 (`atom_name`, `float64_bits`, `to_int64`, ...) stay
+pure; `recreate` keeps its allocation classification (none) and needs `transport` alone.
 
 **Builtins (§9.2), all pure, Apple Silicon emission in `emitter/apple_silicon_mac/terms/prims/prims_transport.silica`:**
 `byte_at`, `byte_slice`, `bytes_of` (a `List[int64, mem(normal)]` of byte values to a string),
@@ -1056,7 +1104,7 @@ empty record literal); both are E2401 naming the component. Trials: `transport_e
 
 **Specification text (§11):** landed 2026-11-05 in silica-specification.md: §1.2 (one principle line), §4.1.6
 (byte access), §4.1.7 (names at run time), §15.1.4 (the reference on the wire), the new §16.4 "Wire
-Transport" (§16.4.1 to §16.4.7: the calls and limits, the transportable types, the rejection atoms, the
+Transport" (§16.4.1 to §16.4.6 and §16.4.10: the calls and limits, the transportable types, the rejection atoms, the
 call-site rule and W2401, the closed protocol set and E2410, the ETF binding, the diagnostics), §20.4 (one
 paragraph) and §22.19 (the builtins). The carrier contract and framing (§5, §6) enter the specification
 with phase 2.
@@ -1072,9 +1120,9 @@ with phase 2.
 - The carrier properties (§6.1) are `compiler/stdlib/Carrier.silica`: `mtu`, `boundaries`, `delivery`,
   `addressing` and `provides` (renamed from `provided` on 2026-11-09: `provided` is a keyword, so the
   call could never be parsed), each a `case` over the tag's atom. The parameter type is `atom` because a
-  one-atom tagged tuple is not a run-time value in this language; the design's spelling `carrier@mtu((:tcp))`
+  one-atom tagged tuple is not a run-time value in this language; the design's spelling `Carrier@mtu((:tcp))`
   works all the same, since the parser reads `(:tcp)` as a parenthesised atom literal (expression kind 2)
-  whose value is the atom `:tcp`, and the bare `carrier@mtu(:tcp)` names the same row. Both forms compile to
+  whose value is the atom `:tcp`, and the bare `Carrier@mtu(:tcp)` names the same row. Both forms compile to
   the same code (checked 2026-11-09 with no compiler change; trial `transport_addition/transport_carrier_tags`
   reads every property of every hosted tag both ways and frames with them). The tag-keyed trait dispatch of
   §9.1 is not built; the module is the closed set.
@@ -1127,7 +1175,7 @@ with phase 2.
   run (no device on the integrate host). The BEAM demo of §13 is `programmer_tools/transport_beam_demo`
   (`run_demo.sh`, outside `make integrate`): the Erlang peer receives the 48-byte `{accel, #{...}}` frame
   of §13.4 and the program decodes the `{led, #{which => red, on => true}}` it answers. The specification
-  text is §16.4.8 (framing) and §16.4.9 (carriers). Deferred, each to the phase that first needs it: E2407 and the
+  text is §16.4.7 (framing) and §16.4.8 (carriers). Deferred, each to the phase that first needs it: E2407 and the
   `WireFrame` segmentation under a real BLE mtu to phase 5 (the first `:unreliable` carrier whose `mtu` a
   fixed-size frame can exceed), and the Linux emitters' side of the FFI struct-result fix to phase 3.
 

@@ -101,6 +101,9 @@
 #define VRG_ATOP       124
 #define VRG_MCHUNK     128
 #define VRG_ACHUNK     132
+#define VRG_ARG        136
+#define VRG_FLOOR      140      // chunk 15 (rt_frame.S): the running frame's floor
+#define VRG_CCB        144
 
     .section .text.silica_rt_start, "ax"
     .literal_position
@@ -221,6 +224,10 @@ silica_rt_start_windowed:
     s32i    a3, a2, VRG_MCHUNK
     movi    a3, silica_rt_main_achunk
     s32i    a3, a2, VRG_ACHUNK
+    l32i    a3, a2, VRG_VSP
+    s32i    a3, a2, VRG_FLOOR                       // main's first frame: an empty dynamic part
+    movi    a3, 0
+    s32i    a3, a2, VRG_CCB
     call8   silica_rt_heap_init
     call8   silica_rt_actors_init        // main's context exists before the first emitted prologue
     // Both cores start at the beginning of a line (rt_console.S, the line hold): a core that has

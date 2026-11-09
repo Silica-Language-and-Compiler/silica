@@ -11,6 +11,7 @@
 | [memory-effects-aarch64-implementation-plan.md](memory-effects-aarch64-implementation-plan.md) | Memory `Space` model for OS-free AArch64 and embedded targets (implementation plan) |
 | [porting_for_os_free_targets.md](porting_for_os_free_targets.md) | OS-free / raw-metal port inventory: boot, `Space` pools, MMIO prims, board packs |
 | [silica_device_actor_specification.md](silica_device_actor_specification.md) | Device-worker actors: `register_rwr` only in `spawn_device` behaviors, `device_actor_ref`, disjoint from Fifi |
+| [transport_serialization_design.md](transport_serialization_design.md), [transport_links_design.md](transport_links_design.md) | Wire transport design (§16.4) and the planned carrier links (§16.4.9; design accepted, nothing implemented) |
 | [tls_quantum_safe_future.md](tls_quantum_safe_future.md) | **Future development:** first-class quantum-safe TLS (TLS 1.3 + hybrid ML-KEM), supervised session actors, Fifi taint |
 
 Platform-specific runtime notes are added as Silica grows to support each target. The macOS crash-handling document is therefore not a portable guarantee for Linux, Windows, bare-metal targets, or future hosted runtimes; those platforms require their own fault-delivery, signal/exception, and process-isolation notes.
@@ -23,6 +24,8 @@ Platform-specific runtime notes are added as Silica grows to support each target
 Silica is a functional systems programming language designed for AArch64 architectures. It emphasizes explicit effect tracking, message-passing concurrency through actors, and memory safety through region-based ownership without garbage collection.
 
 ### 1.2 Design Principles
+**Important: transport is a full and equal citizen of Silica.** Data transport is a full behavior of modern computing devices, so it is built into the language and its compiler and checked by the effect system (the `transport` effect, §9.1.1), as actors and regions are; it is not an add-on library.
+
 - **Explicit Effects**: All side effects are tracked in type signatures
 - **Process Monad**: Sequential computations represented as monadic processes
 - **Actor-Based Concurrency**: Message passing as primary concurrency mechanism
@@ -4763,6 +4766,7 @@ Silica defines several built-in effects that track different kinds of side effec
 - `hot_swap` - Code loading (dynamic loading, JIT, self-modifying code). On AArch64, requires `ISB` barrier to ensure instruction fetch sees code writes.
 - `register_rwr` - Direct device register (MMIO) access. On AArch64, requires `DSB SY` before and `ISB` after for device ordering. This effect authorizes **execution** of the poke prims `map_device`, `peek`, and `poke` (§9.2.2) inside a **device worker** behavior installed by `spawn_device` / `spawn_device_registered`; it does **not** authorize `main`, ordinary `spawn` behaviors, or the spawn install site. Full rules: [silica_device_actor_specification.md](silica_device_actor_specification.md). Named exceptions (reset, early panic, IRQ enqueue) are listed in that document §7.
 - `external_danger` - Outbound calls to `dangerous_*` FFI wrapper modules inside an FFI worker actor's `external_danger` sequence. This effect authorizes **execution** of foreign calls inside the worker behavior installed by `spawn_dangerous`; it does **not** authorize callers at the `spawn_dangerous` install site. Full rules: [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md) §4. On macOS, same-process guarded-FFI crash handling is best-effort and platform-specific; see [macos_crash_handling_for_silica.md](macos_crash_handling_for_silica.md). Other platform-specific crash-handling notes will be added as Silica expands to support those targets.
+- `transport` - Wire transport (§16.4): the derived calls `encode`, `decode` and `recreate`, and the byte-string builtins `byte_at`, `byte_slice`, `bytes_of` and `join_bytes` (§22.19). A sequence that calls one of them declares `transport` **beside** its allocation effect: `sequence proc[mem(normal), transport]`. The allocation effect may be any `mem(...)` kind (`mem(normal)` is not special; `mem(normal_noncacheable)`, `mem(atomic)`, ... satisfy it); `transport` alone is enough for `byte_at` and `recreate`, which allocate nothing. A transport operation in a sequence without `transport` is E3013; without any `mem(...)` it is the ordinary E3002; a declared `transport` that no operation in the block needs is E3010. Like every effect it is local to its sequence (§9.3.1 rule 4): a caller of a function that encodes needs no `transport` of its own.
 
 **Memory effect guarantees (hosting; normative at this time):** The **distinct hardware behaviors** associated with each `mem(Space)` and region `Space` (write-back, write-through, non-cacheable normal, device, and atomic backing rules in **§12.1.1** and following) are **fully supported and guaranteed only on OS-free executions**—for example bare-metal **boards**, firmware, or any environment where the **Silica runtime and linker script control** how memory regions are mapped and which **cacheability / ordering attributes** apply. On **OS-hosted** programs—**macOS**, **Linux**, **Windows**, **Solaris**, and comparable multiprogramming systems—application memory is exposed through the **traditional flat virtual address model** historically rooted in Unix and the **PDP-11** view of a process: ordinary allocations receive **uniform, OS-chosen** attributes, not a portable, per-allocation choice of Silica memory spaces. Because the **operating system controls and shares physical RAM** among processes, that model **cannot be sidestepped** by a portable application runtime to obtain, for all Silica regions, the same per-space **page-table / MAIR-class** distinctions the language describes. On OS-hosted targets, `mem(Space)` and `region(R, Space)` remain in the **type and effect system** for static discipline, documentation, and integration with **non-portable** or **driver-mediated** buffers where available, but **this specification does not guarantee**, at this time, that each memory space maps to **different hardware attributes** on those OSes. See **§12.1.1.0**.
 
@@ -5576,6 +5580,7 @@ When encountering effect errors, consider:
 - **E3010**: Unused effect declaration (UnusedEffectDeclaration): an effect declared on a sequence that nothing in the block requires
 - **E3011**: List memory space mismatch: a `List[T, S]` inside a sequence uses a space `S` different from the sequence's declared `mem(...)`
 - **E3012**: Nested `external_danger`: `sequence proc[external_danger]` is valid only as the root body of a function
+- **E3013**: Transport operation without the `transport` effect: a sequence calls `encode`, `decode`, `recreate`, `byte_at`, `byte_slice`, `bytes_of` or `join_bytes` and its `proc[...]` does not name `transport` (§9.1.1, §16.4). The allocation these operations need is checked separately and is satisfied by any `mem(...)` kind (E3002 when none is declared)
 
 #### 9.3.2 Effect Composition
 Effect polymorphism is achieved through concrete functions for each effect combination, preserving all effect information.
@@ -10467,10 +10472,12 @@ The `reply_to` field is optional - messages without it cannot be used for cast-b
 
 ### 16.4 Wire Transport
 
+**Important: transport is a full and equal citizen of Silica.** Data transport is a full behavior of modern computing devices, so it is built into the language and its compiler and checked by the effect system (the `transport` effect, §9.1.1), as actors and regions are; it is not an add-on library.
+
 Values cross a link as **frames**, byte strings (§4.1.6) written and read by a **wire protocol** the
 language provides. Transport is three concerns: what may cross (a property of the type, read at each call),
 how bytes are spelled (a wire protocol, one built-in implementation per protocol tag, a closed set), and how
-bytes travel (a carrier, one built-in implementation per link tag, a closed set). This section is normative
+bytes travel (a carrier, one built-in implementation per carrier kind, a closed set). This section is normative
 for the first two; carriers and framing are specified when they are built (transport_serialization_design.md
 §5 and §6). Decoding is validation: every received byte is untrusted input, and a decoder never answers
 partial data.
@@ -10478,8 +10485,8 @@ partial data.
 #### 16.4.1 encode and decode
 
 ```
-encode(F, x: T) -> string                                                proc[mem(normal)]
-decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)                 proc[mem(normal)]
+encode(F, x: T) -> string                                                proc[mem(<any kind>), transport]
+decode(F, bytes: string) -> (:ok, T) | (:rejected, atom)                 proc[mem(<any kind>), transport]
 decode(F, bytes: string, { max_bytes: N, max_depth: D, max_length: L }) -> (:ok, T) | (:rejected, atom)
 decode(F, bytes: string, { ... }, r: region(L, normal)) -> (:ok, T) | (:rejected, atom)   // T with ref?(L, S, rec) slots
 ```
@@ -10504,7 +10511,9 @@ decode(F, bytes: string, { ... }, r: region(L, normal)) -> (:ok, T) | (:rejected
 - A type with a `ref?(L, S, rec)` slot (§4.2.2) decodes into a **region the caller owns**: the fourth
   argument, `region(L, normal)` with the slot's lifetime; each present slot of the result is an
   `alloc_rec` cell in that region.
-- Both builtins allocate (`mem(normal)`) and declare no other effect. The compiler derives their bodies
+- Both builtins are transport operations: the sequence that calls them declares `transport` (§9.1.1, E3013
+  when it is missing) beside an allocation effect of any `mem(...)` kind, `sequence proc[mem(normal), transport]`
+  being the usual form. The compiler derives their bodies
   from `T`; a program never writes a protocol's bytes itself. There is nothing to declare: the earlier
   marker traits `Transportable` and `Recreatable` are not part of the language, and an `impl` of either is
   E2411. `decode` and the FFI wrapper specification's `recreate` (§7.7 there) are one mechanism: the same
@@ -10583,7 +10592,7 @@ declares a tagged tuple. Silica's unit is the empty tuple `{}`. OTP writes small
 order, so a map frame from Erlang is compared by decoding, and the byte-for-byte canonical form holds for
 Silica-to-Silica frames only.
 
-#### 16.4.8 Framing
+#### 16.4.7 Framing
 
 A frame is one encoded term. Carriers differ in whether they keep boundaries and how much they move at
 once, so the built-in module `wireframe` sits between `encode` and a carrier. It is not a trait: there is one
@@ -10605,20 +10614,20 @@ wireframe@unframe(state: { mode: atom, expected: int64, pending: string }, segme
   arrived in the same segment by calling again with an empty segment. A frame longer than `max_frame` is
   `:rejected` with `:too_large`; a segment out of order is `:bad_tag`.
 
-#### 16.4.9 Carriers
+#### 16.4.8 Carriers
 
-A carrier is an actor the language provides, one built-in implementation per link tag, installed by the
+A carrier is an actor the language provides, one built-in implementation per carrier kind (`:tcp`, `:udp`, `:serial`), installed by the
 program with `spawn_dangerous` (hosted carriers are Fifi wrappers over the host's sockets and serial ports)
 and spoken to only through casts. `Carrier` is a closed trait (E2409); its properties are literals per tag,
-read through the built-in module `carrier` by the tag's atom (the design's `carrier@mtu((:tcp))` is the same
+read through the built-in module `carrier` by the tag's atom (the design's `Carrier@mtu((:tcp))` is the same
 call: `(:tcp)` as an expression is a parenthesised atom literal):
 
 ```
-carrier@mtu(c: atom) -> int64            // largest segment in bytes; 0 means unbounded
-carrier@boundaries(c: atom) -> atom      // :stream | :datagram | :storage
-carrier@delivery(c: atom) -> atom        // :reliable_ordered | :ordered_lossy | :unreliable
-carrier@addressing(c: atom) -> atom      // :none | :endpoint | :characteristic | :block
-carrier@provides(c: atom) -> boolean     // whether this build's target provides the carrier (`provided` is a keyword)
+Carrier@mtu(c: atom) -> int64            // largest segment in bytes; 0 means unbounded
+Carrier@boundaries(c: atom) -> atom      // :stream | :datagram | :storage
+Carrier@delivery(c: atom) -> atom        // :reliable_ordered | :ordered_lossy | :unreliable
+Carrier@addressing(c: atom) -> atom      // :none | :endpoint | :characteristic | :block
+Carrier@provides(c: atom) -> boolean     // whether this build's target provides the carrier (`provided` is a keyword)
 ```
 
 **The carrier contract.** Every message is cast-only.
@@ -10659,7 +10668,77 @@ its `spawn_dangerous` (a `dangerous_*` function cannot be called outside an `ext
 socket wrappers behind the hosted carriers are the dangerous module `dangerous_sockets` over
 `libsilica_sockets.a`, shipped with the compiler under `compiler/stdlib/net/`.
 
-#### 16.4.7 Diagnostics
+#### 16.4.9 Carrier links (planned; not implemented)
+
+**Status: design accepted for phase A planning; nothing in this subsection is implemented.** The rules below are
+normative for the build that adds them and are marked planned until then. The design is
+[transport_links_design.md](transport_links_design.md).
+
+A carrier's tag names how bytes travel (`:tcp`, `:udp`, `:serial`). A **link** is the hardware layer under it: the OS
+interface on a hosted target, or the UART, Wi-Fi station or Ethernet MAC on a board. A link is a tag followed by
+parameters, written as a tagged tuple such as `(:uart, 1, 115200)` where the language allows it and otherwise as a
+record such as `{ kind: :uart, n: 1, baud: 115200 }`; which is used is decided when the grammar phase starts. A link
+is read by the compiler only: it is literal, never a run-time value, and a one-atom link such as `(:loopback)` is a
+type-level tag like a protocol tag (§16.4.1). The language names these links: `(:loopback)`, `(:interface, name)`,
+`(:ethernet, n)`, `(:wifi, n)`, `(:uart, n, baud)`, `(:serial_port, path, baud)` and `(:usb_cdc, n)`.
+
+**The carrier declaration (planned).** A new top-level form, a pure declaration with no effects:
+
+```
+carried_on <name>: (<:kind>) (<:link>, <params>...);
+```
+
+For example `carried_on lan: (:tcp) (:interface, "en0");` and `carried_on telemetry: (:serial) (:uart, 1, 115200);`.
+`carried_on` is the declaration head; it replaces both a `carrier` keyword and an `on` word, and the kind and the link
+follow the name. It binds `<name>` to a carrier kind and a link. The program names the carrier by `<name>` where it
+names a kind today, and the link may only narrow the kind's properties (§16.4.8). It needs a parser change, and
+`carried_on` becomes a reserved word when the grammar phase lands. The built-in module `carrier` (§16.4.8) is
+unaffected: `carrier` does not become a keyword. The word `link` is never used in the declaration, because `link` is a
+keyword of actor links (§15.4).
+
+**Installing a carrier (planned).** `spawn_dangerous_carrier(<name>)` starts the carrier actor that `<name>` declares. It
+is the planned replacement for installing a carrier through `spawn_dangerous` with an address string (§16.4.8).
+
+**The transport pack (planned).** Each target's transport pack gains `provides_link(link: string, instance: uint32)
+-> boolean`, flat tables like `provides_carrier`, never overridden by a program. The pack lists what the target
+provides; configuration that is fixed by the board (UART pins, windows) lives in the board pack and is not a
+declaration parameter: pins come only from the board pack and a program cannot pass pins. A UART link is 8N1 with no
+flow control; parity, stop bits and flow control are deferred.
+
+**Meaning by target.** On a hosted target the OS owns the hardware and brings the interface up. `(:loopback)` binds or
+connects on the host's loopback address; `(:interface, name)` binds to the address of the named interface (portable;
+forcing traffic through the interface with per-OS socket options is a possible later option); `(:ethernet, n)` and
+`(:wifi, n)` keep the same syntax as on boards and pick the n-th interface the OS classifies as that family, by
+interface enumeration; instance numbers are only as stable as the OS's enumeration, and when no such interface exists
+the carrier fails at open with `(:explicit, :link_unavailable)`; the hosted `provides_link` answers true for every tag
+the hosted target supports;
+`(:serial_port, path, baud)` names a termios port. There is no separate bring-up actor on a host: the carrier actor is
+it. On a board the carrier is served by a **bring-up actor**, a dangerous actor under a supervisor that owns the
+link: it brings it up (clock, pins, UART configure), watches it and reconnects. Wi-Fi and Ethernet on boards are
+later and out of scope.
+
+**Link failure (planned).** A link failure is a supervised actor failure. The bring-up actor, or on a host the carrier
+actor, ends with an exit reason (for example `(:explicit, :link_unavailable)`), and the supervisor restarts it under
+the ordinary policy of §15.4.11 (there is no link-specific backoff); the carrier then reports `:link_up` again. It is not a value the sender checks, and
+it never exits the process (§15.4.11, runtime_failure_reporting.md). A carrier in the declaration's own terms is one
+carrier per link instance.
+
+**Phase order (planned).** A hosted link naming (Mac, Linux AArch64, Linux x86-64); B UART on the ESP32-S3_raw;
+C UART on the STM32-L476RG_raw; D network links on boards, later.
+
+| Code (planned) | Check |
+| --- | --- |
+| E2412 | a carrier declaration names a link the target's transport pack does not provide (including a UART instance that is the target's console); raised wherever the declaration appears |
+| E2413 | a link tag the language does not name |
+| E2414 | the link cannot carry the carrier's kind (`:tcp` on `(:uart, 1, 115200)`) |
+| E2415 | two carrier declarations in one application name the same link tag and instance, or a UART instance another subsystem uses (the console, printing, failure banners) |
+| E2416 | the link needs a board configuration function that is not defined (phase D) |
+| E2417 | a link parameter is not a literal or fails the pack's check (baud out of range, non-literal instance or interface name) |
+
+The numbers are proposed and final numbers are assigned by the diagnostics table at implementation. Until then the
+language does not diagnose these cases and `carried_on ...` does not parse.
+
+#### 16.4.10 Diagnostics
 
 | Code | Check |
 | --- | --- |
@@ -10673,6 +10752,7 @@ socket wrappers behind the hosted carriers are the dangerous module `dangerous_s
 | E2409 | a program `impl` of `WireFormat` or `Carrier` |
 | E2410 | a protocol or carrier tag the build's target does not provide |
 | E2411 | an `impl Transportable` or `impl Recreatable` declaration |
+| E2412 to E2417 | planned, not implemented: carrier link diagnostics (§16.4.9) |
 | W2401 | advisory: a decoder was derived; foreign bytes become values here |
 
 ## 17. Atomic Operations
@@ -15126,7 +15206,7 @@ Pure. `(true, result)` when the result fits in `int64`; `(false, _)` on overflow
 
 ### 22.19 Wire Transport Builtins
 
-All pure (no effects), shared by every target; `encode` and `decode` themselves are §16.4.1.
+Shared by every target; `encode` and `decode` themselves are §16.4.1. The byte-string builtins `byte_at`, `byte_slice`, `bytes_of` and `join_bytes` are transport operations: they are called inside a sequence that declares `transport` (§9.1.1), beside a `mem(...)` effect of any kind for the three that build a string (`byte_at` needs `transport` alone). The bit, atom and width conversions below are pure.
 
 ```
 byte_at(s: string, i: int64) -> int64                       // the byte at i; out of range is a run-time failure

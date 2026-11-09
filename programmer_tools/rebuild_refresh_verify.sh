@@ -32,7 +32,7 @@
 # A raw target (ESP32-S3_raw) is built here as a cross compiler and its trials run on the board
 # attached to this machine. It has no golden step: the board harness compares program output only,
 # never assembly, so there is nothing to record. Its run needs the board plugged in, and it takes the
-# same tree-wide lock as this machine's own run, so the two never overlap.
+# own per-target lock (trials/.integrate.lock.<target>), so a second board run is refused while this machine's own run can overlap it.
 #
 # Each platform prints a before line and an after line. The exit status is 0 only when every
 # platform's second run passed.

@@ -148,7 +148,7 @@ cd trials/<the suite your trial lives in>
 make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host
 ```
 
-Read `.integrate_report`. Failures come in three kinds and they mean different things: `.sout differs`
+Read `.integrate_report` (or `.integrate_report.<target>`). Failures come in three kinds and they mean different things: `.sout differs`
 is a real behaviour difference, `.sams differs` is a recorded assembly expectation that no longer
 matches, and `has no .ascomp` is a golden that was never recorded.
 
@@ -318,7 +318,7 @@ This script never builds a compiler. Each machine must already have its own nati
 - `--log-dir DIR` sets where logs and reports land (default: `../silica_trial_runs/<timestamp>`).
 - `--mac-jobs`, `--pi-jobs` and `--nix-jobs` set the parallelism for those machines.
 
-Remote machines run at the same time as each other. This machine runs its own trials and then the board, because both take `trials/.integrate.lock` — one trial run per machine. The script prints one summary table at the end and exits 0 only when every platform passed.
+Remote machines run at the same time as each other. This machine runs its own trials and then the board, because each takes its own per-target lock (`trials/.integrate.lock.<target>`). The script prints one summary table at the end and exits 0 only when every platform passed.
 
 ## Build and then run the trials, in one command
 
@@ -457,11 +457,11 @@ make integrate TRIAL_TARGET=both                  # this machine, then the board
 make -C case_addition integrate TRIAL_TARGET=ESP32-S3_raw   # one suite on the board
 ```
 
-Only one trial run, host or board, can be in progress at a time; a second one stops and names the run in progress. The board run writes its report to `trials/.integrate_report.ESP32-S3_raw` and leaves the host's results untouched. How it works, what it skips and its settings: [trials/targets/README.md](https://github.com/yenrab/silica/blob/main/trials/targets/README.md). What it needs installed: [Required software]({{ '/required-software/' | relative_url }}).
+Only one trial run PER TARGET can be in progress (`trials/.integrate.lock.<target>`); a second run of the same target stops and names the holder, and runs of different targets (this machine, the board, the remote Linux machines) overlap. The board run writes its report to `trials/.integrate_report.ESP32-S3_raw` and leaves the host's results untouched. How it works, what it skips and its settings: [trials/targets/README.md](https://github.com/yenrab/silica/blob/main/trials/targets/README.md). What it needs installed: [Required software]({{ '/required-software/' | relative_url }}).
 
 ## Reading a report
 
-`trials/.integrate_report` starts with the totals and then lists each failing trial with its reason (`.sams differs from .ascomp`, `.sout differs from .scout`, `.cur_fail differs from .golden_fail`, `compilation failed`, `missing executable`, and so on).
+`trials/.integrate_report` (a copy is kept as `.integrate_report.<target>`, e.g. `.integrate_report.macos_applesilicon`) starts with the totals and then lists each failing trial with its reason (`.sams differs from .ascomp`, `.sout differs from .scout`, `.cur_fail differs from .golden_fail`, `compilation failed`, `missing executable`, and so on).
 
 - **Trust the totals.** If the `fail:` count is higher than the number of listed lines, a suite failed as a whole (for example its batch compile aborted on one trial) and has no per-trial lines; open that suite's `.integrate_log` for the reason.
 - **`missing executable (assemble/link failed earlier)`** on hundreds of trials in one suite usually means a single `.sams` in that suite failed to assemble; the `assemble failed` line names it.

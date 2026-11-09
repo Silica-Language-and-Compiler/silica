@@ -40,7 +40,7 @@ fn fresh(boundaries: atom) -> { mode: atom, expected: int64, pending: string } {
 }
 
 fn u32_prefix(n: int64) -> string {
-    sequence proc[mem(normal)]
+    sequence proc[mem(normal), transport]
         xs: List[int64, mem(normal)] <- [(n / 16777216) % 256, (n / 65536) % 256, (n / 256) % 256, n % 256];
         out: string <- bytes_of(xs)
     produces
@@ -49,7 +49,7 @@ fn u32_prefix(n: int64) -> string {
 }
 
 fn u16_pair(seq: int64, index: int64) -> string {
-    sequence proc[mem(normal)]
+    sequence proc[mem(normal), transport]
         xs: List[int64, mem(normal)] <- [(seq / 256) % 256, seq % 256, (index / 256) % 256, index % 256];
         out: string <- bytes_of(xs)
     produces
@@ -58,7 +58,7 @@ fn u16_pair(seq: int64, index: int64) -> string {
 }
 
 fn join2(a: string, b: string) -> string {
-    sequence proc[mem(normal)]
+    sequence proc[mem(normal), transport]
         parts: List[string, mem(normal)] <- [a, b];
         out: string <- join_bytes(parts)
     produces
@@ -92,7 +92,7 @@ fn segments(f: string, payload: int64, index: int64, n: int64) -> List[string, m
     stop: int64 <- case start + payload >= n of { true -> n; false -> start + payload };
     last: boolean <- stop >= n;
     hdr: string <- case last of { true -> u16_pair(0, index + 32768); false -> u16_pair(0, index) };
-    seg: string <- join2(hdr, byte_slice(f, start, stop));
+    seg: string <- join2(hdr, slice(f, start, stop));
     case last of {
         true -> one(seg);
         false -> {
@@ -106,8 +106,24 @@ fn segments(f: string, payload: int64, index: int64, n: int64) -> List[string, m
     }
 }
 
+// byte_at and byte_slice are transport operations (specification §9.1.1, §16.4): called inside
+// sequences that declare `transport`, here, so the framing functions stay pure.
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+fn slice(s: string, start: int64, stop: int64) -> string {
+    sequence proc[mem(normal), transport]
+        out: string <- byte_slice(s, start, stop)
+    produces
+        pure out
+    end
+}
 fn be32_at(s: string, i: int64) -> int64 {
-    ((byte_at(s, i) * 256 + byte_at(s, i + 1)) * 256 + byte_at(s, i + 2)) * 256 + byte_at(s, i + 3)
+    ((at(s, i) * 256 + at(s, i + 1)) * 256 + at(s, i + 2)) * 256 + at(s, i + 3)
 }
 
 // One segment in; (:more, state), (:frame, frame, state) or (:rejected, atom) out.
@@ -131,7 +147,7 @@ fn unframe_stream(mode: atom, expected: int64, bytes_in: string, max_frame: int6
                 true -> (:rejected, :too_large);
                 false -> case have >= 4 + want of {
                     false -> (:more, { mode: mode, expected: want, pending: bytes_in });
-                    true -> (:frame, byte_slice(bytes_in, 4, 4 + want), { mode: mode, expected: 0, pending: byte_slice(bytes_in, 4 + want, have) })
+                    true -> (:frame, slice(bytes_in, 4, 4 + want), { mode: mode, expected: 0, pending: slice(bytes_in, 4 + want, have) })
                 }
             }
         }
@@ -146,19 +162,19 @@ fn unframe_stream(mode: atom, expected: int64, bytes_in: string, max_frame: int6
 fn unframe_datagram(state: { mode: atom, expected: int64, pending: string }, segment: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
     n: int64 <- length_bytes(segment);
     in_progress: boolean <- length_bytes(state.pending) > 0;
-    starts_multi: boolean <- n >= 4 and byte_at(segment, 0) == 0 and byte_at(segment, 1) == 0 and byte_at(segment, 2) == 0 and byte_at(segment, 3) == 0;
+    starts_multi: boolean <- n >= 4 and at(segment, 0) == 0 and at(segment, 1) == 0 and at(segment, 2) == 0 and at(segment, 3) == 0;
     case in_progress or starts_multi of {
         false -> (:frame, segment, { mode: state.mode, expected: 0, pending: "" });
         true -> case n < 4 of {
             true -> (:rejected, :truncated);
             false -> {
-                index: int64 <- byte_at(segment, 2) * 256 + byte_at(segment, 3);
+                index: int64 <- at(segment, 2) * 256 + at(segment, 3);
                 last: boolean <- index >= 32768;
                 idx: int64 <- case last of { true -> index - 32768; false -> index };
                 case idx != state.expected of {
                     true -> (:rejected, :bad_tag);
                     false -> {
-                        joined: string <- join2(state.pending, byte_slice(segment, 4, n));
+                        joined: string <- join2(state.pending, slice(segment, 4, n));
                         case length_bytes(joined) > max_frame of {
                             true -> (:rejected, :too_large);
                             false -> case last of {

@@ -126,7 +126,7 @@ define APP_INTEGRATE_BODY
 		if [ -f "$$trial.wait_for_exit" ]; then \
 			marker=$$(awk 'NF { if ($$NF ~ /^[0-9]+$$/) { m=$$0; sub(/[ \t]+[0-9]+$$/, "", m); print m } else print $$0; exit } END { if (!NR) print "done" }' "$$trial.wait_for_exit"); \
 			marker_count=$$(awk 'NF { if ($$NF ~ /^[0-9]+$$/) print $$NF; else print 1; exit } END { if (!NR) print 1 }' "$$trial.wait_for_exit"); \
-			$(call INTEGRATE_EXEC_TRIAL,$(APP_LABEL)/$$trial,python3 "$(FFI_TRIAL_DIR)/run_integration_exit_after_marker.py" "$(APP_TRIAL_DIR)" "$$trial" "$$trial.sout" "$$marker" "$$marker_count"); \
+			$(call INTEGRATE_EXEC_TRIAL,$(APP_LABEL)/$$trial,python3 "$(FFI_TRIAL_DIR)/run_integration_exit_after_marker.py" "$(APP_TRIAL_DIR)" "$$trial" "$$trial$(SOUT_EXT)" "$$marker" "$$marker_count"); \
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(APP_LABEL)/$$trial $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
@@ -137,7 +137,7 @@ define APP_INTEGRATE_BODY
 			ko=$$((ko + 1)); failed=1; ran=0; \
 		fi; \
 		else \
-			$(call INTEGRATE_RUN_TRIAL,$(APP_LABEL)/$$trial,$$trial.sout,./$$trial); \
+			$(call INTEGRATE_RUN_TRIAL,$(APP_LABEL)/$$trial,$$trial$(SOUT_EXT),./$$trial); \
 			if [ "$$integrate_killed" = 1 ]; then \
 				echo "❌❌ $(APP_LABEL)/$$trial $(INTEGRATE_KILLED_MSG)"; \
 				$(INTEGRATE_DOT_FAIL); \
@@ -148,15 +148,15 @@ define APP_INTEGRATE_BODY
 		if [ ! -f "$(call SCOUT_FOR,$$trial)" ]; then \
 			echo "  ❌ $(APP_LABEL)/$$trial: missing .scout"; ko=$$((ko + 1)); failed=1; \
 			$(INTEGRATE_DOT_FAIL); \
-		elif [ -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
+		elif [ -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! "$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial$(SOUT_EXT)" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout (normalized compare)"; \
 			$(INTEGRATE_DOT_FAIL); \
-			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
+			"$(SHELL)" "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" "$$trial$(SOUT_EXT)" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
-		elif [ ! -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! diff -Bw -q "$$trial.sout" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
+		elif [ ! -f "$(FFI_TRIAL_DIR)/compare_scout_normalized.sh" ] && ! diff -Bw -q "$$trial$(SOUT_EXT)" "$(call SCOUT_FOR,$$trial)" > /dev/null 2>&1; then \
 			echo "  ❌ $(APP_LABEL)/$$trial .sout differs from .scout"; \
 			$(INTEGRATE_DOT_FAIL); \
-			diff -Bw "$$trial.sout" "$(call SCOUT_FOR,$$trial)" || true; \
+			diff -Bw "$$trial$(SOUT_EXT)" "$(call SCOUT_FOR,$$trial)" || true; \
 			ko=$$((ko + 1)); failed=1; \
 		else \
 			echo "  ✅✅ $(APP_LABEL)/$$trial output matches .scout"; \
