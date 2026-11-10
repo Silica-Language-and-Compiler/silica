@@ -15,13 +15,13 @@
 */
 
 // Console for the bare-metal STM32L476RG runtime: USART2 on PA2 (TX) / PA3 (RX), alternate function 7,
-// the Nucleo's ST-LINK virtual COM port, 115200 8N1 from the 16 MHz HSI (rt_start.S). Output is
+// the Nucleo's ST-LINK virtual COM port, 115200 8N1 from the 80 MHz PCLK1 (rt_start.S). Output is
 // polled (TXE before each byte); there is no FIFO, so a write of n bytes takes n * 87 us.
 //
 // Entries the emitted code calls (Silica pair ABI: X0 = r0:r1, X1 = r2:r3, X2 = r4:r5; every register
 // but r10, r11, lr kept, r0:r1 answered where a result is named):
 //   silica_rt_putc(X0 = byte)                     silica_rt_write(X0 = bytes, X1 = count)
-//   silica_rt_print_i64(X0) / print_u64(X0)       silica_rt_print_bool(X0) / print_char(X0 = code point)
+//   silica_rt_print_i64(X0) / print_u64(X0)       silica_rt_print_bool(X0) / print_char(X0 = encoded char)
 //   silica_rt_print_string(X0 = string handle)    silica_rt_print_string_stderr(X0): the same console
 //   silica_rt_badarith() / silica_rt_case_clause(): runtime aborts (status 71), never return
 //   silica_rt_abort_with(X0 = reason text) and the ABORT_ENTRY family: "[silica] abort: <reason> at
@@ -44,12 +44,27 @@
 #define USART_CR1_UE     0x1
 #define USART_CR1_RE     0x4
 #define USART_CR1_TE     0x8
-#define BRR_16MHZ_115200 139
+#define BRR_80MHZ_115200 694                // 80,000,000 / 115,200 = 694.4 (0.06% fast)
+#define USART_CR1_RXNEIE 0x20
+#define NVIC_ISER1       0xE000E104
+#define USART2_IRQ_BIT   (1 << (38 - 32))   // USART2 global interrupt, IRQ 38
+
+/* The receive ring the USART2 interrupt fills (silica_rt_vec_usart2): the USART has a one-byte
+   receive register and no FIFO, so a byte that arrives while the core sleeps (the scheduler's wfi waits
+   up to a millisecond for the tick) or computes would overrun it: an "exit" line sent while the
+   program idles lost its bytes and was never seen. The interrupt takes each byte as it lands; the
+   readers below take them from the ring. One producer, one consumer, word indices: no lock. */
+#define RX_HEAD          0                  /* the next slot the interrupt writes */
+#define RX_TAIL          4                  /* the next byte the reader takes */
+#define RX_BUF           8
+#define RX_SIZE          64                 /* a power of two; a full ring drops the newest byte */
 
     .section .bss.silica_rt_console, "aw", %nobits
     .balign 4
 silica_rt_exit_line_state:
     .space  12                              // [0] matched length  [4] line failed  [8] CR pending
+silica_rt_rx_ring:
+    .space  RX_BUF + RX_SIZE
 
     .section .text.silica_rt_console, "ax", %progbits
 
@@ -74,12 +89,42 @@ silica_rt_exit_line_state:
     MOV32   r1, USART2_BASE
     movw    r0, #0
     str     r0, [r1, #USART_CR1]
-    movw    r0, #BRR_16MHZ_115200
+    movw    r0, #BRR_80MHZ_115200
     str     r0, [r1, #USART_BRR]
-    movw    r0, #(USART_CR1_UE | USART_CR1_TE | USART_CR1_RE)
+    movw    r0, #(USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE)
     str     r0, [r1, #USART_CR1]
+    MOV32   r1, NVIC_ISER1                  // taken once _start enables interrupts
+    movw    r0, #USART2_IRQ_BIT
+    str     r0, [r1]
     bx      lr
     .size   silica_rt_console_init, . - silica_rt_console_init
+
+// silica_rt_vec_usart2: every received byte into the ring (rt_vectors.S points IRQ 38 here). The
+// hardware stacked r0-r3 and r12. The error flags (an overrun, noise, framing) are cleared so the
+// interrupt does not repeat.
+    FUNC silica_rt_vec_usart2
+    MOV32   r0, USART2_BASE
+    MOV32   r2, silica_rt_rx_ring
+1:  ldr     r1, [r0, #USART_ISR]
+    tst     r1, #USART_ISR_RXNE
+    beq.w   2f
+    ldr     r1, [r0, #USART_RDR]            // (clears RXNE)
+    ldr     r3, [r2, #RX_HEAD]
+    add     r12, r3, #1
+    and     r12, r12, #(RX_SIZE - 1)
+    push    {r4}
+    ldr     r4, [r2, #RX_TAIL]
+    cmp     r12, r4
+    pop     {r4}
+    beq.w   1b                              // full: the byte is dropped
+    add     r3, r3, r2
+    strb    r1, [r3, #RX_BUF]
+    str     r12, [r2, #RX_HEAD]
+    b.w     1b
+2:  movw    r1, #0x0F
+    str     r1, [r0, #USART_ICR]
+    bx      lr
+    .size   silica_rt_vec_usart2, . - silica_rt_vec_usart2
 
 // silica_rt_putc_raw(r0 = byte): one byte, polled. Clobbers r1, r2.
     LFUNC silica_rt_putc_raw
@@ -212,6 +257,9 @@ silica_rt_exit_line_state:
     b.w     1b
 2:  movw    r2, #0x0F                       // clear the error flags (overrun from the loader's bytes)
     str     r2, [r1, #USART_ICR]
+    MOV32   r1, silica_rt_rx_ring           // the ring empty
+    ldr     r2, [r1, #RX_HEAD]
+    str     r2, [r1, #RX_TAIL]
     MOV32   r1, silica_rt_exit_line_state
     movw    r2, #0
     str     r2, [r1, #0]
@@ -226,13 +274,17 @@ silica_rt_exit_line_state:
     FUNC silica_rt_console_poll_exit_line
     push    {r4, r5, lr}
     movw    r0, #0
-    MOV32   r1, USART2_BASE
     MOV32   r4, silica_rt_exit_line_state
-1:  ldr     r2, [r1, #USART_ISR]
-    tst     r2, #USART_ISR_RXNE
+1:  MOV32   r1, silica_rt_rx_ring           // the next byte from the ring, if any
+    ldr     r3, [r1, #RX_TAIL]
+    ldr     r2, [r1, #RX_HEAD]
+    cmp     r3, r2
     beq.w   9f
-    ldr     r2, [r1, #USART_RDR]
-    uxtb    r2, r2                          // the byte
+    add     r2, r1, r3
+    ldrb    r2, [r2, #RX_BUF]               // the byte
+    add     r3, r3, #1
+    and     r3, r3, #(RX_SIZE - 1)
+    str     r3, [r1, #RX_TAIL]
     cmp     r2, #10
     beq.w   5f                              // newline: the line is complete
     ldr     r3, [r4, #8]
@@ -392,41 +444,16 @@ silica_rt_exit_line_state:
     ENTRY_RET
     .size   silica_rt_print_bool, . - silica_rt_print_bool
 
-// print_char(X0 = Unicode scalar): UTF-8 encoded.
+// print_char(X0 = the encoded char): a char is (byte count << 56) | its UTF-8 bytes, first byte
+// lowest (sir_generator/terms/literals.silica char_lexeme_to_utf8_encoded), the same word every
+// target passes. ENTRY_SAVE has just stored r0 (bytes 0..3) at [sp] and r1 at [sp, #4], so the
+// bytes are already in order in memory; the count is r1's top byte.
     FUNC silica_rt_print_char
     ENTRY_SAVE
-    mov     r4, r0
-    cmp     r4, #0x80
-    bhs.w   1f
-    bl      silica_rt_putc_raw
-    b.w     9f
-1:  cmp     r4, #0x800
-    bhs.w   2f
-    lsr     r0, r4, #6
-    orr     r0, r0, #0xC0
-    bl      silica_rt_putc_raw
-    b.w     8f
-2:  cmp     r4, #0x10000
-    bhs.w   3f
-    lsr     r0, r4, #12
-    orr     r0, r0, #0xE0
-    bl      silica_rt_putc_raw
-    b.w     7f
-3:  lsr     r0, r4, #18
-    orr     r0, r0, #0xF0
-    bl      silica_rt_putc_raw
-    lsr     r0, r4, #12
-    and     r0, r0, #0x3F
-    orr     r0, r0, #0x80
-    bl      silica_rt_putc_raw
-7:  lsr     r0, r4, #6
-    and     r0, r0, #0x3F
-    orr     r0, r0, #0x80
-    bl      silica_rt_putc_raw
-8:  and     r0, r4, #0x3F
-    orr     r0, r0, #0x80
-    bl      silica_rt_putc_raw
-9:  ENTRY_RET
+    lsr     r1, r1, #24
+    mov     r0, sp
+    bl      silica_rt_write_raw
+    ENTRY_RET
     .size   silica_rt_print_char, . - silica_rt_print_char
 
 // print_string(X0 = handle): the bytes at [handle + 8] for [handle + 16] bytes. The same console
@@ -470,13 +497,10 @@ silica_rt_print_string_stderr:
     ABORT_ENTRY silica_rt_abort_not_a_string, silica_rt_reason_not_a_string
     ABORT_ENTRY silica_rt_abort_heap_exhausted, silica_rt_reason_heap_exhausted
     ABORT_ENTRY silica_rt_abort_ingress_full, silica_rt_reason_ingress_full
-    ABORT_ENTRY silica_rt_region_alloc_failed, silica_rt_reason_out_of_memory
-    ABORT_ENTRY silica_rt_buf_bounds_failed, silica_rt_reason_buf_bounds
-    ABORT_ENTRY silica_rt_buf_invalid_failed, silica_rt_reason_buf_invalid
-    ABORT_ENTRY silica_rt_badarith, silica_rt_reason_badarith
-    ABORT_ENTRY silica_rt_case_clause, silica_rt_reason_case_clause
     ABORT_ENTRY silica_rt_unsupported, silica_rt_reason_unsupported
     ABORT_ENTRY silica_rt_abort_copier_overrun, silica_rt_reason_copier_overrun
+// badarith / case_clause and the bounds and allocation failures end an actor and are main's
+// language-level failure or abort: rt_failure.S.
 
 // silica_rt_abort_body(r0 = reason, lr = the site's return address): the report, status 71, halt.
     FUNC silica_rt_abort_body
@@ -486,6 +510,10 @@ silica_rt_print_string_stderr:
     bic     r5, r5, #1
     MOV32   r0, _silica_fault_stack_top
     mov     sp, r0
+    MOV32   r0, silica_rt_fatal_depth       // a report is running: a fault from here on takes the
+    ldr     r1, [r0]                        // last-resort path (rt_vectors.S)
+    add     r1, r1, #1
+    str     r1, [r0]
     MOV32   r0, silica_rt_abort_pre
     bl      silica_rt_puts
     mov     r0, r4
@@ -545,6 +573,26 @@ silica_rt_print_string_stderr:
     bl      silica_rt_halt
     .size   silica_rt_fatal_report, . - silica_rt_fatal_report
 
+// silica_rt_fatal_last_resort(r0 = pc): a fault raised while a fatal or abort report was being written
+// (rt_vectors.S, silica_rt_fatal_depth): "[silica] fault at 0x<pc>" and the exit marker with status 70,
+// nothing else (runtime_failure_reporting.md §3.2). Runs on a fresh fault stack. Never returns.
+    FUNC silica_rt_fatal_last_resort
+    mov     r4, r0
+    movw    r0, #10                         // the line may follow part of the first report's line
+    bl      silica_rt_putc_raw
+    MOV32   r0, silica_rt_fault_pre
+    bl      silica_rt_puts
+    mov     r0, r4
+    bl      silica_rt_print_hex32
+    movw    r0, #10
+    bl      silica_rt_putc_raw
+    movw    r0, #70
+    bl      silica_rt_exit_marker
+    movw    r0, #10
+    bl      silica_rt_putc_raw
+    bl      silica_rt_halt
+    .size   silica_rt_fatal_last_resort, . - silica_rt_fatal_last_resort
+
 // silica_rt_fatal_overflow(r0 = pc): main's stack limit crossed (rt_actors.S): the fatal report with
 // cause 1006, the ESP32-S3 port's stack-guard code, so the trial goldens' folded line matches.
     FUNC silica_rt_fatal_overflow
@@ -583,12 +631,16 @@ silica_rt_reason_check:
     .asciz  "runtime check failed"
 silica_rt_reason_region_overflow:
     .asciz  "region allocation failed"
+    .global silica_rt_reason_buf_invalid
 silica_rt_reason_buf_invalid:
     .asciz  "invalid buffer size"
+    .global silica_rt_reason_buf_bounds
 silica_rt_reason_buf_bounds:
     .asciz  "buffer index out of bounds"
+    .global silica_rt_reason_list_index
 silica_rt_reason_list_index:
     .asciz  "list index out of range"
+    .global silica_rt_reason_out_of_memory
 silica_rt_reason_out_of_memory:
     .asciz  "out of memory"
 silica_rt_reason_arena_key:
@@ -601,10 +653,6 @@ silica_rt_reason_ingress_full:
     .asciz  "supervision ingress queue full"
 silica_rt_reason_heap_exhausted:
     .asciz  "heap exhausted"
-silica_rt_reason_badarith:
-    .asciz  "badarith"
-silica_rt_reason_case_clause:
-    .asciz  "case_clause"
 silica_rt_reason_copier_overrun:
     .asciz  "copier overrun (the measure and the copy disagree)"
     .global silica_rt_reason_unsupported

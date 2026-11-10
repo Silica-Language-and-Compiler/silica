@@ -25,13 +25,15 @@
 #
 # Sources are .S/.s hand-written assembly, .sams emitted by a STM32-L476RG_raw silica-compiler, .c files
 # (compiled freestanding by the same toolchain's GCC; no C library in the image beyond the memory
-# functions of board/runtime/rt_support.S; BOARD_CFLAGS adds flags), and prebuilt .o objects and .a
+# functions of board/runtime/rt_support.S; -ffixed-r9; BOARD_CFLAGS adds flags), and prebuilt .o objects and .a
 # archives for this triple (archives are placed after every object on the link line).
 # Produces <name>.elf (what the probe loads: board/tools/run_on_board.py), <name>.map and <name>.bin
 # (the raw image at 0x20000000, for a loader that takes binaries).
 #
 # main's stacks are the linker script's defaults (6 KiB machine, 2 KiB auxiliary); BOARD_MAIN_STACK=N
 # and BOARD_MAIN_AUX=N override them (the ESP32-S3 port's per-image bound is not ported yet).
+# BOARD_FFI_STACK=N sets the machine stack a foreign call in an actor runs on (the link's
+# _silica_ffi_stack_size; 2 KiB when unset; rt_ffi.S).
 #
 # Toolchain: the Arm GNU toolchain (arm-none-eabi-gcc: assembler, linker, libgcc for the soft-float
 # and 64-bit division routines the emitted code calls), Homebrew's `arm-none-eabi-gcc` formula on the
@@ -67,16 +69,20 @@ if [ "$prepare" = 0 ] && { [ -z "$out" ] || [ $# -eq 0 ]; }; then
     exit 2
 fi
 
-ARCH="-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard"
+# softfp, not hard: the FPU instructions are the same, but a C function's float and double arguments and
+# results cross in core registers, as the foreign call block lays them out (terms/ffi_foreign.silica,
+# rt_ffi.S) and as the AEABI helpers the emitted code calls take them; nothing in the image uses the VFP
+# calling convention. -ffixed-r9 keeps C away from TP (rt_defs.h).
+ARCH="-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=softfp"
 # The runtime sources are preprocessed (.S: rt_defs.h); emitted .sams are plain assembler.
 ASFLAGS="-c $ARCH -I$RT"
-CFLAGS="-c $ARCH -Os -ffreestanding -fno-builtin -ffunction-sections -fdata-sections -Wall -Wextra ${BOARD_CFLAGS:-}"
+CFLAGS="-c $ARCH -Os -ffreestanding -fno-builtin -ffixed-r9 -ffunction-sections -fdata-sections -Wall -Wextra ${BOARD_CFLAGS:-}"
 defsyms=""
 [ -n "${BOARD_MAIN_STACK:-}" ] && defsyms="$defsyms -Wl,--defsym,_silica_main_stack_req=$BOARD_MAIN_STACK"
 [ -n "${BOARD_MAIN_AUX:-}" ] && defsyms="$defsyms -Wl,--defsym,_silica_main_aux_req=$BOARD_MAIN_AUX"
 [ -n "${BOARD_FFI_STACK:-}" ] && defsyms="$defsyms -Wl,--defsym,_silica_ffi_stack_req=$BOARD_FFI_STACK"
 
-RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_string.S rt_list.S rt_transport.S rt_support.S rt_float.S rt_actors.S rt_supervisors.S rt_stubs.S"
+RUNTIME_SOURCES="rt_vectors.S rt_start.S rt_console.S rt_heap.S rt_frame.S rt_state.S rt_string.S rt_list.S rt_transport.S rt_support.S rt_ordering.S rt_float.S rt_actors.S rt_failure.S rt_supervisors.S rt_ffi.S rt_stubs.S"
 
 objs=""
 if [ -n "$rtcache" ]; then

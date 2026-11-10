@@ -488,6 +488,26 @@ run_program() {
     return 0
 }
 
+# FFI in a program suite (bees_gaps_open_addition): a top-level unit whose wrapper_meta names
+# dangerous_exposure_source/... gets the ffi_addition fixtures' board view, as the suite's host Makefile
+# links ../ffi_addition/fixtures/build/<platform>/dangerous_exposure_source; the archives the compiler
+# lists in silica.link go last on every program's link line.
+suite_ffi=0
+if [ "${#programs[@]}" -gt 0 ] && grep -qs '^wrapper_meta "dangerous_exposure_source/' "$src"/*.silica; then
+    ffi_src="$TRIALS_ROOT/ffi_addition"
+    ffi_mk="$ffi_src/fixtures_board.mk"
+    [ -f "$ffi_src/fixtures_board_$target.mk" ] && ffi_mk="$ffi_src/fixtures_board_$target.mk"
+    if [ -f "$ffi_mk" ] && make -s -f "$ffi_mk" > build/fixtures_board.log 2>&1; then
+        ln -sfn "$ffi_src/fixtures/build/$target/dangerous_exposure_source" src/dangerous_exposure_source
+        suite_ffi=1
+    else
+        mark_fail
+        printf '❌❌ %sfixtures: the board C fixtures did not build (%s)\n' "$prefix" "$ffi_mk"
+        head -n 20 build/fixtures_board.log 2>/dev/null
+        ko=$((ko + 1))
+    fi
+fi
+
 if [ "${#programs[@]}" -gt 0 ]; then
     ( cd src && find . -name '*.silica' -not -path './.*' | sed 's|^\./||' | LC_ALL=C sort > silica.config )
     echo "Compiling ${#programs[@]} programs with $(basename "$BOARD_SILICA_COMPILER")..."
@@ -499,6 +519,9 @@ if [ "${#programs[@]}" -gt 0 ]; then
     else
         cdir=src gdir=$src closure_programs=" ${programs[*]} " left=${#programs[@]}
         link_archives=() app_link_sams=()
+        if [ "$suite_ffi" = 1 ] && [ -f src/silica.link ]; then
+            while IFS= read -r m; do [ -n "$m" ] && link_archives+=("src/$m"); done < <(awk -F'"' '/^archive:/ { print $2 }' src/silica.link)
+        fi
         gen_elig=0
         for stem in "${programs[@]}"; do
             run_program "$stem" || break
@@ -523,7 +546,11 @@ fi
 # the skip file (<suite>/<stem>) are reported as skipped and left out of the compile.
 if [ "${#appdirs[@]}" -gt 0 ]; then
     export XTENSA_BIN=${XTENSA_BIN:-$HOME/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin}
-    view="$src/fixtures/build/ESP32-S3_raw/dangerous_exposure_source"
+    # the board's C fixtures: fixtures_board_<target>.mk when the suite has one (STM32-L476RG_raw),
+    # else fixtures_board.mk (ESP32-S3_raw); each builds fixtures/build/<target>/
+    fixtures_mk="$src/fixtures_board.mk"
+    [ -f "$src/fixtures_board_$target.mk" ] && fixtures_mk="$src/fixtures_board_$target.mk"
+    view="$src/fixtures/build/$target/dangerous_exposure_source"
     fixtures_ok=0
     fixtures_started=0
     mkdir -p apps
@@ -545,22 +572,25 @@ if [ "${#appdirs[@]}" -gt 0 ]; then
                 continue
             fi
             if [ -f "$adir/$stem.scout" ] || [ -f "$adir/$stem.$target.scout" ]; then
+                # BOARD_ONLY_STEM: only that program runs (the app's other sources are still compiled)
+                if [ -n "$ONLY" ] && [ "$ONLY" != "$stem" ]; then app_modules+=("$stem"); continue; fi
                 app_programs+=("$stem")
             else
                 app_modules+=("$stem")
             fi
         done
         if [ "${#app_programs[@]}" -eq 0 ]; then
+            [ -n "$ONLY" ] && continue
             [ "$app_skipped" -eq 0 ] && { printf 'SKIP: %s%s/ (no program with a golden)\n' "$prefix" "$app"; skipped=$((skipped + 1)); }
             continue
         fi
         if [ "$fixtures_started" = 0 ]; then
             fixtures_started=1
-            if make -s -f "$src/fixtures_board.mk" > build/fixtures_board.log 2>&1; then
+            if make -s -f "$fixtures_mk" > build/fixtures_board.log 2>&1; then
                 fixtures_ok=1
             else
                 mark_fail
-                printf '❌❌ %sfixtures: the board C fixtures did not build (%s)\n' "$prefix" "$src/fixtures_board.mk"
+                printf '❌❌ %sfixtures: the board C fixtures did not build (%s)\n' "$prefix" "$fixtures_mk"
                 head -n 20 build/fixtures_board.log
                 ko=$((ko + 1))
             fi
