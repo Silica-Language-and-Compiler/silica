@@ -2,7 +2,8 @@
 
 Status: **target changed by Lee, 2026-11-09: serial over USB-C is the transport between the Mac and the board; the Wi-Fi
 stages (3 to 9) are deferred (§8).** Route R2 was chosen for Wi-Fi (§3) and stays the Wi-Fi route when it resumes. Stage 1
-is closed (§7); stage S-A and the board part of S-B are done (§7, 2026-11-09). Stage results are recorded in §7. It refines Phase D of
+is closed (§7); stages S-A, S-B and S-C are done (§7, 2026-11-09), and S-D, end to end over USB-C with both peers,
+on 2026-11-10 (§7; synthetic readings: the I2C0 accelerometer worker is not built). Stage results are recorded in §7. It refines Phase D of
 [transport_links_design.md](transport_links_design.md) §8–§9 ("decided later") and uses the item letters of
 [esp32s3_board_peripherals_plan.md](esp32s3_board_peripherals_plan.md) §5. Facts below were read from those two
 documents, `emitter/ESP32-S3_raw/transport_pack.silica` and `compiler/stdlib`; anything not checked is marked
@@ -363,6 +364,108 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     `spawn_dangerous_carrier` answers a `device_actor_ref` because the carrier is a device worker; E2415 is limited to
     exclusive hardware (two carriers on `(:loopback)` are allowed, as the loopback app needs).
 
+- **Stage S-D, 2026-11-10: end to end over the native USB-C jack, on the board, with the Silica peer and with the
+  Erlang peer; the board drives the LED each reply names. The readings are synthetic. The pairs now live in
+  `examples/transport_pairs/`.** The board's MMA8452Q is on I2C0, and the I2C0 worker is not built
+  (esp32s3_board_peripherals_plan.md item 2). The board therefore sends four readings from a fixed table in the
+  program, as `(x, y, z, at_ms)`: `(1, -2, 512, 1000)`, `(3, 1, 100, 1250)`, `(-5, 4, 300, 1500)`, `(0, 0, -480, 1750)`.
+  Row 0 is the §13.4 reading. Nothing reads the sensor. Built:
+  - **The board program,** `examples/transport_pairs/usb_accel_led_erlang_and_silica/accel_led_board/device_usb_accel_led.silica`
+    (first written as `board/apps/silica_34_transport_usb_accel_led`).
+    - It declares `carried_on usb: (:serial) (:usb_serial_jtag);` and registers its owner as `:accel_owner`.
+    - The supervisor's one plain worker spawns the GPIO worker, an LED printer and the carrier, because device workers
+      cannot be supervisor children. The GPIO worker (`device_esp32s3_gpio@gpio_worker`) starts with GPIO2/4/5/6 made
+      outputs and off.
+    - It runs in lockstep, one frame in flight. Reading i is encoded, framed and sent as one `:tx`. The reply is
+      unframed and decoded into `(:led, { which, on })`. `which` maps to the board's pins (all active high): `:red`
+      GPIO2, `:green` GPIO4, `:blue` GPIO5 (the RGB LED), `:single` GPIO6 (LED1).
+    - For each reply the owner casts the GPIO worker three messages: a `:write` of the pin; a `:hold` of 1000 ticks,
+      about 1 s, so each state is easy to see (added at Lee's request); and a `:notify` of `pin * 2 + level` to the
+      printer. The printer prints `rgb red on|off (gpio2)` in the worker's message order, after the pin was written and
+      held, then casts `(:driven, level)` back. Only then is reading i + 1 sent.
+    - The frames are 52, 46, 52 and 49 bytes, all under the 64-byte IN FIFO. The FIFO never holds more than one frame,
+      and the credit (8, then 1 per `:tx`) is never short.
+    - After the fourth `:driven`, the board sends the end-of-stream frame `(:done, 4)` (15 bytes framed; Lee's decision
+      after the first report). It closes the carrier at that `:tx`'s credit, and `:link_down :closed` ends the program
+      with status 0.
+    - `expected.scout` was written from the source. The first board run put `tx credit 8` after the first `reading`
+      line, because the owner handles `:link_up` (which sends reading 1) before the queued `:tx_credit`. That order is
+      deterministic, and the golden follows the board.
+  - **The rule and the peers.** In both peers, `z > 256` gives `(:led, { which: :red, on: true })`, otherwise
+    `on: false`.
+    - The Silica peer, `mac_peer/dangerous_accel_led_peer.silica`, answers every reassembled reading. On `(:done, n)`
+      it closes the port at once. Its fallback: it closes when no reading arrives within 3 s of its last reply. The
+      fallback was raised from 1.5 s when the 1 s hold was added; it keeps a board program without `(:done, n)`
+      working. To tell a reading from the end frame, it decodes as a reading first and as `(:done, int64)` when that
+      is rejected.
+    - The Erlang peer, `mac_peer/accel_led_peer.erl`, does the same. It encodes with
+      `term_to_binary(T, [deterministic])`, because OTP 26 and later order small-map atom keys by the atom table (OTP 28
+      here wrote the reading map `y, x, z, at_ms`). `deterministic` gives term order (`on, which`), which is the order
+      Silica's `encode` writes record fields. It prints fixed fields rather than the map, so its output can be
+      compared.
+    - `programmer_tools/transport_beam_demo/silica_peer.erl` is back to its original one-reading form; the pairs have
+      their own peers.
+  - **`examples/transport_pairs/`,** created at Lee's request: one directory per board/Mac pair.
+    - Each pair has its board program (a directory that `board/tools/run_app.sh` builds from any path, so `run_app.sh`
+      needed no change), its Mac peers in `mac_peer/`, expected output, a README and a `run.sh`. The shared steps are
+      in `lib/pair_lib.sh`, which also holds `find_usb_serial_jtag_port.py`.
+    - An index `README.md` and `run_all.sh` run the pairs one at a time and report PASS / FAIL per pair.
+    - A pair's check covers: the board console against `expected.scout` (`run_app.sh`), the peer's exit status, the
+      peer's output against `expected/<peer>_peer.out` (the port name normalised), and, for the Erlang runs, the bytes
+      the bridge moved each way against `expected/to_mac.hex` / `to_board.hex`.
+    - `usb_accel_led_erlang_and_silica/run.sh --fake` runs both peers against `fake_board_readings.py` on a raw pty and
+      checks their replies byte for byte, with no board.
+    - The pairs: `usb_basic_exchange` (the S-A program `silica_33_transport_usb_serial_jtag_etf`, moved, with the S-A
+      Silica peer and an Erlang peer printing fixed fields); `usb_accel_led_erlang_and_silica` (this stage);
+      `usb_silica_pair` (Silica on both ends, requests from both sides: written by another session as
+      `board/apps/silica_35_transport_usb_silica_pair` and `programmer_tools/transport_usb_silica_pair`, moved here
+      unrun). The UART1 pair is listed but not included: it needs an adapter on the UART1 header.
+    - Pointer READMEs stay at `programmer_tools/transport_usb_serial_jtag_demo/` and
+      `board/apps/silica_33_transport_usb_serial_jtag_etf/`, because older documents and this log name them.
+  - **Two compiler defects, found on the Silica pair's first run.** Both are worked around in the pair's sources, not
+    fixed.
+    - A conversion call written as an argument (`take_request(st, to_int64(rid), body)`) is evaluated in X0 after the
+      first argument was placed there, so the callee receives the id as its state record. On the Mac this was a fault
+      at address 0x9 in `serve_accel`, read from the `.sams`. On the board the same source ended with the carrier's
+      `(:explicit, :actor_not_found)` and a timeout, and it matched once `id: int64 <- to_int64(rid)` was bound first.
+      The Xtensa assembly was not inspected.
+    - Its author had already recorded the second: a nested tagged-tuple literal written straight into `encode` is
+      encoded flattened.
+  - **The board trial was withdrawn.** For a while `trials/transport_board_addition/device_usb_serial_jtag_accel_led_tx`
+    existed (output matched on the board). It was withdrawn when the pairs moved to `examples/`: the pairs are examples,
+    not trials. The suite's `Makefile`, `README.md` and four `.esp32_s3.ascomp` goldens are back to their committed
+    state, and the suite is 9 / 9 on the board again.
+  - **Runs** (2026-11-10):
+    - Setup: board console `/dev/cu.usbserial-8310`, native jack `/dev/cu.usbmodem83201` found by 303A:1001; IDF 6.1
+      Python and esptool; `compiler/build/ESP32-S3_raw/silica-compiler` for the board,
+      `compiler/build/apple_silicon_mac/silica-compiler` for the Silica peers.
+    - `examples/transport_pairs/run_all.sh`: PASS for all three pairs, with both peers for the basic and accel/LED
+      pairs.
+    - Accel/LED board console, both peers: `link up usb_serial_jtag`, `reading 1 x=1 y=-2 z=512 at_ms=1000`,
+      `tx credit 8`, `sent 52 bytes`, `led red on`, `rgb red on (gpio2)`, ... (readings 2 to 4: 46, 52, 49 bytes, off /
+      on / off), `done 4 readings`, `sent 15 bytes`, `link down :closed`, status 0.
+    - The bridge showed the replies `0000002383680277036c6564740000000277026f6e770474727565770577686963687703726564`
+      (on, 39 bytes) and `0000002483680277036c6564740000000277026f6e770566616c7365770577686963687703726564` (off,
+      40 bytes), alternating, and the board's `0000000b8368027704646f6e656104` (`(:done, 4)`). On the pty, the Silica
+      peer's replies are the same bytes.
+    - The Silica pair matched its `expected.scout` (`reply 1 led on`, `reply 3 led off`, `served 2 status requests`)
+      after the workaround. Before it, the Mac peer faulted and the board printed `framing rejected :too_large`.
+    - Earlier in the stage, before the RGB mapping, `(:done, n)` and the hold, the same flow driving LED1 matched
+      twice with both peers, and `silica_33` matched with the looping peers.
+    - `make integrate TRIAL_TARGET=ESP32-S3_raw TRIAL_SUITES=transport_board_addition`: 9 / 9.
+    - `transport_beam_demo/run_demo.sh` exit 0.
+    - No compiler source changed; no Apple suite was touched.
+  - **Found on the way** (already broken, fixed because the Erlang peer was re-checked on its own demo):
+    - `transport_beam_demo/run_demo.sh` still linked `carrier.silica` (E1009 since the rename to `Carrier`).
+    - `dangerous_telemetry.silica` lacked the `transport` effect in two sequences (E3013).
+    - Its watchdog subshell is now disowned.
+    - The demo sometimes prints `link down: :closed` after `done` (status 0 either way); this is noted in its README.
+  - **Not covered:**
+    - real sensor data (I2C0, item 2);
+    - more than one frame in flight in the accel/LED pair (the Silica pair has several);
+    - framing recovery after a lost byte and the CP2102N path (S-E);
+    - the two compiler defects above.
+
 ## 8. Change of target (2026-11-09): serial over USB-C; Wi-Fi deferred
 
 **Why.** The test networks did not work out: the iPhone hotspot on this carrier is IPv6-only (the Mac got a CLAT
@@ -396,5 +499,7 @@ serial-to-TCP bridge of `programmer_tools/transport_uart1_demo`).
   `getpeername` stays a Wi-Fi item. **Done 2026-11-09 on the Mac and the board (§7).**
 - **S-D. End to end.** The board sends accelerometer readings; the Mac replies with an LED command; the same with the
   Erlang peer. Run by script outside `make integrate`, like the BEAM demo.
+  **Done 2026-11-10 with both peers on the board (§7); the readings are a fixed synthetic table, not the
+  MMA8452Q (the I2C0 worker, peripherals plan item 2, is not built). Run by `examples/transport_pairs/run_all.sh`.**
 - **S-E. Hardening and docs.** Framing recovery after a lost byte, flow control (no hardware flow control on the CP2102N
   path: lossy under sustained load per §6.4), the console-interleaving rule, status in the designs.

@@ -20,7 +20,11 @@ carries `:serial`) for the stage S-A carrier. Trials: `trials/error_enforcement_
 `trials/transport_board_addition/device_*_link_tx` and `link_uart0_console_reserved`. Of phase B, the ESP32-S3 UART1
 worker with the §6.2 carrier contract and the §6 failure atoms exists since stage 1 (`device_esp32s3_uart1.silica`),
 and so does the `(:usb_serial_jtag)` carrier of stage S-A (`device_esp32s3_usb_serial_jtag.silica`, both directions, run
-on a real board with the Silica and Erlang peers). **Not done:** the hosted `(:interface, name)`, `(:ethernet, n)` and
+on a real board with the Silica and Erlang peers). Stage S-D (2026-11-10) ran a declared link end to end: in
+`examples/transport_pairs/usb_accel_led_erlang_and_silica` the board (`carried_on usb: (:serial) (:usb_serial_jtag);`)
+sends four ETF readings, each answered by an LED command from a Mac peer that declares its port
+(`(:serial_port, path, 115200)`) or from the Erlang peer behind the serial bridge, and drives the LED each reply names
+(plan §7). **Not done:** the hosted `(:interface, name)`, `(:ethernet, n)` and
 `(:wifi, n)` links are accepted and checked but the TCP and UDP carriers do not bind to the interface yet (no
 `getifaddrs`, no `(:explicit, :link_unavailable)` at open; the `link_interface_absent` and `link_family_absent` trials of
 §10 wait for it); the Linux packs list no link (E2412 there until their rows are written in lock-step); the Nucleo
