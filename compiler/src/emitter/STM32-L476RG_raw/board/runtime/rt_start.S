@@ -20,8 +20,10 @@
 // which then sets PC = _start and resumes; nothing is written to flash. _start never returns:
 //   1. interrupts off, VTOR = our table (rt_vectors.S), sp = main's machine stack top, the FPU on
 //      (CPACR CP10/CP11 full access; no lazy FP context stacking, the tick handler uses no FP);
-//   2. the clock: HSI16 on and selected as SYSCLK (16 MHz; the chip resets on the 4 MHz MSI); no
-//      flash wait states matter, everything runs from SRAM; GPIOA and USART2 clocks on;
+//   2. the clock: SYSCLK = 80 MHz from the PLL on HSI16 (/1 x10 /2; the chip resets on the 4 MHz MSI);
+//      flash latency 4 wait states first (RM0351 for 80 MHz in range 1, the reset default; everything
+//      runs from SRAM, but the setting must match the clock); AHB, APB1 and APB2 undivided (reset
+//      values), so the USART2 kernel clock (PCLK1) is 80 MHz too; GPIOA and USART2 clocks on;
 //   3. the console (rt_console.S): USART2 115200 8N1 on PA2/PA3, the ST-LINK virtual COM port;
 //   4. zero .bss, the heap and main's machine stack (zeroed so the high-water marks can be read at
 //      the end: the lowest non-zero word);
@@ -53,9 +55,18 @@
 
 #define RCC_CR_HSION     0x100
 #define RCC_CR_HSIRDY    0x400
-#define RCC_CFGR_SW_HSI  0x1
+#define RCC_CR_PLLON     0x01000000
+#define RCC_CR_PLLRDY    0x02000000
+#define RCC_PLLCFGR      0x0C
+// PLLSRC = HSI16 (2), PLLM = /1 (field 0), PLLN = 10 (bits 14:8), PLLR = /2 (field 0 at bits 26:25),
+// PLLREN (bit 24): VCO 160 MHz, PLLCLK 80 MHz; the P and Q outputs stay off.
+#define RCC_PLLCFG_80MHZ 0x01000A02
+#define RCC_CFGR_SW_PLL  0x3
 #define RCC_CFGR_SWS_MASK 0xC
-#define RCC_CFGR_SWS_HSI 0x4
+#define RCC_CFGR_SWS_PLL 0xC
+#define FLASH_ACR        0x40022000
+#define FLASH_ACR_LATENCY_MASK 0x7
+#define FLASH_ACR_LATENCY_4WS  0x4
 
     .section .text.silica_rt_start, "ax", %progbits
     FUNC _start
@@ -84,8 +95,25 @@
     ldr     r0, [r1]
     orr     r0, r0, #0x70000                // MemManage, BusFault, UsageFault enabled as separate vectors
     str     r0, [r1]
+    // The null guard (2026-11-09): the MPU makes 0x0000_0000-0x000F_FFFF (the boot alias of flash,
+    // readable on this part) no-access, so a null pointer dereference faults (MemManage, MMFAR = the
+    // address) as it does on the ESP32-S3 (LoadProhibited) and the hosts (SIGSEGV): an actor's ends
+    // that actor with :memory_fault, main's is the fatal report (status 70). Region 0, 1 MiB, XN,
+    // AP = no access; PRIVDEFENA keeps the default map everywhere else (the runtime runs privileged).
+    MOV32   r1, 0xE000ED98                  // MPU_RNR
+    movw    r0, #0
+    str     r0, [r1]
+    movw    r0, #0x10                       // MPU_RBAR: base 0, VALID, region 0
+    str     r0, [r1, #4]
+    MOV32   r0, 0x10000027                  // MPU_RASR: XN, AP 000, SIZE 19 (2^20), ENABLE
+    str     r0, [r1, #8]
+    movw    r0, #5                          // MPU_CTRL: PRIVDEFENA | ENABLE
+    str     r0, [r1, #-4]
+    dsb     sy
+    isb     sy
 
-    // 2. Clock: HSI16 as SYSCLK.
+    // 2. Clock: SYSCLK = PLL (HSI16 /1 x10 /2) = 80 MHz. The probe's "reset halt" leaves the reset
+    //    state (MSI 4 MHz, PLL off, range 1, 0 wait states), so the PLL can be configured directly.
     MOV32   r1, RCC_BASE
     ldr     r0, [r1, #RCC_CR]
     orr     r0, r0, #RCC_CR_HSION
@@ -93,13 +121,30 @@
 1:  ldr     r0, [r1, #RCC_CR]
     tst     r0, #RCC_CR_HSIRDY
     beq.w   1b
+    MOV32   r0, RCC_PLLCFG_80MHZ
+    str     r0, [r1, #RCC_PLLCFGR]
+    ldr     r0, [r1, #RCC_CR]
+    orr     r0, r0, #RCC_CR_PLLON
+    str     r0, [r1, #RCC_CR]
+3:  ldr     r0, [r1, #RCC_CR]
+    tst     r0, #RCC_CR_PLLRDY
+    beq.w   3b
+    MOV32   r2, FLASH_ACR                   // 4 wait states before the clock rises (read back: RM0351)
+    ldr     r0, [r2]
+    bic     r0, r0, #FLASH_ACR_LATENCY_MASK
+    orr     r0, r0, #FLASH_ACR_LATENCY_4WS
+    str     r0, [r2]
+4:  ldr     r0, [r2]
+    and     r0, r0, #FLASH_ACR_LATENCY_MASK
+    cmp     r0, #FLASH_ACR_LATENCY_4WS
+    bne.w   4b
     ldr     r0, [r1, #RCC_CFGR]
     bic     r0, r0, #0x3
-    orr     r0, r0, #RCC_CFGR_SW_HSI
+    orr     r0, r0, #RCC_CFGR_SW_PLL
     str     r0, [r1, #RCC_CFGR]
 2:  ldr     r0, [r1, #RCC_CFGR]
     and     r0, r0, #RCC_CFGR_SWS_MASK
-    cmp     r0, #RCC_CFGR_SWS_HSI
+    cmp     r0, #RCC_CFGR_SWS_PLL
     bne.w   2b
     ldr     r0, [r1, #RCC_AHB2ENR]
     orr     r0, r0, #0x1                    // GPIOAEN
@@ -146,9 +191,9 @@
     str     r0, [r9, #VRG_CCB]
     bl      silica_rt_heap_init
     bl      silica_rt_actors_init           // main's context exists before the first emitted prologue
-    // SysTick: 1 ms at 16 MHz, processor clock, interrupt on
+    // SysTick: 1 ms at 80 MHz (reload 80,000 - 1), processor clock, interrupt on
     MOV32   r1, SYSTICK_RVR
-    movw    r0, #15999
+    MOV32   r0, 79999
     str     r0, [r1]
     MOV32   r1, SYSTICK_CVR
     movw    r0, #0

@@ -24,13 +24,16 @@
    bss, then the heap as the leftover below main's machine stack, which ends at the top of SRAM1.
    SRAM2 holds the stacks that must survive an SRAM1 stack problem: the fault stack (the fatal report
    runs on it whatever state the main stack is in) and main's auxiliary stack (the emitter's SP); the
-   rest of SRAM2 is unused for now.
+   rest of SRAM2 is the second heap arena, for actor stack chunks only (rt_heap.S arena 1; Lee
+   2026-11-09): the chunk allocator tries it first and falls back to the SRAM1 heap.
 
    Budget: main's machine stack 6 KiB by default (build_image.sh BOARD_MAIN_STACK / --defsym
    _silica_main_stack_req), main's auxiliary stack 2 KiB (BOARD_MAIN_AUX), the fault stack 1 KiB, the
-   scheduler's stack 1 KiB (rt_actors.S .bss, SRAM1); an actor costs its ACB (208 B) plus 2 KiB machine
-   + 512 B auxiliary chunks at its first dispatch, growing by doubling. The smoke images leave about
-   76 KiB of heap; a base-suite image (program ~10-15 KiB) about 64 KiB. */
+   scheduler's stack 1 KiB (rt_actors.S .bss, SRAM1); an actor costs its ACB (208 B, SRAM1 heap) plus
+   2 KiB machine + 512 B auxiliary chunks at its first dispatch (SRAM2 arena first), growing by
+   doubling. With the default main aux stack the SRAM2 arena is 29,696 bytes (0x10000C00-0x10008000):
+   the first chunks of 11 actors (2,592 B each with their block headers). The smoke images leave about
+   76 KiB of SRAM1 heap; a base-suite image (program ~10-15 KiB) about 64 KiB. */
 
 ENTRY(_start)
 
@@ -91,7 +94,8 @@ SECTIONS
   } > sram1
 
   /* SRAM2: the fault stack and main's auxiliary stack (rt_start.S zeroes [_silica_sram2_used_start,
-     _silica_sram2_used_end) before anything uses them: the aux stack's high-water mark is read at exit). */
+     _silica_sram2_used_end) before anything uses them: the aux stack's high-water mark is read at exit),
+     then the stack-chunk arena up to the end of SRAM2 (rt_heap.S zeroes every block it hands out). */
   .sram2 (NOLOAD) :
   {
     . = ALIGN(16);
@@ -106,11 +110,15 @@ SECTIONS
     _silica_sram2_used_end = ABSOLUTE(.);
   } > sram2
 
+  _silica_sram2_heap_start = ALIGN(_silica_sram2_used_end, 16);
+  _silica_sram2_heap_end   = _silica_sram2_end;
+
   _silica_heap_start = ALIGN(_silica_bss_end, 16);
   _silica_stack_top  = _silica_sram1_end;
   _silica_heap_end   = (_silica_stack_top - _silica_main_stack_size) & ~63;
 
   ASSERT(_silica_heap_start + 0x4000 < _silica_heap_end, "program too large: less than 16 KiB left for the heap")
+  ASSERT(_silica_sram2_heap_start <= _silica_sram2_heap_end, "SRAM2 overflow: the fault stack and main's auxiliary stack exceed 32 KiB")
   ASSERT((_silica_main_aux_size & 63) == 0, "_silica_main_aux_size must be a multiple of 64")
 
   /DISCARD/ : { *(.comment) *(.note.*) *(.ARM.exidx*) *(.ARM.attributes) }

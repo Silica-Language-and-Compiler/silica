@@ -35,6 +35,7 @@
 #define VRG_ARG          136
 #define VRG_FLOOR        140
 #define VRG_CCB          144
+#define VRG_FFI          148    /* 1 while a foreign call runs (rt_ffi.S): a fault in an actor is :foreign_fault */
 
 /* Actor control block (rt_actors.S of the ESP32-S3 port, "Layouts"). */
 #define ACB_STATE        0
@@ -149,14 +150,19 @@
 #define MSG_PARK_CHUNK   56
 #define MSG_SIZE         64
 
-/* Core block (one core). */
+/* Core block (one core): the ESP32-S3's layout. Three ready queues, index 0 high, 1 normal, 2 low
+   (queue index = 2 - ACB_PRIO): heads at +0/+4/+8, tails at +12/+16/+20, lengths at +40/+44/+48;
+   the weighted-fair tier being served and its remaining credit at +52/+56 (rt_actors.S, "Ready
+   queues and dispatch-order policies"). */
 #define CORE_RQ_HEAD     0
-#define CORE_RQ_TAIL     4
+#define CORE_RQ_TAIL     12
 #define CORE_CURRENT     24
 #define CORE_SCHED       28
 #define CORE_BUSY        32
 #define CORE_ID          36
 #define CORE_RQ_LEN      40
+#define CORE_WF_TIER     52
+#define CORE_WF_CREDIT   56
 #define CORE_SIZE        64
 
 /* Stack chunk header (64 B) + 64-byte band; the usable area starts at CH_USABLE_OFF. */
@@ -222,8 +228,12 @@
 #define ATOM_UNKNOWN     7
 #define ATOM_DANGEROUS   22
 
-/* Registry tables (rt_actors.S): REG_SLOTS (atom -> ACB) words each. */
-#define REG_SLOTS        64
+/* Registry tables (rt_actors.S): one word (atom -> ACB) per atom of the image, sized at
+   silica_rt_actors_init from silica_registry_slots (the build's atom count, emitted into
+   __silica_runtime.sams; at least REG_SLOTS_MIN), as on the ESP32-S3. silica_pid_registry_ref,
+   silica_dangerous_pid_registry_ref and silica_device_pid_registry_ref each hold the address of their
+   heap table; silica_rt_reg_slots holds the slot count. */
+#define REG_SLOTS_MIN    64
 
 /* Peripherals (RM0351). */
 #define RCC_BASE         0x40021000
@@ -276,6 +286,19 @@
 .macro MOV32 r, v
     movw    \r, #:lower16:\v
     movt    \r, #:upper16:\v
+.endm
+/* The base of a registry table (its heap block) into \r. */
+.macro REG_TABLE r, sym
+    movw    \r, #:lower16:\sym
+    movt    \r, #:upper16:\sym
+    ldr     \r, [\r]
+.endm
+/* Compare an atom with the registry slot count (\scratch is clobbered): bhs = outside the tables. */
+.macro REG_BOUND atom, scratch
+    movw    \scratch, #:lower16:silica_rt_reg_slots
+    movt    \scratch, #:upper16:silica_rt_reg_slots
+    ldr     \scratch, [\scratch]
+    cmp     \atom, \scratch
 .endm
 /* A Thumb function. */
 .macro FUNC name

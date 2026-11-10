@@ -101,7 +101,7 @@
 2:  add     r0, r8, r1
     movw    r1, #0
     ENTRY_RET_X0
-8:  bl      silica_rt_abort_list_index
+8:  bl      silica_rt_list_index_failed     // ends the actor, or aborts in main (rt_failure.S)
     .size   silica_rt_list_at, . - silica_rt_list_at
 
 // prepend(packed, head, tail) -> handle.
