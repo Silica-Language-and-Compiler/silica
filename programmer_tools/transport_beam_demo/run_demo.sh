@@ -13,10 +13,10 @@ cd "$WORK"
 ln -sfn "$ROOT/compiler/stdlib/net" dangerous_exposure_source/sockets
 clang -std=c11 -O2 -arch arm64 -mmacosx-version-min=26.0 -c "$ROOT/compiler/stdlib/net/silica_sockets.c" -o silica_sockets.o || exit 1
 ar rcs dangerous_exposure_source/lib/libsilica_sockets.a silica_sockets.o
-for m in Supervisor wire_etf wireframe carrier dangerous_sockets dangerous_tcp_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
+for m in Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" trial_wait_int64.silica
 sed "s/127.0.0.1:4040/127.0.0.1:$PORT/" "$HERE/dangerous_telemetry.silica" > dangerous_telemetry.silica
-printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\ncarrier.silica\ndangerous_sockets.silica\ndangerous_tcp_carrier.silica\ntrial_wait_int64.silica\ndangerous_telemetry.silica\n' > silica.config
+printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_sockets.silica\ndangerous_tcp_carrier.silica\ntrial_wait_int64.silica\ndangerous_telemetry.silica\n' > silica.config
 for i in $(seq 1 12); do "$CC" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
 if [ ! -f dangerous_telemetry.sams ]; then echo "compile failed (exit $ec); see $WORK/compile.log"; grep -A8 "Compilation error" compile.log | head -12; exit 1; fi
 objs=""
@@ -29,7 +29,7 @@ sleep 1
 ./dangerous_telemetry > silica.out 2>&1 &
 PROG=$!
 ( sleep 20; kill $PROG 2>/dev/null; kill $PEER 2>/dev/null ) &
-WATCH=$!
+WATCH=$!; disown
 wait $PROG 2>/dev/null; rc=$?
 wait $PEER 2>/dev/null
 kill $WATCH 2>/dev/null

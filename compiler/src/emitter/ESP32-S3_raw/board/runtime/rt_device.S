@@ -16,7 +16,7 @@
 
 // Device windows for map_device (silica_device_actor_specification.md §5.1, porting_for_os_free_targets.md
 // §5.1, §10). The window table below is the run-time twin of the emitter's board pack,
-// emitter/ESP32-S3_raw/board_pack.silica (window_base / window_size, rows 0-10): the emitter checks a
+// emitter/ESP32-S3_raw/board_pack.silica (window_base / window_size, rows 0-12): the emitter checks a
 // constant map_device base against that table at compile time and calls this routine for a computed
 // one. When one table changes, the other changes.
 //
@@ -43,6 +43,7 @@ silica_rt_device_windows:
     .word   0x60024000, 0x1000        // :esp32s3_spi2 (TRM-unconfirmed, as in the board pack)
     .word   0x60016000, 0x1000        // :esp32s3_rmt (TRM-unconfirmed, as in the board pack; channel RAM at +0x800)
     .word   0x60019000, 0x1000        // :esp32s3_ledc (TRM-unconfirmed, as in the board pack)
+    .word   0x60010000, 0x1000        // :esp32s3_uart1 (TRM-unconfirmed, as in the board pack; the (:uart1) carrier)
     .word   0, 0
 silica_rt_reason_illegal_device_map:
     .asciz  "illegal device map"

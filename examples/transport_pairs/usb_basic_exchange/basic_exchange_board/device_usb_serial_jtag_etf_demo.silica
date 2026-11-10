@@ -1,0 +1,247 @@
+// The board end of the basic exchange (examples/transport_pairs/usb_basic_exchange; it was board app
+// silica_33_transport_usb_serial_jtag_etf): ETF frames both ways over the (:usb_serial_jtag) carrier on the native USB-C
+// jack (transport_esp32s3_wifi_plan.md §8 stage S-A; transport_serialization_design.md §6.4
+// (:usb_serial_jtag), §13 for the terms). The owner actor opens the carrier
+// (device_lib/device_esp32s3_usb_serial_jtag@usb_serial_jtag_carrier, the USB-Serial-JTAG controller
+// the Mac sees as /dev/cu.usbmodem*, 303A:1001), grants four receive credits and, on :link_up, encodes
+// (:accel, { x: 1, y: -2, z: 512, at_ms: 1000 }) with encode((:etf), ...), frames it with the carrier's
+// properties (a 4-byte length prefix on a :stream carrier: 52 bytes for the 48-byte term of design
+// §13.4) and casts it as one :tx. The frame fits the controller's 64-byte IN FIFO, so it waits there
+// until the Mac opens the port. The Mac peer (mac_peer/dangerous_basic_peer.silica: the
+// hosted (:serial) carrier, or mac_peer/basic_peer.erl behind the serial-to-TCP bridge)
+// decodes it and answers one LED command, (:led, { which: :red, on: true }) as an ETF frame; the owner
+// reassembles it from the :rx segments with wireframe@unframe, decodes it and prints "led red on" on
+// UART0 (the console: the carrier's bytes never touch UART0), then closes the carrier and ends the
+// program after :link_down. Expected console: "link up usb_serial_jtag", "tx credit 8", "sent 52
+// bytes", "led red on", "link down :closed", status 0 (expected.scout, written from the source: device
+// apps cannot run on the host, E2220). A term the board cannot decode prints "rejected <why>" and ends
+// with status 2 after the close; a framing error "framing rejected <why>" and status 3; a bring-up
+// failure prints "link down :fault" and ends with status 1 (the carrier's exit reason reaches the
+// FailureReporter). The program waits for the reply as long as run_app.sh's --timeout allows.
+// Since stage S-C the carrier is reached through its link declaration (transport_links_design.md §3.3,
+// specification §16.4.9): `carried_on usb: (:serial) (:usb_serial_jtag);` names the kind and the hardware,
+// spawn_dangerous_carrier(usb, ...) expands on this board to spawn_device of the USB-Serial-JTAG worker
+// (the ESP32-S3 transport pack's carrier_spawn; the worker module is an implicit use), and
+// Carrier@mtu(usb) / Carrier@boundaries(usb) are the (:serial) kind's rows (mtu 0, :stream).
+use wire_etf;
+// spawn_dangerous_carrier adds this `use` implicitly for the compiler; it is written out because the board
+// image tooling (trials/targets/board_suite.sh link_closure, board/tools) links a program with the modules its
+// source names in `use` lines.
+use device_esp32s3_usb_serial_jtag;
+use wireframe;
+use Carrier;
+use Supervisor;
+
+carried_on usb: (:serial) (:usb_serial_jtag);
+
+impl AppSupervisor for Supervisor;
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+// The reading as one framed segment: the declared carrier's kind, (:serial), is mtu 0 and :stream, so the frame
+// gets the length prefix and is never segmented (design §5, links design §7).
+fn reading_segment() -> string {
+    sequence proc[mem(normal), transport]
+        frame: string <- encode((:etf), (:accel, { x: 1, y: 0 - 2, z: 512, at_ms: 1000 }));
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(usb), Carrier@boundaries(usb));
+        seg: string <- first_segment(segs)
+    produces
+        pure seg
+    end
+}
+
+fn show_led(cmd: { which: :single | :red | :green | :blue, on: boolean }) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("led ");
+        _: atom <- case cmd.which of {
+            :single -> print("single");
+            :red -> print("red");
+            :green -> print("green");
+            :blue -> print("blue")
+        };
+        _: atom <- case cmd.on of {
+            true -> print(" on");
+            false -> print(" off")
+        };
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// One complete frame from the peer: decode it, print it, close the carrier. Returns the exit code.
+fn take_frame(car: device_actor_ref, frame0: string) -> int64 {
+    sequence proc[mem(normal), device_io, concurrency, transport]
+        decoded: (:ok, (:led, { which: :single | :red | :green | :blue, on: boolean })) | (:rejected, atom) <- decode((:etf), frame0);
+        code: int64 <- case decoded of {
+            (:ok, (:led, cmd: { which: :single | :red | :green | :blue, on: boolean })) -> {
+                _: atom <- show_led(cmd);
+                0
+            };
+            (:rejected, why: atom) -> {
+                _: atom <- print("rejected ");
+                _: atom <- print_atom(why);
+                _: atom <- println("");
+                2
+            }
+        };
+        _: boolean <- cast_device(car, :close impl ActorMessage {})
+    produces
+        pure code
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { car: device_actor_ref, rx: { mode: atom, expected: int64, pending: string }, sent: int64, code: int64 })
+    -> (:no_reply, { car: device_actor_ref, rx: { mode: atom, expected: int64, pending: string }, sent: int64, code: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("link up ");
+                _: atom <- println(info);
+                _: boolean <- cast_device(state.car, (:credit, 4) impl ActorMessage {});
+                seg: string <- reading_segment();
+                _: boolean <- cast_device(state.car, (:tx, seg, self()) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, rx: state.rx, sent: length_bytes(seg), code: state.code })
+            end
+        };
+        (:tx_credit, n: int64) -> {
+            sequence proc[device_io]
+                _: atom <- case n == 1 of {
+                    true -> {
+                        _: atom <- print("sent ");
+                        _: atom <- print_int64(state.sent);
+                        println(" bytes")
+                    };
+                    false -> {
+                        _: atom <- print("tx credit ");
+                        _: atom <- print_int64(n);
+                        println("")
+                    }
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, segment: string) -> {
+            sequence proc[concurrency]
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                code2: int64 <- case un of {
+                    (:more, _r0: { mode: atom, expected: int64, pending: string }) -> state.code;
+                    (:frame, frame0: string, _r3: { mode: atom, expected: int64, pending: string }) -> take_frame(state.car, frame0);
+                    (:rejected, _why1: atom) -> 3
+                };
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, _frame: string, r2: { mode: atom, expected: int64, pending: string }) -> r2;
+                    (:rejected, why2: atom) -> {
+                        sequence proc[device_io, concurrency]
+                            _: atom <- print("framing rejected ");
+                            _: atom <- print_atom(why2);
+                            _: atom <- println("");
+                            _: boolean <- cast_device(state.car, :close impl ActorMessage {})
+                        produces pure state.rx end
+                    }
+                };
+                _: boolean <- cast_device(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, rx: rx2, sent: state.sent, code: code2 })
+            end
+        };
+        (:tx_failed, why3: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print("tx failed ");
+                _: atom <- print_atom(why3);
+                _: atom <- println("")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:link_down, why4: atom) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- print("link down ");
+                _: atom <- print_atom(why4);
+                _: atom <- println("");
+                _: boolean <- case why4 == :closed of {
+                    true -> cast_exit(state.code);
+                    false -> cast_exit(1)
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+// The app's work, run by the supervisor's one worker: spawn the carrier worker and the owner, open the link.
+fn app_worker(msg: atom, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        car: device_actor_ref <- spawn_dangerous_carrier(usb, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries(usb)), sent: 0, code: 4 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_device(car, (:open, me, "") impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 1 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)] <- [
+            { id: :app_worker, agent_type: :worker, initial_state: initial_state, behavior: app_worker, restart: :transient, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_registered(:app_worker, (:start) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}

@@ -42,9 +42,9 @@ netlist; the supplied pin sheet has the RGB red pin wrong (1 instead of 2).
 | `tools/compare_sout.sh` | Compares a board run's `.sout` with an `expected.scout` the way the trial harness does (fatal-report addresses folded) |
 | `tools/host_reference.sh` | Writes an app's `expected.scout` by building and running it with the macOS compiler (fatal-report lines folded) |
 | `tools/gen_board_pack.py` | Generates `pack/board_pack_<peripheral>_values.silica`, `pack/device_esp32s3_<peripheral>_registers.silica` and `pack/board_pack_gpio_signals.silica` from the ESP-IDF register headers (default IDF tree `/Volumes/2T/silica-esp-idf`); `--check` regenerates into a temporary directory and diffs against the tree |
-| `pack/` | The generated per-peripheral register and value modules (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT, USB-Serial-JTAG) the device drivers use; do not edit by hand |
-| `apps/device_lib/` | Device-worker drivers written in Silica (GPIO, UART, USB-Serial-JTAG, SPI2/ST7789 display, LEDC/buzzer, RMT/WS2813B LED row) |
-| `apps/silica_*` | Silica sample apps, each with the `expected.scout` from the macOS compiler, except `silica_20`, `silica_25` and `silica_26`, `silica_27` (hardware-dependent output: button presses, register dumps, pad levels). Device apps (`silica_16` on) cannot run on the host (E2220: `poke` cannot be compiled for apple_silicon_mac), so the `expected.scout` of `silica_23`, `silica_24` and `silica_28` is written from the source |
+| `pack/` | The generated per-peripheral register and value modules (GPIO, IO_MUX, UART0, UART1 (description only: its field constants are UART0's, the same `uart_reg.h` layout), SPI2, SYSTEM, LEDC, RMT, USB-Serial-JTAG) the device drivers use; do not edit by hand |
+| `apps/device_lib/` | Device-worker drivers written in Silica (GPIO, UART0, the UART1 `(:uart1)` transport carrier (`device_esp32s3_uart1`: the carrier actor contract of `transport_serialization_design.md` §6.2 on the UART1 header, GPIO35 TX / GPIO36 RX), USB-Serial-JTAG (`device_esp32s3_usb_serial_jtag`: the item F console worker `usb_serial_jtag_worker` and the `(:usb_serial_jtag)` transport carrier `usb_serial_jtag_carrier`, the §6.2 contract both ways on the native USB-C jack), SPI2/ST7789 display, LEDC/buzzer, RMT/WS2813B LED row) |
+| `apps/silica_*` | Silica sample apps, each with the `expected.scout` from the macOS compiler, except `silica_20`, `silica_25` and `silica_26`, `silica_27` (hardware-dependent output: button presses, register dumps, pad levels). Device apps (`silica_16` on) cannot run on the host (E2220: `poke` cannot be compiled for apple_silicon_mac), so the `expected.scout` of `silica_23`, `silica_24` and `silica_28` is written from the source. `silica_32` is the UART1 transport demo; the USB-C transport demos (formerly `silica_33`) are board/Mac pairs in `examples/transport_pairs/` at the repository root, each a board program directory that `tools/run_app.sh` builds from its path, with its Mac peers and a run script |
 | `apps/asm_*` | Bring-up apps in hand-written Xtensa assembly (runtime and board checks, no compiler involved) |
 | `tests/xt_helpers_selftest/` | 408-case hardware self-test of the emitter's Xtensa instruction helpers (`shared/xt_*.silica`) |
 
@@ -219,6 +219,16 @@ of heap chunks that grow on demand and are released by the actor's `stack_policy
   `~/.espressif/python_env/idf6.2_py3.14_env/bin/python` (or another Python that has esptool 5.x and
   pyserial), and `build_image.sh` calls that environment's `esptool`. A change to plain `python3` with
   `pip install esptool pyserial` is planned but not done.
+  **On the 2026-11-09 setup the installed environment is `idf6.1_py3.14_env`, not 6.2**, so the defaults point at a
+  missing directory and every run needs the overrides. The system `python3` has no pyserial. A working recipe:
+  ```sh
+  export BOARD_PYTHON=~/.espressif/python_env/idf6.1_py3.14_env/bin/python
+  export ESPTOOL=~/.espressif/python_env/idf6.1_py3.14_env/bin/esptool
+  export BOARD_PORT=/dev/cu.usbserial-8310          # the USB-UART jack (UART0); the number differs per board
+  export SILICA_COMPILER=$PWD/compiler/build/ESP32-S3_raw/silica-compiler   # also BOARD_SILICA_COMPILER for the suites
+  ```
+  The native USB-C jack enumerates separately (`/dev/cu.usbmodem*`, 303A:1001); find it by VID:PID, the node name
+  changes across resets.
 - **An ESP32-S3_raw compiler that matches the runtime in this tree.** The runtime (`rt_actors.S`,
   `rt_supervisors.S`) refers to symbols the compiler emits (atom tags, registry atoms), so a compiler
   older than the runtime compiles but does not link, and one older than the language rules the apps
@@ -226,6 +236,11 @@ of heap chunks that grow on demand and are released by the actor's `stack_policy
   compiler is built and published by `make TARGET=ESP32-S3_raw` in `compiler/src` (published as
   `binaries/silica-compiler-ESP32-S3_raw`; `INSTALL_SELFHOST=0` builds without publishing, into
   `compiler/build/ESP32-S3_raw/silica-compiler`).
+  The cross compiler in `compiler/build/ESP32-S3_raw/` was rebuilt on 2026-11-09 for the `(:uart1)` window (77 minutes,
+  scratch `BUILD_ROOT`) and again the same day for stage S-C of `transport_esp32s3_wifi_plan.md` (the `carried_on`
+  link declaration: the shared parser and type checker, the pack's `provides_link` / `carrier_spawn` rows; 67 min 47 s, scratch `BUILD_ROOT`, copied over `compiler/build/ESP32-S3_raw/silica-compiler`).
+  The published `binaries/silica-compiler-ESP32-S3_raw` knows neither the `:esp32s3_uart1` window (it refuses
+  `map_device 0x60010000`) nor `carried_on`.
 
 ### Build and run one app
 
@@ -398,7 +413,9 @@ record for the language features.
 | `silica_28_device_pin_hunt` | Twin of `asm_10_pin_hunt`: 440 Hz square on pins 2, 3, 7, 8, 9, 12 to 18, 45, 46 for about 4 s, run in the worker by `:square` | expected `square wave on`, `done`, status 0 (from the source); ✓ 2026-10-28: matched twice, observer confirmed
 | `silica_29_recursion_wide` | Native coverage: 1000-deep recursion, int64 wide sum, values bound across deep calls (`asm_05_recursion`) | `expected.scout` matches the macOS host run; ✓ 2026-10-28: matched on the board
 | `silica_30_heap_list` | Native coverage: 2000-element list built, walked and summed (`asm_06_heap`) | `expected.scout` matches the macOS host run; ✓ 2026-10-28: matched on the board (sums by index with `list_at`; the `[h, t]` pattern walk exhausted the heap)
-| `silica_31_device_usb_console` | A second console: UART0 and the USB-Serial-JTAG worker (`device_lib/device_esp32s3_usb_serial_jtag`, `:exchange`) together; the worker waits up to about 20 s for a byte from the USB host, then writes `hello from usb serial jtag`, the byte and a newline to the USB console | UART0: `waiting for usb host`, `usb byte 65`, status 0 (`expected.scout` written from the source, with a host sending `A`); no byte in time: `usb timed out`, then seven register lines (`usb ep1_conf N`, `usb conf0 N`, `usb out_ep1_st N`, `usb in_ep1_st N`, `usb jfifo_st N`, `usb fram_num N`, `usb fram_num_100ms_later N`, decimal), status 3. Gate passed on the board 2026-10-30 (`usb_console_check.py` exit 0: UART0 matched, USB console `hello from usb serial jtag` and `A`). Run it with `tools/usb_console_check.py`, which plays the USB host |
+| `silica_31_device_usb_console` | A second console: UART0 and the USB-Serial-JTAG worker (`device_lib/device_esp32s3_usb_serial_jtag`, `:exchange`) together; the worker waits up to about 20 s for a byte from the USB host, then writes `hello from usb serial jtag`, the byte and a newline to the USB console | UART0: `waiting for usb host`, `usb byte 65`, status 0 (`expected.scout` written from the source, with a host sending `A`); no byte in time: `usb timed out`, then seven register lines (`usb ep1_conf N`, `usb conf0 N`, `usb out_ep1_st N`, `usb in_ep1_st N`, `usb jfifo_st N`, `usb fram_num N`, `usb fram_num_100ms_later N`, decimal), status 3. Gate passed on the board 2026-10-30 (`usb_console_check.py` exit 0: UART0 matched, USB console `hello from usb serial jtag` and `A`), and again 2026-11-09 after the app moved to the chunk-15 spawn forms (`state_policy`). Run it with `tools/usb_console_check.py`, which plays the USB host |
+| `silica_32_transport_uart1_etf` | One ETF frame over the `(:uart1)` transport carrier (`device_lib/device_esp32s3_uart1`, the §6.2 carrier contract of `transport_serialization_design.md` on the UART1 header, GPIO35 TX / GPIO36 RX, 115200 8N1): the owner opens the carrier, encodes `(:accel, { x: 1, y: -2, z: 512, at_ms: 1000 })` with `encode((:etf), ...)`, frames it with the carrier's properties (52 bytes) and sends it as one `:tx`, then closes. The Mac peer is `programmer_tools/transport_uart1_demo` (needs a USB-serial adapter on the header: adapter RX to GPIO35, GND to GND) | expected `link up uart1@115200`, `tx credit 8`, `sent 52 bytes`, `link down :closed`, status 0 (`expected.scout` written from the source); ✓ 2026-11-09 with `run_app.sh` (compiler built from the tree, `BUILD_ROOT` scratch): matched twice; nothing was wired to the header, so the bytes left on GPIO35 unobserved |
+| `silica_33_transport_usb_serial_jtag_etf` | ETF frames both ways over the `(:usb_serial_jtag)` transport carrier (`device_esp32s3_usb_serial_jtag@usb_serial_jtag_carrier`, the native USB-C jack, `/dev/cu.usbmodem*` 303A:1001 on the Mac): the owner opens the carrier, grants receive credit, encodes `(:accel, { x: 1, y: -2, z: 512, at_ms: 1000 })` and sends it as one 52-byte `:tx`, then decodes the peer's reply `(:led, { which: :red, on: true })` from the `:rx` segments and prints it, then closes. The Mac peer is `programmer_tools/transport_usb_serial_jtag_demo` (the hosted `(:serial)` carrier, or the Erlang peer behind the bridge); start it after `run_app.sh` prints `running ... on the board` | expected `link up usb_serial_jtag`, `tx credit 8`, `sent 52 bytes`, `led red on`, `link down :closed`, status 0 (`expected.scout` written from the source); ✓ 2026-11-09 with `run_app.sh --timeout 120`: matched against the Silica peer and against the Erlang peer (the bridge showed the 52 bytes out and the 39-byte reply in); waits for the reply until `--timeout` when no peer opens the port |
 
 Every `silica_*` app is compiled by the ESP32-S3_raw emitter and compared byte for byte with the
 `expected.scout` the macOS compiler produced for the same source (`tools/host_reference.sh <app dir>`
@@ -422,3 +439,25 @@ trials, and the apps exercise them again: a tuple literal as a record field valu
 returning the wrong one, the compare's operand staging having overwritten the second parameter's
 register (`silica_12_floats`; `trials/float64_addition/case_float_compare_params` and its float32 /
 float16 twins).
+
+## Known issues (2026-11-09)
+
+- **Stale three-argument `spawn` forms.** The device apps `silica_16` to `silica_28` (14 files) still call `spawn` /
+  `spawn_device` with the pre-chunk-15 three-argument form and fail with E2005 under the current compiler; they need the
+  `state_policy(:keep_state_area)` argument. `silica_31_device_usb_console` and the new transport apps are current.
+  Update the others when their suites are next run.
+- **Board assembly goldens depend on the suite's compile set.** Atom indices are assigned across the whole `silica.config`,
+  so staging another module into a suite renumbers `movi` immediates in that suite's `.esp32_s3.ascomp` files. Regenerate
+  them from the compiler's own output (`gen_board_ascomp.sh --suite <name> ESP32-S3_raw`); see
+  `trials/transport_board_addition/README.md`.
+- **Carrier declarations on the board (stage S-C, 2026-11-09).** `carried_on usb: (:serial) (:usb_serial_jtag);` and
+  `carried_on host_line: (:serial) (:uart, 1, 115200);` are the two links this pack provides;
+  `spawn_dangerous_carrier(<name>, ...)` expands to `spawn_device(:idle, <worker>@<carrier>, ...)` and answers a
+  `device_actor_ref` (the carriers are device workers; a device worker cannot be a supervisor child yet, so the owner
+  spawns and restarts it). `(:uart, 0, ...)` is the console and is E2412 with the console note; UART2 has no window
+  yet and is not provided; the UART1 worker's clock divider is fixed, so only 115200 is accepted (E2417 otherwise).
+  `silica_33_transport_usb_serial_jtag_etf` and the `device_*_link_tx` trials use the declaration;
+  `silica_32_transport_uart1_etf` keeps the tag form (`Carrier@mtu((:uart1))`, `spawn_device`), which still compiles.
+- **Compiler: `.iface` files carry no device-description rows**, so a driver compiled in a later process after a skipped
+  `use` can get a wrong E2213 (order-dependent). The transport carriers therefore have their own suite,
+  `trials/transport_board_addition`, apart from `device_actor_addition`.

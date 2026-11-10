@@ -1,0 +1,108 @@
+// The (:uart1) carrier sends one frame larger than the UART's 128-byte FIFO (transport_links_design.md
+// §10 phase B, "uart1_stream_framing": the board only sends; decision 15). The owner opens the carrier
+// (device_esp32s3_uart1: TX GPIO35, RX GPIO36, 115200 8N1), and on :link_up frames a 200-byte text with
+// the carrier's properties (wireframe: a 4-byte length prefix, :stream, mtu 0, so 204 bytes in one
+// segment) and casts it as one :tx; the credit coming back means every byte went through the FIFO
+// (the worker waits for room byte by byte), so the owner closes the carrier and ends the program on
+// :link_down. Nothing needs to be wired to the header for this trial: the bytes leave on GPIO35.
+// Expected (board only; the host emitter rejects the prims with E2220):
+//   link up uart1@115200 / tx credit 8 / sent 204 bytes / link down :closed / status 0.
+use device_esp32s3_uart1;
+use wireframe;
+use Carrier;
+use trial_wait_int64;
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+// 200 bytes of text: four 50-byte lines.
+fn payload() -> string {
+    line: string <- "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM\n";
+    concat(concat(line, line), concat(line, line))
+}
+
+fn framed_payload() -> string {
+    segs: List[string, mem(normal)] <- wireframe@frame(payload(), Carrier@mtu((:uart1)), Carrier@boundaries((:uart1)));
+    first_segment(segs)
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { car: device_actor_ref, sent: int64 }) -> (:no_reply, { car: device_actor_ref, sent: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("link up ");
+                _: atom <- println(info);
+                seg: string <- framed_payload();
+                _: boolean <- cast_device(state.car, (:tx, seg, self()) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, sent: length_bytes(seg) })
+            end
+        };
+        (:tx_credit, n: int64) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- case n == 1 of {
+                    true -> {
+                        _: atom <- print("sent ");
+                        _: atom <- print_int64(state.sent);
+                        _: atom <- println(" bytes");
+                        _: boolean <- cast_device(state.car, :close impl ActorMessage {});
+                        :ok
+                    };
+                    false -> {
+                        _: atom <- print("tx credit ");
+                        _: atom <- print_int64(n);
+                        println("")
+                    }
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_failed, why: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print("tx failed ");
+                _: atom <- print_atom(why);
+                _: atom <- println("")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:link_down, why2: atom) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- print("link down ");
+                _: atom <- print_atom(why2);
+                _: atom <- println("");
+                _: boolean <- case why2 == :closed of {
+                    true -> cast_exit(0);
+                    false -> cast_exit(1)
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                car: device_actor_ref <- spawn_device(:idle, device_esp32s3_uart1@uart1_carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- spawn({ car: car, sent: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast_device(car, (:open, me, "") impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

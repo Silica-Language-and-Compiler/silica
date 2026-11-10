@@ -1,0 +1,226 @@
+// The Silica Mac peer of the accel/LED pair (examples/transport_pairs/usb_accel_led_erlang_and_silica): the hosted
+// (:serial) carrier (dangerous_serial_carrier, termios; the USB-Serial-JTAG controller ignores the baud) opened on
+// the board's native USB-C port reads the frames the board sends, one reading in flight at a time, reassembles
+// each with wireframe@unframe (the 4-byte length prefix of a :stream carrier), decodes the ETF term into
+// (:accel, { x, y, z, at_ms }), and answers each with one LED command decided by the reading:
+// z > 256 -> (:led, { which: :red, on: true }), otherwise (:led, { which: :red, on: false }). The Erlang peer
+// (accel_led_peer.erl) applies the same rule and sends the same bytes. The board ends the stream with
+// (:done, n), n the readings it sent; the peer then closes the port at once. As a fallback (a board program that
+// sends no end frame) it closes the port when no reading has arrived for 3 s after its last reply (the board's
+// own close is not visible to the host). run.sh puts the port path in place of the placeholder below.
+module dangerous_accel_led_peer;
+
+use wire_etf;
+use wireframe;
+use Carrier;
+use dangerous_sockets;
+use dangerous_serial_carrier;
+use trial_wait_int64;
+
+// The link under the (:serial) carrier (transport_links_design.md §3.3, specification §16.4.9): the
+// board's USB-Serial-JTAG port on this Mac, patched per run by run.sh (the controller ignores the
+// line speed; 115200 is the termios setting). spawn_dangerous_carrier(board, ...) in main starts the
+// carrier on it, and the :open address is then "".
+carried_on board: (:serial) (:serial_port, "/dev/cu.usbmodem-PLACEHOLDER", 115200);
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+fn show_reading(r: { x: int16, y: int16, z: int16, at_ms: uint64 }) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("accel x=");
+        _: atom <- print_int64(to_int64(r.x));
+        _: atom <- print(" y=");
+        _: atom <- print_int64(to_int64(r.y));
+        _: atom <- print(" z=");
+        _: atom <- print_int64(to_int64(r.z));
+        _: atom <- print(" at_ms=");
+        _: atom <- print_int64(to_int64(r.at_ms));
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// The rule (the same in accel_led_peer.erl): the red LED on when z is above 256 counts, off otherwise.
+fn led_on_for(r: { x: int16, y: int16, z: int16, at_ms: uint64 }) -> boolean {
+    to_int64(r.z) > 256
+}
+
+// The LED command as one framed segment, sent as one :tx; returns its length.
+fn send_led(car: dangerous_actor_ref, on: boolean) -> int64 {
+    sequence proc[mem(normal), concurrency, transport, device_io]
+        _: atom <- case on of {
+            true -> println("reply led red on");
+            false -> println("reply led red off")
+        };
+        frame: string <- encode((:etf), (:led, { which: :red, on: on }));
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(board), Carrier@boundaries(board));
+        seg: string <- first_segment(segs);
+        _: boolean <- cast(car, (:tx, seg, self()) impl ActorMessage {})
+    produces
+        pure length_bytes(seg)
+    end
+}
+
+// One complete frame from the board: decode it, print it, answer it by the rule. Returns the exit code so far
+// (0 after a reading was answered; 2 when the term was rejected, and the port is then closed) and the length of
+// the reply sent (0 when none).
+fn take_frame(car: dangerous_actor_ref, frame0: string) -> (int64, int64) {
+    sequence proc[mem(normal), device_io, transport]
+        _: atom <- print("frame ");
+        _: atom <- print_int64(length_bytes(frame0));
+        _: atom <- println(" bytes");
+        decoded: (:ok, (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 })) | (:rejected, atom) <- decode((:etf), frame0);
+        result: (int64, int64) <- case decoded of {
+            (:ok, (:accel, r: { x: int16, y: int16, z: int16, at_ms: uint64 })) -> {
+                _: atom <- show_reading(r);
+                len: int64 <- send_led(car, led_on_for(r));
+                (0, len)
+            };
+            (:rejected, _why: atom) -> (take_done(car, frame0), 0)
+        }
+    produces
+        pure result
+    end
+}
+
+// A frame that is not a reading: the board's end of stream, (:done, n) with n the readings it sent, closes the
+// port at once (exit code 0); anything else is rejected (2) and closes it too.
+fn take_done(car: dangerous_actor_ref, frame0: string) -> int64 {
+    sequence proc[mem(normal), device_io, concurrency, transport]
+        decoded: (:ok, (:done, int64)) | (:rejected, atom) <- decode((:etf), frame0);
+        code: int64 <- case decoded of {
+            (:ok, (:done, n: int64)) -> {
+                _: atom <- print("board done after ");
+                _: atom <- print_int64(n);
+                _: atom <- println(" readings");
+                0
+            };
+            (:rejected, why: atom) -> {
+                _: atom <- print("rejected ");
+                _: atom <- print_atom(why);
+                _: atom <- println("");
+                2
+            }
+        };
+        _: boolean <- cast(car, :close impl ActorMessage {})
+    produces
+        pure code
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:finish, int64),
+         state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, reply: int64, n: int64 })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, reply: int64, n: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("serial open ");
+                _: atom <- println(info);
+                _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        // A reply left: print it and arm the idle check for this reply count.
+        (:tx_credit, k: int64) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- case k == 1 of {
+                    true -> {
+                        _: atom <- print("sent ");
+                        _: atom <- print_int64(state.reply);
+                        _: atom <- println(" bytes");
+                        _: timer_ref <- send_after(3000, self(), (:finish, state.n) impl ActorMessage {});
+                        :ok
+                    };
+                    false -> :ok
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        // Close only when no reading was answered since this check was armed.
+        (:finish, seen: int64) -> {
+            sequence proc[concurrency]
+                _: boolean <- case seen == state.n of {
+                    true -> cast(state.car, :close impl ActorMessage {});
+                    false -> false
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, segment: string) -> {
+            sequence proc[concurrency]
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                taken: (int64, int64) <- case un of {
+                    (:more, _r0: { mode: atom, expected: int64, pending: string }) -> (state.code, 0);
+                    (:frame, frame0: string, _r3: { mode: atom, expected: int64, pending: string }) -> take_frame(state.car, frame0);
+                    (:rejected, _why1: atom) -> (3, 0)
+                };
+                (code2, len) <- taken;
+                answered: boolean <- len > 0;
+                reply2: int64 <- case answered of { true -> len; false -> state.reply };
+                n2: int64 <- case answered of { true -> state.n + 1; false -> state.n };
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, _frame: string, r2: { mode: atom, expected: int64, pending: string }) -> r2;
+                    (:rejected, why2: atom) -> {
+                        sequence proc[device_io, concurrency]
+                            _: atom <- print("framing rejected ");
+                            _: atom <- print_atom(why2);
+                            _: atom <- println("");
+                            _: boolean <- cast_exit(3)
+                        produces pure state.rx end
+                    }
+                };
+                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, rx: rx2, code: code2, reply: reply2, n: n2 })
+            end
+        };
+        (:tx_failed, why4: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print("tx failed ");
+                _: atom <- print_atom(why4);
+                _: atom <- println("")
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, why5: atom) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- print("link down ");
+                _: atom <- print_atom(why5);
+                _: atom <- print(" after ");
+                _: atom <- print_int64(state.n);
+                _: atom <- println(" readings");
+                _: boolean <- case why5 == :closed of {
+                    true -> cast_exit(state.code);
+                    false -> cast_exit(1)
+                }
+            produces pure (:no_reply, state) end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                car: dangerous_actor_ref <- spawn_dangerous_carrier(board, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries(board)), code: 4, reply: 0, n: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(car, (:open, me, "") impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

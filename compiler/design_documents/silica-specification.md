@@ -11,7 +11,7 @@
 | [memory-effects-aarch64-implementation-plan.md](memory-effects-aarch64-implementation-plan.md) | Memory `Space` model for OS-free AArch64 and embedded targets (implementation plan) |
 | [porting_for_os_free_targets.md](porting_for_os_free_targets.md) | OS-free / raw-metal port inventory: boot, `Space` pools, MMIO prims, board packs |
 | [silica_device_actor_specification.md](silica_device_actor_specification.md) | Device-worker actors: `register_rwr` only in `spawn_device` behaviors, `device_actor_ref`, disjoint from Fifi |
-| [transport_serialization_design.md](transport_serialization_design.md), [transport_links_design.md](transport_links_design.md) | Wire transport design (§16.4) and the planned carrier links (§16.4.9; design accepted, nothing implemented) |
+| [transport_serialization_design.md](transport_serialization_design.md), [transport_links_design.md](transport_links_design.md) | Wire transport design (§16.4) and the carrier links (§16.4.9; declaration, `Link` and pack rows on the Mac and the ESP32-S3 since 2026-11-09) |
 | [tls_quantum_safe_future.md](tls_quantum_safe_future.md) | **Future development:** first-class quantum-safe TLS (TLS 1.3 + hybrid ML-KEM), supervised session actors, Fifi taint |
 
 Platform-specific runtime notes are added as Silica grows to support each target. The macOS crash-handling document is therefore not a portable guarantee for Linux, Windows, bare-metal targets, or future hosted runtimes; those platforms require their own fault-delivery, signal/exception, and process-isolation notes.
@@ -10617,7 +10617,7 @@ wireframe@unframe(state: { mode: atom, expected: int64, pending: string }, segme
 #### 16.4.8 Carriers
 
 A carrier is an actor the language provides, one built-in implementation per carrier kind (`:tcp`, `:udp`, `:serial`), installed by the
-program with `spawn_dangerous` (hosted carriers are Fifi wrappers over the host's sockets and serial ports)
+program with `spawn_dangerous_carrier` from a `carried_on` declaration (§16.4.9) or with `spawn_dangerous` (hosted carriers are Fifi wrappers over the host's sockets and serial ports)
 and spoken to only through casts. `Carrier` is a closed trait (E2409); its properties are literals per tag,
 read through the built-in module `carrier` by the tag's atom (the design's `Carrier@mtu((:tcp))` is the same
 call: `(:tcp)` as an expression is a parenthesised atom literal):
@@ -10627,7 +10627,7 @@ Carrier@mtu(c: atom) -> int64            // largest segment in bytes; 0 means un
 Carrier@boundaries(c: atom) -> atom      // :stream | :datagram | :storage
 Carrier@delivery(c: atom) -> atom        // :reliable_ordered | :ordered_lossy | :unreliable
 Carrier@addressing(c: atom) -> atom      // :none | :endpoint | :characteristic | :block
-Carrier@provides(c: atom) -> boolean     // whether this build's target provides the carrier (`provided` is a keyword)
+Carrier@provides(c: atom) -> boolean     // whether the language provides the carrier tag (`provided` is a keyword); the ESP32-S3 rows `:uart1` and `:usb_serial_jtag` answer true with addressing `:none`
 ```
 
 **The carrier contract.** Every message is cast-only.
@@ -10661,82 +10661,115 @@ socket only; the connections it spawned live on.
 | --- | --- | --- | --- | --- | --- |
 | `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound) and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
 | `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx`, and the local port to bind (`:link_up` carries `"port:<n>"`) | 65507 | `:datagram` | `:unreliable` |
-| `:serial` | `dangerous_serial_carrier@carrier` | `"path@baud"`, raw 8N1 | 0 | `:stream` | `:reliable_ordered` |
+| `:serial` | `dangerous_serial_carrier@carrier` | `""` when the port is declared (`carried_on ... (:serial_port, path, baud)`, §16.4.9), else `"path@baud"`; raw 8N1; `:link_up` carries `"path@baud"` | 0 | `:stream` | `:reliable_ordered` |
 
-A carrier's initial state is the record its module's `initial/0` spells; a program writes that literal at
-its `spawn_dangerous` (a `dangerous_*` function cannot be called outside an `external_danger` block). The
+A carrier's initial state is the record its module's `initial/0` spells; a program that installs a carrier through
+`spawn_dangerous` writes that literal (a `dangerous_*` function cannot be called outside an `external_danger` block);
+a program that declares the carrier with `carried_on` installs it with `spawn_dangerous_carrier(<name>, ...)` and the
+compiler writes the literal (§16.4.9). The
 socket wrappers behind the hosted carriers are the dangerous module `dangerous_sockets` over
 `libsilica_sockets.a`, shipped with the compiler under `compiler/stdlib/net/`.
 
-#### 16.4.9 Carrier links (planned; not implemented)
+#### 16.4.9 Carrier links
 
-**Status: design accepted for phase A planning; nothing in this subsection is implemented.** The rules below are
-normative for the build that adds them and are marked planned until then. The design is
-[transport_links_design.md](transport_links_design.md).
+**Status (2026-11-09).** Implemented for the Apple Silicon macOS target and the ESP32-S3_raw board (stage S-C of
+[transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md), phase A and the UART part of phase B of
+[transport_links_design.md](transport_links_design.md)): the declaration, the built-in module `Link`, the pack rows
+and the diagnostics below. The Linux and Nucleo packs do not list any link yet, so a declaration compiled for them is
+E2412 until their rows are written. The hosted `(:interface, name)`, `(:ethernet, n)` and `(:wifi, n)` links are
+accepted and checked but the carrier does not yet bind its socket to the interface (it uses the host's default route);
+binding, the interface-family resolution and the `(:explicit, :link_unavailable)` failure at open are the next step.
 
-A carrier's tag names how bytes travel (`:tcp`, `:udp`, `:serial`). A **link** is the hardware layer under it: the OS
-interface on a hosted target, or the UART, Wi-Fi station or Ethernet MAC on a board. A link is a tag followed by
-parameters, written as a tagged tuple such as `(:uart, 1, 115200)` where the language allows it and otherwise as a
-record such as `{ kind: :uart, n: 1, baud: 115200 }`; which is used is decided when the grammar phase starts. A link
-is read by the compiler only: it is literal, never a run-time value, and a one-atom link such as `(:loopback)` is a
-type-level tag like a protocol tag (§16.4.1). The language names these links: `(:loopback)`, `(:interface, name)`,
-`(:ethernet, n)`, `(:wifi, n)`, `(:uart, n, baud)`, `(:serial_port, path, baud)` and `(:usb_cdc, n)`.
+A carrier's kind names how bytes travel (`:tcp`, `:udp`, `:serial`). A **link** is the hardware layer under it: the OS
+interface on a hosted target, or the UART, the USB-Serial-JTAG controller, a Wi-Fi station or an Ethernet MAC on a
+board. A link is a tag followed by parameters, written as a tagged tuple such as `(:uart, 1, 115200)`. A link is read
+by the compiler only: it is literal, never a run-time value, and a one-atom link such as `(:loopback)` is a type-level
+tag like a protocol tag (§16.4.1). The language names these links:
 
-**The carrier declaration (planned).** A new top-level form, a pure declaration with no effects:
+| Link | Parameters | Carries | Meaning |
+| --- | --- | --- | --- |
+| `(:loopback)` | none | `:tcp`, `:udp` | hosted: the host's loopback interface |
+| `(:interface, name)` | a string or atom literal | `:tcp`, `:udp` | hosted: the named OS interface |
+| `(:ethernet, n)` | an integer literal | `:tcp`, `:udp` | hosted: the n-th wired interface; boards: later |
+| `(:wifi, n)` | an integer literal | `:tcp`, `:udp` | hosted: the n-th wireless interface; boards: later |
+| `(:uart, n, baud)` | two integer literals | `:serial` | board: UART n at the baud, 8N1, no flow control |
+| `(:serial_port, path, baud)` | a string literal, an integer literal | `:serial` | hosted: a termios port |
+| `(:usb_cdc, n)` | an integer literal | `:serial` | board, later |
+| `(:usb_serial_jtag)` | none | `:serial` | ESP32-S3: the native USB-C jack through the USB-Serial-JTAG controller |
+
+**The carrier declaration.** A top-level form, a pure declaration with no effects; `carried_on` is a reserved word:
 
 ```
 carried_on <name>: (<:kind>) (<:link>, <params>...);
 ```
 
-For example `carried_on lan: (:tcp) (:interface, "en0");` and `carried_on telemetry: (:serial) (:uart, 1, 115200);`.
-`carried_on` is the declaration head; it replaces both a `carrier` keyword and an `on` word, and the kind and the link
-follow the name. It binds `<name>` to a carrier kind and a link. The program names the carrier by `<name>` where it
-names a kind today, and the link may only narrow the kind's properties (§16.4.8). It needs a parser change, and
-`carried_on` becomes a reserved word when the grammar phase lands. The built-in module `carrier` (§16.4.8) is
-unaffected: `carrier` does not become a keyword. The word `link` is never used in the declaration, because `link` is a
-keyword of actor links (§15.4).
+For example `carried_on test_net: (:tcp) (:loopback);`, `carried_on board: (:serial) (:serial_port,
+"/dev/cu.usbmodem101", 115200);` and, on the ESP32-S3, `carried_on usb: (:serial) (:usb_serial_jtag);` and
+`carried_on host_line: (:serial) (:uart, 1, 115200);`. The declaration binds `<name>` to a carrier kind and a link.
+Where an expression names the carrier, `<name>` stands for the kind's atom: `Carrier@mtu(<name>)`,
+`Carrier@boundaries(<name>)` and the other properties of §16.4.8 answer the kind's row (the link narrows no property
+in this phase). The declaration is local to its module. Every parameter is a literal (E2417); the word `link` is not
+used in the declaration, because `link` is a keyword of actor links (§15.4), and the built-in module `Carrier` is
+unaffected.
 
-**Installing a carrier (planned).** `spawn_dangerous_carrier(<name>)` starts the carrier actor that `<name>` declares. It
-is the planned replacement for installing a carrier through `spawn_dangerous` with an address string (§16.4.8).
+**Installing a carrier.** `spawn_dangerous_carrier(<name>, <policies>...)` starts the carrier that `<name>` declares, with
+the same `stack_policy` and `state_policy` arguments as `spawn_dangerous` (§15.4.13.5), and replaces installing a
+carrier through `spawn_dangerous` with the module's initial-state literal (§16.4.8). What it starts is the target's
+business, spelled by the target's transport pack:
 
-**The transport pack (planned).** Each target's transport pack gains `provides_link(link: string, instance: uint32)
--> boolean`, flat tables like `provides_carrier`, never overridden by a program. The pack lists what the target
-provides; configuration that is fixed by the board (UART pins, windows) lives in the board pack and is not a
-declaration parameter: pins come only from the board pack and a program cannot pass pins. A UART link is 8N1 with no
-flow control; parity, stop bits and flow control are deferred.
+- on a hosted target, `spawn_dangerous(<initial state>, dangerous_<kind>_carrier@carrier, <policies>...)`: a
+  `dangerous_actor_ref`. The `(:serial)` carrier's initial state carries the declared path and baud, so its `:open`
+  address is `""` (an address `"path@baud"` still names a port directly); `:link_up` carries `"path@baud"`. The
+  `(:tcp)` and `(:udp)` carriers keep their address strings at `:open` (`"listen:0"`, `"host:port"`, ...), and
+  `(:loopback)` is where they already bind. The module the spawn names is an implicit `use`, as `wire_etf` is for
+  `(:etf)`;
+- on the ESP32-S3, `spawn_device(:idle, <device worker>@<carrier behaviour>, <policies>...)`: a `device_actor_ref`,
+  spoken to with `cast_device`, because the board's carriers are device workers (§20.4; a device worker cannot yet be a
+  supervisor child). `(:uart, 1, baud)` starts `device_esp32s3_uart1@uart1_carrier` and `(:usb_serial_jtag)` starts
+  `device_esp32s3_usb_serial_jtag@usb_serial_jtag_carrier`; the worker module is in the program's configuration.
 
-**Meaning by target.** On a hosted target the OS owns the hardware and brings the interface up. `(:loopback)` binds or
-connects on the host's loopback address; `(:interface, name)` binds to the address of the named interface (portable;
-forcing traffic through the interface with per-OS socket options is a possible later option); `(:ethernet, n)` and
-`(:wifi, n)` keep the same syntax as on boards and pick the n-th interface the OS classifies as that family, by
-interface enumeration; instance numbers are only as stable as the OS's enumeration, and when no such interface exists
-the carrier fails at open with `(:explicit, :link_unavailable)`; the hosted `provides_link` answers true for every tag
-the hosted target supports;
-`(:serial_port, path, baud)` names a termios port. There is no separate bring-up actor on a host: the carrier actor is
-it. On a board the carrier is served by a **bring-up actor**, a dangerous actor under a supervisor that owns the
-link: it brings it up (clock, pins, UART configure), watches it and reconnects. Wi-Fi and Ethernet on boards are
-later and out of scope.
+**The built-in module `Link`** (`compiler/stdlib/Link.silica`, closed like `Carrier`, E2409 applies to neither) answers
+the language-wide facts by the tag's atom: `Link@known(l) -> boolean`, `Link@arity(l) -> int64` (the parameter count,
+-1 for an unknown tag), `Link@instance_indexed(l) -> boolean` (whether the first parameter is an instance number) and
+`Link@carries(l, kind) -> boolean` (the pairing table above). The compiler keeps its own copy of the table.
 
-**Link failure (planned).** A link failure is a supervised actor failure. The bring-up actor, or on a host the carrier
-actor, ends with an exit reason (for example `(:explicit, :link_unavailable)`), and the supervisor restarts it under
-the ordinary policy of §15.4.11 (there is no link-specific backoff); the carrier then reports `:link_up` again. It is not a value the sender checks, and
-it never exits the process (§15.4.11, runtime_failure_reporting.md). A carrier in the declaration's own terms is one
-carrier per link instance.
+**The transport pack.** Each target's transport pack (§16.4.8, [transport_serialization_design.md](transport_serialization_design.md) §6.0)
+gains `provides_link(link: string, instance: int64) -> boolean`, `provided_links() -> string` (the list the E2412
+message prints), `link_console_note(link, instance) -> string` (the note for a console instance), `link_baud_ok(link,
+baud) -> boolean` and `carrier_spawn(kind, link, instance, params) -> string` with `carrier_module(kind, link) ->
+string` (the spawn text above and the module it names). The hosted packs' `provides_carrier` rows now list `tcp`,
+`udp` and `serial`, so the pack is the one place the compiler asks. Configuration fixed by the board (UART pins,
+windows) lives in the board pack and is not a declaration parameter: pins come only from the board pack and a program
+cannot pass pins. A UART link is 8N1 with no flow control; parity, stop bits and flow control are deferred.
 
-**Phase order (planned).** A hosted link naming (Mac, Linux AArch64, Linux x86-64); B UART on the ESP32-S3_raw;
+**What the packs provide (2026-11-09).** apple_silicon_mac: `loopback`, `interface`, `ethernet n`, `wifi n`,
+`serial_port` (baud 9600 to 230400, the termios speeds the wrapper sets). ESP32-S3_raw: `uart 1` at 115200 (the
+worker's fixed clock divider) and `usb_serial_jtag`; `(:uart, 0, ...)` is the console and is rejected with the console
+note; UART2 waits for its window. linux_aarch64, linux_x86_64, STM32-L476RG_raw: none yet.
+
+**Link failure.** A link failure is a supervised actor failure, never a value the sender checks: the carrier (on a host)
+or the device worker (on the board) ends with an exit reason such as `(:explicit, :link_unavailable)`, `(:explicit,
+:link_lost)` or `(:explicit, :link_timeout)` after telling its owner `(:link_down, :fault)`, and the supervisor restarts
+it under the ordinary policy of §15.4.11 (no link-specific backoff). The hosted `(:explicit, :link_unavailable)` for an
+absent interface is not implemented yet (the interface links do not bind). One carrier per link instance: a UART
+instance, a serial port path or the USB-Serial-JTAG controller is claimed by one declaration (E2415); a loopback or
+network interface is shared freely.
+
+**Phase order.** A hosted link naming (Mac done; Linux AArch64 and Linux x86-64: pack rows pending); B UART on the
+ESP32-S3_raw (UART1 and USB-Serial-JTAG done through the declaration; UART2, the supervised bring-up actor pending);
 C UART on the STM32-L476RG_raw; D network links on boards, later.
 
-| Code (planned) | Check |
+| Code | Check |
 | --- | --- |
-| E2412 | a carrier declaration names a link the target's transport pack does not provide (including a UART instance that is the target's console); raised wherever the declaration appears |
+| E1081 | a `carried_on` line that does not have the form above (the declaration is never skipped silently), or a `spawn_dangerous_carrier` whose first argument is not a `carried_on` declaration of the module |
+| E2408 | the carrier kind is not one the language names (`:tcp`, `:udp`, `:serial`); the same code as a misspelt protocol tag |
+| E2410 | the carrier kind is not provided by the build's target (the kind row of the pack), at the declaration or at the spawn |
+| E2412 | a carrier declaration names a link the target's transport pack does not provide, including a UART instance that is the target's console (the message says so and lists the links the target provides); raised wherever the declaration appears, even unused, and at a `spawn_dangerous_carrier` of it |
 | E2413 | a link tag the language does not name |
 | E2414 | the link cannot carry the carrier's kind (`:tcp` on `(:uart, 1, 115200)`) |
-| E2415 | two carrier declarations in one application name the same link tag and instance, or a UART instance another subsystem uses (the console, printing, failure banners) |
-| E2416 | the link needs a board configuration function that is not defined (phase D) |
-| E2417 | a link parameter is not a literal or fails the pack's check (baud out of range, non-literal instance or interface name) |
-
-The numbers are proposed and final numbers are assigned by the diagnostics table at implementation. Until then the
-language does not diagnose these cases and `carried_on ...` does not parse.
+| E2415 | two carrier declarations, in one module or across the modules of a compile, claim the same exclusive hardware: a UART or USB CDC instance, a serial port path, or the USB-Serial-JTAG controller |
+| E2416 | reserved: the link needs a board configuration function that is not defined (phase D; nothing reaches it yet) |
+| E2417 | a link parameter is not a literal, is of the wrong kind, is missing or is one too many, a baud is not positive, or the pack rejects the baud |
 
 #### 16.4.10 Diagnostics
 
@@ -10752,7 +10785,7 @@ language does not diagnose these cases and `carried_on ...` does not parse.
 | E2409 | a program `impl` of `WireFormat` or `Carrier` |
 | E2410 | a protocol or carrier tag the build's target does not provide |
 | E2411 | an `impl Transportable` or `impl Recreatable` declaration |
-| E2412 to E2417 | planned, not implemented: carrier link diagnostics (§16.4.9) |
+| E2412 to E2417 | carrier link diagnostics, with E1081 for a malformed `carried_on` line: §16.4.9 |
 | W2401 | advisory: a decoder was derived; foreign bytes become values here |
 
 ## 17. Atomic Operations
