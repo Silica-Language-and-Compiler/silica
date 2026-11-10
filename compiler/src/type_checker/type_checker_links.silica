@@ -1,0 +1,362 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// Carrier declarations, `carried_on <name>: (<:kind>) (<:link>, <params>...);` (transport_links_design.md
+// §3, §5.2; specification §16.4.9): the checks that depend only on the language's tables, for every
+// target alike. The parser keeps a declaration as a tag-11 declaration whose parameters are its tokens
+// after the name (lexeme in `name`, class in `type_name`: "atom", "int", "string", "float", "char",
+// "ident", "punct"), in source order: `: ( :kind ) ( :link , p1 , p2 )`.
+//
+//   E2408  the carrier kind is not one the language names (:tcp, :udp, :serial)
+//   E2413  the link tag is not in the language's link vocabulary (§3.1)
+//   E2414  the link cannot carry the carrier's kind (:tcp on (:uart, 1, 115200))
+//   E2415  two declarations name one piece of exclusive hardware: the same UART or USB CDC instance,
+//          the same serial port path, or the USB-Serial-JTAG controller twice (decisions 6 and 17)
+//   E2417  a parameter is not a literal, is of the wrong kind, is missing or is one too many, or a baud
+//          is not positive
+//
+// Whether the target provides the link (E2412), the kind (E2410) or the baud (E2417 by the pack's
+// link_baud_ok) is the pack's answer, read by sir_target_verify. The program-facing copy of the
+// vocabulary is compiler/stdlib/Link.silica; the two tables are kept in step by hand.
+
+use parser_ast;
+use type_checker_core;
+use transport_types;
+
+export check_link_declarations/3;
+export is_link_declaration/1;
+export link_kind_of/1;
+export link_tag_of/1;
+export link_instance_of/1;
+export link_baud_of/1;
+export link_text_of/1;
+export link_vocabulary/0;
+
+fn is_link_declaration(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> boolean {
+    decl.tag == 11
+}
+
+// ---- the language's link table (Link.silica's twin) ---------------------------------------------------
+
+fn link_vocabulary() -> string {
+    "(:loopback), (:interface, name), (:ethernet, n), (:wifi, n), (:uart, n, baud), (:serial_port, path, baud), (:usb_cdc, n), (:usb_serial_jtag)"
+}
+
+fn known_link(l: string) -> boolean {
+    l == "loopback" or l == "interface" or l == "ethernet" or l == "wifi" or l == "uart" or l == "serial_port" or l == "usb_cdc" or l == "usb_serial_jtag"
+}
+
+fn known_kind(k: string) -> boolean {
+    k == "tcp" or k == "udp" or k == "serial"
+}
+
+// The parameter classes a link takes, as one text: "i" integer, "s" string, "n" name (a string or an
+// atom), in order.
+fn link_shape(l: string) -> string {
+    case l of {
+        "loopback" -> "";
+        "interface" -> "n";
+        "ethernet" -> "i";
+        "wifi" -> "i";
+        "uart" -> "ii";
+        "serial_port" -> "si";
+        "usb_cdc" -> "i";
+        "usb_serial_jtag" -> "";
+        _: string -> ""
+    }
+}
+
+// What each parameter is, for messages.
+fn link_param_role(l: string, i: int64) -> string {
+    case l of {
+        "interface" -> "the interface name";
+        "ethernet" -> "the interface instance";
+        "wifi" -> "the interface instance";
+        "usb_cdc" -> "the instance";
+        "uart" -> case i == 0 of { true -> "the UART instance"; false -> "the baud" };
+        "serial_port" -> case i == 0 of { true -> "the device path"; false -> "the baud" };
+        _: string -> "a parameter"
+    }
+}
+
+fn link_carries(l: string, kind: string) -> boolean {
+    case l of {
+        "loopback" -> kind == "tcp" or kind == "udp";
+        "interface" -> kind == "tcp" or kind == "udp";
+        "ethernet" -> kind == "tcp" or kind == "udp";
+        "wifi" -> kind == "tcp" or kind == "udp";
+        "uart" -> kind == "serial";
+        "serial_port" -> kind == "serial";
+        "usb_cdc" -> kind == "serial";
+        "usb_serial_jtag" -> kind == "serial";
+        _: string -> false
+    }
+}
+
+fn link_carries_text(l: string) -> string {
+    case link_carries(l, "tcp") of {
+        true -> "(:tcp) and (:udp)";
+        false -> "(:serial)"
+    }
+}
+
+// Exclusive hardware: two declarations on the same instance (or path, or the one controller) conflict.
+fn link_exclusive(l: string) -> boolean {
+    l == "uart" or l == "usb_cdc" or l == "serial_port" or l == "usb_serial_jtag"
+}
+
+// ---- reading a declaration's parameters ----------------------------------------------------------------
+
+fn nth_param(ps: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], i: int64) -> { name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } } {
+    case ps.is_nil of {
+        true -> { name: "", type_name: "", location: parser_ast@zero_location() };
+        false -> case i == 0 of {
+            true -> ps.head;
+            false -> nth_param(ps.tail, i - 1)
+        }
+    }
+}
+
+fn drop_params(ps: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], i: int64) -> List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case ps.is_nil or i == 0 of {
+        true -> ps;
+        false -> drop_params(ps.tail, i - 1)
+    }
+}
+
+fn tag_atom_name(lexeme: string) -> string {
+    case length_bytes(lexeme) > 1 and substring(lexeme, 0, 1) == ":" of {
+        true -> substring(lexeme, 1, length_bytes(lexeme));
+        false -> lexeme
+    }
+}
+
+// The tokens are `: ( :kind ) ( :link , p , p )`: the kind is parameter 2, the link tag parameter 5,
+// the link's parameters every second token from 7.
+fn link_kind_of(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> string {
+    tag_atom_name(nth_param(decl.parameters, 2).name)
+}
+
+fn link_tag_of(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> string {
+    tag_atom_name(nth_param(decl.parameters, 5).name)
+}
+
+// The link's own parameters (the tokens after the tag, commas dropped, up to `)`), in order.
+fn link_args_from(ps: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case ps.is_nil of {
+        true -> ps;
+        false -> case ps.head.type_name == "punct" of {
+            true -> case ps.head.name == ")" of {
+                true -> parser_ast@nil_list_param();
+                false -> link_args_from(ps.tail)
+            };
+            false -> parser_ast@cons_param(ps.head, link_args_from(ps.tail))
+        }
+    }
+}
+
+fn link_args(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    link_args_from(drop_params(decl.parameters, 6))
+}
+
+fn count_params(ps: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> int64 {
+    case ps.is_nil of {
+        true -> 0;
+        false -> 1 + count_params(ps.tail)
+    }
+}
+
+// The instance of an instance-indexed link (its first parameter), 0 otherwise or when not an integer.
+fn link_instance_of(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> int64 {
+    first: { name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- nth_param(link_args(decl), 0);
+    case first.type_name == "int" of {
+        true -> transport_types@parse_decimal(first.name);
+        false -> 0
+    }
+}
+
+// The baud of a (:uart, n, baud) or (:serial_port, path, baud) link, 0 for the others.
+fn link_baud_of(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> int64 {
+    l: string <- link_tag_of(decl);
+    case l == "uart" or l == "serial_port" of {
+        false -> 0;
+        true -> {
+            second: { name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- nth_param(link_args(decl), 1);
+            case second.type_name == "int" of {
+                true -> transport_types@parse_decimal(second.name);
+                false -> 0
+            }
+        }
+    }
+}
+
+// The link as written, `(:uart, 1, 115200)`, for messages.
+fn args_text(ps: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> string {
+    case ps.is_nil of {
+        true -> "";
+        false -> concat(concat(", ", ps.head.name), args_text(ps.tail))
+    }
+}
+
+fn link_text_of(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> string {
+    concat(concat(concat("(:", link_tag_of(decl)), args_text(link_args(decl))), ")")
+}
+
+// The identity of the hardware a declaration claims, for E2415: tag plus instance, or tag plus path.
+fn link_claim(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> string {
+    l: string <- link_tag_of(decl);
+    case link_exclusive(l) of {
+        false -> "";
+        true -> concat(concat(l, " "), nth_param(link_args(decl), 0).name)
+    }
+}
+
+// ---- the checks ---------------------------------------------------------------------------------------
+
+fn err(code: string, decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, msg: string) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    type_checker_core@type_check_err(code, decl.location, concat(concat("carried_on ", decl.name), concat(": ", msg)), "sect16.4")
+}
+
+fn want_text(want: string) -> string {
+    case want of {
+        "i" -> "an integer literal";
+        "s" -> "a string literal";
+        _: string -> "a string or atom literal"
+    }
+}
+
+// E2417 over the link's parameters against its shape: one per position, in order.
+fn check_params(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, l: string, shape: string, i: int64, args: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    lt: string <- link_text_of(decl);
+    case i >= length_bytes(shape) of {
+        true -> case args.is_nil of {
+            true -> type_checker_core@type_check_ok();
+            false -> err("E2417", decl, concat(concat(concat("link ", lt), concat(" has too many parameters: (:", l)), concat(") takes ", concat(transport_types@int_text(length_bytes(shape)), concat(" (links design §3.1: ", concat(link_vocabulary(), ")"))))))
+        };
+        false -> case args.is_nil of {
+            true -> err("E2417", decl, concat(concat(concat("link ", lt), concat(" is missing ", link_param_role(l, i))), concat(": (:", concat(l, concat(") takes ", concat(transport_types@int_text(length_bytes(shape)), concat(" (links design §3.1: ", concat(link_vocabulary(), ")"))))))));
+            false -> {
+                want: string <- substring(shape, i, i + 1);
+                cls: string <- args.head.type_name;
+                lit_ok: boolean <- case want of {
+                    "i" -> cls == "int";
+                    "s" -> cls == "string";
+                    _: string -> cls == "string" or cls == "atom"
+                };
+                case cls == "ident" of {
+                    true -> err("E2417", decl, concat(concat(concat("parameter ", transport_types@int_text(i + 1)), concat(" of link ", lt)), concat(concat(", '", args.head.name), "', is not a literal: a carrier declaration is pure and literal-only, like a limits record (links design §5.2)")));
+                    false -> case lit_ok of {
+                        false -> err("E2417", decl, concat(concat(concat("parameter ", transport_types@int_text(i + 1)), concat(" of link ", lt)), concat(concat(", '", args.head.name), concat("', is not ", concat(link_param_role(l, i), concat(": expected ", want_text(want)))))));
+                        true -> case want == "i" and (l == "uart" or l == "serial_port") and i == 1 and transport_types@parse_decimal(args.head.name) == 0 of {
+                            true -> err("E2417", decl, concat(concat("the baud of link ", lt), " must be a positive integer (links design §5.2)"));
+                            false -> check_params(decl, l, shape, i + 1, args.tail)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn check_one(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    k: string <- link_kind_of(decl);
+    l: string <- link_tag_of(decl);
+    case known_kind(k) of {
+        false -> err("E2408", decl, concat(concat("unknown carrier kind (:", k), "): the language provides (:tcp), (:udp) and (:serial) (transport design §6.3, links design §3.1)"));
+        true -> case known_link(l) of {
+            false -> err("E2413", decl, concat(concat(concat("unknown link (:", l), "): the language names "), concat(link_vocabulary(), " (links design §3.1)")));
+            true -> {
+                pr: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- check_params(decl, l, link_shape(l), 0, link_args(decl));
+                case pr.is_ok of {
+                    false -> pr;
+                    true -> case link_carries(l, k) of {
+                        false -> err("E2414", decl, concat(concat(concat("link ", link_text_of(decl)), concat(" cannot carry carrier kind (:", k)), concat("): it carries ", concat(link_carries_text(l), " (links design §3.1)"))));
+                        true -> type_checker_core@type_check_ok()
+                    }
+                }
+            }
+        }
+    }
+}
+
+// E2415 against the declarations after this one in this module, then against every other module's.
+fn find_claim(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], claim: string) -> string {
+    case decls.is_nil of {
+        true -> "";
+        false -> case decls.head.tag == 11 and link_claim(decls.head) == claim of {
+            true -> decls.head.name;
+            false -> find_claim(decls.tail, claim)
+        }
+    }
+}
+
+fn find_claim_in_world(world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)], current_module: string, claim: string) -> string {
+    case world.is_nil of {
+        true -> "";
+        false -> case world.head.module_name == current_module of {
+            true -> find_claim_in_world(world.tail, current_module, claim);
+            false -> {
+                other: string <- find_claim(world.head.program.declarations, claim);
+                case other == "" of {
+                    true -> find_claim_in_world(world.tail, current_module, claim);
+                    false -> concat(concat(world.head.module_name, "@"), other)
+                }
+            }
+        }
+    }
+}
+
+fn check_claims(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, rest: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], current_module: string, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    claim: string <- link_claim(decl);
+    case claim == "" of {
+        true -> type_checker_core@type_check_ok();
+        false -> {
+            local: string <- find_claim(rest, claim);
+            other: string <- case local == "" of { true -> find_claim_in_world(world, current_module, claim); false -> local };
+            case other == "" of {
+                true -> type_checker_core@type_check_ok();
+                false -> err("E2415", decl, concat(concat(concat("link ", link_text_of(decl)), " is also claimed by carried_on "), concat(other, ": a UART instance, a serial port or the USB-Serial-JTAG controller carries one carrier (links design decisions 6 and 17)")))
+            }
+        }
+    }
+}
+
+fn check_from(decls: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], current_module: string, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    case decls.is_nil of {
+        true -> type_checker_core@type_check_ok();
+        false -> case decls.head.tag == 11 of {
+            false -> check_from(decls.tail, current_module, world);
+            true -> {
+                r: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- check_one(decls.head);
+                case r.is_ok of {
+                    false -> r;
+                    true -> {
+                        c: { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } <- check_claims(decls.head, decls.tail, current_module, world);
+                        case c.is_ok of {
+                            false -> c;
+                            true -> check_from(decls.tail, current_module, world)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn check_link_declarations(program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } }, current_module: string, world: List[{ module_name: string, program: { declarations: List[{ tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], location: { file: string, line: int64, column: int64, offset: int64 } } }, mem(normal)]) -> { is_ok: boolean, error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string, spec_section: string } {
+    check_from(program.declarations, current_module, world)
+}
