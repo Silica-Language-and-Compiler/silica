@@ -32,9 +32,9 @@ TRIAL_DIR := $(notdir $(patsubst %/,%,$(THIS_DIR)))
 MSG_PREFIX := $(TRIAL_DIR)/
 
 # The language's built-in modules (compiler/stdlib) the flat trials here link.
-STDLIB_MODS := wire_etf wireframe Carrier
+STDLIB_MODS := wire_etf wireframe Carrier Link
 # Sub-trials with a Makefile of their own, run after the flat trials and counted with them.
-SUB_TRIALS := app_transport_tcp_listener
+SUB_TRIALS := app_transport_tcp_listener app_transport_tcp_loopback_link
 
 
 .DEFAULT_GOAL := all
