@@ -17,7 +17,7 @@ sends one ETF frame over its UART1 header through the `(:uart1)` carrier
   `../transport_beam_demo` (`silica_peer.erl`, `gen_tcp` with `{packet, 4}`) reads the board's frame unchanged
   (`transport_serialization_design.md` §6.4: "a host bridges it to its network"). Its LED reply goes back to
   the port; the stage-1 board program does not read it. `--hex` prints every chunk moved with its direction.
-  It is also the bridge of `../transport_usb_serial_jtag_demo` (stage S-A, 2026-11-09), which is why it opens
+  It is also the bridge of the USB-C pairs in `examples/transport_pairs/` (formerly `../transport_usb_serial_jtag_demo`; stage S-A, 2026-11-09), which is why it opens
   the port without pyserial's flush-at-open: a frame the board sent before the port was opened is already in
   the driver's buffer and `tcflush` threw it away.
 - `fake_board.py`: plays the board on a pseudo-terminal with the 52 bytes of design §13.4, to check the Mac
