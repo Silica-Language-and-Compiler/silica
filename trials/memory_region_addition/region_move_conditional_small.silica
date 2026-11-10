@@ -1,0 +1,66 @@
+// SMALL VARIANT of region_move_conditional.silica for targets with a ~64 KB heap: buffers of 1000 int64 and 200 iterations instead of 200000 and 2000.
+// A leak is still fatal there (200 iterations x at least 7 KB cannot fit); the checked logic is unchanged.
+// Trial: a region moved away on one branch and dropped on the other must be
+// released exactly once either way.
+//
+// silica-specification §3.247 (regions are move-only, passing transfers
+// ownership). On even iterations the handle is moved into consume_c() and
+// ownership ends there; on odd iterations it is never moved, so it dies at scope
+// exit and must be released by the creating scope.
+//
+// This is the case a purely syntactic rule gets wrong in both directions:
+// freeing on the moved path is a double free, and not freeing on the dropped
+// path is a leak. 2000 iterations x 1.6 MB makes either failure fatal.
+//
+// Want 0.
+
+// consume_c is written over its own lifetime R; the call instantiates R := L1 (spec §12.1.4).
+use trial_support_int64;
+
+fn consume_c(r: region(R, normal), n: int64) -> int64 {
+    sequence proc[mem(normal)]
+        cell: ref(R, normal, int64) <- alloc_ref(r, n)
+    produces
+        pure read_ref(cell)
+    end
+}
+
+fn cond_one(n: int64) -> int64 {
+    sequence proc[mem(normal)]
+        L1: lifetime <- fresh_lifetime();
+        r: region(L1, normal) <- alloc_region(normal);
+        pad: buf(L1, normal, int64, 1000) <- alloc_buf(r, 1000);
+        v: int64 <- case n - (n / 2) * 2 == 0 of {
+            // even: ownership leaves this scope, so this scope must not free it
+            true -> consume_c(r, n);
+            // odd: never moved, so it dies here and this scope must free it
+            false -> n
+        }
+    produces
+        pure v
+    end
+}
+
+fn loop_cond(i: int64, acc: int64) -> int64 {
+    case i <= 0 of {
+        true -> acc;
+        false -> loop_cond(i - 1, acc + cond_one(i))
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_support_int64@start();
+        _: boolean <- trial_support_int64@run(fn() -> int64 {
+            sequence
+                total: int64 <- loop_cond(200, 0)
+            produces
+                // both branches yield n, so the total is sum(1..200) either way
+                pure case total == 20100 of { true -> 0; false -> 1 }
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

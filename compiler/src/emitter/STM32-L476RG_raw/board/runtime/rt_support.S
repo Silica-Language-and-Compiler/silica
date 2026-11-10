@@ -14,8 +14,9 @@
    limitations under the License.
 */
 
-// Small runtime pieces of the bare-metal STM32L476RG port that the ESP32-S3 tree keeps in rt_float.S,
-// rt_ordering.S, rt_board.S, rt_device.S and rt_ffi.S:
+// Small runtime pieces of the bare-metal STM32L476RG port that the ESP32-S3 tree keeps in rt_float.S
+// (its conversions; the printing is in this tree's rt_float.S too), rt_ordering.S, rt_board.S,
+// rt_device.S and rt_ffi.S:
 //   checked int64 arithmetic (spec §4.2.4): silica_rt_checked_i64_add / _add1 / _mul -> X0 ok (0/1),
 //     X1 the value (the emitter reads the value from X1: prims_checked_int64.silica)
 //   half precision: silica_rt_h2f(r0 = bits) -> r0 float bits, silica_rt_f2h(r0) -> r0 half bits
@@ -25,8 +26,7 @@
 //     run-time twin of board_pack.silica's window table (the same rows, the same order)
 //   the memory functions a foreign C wrapper would need (memcpy, memmove, memset, memcmp, strlen)
 //   GPIO helpers for the user LED (PA5) and a busy delay, for board apps
-// Float printing (silica_rt_print_f64 / f32 / f16, the host's 15 / 7 digit algorithm) and the ordering
-// identities are not ported yet (rt_stubs.S).
+// The ordering identities are not ported yet (rt_stubs.S).
 
 #include "rt_defs.h"
 

@@ -19,11 +19,14 @@
 // The image runs from SRAM: the table is the first thing in the image (linker script
 // silica_stm32l476rg.ld, .vectors), and _start (rt_start.S) writes its address into VTOR, so the
 // loader only has to set PC = _start and SP (the first word) and resume. Every fault vector lands in
-// the fatal path of spec §15.4.5.5 (rt_console.S silica_rt_fatal_report: "[silica] fault at 0x<pc>",
-// exit status 70), on the fault stack; SysTick keeps the millisecond clock (rt_actors.S
-// silica_rt_ticks_ms) and is the only interrupt the runtime enables. Nothing is preempted: the
-// scheduler switches actors only where the specification allows (spec §15.1.2), so the tick handler
-// touches nothing but its counter.
+// silica_rt_fault_common on the fault stack: a HardFault, MemManage, BusFault or UsageFault an actor
+// raised in thread mode ends that actor (rt_failure.S silica_rt_actor_fault_hook, runtime_failure_
+// reporting.md §6); anything else takes the fatal path of spec §15.4.5.5 (rt_console.S
+// silica_rt_fatal_report: "[silica] fault at 0x<pc>", exit status 70); SysTick keeps the millisecond clock (rt_actors.S
+// silica_rt_ticks_ms) and USART2's receive interrupt fills the console's receive ring (rt_console.S
+// silica_rt_vec_usart2); those are the only interrupts the runtime enables. Nothing is preempted: the
+// scheduler switches actors only where the specification allows (spec §15.1.2), so the handlers
+// touch nothing but their counter and ring.
 
 #include "rt_defs.h"
 
@@ -49,7 +52,11 @@ silica_rt_vectors:
     .word   0                               // 13 reserved
     .word   silica_rt_vec_pendsv            // 14
     .word   silica_rt_vec_systick           // 15
-    .rept   82                              // 16.. the STM32L476 peripheral IRQs: none enabled
+    .rept   38                              // 16.. the STM32L476 peripheral IRQs: only USART2 enabled
+    .word   silica_rt_vec_unused
+    .endr
+    .word   silica_rt_vec_usart2            // 54 = IRQ 38, USART2: the console's receive ring (rt_console.S)
+    .rept   43                              // IRQs 39..81
     .word   silica_rt_vec_unused
     .endr
 
@@ -70,8 +77,8 @@ silica_rt_vectors:
 // Faults. The exception entry stacked r0-r3, r12, lr, pc, xPSR on the active stack (MSP: the
 // runtime uses one stack pointer). The stacked pc names the faulting instruction (0 when the stacking
 // itself failed, CFSR STKERR / MSTKERR); the report runs on the fault stack in SRAM2, switched to
-// before anything else, with interrupts masked, and never returns (the chip is reset before the next
-// load). r0 = cause code (1 NMI, 3 HardFault, 4 MemManage, 5 BusFault, 6 UsageFault, 11 SVC,
+// before anything else, with interrupts masked; it returns only through the fault hook's exception
+// return into the scheduler (an actor's fault), otherwise never (the chip is reset before the next load). r0 = cause code (1 NMI, 3 HardFault, 4 MemManage, 5 BusFault, 6 UsageFault, 11 SVC,
 // 12 DebugMon, 14 PendSV, 1000 an unused IRQ), r1 = the stacked pc, r2 = the fault address when
 // the cause has one (MMFAR for MemManage, BFAR for BusFault when valid), else 0.
 .macro FAULT_VECTOR name, code
@@ -92,7 +99,11 @@ silica_rt_vectors:
 
     LFUNC silica_rt_fault_common
     cpsid   i
-    mrs     r1, msp                         // the stacked frame (the runtime runs on MSP throughout)
+    mov     r10, lr                         // EXC_RETURN (r4-r8, r10, r11 are free from here: the
+    mrs     r11, msp                        // faulting context is ended or abandoned)
+    // r9 is TP again: a foreign C wrapper built without -ffixed-r9 may have been using it when it
+    // faulted, and the scheduler resumed by the fault hook's exception return runs with this r9
+    MOV32   r9, silica_rt_core_regs
     MOV32   r3, _silica_fault_stack_top     // the report runs on the fault stack (SRAM2): from here
     mov     sp, r3                          // on nothing depends on the stack that may have failed
     MOV32   r3, SCB_CFSR                    // the stacked pc, unless the stacking itself failed
@@ -100,10 +111,17 @@ silica_rt_vectors:
     movw    r12, #0x1010
     tst     r3, r12
     bne.w   4f
-    ldr     r1, [r1, #24]
+    ldr     r1, [r11, #24]
     b.w     5f
 4:  movw    r1, #0
-5:  movw    r2, #0
+5:  // a fault while a fatal or abort report runs takes the last-resort path (silica_rt_fatal_depth)
+    MOV32   r3, silica_rt_fatal_depth
+    ldr     r2, [r3]
+    add     r12, r2, #1
+    str     r12, [r3]
+    cmp     r2, #0
+    bne.w   silica_rt_fatal_nested
+    movw    r2, #0
     cmp     r0, #4
     bne.w   1f
     MOV32   r3, SCB_CFSR
@@ -121,6 +139,38 @@ silica_rt_vectors:
     beq.w   2f
     MOV32   r3, SCB_BFAR
     ldr     r2, [r3]
-2:  bl      silica_rt_fatal_report          // never returns
+2:  // a fault in an actor ends that actor only (rt_failure.S silica_rt_actor_fault_hook does not return
+    // then: it resumes the scheduler); main's, the scheduler's or an interrupt handler's is the process's
+    mov     r4, r0
+    mov     r5, r1
+    mov     r6, r2
+    mov     r3, r10
+    bl      silica_rt_actor_fault_hook
+    mov     r0, r4
+    mov     r1, r5
+    mov     r2, r6
+    bl      silica_rt_fatal_report          // never returns
 3:  b.w     3b
     .size   silica_rt_fault_common, . - silica_rt_fault_common
+
+// r1 = the faulting pc, r2 = silica_rt_fatal_depth before this entry (nonzero). Depth 1: a report was
+// running, so write the last-resort line and exit 70 on a fresh fault stack; deeper: the last resort
+// itself faulted, so halt.
+    LFUNC silica_rt_fatal_nested
+    cmp     r2, #1
+    bne.w   1f
+    MOV32   r3, _silica_fault_stack_top
+    mov     sp, r3
+    mov     r0, r1
+    bl      silica_rt_fatal_last_resort     // never returns
+1:  b.w     1b
+    .size   silica_rt_fatal_nested, . - silica_rt_fatal_nested
+
+// silica_rt_fatal_depth: the entries into the fatal report (silica_rt_fault_common) and the abort report
+// (rt_console.S silica_rt_abort_body) not yet handled; the fault hook counts a handled actor fault back.
+// In .data, so it reads 0 before rt_start.S zeroes .bss.
+    .section .data.silica_rt_fatal_depth, "aw", %progbits
+    .balign 4
+    .global silica_rt_fatal_depth
+silica_rt_fatal_depth:
+    .word   0
