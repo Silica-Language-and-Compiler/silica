@@ -65,10 +65,13 @@ Missing:
 
 ## 5. Stages
 
-- **E0. Remote readiness (no code).** Script `programmer_tools/transport_ethernet_demo/check_remote.sh`: ssh with
-  BatchMode, `erl` version, a loopback-only `gen_tcp` echo on the remote, and an ETF round trip Mac to remote to Mac
-  through `ssh -L` (existing `silica_peer.erl` adapted, `{ip, {127,0,0,1}}` already). Exit gate: the 48-byte accel
-  term decodes on OTP 27 and the reply decodes in Silica.
+- **E0. Remote readiness (no code).** **Done 2026-11-10.** Script `examples/transport_pairs/ethernet_remote/check_remote.sh`
+  (the pairs live under `examples/transport_pairs/`, not `programmer_tools/`): ssh with BatchMode, `erl` version, the BEAM
+  demo's unchanged `silica_peer.erl` copied to `~/silica_demo` on the remote and started on `127.0.0.1:4540` only, an
+  `ssh -L` forward to it, and the hosted Silica demo program (`(:tcp)` carrier) through the forward. Result: remote
+  `aalang-web` (Linux x86_64) OTP 27 decoded the 48-byte accel term (`#{x => 1, y => -2, z => 512, at_ms => 1000}`) and
+  Silica decoded the OTP 27 reply (`led red on`), exit 0. The script tears down the forward and the remote `erl` (trap);
+  afterwards the remote holds only `~/silica_demo/` (peer.erl, .beam, peer.out) and no listener. Gate met.
 - **E1. Request/reply Silica peer and Erlang peer.** `dangerous_ethernet_peer.silica` (dials; listens) and
   `ethernet_peer.erl` (listens; dials), both with the `(:request, id, body)` rule, both exiting 0 after N exchanges.
   First on one Mac (127.0.0.1, both directions, no ssh): proves the logic before the network. Output compared with an
