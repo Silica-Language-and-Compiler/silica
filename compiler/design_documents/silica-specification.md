@@ -10696,6 +10696,14 @@ tag like a protocol tag (§16.4.1). The language names these links:
 | `(:serial_port, path, baud)` | a string literal, an integer literal | `:serial` | hosted: a termios port |
 | `(:usb_cdc, n)` | an integer literal | `:serial` | board, later |
 | `(:usb_serial_jtag)` | none | `:serial` | ESP32-S3: the native USB-C jack through the USB-Serial-JTAG controller |
+| `(:bluetooth, n)` | an integer literal | `:ble_gatt` | hosted: the host's n-th Bluetooth adapter; no target provides it yet |
+| `(:esp_at, n)` | an integer literal | `:ble_gatt` | board: an ESP-AT module on UART n; it claims that UART instance (E2415); no target provides it yet |
+
+**Bluetooth (2026-11-10, stage 2 of [transport_ble_plan.md](transport_ble_plan.md)).** The carrier kind `:ble_gatt`
+and the links `(:bluetooth, n)` and `(:esp_at, n)` are named by the language and checked by the compiler (E2408,
+E2413, E2414, E2415, E2417). No target's transport pack provides the kind, so a declaration that passes those checks
+is E2410 on every target. The `:ble_gatt` row of `Carrier`, the two rows of `Link` and the pack rows are added with
+the carrier itself.
 
 **The carrier declaration.** A top-level form, a pure declaration with no effects; `carried_on` is a reserved word:
 
@@ -10762,12 +10770,12 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | Code | Check |
 | --- | --- |
 | E1081 | a `carried_on` line that does not have the form above (the declaration is never skipped silently), or a `spawn_dangerous_carrier` whose first argument is not a `carried_on` declaration of the module |
-| E2408 | the carrier kind is not one the language names (`:tcp`, `:udp`, `:serial`); the same code as a misspelt protocol tag |
+| E2408 | the carrier kind is not one the language names (`:tcp`, `:udp`, `:serial`, `:ble_gatt`); the same code as a misspelt protocol tag |
 | E2410 | the carrier kind is not provided by the build's target (the kind row of the pack), at the declaration or at the spawn |
 | E2412 | a carrier declaration names a link the target's transport pack does not provide, including a UART instance that is the target's console (the message says so and lists the links the target provides); raised wherever the declaration appears, even unused, and at a `spawn_dangerous_carrier` of it |
 | E2413 | a link tag the language does not name |
 | E2414 | the link cannot carry the carrier's kind (`:tcp` on `(:uart, 1, 115200)`) |
-| E2415 | two carrier declarations, in one module or across the modules of a compile, claim the same exclusive hardware: a UART or USB CDC instance, a serial port path, or the USB-Serial-JTAG controller |
+| E2415 | two carrier declarations, in one module or across the modules of a compile, claim the same exclusive hardware: a UART or USB CDC instance, a serial port path, or the USB-Serial-JTAG controller. `(:esp_at, n)` claims UART n, so it conflicts with `(:uart, n, baud)` |
 | E2416 | reserved: the link needs a board configuration function that is not defined (phase D; nothing reaches it yet) |
 | E2417 | a link parameter is not a literal, is of the wrong kind, is missing or is one too many, a baud is not positive, or the pack rejects the baud |
 

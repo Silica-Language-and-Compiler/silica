@@ -92,24 +92,32 @@ any compiler-source change, as in the Wi-Fi plan §4.
   grants the Bluetooth permission to a command-line binary. All three *(unverified)*.
 - **Closes when:** bytes cross in both directions, or the reason they cannot is written into §7.
 
-### Stage 2. Vocabulary in the compiler
+### Stage 2. Vocabulary in the compiler (checks only)
 
-- The `:ble_gatt` row; the link tags in `Link.silica` and `type_checker_links.silica`; the Mac pack's
-  `provides_carrier`, `provides_link`, `carrier_module` and `carrier_spawn`; specification §16.4.8 and §16.4.9;
-  error trials for E2410, E2412, E2414 and E2417 on the new tags.
-- Costs known from stage S-C: new atoms in `Carrier.silica` renumber the atom indices of every suite that links it
-  (Apple goldens regenerated; Linux goldens join the stale set); a full ESP32-S3 cross-compiler rebuild was about
-  70 minutes.
-- **Closes when:** a program with `carried_on phone: (:ble_gatt) (:bluetooth, 0);` compiles on the Mac and is rejected
-  with E2412 on the other targets.
+- The compiler's own table (`type_checker/type_checker_links.silica`): the kind `:ble_gatt`, the links
+  `(:bluetooth, n)` and `(:esp_at, n)`, their parameter shapes and pairing, and the claim of UART n by
+  `(:esp_at, n)` for E2415; specification §16.4.9; error trials for E2410, E2414, E2415 and E2417 on the new tags.
+- Narrowed on 2026-11-10 (Matt Manley): the `:ble_gatt` row of `Carrier.silica`, the two rows of `Link.silica` and
+  the Mac pack rows moved to stage 3. The pack's spawn text must name a carrier module, which stage 3 writes, and new
+  atoms in the two library files renumber the atom indices of every suite that links them (stage S-C), so they change
+  once, with the carrier.
+- **Closes when:** a program with `carried_on phone: (:ble_gatt) (:bluetooth, 0);` passes the language's checks and
+  is rejected with E2410 by every target's pack, the Mac's included; the full Apple trial tree is green; the Apple
+  compiler is at a fixed point.
 
 ### Stage 3. Hosted `(:ble_gatt)` carrier on macOS
 
 - `dangerous_ble_gatt_carrier.silica` over the stage 1 wrapper: the §6.2 contract, both roles, credit both ways,
   `:link_up` carrying the negotiated MTU, the links design §6.3 failure atoms.
+- The rows moved from stage 2: `:ble_gatt` in `Carrier.silica`; `:bluetooth` and `:esp_at` in `Link.silica`; the Mac
+  pack's `provides_carrier`, `provides_link`, `carrier_module` and `carrier_spawn`. Costs known from stage S-C: the
+  Apple goldens of every suite that links the two library files are regenerated, the Linux goldens join the stale
+  set, and the board goldens need the ESP32-S3 cross compiler (about 70 minutes to build).
 - A loopback trial is not possible on one Mac *(unverified)*, so the run is a script outside `make integrate`, like
   the BEAM demo. The segmentation path of `wireframe` gets a trial that needs no radio.
-- **Closes when:** a 48-byte ETF frame, in segments, crosses between the Mac and a second peer in both directions.
+- **Closes when:** a program with `carried_on phone: (:ble_gatt) (:bluetooth, 0);` compiles on the Mac and is rejected
+  with E2412 on the other targets, and a 48-byte ETF frame, in segments, crosses between the Mac and a second peer in
+  both directions.
 
 ### Stage 4. UART1 receive on the board
 
@@ -192,6 +200,31 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Not covered: the central role against a real peripheral (the code exists and has only scanned); more than one
     segment; a frame through `wireframe` and ETF; timeouts and the failure paths; which application macOS credits
     with the Bluetooth permission. These are stage 3's.
+
+- **Stage 2, 2026-11-10, closed: the compiler knows the vocabulary and checks it; no target provides it yet.**
+  The stage was narrowed to checks only before it started (§5): the rows in `Carrier.silica`, `Link.silica` and the
+  Mac pack moved to stage 3, so that the goldens they change are regenerated once, with a carrier that works, and no
+  stub carrier is committed.
+  - Built: in `type_checker_links.silica`, the kind `(:ble_gatt)` and the links `(:bluetooth, n)` and `(:esp_at, n)`.
+    Each takes one integer and carries only `(:ble_gatt)`. The kind is named in the E2408 text and the links in the
+    vocabulary that the E2413 and E2417 texts print. `(:esp_at, n)` is
+    exclusive and claims UART `n`, so it conflicts with a `(:uart, n, baud)` on the same instance (E2415).
+    Specification §16.4.9: the two link rows, a Bluetooth paragraph, and the E2408 and E2415 rows.
+  - Trials, in `trials/error_enforcement_addition`: five new, `link_ble_kind_not_provided` (E2410),
+    `link_ble_link_cannot_carry_tcp` (E2414), `link_ble_kind_on_loopback` (E2414), `link_ble_adapter_missing` (E2417),
+    `link_esp_at_uart_conflict` (E2415). Three goldens recorded again because the texts they hold now list the new
+    names: `link_kind_unknown`, `link_parameter_missing`, `link_unknown`. No other golden changed.
+  - Results (apple_silicon_mac): `make -C trials integrate JOBS=6` with the new compiler: 35,157 passed, 0 failed.
+    `build_all_platforms.sh --targets "apple_silicon_mac"`: 374 units compared, none emitted differently by gen2
+    than by gen1, gen3 byte-identical to gen2. The other targets were not built or run here.
+  - Consequence until stage 3: `carried_on phone: (:ble_gatt) (:bluetooth, 0);` passes the language's checks and is
+    then rejected with E2410 on every target, the Mac included.
+  - No compiler binary is committed with this stage. `binaries/silica-compiler` on this branch does not know the new
+    names until a binary is published in the usual way.
+  - Open, found while looking at hardware for stage 5: Espressif publishes ESP-AT for the ESP32, C2, C3, C6 and S2,
+    and not for the ESP32-S3. Route M2 therefore needs a module of one of those chips, or other firmware on a second
+    S3. If the route changes, the link name `(:esp_at, n)` changes with it (one rebuild and the goldens above
+    recorded again). Not decided.
 
 ## 8. Decisions (Matt Manley, 2026-11-10)
 
