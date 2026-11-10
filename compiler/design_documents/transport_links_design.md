@@ -197,6 +197,17 @@ therefore only says **which interface family the carrier's socket binds to**:
   default restart policy provides the retry; if the interface disappears while running, the socket error becomes the
   failure (the `:link_lost` path, §6.3). No poll-interval constant exists.
 
+**Until this binding exists** (hosted Ethernet plan stage E2), `dangerous_tcp_carrier` offers one explicit wildcard
+form (2026-11-10): the address `"listen:any:<port>"` binds every IPv4 interface (`0.0.0.0`) through
+`dangerous_sockets@tcp_listen_any`, while `"listen:<port>"` stays loopback-only. It is chosen only by writing it,
+and no `carried_on` link maps to it (the hosted links bind nothing yet); `(:interface, name)` and `(:ethernet, n)`
+will replace it with a bind to one interface's address, and once `(:loopback)` refuses non-loopback addresses as
+above, it must refuse this form too. The direct Mac-to-Linux pair
+(`examples/transport_pairs/ethernet_direct`) is its first user, and it is the non-loopback listener Project BEES's
+milestone N1 needs.
+
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
+
 ### 3.3 Syntax proposal
 
 Today there is no carrier declaration form; carriers are chosen by module at `spawn_dangerous` and by an address string

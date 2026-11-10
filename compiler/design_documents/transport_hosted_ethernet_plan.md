@@ -1,6 +1,10 @@
 # Hosted Ethernet transport: development plan (Mac to a remote Erlang peer)
 
-Status: plan, 2026-11-10. Nothing here is built yet. Companion to `transport_serialization_design.md` (carriers, ETF,
+Status: 2026-11-10. E0 done. E1 dropped: work-network restrictions rule out the local-Mac test. In its place, stages
+L0 to L3 (§5a) ran a Silica-to-Silica interchange between this Mac and the remote Linux x86-64 host; they are done.
+**Tunnels dropped the same day (user ruling): stages D0 to D2 (§5b) run that interchange over one direct TCP
+connection, with the Mac dialing `138.197.209.113:4550` and requests flowing both ways. This adds the carrier's
+`"listen:any:<port>"` wildcard listener.** The rest of the stages below are not started. Companion to `transport_serialization_design.md` (carriers, ETF,
 wire framing), `transport_links_design.md` (`carried_on`, `(:ethernet, n)`, `(:interface, name)`) and
 `transport_esp32s3_wifi_plan.md` (the serial plan whose demos this one mirrors).
 
@@ -27,21 +31,24 @@ Erlang peer, run by script outside `make integrate`, output compared with an `ex
    are the hosted link tags of links-design decisions 10 and 11; this plan builds them (stage E2) so the Mac side can
    say `carried_on wire: (:tcp) (:ethernet, 0);` and the demo is genuinely "Ethernet". Until then the demo declares
    `(:tcp)` by module (`spawn_dangerous` with an address string), which already works.
-2. **No new public port on aalang.org.** The remote's Erlang listens on loopback (`127.0.0.1:<port>`) and is reached
-   through an SSH local forward (`ssh -L`). No `ufw` change, no exposure of the web host. (Overrule only if you want a
-   raw port open; it needs `sudo ufw allow` and is plain, unauthenticated TCP.)
-3. **Remote-to-Mac connections use a reverse tunnel** (`ssh -R 127.0.0.1:<rport>:127.0.0.1:<mport>`): the Erlang node
-   dials its own loopback and arrives at the Mac's Silica listener. The Mac listener binds `127.0.0.1` only.
-4. **Both ends play both roles in one run**: each end runs a listener and a dialer. The Mac dials the remote listener
-   and the remote dials the Mac listener, so there are two TCP connections, each with a request sent in each
-   direction (decision 5).
+2. **Superseded 2026-11-10 (user): one public port, no tunnels.** Originally the remote listened on loopback only,
+   reached through `ssh -L`. The user has since opened TCP 4550 in the remote's `ufw` for this Mac's public address
+   (157.201.64.9) only, and ruled out ssh tunnels. The Mac now dials the remote's Silica listener directly at
+   `138.197.209.113:4550` (§5b). The listener uses the carrier's explicit wildcard address `"listen:any:4550"`, and
+   it runs only during a run. This is plain, unauthenticated TCP: the source-address rule is its only protection.
+3. **Superseded 2026-11-10: no reverse tunnel.** The remote cannot dial the Mac, which is behind the campus NAT. So
+   there is one connection, made by the Mac, and the remote's requests travel back over it (decision 4).
+4. **Both ends make requests in one run.** Originally each end ran a listener and a dialer, giving two connections
+   (§5a, through tunnels). Since 2026-11-10 there is **one connection**, dialed by the Mac. TCP is full duplex, so
+   both ends send requests and replies over it, the ids matched (odd from the Mac, even from the remote; §5b).
 5. **Request/reply vocabulary** (ETF terms, `{packet, 4}` framing, no new wire format):
    `(:request, id: uint32, body)` and `(:reply, id: uint32, body)`. Bodies: Mac to remote `(:accel, {x,y,z,at_ms})`
    answered by `(:led, {which, on})` with the serial demo's rule (z above a threshold gives red on), so the answer is
    comparable with S-D; remote to Mac `(:status)` answered by `(:status, {host, otp, uptime_ms})`-style map. The id
    pairs a reply with its request, so several can be in flight.
-6. **Encryption is out of scope for the transport** (your earlier ruling); the SSH tunnel carries the bytes
-   encrypted in practice. The plan records that the TCP carrier itself is plain.
+6. **Encryption is out of scope for the transport** (your earlier ruling). The TCP carrier itself is plain. The
+   tunnels of §5a encrypted the bytes in practice; the direct connection of §5b does not (see the security note
+   in §5b).
 7. **Keys stay in `~/.ssh`**; scripts use `ssh -o BatchMode=yes` and never print or copy keys. The scripts take the
    target as `REMOTE=manager@aalang.org` so nothing is hard-wired to your account.
 8. **Outside `make integrate`**, like the BEAM and serial demos (needs the network and the remote). Hosted loopback
@@ -72,7 +79,9 @@ Missing:
   `aalang-web` (Linux x86_64) OTP 27 decoded the 48-byte accel term (`#{x => 1, y => -2, z => 512, at_ms => 1000}`) and
   Silica decoded the OTP 27 reply (`led red on`), exit 0. The script tears down the forward and the remote `erl` (trap);
   afterwards the remote holds only `~/silica_demo/` (peer.erl, .beam, peer.out) and no listener. Gate met.
-- **E1. Request/reply Silica peer and Erlang peer.** `dangerous_ethernet_peer.silica` (dials; listens) and
+- **E1. (Dropped 2026-11-10: the local-Mac test is not possible under the work-network restrictions. Replaced by
+  L0 to L3, §5a, which run the request/reply exchange Silica to Silica between the Mac and the remote.)**
+  Request/reply Silica peer and Erlang peer. `dangerous_ethernet_peer.silica` (dials; listens) and
   `ethernet_peer.erl` (listens; dials), both with the `(:request, id, body)` rule, both exiting 0 after N exchanges.
   First on one Mac (127.0.0.1, both directions, no ssh): proves the logic before the network. Output compared with an
   `expected.txt`.
@@ -91,12 +100,147 @@ Missing:
   Erlang dials its own loopback and sends `(:request, 1, (:status))`; the Silica listener answers.
 - **E6. Both at once.** One run, two connections, requests from both sides interleaved, ids matched; timeouts and
   cleanup; run twice in a row to prove no stale state. Expected output compared byte for byte.
-- **E7 (optional). Linux x86-64 Silica peer on aalang.org.** The compiler targets Linux x86-64; build the peer there
-  and replace the Erlang peer in a run, so Silica talks to Silica across the Internet. Needs the toolchain on the web
+- **E7 (optional). Linux x86-64 Silica peer on aalang.org.** (Done in another form by L0 to L2, §5a: the Silica
+  peer is built on the remote with the copied hosted compiler and talks to the Mac's Silica end.) The compiler
+  targets Linux x86-64; build the peer there and replace the Erlang peer in a run, so Silica talks to Silica across the Internet. Needs the toolchain on the web
   host (probe first: do not install on a production machine without asking), so the build may instead be done on the
   Mac and the binary copied.
 - **E8. Hardening and docs.** Reconnect after a drop, connect timeout, large frames (the 4-byte prefix is the limit),
   status lines in the transport and links designs, memory note.
+
+## 5a. Silica on both ends, Mac and Linux x86-64 (replaces E1; done 2026-11-10)
+
+The work for this stage is in `examples/transport_pairs/ethernet_remote/`: `run_mac_linux.sh`,
+`dangerous_ethernet_silica_pair.silica`, `build_linux.sh`, `expected/` and `README.md`. Rules on the remote: everything
+under `~/silica_demo/`, no sudo, no installs, no firewall or service change, and listeners on loopback only. The old
+checkout `~/silica` there is not used.
+
+- **L0. A Linux x86-64 toolchain on the remote. Done.**
+  - **The toolchain.** The Mac checkout's `binaries/silica-compiler-linux_x86_64` (silica-999959, the hosted compiler
+    of the 2026-11-08 trials) is copied to `~/silica_demo/toolchain`, about 23 MB. With it go the stdlib modules a
+    `(:tcp)` program needs (Supervisor, wire_etf, wireframe, Carrier, dangerous_sockets, dangerous_tcp_carrier),
+    `trial_wait_int64` and `compiler/stdlib/net` (`silica_sockets.c`). No bootstrap was needed.
+  - **First check.** The current stdlib, including Carrier with the `transport` effect, compiled with that binary. The
+    unchanged trial `ffi_addition/app_transport_tcp_loopback` built on the remote in 5 s and printed
+    `ping 7 / pong 8 / done`, exit 0.
+  - **Gaps.** silica-999959 predates `carried_on`, so the program names its carrier by module. `silica_sockets.c`
+    needs `-D_GNU_SOURCE` with `-std=c11` on glibc, as the trials already pass.
+- **L1. One program for both ends. Done.**
+  - **Shape.** `dangerous_ethernet_silica_pair.silica` is a listener and a dialer in one program. The vocabulary is
+    decision 5's: `(:request, id, (:accel, {x,y,z,at_ms}))` is answered by `(:reply, id, (:led, {which,on}))`
+    (z > 256), and `(:request, id, :status)` by `(:reply, id, (:status, {host, uptime_ms, requests_seen}))`.
+  - **Per-host differences.** The ports, the host name and the side are set at compile time by sed. The side is
+    chosen by two blocks in the one source, one of which is a `{- -}` comment.
+  - **Loopback self-test.** The logic was first checked on the Mac by running two copies against each other on
+    loopback.
+- **L2. `run_mac_linux.sh`. Done: five PASS runs (three in a row, then two more in a row after the last script
+  change), about 37 s each with both builds.**
+  - **What it does.** It builds both ends (the Linux end on the remote) and starts the Linux end, which listens on
+    127.0.0.1:4550. One ssh connection carries `-L 127.0.0.1:4560 -> remote 4550` and
+    `-R remote 127.0.0.1:4561 -> Mac 4551`. The script then runs the Mac end, which listens on 127.0.0.1:4551.
+  - **Checks.** Both outputs are compared, sorted, with `expected/`, and both ends must exit 0.
+  - **Teardown.** A trap tears everything down. The script then checks that neither side has a program, listener or
+    forward left. That check reported none after every run.
+  - **Timeout path.** `--timeout-check` runs without the Linux end: the Mac prints
+    `timeout: dialer done no listener done no` and exits 5.
+  - **Redialing.** The remote's dialer reaches the `-R` forward before the Mac listens. It redials (ssh logs
+    `connect_to 127.0.0.1 port 4551: failed`) until the Mac listener is up, and nothing of that shows in the output.
+- **L3. Docs. Done.** This section; the example's README; the entry in `examples/transport_pairs/README.md`.
+
+### Compiler problems found
+
+- **The hosted Linux compiler on a 3.9 GB host (no swap).** The `type_surface_cache` actor fails with
+  `(:explicit, :out_of_memory)` on a unit with somewhat more types than the usb pair's Mac peer, and the driver
+  reports a crash. The process stays near 500 MB RSS, and no system call fails.
+  - **Likely cause.** The actor's state area outgrows the per-actor reservation (physical memory plus swap) in
+    address space. This is inferred, not confirmed.
+  - **Workaround.** Each end compiles only its own side.
+  - **Fix needed.** In the Linux runtime's state-area reuse, or in the cache's reservation. The usb pair's Mac peer
+    compiled there. The first version of this program, with both sides in one unit, did not.
+- **No `carried_on` on silica-999959.** A Linux x86-64 compiler built from the current tree is needed to use it there.
+- **Two defects seen in `usb_silica_pair` and worked around on both ends:** an inline nested tuple in `encode` is
+  encoded flattened, and a `to_int64(...)` argument can clobber an earlier argument.
+
+What is left on the remote: `~/silica_demo/toolchain` (the compiler and the stdlib sources), `~/silica_demo/ethernet_pair`
+(the build) and the E0 files.
+
+## 5b. One direct TCP connection, requests both ways (replaces the tunnels; 2026-11-10)
+
+The work is in `examples/transport_pairs/ethernet_direct/`: `run_direct.sh`, `dangerous_ethernet_direct_pair.silica`,
+`build_linux.sh`, `expected/` and `README.md`. The rules on the remote are §5a's, with two changes. The listener binds
+every interface, on port 4550 only, and only during a run. Nothing changes in the firewall: the `ufw` rule (TCP 4550
+from 157.201.64.9) was made by the user beforehand.
+
+- **D0. The wildcard listener. Done.**
+  - **What `"listen:<port>"` does.** `dangerous_tcp_carrier` binds `127.0.0.1` only, and that does not change.
+  - **The new form.** `"listen:any:<port>"` binds `0.0.0.0:<port>`. It goes through
+    `dangerous_sockets@tcp_listen_any`, the C wrapper `silica_sockets_tcp_listen_any` (`INADDR_ANY`), which shares one
+    bind routine with `silica_sockets_tcp_listen`.
+  - **Explicit only.** A program must write the form; nothing selects it by default. It is the stdlib's explicit
+    wildcard until stage E2 binds `(:interface, name)` and `(:ethernet, n)` to one interface's address.
+  - **Platforms.** The same C file builds on macOS and on glibc (with `-D_GNU_SOURCE`, as before).
+  - **New trial.** `trials/transport_addition/app_transport_tcp_listen_any` opens `"listen:any:0"` and connects
+    through 127.0.0.1. Its output is `ping 7 / pong 8 / done`, exit 0. It has Apple goldens only; the Linux goldens
+    of the transport apps stay stale, as before.
+  - **Regenerated goldens.** Adding the wrapper changes several existing goldens, though not what the loopback
+    listener does:
+    - the `dangerous_sockets` and `dangerous_tcp_carrier` `.ascomp` and `silica.link.scout` of
+      `app_transport_tcp_listener`, `app_transport_tcp_loopback_link` and `ffi_addition/app_transport_tcp_loopback`;
+    - four `error_enforcement_addition/dangerous_carrier_*` `.golden_fail` files: one more W4001 FFI warning, and
+      shifted line numbers and offsets.
+  - **Prerequisite for BEES.** This form and the direct dial to a non-loopback address are what Project BEES's
+    milestone N1 needs. N1 is "a transport that is not loopback-only", and BEES lists that part as not started.
+- **D1. One program, one connection, requests both ways. Done.**
+  - **Vocabulary.** As in §5a: odd ids carry `(:accel, ...)` from the Mac, even ids carry `:status` from Linux.
+  - **Roles.** The Linux end (the status side) listens on `"listen:any:4550"`. The Mac end (the accel side) dials
+    `138.197.209.113:4550`.
+  - **One connection actor per end.** After `:link_up` it sends that end's three requests and answers the peer's
+    three. It decodes every incoming frame first as a reply and, if that is rejected, as a request.
+  - **Why one connection.** The Mac is behind the campus NAT and cannot be dialed. TCP is full duplex, so one
+    connection carries both directions.
+  - **Side blocks.** As in §5a, the side is chosen by swapping two blocks with sed. Each end compiles only its own
+    side, because of the Linux compiler's memory limit.
+  - **Carrier naming.** The carrier is named by module, because silica-999959 predates `carried_on`.
+  - **Self-test.** `run_direct.sh --local` runs both sides on the Mac (`listen:any:45550`, dial 127.0.0.1).
+- **D2. `run_direct.sh`. Done 2026-11-10 (20:2x UTC), after the remote was rebooted and temporarily upgraded to 16 GB / 8 CPUs.**
+  - **Result against `manager@aalang.org` (Linux x86_64) over direct TCP 4550, no tunnels:** `--runs 2` PASS. The Mac end
+    dialed `138.197.209.113:4550`; the Linux end (compiled on the remote with the Mac checkout's 999959 compiler,
+    listening on `listen:any:4550`) accepted; 3 accel requests (ids 1, 3, 5) from the Mac were answered `led red
+    on/off/on`, and 3 status requests (ids 2, 4, 6) from the remote went back over the same connection and were answered;
+    both ends printed `pair complete: 3 replies matched, 3 peer requests answered`, exit 0, outputs MATCH `expected/`
+    both runs. After each run: no program and no listener on 4550 on the remote, nothing left on the Mac.
+  - (The text below was written before this run and is kept as the record of what the script does.)
+  - **What it does.** It builds the Mac end, then waits until the remote is idle. A remote that does not answer
+    ssh counts as busy. It stages and builds the Linux end under `~/silica_demo/ethernet_direct`, starts it under
+    `timeout 90` and waits for `0.0.0.0:4550` in `ss`. It then runs the Mac end and compares both outputs, sorted,
+    with `expected/`. After each run, and in an exit trap, it kills the remote program and checks that no program
+    and no listener on 4550 is left. A remote check passes only if ssh answered.
+  - **Verified on the Mac:**
+    - `--local` passed three runs (one, then two in a row): both sides on the Mac, `listen:any:45550`.
+    - `--timeout-check` passed: the Mac end dialed `138.197.209.113:4550`, was refused (reachable, nothing
+      listening), printed `timeout: pair not complete` and exited 5.
+  - **Not run yet.** The remote stopped answering ssh at about 19:36 UTC 2026-11-10, after another agent's compiler
+    build overloaded it. Remote work was halted on the coordinator's instruction. No file was staged under
+    `~/silica_demo/ethernet_direct` and nothing was started there. The real run (`--runs 2`) is still to do.
+- **D3. Erlang on either end. Done 2026-11-10 (20:4x UTC).** Two siblings of `ethernet_direct`, same terms, same
+  one connection: `examples/transport_pairs/ethernet_mac_erlang_remote_silica/` (Erlang dialer on the Mac, OTP 28;
+  the Silica Linux end reused from `ethernet_direct`, not rebuilt) and `ethernet_mac_silica_remote_erlang/` (the
+  Silica Mac end; an OTP 27 `gen_tcp` listener on the remote's `0.0.0.0:4550`). Both `--runs 2` PASS against
+  `manager@aalang.org`, `--local` and `--timeout-check` PASS; every Silica frame equals Erlang's
+  `term_to_binary(T, [deterministic])`; no program or listener left after each run.
+
+### Security
+
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
+
+- **This pair.** The remote's source-address rule (TCP 4550 from 157.201.64.9 only) is the listener's only
+  protection, and every host behind the campus NAT shares that address.
+- **Limiting exposure.** The Linux end runs under `timeout 90` and closes its listener on completion. The script
+  kills it on any exit and checks that no listener is left on 4550.
+- **Readable bytes.** The bytes, synthetic readings and status records, cross the Internet in clear text.
+- **A dropped connection attempt.** `silica_sockets_tcp_connect` has no connect timeout. A dial to a port whose
+  firewall drops packets, instead of refusing them, would block the dialing carrier's thread until the OS gives up.
+  This is stage E8's "connect timeout".
 
 ## 6. Risks
 
@@ -106,11 +250,12 @@ Missing:
 - **`(:ethernet, 0)` on this Mac** is the 802.1X wired port; if it is down, the carrier fails with `:link_unavailable`
   by design. The Internet leg then uses Wi-Fi; the demo documents which interface carried it.
 - **OTP 27 vs 26 ETF differences** (atom encoding, `NEW_FLOAT`): checked in E0.
-- **Environment**: the published `binaries/silica-compiler` predates `carried_on`; use
-  `compiler/build/apple_silicon_mac/silica-compiler` (`SILICA_COMPILER`).
+- **Environment**: since 2026-11-10 the published `binaries/silica-compiler` (999925) has `carried_on`, and the
+  demos use it. The published Linux x86-64 compiler (`binaries/silica-compiler-linux_x86_64`, 999959) does not.
 
 ## 7. Open questions
 
-1. Is a tunnel acceptable, or do you want a real public port (needs `sudo ufw allow <port>/tcp` on the web host)?
+1. ~~Is a tunnel acceptable, or do you want a real public port?~~ **Answered 2026-11-10:** a real port. TCP 4550 is
+   open in `ufw` from the Mac's address only, and the tunnels are dropped (§5b).
 2. Should E7 (Silica on the remote) be in scope, and may I probe it for a C toolchain (`clang`/`ar`)?
 3. Which demo content: the accel/LED terms (same as the serial demo) plus the `:status` request, or something else?
