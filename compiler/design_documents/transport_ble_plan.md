@@ -148,8 +148,50 @@ any compiler-source change, as in the Wi-Fi plan §4.
 
 ## 7. Stage log
 
-Empty. Each stage's result is recorded here when it closes: date, what was built, trials, and anything that changed
-the plan.
+Each stage's result is recorded here when it closes: date, what was built, trials, and anything that changed the plan.
+
+- **Stage 1, 2026-11-10, closed: the three technical questions are answered yes, and bytes crossed in both
+  directions between a Silica program on the Mac and an iPhone.** Built, all in `programmer_tools/transport_ble_spike` (throwaway):
+  - `silica_ble.m`: an Objective-C wrapper over CoreBluetooth in the shape of `silica_sockets.c` (tagged results,
+    every call bounded by a timeout, received bytes through a `take`). The managers deliver callbacks on a private
+    serial dispatch queue and the calls wait on a condition. Roles: central, peripheral, scan only. Service: the
+    Nordic UART Service; the central writes with response, the peripheral sends by indication.
+  - `harness.c`: drives the wrapper from plain C with no run loop. `dangerous_ble.silica` and
+    `silica_ble_wrapper.meta`: the wrapper as a dangerous module. `dangerous_ble_spike.silica`: a dangerous actor that
+    polls the wrapper between mailbox messages and reports to a plain owner actor. `run_spike.sh` builds and runs
+    either.
+  - Runs (macOS 26.6.2, Apple clang 21, `binaries/silica-compiler`): `run_spike.sh --c scan`: open ok, 35
+    advertisers counted in 5 s. `run_spike.sh scan`, the Silica program: `open tag=0`, `advertisers seen=31`, exit 0.
+  - Answers: (1) a Fifi wrapper can be Objective-C and link `CoreBluetooth` and `Foundation`: the archive is built
+    with `/usr/bin/clang -fobjc-arc` and the two `-framework` flags are added to the program's link line; the
+    compiler needed no change. (2) The callbacks arrive with the entry `-e main` and no main run loop, on the dispatch
+    queue the manager was given, both from C and from a dangerous actor's thread. (3) The manager reported powered
+    on and scanned when started from a terminal inside VS Code. Whether macOS showed a permission prompt, and to
+    which application it attributes the permission, was not observed; the binary carries an
+    `NSBluetoothAlwaysUsageDescription` in an embedded `Info.plist` section in case it is needed.
+  - Loopback on one Mac: a peripheral process and a central process of the harness on the same Mac did not find each
+    other in 15 s (one attempt). Stage 3's two-way run needs a second device, as §5 assumed.
+  - The exchange (Mac as peripheral, `SILICA_BLE_TRACE=1 run_spike.sh peripheral`; iPhone with nRF Connect as the
+    central): the phone enabled indications on the TX characteristic and the program printed `link up, mtu=512` and
+    `sent, tag=0`; the phone showed `hello from silica`. The phone wrote `hi mac` to the RX characteristic and the
+    program printed `rx: hi mac` and `sent, tag=0` for its `ack from silica`. The wrapper's trace showed the write as
+    one request of 6 bytes on `6E400002`.
+  - Found on the way:
+    - `maximumUpdateValueLength` answered 512 for the iPhone, above the 244 the transport design §6.3 gives as the
+      ceiling. The carrier row's literal 20 (decision 3) is unaffected; the value `:link_up` carries can be larger
+      than the design says.
+    - A central unsubscribing is not the end of the link: it can still write and can subscribe again. The wrapper
+      first treated it as link down and the program exited; it no longer does.
+    - Every start of the program publishes the service again. A phone that stays connected to the Mac across a
+      restart was seen to subscribe again on its own.
+    - Several test writes were lost because they were sent to the Characteristic Extended Properties descriptor
+      (2900) that macOS adds under the RX characteristic, not to the characteristic; nRF Connect shows a write
+      button for both. Two changes made during that search (Write Without Response on the RX characteristic, strong
+      references to the RX characteristic and the service) were backed out afterwards and the exchange was run
+      again with the same result, so the RX characteristic is Write only, as decision 3 requires.
+  - Not covered: the central role against a real peripheral (the code exists and has only scanned); more than one
+    segment; a frame through `wireframe` and ETF; timeouts and the failure paths; which application macOS credits
+    with the Bluetooth permission. These are stage 3's.
 
 ## 8. Decisions (Matt Manley, 2026-11-10)
 
