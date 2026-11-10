@@ -285,6 +285,84 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     as in stage 1). S-B is done in the part that needs the board (both peers, both directions); the `(:uart0)`
     path of the §8 table was not built (the console shares it).
 
+- **Stage S-C, 2026-11-09: the `carried_on` link declaration exists on the Apple Silicon Mac and the ESP32-S3 board;
+  the loopback apps and the board carriers run through declarations.** Built (shared front end, packs, stdlib; the
+  normative text is specification §16.4.9, the status is in transport_links_design.md):
+  - Parser: `carried_on` is a keyword (lexer); `parser/carried_on_expand.silica` reads every declaration at the token
+    level before the constraint parser (a malformed line is E1081, never skipped), turns a declaration's name in an
+    expression into the kind's atom (`Carrier@mtu(usb)` is the `(:serial)` row) and expands
+    `spawn_dangerous_carrier(<name>, <policies>...)` into the spawn the target's pack spells (`carrier_spawn`): on the
+    Mac `spawn_dangerous(<initial literal>, dangerous_<kind>_carrier@carrier, ...)`, the serial carrier's literal
+    holding the declared path and baud; on the board `spawn_device(:idle, device_esp32s3_<uart1 | usb_serial_jtag>@...,
+    ...)`. The module the spawn names is an implicit `use` (as `wire_etf` is). The declaration is a tag-11 declaration
+    (`constraint_extract_decls`), its tokens as parameters.
+  - Checks: `type_checker/type_checker_links.silica` (shared: E2408 unknown kind, E2413 unknown link, E2414 kind and
+    link do not pair, E2415 the same UART instance / serial path / USB-Serial-JTAG controller claimed twice in a module
+    or across the compile's modules, E2417 parameter shape, a baud of 0); `sir_generator/sir_target_verify.silica`
+    (pack: E2410 kind not provided, E2412 link not provided with the console note of decision 17 and the pack's
+    `provided_links`, E2417 a baud the pack's `link_baud_ok` rejects), for every declaration, used or not; the parser
+    gives E2410 / E2412 at a `spawn_dangerous_carrier` the pack cannot serve.
+  - Packs (all five export `provides_link/2`, `provided_links/0`, `link_console_note/2`, `link_baud_ok/2`,
+    `carrier_spawn/4`, `carrier_module/2`): the Mac provides `tcp`, `udp`, `serial` as carrier kinds (decision 16) and
+    the links `loopback`, `interface`, `ethernet n`, `wifi n`, `serial_port` (baud in the termios set of the wrapper);
+    the ESP32-S3 provides `serial` and the links `uart 1` (115200 only: the worker's fixed CLKDIV) and
+    `usb_serial_jtag`, UART0 rejected as the console, UART2 not until it has a window; Linux and the Nucleo answer
+    false / "" (their rows are not written: E2412 there).
+  - Stdlib: `Link.silica` (closed like `Carrier`: `known`, `arity`, `instance_indexed`, `carries`; the vocabulary gained
+    `(:usb_serial_jtag)`), `Carrier.silica` rows `:uart1` and `:usb_serial_jtag` (`provides` true, `addressing`
+    `:none`; the deferred stage 1 / S-A item), `dangerous_serial_carrier` state `path` and `baud` (the declared port;
+    `:open` with `""`; `:link_up` carries `"path@baud"`). The demo peers (`transport_uart1_demo`,
+    `transport_usb_serial_jtag_demo`) declare their port and spawn with `spawn_dangerous_carrier`; `run_peer.sh`
+    patches the declaration's path literal.
+  - Trials: `error_enforcement_addition/link_*` (E1081 x2, E2408, E2412 x2, E2413, E2414, E2415, E2417 x3);
+    `transport_addition/transport_link_tags` (the `Link` facts, the board carrier rows, declared carriers read through
+    their names) and the sub-trial `app_transport_tcp_loopback_link` (the TCP and UDP loopback apps on
+    `carried_on ... (:loopback)`, the loopback goldens; the original `ffi_addition/app_transport_tcp_loopback` is
+    unchanged so its Linux goldens stay valid); `transport_board_addition/device_uart1_link_tx`,
+    `device_usb_serial_jtag_link_tx` (the stage 1 / S-A programs through declarations, same `.scout`) and the
+    compile-failure trial `link_uart0_console_reserved` (E2412 with the console note). Runs: Apple compiler rebuilt
+    incrementally from `binaries/silica-compiler` (the baseline had to be rebuilt in full first, 25 min; then 2 min and 9 s);
+    `transport_addition` 39 / 39 (the Apple `.ascomp` goldens of `transport_carrier_tags`, the listener sub-trial and the
+    new sub-trial were regenerated: two new atoms in `Carrier.silica` renumber every atom index of a suite that links it);
+    `ffi_addition/app_transport_tcp_loopback` green after the same regeneration of its eight Apple goldens;
+    `error_enforcement_addition` 11099 / 11099 with the eleven `link_*` trials (goldens from the compiler's output);
+    `programmer_tools/transport_uart1_demo/run_peer.sh --fake-board` exit 0 through the declared port (its fake board now
+    waits 12 s instead of 3: the peer is compiled first, and a frame written before the pty slave is opened was echoed
+    back in cooked mode); the ESP32-S3 cross compiler rebuilt from the tree (67 min 47 s, scratch `BUILD_ROOT`, copied
+    over `compiler/build/ESP32-S3_raw/silica-compiler`); `make integrate TRIAL_TARGET=ESP32-S3_raw
+    TRIAL_SUITES=transport_board_addition` 9 / 9 on the board (four programs' output and assembly, the UART0 console
+    rejection; the four `.esp32_s3.ascomp` goldens regenerated by `gen_board_ascomp.sh` after the matching run, the two
+    old ones having been renumbered); `run_app.sh --timeout 120 silica_33_transport_usb_serial_jtag_etf` (the demo now
+    declares `carried_on usb: (:serial) (:usb_serial_jtag);`) MATCH against the Mac peer that declares its port
+    (`frame 48 bytes`, `accel x=1 y=-2 z=512 at_ms=1000`, `sent 39 bytes`, exit 0). Fixed point on Apple Silicon: gen2 (the tree built by the new
+    compiler, scratch `BUILD_ROOT`) and gen3 (the tree built by gen2) compared unit by unit with the o<N> counters
+    normalised, 374 units, 0 differ, and the two binaries are byte-identical.
+    The full Apple tree (`make -C trials integrate JOBS=6` with the new compiler): 35152 / 35152, no failures (the
+    two pre-existing failures of 2026-11-05 did not reappear).
+  - Found on the way: the board image tooling (`board_suite.sh link_closure`, `build_image.sh`) links a program with the
+    modules its source names in `use` lines, so a board program keeps an explicit `use device_esp32s3_...;` beside the
+    implicit one the expansion adds (the hosted app makefiles list their link objects, so the implicit `use` alone is
+    enough there).
+  - **Linux goldens stale, to be regenerated on a Linux host in lock-step** (the Linux ports were not touched and the Mac cannot
+    regenerate them): all 16 in `trials/ffi_addition/app_transport_tcp_loopback`, that is `{Carrier, dangerous_sockets,
+    dangerous_tcp_carrier, dangerous_tcp_loopback, dangerous_udp_carrier, dangerous_udp_loopback, wire_etf, wireframe}` with
+    `.linux_aarch64.ascomp` and `.linux_x86_64.ascomp`. Two causes: this stage's two new `Carrier.silica` atoms renumber atom
+    indices in every unit of the suite, and the earlier, already pushed carrier work (the `provides` rename and comments in
+    `Carrier.silica`, whose byte offsets name the `L_case_o<offset>` labels; the multi-peer rewrite of
+    `dangerous_tcp_carrier.silica`; the loopback sources) had already staled some of them. The Linux
+    `transport_err_not_on_target.linux_*.golden_fail` are unaffected (the message did not change). The Apple goldens were
+    regenerated from the compiler built from this tree (`compiler/build/apple_silicon_mac/silica-compiler`); the published
+    `binaries/silica-compiler` predates `carried_on` and cannot compile the link trials until it is republished.
+  - Not done: the hosted interface links bind nothing yet (`(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)` are
+    accepted and spawn the plain carriers; no `getifaddrs`, no `(:explicit, :link_unavailable)` at open, so the
+    `link_interface_absent` / `link_family_absent` trials of the links design §10 wait); E2416 (phase D); the Linux
+    and Nucleo pack rows; UART2; the supervised board bring-up (no `:device` flavor). Decisions for Lee: the parser
+    (a shared stage) reads the pack's `carrier_spawn` text, as `sir_target_verify` reads `provides_format`, which is
+    the pack-as-data pattern of the transport design §6.0 and not a target hook in the front end; the one-atom
+    `(:usb_serial_jtag)` joined the link vocabulary (the design listed `(:usb_cdc, n)` only); on the board
+    `spawn_dangerous_carrier` answers a `device_actor_ref` because the carrier is a device worker; E2415 is limited to
+    exclusive hardware (two carriers on `(:loopback)` are allowed, as the loopback app needs).
+
 ## 8. Change of target (2026-11-09): serial over USB-C; Wi-Fi deferred
 
 **Why.** The test networks did not work out: the iPhone hotspot on this carrier is IPv6-only (the Mac got a CLAT
@@ -313,8 +391,9 @@ serial-to-TCP bridge of `programmer_tools/transport_uart1_demo`).
 - **S-B. Mac side.** `(:serial)` carrier against the port (macOS termios, already built); Silica peer and the Erlang peer
   through the bridge; both directions, with the real board. **Done with S-A for both peers (§7); the hosted carrier
   needed no change.**
-- **S-C. Link naming (old stage 2).** `carried_on` with `(:usb_serial_jtag)` / `(:uart, 0, baud)`, `Link.silica`, E2412 to E2417,
-  `getpeername` stays a Wi-Fi item.
+- **S-C. Link naming (old stage 2).** `carried_on` with `(:usb_serial_jtag)` / `(:uart, 1, baud)` (UART0 is the console and is
+  rejected, decision 17), `Link.silica`, E2412 to E2415 and E2417 (E2416 is phase D), `spawn_dangerous_carrier`;
+  `getpeername` stays a Wi-Fi item. **Done 2026-11-09 on the Mac and the board (§7).**
 - **S-D. End to end.** The board sends accelerometer readings; the Mac replies with an LED command; the same with the
   Erlang peer. Run by script outside `make integrate`, like the BEAM demo.
 - **S-E. Hardening and docs.** Framing recovery after a lost byte, flow control (no hardware flow control on the CP2102N

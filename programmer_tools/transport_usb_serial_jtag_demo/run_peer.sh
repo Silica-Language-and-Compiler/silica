@@ -57,13 +57,13 @@ build_peer() {
     echo "run_peer: built the Silica peer in $WORK"
 }
 
-link_peer_for_port() {   # the port path is a string literal in the program: patch the assembly (the
+link_peer_for_port() {   # the port path is the string literal of the carried_on declaration: patch the assembly (the
     cd "$WORK" || exit 1    # .ascii text and the .quad length two lines above it) and relink
     python3 - "$1" dangerous_usb_serial_jtag_peer.sams dangerous_usb_serial_jtag_peer.port.sams <<'PY' || exit 1
 import sys
 port, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
-old = "/dev/cu.usbmodem-PLACEHOLDER@115200"
-new = port + "@115200"
+old = "/dev/cu.usbmodem-PLACEHOLDER"
+new = port
 lines = open(src).read().split("\n")
 for i, line in enumerate(lines):
     if line.strip() == '.ascii "%s"' % old:

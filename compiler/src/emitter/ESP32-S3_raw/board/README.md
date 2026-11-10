@@ -237,9 +237,10 @@ of heap chunks that grow on demand and are released by the actor's `stack_policy
   `binaries/silica-compiler-ESP32-S3_raw`; `INSTALL_SELFHOST=0` builds without publishing, into
   `compiler/build/ESP32-S3_raw/silica-compiler`).
   The cross compiler in `compiler/build/ESP32-S3_raw/` was rebuilt on 2026-11-09 for the `(:uart1)` window (77 minutes,
-  scratch `BUILD_ROOT`); it is one transport-pack row behind the source (`provides_carrier "usb_serial_jtag"`), which
-  nothing reads yet, so rebuild it only when something does. The published `binaries/silica-compiler-ESP32-S3_raw` does
-  not know the `:esp32s3_uart1` window and refuses `map_device 0x60010000`.
+  scratch `BUILD_ROOT`) and again the same day for stage S-C of `transport_esp32s3_wifi_plan.md` (the `carried_on`
+  link declaration: the shared parser and type checker, the pack's `provides_link` / `carrier_spawn` rows; 67 min 47 s, scratch `BUILD_ROOT`, copied over `compiler/build/ESP32-S3_raw/silica-compiler`).
+  The published `binaries/silica-compiler-ESP32-S3_raw` knows neither the `:esp32s3_uart1` window (it refuses
+  `map_device 0x60010000`) nor `carried_on`.
 
 ### Build and run one app
 
@@ -449,6 +450,14 @@ float16 twins).
   so staging another module into a suite renumbers `movi` immediates in that suite's `.esp32_s3.ascomp` files. Regenerate
   them from the compiler's own output (`gen_board_ascomp.sh --suite <name> ESP32-S3_raw`); see
   `trials/transport_board_addition/README.md`.
+- **Carrier declarations on the board (stage S-C, 2026-11-09).** `carried_on usb: (:serial) (:usb_serial_jtag);` and
+  `carried_on host_line: (:serial) (:uart, 1, 115200);` are the two links this pack provides;
+  `spawn_dangerous_carrier(<name>, ...)` expands to `spawn_device(:idle, <worker>@<carrier>, ...)` and answers a
+  `device_actor_ref` (the carriers are device workers; a device worker cannot be a supervisor child yet, so the owner
+  spawns and restarts it). `(:uart, 0, ...)` is the console and is E2412 with the console note; UART2 has no window
+  yet and is not provided; the UART1 worker's clock divider is fixed, so only 115200 is accepted (E2417 otherwise).
+  `silica_33_transport_usb_serial_jtag_etf` and the `device_*_link_tx` trials use the declaration;
+  `silica_32_transport_uart1_etf` keeps the tag form (`Carrier@mtu((:uart1))`, `spawn_device`), which still compiles.
 - **Compiler: `.iface` files carry no device-description rows**, so a driver compiled in a later process after a skipped
   `use` can get a wrong E2213 (order-dependent). The transport carriers therefore have their own suite,
   `trials/transport_board_addition`, apart from `device_actor_addition`.

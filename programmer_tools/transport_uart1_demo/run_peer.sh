@@ -33,7 +33,7 @@ rm -rf "$WORK"; mkdir -p "$WORK/dangerous_exposure_source/lib"
 cd "$WORK" || exit 1
 
 if [ "$MODE" = fake ]; then
-    python3 "$HERE/fake_board.py" --delay 3 > fake.out 2>&1 &
+    python3 "$HERE/fake_board.py" --delay 12 > fake.out 2>&1 &   # the peer is compiled and linked first; a frame written before the slave is opened would be echoed by the pty in cooked mode
     FAKE=$!; disown
     for i in $(seq 1 50); do PORT=$(sed -n 's/^pty //p' fake.out | head -1); [ -n "$PORT" ] && break; sleep 0.1; done
     [ -n "$PORT" ] || { echo "run_peer: fake_board.py gave no pty"; cat fake.out; exit 1; }

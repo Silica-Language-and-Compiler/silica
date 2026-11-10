@@ -1,18 +1,36 @@
 # Transport links: the hardware a carrier runs on
 
-Status: design accepted for phase A planning; nothing of the `carried_on` grammar, `Link.silica` or E2412 to
-E2417 is implemented (2026-11-08). Of phase B, the ESP32-S3 UART1 worker with the §6.2 carrier contract and the §6
-failure atoms exists since 2026-11-09 (stage 1 of [transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md),
-`emitter/ESP32-S3_raw/board/apps/device_lib/device_esp32s3_uart1.silica`, reached through `spawn_device` until the
-declaration form lands), and so does the `(:usb_serial_jtag)` carrier of stage S-A (`device_lib/device_esp32s3_usb_serial_jtag.silica`, both
-directions, run on a real board with the Silica and Erlang peers). Still open for the hosted and board links: the `carried_on` grammar,
-`Link.silica`, the `Carrier.silica` rows and `provides` for both carriers, E2412 to E2417, `(:uart, 0, baud)` (the console), and the
-supervised form of the bring-up (a device worker cannot be a supervisor child yet). It extends
+Status (2026-11-09, stage S-C of [transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md) §8): **the `carried_on`
+grammar, `Link.silica`, the pack `provides_link` rows and E2412 to E2415 and E2417 are implemented on the Apple Silicon
+Mac and the ESP32-S3_raw board** (specification §16.4.9 is the normative text). Done: the declaration is read at the
+token level by the parser (`parser/carried_on_expand.silica`, a malformed line is E1081), kept as a tag-11 declaration
+(`constraint_extract_decls`), checked by the shared front end (`type_checker/type_checker_links.silica`: E2408 for an
+unknown kind, E2413, E2414, E2415 within a module and across the modules of a compile, E2417 for parameter shape) and by
+the target verifier against the pack (`sir_generator/sir_target_verify.silica`: E2410 for the kind, E2412 for the link
+with the console note of decision 17, E2417 for a baud the pack rejects); `Carrier@mtu(<name>)` resolves to the kind's
+row (§7: the link narrows nothing yet); `spawn_dangerous_carrier(<name>, <policies>...)` expands to the pack's spawn
+text (`carrier_spawn`: `spawn_dangerous` with the initial-state literal on the Mac, the serial carrier taking the
+declared path and baud; `spawn_device` of the UART1 or USB-Serial-JTAG worker on the board) and the module it names is
+an implicit `use`; `compiler/stdlib/Link.silica` answers `known`, `arity`, `instance_indexed`, `carries`;
+`Carrier.silica` gained the `:uart1` and `:usb_serial_jtag` rows (`provides` true, `addressing` `:none`). The Mac pack
+provides `loopback`, `interface`, `ethernet n`, `wifi n`, `serial_port`; the ESP32-S3 pack `uart 1` (115200) and
+`usb_serial_jtag`, with UART0 rejected as the console. The link vocabulary gained `(:usb_serial_jtag)` (0 parameters,
+carries `:serial`) for the stage S-A carrier. Trials: `trials/error_enforcement_addition/link_*`,
+`trials/transport_addition/transport_link_tags` and `app_transport_tcp_loopback_link`,
+`trials/transport_board_addition/device_*_link_tx` and `link_uart0_console_reserved`. Of phase B, the ESP32-S3 UART1
+worker with the §6.2 carrier contract and the §6 failure atoms exists since stage 1 (`device_esp32s3_uart1.silica`),
+and so does the `(:usb_serial_jtag)` carrier of stage S-A (`device_esp32s3_usb_serial_jtag.silica`, both directions, run
+on a real board with the Silica and Erlang peers). **Not done:** the hosted `(:interface, name)`, `(:ethernet, n)` and
+`(:wifi, n)` links are accepted and checked but the TCP and UDP carriers do not bind to the interface yet (no
+`getifaddrs`, no `(:explicit, :link_unavailable)` at open; the `link_interface_absent` and `link_family_absent` trials of
+§10 wait for it); the Linux packs list no link (E2412 there until their rows are written in lock-step); the Nucleo
+(phase C); UART2 on the ESP32-S3 (no window yet); E2416 (phase D: nothing reaches it); the supervised form of the
+board bring-up (a device worker cannot be a supervisor child yet). It extends
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below), §6 (carriers),
 §6.0 (the transport pack) and §9.3 (diagnostics), and uses the device and FFI rules of specification §20.4 and
 [runtime_failure_reporting.md](runtime_failure_reporting.md). Decisions marked **Decided** are Lee's; the rest of the
 text works them out. The companion overview is the "Links" subsection (§6.7) of the transport design; the normative
-(planned) text is specification §16.4.9.
+text is specification §16.4.9.
 
 ## 0. Summary
 
@@ -144,6 +162,7 @@ carriers):
 | `(:uart, n: uint32, baud: uint32)` | UART instance, baud | `:serial` | board: UART n at baud b, 8N1, no flow control; hosted: not provided (a hosted serial port is `(:serial_port, path, baud)`) |
 | `(:serial_port, path: string, baud: uint32)` | OS device path, baud | `:serial` | hosted: a termios port; today's `(:serial)` carrier with its `"path@baud"` address split out |
 | `(:usb_cdc, n: uint32)` | instance | `:serial` | board, later (plan item L) |
+| `(:usb_serial_jtag)` | none | `:serial` | ESP32-S3: the native USB-C jack through the USB-Serial-JTAG controller (the stage S-A carrier; added to the vocabulary 2026-11-09, stage S-C) |
 
 The pairing of link and carrier kind is a table in the pack module's shared vocabulary (`Link@carries(link, kind)`,
 §3.4); a mismatch is E2414.
