@@ -1,0 +1,289 @@
+{-
+
+   Copyright 2026 COPYRIGHT-HOLDER-PLACEHOLDER (to be decided before this is merged)
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The (:ble_gatt) carrier of transport_serialization_design.md §6.3 and §6.5 on a hosted target
+// (transport_ble_plan.md stage 3): a dangerous actor over the host's Bluetooth stack (dangerous_ble)
+// speaking the carrier contract of §6.2. It is declared on the host's adapter,
+// `carried_on <name>: (:ble_gatt) (:bluetooth, 0);`, spawned with spawn_dangerous_carrier(<name>, ...)
+// and opened with (:open, owner, address). The address names the role and the service:
+//
+//   "central:<uuid>"     scans for a peripheral offering the service, connects and subscribes;
+//   "peripheral:<uuid>"  publishes and advertises the service and waits for a central to subscribe.
+//
+// <uuid> is the service's UUID in text (4, 8 or 36 characters); "central:" and "peripheral:" with
+// nothing after the colon mean the Nordic UART Service. The service has one characteristic toward each
+// side (dangerous_ble's wrapper says which). :open answers nothing while the carrier seeks its peer;
+// when the link is up the owner gets (:link_up, "mtu:<n>"), n being the largest segment the link
+// carries (the negotiated ATT_MTU minus 3, at least 20), and 8 send credits. An owner that wants
+// segments larger than Carrier@mtu(<name>), which is the floor of 20, passes n to wireframe@frame.
+//
+// One :tx is one segment: a write with response toward a peripheral, an indication toward a central,
+// so the carrier is :reliable_ordered and :tx_credit comes back when the peer has taken the segment.
+// A segment longer than the link's mtu is (:tx_failed, :too_long); a :tx while the link is not up is
+// (:tx_failed, :link_down). Received segments are delivered as :rx, one per :credit the owner granted.
+//
+// (:link_down, reason): :closed after :close or when the peer ended the link, :timeout when the link
+// was lost or the adapter did not answer at :open, :fault for an address that names no role, a UUID
+// that cannot be read, an adapter that is off or not permitted, or any other failure. After
+// :link_down the session is released and the carrier can be opened again.
+//
+// The carrier polls the wrapper between mailbox messages with a 20 ms timeout, so it never blocks its
+// thread for longer than that, except for a :tx, which waits up to 2 s for the peer to take the segment.
+module dangerous_ble_gatt_carrier;
+
+use dangerous_ble;
+
+export initial/0;
+export carrier/2;
+
+// handle: the wrapper's session, -1 when there is none. phase: 0 not open, 1 seeking the peer, 2 up.
+fn initial() -> { owner: actor_ref, handle: int64, phase: int64, rx_credit: int64 } {
+    { owner: actor_ref_of_word(0), handle: 0 - 1, phase: 0, rx_credit: 0 }
+}
+
+fn starts(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+// 0 central, 1 peripheral, -1 for an address that names neither.
+fn role_of(address: string) -> int64 {
+    case starts(address, "central:") of {
+        true -> 0;
+        false -> case starts(address, "peripheral:") of {
+            true -> 1;
+            false -> 0 - 1
+        }
+    }
+}
+
+fn service_of(address: string) -> string {
+    case starts(address, "central:") of {
+        true -> substring(address, 8, length_bytes(address));
+        false -> case starts(address, "peripheral:") of {
+            true -> substring(address, 11, length_bytes(address));
+            false -> ""
+        }
+    }
+}
+
+fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
+    case r of {
+        (:ok, v: int64) -> v;
+        (:rejected, _why: atom) -> 0 - 1
+    }
+}
+
+fn int_text_from(n: int64, acc: string) -> string {
+    case n < 10 of {
+        true -> concat(substring("0123456789", n, n + 1), acc);
+        false -> int_text_from(n / 10, concat(substring("0123456789", n % 10, n % 10 + 1), acc))
+    }
+}
+
+fn int_text(n: int64) -> string {
+    int_text_from(n, "")
+}
+
+// The message read without the worker's effects: pure selectors a sequence can bind.
+fn msg_kind(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> atom {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> :open;
+        (:tx, _s: string, _f: actor_ref) -> :tx;
+        (:credit, _n: int64) -> :credit;
+        :close -> :close;
+        :poll -> :poll
+    }
+}
+
+fn msg_owner(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, fallback: actor_ref) -> actor_ref {
+    case msg of {
+        (:open, o: actor_ref, _a: string) -> o;
+        (:tx, _s: string, _f: actor_ref) -> fallback;
+        (:credit, _n: int64) -> fallback;
+        :close -> fallback;
+        :poll -> fallback
+    }
+}
+
+fn msg_text(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> string {
+    case msg of {
+        (:open, _o: actor_ref, a: string) -> a;
+        (:tx, s: string, _f: actor_ref) -> s;
+        (:credit, _n: int64) -> "";
+        :close -> "";
+        :poll -> ""
+    }
+}
+
+fn msg_count(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> int64 {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> 0;
+        (:tx, _s: string, _f: actor_ref) -> 0;
+        (:credit, n: int64) -> n;
+        :close -> 0;
+        :poll -> 0
+    }
+}
+
+fn none_res() -> { tag: int64, value: int64, error_code: int64 } {
+    { tag: 2, value: 0 - 1, error_code: 0 }
+}
+
+// The wrapper's phases 3, 4 and 5 as the contract's reasons.
+fn down_reason_of(phase: int64) -> atom {
+    case phase == 3 of {
+        true -> :closed;
+        false -> case phase == 4 of {
+            true -> :timeout;
+            false -> :fault
+        }
+    }
+}
+
+// One mailbox message, one pass over the session: the sequence proc[external_danger] is the whole body
+// (the language allows it only there), so the work is chosen by the message and the state. An :open
+// while a session exists is ignored: the owner closes first.
+fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, handle: int64, phase: int64, rx_credit: int64 }) -> (:no_reply, { owner: actor_ref, handle: int64, phase: int64, rx_credit: int64 }) {
+    sequence proc[external_danger, concurrency, transport]
+        kind: atom <- msg_kind(msg);
+        text: string <- msg_text(msg);
+        opening: boolean <- kind == :open and state.phase == 0;
+        owner: actor_ref <- case opening of { true -> msg_owner(msg, state.owner); false -> state.owner };
+        role: int64 <- role_of(text);
+        do_open: boolean <- opening and role >= 0;
+        res_open: { tag: int64, value: int64, error_code: int64 } <- case do_open of {
+            true -> dangerous_ble@open(role, service_of(text), 5000);
+            false -> none_res()
+        };
+        open_tag_raw: int64 <- res_open.tag;
+        open_handle_raw: int64 <- res_open.value;
+        open_tag: int64 <- pure_int(recreate(open_tag_raw));
+        open_handle: int64 <- pure_int(recreate(open_handle_raw));
+        opened: boolean <- do_open and open_tag == 0;
+        open_failed: boolean <- opening and opened == false;
+        // a segment that arrived before the link went down is still delivered, so receive comes first
+        polling: boolean <- kind == :poll and state.phase != 0;
+        do_rx: boolean <- polling and state.phase == 2 and state.rx_credit > 0;
+        res_rx: { tag: int64, value: int64, error_code: int64 } <- case do_rx of {
+            true -> dangerous_ble@recv_bytes(state.handle, 512, 20);
+            false -> none_res()
+        };
+        rx_tag_raw: int64 <- res_rx.tag;
+        rx_tag: int64 <- pure_int(recreate(rx_tag_raw));
+        got: boolean <- do_rx and rx_tag == 0;
+        bytes_in: string <- case got of {
+            true -> dangerous_ble@take(state.handle);
+            false -> ""
+        };
+        do_phase: boolean <- polling and got == false;
+        res_phase: { tag: int64, value: int64, error_code: int64 } <- case do_phase of {
+            true -> dangerous_ble@phase(state.handle, state.phase, case state.phase == 1 of { true -> 20; false -> 0 });
+            false -> none_res()
+        };
+        phase_tag_raw: int64 <- res_phase.tag;
+        phase_value_raw: int64 <- res_phase.value;
+        phase_tag: int64 <- pure_int(recreate(phase_tag_raw));
+        phase_value: int64 <- pure_int(recreate(phase_value_raw));
+        phase_seen: int64 <- case do_phase of {
+            false -> state.phase;
+            true -> case phase_tag == 0 of { true -> phase_value; false -> 5 }
+        };
+        came_up: boolean <- do_phase and state.phase == 1 and phase_seen == 2;
+        went_down: boolean <- do_phase and phase_seen > 2;
+        res_mtu: { tag: int64, value: int64, error_code: int64 } <- case came_up of {
+            true -> dangerous_ble@mtu(state.handle);
+            false -> none_res()
+        };
+        mtu_raw: int64 <- res_mtu.value;
+        mtu: int64 <- pure_int(recreate(mtu_raw));
+        do_tx: boolean <- kind == :tx and state.phase == 2;
+        res_tx: { tag: int64, value: int64, error_code: int64 } <- case do_tx of {
+            true -> dangerous_ble@send_bytes(state.handle, text, 2000);
+            false -> none_res()
+        };
+        tx_tag_raw: int64 <- res_tx.tag;
+        tx_code_raw: int64 <- res_tx.error_code;
+        tx_tag: int64 <- pure_int(recreate(tx_tag_raw));
+        tx_code: int64 <- pure_int(recreate(tx_code_raw));
+        closing: boolean <- kind == :close;
+        do_close: boolean <- (closing or went_down) and state.handle >= 0;
+        _: { tag: int64, value: int64, error_code: int64 } <- case do_close of {
+            true -> dangerous_ble@close(state.handle);
+            false -> none_res()
+        };
+        _: boolean <- case came_up of {
+            true -> cast(owner, (:link_up, concat("mtu:", int_text(mtu))) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case came_up of {
+            true -> cast(owner, (:tx_credit, 8) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case do_tx of {
+            true -> case tx_tag == 0 of {
+                true -> cast(owner, (:tx_credit, 1) impl ActorMessage {});
+                false -> cast(owner, (:tx_failed, case tx_tag == 1 and tx_code == 4 of { true -> :too_long; false -> :link_down }) impl ActorMessage {})
+            };
+            false -> case kind == :tx of {
+                true -> cast(owner, (:tx_failed, :link_down) impl ActorMessage {});
+                false -> true
+            }
+        };
+        _: boolean <- case got of {
+            true -> cast(owner, (:rx, bytes_in) impl ActorMessage {});
+            false -> true
+        };
+        link_down_now: boolean <- open_failed or went_down or closing;
+        down_reason: atom <- case closing of {
+            true -> :closed;
+            false -> case went_down of {
+                true -> down_reason_of(phase_seen);
+                false -> case do_open and open_tag == 2 of { true -> :timeout; false -> :fault }
+            }
+        };
+        _: boolean <- case link_down_now of {
+            true -> cast(owner, (:link_down, down_reason) impl ActorMessage {});
+            false -> true
+        };
+        phase_next: int64 <- case link_down_now of {
+            true -> 0;
+            false -> case opened of { true -> 1; false -> phase_seen }
+        };
+        handle_next: int64 <- case link_down_now of {
+            true -> 0 - 1;
+            false -> case opened of { true -> open_handle; false -> state.handle }
+        };
+        credit_next: int64 <- case kind == :credit of {
+            true -> state.rx_credit + msg_count(msg);
+            false -> case got of { true -> state.rx_credit - 1; false -> state.rx_credit }
+        };
+        keep_polling: boolean <- opened or (polling and phase_next != 0);
+        poll_delay: uint64 <- case polling and phase_next == 2 and credit_next == 0 of { true -> 20; false -> 1 };
+        _: boolean <- case keep_polling of {
+            true -> {
+                sequence proc[concurrency]
+                    _: timer_ref <- send_after(poll_delay, self(), :poll impl ActorMessage {})
+                produces
+                    pure true
+                end
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, { owner: owner, handle: handle_next, phase: phase_next, rx_credit: credit_next })
+    end
+}

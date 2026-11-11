@@ -1,0 +1,190 @@
+{-
+
+   Copyright 2026 COPYRIGHT-HOLDER-PLACEHOLDER (to be decided before this is merged)
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The Mac end of the Bluetooth demo (transport_ble_plan.md stage 3): the hosted (:ble_gatt) carrier
+// (dangerous_ble_gatt_carrier, CoreBluetooth) declared on the Mac's adapter. On :link_up it encodes
+// (:accel, { x: 1, y: -2, z: 512, at_ms: 1000 }) with ETF (48 bytes), cuts the frame into segments of
+// Carrier@mtu(phone) = 20 bytes with wireframe@frame and sends them, printing each in hexadecimal. It
+// then reassembles whatever segments the peer sends with wireframe@unframe, decodes the frame and
+// prints the reading: a peer that sends the same segments back proves both directions. Run it through
+// run_peer.sh, which puts the role in place of the address below.
+module dangerous_ble_peer;
+
+use wire_etf;
+use wireframe;
+use Carrier;
+use dangerous_ble;
+use trial_support_hex;
+use trial_wait_int64;
+
+// The link under the (:ble_gatt) carrier: the Mac's Bluetooth adapter. The role and the service are
+// the peer's side of the matter and go in the :open address (plan §8, decision 4).
+carried_on phone: (:ble_gatt) (:bluetooth, 0);
+
+// Patched per run by run_peer.sh: "peripheral:" or "central:", then the service UUID or nothing.
+fn address() -> string { "peripheral:" }
+
+fn show_reading(r: { x: int16, y: int16, z: int16, at_ms: uint64 }) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("accel x=");
+        _: atom <- print_int64(to_int64(r.x));
+        _: atom <- print(" y=");
+        _: atom <- print_int64(to_int64(r.y));
+        _: atom <- print(" z=");
+        _: atom <- print_int64(to_int64(r.z));
+        _: atom <- print(" at_ms=");
+        _: atom <- print_int64(to_int64(r.at_ms));
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// Every segment to the carrier, in order; the count sent.
+fn send_all(car: dangerous_actor_ref, segs: List[string, mem(normal)], sent: int64) -> int64 {
+    case segs of {
+        []: List[string, mem(normal)] -> sent;
+        [h: string, t: List[string, mem(normal)]] -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("tx segment ");
+                _: atom <- print_int64(sent);
+                _: atom <- print(" ");
+                _: atom <- println(trial_support_hex@hex(h));
+                _: boolean <- cast(car, (:tx, h, self()) impl ActorMessage {});
+                n: int64 <- send_all(car, t, sent + 1)
+            produces
+                pure n
+            end
+        }
+    }
+}
+
+fn send_reading(car: dangerous_actor_ref) -> int64 {
+    sequence proc[mem(normal), device_io, transport]
+        frame: string <- encode((:etf), (:accel, { x: 1, y: 0 - 2, z: 512, at_ms: 1000 }));
+        _: atom <- print("frame out ");
+        _: atom <- print_int64(length_bytes(frame));
+        _: atom <- println(" bytes");
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(phone), Carrier@boundaries(phone));
+        n: int64 <- send_all(car, segs, 0)
+    produces
+        pure n
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64 })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("link up ");
+                _: atom <- println(info);
+                _: boolean <- cast(state.car, (:credit, 8) impl ActorMessage {});
+                n: int64 <- send_reading(state.car);
+                _: atom <- print("sent ");
+                _: atom <- print_int64(n);
+                _: atom <- println(" segments; waiting for a frame from the peer")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:rx, segment: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("rx segment ");
+                _: atom <- println(trial_support_hex@hex(segment));
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                code2: int64 <- case un of {
+                    (:more, _r0: { mode: atom, expected: int64, pending: string }) -> state.code;
+                    (:frame, frame0: string, _r3: { mode: atom, expected: int64, pending: string }) -> {
+                        sequence proc[mem(normal), device_io, concurrency, transport]
+                            _: atom <- print("frame in ");
+                            _: atom <- print_int64(length_bytes(frame0));
+                            _: atom <- println(" bytes");
+                            decoded: (:ok, (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 })) | (:rejected, atom) <- decode((:etf), frame0);
+                            code: int64 <- case decoded of {
+                                (:ok, (:accel, r: { x: int16, y: int16, z: int16, at_ms: uint64 })) -> {
+                                    _: atom <- show_reading(r);
+                                    0
+                                };
+                                (:rejected, why: atom) -> {
+                                    _: atom <- print("rejected ");
+                                    _: atom <- print_atom(why);
+                                    _: atom <- println("");
+                                    2
+                                }
+                            };
+                            _: boolean <- cast(state.car, :close impl ActorMessage {})
+                        produces pure code end
+                    };
+                    (:rejected, _why1: atom) -> 3
+                };
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, _frame: string, r2: { mode: atom, expected: int64, pending: string }) -> r2;
+                    (:rejected, why2: atom) -> {
+                        sequence proc[device_io]
+                            _: atom <- print("framing rejected ");
+                            _: atom <- print_atom(why2);
+                            _: atom <- println("; send the frame again from its first segment")
+                        produces pure wireframe@fresh(Carrier@boundaries(phone)) end
+                    }
+                };
+                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, rx: rx2, code: code2 })
+            end
+        };
+        (:tx_failed, why3: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print("tx failed ");
+                _: atom <- print_atom(why3);
+                _: atom <- println("")
+            produces pure (:no_reply, state) end
+        };
+        (:link_down, why4: atom) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- print("link down ");
+                _: atom <- print_atom(why4);
+                _: atom <- println("");
+                _: boolean <- case why4 == :closed of {
+                    true -> cast_exit(state.code);
+                    false -> cast_exit(1)
+                }
+            produces pure (:no_reply, state) end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                car: dangerous_actor_ref <- spawn_dangerous_carrier(phone, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries(phone)), code: 4 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(car, (:open, me, address()) impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
