@@ -124,7 +124,9 @@ checkout `~/silica` there is not used.
     unchanged trial `ffi_addition/app_transport_tcp_loopback` built on the remote in 5 s and printed
     `ping 7 / pong 8 / done`, exit 0.
   - **Gaps.** silica-999959 predates `carried_on`, so the program names its carrier by module. `silica_sockets.c`
-    needs `-D_GNU_SOURCE` with `-std=c11` on glibc, as the trials already pass.
+    needs `-D_GNU_SOURCE` with `-std=c11` on glibc, as the trials already pass. **Update 2026-11-10:**
+    silica-999958-linux-x86_64 now has `carried_on`; see "Compiler problems found". The demos have not been switched
+    to it yet: `~/silica_demo/toolchain` still holds 999959.
 - **L1. One program for both ends. Done.**
   - **Shape.** `dangerous_ethernet_silica_pair.silica` is a listener and a dialer in one program. The vocabulary is
     decision 5's: `(:request, id, (:accel, {x,y,z,at_ms}))` is answered by `(:reply, id, (:led, {which,on}))`
@@ -157,7 +159,25 @@ checkout `~/silica` there is not used.
   - **Workaround.** Each end compiles only its own side.
   - **Fix needed.** In the Linux runtime's state-area reuse, or in the cache's reservation. The usb pair's Mac peer
     compiled there. The first version of this program, with both sides in one unit, did not.
-- **No `carried_on` on silica-999959.** A Linux x86-64 compiler built from the current tree is needed to use it there.
+  - **On 16 GB RAM (2026-11-10, the host temporarily upgraded): the crash does not occur.**
+    - Both versions of the both-sides unit compile, with 999959 and with the new 999958, at about 640 MB peak RSS:
+      the module-named version and the `carried_on` version (the latter with 999958 only).
+    - This fits the reservation hypothesis: the limit grows with physical memory.
+    - On a 4 GB host the limit is presumably still there. No runtime fix was made.
+  - **Building the compiler itself needs the memory too.** The native build of the compiler on that host, at 380
+    units, peaked at 4.4 GB RSS for one unit (`type_checker_expressions_actor_spawn`). Five more units were above
+    2.7 GB and about a dozen above 2.3 GB. The attempt on the 3.9 GB host starved the machine.
+- **`carried_on` on Linux x86-64: fixed 2026-11-10.**
+  - **Compiler.** silica-999958-linux-x86_64 was built natively on the remote from this tree, with 999959 as the host
+    compiler, in 48 min at low priority. It is installed as `binaries/silica-compiler-linux_x86_64`.
+  - **Pack change.** `emitter/linux_x86_64/transport_pack.silica` got the Mac's carrier and link rows. Before that,
+    the tree's Linux pack listed no carrier and no link, so a current-tree build still rejected `carried_on ... (:tcp)`
+    with E2410.
+  - **Results on the remote.** `app_transport_tcp_loopback_link` and a copy of it on `(:interface, "lo")` both print
+    `ping 7 / pong 8 / done`. The whole linux_x86_64 trial tree passes, apart from goldens that were already stale
+    with 999959.
+  - **Not verified.** The fixed-point check (the new compiler rebuilding itself byte-identically) was not run.
+  - **Still to do.** linux_aarch64 is not done.
 - **Two defects seen in `usb_silica_pair` and worked around on both ends:** an inline nested tuple in `encode` is
   encoded flattened, and a `to_int64(...)` argument can clobber an earlier argument.
 
@@ -200,7 +220,9 @@ from 157.201.64.9) was made by the user beforehand.
     connection carries both directions.
   - **Side blocks.** As in §5a, the side is chosen by swapping two blocks with sed. Each end compiles only its own
     side, because of the Linux compiler's memory limit.
-  - **Carrier naming.** The carrier is named by module, because silica-999959 predates `carried_on`.
+  - **Carrier naming.** The carrier is named by module, because silica-999959 predates `carried_on`. The Linux
+    x86-64 compiler installed on 2026-11-10 (999958) accepts `carried_on wire: (:tcp) (:loopback);`. The example still
+    uses the module-named form and the 999959 toolchain copy.
   - **Self-test.** `run_direct.sh --local` runs both sides on the Mac (`listen:any:45550`, dial 127.0.0.1).
 - **D2. `run_direct.sh`. Done 2026-11-10 (20:2x UTC), after the remote was rebooted and temporarily upgraded to 16 GB / 8 CPUs.**
   - **Result against `manager@aalang.org` (Linux x86_64) over direct TCP 4550, no tunnels:** `--runs 2` PASS. The Mac end
@@ -251,7 +273,8 @@ from 157.201.64.9) was made by the user beforehand.
   by design. The Internet leg then uses Wi-Fi; the demo documents which interface carried it.
 - **OTP 27 vs 26 ETF differences** (atom encoding, `NEW_FLOAT`): checked in E0.
 - **Environment**: since 2026-11-10 the published `binaries/silica-compiler` (999925) has `carried_on`, and the
-  demos use it. The published Linux x86-64 compiler (`binaries/silica-compiler-linux_x86_64`, 999959) does not.
+  demos use it. The published Linux x86-64 compiler (`binaries/silica-compiler-linux_x86_64`) was 999959, which does
+  not. Since late 2026-11-10 it is 999958, which does.
 
 ## 7. Open questions
 

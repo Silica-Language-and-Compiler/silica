@@ -7,8 +7,10 @@ sides interleaved, every reply matched to its request by id.
 - One source, `dangerous_ethernet_silica_pair.silica`, holds both ends. `run_mac_linux.sh` makes the per-host copy
   with sed at compile time. It sets the ports and the host name, and it picks the side (see below).
 - The Mac end is built with `binaries/silica-compiler`.
-- The Linux end is built **on the remote** with `binaries/silica-compiler-linux_x86_64` (the hosted Linux compiler,
-  silica-999959). The script copies the compiler into `~/silica_demo/toolchain`.
+- The Linux end is built **on the remote** with `binaries/silica-compiler-linux_x86_64`, the hosted Linux compiler.
+  - **Which build.** It was silica-999959 for the results below. Since late 2026-11-10 it is silica-999958, which has
+    `carried_on`.
+  - **Staging.** The script copies the compiler into `~/silica_demo/toolchain` when its checksum differs.
 - Both ends use the hosted `(:tcp)` carrier (`dangerous_tcp_carrier`): one listener and one connecting carrier per
   end.
 
@@ -170,11 +172,17 @@ MATCH: linux end
    - **Workaround.** Each end compiles only its own side block.
    - **To fix it.** Make the cache actor's state area stop growing in address space (or give it its own
      reservation), or rebuild the Linux compiler with a fix. Then a host with less memory can compile larger units.
+   - **2026-11-10, with the remote temporarily at 16 GB RAM.** The both-sides unit compiled at about 640 MB peak RSS,
+     with no crash: the module-named version with both 999959 and 999958, and the `carried_on` version with 999958.
+     So the limit grows with physical memory, as inferred. It is presumably still there on a 4 GB host.
 
 2. **The Linux compiler predates `carried_on`.** silica-999959 does not expand `carried_on` declarations. The
    `usb_silica_pair` Mac peer fails there with E2005 at the first use of its declared name (`Carrier@mtu(board)`).
    This program names its carrier by module instead: `spawn_dangerous` of `dangerous_tcp_carrier@carrier`, with the
    address string. Installing a Linux x86-64 compiler built from the current tree would allow `carried_on` here.
+   - **Done 2026-11-10.** silica-999958-linux-x86_64 was built on the remote from the current tree, with the Linux
+     x86-64 transport pack given the Mac's link rows. It compiles `carried_on wire: (:tcp) (:loopback);`. The program
+     here has not been switched to that form yet.
 
 3. **The compiler defects found by `../usb_silica_pair`.**
    - A nested tagged tuple written inline in `encode` is encoded flattened, so each term is bound to an annotated

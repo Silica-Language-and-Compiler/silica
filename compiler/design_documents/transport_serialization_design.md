@@ -1254,11 +1254,27 @@ real board with both Mac peers. They bind later work on any serial-like carrier.
   `carrier_spawn` texts, `spawn_dangerous_carrier`, E1081 and E2412 to E2415 and E2417, and the `Carrier.silica` rows
   for `(:uart1)` and `(:usb_serial_jtag)` (`provides` true, `addressing` `:none`). `Carrier.silica` is a Linux golden
   of `trials/ffi_addition/app_transport_tcp_loopback` (`Carrier.linux_aarch64.ascomp`, `Carrier.linux_x86_64.ascomp`),
-  so those two goldens are stale until regenerated on a Linux host. The serial carrier's state gained `path` and
+  so those two goldens are stale until regenerated on a Linux host. (The x86-64 ones were regenerated on 2026-11-10;
+  see the Linux x86-64 entry below.) The serial carrier's state gained `path` and
   `baud` (the declared port; `:open` with `""`), and the loopback apps were copied onto declarations as
   `transport_addition/app_transport_tcp_loopback_link` (the originals keep their Linux goldens). Still not done: the
   `(:uart0)` carrier (the console shares UART0), UART2, the hosted interface binding for `(:interface, name)`,
   `(:ethernet, n)` and `(:wifi, n)`.
+- **Linux x86-64, 2026-11-10.**
+  - **Compiler.** silica-999958-linux-x86_64 is built from this tree on a Linux x86-64 host (16 GB RAM). Its
+    `linux_x86_64/transport_pack.silica` has the Mac's carrier and link rows (links design §5.1), so it accepts
+    `carried_on`.
+  - **Trials.** The whole linux_x86_64 trial tree ran with it, and no result is worse than with silica-999959. The
+    hosted transport apps (`app_transport_tcp_loopback`, `_link`, `_listener` and `_listen_any`) print their
+    `.scout` output there.
+  - **Goldens.** Their `.linux_x86_64.ascomp` goldens were refreshed from that run: 8 changed, plus 22 new for the
+    `transport_addition` apps and for `transport_carrier_tags` and `transport_link_tags`.
+  - **Still stale.** Seven `transport_addition` single-file goldens (`transport_any_mem_kind`,
+    `transport_derived_case_label_collision`, `transport_etf_list_sum`, `transport_etf_record`,
+    `transport_etf_recursive`, `transport_etf_rejections` and `transport_etf_scalars`) and two
+    `recursive_function_addition` ackermann goldens. silica-999959 emits the same bytes for them as the new compiler,
+    so they were stale before.
+  - **Linux AArch64.** Its goldens were not touched.
 - **Done 2026-11-10 (stage S-D):** end to end over the native USB-C jack, as the examples in `examples/transport_pairs/`
   (one directory per board/Mac pair, each with a `run.sh` that checks both ends; `run_all.sh` runs them all).
   - In `usb_accel_led_erlang_and_silica`, the board sends four accelerometer readings, `(:accel, { x, y, z, at_ms })`

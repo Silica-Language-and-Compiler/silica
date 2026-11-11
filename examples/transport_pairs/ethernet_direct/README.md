@@ -9,10 +9,13 @@ full duplex. Every reply is matched to its request by id.
   with sed at compile time. It sets the addresses and the host name, and it picks the side.
 - **The Mac end** is built with `binaries/silica-compiler`.
 - **The Linux end** is built on the remote with the hosted Linux compiler: `binaries/silica-compiler-linux_x86_64`
-  (silica-999959), which `../ethernet_remote` already staged at `~/silica_demo/toolchain/silica-compiler`. This pair
-  only reads that file.
+  (silica-999959 when this pair was written), which `../ethernet_remote` stages at
+  `~/silica_demo/toolchain/silica-compiler`. This pair only reads that file.
+  - **Since late 2026-11-10** the link points at silica-999958, which accepts `carried_on`. The next
+    `../ethernet_remote` run stages it.
 - **The carrier.** Both ends use the hosted `(:tcp)` carrier, `dangerous_tcp_carrier`, named by module
-  (`spawn_dangerous` with an address string). silica-999959 predates `carried_on`.
+  (`spawn_dangerous` with an address string). silica-999959 predates `carried_on`. With 999958 the form
+  `carried_on wire: (:tcp) (:loopback);` also compiles on Linux. This example still uses the module-named form.
 
 ```
         Mac (accel side, behind the campus NAT)                Linux x86-64 (status side, public address)

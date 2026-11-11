@@ -134,9 +134,11 @@ numbers are different series, and the question numbers are kept (§12).
   (`"host:port"`, `"listen:port"`, `"path@baud"`).
 - **The transport pack** (`emitter/<TARGET>/transport_pack.silica`): `provides_format(tag: string)` and
   `provides_carrier(tag: string)`, flat tables read by the shared compiler; a tag the pack does not list is E2410
-  (`NotProvidedOnTarget`) from `sir_target_verify`, wherever it appears. Today the ESP32-S3_raw, STM32-L476RG_raw,
-  Linux and Mac packs all answer `false` for every carrier, and the hosted carriers are provided through
-  `compiler/stdlib/Carrier.silica` rather than the pack (see the comment in `linux_x86_64/transport_pack.silica`).
+  (`NotProvidedOnTarget`) from `sir_target_verify`, wherever it appears. This paragraph described the state before
+  phase A, when every pack answered `false` for every carrier and the hosted carriers were provided through
+  `compiler/stdlib/Carrier.silica` rather than the pack. Since phase A the Mac pack (2026-11-09) and the Linux x86-64
+  pack (2026-11-10) list `tcp`, `udp` and `serial` and the hosted links. The linux_aarch64 pack still answers `false`
+  and lists no link.
 - **Board packs.** The ESP32-S3 draft (`ports/board_pack.silica`) is pure indexed functions with no allocation and no
   effects, and already holds `pin_uart0_tx/rx` (43/44), `pin_uart1_tx/rx` (35/36), `uart_txfifo_max` and a
   window-name table (`":esp32s3_uart"`). The Nucleo pack (`emitter/STM32-L476RG_raw/board_pack.silica`) holds
@@ -360,6 +362,19 @@ The rows by target and phase:
 
 The existing `provides_carrier(tag)` row for `"serial"` becomes `true` on the targets that provide a link for it, so
 E2410 keeps its meaning (the kind is provided) and the new E2412 says the hardware is not.
+
+**Status (2026-11-10).**
+- **Mac.** Done 2026-11-09, as stage S-C.
+- **Linux x86-64.** Done 2026-11-10. `emitter/linux_x86_64/transport_pack.silica` now has the Mac's rows: the
+  carriers, the hosted links, the baud check and `carrier_spawn`.
+  - **Compiler.** silica-999958-linux-x86_64, built natively on a Linux x86-64 host.
+  - **Trials passed there.** `transport_addition/app_transport_tcp_loopback_link` (`ping 7 / pong 8 / done`),
+    `transport_link_tags`, and the `link_*` error trials. `link_not_provided_hosted` and `link_baud_unsupported` have
+    `.linux_x86_64.golden_fail` goldens that differ from the Mac's only in the target name.
+  - **Interface binding.** A `(:interface, "lo")` copy of the loopback app also ran. Interface binding itself is still
+    not built (§3.2).
+- **Linux AArch64.** Not done. Its pack still lists no link, so `carried_on` is E2410/E2412 there, and no AArch64
+  host was available to verify the change.
 
 ### 5.2 Diagnostics
 
