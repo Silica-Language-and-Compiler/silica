@@ -1,6 +1,6 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-10. Stages 1 to 3 are closed (§6); stage 4 is next. The goal, the design and the
+Status: **2026-11-10. Stages 1 to 4 are closed (§6); stage 5 is next. The goal, the design and the
 vocabulary are decided (§8: Matt Manley, 2026-11-10).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
@@ -56,8 +56,8 @@ environment it was written for:
   generation and its scheduler logic and replaces the parts that own the chip: start-up, the vector table, the
   memory layout, and polling with interrupts masked. `ESP32-S3_raw` stays as it is, owning the chip, for programs
   that need no radio. A program that wants the radio is built for the new target.
-- **HCI is the boundary.** ESP-IDF hands HCI packets to the application through its virtual HCI calls *(the
-  configuration for the ESP32-S3 is unverified)*. They are foreign code, reached through Fifi.
+- **HCI is the boundary.** ESP-IDF hands HCI packets to the application through its virtual HCI calls
+  (`CONFIG_BT_CONTROLLER_ONLY`; run on the board in stage 4). They are foreign code, reached through Fifi.
 - **AtomVM's ESP32 port is the model**: an actor runtime started by ESP-IDF, with its schedulers as tasks and radio
   events delivered as messages. It is open source.
 
@@ -317,6 +317,73 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - No compiler binary is committed with the stage.
   - The files new in this stage carry a placeholder for the copyright holder, to be decided before the branch is
     merged.
+
+- **Stage 4, 2026-11-10, closed: yes. Silica's board runtime runs as a guest of ESP-IDF, and a Silica program on
+  the board sent an HCI Reset to Espressif's controller and printed its answer.** Built, all in
+  `programmer_tools/transport_ble_board_spike` (throwaway). Board: ESP32-S3, 4 MB flash, 2 MB PSRAM (unused).
+  ESP-IDF v5.3.5, built with the controller and no Bluetooth host.
+  - Runs:
+    - Plain C under ESP-IDF, no Silica: the controller answered an HCI Reset with `040e0405030c00` (Command
+      Complete, status 0).
+    - `trials/cast_exit_board_addition/cast_exit_cross_core_call.silica`, unchanged, as a guest with the
+      controller up: `reply 42`, exit 9, its `.scout`. `main` on core 0 called an actor on core 1.
+    - `silica/dangerous_hci_reset.silica`: a dangerous actor calls a Fifi wrapper over the virtual HCI calls and
+      casts the event to a plain owner actor, which printed `hci reset length=7 event=040E0405030C00`; exit 0.
+  - Question 1, what was replaced. Of the runtime's sixteen `.S` files, twelve are used as they are (the
+    schedulers, mailboxes, stacks and supervision among them), two with small changes, and two are left out.
+    The emitted code is the `ESP32-S3_raw` compiler's, unchanged.
+    - `rt_start.S` and `rt_vectors.S` are left out. In their place (`rt_guest_start.S`, `guest.c`): each core's
+      scheduler is entered from a FreeRTOS task pinned to that core; "start core 1" creates the second task;
+      "stall the other core" suspends its task. `silica_rt_start_windowed` is kept word for word.
+    - The memory the linker script lays out (main's two stacks and the heap) is one zeroed block of ESP-IDF's
+      `.bss` with the same symbol names (`rt_guest_mem.S`).
+    - `rt_console.S`: the two places that halt a core with interrupts masked (`waiti 15`) return the task to
+      FreeRTOS. `rt_ffi.S`: its `memcpy` and the four like it are dropped, ESP-IDF has them.
+    - FreeRTOS saves and restores THREADPTR and SCOMPARE1 with each task (read in ESP-IDF's port and the chip's
+      register list), so the runtime's per-core block and its locks survive a task switch.
+  - Question 2: yes, above. The wrapper returns one integer, because the board's emitter does not yet take a
+    record back from a foreign call (only a scalar, or the text record a string is made from). The hosted
+    wrappers' `{ tag, value, error_code }` is therefore not available on the board.
+  - Question 3, cost:
+
+    | | Flash image | RAM free at start | RAM free with the controller up |
+    | --- | --- | --- | --- |
+    | ESP-IDF and the controller alone | 378,528 bytes | 349,384 | 315,152 |
+    | with Silica's runtime and the HCI program | 427,136 bytes | 150,932 | 116,700 |
+
+    The controller takes about 34 KB of RAM. Silica takes about 198 KB as built here: a fixed block of 135 KB
+    (96 KB heap, 32 KB for main's stack, 4 KB auxiliary), which is a choice, and its code and constants, 57 KB,
+    which sit in RAM (below). The HCI program used 55 KB of the 96 KB heap.
+  - Question 4: an image is an ordinary ESP-IDF application (`run_guest.sh`: compile the program, copy the
+    runtime, `idf.py build flash`), written to flash, where the bare-metal image is loaded into RAM. The console
+    carries the same `SILICA:START` and `SILICA:EXIT` markers after ESP-IDF's boot log, so the board trial
+    driver's reading of a run still applies.
+  - Found, for stage 5 to settle. None stopped the spike:
+    1. **A fault in an actor ends the whole program.** Silica's own exception vectors are gone, so a CPU exception
+       is ESP-IDF's panic; on the bare-metal target it ends only the actor. Not tried on the board.
+    2. **The schedulers spin when idle**, so FreeRTOS's idle tasks never run while a program does. The spike
+       turns off the watchdog's idle check. A real target has the scheduler block until there is work.
+    3. **Silica's code and constants are in RAM.** The runtime reads a marker word through the data-bus alias of
+       a function's address (`rt_actors.S`), which exists only for code in RAM. Running from flash, as ESP-IDF
+       code does, needs that read replaced, and returns 57 KB.
+    4. **The stack reserve is a guess.** An interrupt now lands on whatever stack is running. The spike raises the
+       reserve every prologue keeps above a chunk's guard band to 4 KB (the bare-metal build measures it per
+       program, 2,768 bytes for a small one). It has to be derived, and it makes actor stacks larger.
+    5. **The stack guards** still use both of the chip's data watchpoints; a hit is ESP-IDF's panic, not Silica's
+       fault report.
+    6. **The runtime's spinlocks are taken with interrupts on.** A task that is paused while holding one keeps the
+       other core spinning until it runs again.
+    7. **Both write UART0**: ESP-IDF's log and Silica's console. **Both read system timer unit 0**: ESP-IDF's
+       timer and Silica's clock.
+    8. C code called from a Silica task sees Silica's THREADPTR, so a wrapper must not use C thread-local
+       variables.
+  - Not covered: the controller's timing while a Silica program is busy (nothing was on the air; stage 5's
+    advertising is the first test of it); more than one program; the existing board trials on the new target;
+    PSRAM.
+  - Tools on this machine: ESP-IDF 5.3.5 and the `esp-13.2.0` toolchain, where the board scripts name the 6.2
+    environment and `esp-16.1.0`. A bare-metal image builds with `XTENSA_BIN` set, but `run_on_board.py` did not
+    load it with this environment's esptool, so no bare-metal run was made for comparison, and the four board
+    goldens left stale in stage 3 are still stale.
 
 ## 7. Facts the design rests on
 
