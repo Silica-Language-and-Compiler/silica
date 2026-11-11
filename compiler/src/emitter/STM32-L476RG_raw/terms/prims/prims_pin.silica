@@ -1,0 +1,186 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The board pin builtins on the NUCLEO-L476RG: pin_mode, pin_pull, pin_write, pin_read
+// (board_pin_builtins_design.md). Pins are numbered 16 * port + bit (board_pack.silica); the runtime
+// side is board/runtime/rt_support.S (silica_rt_pin_*: the port's clock on in RCC AHB2ENR at first use,
+// MODER / OTYPER / PUPDR read-modify-writes, BSRR for writes, IDR for reads).
+//
+// SIR shapes (sir_device_calls build_pin): pin_mode / pin_pull -- inner = the pin (uint32), right = an
+// integer constant node, the mode code (:input 0, :output 1, :output_open_drain 2) or the pull code
+// (:none 0, :up 1, :down 2); pin_write -- inner = the pin, right = the level (bool); pin_read -- inner =
+// the pin, typed bool. term_emit_kind_compound_part2 stages the pin in X1 and pin_write's level in X2
+// (prims_device@emit_prim_op_with_atoms hands the prim here); the code is loaded into X2 here.
+//
+// Each prim is one call into the board runtime (board/runtime, silica_rt_pin_*), which reaches the GPIO
+// registers. A literal pin was checked against board_pack@pin_class before emission (the pre-emit pass,
+// pin_literal_reason below: E2221 / E2222 / E2227), so it calls the unchecked entry (silica_rt_pin_*_lit);
+// a computed pin calls the checked entry, which tests the runtime twin of the pin table first and ends the
+// program with the abort report (status 71) naming the builtin and the number. pin_mode, pin_pull and
+// pin_write answer :ok; pin_read answers the pad level (0 or 1) in X0.
+
+use atom_table;
+use board_pack;
+use term_sir_helpers;
+use arm_isa;
+
+export is_pin_prim/1;
+export emit_pin_op/3;
+export pin_literal_reason/2;
+export pin_literal_code/2;
+
+fn is_pin_prim(name: string) -> boolean {
+    name == "pin_mode" or name == "pin_pull" or name == "pin_write" or name == "pin_read"
+}
+
+fn x_view(dest: string) -> string {
+    case length_bytes(dest) > 1 and substring(dest, 0, 1) == "W" of {
+        true -> concat("X", substring(dest, 1, length_bytes(dest)));
+        false -> dest
+    }
+}
+
+fn pin_is_literal(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).inner)).kind == 0
+}
+
+fn pin_code(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> int64 {
+    code_text: string <- term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(term, term_sir_helpers@sir_term_root_node(term).right_expr)).value;
+    case code_text of {
+        "1" -> 1;
+        "2" -> 2;
+        _: string -> 0
+    }
+}
+
+fn entry_name(prim: string, literal: boolean) -> string {
+    case literal of {
+        true -> concat("silica_rt_", concat(prim, "_lit"));
+        false -> concat("silica_rt_", prim)
+    }
+}
+
+fn emit_pin_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }) -> string {
+    prim: string <- term_sir_helpers@sir_term_root_node(term).name;
+    call: string <- arm_isa@xt_call(entry_name(prim, pin_is_literal(term)));
+    ok_idx: int64 <- atom_table@atom_lexeme_to_index(table, ":ok");
+    case prim of {
+        "pin_read" -> case x_view(dest) == "X0" of {
+            true -> call;
+            false -> concat(call, arm_isa@xt_mov(x_view(dest), "X0"))
+        };
+        "pin_write" -> concat(call, arm_isa@xt_movi(x_view(dest), ok_idx));
+        _: string -> concat(arm_isa@xt_movi("X2", pin_code(term)), concat(call, arm_isa@xt_movi(x_view(dest), ok_idx)))
+    }
+}
+
+// --- the literal-pin check (the pre-emit pass, sir_target_verify) -----------------------------------
+
+fn decimal_digit(c: string) -> uint32 {
+    case c of {
+        "0" -> 0;
+        "1" -> 1;
+        "2" -> 2;
+        "3" -> 3;
+        "4" -> 4;
+        "5" -> 5;
+        "6" -> 6;
+        "7" -> 7;
+        "8" -> 8;
+        "9" -> 9;
+        _: string -> 99
+    }
+}
+
+fn hex_digit(c: string) -> uint32 {
+    case c of {
+        "a" -> 10;
+        "b" -> 11;
+        "c" -> 12;
+        "d" -> 13;
+        "e" -> 14;
+        "f" -> 15;
+        "A" -> 10;
+        "B" -> 11;
+        "C" -> 12;
+        "D" -> 13;
+        "E" -> 14;
+        "F" -> 15;
+        _: string -> decimal_digit(c)
+    }
+}
+
+// The literal's text read as a pin number, digit by digit into a uint32 (the value is produced in the
+// pack's type, no conversion); anything that is not a small decimal or 0x number reads as 65535, which
+// is no pin on either board.
+fn pin_value_from(text: string, i: int64, acc: uint32, base: uint32) -> uint32 {
+    case i >= length_bytes(text) of {
+        true -> acc;
+        false -> {
+            c: string <- substring(text, i, i + 1);
+            d: uint32 <- case base == 16 of {
+                true -> hex_digit(c);
+                false -> decimal_digit(c)
+            };
+            case c == "_" of {
+                true -> pin_value_from(text, i + 1, acc, base);
+                false -> case d >= base or acc > 4096 of {
+                    true -> 65535;
+                    false -> pin_value_from(text, i + 1, acc * base + d, base)
+                }
+            }
+        }
+    }
+}
+
+fn pin_value(text: string) -> uint32 {
+    n: int64 <- length_bytes(text);
+    case n > 2 and (substring(text, 0, 2) == "0x" or substring(text, 0, 2) == "0X") of {
+        true -> pin_value_from(text, 2, 0, 16);
+        false -> case n == 0 of {
+            true -> 65535;
+            false -> pin_value_from(text, 0, 0, 10)
+        }
+    }
+}
+
+// "" when the builtin may use the pin; otherwise the reason (board_pack@pin_class is the authority).
+fn pin_literal_reason(prim: string, text: string) -> string {
+    p: uint32 <- pin_value(text);
+    case board_pack@pin_class(p) of {
+        0 -> concat("pin ", concat(text, concat(" is not a pin of the ", concat(board_pack@board_name(), concat(": ", board_pack@pin_numbering())))));
+        1 -> concat("pin ", concat(text, concat(" is reserved on the ", concat(board_pack@board_name(), concat(" (", concat(board_pack@pin_use(p), "); the pin builtins never touch it"))))));
+        2 -> case prim == "pin_read" of {
+            true -> "";
+            false -> concat("pin ", concat(text, concat(" is read-only on the ", concat(board_pack@board_name(), concat(" (", concat(board_pack@pin_use(p), "): only pin_read may use it"))))))
+        };
+        _: uint32 -> ""
+    }
+}
+
+fn pin_literal_code(prim: string, text: string) -> string {
+    p: uint32 <- pin_value(text);
+    case board_pack@pin_class(p) of {
+        0 -> "E2221";
+        1 -> "E2222";
+        2 -> case prim == "pin_read" of {
+            true -> "";
+            false -> "E2227"
+        };
+        _: uint32 -> ""
+    }
+}

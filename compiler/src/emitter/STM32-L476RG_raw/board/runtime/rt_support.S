@@ -25,6 +25,8 @@
 //   silica_rt_map_device_check(X0 base, X1 size) -> X0 base, or the abort "illegal device map": the
 //     run-time twin of board_pack.silica's window table (the same rows, the same order)
 //   the memory functions a foreign C wrapper would need (memcpy, memmove, memset, memcmp, strlen)
+//   the board pin builtins (silica_rt_pin_mode / _pull / _write / _read and their _lit entries) with the
+//     run-time twin of board_pack.silica's pin table
 //   GPIO helpers for the user LED (PA5) and a busy delay, for board apps
 // The ordering identities are not ported yet (rt_stubs.S).
 
@@ -262,7 +264,7 @@
     FUNC silica_rt_map_device_check
     ENTRY_SAVE
     MOV32   r4, silica_rt_windows
-    movw    r5, #12
+    movw    r5, #14                         // board_pack.silica window_count
 1:  cmp     r5, #0
     beq.w   8f
     ldr     r6, [r4], #4                    // base
@@ -282,6 +284,165 @@
 9:  movw    r1, #0
     ENTRY_RET_X0
     .size   silica_rt_map_device_check, . - silica_rt_map_device_check
+
+// ---- board pin builtins (board_pin_builtins_design.md) -------------------------------------------
+//
+// silica_rt_pin_mode(X1 pin, X2 mode)    mode 0 :input, 1 :output, 2 :output_open_drain
+// silica_rt_pin_pull(X1 pin, X2 pull)    pull 0 :none, 1 :up, 2 :down
+// silica_rt_pin_write(X1 pin, X2 level)  level 0 low, otherwise high (BSRR: one store, atomic)
+// silica_rt_pin_read(X1 pin) -> X0       the pad level from IDR (0 / 1), in every mode
+// The pin is 16 * port + bit (board_pack.silica). The checked entries test the pin against
+// silica_rt_pin_class (the twin of board_pack@pin_class: the same rows) and end the program with the
+// abort report "<builtin>: pin <n> is not a pin it may use on this board" (status 71) for a number the
+// builtin may not use; the _lit entries are for a literal pin, which the compiler checked already. Each
+// entry switches the port's clock on (RCC AHB2ENR, GPIOxEN = bit port) before the first access.
+// Entry convention (rt_defs.h): every register is kept except r10, r11, lr, and r0:r1 for pin_read.
+
+#define PIN_LIMIT        114                // board_pack@pin_number_limit
+#define PIN_READ_ONLY    2
+#define PIN_USABLE       3
+
+// The checked prologue: r2 = pin (X1's low word; a uint32, the high word is not read), r10 = the
+// builtin's reason prefix, r11 = the site's return address; lr is the table scratch, then restored.
+.macro PIN_CHECKED name, lit, minclass, prefix
+    FUNC \name
+    mov     r11, lr
+    MOV32   r10, \prefix
+    cmp     r2, #PIN_LIMIT
+    bhs.w   rt_pin_bad
+    MOV32   lr, silica_rt_pin_class
+    ldrb    lr, [lr, r2]
+    cmp     lr, #\minclass
+    blo.w   rt_pin_bad
+    mov     lr, r11
+    b.w     \lit
+    .size   \name, . - \name
+.endm
+
+    PIN_CHECKED silica_rt_pin_mode, silica_rt_pin_mode_lit, PIN_USABLE, silica_rt_pin_reason_mode
+    PIN_CHECKED silica_rt_pin_pull, silica_rt_pin_pull_lit, PIN_USABLE, silica_rt_pin_reason_pull
+    PIN_CHECKED silica_rt_pin_write, silica_rt_pin_write_lit, PIN_USABLE, silica_rt_pin_reason_write
+    PIN_CHECKED silica_rt_pin_read, silica_rt_pin_read_lit, PIN_READ_ONLY, silica_rt_pin_reason_read
+
+// The abort for a pin the builtin may not use: the reason is composed in silica_rt_pin_reason_buf
+// (prefix, the number in decimal, the tail), then silica_rt_abort_body reports it at the site (lr).
+    LFUNC rt_pin_bad
+    MOV32   r0, silica_rt_pin_reason_buf
+1:  ldrb    r1, [r10], #1                   // the prefix ("pin_write: pin ")
+    cmp     r1, #0
+    beq.w   2f
+    strb    r1, [r0], #1
+    b.w     1b
+2:  MOV32   r4, silica_rt_pin_digits_end    // the number, written backwards into the digit area
+    mov     r5, r2
+    movw    r6, #10
+3:  udiv    r7, r5, r6
+    mls     r8, r7, r6, r5
+    add     r8, r8, #48
+    strb    r8, [r4, #-1]!
+    mov     r5, r7
+    cmp     r5, #0
+    bne.w   3b
+    MOV32   r6, silica_rt_pin_digits_end
+4:  ldrb    r1, [r4], #1
+    strb    r1, [r0], #1
+    cmp     r4, r6
+    bne.w   4b
+    MOV32   r10, silica_rt_pin_reason_tail
+5:  ldrb    r1, [r10], #1
+    strb    r1, [r0], #1
+    cmp     r1, #0
+    bne.w   5b
+    MOV32   r0, silica_rt_pin_reason_buf
+    mov     lr, r11
+    b.w     silica_rt_abort_body
+    .size   rt_pin_bad, . - rt_pin_bad
+
+// rt_pin_port(r2 = pin) -> r6 = the port's GPIO base, r7 = the bit; the port's clock is on. Internal,
+// called inside an ENTRY_SAVE frame; clobbers r0, r1, r3.
+    LFUNC rt_pin_port
+    lsr     r0, r2, #4
+    and     r7, r2, #15
+    MOV32   r6, GPIOA_BASE
+    add     r6, r6, r0, lsl #10             // GPIOx = GPIOA + 0x400 * port
+    movw    r3, #1
+    lsl     r3, r3, r0
+    MOV32   r1, RCC_BASE
+    ldr     r0, [r1, #RCC_AHB2ENR]
+    tst     r0, r3
+    bne.w   1f
+    orr     r0, r0, r3
+    str     r0, [r1, #RCC_AHB2ENR]
+    ldr     r0, [r1, #RCC_AHB2ENR]          // the read back is the delay RM0351 §6.2.18 asks for
+1:  bx      lr
+    .size   rt_pin_port, . - rt_pin_port
+
+// pin_mode: OTYPER (open drain for mode 2) first, then MODER (00 input, 01 output), so an output never
+// starts as the wrong type.
+    FUNC silica_rt_pin_mode_lit
+    ENTRY_SAVE
+    bl      rt_pin_port
+    movw    r1, #1
+    lsl     r1, r1, r7
+    ldr     r0, [r6, #GPIO_OTYPER]
+    bic     r0, r0, r1
+    cmp     r4, #2
+    it      eq
+    orreq   r0, r0, r1
+    str     r0, [r6, #GPIO_OTYPER]
+    lsl     r8, r7, #1
+    movw    r1, #3
+    lsl     r1, r1, r8
+    ldr     r0, [r6, #GPIO_MODER]
+    bic     r0, r0, r1
+    cmp     r4, #0
+    beq.w   1f
+    movw    r1, #1
+    lsl     r1, r1, r8
+    orr     r0, r0, r1
+1:  str     r0, [r6, #GPIO_MODER]
+    ENTRY_RET
+    .size   silica_rt_pin_mode_lit, . - silica_rt_pin_mode_lit
+
+// pin_pull: PUPDR's two bits are the pull code itself (00 none, 01 up, 10 down).
+    FUNC silica_rt_pin_pull_lit
+    ENTRY_SAVE
+    bl      rt_pin_port
+    lsl     r8, r7, #1
+    movw    r1, #3
+    lsl     r1, r1, r8
+    ldr     r0, [r6, #GPIO_PUPDR]
+    bic     r0, r0, r1
+    and     r1, r4, #3
+    lsl     r1, r1, r8
+    orr     r0, r0, r1
+    str     r0, [r6, #GPIO_PUPDR]
+    ENTRY_RET
+    .size   silica_rt_pin_pull_lit, . - silica_rt_pin_pull_lit
+
+// pin_write: BSRR bit n sets the output, bit n + 16 resets it.
+    FUNC silica_rt_pin_write_lit
+    ENTRY_SAVE
+    bl      rt_pin_port
+    cmp     r4, #0
+    it      eq
+    addeq   r7, r7, #16
+    movw    r1, #1
+    lsl     r1, r1, r7
+    str     r1, [r6, #GPIO_BSRR]
+    ENTRY_RET
+    .size   silica_rt_pin_write_lit, . - silica_rt_pin_write_lit
+
+// pin_read: IDR, the pad's level (not the output latch).
+    FUNC silica_rt_pin_read_lit
+    ENTRY_SAVE
+    bl      rt_pin_port
+    ldr     r0, [r6, #GPIO_IDR]
+    lsr     r0, r0, r7
+    and     r0, r0, #1
+    movw    r1, #0
+    ENTRY_RET_X0
+    .size   silica_rt_pin_read_lit, . - silica_rt_pin_read_lit
 
 // ---- memory functions (AAPCS, for foreign C code) ----------------------------------------------
 
@@ -407,5 +568,32 @@ silica_rt_windows:
     .word   0xE000E010, 0x10                // systick
     .word   0xE000ED00, 0x90                // scb
     .word   0x40007000, 0x400               // pwr
+    .word   0x48000C00, 0x400               // gpiod
+    .word   0x48001C00, 0x400               // gpioh
 silica_rt_reason_device_map:
     .asciz  "illegal device map"
+
+// The pin builtins' table, one byte per pin number 0..113 (board_pack.silica pin_class: 0 not a pin,
+// 1 reserved, 2 read-only, 3 usable; the same rows).
+silica_rt_pin_class:
+    .byte   3, 3, 1, 1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 3   // 0..15
+    .byte   3, 3, 3, 1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3   // 16..31
+    .byte   3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1   // 32..47
+    .byte   0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   // 48..63
+    .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   // 64..79
+    .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   // 80..95
+    .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0   // 96..111
+    .byte   1, 1                                             // 112..113
+silica_rt_pin_reason_mode:  .asciz "pin_mode: pin "
+silica_rt_pin_reason_pull:  .asciz "pin_pull: pin "
+silica_rt_pin_reason_write: .asciz "pin_write: pin "
+silica_rt_pin_reason_read:  .asciz "pin_read: pin "
+silica_rt_pin_reason_tail:  .asciz " is not a pin it may use on this board"
+
+    .section .bss.silica_rt_pin, "aw", %nobits
+    .balign 4
+silica_rt_pin_reason_buf:
+    .space  80
+silica_rt_pin_digits:
+    .space  12
+silica_rt_pin_digits_end:

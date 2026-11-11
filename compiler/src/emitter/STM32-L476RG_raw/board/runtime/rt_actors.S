@@ -1661,8 +1661,17 @@ rt_publish_context:
 // the ACB; a cast: state into the ACB). The layout follows the tuple's own tag (the image's :reply /
 // :no_reply atoms, emitted as silica_rt_reply_tag / silica_rt_no_reply_tag, -1 when unused), not the
 // message kind, as on the ESP32-S3.
+//
+// The behaviour returns like every Silica function, with SP at its floor: its result's nodes (the new
+// state, a reply's nodes) stay in its frame's dynamic part on the auxiliary stack, where its own callers
+// adopt them when it is called as a helper (control.silica function_epilogue_tail_with_effects). This
+// routine is the one caller that does not adopt: the dispatch end reads the new state where it lies,
+// and only then does SP go back to its value at the call ([sp], kept across the call), popping every
+// auxiliary chunk the behaviour took (the emitted restore check: below VRG_ALIMIT or at or above
+// VRG_ATOP).
     LFUNC silica_rt_run_behaviour
     push    {r4-r7, lr}
+    sub     sp, sp, #12                     // [sp] SP (VRG_VSP) at the call, [sp+4] pad
     mov     r4, r0
     mov     r5, r1
     mov     r6, r2
@@ -1676,6 +1685,8 @@ rt_publish_context:
     str     r0, [r4, #ACB_RSLOT + 4]
     str     r0, [r4, #ACB_SDESC]
     str     r0, [r4, #ACB_SDESC + 4]
+    ldr     r0, [r9, #VRG_VSP]
+    str     r0, [sp, #0]
     ldr     r0, [r5, #MSG_PAYLOAD]
     ldr     r1, [r5, #MSG_PAYLOAD + 4]
     ldr     r2, [r4, #ACB_STATE]
@@ -1724,7 +1735,7 @@ rt_publish_context:
     bl      silica_rt_state_dispatch_end
     str     r0, [r4, #ACB_STATE]
     str     r1, [r4, #ACB_STATE + 4]
-    pop     {r4-r7, pc}
+    b.w     6f
 3:  // (:no_reply, state): state at +8; a cast-style result to a call answers 0
     ldr     r1, [r5, #MSG_KIND]
     cmp     r1, #1
@@ -1738,6 +1749,17 @@ rt_publish_context:
     bl      silica_rt_state_dispatch_end
     str     r0, [r4, #ACB_STATE]
     str     r1, [r4, #ACB_STATE + 4]
+6:  // the state is placed: SP goes back to its value at the call
+    ldr     r0, [sp, #0]
+    str     r0, [r9, #VRG_VSP]
+    ldr     r1, [r9, #VRG_ALIMIT]
+    cmp     r0, r1
+    blo.w   7f
+    ldr     r1, [r9, #VRG_ATOP]
+    cmp     r0, r1
+    blo.w   8f
+7:  bl      silica_rt_aux_release
+8:  add     sp, sp, #12
     pop     {r4-r7, pc}
     .size   silica_rt_run_behaviour, . - silica_rt_run_behaviour
 
