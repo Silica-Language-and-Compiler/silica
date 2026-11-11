@@ -1,0 +1,92 @@
+// A device window parameter survives a let in a call-free register body (the NUCLEO twin of
+// device_actor_addition/device_window_param_survives_let). gate(w) has two lets, a peek and a poke, no
+// call and no case; `keep <- bnot led` is staged through X0, so a window left in X0 would be read
+// through the mask. The poke writes 0 to :bsrr (sets and resets nothing). The worker then makes PA5 an
+// output, drives it high through BSRR and reads it back from IDR through the returned window (an output
+// pin's IDR bit is its pad level), casts the level, and turns the LED off again.
+// Expected: led 1 / status 0.
+use device_stm32l4_gpioa_registers;
+use trial_wait_int64;
+
+fn gate(w: device_window(L, (:stm32l4_gpioa))) -> device_window(L, (:stm32l4_gpioa)) {
+    sequence proc[register_rwr]
+        led: uint32 <- 0x20;
+        keep: uint32 <- bnot led;
+        pads: uint32 <- peek(w, :idr) impl Register32 {};
+        _: atom <- poke(w, :bsrr, ((pads band led) band keep) impl Register32 {})
+    produces
+        pure w
+    end
+}
+
+fn led_level(w: device_window(L, (:stm32l4_gpioa))) -> (device_window(L, (:stm32l4_gpioa)), int64) {
+    sequence proc[register_rwr]
+        mask: uint32 <- 0xC00;
+        mode_out: uint32 <- 0x400;
+        moder: uint32 <- peek(w, :moder) impl Register32 {};
+        _: atom <- poke(w, :moder, ((moder band (bnot mask)) bor mode_out) impl Register32 {});
+        _: atom <- poke(w, :bsrr, 0x20 impl Register32 {});
+        pads: uint32 <- peek(w, :idr) impl Register32 {};
+        _: atom <- poke(w, :bsrr, 0x200000 impl Register32 {});
+        bit: uint32 <- (pads shr 5) band 1;
+        level: int64 <- case bit == 1 of {
+            true -> 1;
+            false -> 0
+        }
+    produces
+        pure (w, level)
+    end
+}
+
+fn worker(msg: { op: atom, reply_to: actor_ref }, state: :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa)))) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa)))) {
+    sequence proc[register_rwr, concurrency]
+        next: :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa))) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    w: device_window(L, (:stm32l4_gpioa)) <- map_device((:stm32l4_gpioa), 0x48000000);
+                    (:mapped, gate(w))
+                };
+                _: atom -> :unmapped
+            };
+            (:mapped, w: device_window(L, (:stm32l4_gpioa))) -> case msg.op of {
+                :read_led -> {
+                    (w2, level) <- led_level(w);
+                    _: boolean <- cast(msg.reply_to, level impl ActorMessage {});
+                    (:mapped, w2)
+                };
+                _: atom -> (:mapped, w)
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}
+
+fn printer(level: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        print("led ");
+        _: atom <- print_int64(level);
+        println("")
+    produces
+        pure (:no_reply, state + 1)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                p: actor_ref <- spawn(0, printer, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                d: device_actor_ref <- spawn_device(:unmapped, worker, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast_device(d, { op: :init, reply_to: p } impl ActorMessage {});
+                _: boolean <- cast_device(d, { op: :read_led, reply_to: p } impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}
