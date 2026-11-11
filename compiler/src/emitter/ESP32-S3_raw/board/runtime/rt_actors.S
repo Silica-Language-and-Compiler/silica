@@ -2700,6 +2700,15 @@ silica_rt_spawn_waiter_wake:
 // the behaviour's frame region once it has returned, and the loop's later frames may reuse it. (Until
 // 2026-10-08 this frame was a 1,568-byte pad that kept that region intact, item C.) No call is made
 // here after the behaviour returns.
+//
+// The behaviour returns like every Silica function, with SP at its floor: its result's nodes (the new
+// state, a reply's nodes) stay in its frame's dynamic part on the auxiliary stack, where its own callers
+// adopt them when it is called as a helper (emitter_core fn_epilogue_adopts, 2026-11-10). This routine
+// is the one caller that does not adopt: the dispatch end reads the new state where it lies, and only
+// then does SP go back to its value at the call (a7, kept across the CALLX8 by the window rotation and
+// across a context switch by the window spill), popping every auxiliary chunk the behaviour took (the
+// emitted restore check: below VRG_ALIMIT or at or above VRG_ATOP). The register block is read through
+// THREADPTR again after the call: the actor may have resumed on the other core.
     .align  4
 silica_rt_run_behaviour:
     entry   a1, 32
@@ -2721,6 +2730,8 @@ silica_rt_run_behaviour:
     l32i    a13, a2, ACB_STATE + 4
     mov     a14, a4
     movi    a15, 0
+    rur     a7, threadptr               // a7 = SP (VRG_VSP) at the call
+    l32i    a7, a7, VRG_VSP
     l32i    a8, a2, ACB_BEH
     callx8  a8
     mov     a5, a10                     // a5 = the result tuple
@@ -2754,7 +2765,7 @@ silica_rt_run_behaviour:
     call8   silica_rt_state_dispatch_end
     s32i    a10, a2, ACB_STATE
     s32i    a11, a2, ACB_STATE + 4
-    retw
+    j       6f
 3:  // a cast-style result to a call: the reply is 0
     l32i    a4, a3, MSG_KIND
     movi    a6, 1
@@ -2769,7 +2780,15 @@ silica_rt_run_behaviour:
     call8   silica_rt_state_dispatch_end
     s32i    a10, a2, ACB_STATE
     s32i    a11, a2, ACB_STATE + 4
-    retw
+6:  // the state is placed: SP goes back to its value at the call
+    rur     a8, threadptr
+    s32i    a7, a8, VRG_VSP
+    l32i    a9, a8, VRG_ALIMIT
+    bltu    a7, a9, 7f
+    l32i    a9, a8, VRG_ATOP
+    bltu    a7, a9, 8f
+7:  call8   silica_rt_aux_release
+8:  retw
     .size   silica_rt_run_behaviour, . - silica_rt_run_behaviour
 
 // ---------------------------------------------------------------------------------------------
