@@ -1,0 +1,686 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The (:uart1) carrier of transport_serialization_design.md §6.4 (transport_esp32s3_wifi_plan.md stage 1,
+// transport_links_design.md phase B, board plan item N): UART1 on the UART1 header (TX GPIO35, RX GPIO36,
+// board_pack pin_uart1_tx / pin_uart1_rx) as a device worker that speaks the carrier actor contract of
+// design §6.2 to its owner. UART0 (GPIO43/44) is the console and is never a carrier (links design
+// decision 17). The line is 115200 8N1, no flow control (decision 13; the baud may be given in the
+// :open address as decimal text, "" means 115200).
+//
+// Windows (all four owned by this worker, spec §5.1; nothing maps at the spawn site, spec §4.3):
+// UART1 (board_pack window 12, 0x60010000, description device_esp32s3_uart1_registers; the field
+// constants are board_pack_uart0_values, the same uart_reg.h layout), GPIO (window 1) and IO_MUX
+// (window 3) for the two pads, SYSTEM (window 8) for the peripheral clock gate and reset. A program
+// that also drives GPIO from another worker cannot own GPIO twice, so a UART1 program routes its
+// other pins through this worker or does without (the demo does without).
+//
+// Messages (the §6.2 contract toward the carrier, plus the internal :poll):
+//   (:open, owner, address)   bring the link up (below) and answer (:link_up, "uart1@<baud>") and
+//                             (:tx_credit, 8) to owner; address "" or a decimal baud
+//   (:tx, segment, from)      write the segment's bytes to the TX FIFO (waiting for room byte by byte),
+//                             then (:tx_credit, 1) to the owner; before :open, or after the link is
+//                             down, (:tx_failed, :link_down)
+//   (:credit, n)              the owner takes n more :rx messages; a receive poll starts when n > 0
+//   :close                    (:link_down, :closed) to the owner; the worker drops its windows and is :idle
+//                             again, ready for another :open (it does not end itself: a device worker
+//                             spawned at the root has no supervisor, and its normal end would be reported
+//                             as a root exit on the console)
+//   :poll                     (internal, from send_after) drain the RX FIFO into one (:rx, bytes)
+//                             while credit remains, then re-arm
+//
+// Bring-up at :open (the links design's §6 bring-up, done here because only the device worker may
+// touch registers; a UART has no association step, so the bring-up actor and the carrier are one
+// worker in this phase): the SYSTEM clock gate of UART1 is opened and its reset released
+// (PERIP_CLK_EN0 / PERIP_RST_EN0 bit 5, with UART_MEM_CLK_EN), the UART core is reset (CLK_CONF
+// RST_CORE), the clock is the crystal (SCLK_SEL 3, board_pack crystal_hz, divider 1) so the baud does not
+// depend on the hand-off CPU clock, CLKDIV holds 40 MHz * 16 / baud in 12.4 fixed point (347 + 3/16
+// for 115200, 0.0005% off), CONF0 is 8N1 (BIT_NUM 3, STOP_BIT_NUM 1, no parity) with both FIFOs
+// reset, the pads are routed through the GPIO matrix (U1TXD_OUT = U1RXD_IN = signal 15 of
+// gpio_sig_map.h: FUNC35_OUT_SEL_CFG = OEN_SEL | 15 and GPIO_ENABLE1 bit 3 for TX, FUNC15_IN_SEL_CFG =
+// SIG_IN_SEL | 36 for RX; IO_MUX MCU_SEL 1 on both, 20 mA drive on TX, input buffer and pull-up on RX so
+// an unconnected header idles high), and the pending interrupt flags are cleared.
+//
+// Failure atoms (links design §6.3), all through the owner-facing contract first:
+//   (:explicit, :link_unavailable)  the UART did not come up: CLKDIV does not read back what was
+//                                   written (the clock gate is closed or the window is not a UART);
+//                                   (:link_down, :fault) to the owner, then stop_self
+//   (:explicit, :link_timeout)      bring-up exceeded its deadline: the TX FIFO is not empty after the
+//                                   FIFO reset within the bound; the same two steps
+//   (:explicit, :link_lost)         the link was lost after :link_up: the RX FIFO overflowed or a frame
+//                                   error was seen (bytes are gone, so :reliable_ordered no longer
+//                                   holds), or a TX byte found no FIFO room within the bound;
+//                                   (:tx_failed, :link_down) for the :tx in hand, (:link_down, :fault),
+//                                   then stop_self. The worker does not retry: the program restarts the
+//                                   carrier (design §6.2) and opens it again.
+// A clean :close is not a failure: (:link_down, :closed), then :idle.
+//
+// Polls return only the window (a tuple result per poll would be a 24-byte heap leak on this emitter,
+// board plan "Known issue: board emitter heap"); a :tx waits at most tx_wait_polls polls of about a
+// microsecond each per byte (a byte takes 87 us at 115200), the bring-up at most open_wait_polls.
+// Received bytes are collected into a List[int64] and turned into one string with bytes_of.
+
+use device_esp32s3_uart1_registers;
+use device_esp32s3_gpio_registers;
+use device_esp32s3_io_mux_registers;
+use device_esp32s3_system_registers;
+use board_pack;
+use board_pack_uart0_values;
+use board_pack_gpio_values;
+use board_pack_io_mux_values;
+use board_pack_system_values;
+
+export uart1_carrier/2;
+export default_baud/0;
+export link_info/1;
+
+fn default_baud() -> int64 {
+    115200
+}
+
+// Polls a TX byte waits for FIFO room (one peek each); the FIFO drains a byte per 87 us at 115200.
+fn tx_wait_polls() -> int64 {
+    200000
+}
+
+// Polls the bring-up waits for the TX FIFO to read empty after the FIFO reset.
+fn open_wait_polls() -> int64 {
+    10000
+}
+
+// U1TXD_OUT_IDX = U1RXD_IN_IDX = 15 (gpio_sig_map.h; the generated signal table lists only the RMT and
+// LEDC signals, so the UART1 index is stated here).
+fn uart1_signal() -> uint32 {
+    15
+}
+
+fn credit_grant() -> int64 {
+    8
+}
+
+// --- pure helpers ---------------------------------------------------------------------------------
+
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+fn digits_from(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            d: int64 <- at(s, i) - 48;
+            case d < 0 or d > 9 of {
+                true -> acc;
+                false -> digits_from(s, i + 1, acc * 10 + d)
+            }
+        }
+    }
+}
+
+// The baud of an :open address: "" is the default, otherwise its leading decimal digits (0 is the default too).
+fn baud_of(address: string) -> int64 {
+    b: int64 <- digits_from(address, 0, 0);
+    case b == 0 of {
+        true -> default_baud();
+        false -> b
+    }
+}
+
+fn int_text_from(n: int64, acc: string) -> string {
+    case n < 10 of {
+        true -> concat(substring("0123456789", n, n + 1), acc);
+        false -> int_text_from(n / 10, concat(substring("0123456789", n % 10, n % 10 + 1), acc))
+    }
+}
+
+// The :link_up info text of design §6.3: "uart1@115200".
+fn link_info(baud: int64) -> string {
+    concat("uart1@", int_text_from(baud, ""))
+}
+
+fn to_u32(n: int64) -> uint32 {
+    to_uint32(n)
+}
+
+// CLKDIV register value for `baud` from the crystal: integer part in bits 11:0, fraction/16 in 23:20
+// (uart_ll_set_baudrate with sclk_div 1).
+fn clkdiv_value(baud: int64) -> uint32 {
+    sclk: int64 <- to_int64(board_pack@crystal_hz());
+    div16: int64 <- (sclk * 16) / baud;
+    frag: uint32 <- to_u32(div16 % 16);
+    whole: uint32 <- to_u32(div16 / 16);
+    (frag shl board_pack_uart0_values@uart0_clkdiv_frag_shift()) bor (whole band board_pack_uart0_values@uart0_clkdiv_mask())
+}
+
+fn msg_kind(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> atom {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> :open;
+        (:tx, _s: string, _f: actor_ref) -> :tx;
+        (:credit, _n: int64) -> :credit;
+        :close -> :close;
+        :poll -> :poll
+    }
+}
+
+fn msg_owner(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, fallback: actor_ref) -> actor_ref {
+    case msg of {
+        (:open, o: actor_ref, _a: string) -> o;
+        (:tx, _s: string, f: actor_ref) -> f;
+        (:credit, _n: int64) -> fallback;
+        :close -> fallback;
+        :poll -> fallback
+    }
+}
+
+fn msg_text(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> string {
+    case msg of {
+        (:open, _o: actor_ref, a: string) -> a;
+        (:tx, s: string, _f: actor_ref) -> s;
+        (:credit, _n: int64) -> "";
+        :close -> "";
+        :poll -> ""
+    }
+}
+
+fn msg_count(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> int64 {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> 0;
+        (:tx, _s: string, _f: actor_ref) -> 0;
+        (:credit, n: int64) -> n;
+        :close -> 0;
+        :poll -> 0
+    }
+}
+
+// --- SYSTEM: clock gate and reset of UART1 -------------------------------------------------------------
+
+// PERIP_CLK_EN0: UART1_CLK_EN and UART_MEM_CLK_EN on; PERIP_RST_EN0: UART1_RST pulsed then released
+// (uart_ll_reset_register's order, without the core reset, which uart_core_reset does once the clock runs).
+fn uart1_clock_on(s: device_window(L, (:esp32s3_system))) -> device_window(L, (:esp32s3_system)) {
+    sequence proc[register_rwr]
+        clk_bit: uint32 <- board_pack_system_values@system_uart1_clk_en_mask();
+        mem_bit: uint32 <- board_pack_system_values@system_uart_mem_clk_en_mask();
+        rst_bit: uint32 <- board_pack_system_values@system_uart1_rst_mask();
+        en: uint32 <- peek(s, :perip_clk_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_clk_en0, (en bor clk_bit bor mem_bit) impl Register32 {});
+        rst: uint32 <- peek(s, :perip_rst_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_rst_en0, (rst bor rst_bit) impl Register32 {});
+        rst2: uint32 <- peek(s, :perip_rst_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_rst_en0, (rst2 band (bnot rst_bit)) impl Register32 {})
+    produces
+        pure s
+    end
+}
+
+// --- UART1 registers --------------------------------------------------------------------------------------
+
+// CLK_CONF: the crystal as the source (SCLK_SEL 3), divider 1 (SCLK_DIV_NUM 0, DIV_A 0, DIV_B 0), the
+// core clock and both directions enabled, with RST_CORE pulsed first so the core starts clean.
+fn uart_clock_select(u: device_window(L, (:esp32s3_uart1))) -> device_window(L, (:esp32s3_uart1)) {
+    sequence proc[register_rwr]
+        sel_xtal: uint32 <- 3;
+        sel_bits: uint32 <- sel_xtal shl board_pack_uart0_values@uart0_sclk_sel_shift();
+        en_bits: uint32 <- board_pack_uart0_values@uart0_sclk_en_mask() bor board_pack_uart0_values@uart0_tx_sclk_en_mask() bor board_pack_uart0_values@uart0_rx_sclk_en_mask();
+        rst_core: uint32 <- board_pack_uart0_values@uart0_rst_core_mask();
+        _: atom <- poke(u, :clk_conf, (sel_bits bor en_bits bor rst_core) impl Register32 {});
+        _: atom <- poke(u, :clk_conf, (sel_bits bor en_bits) impl Register32 {})
+    produces
+        pure u
+    end
+}
+
+// CONF0: 8 data bits, 1 stop bit, no parity, the FIFO memory clock on; the two FIFO resets pulsed.
+fn uart_line_8n1(u: device_window(L, (:esp32s3_uart1))) -> device_window(L, (:esp32s3_uart1)) {
+    sequence proc[register_rwr]
+        eight: uint32 <- 3;
+        one_stop: uint32 <- 1;
+        bits: uint32 <- (eight shl board_pack_uart0_values@uart0_bit_num_shift()) bor (one_stop shl board_pack_uart0_values@uart0_stop_bit_num_shift()) bor board_pack_uart0_values@uart0_mem_clk_en_mask();
+        fifo_rst: uint32 <- board_pack_uart0_values@uart0_rxfifo_rst_mask() bor board_pack_uart0_values@uart0_txfifo_rst_mask();
+        _: atom <- poke(u, :conf0, (bits bor fifo_rst) impl Register32 {});
+        _: atom <- poke(u, :conf0, bits impl Register32 {})
+    produces
+        pure u
+    end
+}
+
+fn uart_set_baud(u: device_window(L, (:esp32s3_uart1)), baud: int64) -> device_window(L, (:esp32s3_uart1)) {
+    sequence proc[register_rwr]
+        _: atom <- poke(u, :clkdiv, clkdiv_value(baud) impl Register32 {})
+    produces
+        pure u
+    end
+}
+
+// True when CLKDIV reads back the value written for `baud`: the register took the write, so the
+// peripheral is clocked and the window is a UART.
+fn uart_clkdiv_ok(u: device_window(L, (:esp32s3_uart1)), baud: int64) -> boolean {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(u, :clkdiv) impl Register32 {};
+        want: uint32 <- clkdiv_value(baud);
+        keep: uint32 <- board_pack_uart0_values@uart0_clkdiv_mask() bor board_pack_uart0_values@uart0_clkdiv_frag_mask()
+    produces
+        pure (v band keep) == want
+    end
+}
+
+// INT_CLR: every pending flag cleared (the W1C register is written whole).
+fn uart_clear_flags(u: device_window(L, (:esp32s3_uart1))) -> device_window(L, (:esp32s3_uart1)) {
+    sequence proc[register_rwr]
+        all: uint32 <- 0x0FFFFFFF;
+        _: atom <- poke(u, :int_clr, all impl Register32 {})
+    produces
+        pure u
+    end
+}
+
+fn tx_count(u: device_window(L, (:esp32s3_uart1))) -> uint32 {
+    sequence proc[register_rwr]
+        status: uint32 <- peek(u, :status) impl Register32 {};
+        cnt_shift: uint32 <- board_pack_uart0_values@uart0_txfifo_cnt_shift();
+        cnt_mask: uint32 <- board_pack_uart0_values@uart0_txfifo_cnt_mask()
+    produces
+        pure (status band cnt_mask) shr cnt_shift
+    end
+}
+
+fn rx_count(u: device_window(L, (:esp32s3_uart1))) -> uint32 {
+    sequence proc[register_rwr]
+        status: uint32 <- peek(u, :status) impl Register32 {};
+        cnt_mask: uint32 <- board_pack_uart0_values@uart0_rxfifo_cnt_mask()
+    produces
+        pure status band cnt_mask
+    end
+}
+
+// Waits (at most `polls` polls) until the TX FIFO is empty; returns only the window, the caller reads
+// tx_count once more to tell "empty" from "timed out".
+fn wait_tx_empty(u: device_window(L, (:esp32s3_uart1)), polls: int64) -> device_window(L, (:esp32s3_uart1)) {
+    sequence proc[register_rwr]
+        cnt: uint32 <- tx_count(u);
+        r: device_window(L, (:esp32s3_uart1)) <- case cnt == 0 or polls == 0 of {
+            true -> u;
+            false -> wait_tx_empty(u, polls - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+// Waits (at most `polls` polls) until the TX FIFO has room (fewer than 128 bytes queued).
+fn wait_tx_room(u: device_window(L, (:esp32s3_uart1)), polls: int64) -> device_window(L, (:esp32s3_uart1)) {
+    sequence proc[register_rwr]
+        cnt: uint32 <- tx_count(u);
+        r: device_window(L, (:esp32s3_uart1)) <- case cnt < 128 or polls == 0 of {
+            true -> u;
+            false -> wait_tx_room(u, polls - 1)
+        }
+    produces
+        pure r
+    end
+}
+
+// Writes the segment's bytes from index i on; stops early when a byte finds no room within the bound.
+// Returns the window; the caller tells success from the count it asks for (tx_written).
+fn put_bytes(u: device_window(L, (:esp32s3_uart1)), seg: string, i: int64) -> device_window(L, (:esp32s3_uart1)) {
+    sequence proc[register_rwr]
+        r: device_window(L, (:esp32s3_uart1)) <- case i >= length_bytes(seg) of {
+            true -> u;
+            false -> {
+                u1: device_window(L, (:esp32s3_uart1)) <- wait_tx_room(u, tx_wait_polls());
+                cnt: uint32 <- tx_count(u1);
+                case cnt < 128 of {
+                    false -> u1;
+                    true -> {
+                        _: atom <- poke(u1, :fifo, to_u32(at(seg, i)) impl Register32 {});
+                        put_bytes(u1, seg, i + 1)
+                    }
+                }
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+// True when the TX path is healthy after put_bytes: the FIFO is below full (a stuck FIFO stays at 128).
+fn tx_healthy(u: device_window(L, (:esp32s3_uart1))) -> boolean {
+    sequence proc[register_rwr]
+        cnt: uint32 <- tx_count(u)
+    produces
+        pure cnt < 128
+    end
+}
+
+// INT_RAW: overflow or frame error since the last clear means bytes were lost or corrupted.
+fn rx_faulted(u: device_window(L, (:esp32s3_uart1))) -> boolean {
+    sequence proc[register_rwr]
+        raw: uint32 <- peek(u, :int_raw) impl Register32 {};
+        bad: uint32 <- board_pack_uart0_values@uart0_rxfifo_ovf_int_raw_mask() bor board_pack_uart0_values@uart0_frm_err_int_raw_mask()
+    produces
+        pure (raw band bad) != 0
+    end
+}
+
+// Pops one received byte (bits 7:0 of :fifo; a read pops it).
+fn read_byte(u: device_window(L, (:esp32s3_uart1))) -> int64 {
+    sequence proc[register_rwr]
+        word: uint32 <- peek(u, :fifo) impl Register32 {};
+        byte_mask: uint32 <- board_pack_uart0_values@uart0_rxfifo_rd_byte_mask()
+    produces
+        pure to_int64(word band byte_mask)
+    end
+}
+
+// Pops up to `n` bytes into the accumulator (newest first; drain reverses it).
+fn pop_bytes(u: device_window(L, (:esp32s3_uart1)), n: uint32, acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[register_rwr, mem(normal)]
+        r: List[int64, mem(normal)] <- case n == 0 of {
+            true -> acc;
+            false -> pop_bytes(u, n - 1, prepend[int64, mem(normal)](read_byte(u), acc))
+        }
+    produces
+        pure r
+    end
+}
+
+fn reverse_into(xs: List[int64, mem(normal)], acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[int64, mem(normal)] <- case xs of {
+            []: List[int64, mem(normal)] -> acc;
+            [h: int64, t: List[int64, mem(normal)]] -> reverse_into(t, prepend[int64, mem(normal)](h, acc))
+        }
+    produces
+        pure r
+    end
+}
+
+// Everything in the RX FIFO now, as one string ("" when it is empty).
+fn drain(u: device_window(L, (:esp32s3_uart1))) -> string {
+    sequence proc[register_rwr, mem(normal), transport]
+        n: uint32 <- rx_count(u);
+        s: string <- case n == 0 of {
+            true -> "";
+            false -> bytes_of(reverse_into(pop_bytes(u, n, empty[int64, mem(normal)]()), empty[int64, mem(normal)]()))
+        }
+    produces
+        pure s
+    end
+}
+
+// --- pads: GPIO35 as U1TXD, GPIO36 as U1RXD --------------------------------------------------------------
+
+fn route_tx_pad(g: device_window(L, (:esp32s3_gpio))) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        oen_from_enable: uint32 <- board_pack_gpio_values@gpio_func_oen_sel_mask();
+        open_drain: uint32 <- board_pack@gpio_pin_open_drain_bit();
+        one: uint32 <- 1;
+        tx_bit: uint32 <- one shl (board_pack@pin_uart1_tx() band 31);
+        _: atom <- poke(g, :func35_out_sel_cfg, (oen_from_enable bor uart1_signal()) impl Register32 {});
+        pin: uint32 <- peek(g, :pin35) impl Register32 {};
+        _: atom <- poke(g, :pin35, (pin band (bnot open_drain)) impl Register32 {});
+        _: atom <- poke(g, :enable1_w1ts, tx_bit impl Register32 {})
+    produces
+        pure g
+    end
+}
+
+fn route_rx_pad(g: device_window(L, (:esp32s3_gpio))) -> device_window(L, (:esp32s3_gpio)) {
+    sequence proc[register_rwr]
+        through_matrix: uint32 <- board_pack_gpio_values@gpio_sig_in_sel_mask();
+        _: atom <- poke(g, :func15_in_sel_cfg, (through_matrix bor board_pack@pin_uart1_rx()) impl Register32 {})
+    produces
+        pure g
+    end
+}
+
+// IO_MUX: MCU_SEL 1 (the GPIO matrix function), 20 mA drive on the TX pad; MCU_SEL 1, input buffer and
+// pull-up on the RX pad (mux_config's values in device_esp32s3_gpio, for the two pads it does not list).
+fn mux_pads(m: device_window(L, (:esp32s3_io_mux))) -> device_window(L, (:esp32s3_io_mux)) {
+    sequence proc[register_rwr]
+        mcu_sel_mask: uint32 <- board_pack_io_mux_values@io_mux_mcu_sel_mask();
+        drv_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_drv_mask();
+        pu_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_pu_mask();
+        pd_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_pd_mask();
+        ie_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_ie_mask();
+        mcu_gpio: uint32 <- board_pack@io_mux_mcu_sel_gpio();
+        drv_20ma: uint32 <- board_pack@io_mux_fun_drv_20ma();
+        clear: uint32 <- bnot (mcu_sel_mask bor drv_mask bor pu_mask bor pd_mask bor ie_mask);
+        tx_bits: uint32 <- mcu_gpio bor drv_20ma;
+        rx_bits: uint32 <- mcu_gpio bor ie_mask bor pu_mask;
+        tx: uint32 <- peek(m, :gpio35) impl Register32 {};
+        _: atom <- poke(m, :gpio35, ((tx band clear) bor tx_bits) impl Register32 {});
+        rx: uint32 <- peek(m, :gpio36) impl Register32 {};
+        _: atom <- poke(m, :gpio36, ((rx band clear) bor rx_bits) impl Register32 {})
+    produces
+        pure m
+    end
+}
+
+// --- the worker -------------------------------------------------------------------------------------------
+
+// Casts a message to the owner.
+fn tell(owner: actor_ref, msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom)) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast(owner, msg impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+
+// Tells the owner the link is down (design §6.3) and names the exit reason; the behaviour itself ends the
+// worker with stop_self((:explicit, reason)) at the end of the dispatch, since stop_self is admitted only
+// in the behaviour function (E2091).
+fn fail_link(owner: actor_ref, reason: atom) -> atom {
+    _: boolean <- tell(owner, (:link_down, :fault));
+    reason
+}
+
+fn arm_poll(delay_ms: uint64) -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(delay_ms, self(), :poll impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+// The worker's state: :idle before :open; (:open, uart1, gpio, io_mux, system, owner, baud, rx credit,
+// fault) after it, where fault is :ok or the exit reason the dispatch ends with.
+fn fault_of(st: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom)) -> atom {
+    case st of {
+        :idle -> :ok;
+        (:open, _u: device_window(L, (:esp32s3_uart1)), _g: device_window(L, (:esp32s3_gpio)), _m: device_window(L, (:esp32s3_io_mux)), _s: device_window(L, (:esp32s3_system)), _o: actor_ref, _b: int64, _c: int64, fault: atom) -> fault
+    }
+}
+
+// :open from :idle: map the four windows, bring the link up, check it, tell the owner.
+fn open_link(owner: actor_ref, address: string) -> :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) {
+    sequence proc[register_rwr]
+        baud: int64 <- baud_of(address);
+        s: device_window(L, (:esp32s3_system)) <- map_device((:esp32s3_system), 0x600C0000);   // board_pack window 8
+        g: device_window(L, (:esp32s3_gpio)) <- map_device((:esp32s3_gpio), 0x60004000);       // window 1
+        m: device_window(L, (:esp32s3_io_mux)) <- map_device((:esp32s3_io_mux), 0x60009000);   // window 3
+        u: device_window(L, (:esp32s3_uart1)) <- map_device((:esp32s3_uart1), 0x60010000);     // window 12
+        s1: device_window(L, (:esp32s3_system)) <- uart1_clock_on(s);
+        u1: device_window(L, (:esp32s3_uart1)) <- uart_clock_select(u);
+        u2: device_window(L, (:esp32s3_uart1)) <- uart_set_baud(u1, baud);
+        u3: device_window(L, (:esp32s3_uart1)) <- uart_line_8n1(u2);
+        m1: device_window(L, (:esp32s3_io_mux)) <- mux_pads(m);
+        g1: device_window(L, (:esp32s3_gpio)) <- route_tx_pad(g);
+        g2: device_window(L, (:esp32s3_gpio)) <- route_rx_pad(g1);
+        u4: device_window(L, (:esp32s3_uart1)) <- uart_clear_flags(u3);
+        clocked: boolean <- uart_clkdiv_ok(u4, baud);
+        u5: device_window(L, (:esp32s3_uart1)) <- wait_tx_empty(u4, open_wait_polls());
+        idle: boolean <- tx_count(u5) == 0;
+        fault: atom <- case clocked of {
+            false -> fail_link(owner, :link_unavailable);
+            true -> case idle of {
+                false -> fail_link(owner, :link_timeout);
+                true -> {
+                    _: boolean <- tell(owner, (:link_up, link_info(baud)));
+                    _: boolean <- tell(owner, (:tx_credit, credit_grant()));
+                    :ok
+                }
+            }
+        }
+    produces
+        pure (:open, u5, g2, m1, s1, owner, baud, 0, fault)
+    end
+}
+
+// After put_bytes: one credit back when the FIFO is healthy; a byte that found no room in time is a lost
+// link (the :tx in hand fails, the link goes down, the dispatch ends the worker).
+fn tx_outcome(u: device_window(L, (:esp32s3_uart1)), owner: actor_ref) -> atom {
+    sequence proc[register_rwr]
+        ok: boolean <- tx_healthy(u);
+        fault: atom <- case ok of {
+            true -> {
+                _: boolean <- tell(owner, (:tx_credit, 1));
+                :ok
+            };
+            false -> {
+                _: boolean <- tell(owner, (:tx_failed, :link_down));
+                fail_link(owner, :link_lost)
+            }
+        }
+    produces
+        pure fault
+    end
+}
+
+// :tx. Before :open the segment cannot go anywhere: (:tx_failed, :link_down) to the sender.
+fn serve_tx(st: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom), seg: string, from: actor_ref) -> :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) {
+    sequence proc[register_rwr]
+        res: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) <- case st of {
+            :idle -> {
+                _: boolean <- tell(from, (:tx_failed, :link_down));
+                :idle
+            };
+            (:open, u: device_window(L, (:esp32s3_uart1)), g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), owner: actor_ref, baud: int64, credit: int64, _f: atom) -> {
+                u1: device_window(L, (:esp32s3_uart1)) <- put_bytes(u, seg, 0);
+                fault: atom <- tx_outcome(u1, owner);
+                (:open, u1, g, m, s, owner, baud, credit, fault)
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+// (:credit, n): the owner takes n more :rx messages; the first credit after none starts the poll.
+fn serve_credit(st: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom), n: int64) -> :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) {
+    res: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) <- case st of {
+        :idle -> :idle;
+        (:open, u: device_window(L, (:esp32s3_uart1)), g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), owner: actor_ref, baud: int64, credit: int64, fault: atom) -> {
+            total: int64 <- credit + n;
+            _: boolean <- case credit == 0 and total > 0 of {
+                true -> arm_poll(1);
+                false -> true
+            };
+            (:open, u, g, m, s, owner, baud, total, fault)
+        }
+    };
+    res
+}
+
+// :poll with credit: whatever arrived is one :rx (one credit), and the poll is re-armed while credit
+// remains. Returns the credit left.
+fn receive(u: device_window(L, (:esp32s3_uart1)), owner: actor_ref, credit: int64) -> int64 {
+    sequence proc[register_rwr]
+        bytes_in: string <- drain(u);
+        got: boolean <- length_bytes(bytes_in) > 0;
+        _: boolean <- case got of {
+            true -> tell(owner, (:rx, bytes_in));
+            false -> true
+        };
+        remaining: int64 <- case got of { true -> credit - 1; false -> credit };
+        _: boolean <- case remaining > 0 of {
+            true -> arm_poll(20);
+            false -> true
+        }
+    produces
+        pure remaining
+    end
+}
+
+// :poll: an RX overflow or frame error since the last clear is a lost link; otherwise receive.
+fn serve_poll(st: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom)) -> :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) {
+    sequence proc[register_rwr]
+        res: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) <- case st of {
+            :idle -> :idle;
+            (:open, u: device_window(L, (:esp32s3_uart1)), g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), owner: actor_ref, baud: int64, credit: int64, _f: atom) -> case credit > 0 of {
+                false -> (:open, u, g, m, s, owner, baud, credit, :ok);
+                true -> {
+                    faulted: boolean <- rx_faulted(u);
+                    fault: atom <- case faulted of {
+                        true -> fail_link(owner, :link_lost);
+                        false -> :ok
+                    };
+                    left: int64 <- case faulted of {
+                        true -> 0;
+                        false -> receive(u, owner, credit)
+                    };
+                    (:open, u, g, m, s, owner, baud, left, fault)
+                }
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+// :close: (:link_down, :closed) to the owner; the worker is :idle again (the windows are dropped and mapped
+// afresh by the next :open).
+fn serve_close(st: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom)) -> :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) {
+    res: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) <- case st of {
+        :idle -> :idle;
+        (:open, u: device_window(L, (:esp32s3_uart1)), g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), owner: actor_ref, baud: int64, credit: int64, _f: atom) -> {
+            _: boolean <- tell(owner, (:link_down, :closed));
+            :idle
+        }
+    };
+    res
+}
+
+fn uart1_carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom)) -> (:no_reply, :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom)) {
+    sequence proc[register_rwr, concurrency]
+        kind: atom <- msg_kind(msg);
+        next: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) <- case kind of {
+            :open -> case state of {
+                :idle -> open_link(msg_owner(msg, self()), msg_text(msg));
+                _: :idle | (:open, device_window(L, (:esp32s3_uart1)), device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), actor_ref, int64, int64, atom) -> state
+            };
+            :tx -> serve_tx(state, msg_text(msg), msg_owner(msg, self()));
+            :credit -> serve_credit(state, msg_count(msg));
+            :poll -> serve_poll(state);
+            :close -> serve_close(state);
+            _: atom -> state
+        };
+        _: atom <- case fault_of(next) of {
+            :link_unavailable -> stop_self((:explicit, :link_unavailable));
+            :link_timeout -> stop_self((:explicit, :link_timeout));
+            :link_lost -> stop_self((:explicit, :link_lost));
+            _: atom -> :ok
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}

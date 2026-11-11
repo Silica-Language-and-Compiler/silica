@@ -1,0 +1,456 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The carrier declaration of transport_links_design.md §3.3 (specification §16.4.9), at the token level,
+// before the constraint parser sees the unit:
+//
+//     carried_on <name>: (<:kind>) (<:link>, <params>...);
+//
+// 1. Every declaration is read here (name, kind, link tag, instance, parameter text). A declaration
+//    that does not have this shape is a parse error (E1081): the top-level walk would otherwise skip it
+//    silently, and the declaration is read by the compiler only, never at run time.
+// 2. `<name>` where an expression names the carrier (`Carrier@mtu(<name>)`, §3.3) becomes the kind's
+//    atom literal, so the properties resolve to the kind's row (the link narrows nothing in phases A to C,
+//    §7). The declaration itself keeps its name.
+// 3. `spawn_dangerous_carrier(<name>, <policies>...)` (§3.3, specification §16.4.9) becomes the spawn the
+//    target's transport pack spells for the kind on that link, `transport_pack@carrier_spawn`: on a hosted
+//    target `spawn_dangerous(<initial state>, dangerous_<kind>_carrier@carrier, <policies>...)` with the
+//    link's path and baud in the initial state, on the ESP32-S3 `spawn_device(:idle,
+//    <device worker>@<carrier behaviour>, <policies>...)`. The module the spawn names is answered through
+//    `modules`, and parser_runner adds the implicit `use` for it as it does for wire_etf. A declaration
+//    the pack cannot serve is E2410 (the kind is not provided) or E2412 (the link is not provided) here,
+//    where the spawn is; a declaration nothing uses gets the same E2412 from sir_target_verify.
+//
+// The vocabulary checks that depend only on the language (E2413 unknown link, E2414 kind and link do not
+// pair, E2415 instance conflict, E2417 parameter shape) are the type checker's (type_checker_links); the
+// declaration reaches it as a tag-11 declaration (constraint_extract_decls).
+
+use lexer_token_kind;
+use lexer_core;
+use lexer_runner;
+use parser_ast;
+use transport_pack;
+
+export expand/1;
+export reverse_token_list/1;
+
+// ---- small lists --------------------------------------------------------------------------------------
+
+fn nil_strings() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure r
+    end
+}
+
+fn cons_string(h: string, t: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[string, mem(normal)] <- prepend[string, mem(normal)](h, t)
+    produces
+        pure r
+    end
+}
+
+fn strings_have(xs: List[string, mem(normal)], s: string) -> boolean {
+    case xs.is_nil of {
+        true -> false;
+        false -> case xs.head == s of {
+            true -> true;
+            false -> strings_have(xs.tail, s)
+        }
+    }
+}
+
+fn nil_decls() -> List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- empty[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]()
+    produces
+        pure r
+    end
+}
+
+fn cons_decl(h: { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, t: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- prepend[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)](h, t)
+    produces
+        pure r
+    end
+}
+
+fn none_decl() -> { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } } {
+    { name: "", kind: "", link_tag: "", instance: 0, params: "", text: "", location: parser_ast@zero_location() }
+}
+
+fn find_decl(decls: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], name: string) -> { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } } {
+    case decls.is_nil of {
+        true -> none_decl();
+        false -> case decls.head.name == name of {
+            true -> decls.head;
+            false -> find_decl(decls.tail, name)
+        }
+    }
+}
+
+// Tokens arrive from the lexer newest first (EOF at the head); the passes here walk them in source order.
+fn reverse_into(acc: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], xs: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case xs.is_nil of {
+        true -> acc;
+        false -> reverse_into(lexer_runner@cons_token(xs.head, acc), xs.tail)
+    }
+}
+
+fn reverse_token_list(xs: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    reverse_into(lexer_runner@empty_token_list(), xs)
+}
+
+// ---- token access that never touches the head of an empty list -----------------------------------------
+
+fn is_space_lexeme(s: string) -> boolean {
+    s == " " or s == "\t" or s == "\n" or s == "\r"
+}
+
+fn skip_space(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case ts.is_nil of {
+        true -> ts;
+        false -> case is_space_lexeme(ts.head.lexeme) of {
+            true -> skip_space(ts.tail);
+            false -> ts
+        }
+    }
+}
+
+// -1 for the end of the list.
+fn head_kind(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> int64 {
+    case ts.is_nil of {
+        true -> 0 - 1;
+        false -> ts.head.kind
+    }
+}
+
+fn head_lexeme(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> string {
+    case ts.is_nil of {
+        true -> "";
+        false -> ts.head.lexeme
+    }
+}
+
+fn head_loc(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], fallback: { file: string, line: int64, column: int64, offset: int64 }) -> { file: string, line: int64, column: int64, offset: int64 } {
+    case ts.is_nil of {
+        true -> fallback;
+        false -> ts.head.location
+    }
+}
+
+fn rest_of(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case ts.is_nil of {
+        true -> ts;
+        false -> ts.tail
+    }
+}
+
+fn head_is_identifier(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> boolean {
+    case ts.is_nil of {
+        true -> false;
+        false -> lexer_token_kind@is_identifier_lexeme_token(ts.head.kind)
+    }
+}
+
+// ---- text helpers -------------------------------------------------------------------------------------
+
+fn digit_value(c: string) -> int64 {
+    case c of {
+        "0" -> 0;
+        "1" -> 1;
+        "2" -> 2;
+        "3" -> 3;
+        "4" -> 4;
+        "5" -> 5;
+        "6" -> 6;
+        "7" -> 7;
+        "8" -> 8;
+        "9" -> 9;
+        _: string -> 0 - 1
+    }
+}
+
+fn digits_from(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            v: int64 <- digit_value(substring(s, i, i + 1));
+            case v < 0 of {
+                true -> acc;
+                false -> digits_from(s, i + 1, acc * 10 + v)
+            }
+        }
+    }
+}
+
+fn decimal_of(s: string) -> int64 {
+    digits_from(s, 0, 0)
+}
+
+// The atom name of an atom literal token (":tcp" -> "tcp").
+fn atom_name_of(lexeme: string) -> string {
+    case length_bytes(lexeme) > 1 and substring(lexeme, 0, 1) == ":" of {
+        true -> substring(lexeme, 1, length_bytes(lexeme));
+        false -> lexeme
+    }
+}
+
+fn is_literal_or_name(kind: int64) -> boolean {
+    kind == lexer_token_kind@token_kind_integer_literal() or kind == lexer_token_kind@token_kind_string_literal() or kind == lexer_token_kind@token_kind_atom_literal() or kind == lexer_token_kind@token_kind_float_literal() or kind == lexer_token_kind@token_kind_char_literal() or lexer_token_kind@is_identifier_lexeme_token(kind)
+}
+
+fn shape_hint() -> string {
+    "; the form is `carried_on <name>: (<:kind>) (<:link>, <params>...);` (specification §16.4.9)"
+}
+
+fn bad(msg: string, loc: { file: string, line: int64, column: int64, offset: int64 }) -> (boolean, { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], string, { file: string, line: int64, column: int64, offset: int64 }) {
+    (false, none_decl(), lexer_runner@empty_token_list(), msg, loc)
+}
+
+// ---- reading one declaration --------------------------------------------------------------------------
+
+// The parameters after the link tag: `, <literal>` repeated, then `)`. Answers (ok, parameter text with
+// the lexemes joined by ", ", the link text for messages, the instance when the first parameter is an
+// integer, the tokens after `)`, message, location).
+fn read_params(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], params: string, text: string, first: boolean, instance: int64, kw_loc: { file: string, line: int64, column: int64, offset: int64 }) -> (boolean, string, string, int64, List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], string, { file: string, line: int64, column: int64, offset: int64 }) {
+    t0: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(ts);
+    k0: int64 <- head_kind(t0);
+    case k0 < 0 of {
+        true -> (false, params, text, instance, t0, concat("the declaration ends inside its link", shape_hint()), kw_loc);
+        false -> case k0 == lexer_token_kind@token_kind_right_paren() of {
+            true -> (true, params, concat(text, ")"), instance, rest_of(t0), "", kw_loc);
+            false -> case k0 == lexer_token_kind@token_kind_comma() of {
+                false -> (false, params, text, instance, t0, concat(concat("unexpected '", head_lexeme(t0)), concat("' in the link: link parameters are separated by commas", shape_hint())), head_loc(t0, kw_loc));
+                true -> {
+                    t1: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t0));
+                    k1: int64 <- head_kind(t1);
+                    case k1 < 0 of {
+                        true -> (false, params, text, instance, t1, concat("the declaration ends inside its link", shape_hint()), kw_loc);
+                        false -> case is_literal_or_name(k1) of {
+                            false -> (false, params, text, instance, t1, concat(concat("unexpected '", head_lexeme(t1)), concat("' as a link parameter: a parameter is a literal", shape_hint())), head_loc(t1, kw_loc));
+                            true -> {
+                                lx: string <- head_lexeme(t1);
+                                p2: string <- case params == "" of { true -> lx; false -> concat(concat(params, ", "), lx) };
+                                inst2: int64 <- case first and k1 == lexer_token_kind@token_kind_integer_literal() of { true -> decimal_of(lx); false -> instance };
+                                read_params(rest_of(t1), p2, concat(concat(text, ", "), lx), false, inst2, kw_loc)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// After `carried_on`: `<name>: (<:kind>) (<:link>` then read_params then `;`.
+fn read_decl(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], kw_loc: { file: string, line: int64, column: int64, offset: int64 }) -> (boolean, { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], string, { file: string, line: int64, column: int64, offset: int64 }) {
+    t0: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(ts);
+    case head_is_identifier(t0) of {
+        false -> bad(concat("carried_on must be followed by the carrier's name", shape_hint()), kw_loc);
+        true -> {
+            name: string <- head_lexeme(t0);
+            t1: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t0));
+            case head_kind(t1) == lexer_token_kind@token_kind_colon() of {
+                false -> bad(concat(concat("carried_on ", name), concat(": expected ':' after the carrier's name", shape_hint())), kw_loc);
+                true -> {
+                    t2: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t1));
+                    case head_kind(t2) == lexer_token_kind@token_kind_left_paren() of {
+                        false -> bad(concat(concat("carried_on ", name), concat(": expected the carrier kind, (:tcp), (:udp) or (:serial), after ':'", shape_hint())), kw_loc);
+                        true -> {
+                            t3: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t2));
+                            case head_kind(t3) == lexer_token_kind@token_kind_atom_literal() of {
+                                false -> bad(concat(concat("carried_on ", name), concat(": the carrier kind is an atom tag such as (:tcp)", shape_hint())), kw_loc);
+                                true -> {
+                                    kind_name: string <- atom_name_of(head_lexeme(t3));
+                                    t4: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t3));
+                                    case head_kind(t4) == lexer_token_kind@token_kind_right_paren() of {
+                                        false -> bad(concat(concat("carried_on ", name), concat(": the carrier kind takes no parameters: write (:tcp), then the link", shape_hint())), kw_loc);
+                                        true -> {
+                                            t5: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t4));
+                                            case head_kind(t5) == lexer_token_kind@token_kind_left_paren() of {
+                                                false -> bad(concat(concat("carried_on ", name), concat(": expected the link, (<:link>, <params>...), after the kind", shape_hint())), kw_loc);
+                                                true -> {
+                                                    t6: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t5));
+                                                    case head_kind(t6) == lexer_token_kind@token_kind_atom_literal() of {
+                                                        false -> bad(concat(concat("carried_on ", name), concat(": the link begins with its tag, an atom such as (:loopback) or (:uart, 1, 115200)", shape_hint())), kw_loc);
+                                                        true -> {
+                                                            ltag: string <- atom_name_of(head_lexeme(t6));
+                                                            (p_ok: boolean, params: string, link_text: string, instance: int64, t7: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], p_msg: string, p_loc: { file: string, line: int64, column: int64, offset: int64 }) <- read_params(rest_of(t6), "", concat("(", head_lexeme(t6)), true, 0, kw_loc);
+                                                            case p_ok of {
+                                                                false -> bad(concat(concat("carried_on ", name), concat(": ", p_msg)), p_loc);
+                                                                true -> {
+                                                                    t8: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(t7);
+                                                                    case head_kind(t8) == lexer_token_kind@token_kind_semicolon() of {
+                                                                        false -> bad(concat(concat("carried_on ", name), concat(": expected ';' after the link", shape_hint())), kw_loc);
+                                                                        true -> (true, { name: name, kind: kind_name, link_tag: ltag, instance: instance, params: params, text: link_text, location: kw_loc }, rest_of(t8), "", kw_loc)
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], acc: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> (boolean, List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], string, { file: string, line: int64, column: int64, offset: int64 }) {
+    case ts.is_nil of {
+        true -> (true, acc, "", parser_ast@zero_location());
+        false -> case ts.head.kind == lexer_token_kind@token_kind_carried_on_keyword() of {
+            false -> collect(ts.tail, acc);
+            true -> {
+                (ok: boolean, d: { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, rest: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], msg: string, loc: { file: string, line: int64, column: int64, offset: int64 }) <- read_decl(ts.tail, ts.head.location);
+                case ok of {
+                    false -> (false, acc, msg, loc);
+                    true -> collect(rest, cons_decl(d, acc))
+                }
+            }
+        }
+    }
+}
+
+// ---- rewriting ----------------------------------------------------------------------------------------
+
+fn ok_result(tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], mods: List[string, mem(normal)]) -> { is_ok: boolean, tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], modules: List[string, mem(normal)], error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string } {
+    { is_ok: true, tokens: tokens, modules: mods, error_code: "", error_location: parser_ast@zero_location(), error_message: "" }
+}
+
+fn err_result(code: string, loc: { file: string, line: int64, column: int64, offset: int64 }, msg: string) -> { is_ok: boolean, tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], modules: List[string, mem(normal)], error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string } {
+    { is_ok: false, tokens: lexer_runner@empty_token_list(), modules: nil_strings(), error_code: code, error_location: loc, error_message: msg }
+}
+
+// The pack's spawn text, lexed, every token placed at the call's location, pushed onto the reversed
+// accumulator in source order (the EOF the lexer adds is dropped).
+fn push_relocated(src: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], loc: { file: string, line: int64, column: int64, offset: int64 }, acc: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case src.is_nil of {
+        true -> acc;
+        false -> case src.head.kind == lexer_token_kind@token_kind_eof() of {
+            true -> push_relocated(src.tail, loc, acc);
+            false -> push_relocated(src.tail, loc, lexer_runner@cons_token(lexer_core@make_token(src.head.kind, src.head.lexeme, loc), acc))
+        }
+    }
+}
+
+fn spawn_tokens(text: string, loc: { file: string, line: int64, column: int64, offset: int64 }, acc: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    lexed: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- lexer_runner@tokenize(lexer_core@new_lexer(text, loc.file), lexer_runner@empty_token_list());
+    push_relocated(reverse_token_list(lexed), loc, acc)
+}
+
+// Why the pack has no spawn for a declaration: the kind (E2410) or the link (E2412).
+fn not_served_message(d: { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> (string, string) {
+    case transport_pack@provides_carrier(d.kind) of {
+        false -> ("E2410", concat(concat(concat(concat("carried_on ", d.name), ": carrier kind (:"), d.kind), ") is not provided by this emit target: its transport pack does not list it (transport_serialization_design.md §6.0)"));
+        true -> {
+            console: string <- transport_pack@link_console_note(d.link_tag, d.instance);
+            provided_text: string <- concat("; this target provides: ", transport_pack@provided_links());
+            case console == "" of {
+                false -> ("E2412", concat(concat(concat(concat("carried_on ", d.name), ": link "), d.text), concat(console, provided_text)));
+                true -> ("E2412", concat(concat(concat(concat("carried_on ", d.name), ": link "), d.text), concat(" is not provided by this emit target (transport_links_design.md §5.1)", provided_text)))
+            }
+        }
+    }
+}
+
+fn rewrite(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], decls: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], acc: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], mods: List[string, mem(normal)]) -> { is_ok: boolean, tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], modules: List[string, mem(normal)], error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string } {
+    case ts.is_nil of {
+        true -> ok_result(reverse_token_list(acc), mods);
+        false -> case ts.head.kind == lexer_token_kind@token_kind_carried_on_keyword() of {
+            true -> rewrite_declaration_head(ts, decls, acc, mods);
+            false -> case lexer_token_kind@is_identifier_lexeme_token(ts.head.kind) of {
+                false -> rewrite(ts.tail, decls, lexer_runner@cons_token(ts.head, acc), mods);
+                true -> case ts.head.lexeme == "spawn_dangerous_carrier" of {
+                    true -> rewrite_spawn(ts, decls, acc, mods);
+                    false -> {
+                        d: { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- find_decl(decls, ts.head.lexeme);
+                        case d.name == "" of {
+                            true -> rewrite(ts.tail, decls, lexer_runner@cons_token(ts.head, acc), mods);
+                            false -> rewrite(ts.tail, decls, lexer_runner@cons_token(lexer_core@make_token(lexer_token_kind@token_kind_atom_literal(), concat(":", d.kind), ts.head.location), acc), mods)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The declaration keeps its name: the keyword and the name are copied as they are.
+fn rewrite_declaration_head(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], decls: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], acc: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], mods: List[string, mem(normal)]) -> { is_ok: boolean, tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], modules: List[string, mem(normal)], error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string } {
+    after: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(ts.tail);
+    acc1: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- lexer_runner@cons_token(ts.head, acc);
+    case after.is_nil of {
+        true -> rewrite(ts.tail, decls, acc1, mods);
+        false -> rewrite(after.tail, decls, lexer_runner@cons_token(after.head, acc1), mods)
+    }
+}
+
+// `spawn_dangerous_carrier ( <name>` with the head at `spawn_dangerous_carrier`.
+fn rewrite_spawn(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], decls: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], acc: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], mods: List[string, mem(normal)]) -> { is_ok: boolean, tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], modules: List[string, mem(normal)], error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string } {
+    loc: { file: string, line: int64, column: int64, offset: int64 } <- ts.head.location;
+    t1: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(ts.tail);
+    case head_kind(t1) == lexer_token_kind@token_kind_left_paren() of {
+        false -> err_result("E1081", loc, "spawn_dangerous_carrier is a call: spawn_dangerous_carrier(<carried_on name>, <policies>...) (specification §16.4.9)");
+        true -> {
+            t2: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t1));
+            case head_is_identifier(t2) of {
+                false -> err_result("E1081", loc, "spawn_dangerous_carrier's first argument is the name of a carried_on declaration of this module (specification §16.4.9)");
+                true -> {
+                    d: { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- find_decl(decls, head_lexeme(t2));
+                    case d.name == "" of {
+                        true -> err_result("E1081", head_loc(t2, loc), concat(concat("spawn_dangerous_carrier: '", head_lexeme(t2)), "' is not a carried_on declaration of this module (specification §16.4.9)"));
+                        false -> {
+                            spawn_text: string <- transport_pack@carrier_spawn(d.kind, d.link_tag, d.instance, d.params);
+                            case spawn_text == "" of {
+                                true -> {
+                                    (code: string, msg: string) <- not_served_message(d);
+                                    err_result(code, loc, msg)
+                                };
+                                false -> {
+                                    m: string <- transport_pack@carrier_module(d.kind, d.link_tag);
+                                    mods2: List[string, mem(normal)] <- case m == "" or strings_have(mods, m) of { true -> mods; false -> cons_string(m, mods) };
+                                    rewrite(rest_of(t2), decls, spawn_tokens(spawn_text, loc, acc), mods2)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Tokens in source order in, tokens in source order out.
+fn expand(tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> { is_ok: boolean, tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], modules: List[string, mem(normal)], error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string } {
+    (ok: boolean, decls: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], msg: string, loc: { file: string, line: int64, column: int64, offset: int64 }) <- collect(tokens, nil_decls());
+    case ok of {
+        false -> err_result("E1081", loc, msg);
+        // the rewrite runs with no declarations too: a spawn_dangerous_carrier of an undeclared name is E1081
+        true -> rewrite(tokens, decls, lexer_runner@empty_token_list(), nil_strings())
+    }
+}

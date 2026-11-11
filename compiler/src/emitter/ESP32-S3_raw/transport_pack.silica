@@ -16,18 +16,49 @@
 -}
 
 // The transport pack of this emit target (transport_serialization_design.md §6.0): which wire
-// protocol tags and carrier tags this compiler build provides. The language's vocabulary is the
-// union of every target's pack; a program that names a tag this pack does not list is rejected by
-// sir_target_verify with E2410 before anything is emitted. Every emit target carries its own copy
-// at emitter/<TARGET>/transport_pack.silica, read by the shared compiler like pack_descriptions.
+// protocol tags, carrier kinds and links this compiler build provides. The language's vocabulary is
+// the union of every target's pack; a program that names a tag this pack does not list is rejected by
+// the shared compiler (E2410 for a protocol or a carrier kind, E2412 for a link) before anything is
+// emitted. Every emit target carries its own copy at emitter/<TARGET>/transport_pack.silica, read by
+// the shared compiler like pack_descriptions.
+//
 // The board's transport set is decided per board release (design §6.0, §6.4). This release provides
 // ETF: the wire protocol is pure Silica (compiler/stdlib/wire_etf.silica) over the transport builtins,
 // which the emitter lowers (terms/prims/prims_transport.silica) onto the board runtime's
-// rt_transport.S; only the in-memory encode / decode path is provided. No carrier of §6.4 is
-// provided yet (the UART1 carrier worker is phase 4), so every carrier tag is E2410 here.
+// rt_transport.S; only the in-memory encode / decode path is provided. Two carriers of §6.4 are
+// provided, each a device worker speaking the §6.2 carrier contract: (:uart1), the UART1 header (TX
+// GPIO35, RX GPIO36; board_pack pin_uart1_tx / pin_uart1_rx, window 12;
+// board/apps/device_lib/device_esp32s3_uart1.silica; transport_esp32s3_wifi_plan.md stage 1,
+// transport_links_design.md phase B, board plan item N), and (:usb_serial_jtag), the native USB-C jack
+// through the USB-Serial-JTAG controller (window 7, 303A:1001 on the host, device role only;
+// board/apps/device_lib/device_esp32s3_usb_serial_jtag.silica usb_serial_jtag_carrier;
+// transport_esp32s3_wifi_plan.md §8 stage S-A). Their Carrier properties are the §6.4 rows: mtu 0,
+// :stream, :reliable_ordered (compiler/stdlib/Carrier.silica answers them for the tags).
+//
+// In the link vocabulary of transport_links_design.md (stage S-C, 2026-11-09) both are the carrier kind
+// (:serial) on a link: `carried_on host_line: (:serial) (:uart, 1, 115200);` and `carried_on usb:
+// (:serial) (:usb_serial_jtag);`. provides_link lists (:uart, 1) and (:usb_serial_jtag). UART0 is the
+// console (rt_console.S) and is never a link (decision 17: E2412 with the console note); UART2 is a
+// link of decision 17 but has no window in board_pack yet, so it is not provided until it does. The
+// UART1 worker runs 115200 8N1 with a fixed CLKDIV (crystal clock, 347 + 3/16), so link_baud_ok
+// accepts 115200 only for now; the USB-Serial-JTAG controller has no line speed. (:tcp) and (:udp) and
+// the network links wait for phase D (E2410 / E2412 here). The ESP32-S3 board compiles the carrier
+// tags (:uart1) / (:usb_serial_jtag) as well, for programs that read Carrier@mtu((:uart1)) directly.
+//
+// carrier_spawn spells the spawn that `spawn_dangerous_carrier(<name>, <policies>...)` expands to
+// (parser carried_on_expand): on this board the carrier is a device worker reached with spawn_device,
+// so the expansion is `spawn_device(:idle, <worker module>@<carrier behaviour>, <policies>...)` and the
+// result is a device_actor_ref the program casts to with cast_device. The worker module must be in the
+// program's silica.config (the trials and the board apps list device_lib/ and the pack descriptions).
 
 export provides_format/1;
 export provides_carrier/1;
+export provides_link/2;
+export provided_links/0;
+export link_console_note/2;
+export link_baud_ok/2;
+export carrier_spawn/4;
+export carrier_module/2;
 
 fn provides_format(tag: string) -> boolean {
     case tag of {
@@ -38,6 +69,63 @@ fn provides_format(tag: string) -> boolean {
 
 fn provides_carrier(tag: string) -> boolean {
     case tag of {
+        "serial" -> true;
+        "uart1" -> true;
+        "usb_serial_jtag" -> true;
         _: string -> false
+    }
+}
+
+// link: the tag name ("uart"); instance: the instance number (0 where the link has none).
+fn provides_link(link_tag: string, instance: int64) -> boolean {
+    case link_tag of {
+        "uart" -> instance == 1;
+        "usb_serial_jtag" -> true;
+        _: string -> false
+    }
+}
+
+fn provided_links() -> string {
+    "(:uart, 1, baud), (:usb_serial_jtag)"
+}
+
+// Decision 17: UART0 is the console (rt_console.S, the USB-UART jack) and cannot be a link.
+fn link_console_note(link_tag: string, instance: int64) -> string {
+    case link_tag == "uart" and instance == 0 of {
+        true -> " is the console of target ESP32-S3_raw (UART0, the USB-UART jack) and cannot be used as a link";
+        false -> ""
+    }
+}
+
+// The UART1 worker's CLKDIV is fixed for 115200 (device_esp32s3_uart1.silica); the USB-Serial-JTAG
+// controller ignores the host's line speed, so a baud is not a parameter of that link.
+fn link_baud_ok(link_tag: string, baud: int64) -> boolean {
+    case link_tag of {
+        "uart" -> baud == 115200;
+        _: string -> true
+    }
+}
+
+fn carrier_module(kind: string, link_tag: string) -> string {
+    case kind == "serial" of {
+        false -> "";
+        true -> case link_tag of {
+            "uart" -> "device_esp32s3_uart1";
+            "usb_serial_jtag" -> "device_esp32s3_usb_serial_jtag";
+            _: string -> ""
+        }
+    }
+}
+
+// params: the link's parameter lexemes joined by ", " (`1, 115200` for UART1). "" when this board has
+// no carrier for the kind on the link.
+fn carrier_spawn(kind: string, link_tag: string, instance: int64, params: string) -> string {
+    case provides_link(link_tag, instance) and kind == "serial" of {
+        false -> "";
+        true -> case link_tag of {
+            "uart" -> "spawn_device(:idle, device_esp32s3_uart1@uart1_carrier";
+            "usb_serial_jtag" -> "spawn_device(:idle, device_esp32s3_usb_serial_jtag@usb_serial_jtag_carrier";
+            _: string -> ""
+        }
     }
 }

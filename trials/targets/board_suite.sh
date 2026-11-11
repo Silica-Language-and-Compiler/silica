@@ -120,7 +120,7 @@ if [ "${1:-}" = "--fail-one" ]; then
         printf '%s\n' "$m.silica" Supervisor.silica >> "$tmp/silica.config"
     done
     # error_enforcement_addition/Makefile stages WireFormat/Carrier for `use` lines
-    for tr in WireFormat Carrier; do
+    for tr in WireFormat Carrier Link; do
         if grep -q "use $tr;" "$src/$stem.silica"; then
             ln -sfn "$TRIALS_ROOT/../compiler/stdlib/$tr.silica" "$tmp/$tr.silica"
             echo "$tr.silica" >> "$tmp/silica.config"

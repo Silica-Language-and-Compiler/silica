@@ -1,0 +1,113 @@
+// The (:uart1) carrier reached through its link declaration (transport_links_design.md §3.3, example 2;
+// stage S-C of transport_esp32s3_wifi_plan.md §8): `carried_on host_line: (:serial) (:uart, 1, 115200);`
+// names the kind and the UART1 header, spawn_dangerous_carrier(host_line, ...) expands on this board to
+// spawn_device(:idle, device_esp32s3_uart1@uart1_carrier, ...) (the ESP32-S3 transport pack's
+// carrier_spawn), and Carrier@mtu(host_line) / Carrier@boundaries(host_line) are the (:serial) kind's rows.
+// Otherwise the program is device_uart1_carrier_tx: a 204-byte frame, larger than the 128-byte FIFO,
+// sent in one :tx, then close; the board only sends (links design decision 15).
+// Expected (board only; the host emitter rejects the prims with E2220):
+//   link up uart1@115200 / tx credit 8 / sent 204 bytes / link down :closed / status 0.
+// spawn_dangerous_carrier adds this `use` implicitly for the compiler; it is written out because the board
+// image tooling (trials/targets/board_suite.sh link_closure, board/tools) links a program with the modules its
+// source names in `use` lines.
+use device_esp32s3_uart1;
+use wireframe;
+use Carrier;
+use trial_wait_int64;
+
+carried_on host_line: (:serial) (:uart, 1, 115200);
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+// 200 bytes of text: four 50-byte lines.
+fn payload() -> string {
+    line: string <- "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLM\n";
+    concat(concat(line, line), concat(line, line))
+}
+
+fn framed_payload() -> string {
+    segs: List[string, mem(normal)] <- wireframe@frame(payload(), Carrier@mtu(host_line), Carrier@boundaries(host_line));
+    first_segment(segs)
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { car: device_actor_ref, sent: int64 }) -> (:no_reply, { car: device_actor_ref, sent: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("link up ");
+                _: atom <- println(info);
+                seg: string <- framed_payload();
+                _: boolean <- cast_device(state.car, (:tx, seg, self()) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, sent: length_bytes(seg) })
+            end
+        };
+        (:tx_credit, n: int64) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- case n == 1 of {
+                    true -> {
+                        _: atom <- print("sent ");
+                        _: atom <- print_int64(state.sent);
+                        _: atom <- println(" bytes");
+                        _: boolean <- cast_device(state.car, :close impl ActorMessage {});
+                        :ok
+                    };
+                    false -> {
+                        _: atom <- print("tx credit ");
+                        _: atom <- print_int64(n);
+                        println("")
+                    }
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_failed, why: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print("tx failed ");
+                _: atom <- print_atom(why);
+                _: atom <- println("")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:link_down, why2: atom) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- print("link down ");
+                _: atom <- print_atom(why2);
+                _: atom <- println("");
+                _: boolean <- case why2 == :closed of {
+                    true -> cast_exit(0);
+                    false -> cast_exit(1)
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                car: device_actor_ref <- spawn_dangerous_carrier(host_line, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- spawn({ car: car, sent: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast_device(car, (:open, me, "") impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

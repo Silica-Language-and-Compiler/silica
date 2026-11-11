@@ -37,11 +37,57 @@
 // report_timeout). A send wait polls up to 500 times,
 // one spin(40) apart (about 50 ms) per byte, then drops that byte and goes on. The polls are tail
 // calls that return only the window, so no tuple is destructured per poll.
+//
+// The same controller as the (:usb_serial_jtag) transport carrier (transport_serialization_design.md
+// §6.4; transport_esp32s3_wifi_plan.md §8 stage S-A): the second exported behaviour,
+// usb_serial_jtag_carrier/2, speaks the carrier actor contract of design §6.2 to its owner, both
+// directions, over the same register helpers. It is modelled on the UART1 carrier
+// (device_esp32s3_uart1): a program spawns one of the two behaviours for this window, never both.
+//
+// Carrier messages (design §6.2, plus the internal :poll):
+//   (:open, owner, address)   map the window, enable the USB pads (CONF0 USB_PAD_ENABLE, the reset
+//                             default, which rt_board clears only when GPIO19/20 are used as plain
+//                             GPIO), clear the pending flags, discard bytes left in the OUT FIFO, and
+//                             check the link: the SOF frame index (:fram_num) must advance over about
+//                             100 ms, which it does whenever a USB host has the cable (the host sends
+//                             SOFs with the port open or not; the controller is enumerated by the ROM
+//                             and hardware, there is no association step). Then (:link_up,
+//                             "usb_serial_jtag") (with "@<address>" appended when the address is not
+//                             "") and (:tx_credit, 8) to the owner
+//   (:tx, segment, from)      write the segment into the 64-byte IN FIFO byte by byte, waiting for
+//                             SERIAL_IN_EP_DATA_FREE before each, WR_DONE after every 64 bytes and at
+//                             the end; then (:tx_credit, 1) to the owner. Before :open, or after the
+//                             link is down, (:tx_failed, :link_down) to the sender. A packet the host
+//                             has not read keeps the FIFO busy, so a byte waits up to tx_wait_polls
+//                             polls of about 0.1 ms (about 10 s: a host that opens its port late still
+//                             gets the frame; a frame of at most 64 bytes needs no reader at all, it
+//                             sits in the FIFO until the port is opened)
+//   (:credit, n)              the owner takes n more :rx messages; a receive poll starts when n > 0
+//   :poll                     (internal, from send_after) drain the OUT FIFO into one (:rx, bytes)
+//                             while credit remains (at most 256 bytes per poll; the controller accepts
+//                             the next 64-byte OUT packet once the previous one is read out), then
+//                             re-arm: 1 ms after bytes arrived, 20 ms otherwise
+//   :close                    (:link_down, :closed) to the owner; the worker is :idle again (it does
+//                             not end itself: a device worker spawned at the root has no supervisor)
+// Failure atoms (links design §6.3), owner-facing contract first, then stop_self by the behaviour:
+//   (:explicit, :link_unavailable)  no SOF within the check at :open (no host on the USB-C jack, or
+//                                   the PHY is routed to the OTG controller); (:link_down, :fault)
+//   (:explicit, :link_lost)         a TX byte found no FIFO room within the bound (the host stopped
+//                                   reading), or a bus error since :open (INT_RAW PID, CRC5, CRC16 or
+//                                   bit-stuff error: bytes may be corrupt, :reliable_ordered no longer
+//                                   holds); (:tx_failed, :link_down) for the :tx in hand, then
+//                                   (:link_down, :fault)
+// Not detected here: the host dropping DTR (the CDC line state is not visible in this register set)
+// and a USB suspend. The Mac must not toggle DTR/RTS on this port: (DTR, RTS) = (0, 1) resets the
+// chip (item F, usb_console_check.py open_port). There is no line speed: the host's baud setting is
+// ignored by the controller, so the :link_up info names no baud.
 
 use device_esp32s3_usb_serial_jtag_registers;
 use board_pack_usb_serial_jtag_values;
 
 export usb_serial_jtag_worker/2;
+export usb_serial_jtag_carrier/2;
+export link_info/1;
 
 fn byte_of(ch: string) -> uint32 {
     case ch of {
@@ -236,6 +282,442 @@ fn usb_serial_jtag_worker(msg: { op: atom, byte: uint32, text: string, reply_to:
                 :exchange -> (:mapped, exchange(w, msg.text, msg.reply_to));
                 _: atom -> (:mapped, w)
             }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}
+
+// ===== The (:usb_serial_jtag) carrier (design §6.2 contract; see the header) ===========================
+
+// Polls (about 0.1 ms each) a TX byte waits for IN FIFO room: about 10 s, the time a host may take to
+// open its port after the board program started (the Mac peer opens after the RAM load's chip reset).
+fn tx_wait_polls() -> int64 {
+    100000
+}
+
+// Bytes drained per :poll at most (four 64-byte OUT packets).
+fn rx_drain_limit() -> int64 {
+    256
+}
+
+fn credit_grant() -> int64 {
+    8
+}
+
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+fn to_u32(n: int64) -> uint32 {
+    to_uint32(n)
+}
+
+// The :link_up info: "usb_serial_jtag", with "@<address>" when the :open address is not "".
+fn link_info(address: string) -> string {
+    case length_bytes(address) == 0 of {
+        true -> "usb_serial_jtag";
+        false -> concat("usb_serial_jtag@", address)
+    }
+}
+
+fn msg_kind(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> atom {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> :open;
+        (:tx, _s: string, _f: actor_ref) -> :tx;
+        (:credit, _n: int64) -> :credit;
+        :close -> :close;
+        :poll -> :poll
+    }
+}
+
+fn msg_owner(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, fallback: actor_ref) -> actor_ref {
+    case msg of {
+        (:open, o: actor_ref, _a: string) -> o;
+        (:tx, _s: string, f: actor_ref) -> f;
+        (:credit, _n: int64) -> fallback;
+        :close -> fallback;
+        :poll -> fallback
+    }
+}
+
+fn msg_text(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> string {
+    case msg of {
+        (:open, _o: actor_ref, a: string) -> a;
+        (:tx, s: string, _f: actor_ref) -> s;
+        (:credit, _n: int64) -> "";
+        :close -> "";
+        :poll -> ""
+    }
+}
+
+fn msg_count(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> int64 {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> 0;
+        (:tx, _s: string, _f: actor_ref) -> 0;
+        (:credit, n: int64) -> n;
+        :close -> 0;
+        :poll -> 0
+    }
+}
+
+// --- registers --------------------------------------------------------------------------------------------
+
+// True when the IN FIFO can take a byte (one peek of :ep1_conf).
+fn in_free(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> boolean {
+    sequence proc[register_rwr]
+        status: uint32 <- peek(w, :ep1_conf) impl Register32 {};
+        free_mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_serial_in_ep_data_free_mask();
+        free: boolean <- case (status band free_mask) == 0 of { true -> false; false -> true }
+    produces
+        pure free
+    end
+}
+
+// Waits (at most `polls` polls of spin(40), about 0.1 ms) until the IN FIFO has room; returns only the
+// window, the caller asks in_free once more to tell "room" from "timed out".
+fn wait_in_free(w: device_window(L, (:esp32s3_usb_serial_jtag)), polls: int64) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr]
+        status: uint32 <- peek(w, :ep1_conf) impl Register32 {};
+        free_mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_serial_in_ep_data_free_mask();
+        r: device_window(L, (:esp32s3_usb_serial_jtag)) <- case (status band free_mask) == 0 of {
+            true -> case polls == 0 of {
+                true -> w;
+                false -> {
+                    _: int64 <- spin(40);
+                    wait_in_free(w, polls - 1)
+                }
+            };
+            false -> w
+        }
+    produces
+        pure r
+    end
+}
+
+// Writes the segment's bytes from index i on, WR_DONE after every 64th byte written since the last
+// flush and once at the end; stops early when a byte finds no room within the bound. Returns the
+// number of bytes written (the segment's length on success).
+fn put_segment(w: device_window(L, (:esp32s3_usb_serial_jtag)), seg: string, i: int64, since_flush: int64) -> int64 {
+    sequence proc[register_rwr]
+        n: int64 <- case i >= length_bytes(seg) of {
+            true -> {
+                _: device_window(L, (:esp32s3_usb_serial_jtag)) <- case since_flush > 0 of {
+                    true -> flush(w);
+                    false -> w
+                };
+                i
+            };
+            false -> {
+                w1: device_window(L, (:esp32s3_usb_serial_jtag)) <- wait_in_free(w, tx_wait_polls());
+                room: boolean <- in_free(w1);
+                case room of {
+                    false -> i;
+                    true -> {
+                        _: atom <- poke(w1, :ep1, to_u32(at(seg, i)) impl Register32 {});
+                        written: int64 <- since_flush + 1;
+                        case written >= 64 of {
+                            true -> {
+                                _: device_window(L, (:esp32s3_usb_serial_jtag)) <- flush(w1);
+                                put_segment(w1, seg, i + 1, 0)
+                            };
+                            false -> put_segment(w1, seg, i + 1, written)
+                        }
+                    }
+                }
+            }
+        }
+    produces
+        pure n
+    end
+}
+
+// Pops up to `left` received bytes while one is available (newest first; drain reverses it).
+fn pop_available(w: device_window(L, (:esp32s3_usb_serial_jtag)), left: int64, acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[register_rwr, mem(normal)]
+        r: List[int64, mem(normal)] <- case left == 0 of {
+            true -> acc;
+            false -> case byte_ready(w) of {
+                false -> acc;
+                true -> pop_available(w, left - 1, prepend[int64, mem(normal)](to_int64(read_byte(w)), acc))
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+fn reverse_into(xs: List[int64, mem(normal)], acc: List[int64, mem(normal)]) -> List[int64, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[int64, mem(normal)] <- case xs of {
+            []: List[int64, mem(normal)] -> acc;
+            [h: int64, t: List[int64, mem(normal)]] -> reverse_into(t, prepend[int64, mem(normal)](h, acc))
+        }
+    produces
+        pure r
+    end
+}
+
+// Everything available in the OUT FIFO now (up to rx_drain_limit bytes), as one string ("" when none).
+fn drain(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> string {
+    sequence proc[register_rwr, mem(normal), transport]
+        got: List[int64, mem(normal)] <- pop_available(w, rx_drain_limit(), empty[int64, mem(normal)]());
+        n: int64 <- length[int64, mem(normal)](got);
+        s: string <- case n == 0 of {
+            true -> "";
+            false -> bytes_of(reverse_into(got, empty[int64, mem(normal)]()))
+        }
+    produces
+        pure s
+    end
+}
+
+// Reads and discards up to `left` bytes left in the OUT FIFO (at :open, so a stale byte cannot
+// corrupt the first frame).
+fn discard_pending(w: device_window(L, (:esp32s3_usb_serial_jtag)), left: int64) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr]
+        r: device_window(L, (:esp32s3_usb_serial_jtag)) <- case left == 0 of {
+            true -> w;
+            false -> case byte_ready(w) of {
+                false -> w;
+                true -> {
+                    _: uint32 <- read_byte(w);
+                    discard_pending(w, left - 1)
+                }
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+// CONF0 USB_PAD_ENABLE set (idempotent: it is the reset default).
+fn enable_pads(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr]
+        pad: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_usb_pad_enable_mask();
+        conf: uint32 <- peek(w, :conf0) impl Register32 {};
+        _: atom <- poke(w, :conf0, (conf bor pad) impl Register32 {})
+    produces
+        pure w
+    end
+}
+
+// INT_CLR: every pending flag cleared (bits 0..11 of the controller's interrupt set).
+fn clear_flags(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> device_window(L, (:esp32s3_usb_serial_jtag)) {
+    sequence proc[register_rwr]
+        all: uint32 <- 0xFFF;
+        _: atom <- poke(w, :int_clr, all impl Register32 {})
+    produces
+        pure w
+    end
+}
+
+// True when the SOF frame index advanced over about 100 ms: a USB host is on the cable.
+fn sof_running(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> boolean {
+    sequence proc[register_rwr]
+        mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_sof_frame_index_mask();
+        f1: uint32 <- peek(w, :fram_num) impl Register32 {};
+        _: int64 <- spin(40000);
+        f2: uint32 <- peek(w, :fram_num) impl Register32 {}
+    produces
+        pure (f1 band mask) != (f2 band mask)
+    end
+}
+
+// INT_RAW: a PID, CRC5, CRC16 or bit-stuff error since the last clear means bytes may be corrupt.
+fn bus_faulted(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> boolean {
+    sequence proc[register_rwr]
+        raw: uint32 <- peek(w, :int_raw) impl Register32 {};
+        bad: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_pid_err_int_raw_mask() bor board_pack_usb_serial_jtag_values@usb_serial_jtag_crc5_err_int_raw_mask() bor board_pack_usb_serial_jtag_values@usb_serial_jtag_crc16_err_int_raw_mask() bor board_pack_usb_serial_jtag_values@usb_serial_jtag_stuff_err_int_raw_mask()
+    produces
+        pure (raw band bad) != 0
+    end
+}
+
+// --- the carrier worker -----------------------------------------------------------------------------------
+
+// Casts a message to the owner.
+fn tell(owner: actor_ref, msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom)) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast(owner, msg impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// Tells the owner the link is down (design §6.3) and names the exit reason; the behaviour ends the
+// worker with stop_self((:explicit, reason)) at the end of the dispatch (stop_self is admitted only in
+// the behaviour function, E2091).
+fn fail_link(owner: actor_ref, reason: atom) -> atom {
+    _: boolean <- tell(owner, (:link_down, :fault));
+    reason
+}
+
+fn arm_poll(delay_ms: uint64) -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(delay_ms, self(), :poll impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+// The carrier's state: :idle before :open; (:open, window, owner, rx credit, fault) after it, where
+// fault is :ok or the exit reason the dispatch ends with.
+fn fault_of(st: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom)) -> atom {
+    case st of {
+        :idle -> :ok;
+        (:open, _w: device_window(L, (:esp32s3_usb_serial_jtag)), _o: actor_ref, _c: int64, fault: atom) -> fault
+    }
+}
+
+// :open from :idle: map the window, bring the link up, check it, tell the owner.
+fn open_link(owner: actor_ref, address: string) -> :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) {
+    sequence proc[register_rwr]
+        w: device_window(L, (:esp32s3_usb_serial_jtag)) <- map_device((:esp32s3_usb_serial_jtag), 0x60038000); // board_pack window 7
+        w1: device_window(L, (:esp32s3_usb_serial_jtag)) <- enable_pads(w);
+        w2: device_window(L, (:esp32s3_usb_serial_jtag)) <- clear_flags(w1);
+        w3: device_window(L, (:esp32s3_usb_serial_jtag)) <- discard_pending(w2, rx_drain_limit());
+        alive: boolean <- sof_running(w3);
+        fault: atom <- case alive of {
+            false -> fail_link(owner, :link_unavailable);
+            true -> {
+                _: boolean <- tell(owner, (:link_up, link_info(address)));
+                _: boolean <- tell(owner, (:tx_credit, credit_grant()));
+                :ok
+            }
+        }
+    produces
+        pure (:open, w3, owner, 0, fault)
+    end
+}
+
+// :tx. Before :open the segment cannot go anywhere: (:tx_failed, :link_down) to the sender. A byte that
+// found no room in time is a lost link (the :tx in hand fails, the link goes down, the dispatch ends the
+// worker); otherwise one credit back.
+fn serve_tx(st: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom), seg: string, from: actor_ref) -> :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) {
+    sequence proc[register_rwr]
+        res: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) <- case st of {
+            :idle -> {
+                _: boolean <- tell(from, (:tx_failed, :link_down));
+                :idle
+            };
+            (:open, w: device_window(L, (:esp32s3_usb_serial_jtag)), owner: actor_ref, credit: int64, _f: atom) -> {
+                n: int64 <- put_segment(w, seg, 0, 0);
+                fault: atom <- case n >= length_bytes(seg) of {
+                    true -> {
+                        _: boolean <- tell(owner, (:tx_credit, 1));
+                        :ok
+                    };
+                    false -> {
+                        _: boolean <- tell(owner, (:tx_failed, :link_down));
+                        fail_link(owner, :link_lost)
+                    }
+                };
+                (:open, w, owner, credit, fault)
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+// (:credit, n): the owner takes n more :rx messages; the first credit after none starts the poll.
+fn serve_credit(st: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom), n: int64) -> :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) {
+    res: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) <- case st of {
+        :idle -> :idle;
+        (:open, w: device_window(L, (:esp32s3_usb_serial_jtag)), owner: actor_ref, credit: int64, fault: atom) -> {
+            total: int64 <- credit + n;
+            _: boolean <- case credit == 0 and total > 0 of {
+                true -> arm_poll(1);
+                false -> true
+            };
+            (:open, w, owner, total, fault)
+        }
+    };
+    res
+}
+
+// :poll with credit: whatever arrived is one :rx (one credit), and the poll is re-armed while credit
+// remains (sooner after data). Returns the credit left.
+fn receive(w: device_window(L, (:esp32s3_usb_serial_jtag)), owner: actor_ref, credit: int64) -> int64 {
+    sequence proc[register_rwr]
+        bytes_in: string <- drain(w);
+        got: boolean <- length_bytes(bytes_in) > 0;
+        _: boolean <- case got of {
+            true -> tell(owner, (:rx, bytes_in));
+            false -> true
+        };
+        remaining: int64 <- case got of { true -> credit - 1; false -> credit };
+        _: boolean <- case remaining > 0 of {
+            true -> case got of { true -> arm_poll(1); false -> arm_poll(20) };
+            false -> true
+        }
+    produces
+        pure remaining
+    end
+}
+
+// :poll: a bus error since :open is a lost link; otherwise receive.
+fn serve_poll(st: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom)) -> :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) {
+    sequence proc[register_rwr]
+        res: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) <- case st of {
+            :idle -> :idle;
+            (:open, w: device_window(L, (:esp32s3_usb_serial_jtag)), owner: actor_ref, credit: int64, _f: atom) -> case credit > 0 of {
+                false -> (:open, w, owner, credit, :ok);
+                true -> {
+                    faulted: boolean <- bus_faulted(w);
+                    fault: atom <- case faulted of {
+                        true -> fail_link(owner, :link_lost);
+                        false -> :ok
+                    };
+                    left: int64 <- case faulted of {
+                        true -> 0;
+                        false -> receive(w, owner, credit)
+                    };
+                    (:open, w, owner, left, fault)
+                }
+            }
+        }
+    produces
+        pure res
+    end
+}
+
+// :close: (:link_down, :closed) to the owner; the worker is :idle again (the window is mapped afresh by
+// the next :open).
+fn serve_close(st: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom)) -> :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) {
+    res: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) <- case st of {
+        :idle -> :idle;
+        (:open, _w: device_window(L, (:esp32s3_usb_serial_jtag)), owner: actor_ref, _c: int64, _f: atom) -> {
+            _: boolean <- tell(owner, (:link_down, :closed));
+            :idle
+        }
+    };
+    res
+}
+
+fn usb_serial_jtag_carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom)) -> (:no_reply, :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom)) {
+    sequence proc[register_rwr, concurrency]
+        kind: atom <- msg_kind(msg);
+        next: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) <- case kind of {
+            :open -> case state of {
+                :idle -> open_link(msg_owner(msg, self()), msg_text(msg));
+                _: :idle | (:open, device_window(L, (:esp32s3_usb_serial_jtag)), actor_ref, int64, atom) -> state
+            };
+            :tx -> serve_tx(state, msg_text(msg), msg_owner(msg, self()));
+            :credit -> serve_credit(state, msg_count(msg));
+            :poll -> serve_poll(state);
+            :close -> serve_close(state);
+            _: atom -> state
+        };
+        _: atom <- case fault_of(next) of {
+            :link_unavailable -> stop_self((:explicit, :link_unavailable));
+            :link_lost -> stop_self((:explicit, :link_lost));
+            _: atom -> :ok
         }
     produces
         pure (:no_reply, next)

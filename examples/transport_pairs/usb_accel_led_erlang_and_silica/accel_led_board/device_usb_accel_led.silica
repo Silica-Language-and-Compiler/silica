@@ -1,0 +1,405 @@
+// The board end of the accel/LED pair (examples/transport_pairs/usb_accel_led_erlang_and_silica; stage S-D of
+// compiler/design_documents/transport_esp32s3_wifi_plan.md §8): end to end over the native USB-C jack.
+// The board sends a sequence of accelerometer readings as ETF frames, the Mac peer answers each with an LED
+// command decided by the reading, the board drives the LED the command names through the GPIO device worker and
+// prints what it did on UART0 (the console; the carrier's bytes never touch UART0), and after the last reply it
+// sends an end-of-stream frame, (:done, n) with n the number of readings sent, on which both peers end.
+//
+// The readings are SYNTHETIC: a fixed table of four (:accel, { x, y, z, at_ms }) values in `reading/1`. The
+// board's MMA8452Q accelerometer sits on I2C0, and the I2C0 worker is not built (esp32s3_board_peripherals_plan.md
+// item 2), so nothing here reads the sensor. The table stands where the sensor's samples will go.
+//
+// The flow is lockstep, one frame in flight: reading i is encoded with encode((:etf), ...), framed with the
+// carrier's properties (Carrier@mtu(usb) / Carrier@boundaries(usb): mtu 0, :stream, so a 4-byte length prefix)
+// and sent as one :tx; the reply is reassembled from the :rx segments with wireframe@unframe and decoded into
+// (:led, { which, on }); the owner casts the GPIO worker a :write of the LED's pin (1 for on, 0 for off), a :hold
+// of 1000 ticks (about 1 s, so each LED state is easy to see) and then a :notify to the LED printer (level pin * 2 + on), which prints the LED in the worker's message order (so the
+// line appears only after the pad was written) and casts (:driven, level) back to the owner; only then is
+// reading i + 1 sent. Each frame is 46 to 52 bytes, under the USB-Serial-JTAG controller's 64-byte IN FIFO,
+// and the next one waits for the reply, so the FIFO never holds more than one frame and the carrier's credit
+// (8 at :link_up, 1 back per :tx) is never short; the first frame waits in the FIFO until the Mac opens the port.
+// After the fourth LED is driven the owner sends (:done, 4) (15 bytes framed; the peers answer nothing), closes
+// the carrier when that :tx is done (:tx_credit 1), and ends the program after :link_down.
+//
+// The LEDs (PORT_TEST_BOARD_byu_idaho_v4.0_feb26.md, all active high): `which` :red -> GPIO2, :green -> GPIO4,
+// :blue -> GPIO5 (the RGB LED's channels; the netlist's red pin, not the pin sheet's 1), :single -> GPIO6 (LED1,
+// the plain LED, faint). All four are made outputs, off, at the start.
+//
+// The peer's rule (mac_peer/dangerous_accel_led_peer.silica, the Silica (:serial) peer, and
+// mac_peer/accel_led_peer.erl, the Erlang peer behind the serial-to-TCP bridge; both send byte-identical replies):
+// z > 256 -> (:led, { which: :red, on: true }), otherwise (:led, { which: :red, on: false }).
+//
+// Expected console (expected.scout, written from the source and the rule: device apps cannot run on the host,
+// E2220): "link up usb_serial_jtag", then per reading "reading <n> x=.. y=.. z=.. at_ms=..", "sent <bytes> bytes",
+// "led red on|off", "rgb red on|off (gpio2)" (with "tx credit 8" after the first reading line: the owner handles
+// :link_up, which prints and sends reading 1, before the :tx_credit the carrier queued behind it), then
+// "done 4 readings", "sent 15 bytes", "link down :closed", status 0. The frames are 52, 46, 52 and 49 bytes. A term the
+// board cannot decode prints "rejected <why>" and ends with status 2 after the close; a framing error
+// "framing rejected <why>" and status 3; a bring-up failure prints "link down :fault" and ends with status 1.
+// The program waits for each reply as long as run_app.sh's --timeout allows.
+//
+// The carrier is reached through its link declaration (transport_links_design.md §3.3, specification §16.4.9):
+// spawn_dangerous_carrier(usb, ...) expands on this board to spawn_device of the USB-Serial-JTAG worker. Device
+// workers cannot be supervisor children (`flavor` has no :device), so the supervisor's one plain worker spawns
+// the carrier and the GPIO worker.
+use wire_etf;
+// spawn_dangerous_carrier adds this `use` implicitly for the compiler; it is written out because the board
+// image tooling links a program with the modules its source names in `use` lines.
+use device_esp32s3_usb_serial_jtag;
+use device_esp32s3_gpio;
+use wireframe;
+use Carrier;
+use Supervisor;
+
+carried_on usb: (:serial) (:usb_serial_jtag);
+
+impl AppSupervisor for Supervisor;
+
+// How many readings the board sends (the rows of `reading/1`); the Mac peers answer as many.
+fn reading_count() -> int64 {
+    4
+}
+
+// The synthetic readings (no sensor: the I2C0 worker is not built). Row 0 is the §13.4 reading.
+fn reading(i: int64) -> { x: int64, y: int64, z: int64, at_ms: int64 } {
+    case i of {
+        0 -> { x: 1, y: 0 - 2, z: 512, at_ms: 1000 };
+        1 -> { x: 3, y: 1, z: 100, at_ms: 1250 };
+        2 -> { x: 0 - 5, y: 4, z: 300, at_ms: 1500 };
+        _: int64 -> { x: 0, y: 0, z: 0 - 480, at_ms: 1750 }
+    }
+}
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+// Reading i as one framed segment (mtu 0, :stream: the length prefix, never segmented).
+fn reading_segment(i: int64) -> string {
+    sequence proc[mem(normal), transport]
+        r: { x: int64, y: int64, z: int64, at_ms: int64 } <- reading(i);
+        frame: string <- encode((:etf), (:accel, { x: r.x, y: r.y, z: r.z, at_ms: r.at_ms }));
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(usb), Carrier@boundaries(usb));
+        seg: string <- first_segment(segs)
+    produces
+        pure seg
+    end
+}
+
+fn show_reading(i: int64) -> atom {
+    sequence proc[device_io]
+        r: { x: int64, y: int64, z: int64, at_ms: int64 } <- reading(i);
+        _: atom <- print("reading ");
+        _: atom <- print_int64(i + 1);
+        _: atom <- print(" x=");
+        _: atom <- print_int64(r.x);
+        _: atom <- print(" y=");
+        _: atom <- print_int64(r.y);
+        _: atom <- print(" z=");
+        _: atom <- print_int64(r.z);
+        _: atom <- print(" at_ms=");
+        _: atom <- print_int64(r.at_ms);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// Prints reading i and sends it as one :tx; returns the frame's length.
+fn send_reading(car: device_actor_ref, i: int64) -> int64 {
+    sequence proc[concurrency]
+        _: atom <- show_reading(i);
+        seg: string <- reading_segment(i);
+        _: boolean <- cast_device(car, (:tx, seg, self()) impl ActorMessage {})
+    produces
+        pure length_bytes(seg)
+    end
+}
+
+// The end-of-stream frame, (:done, n) with n the readings sent, framed like the readings; returns its length.
+fn done_segment(n: int64) -> string {
+    sequence proc[mem(normal), transport]
+        frame: string <- encode((:etf), (:done, n));
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(usb), Carrier@boundaries(usb));
+        seg: string <- first_segment(segs)
+    produces
+        pure seg
+    end
+}
+
+fn send_done(car: device_actor_ref, n: int64) -> int64 {
+    sequence proc[device_io, concurrency]
+        _: atom <- print("done ");
+        _: atom <- print_int64(n);
+        _: atom <- println(" readings");
+        seg: string <- done_segment(n);
+        _: boolean <- cast_device(car, (:tx, seg, self()) impl ActorMessage {})
+    produces
+        pure length_bytes(seg)
+    end
+}
+
+fn show_led(cmd: { which: :single | :red | :green | :blue, on: boolean }) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("led ");
+        _: atom <- case cmd.which of {
+            :single -> print("single");
+            :red -> print("red");
+            :green -> print("green");
+            :blue -> print("blue")
+        };
+        _: atom <- case cmd.on of {
+            true -> print(" on");
+            false -> print(" off")
+        };
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+// The pin of each LED (board file, all active high): the RGB LED's channels and LED1.
+fn led_pin(which: :single | :red | :green | :blue) -> uint32 {
+    case which of {
+        :red -> 2;
+        :green -> 4;
+        :blue -> 5;
+        :single -> 6
+    }
+}
+
+// Drives the LED a command names: the :write of its pin, a :hold of about 1 s (so each state stays visible
+// before the next reading goes out), then a :notify of pin * 2 + level to the LED printer, which therefore
+// reports only after the worker wrote the pad and held it.
+fn drive_led(gpio: device_actor_ref, lp: actor_ref, cmd: { which: :single | :red | :green | :blue, on: boolean }) -> boolean {
+    sequence proc[concurrency]
+        pin: uint32 <- led_pin(cmd.which);
+        level: uint32 <- case cmd.on of { true -> 1; false -> 0 };
+        _: boolean <- cast_device(gpio, { op: :write, pin: pin, level: level, reply_to: lp } impl ActorMessage {});
+        // hold the new state about a second (1000 ticks of the worker's :hold busy-wait) so it is easy to see
+        _: boolean <- cast_device(gpio, { op: :hold, pin: 0, level: 1000, reply_to: lp } impl ActorMessage {});
+        sent: boolean <- cast_device(gpio, { op: :notify, pin: pin, level: pin * 2 + level, reply_to: lp } impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// One complete frame from the peer: decode it, print it, drive the LED. Returns the exit code so far (4: waiting
+// for the rest of the readings; 2: rejected, and the carrier is closed).
+fn take_frame(state: { car: device_actor_ref, gpio: device_actor_ref, lp: actor_ref, rx: { mode: atom, expected: int64, pending: string }, idx: int64, sent: int64, code: int64 }, frame0: string) -> int64 {
+    sequence proc[mem(normal), device_io, concurrency, transport]
+        decoded: (:ok, (:led, { which: :single | :red | :green | :blue, on: boolean })) | (:rejected, atom) <- decode((:etf), frame0);
+        code: int64 <- case decoded of {
+            (:ok, (:led, cmd: { which: :single | :red | :green | :blue, on: boolean })) -> {
+                _: atom <- show_led(cmd);
+                _: boolean <- drive_led(state.gpio, state.lp, cmd);
+                state.code
+            };
+            (:rejected, why: atom) -> {
+                _: atom <- print("rejected ");
+                _: atom <- print_atom(why);
+                _: atom <- println("");
+                _: boolean <- cast_device(state.car, :close impl ActorMessage {});
+                2
+            }
+        }
+    produces
+        pure code
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:driven, uint32),
+         state: { car: device_actor_ref, gpio: device_actor_ref, lp: actor_ref, rx: { mode: atom, expected: int64, pending: string }, idx: int64, sent: int64, code: int64 })
+    -> (:no_reply, { car: device_actor_ref, gpio: device_actor_ref, lp: actor_ref, rx: { mode: atom, expected: int64, pending: string }, idx: int64, sent: int64, code: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("link up ");
+                _: atom <- println(info);
+                _: boolean <- cast_device(state.car, (:credit, 4) impl ActorMessage {});
+                n: int64 <- send_reading(state.car, 0)
+            produces
+                pure (:no_reply, { car: state.car, gpio: state.gpio, lp: state.lp, rx: state.rx, idx: 0, sent: n, code: state.code })
+            end
+        };
+        (:tx_credit, n: int64) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- case n == 1 of {
+                    true -> {
+                        _: atom <- print("sent ");
+                        _: atom <- print_int64(state.sent);
+                        _: atom <- println(" bytes");
+                        // the (:done, n) frame left: close
+                        _: boolean <- case state.idx >= reading_count() of {
+                            true -> cast_device(state.car, :close impl ActorMessage {});
+                            false -> false
+                        };
+                        :ok
+                    };
+                    false -> {
+                        _: atom <- print("tx credit ");
+                        _: atom <- print_int64(n);
+                        println("")
+                    }
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, segment: string) -> {
+            sequence proc[concurrency]
+                un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(state.rx, segment, 4096);
+                code2: int64 <- case un of {
+                    (:more, _r0: { mode: atom, expected: int64, pending: string }) -> state.code;
+                    (:frame, frame0: string, _r3: { mode: atom, expected: int64, pending: string }) -> take_frame(state, frame0);
+                    (:rejected, _why1: atom) -> 3
+                };
+                rx2: { mode: atom, expected: int64, pending: string } <- case un of {
+                    (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
+                    (:frame, _frame: string, r2: { mode: atom, expected: int64, pending: string }) -> r2;
+                    (:rejected, why2: atom) -> {
+                        sequence proc[device_io, concurrency]
+                            _: atom <- print("framing rejected ");
+                            _: atom <- print_atom(why2);
+                            _: atom <- println("");
+                            _: boolean <- cast_device(state.car, :close impl ActorMessage {})
+                        produces pure state.rx end
+                    }
+                };
+                _: boolean <- cast_device(state.car, (:credit, 1) impl ActorMessage {})
+            produces
+                pure (:no_reply, { car: state.car, gpio: state.gpio, lp: state.lp, rx: rx2, idx: state.idx, sent: state.sent, code: code2 })
+            end
+        };
+        // The LED now shows reply idx: send the next reading, or (:done, n) after the last one.
+        (:driven, _level: uint32) -> {
+            next: int64 <- state.idx + 1;
+            more: boolean <- next < reading_count();
+            n: int64 <- case more of {
+                true -> send_reading(state.car, next);
+                false -> send_done(state.car, next)
+            };
+            code3: int64 <- case more of { true -> state.code; false -> 0 };
+            (:no_reply, { car: state.car, gpio: state.gpio, lp: state.lp, rx: state.rx, idx: next, sent: n, code: code3 })
+        };
+        (:tx_failed, why3: atom) -> {
+            sequence proc[device_io]
+                _: atom <- print("tx failed ");
+                _: atom <- print_atom(why3);
+                _: atom <- println("")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:link_down, why4: atom) -> {
+            sequence proc[device_io, concurrency]
+                _: atom <- print("link down ");
+                _: atom <- print_atom(why4);
+                _: atom <- println("");
+                _: boolean <- case why4 == :closed of {
+                    true -> cast_exit(state.code);
+                    false -> cast_exit(1)
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+// The GPIO worker's :notify casts pin * 2 + the level it just wrote; print the LED and let the owner go on.
+fn led_printer(level: uint32, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        pin: uint32 <- level / 2;
+        _: atom <- case pin of {
+            2 -> print("rgb red");
+            4 -> print("rgb green");
+            5 -> print("rgb blue");
+            _: uint32 -> print("led1")
+        };
+        _: atom <- case level - pin * 2 == 0 of { true -> print(" off (gpio"); false -> print(" on (gpio") };
+        _: atom <- print_uint32(pin);
+        _: atom <- println(")");
+        _: boolean <- cast_registered(:accel_owner, (:driven, level) impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// The app's work, run by the supervisor's one worker: spawn the LED printer, the GPIO worker (the four LED pins made
+// outputs, off), the carrier worker and the owner, then open the link.
+fn app_worker(msg: atom, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        lp: actor_ref <- spawn(0, led_printer, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        gpio: device_actor_ref <- spawn_device(:unmapped, device_esp32s3_gpio@gpio_worker, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_device(gpio, { op: :init, pin: 0, level: 0, reply_to: lp } impl ActorMessage {});
+        _: boolean <- cast_device(gpio, { op: :output, pin: 2, level: 0, reply_to: lp } impl ActorMessage {});
+        _: boolean <- cast_device(gpio, { op: :output, pin: 4, level: 0, reply_to: lp } impl ActorMessage {});
+        _: boolean <- cast_device(gpio, { op: :output, pin: 5, level: 0, reply_to: lp } impl ActorMessage {});
+        _: boolean <- cast_device(gpio, { op: :output, pin: 6, level: 0, reply_to: lp } impl ActorMessage {});
+        car: device_actor_ref <- spawn_dangerous_carrier(usb, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        me: actor_ref <- spawn_registered({ car: car, gpio: gpio, lp: lp, rx: wireframe@fresh(Carrier@boundaries(usb)), idx: 0, sent: 0, code: 4 }, owner, :accel_owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_device(car, (:open, me, "") impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 1 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)] <- [
+            { id: :app_worker, agent_type: :worker, initial_state: initial_state, behavior: app_worker, restart: :transient, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_registered(:app_worker, (:start) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}
