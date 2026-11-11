@@ -22,7 +22,8 @@ carried_on phone: (:ble_gatt) (:bluetooth, 0);
 - **Codec:** ETF, `(:etf)`, with `wireframe` between `encode` and the carrier, as in the serial demos.
 - **On the board, the Bluetooth host is written in Silica**, as actors, above Espressif's closed controller (§2).
 - **Demo:** the accelerometer frame and the LED reply of `silica_33_transport_usb_serial_jtag_etf`, over BLE, between
-  the board and the Mac, and board to board.
+  the board and the Mac.
+- **Hardware:** one board. Its peers are the Mac and a phone.
 
 ## 2. Design
 
@@ -58,7 +59,7 @@ environment it was written for:
 - **HCI is the boundary.** ESP-IDF hands HCI packets to the application through its virtual HCI calls *(the
   configuration for the ESP32-S3 is unverified)*. They are foreign code, reached through Fifi.
 - **AtomVM's ESP32 port is the model**: an actor runtime started by ESP-IDF, with its schedulers as tasks and radio
-  events delivered as messages. It is open source, and an AtomVM image already runs on the second board.
+  events delivered as messages. It is open source.
 
 ### 2.2 The actors above HCI
 
@@ -136,7 +137,7 @@ unrun, so its result serves both plans.
   2. Does a Silica program send an HCI Reset through the virtual HCI calls and receive the Command Complete event?
   3. What do ESP-IDF and the controller cost in flash and RAM, and what is left for the program?
   4. How is an image of the new target built, flashed and trialled?
-- Throwaway code, as stage 1 was. Hardware: the second ESP32-S3 board.
+- Throwaway code, as stage 1 was. Hardware: the board.
 - **Closes when:** a Silica program on the board prints the controller's answer to an HCI Reset, or the reason it
   cannot is written into §6. If it cannot, the plan stops there and is reconsidered with what the spike found; no
   other route is started without that.
@@ -165,10 +166,10 @@ unrun, so its result serves both plans.
   command; both ends Silica. This is also the first run of the Mac carrier's central role against a real peripheral.
 - **Closes when:** the demo runs by script with only the `carried_on` line differing from the USB-Serial-JTAG demo.
 
-### Stage 8. Central role on the board; board to board
+### Stage 8. Central role on the board
 
 - The host's central side: scan, connect, discover the service, subscribe, write.
-- **Closes when:** two ESP32-S3 boards exchange the frame, one in each role.
+- **Closes when:** the board as central and the Mac as peripheral exchange the frame.
 
 ### Stage 9. Hardening, Linux and docs
 
