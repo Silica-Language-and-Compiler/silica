@@ -500,7 +500,7 @@ way down" (§4.6) made concrete. All messages are cast-only (`:no_reply`), as de
 
 | Direction | Message | Meaning |
 | --- | --- | --- |
-| program to carrier | `(:open, owner: actor_ref, address: string)` | bind or connect; `address` is carrier-specific text (`"10.0.0.2:4369"`, `"listen:4369"` to listen, `""` for a UART, a characteristic UUID for BLE). On a connection a listener accepted (next table) `address` is ignored: the peer is already there, and the sender becomes the connection's owner |
+| program to carrier | `(:open, owner: actor_ref, address: string)` | bind or connect; `address` is carrier-specific text (`"10.0.0.2:4369"`, `"listen:4369"` to listen on 127.0.0.1, `"listen:any:4369"` to listen on every interface, `""` for a UART, a characteristic UUID for BLE). On a connection a listener accepted (next table) `address` is ignored: the peer is already there, and the sender becomes the connection's owner |
 | program to carrier | `(:tx, segment: string, from: actor_ref)` | send one segment; consumes one send credit |
 | program to carrier | `(:credit, n: uint32)` | the owner will accept n more `:rx` messages |
 | program to carrier | `(:close)` | orderly close; the carrier ends after `:link_down` |
@@ -516,7 +516,8 @@ sender is mailbox order. Failure is the carrier actor exiting with a reason, han
 supervisors like any actor; a program that needs the link back restarts the carrier under its supervisor.
 
 **Listeners.** A carrier whose `addressing` is `:endpoint` and whose `boundaries` are `:stream` may be opened to
-listen instead of connect (`(:tcp)`: `"listen:<port>"`). A listener carries no bytes itself: it answers
+listen instead of connect (`(:tcp)`: `"listen:<port>"` binds 127.0.0.1 only; `"listen:any:<port>"` binds every IPv4
+interface, 0.0.0.0, and is otherwise the same). A listener carries no bytes itself: it answers
 `(:link_up, info)` once bound, and for every peer it accepts it spawns **one connection carrier** holding that
 peer, a carrier actor like any other, and tells its owner about it. The owner decides who owns each connection
 by opening it, the way `gen_tcp:controlling_process/2` hands an accepted socket to the process that will read
@@ -543,11 +544,13 @@ not list the same rows (BLE on a headless server, for instance).
 
 | Tag | Provided by | `mtu` | `boundaries` | `delivery` | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor (`"listen:<port>"`) spawns one per accepted peer and announces it with `(:accepted, conn, info)` (§6.2) |
+| `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor (`"listen:<port>"` on 127.0.0.1, `"listen:any:<port>"` on 0.0.0.0, the explicit wildcard until interface binding exists, §6.7) spawns one per accepted peer and announces it with `(:accepted, conn, info)` (§6.2). **Plain TCP: no authentication, no encryption, no peer identity** (see the security note under this table) |
 | `(:udp)` | the same wrappers | 65507 | `:datagram` | `:unreliable` | an endpoint actor per bound port |
 | `(:serial)` | a dangerous actor over a Fifi wrapper of the host's serial port (termios on macOS and Linux) | 0 | `:stream` | `:reliable_ordered` | the port and line speed come from the carrier's declaration, `carried_on <name>: (:serial) (:serial_port, "/dev/cu.usbmodem101", 115200);` (§6.7; `spawn_dangerous_carrier(<name>, ...)` puts them in the initial state and `:open`'s `address` is `""`); an `address` `"path@baud"` still names a port directly. This is the host end of the board's USB-UART, USB-Serial-JTAG and USB CDC carriers, so a Mac and the board exchange frames Silica to Silica with no Erlang in between. The wrapper does not flush the port's input at open, which this path needs (§14, board carrier notes) |
 | `(:ble_gatt)` | a dangerous actor over a Fifi wrapper of the host's Bluetooth stack (CoreBluetooth on macOS, BlueZ D-Bus on Linux) | negotiated ATT_MTU minus 3 (20 by default, up to 244 after MTU exchange; a characteristic value is at most 512 bytes) | `:datagram` | `:ordered_lossy` for notifications, `:reliable_ordered` for indications and writes with response | `address` is a characteristic UUID; `:link_up` carries the negotiated MTU |
 | `(:unix_dgram)` | later, if [IPC_OS.md](IPC_OS.md) is ever built | per OS | `:datagram` | `:reliable_ordered` | cross-process actors on one host |
+
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated). The `"listen:any:<port>"` form and direct (non-loopback) TCP are the prerequisite BEES milestone N1 (non-loopback addresses) needs.
 
 Hosted carriers are all Fifi, as specification §20.4 requires; the bytes they deliver are external-danger-touched,
 so the owner's `decode` runs in the FFI result-cast handler and is the de-taint point (§4.5).
@@ -857,6 +860,8 @@ transport pack (§6.0), with E2410 for anything else. The tables of §6.3 and §
 A hosted Silica program streams accelerometer readings to an Erlang shell over TCP as ETF, and accepts LED
 commands from it. The same owner actor runs on the board over UART1 with a two-line change (§13.5).
 
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
+
 ### 13.1 The shared vocabulary
 
 ```silica
@@ -1149,7 +1154,9 @@ with phase 2.
 - The carriers are library FFI workers: `dangerous_tcp_carrier`, `dangerous_udp_carrier` and
   `dangerous_serial_carrier`, each one exported cast-only behaviour `carrier/2` that a program installs
   with `spawn_dangerous` and opens with `(:open, owner, address)`: `"host:port"` connects, `"listen:port"`
-  listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound),
+  listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"`
+  listens on every IPv4 interface (2026-11-10, `silica_sockets_tcp_listen_any`; trial
+  `transport_addition/app_transport_tcp_listen_any`),
   `"host:port@local"` for a UDP endpoint, `"path@baud"` for a serial port. The contract of §6.2 is
   spoken as written, with `int64` counts; a carrier polls its descriptor between mailbox messages with a
   20 ms timeout and delivers `:rx` only against the owner's `:credit`. Because the language allows a
@@ -1247,11 +1254,27 @@ real board with both Mac peers. They bind later work on any serial-like carrier.
   `carrier_spawn` texts, `spawn_dangerous_carrier`, E1081 and E2412 to E2415 and E2417, and the `Carrier.silica` rows
   for `(:uart1)` and `(:usb_serial_jtag)` (`provides` true, `addressing` `:none`). `Carrier.silica` is a Linux golden
   of `trials/ffi_addition/app_transport_tcp_loopback` (`Carrier.linux_aarch64.ascomp`, `Carrier.linux_x86_64.ascomp`),
-  so those two goldens are stale until regenerated on a Linux host. The serial carrier's state gained `path` and
+  so those two goldens are stale until regenerated on a Linux host. (The x86-64 ones were regenerated on 2026-11-10;
+  see the Linux x86-64 entry below.) The serial carrier's state gained `path` and
   `baud` (the declared port; `:open` with `""`), and the loopback apps were copied onto declarations as
   `transport_addition/app_transport_tcp_loopback_link` (the originals keep their Linux goldens). Still not done: the
   `(:uart0)` carrier (the console shares UART0), UART2, the hosted interface binding for `(:interface, name)`,
   `(:ethernet, n)` and `(:wifi, n)`.
+- **Linux x86-64, 2026-11-10.**
+  - **Compiler.** silica-999958-linux-x86_64 is built from this tree on a Linux x86-64 host (16 GB RAM). Its
+    `linux_x86_64/transport_pack.silica` has the Mac's carrier and link rows (links design §5.1), so it accepts
+    `carried_on`.
+  - **Trials.** The whole linux_x86_64 trial tree ran with it, and no result is worse than with silica-999959. The
+    hosted transport apps (`app_transport_tcp_loopback`, `_link`, `_listener` and `_listen_any`) print their
+    `.scout` output there.
+  - **Goldens.** Their `.linux_x86_64.ascomp` goldens were refreshed from that run: 8 changed, plus 22 new for the
+    `transport_addition` apps and for `transport_carrier_tags` and `transport_link_tags`.
+  - **Still stale.** Seven `transport_addition` single-file goldens (`transport_any_mem_kind`,
+    `transport_derived_case_label_collision`, `transport_etf_list_sum`, `transport_etf_record`,
+    `transport_etf_recursive`, `transport_etf_rejections` and `transport_etf_scalars`) and two
+    `recursive_function_addition` ackermann goldens. silica-999959 emits the same bytes for them as the new compiler,
+    so they were stale before.
+  - **Linux AArch64.** Its goldens were not touched.
 - **Done 2026-11-10 (stage S-D):** end to end over the native USB-C jack, as the examples in `examples/transport_pairs/`
   (one directory per board/Mac pair, each with a `run.sh` that checks both ends; `run_all.sh` runs them all).
   - In `usb_accel_led_erlang_and_silica`, the board sends four accelerometer readings, `(:accel, { x, y, z, at_ms })`

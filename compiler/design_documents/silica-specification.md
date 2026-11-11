@@ -10650,7 +10650,7 @@ mailbox order. Failure is the carrier actor exiting with a reason, handled by li
 like any actor. The bytes a hosted carrier delivers are external-danger-touched, so the owner's `decode` runs
 in the handler that receives them, where §16.4.4 permits it.
 
-A carrier opened to listen (`"listen:<port>"` on `:tcp`) carries no bytes itself: it answers `:link_up` once
+A carrier opened to listen (`"listen:<port>"` on `:tcp`, or `"listen:any:<port>"` to bind every interface) carries no bytes itself: it answers `:link_up` once
 bound and `(:accepted, conn, info)` for every peer, each in a connection carrier of its own, so a program that
 serves many peers gives each connection an owner of its own. `:close` to a listener closes the listening
 socket only; the connections it spawned live on.
@@ -10659,7 +10659,7 @@ socket only; the connections it spawned live on.
 
 | Tag | Module and behaviour | `address` | `mtu` | `boundaries` | `delivery` |
 | --- | --- | --- | --- | --- | --- |
-| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound) and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
+| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"` the same on every IPv4 interface (0.0.0.0), and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
 | `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx`, and the local port to bind (`:link_up` carries `"port:<n>"`) | 65507 | `:datagram` | `:unreliable` |
 | `:serial` | `dangerous_serial_carrier@carrier` | `""` when the port is declared (`carried_on ... (:serial_port, path, baud)`, §16.4.9), else `"path@baud"`; raw 8N1; `:link_up` carries `"path@baud"` | 0 | `:stream` | `:reliable_ordered` |
 
@@ -10669,6 +10669,8 @@ a program that declares the carrier with `carried_on` installs it with `spawn_da
 compiler writes the literal (§16.4.9). The
 socket wrappers behind the hosted carriers are the dangerous module `dangerous_sockets` over
 `libsilica_sockets.a`, shipped with the compiler under `compiler/stdlib/net/`.
+
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
 
 #### 16.4.9 Carrier links
 

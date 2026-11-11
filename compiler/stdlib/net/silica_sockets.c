@@ -120,7 +120,7 @@ silica_sockets_tagged silica_sockets_tcp_connect(const uint8_t *host_ptr, uint64
     return ok(fd);
 }
 
-silica_sockets_tagged silica_sockets_tcp_listen(int64_t port) {
+static silica_sockets_tagged tcp_listen_on(int64_t port, uint32_t host_order_addr) {
     struct sockaddr_in addr;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return err();
@@ -129,10 +129,23 @@ silica_sockets_tagged silica_sockets_tcp_listen(int64_t port) {
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl(host_order_addr);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { int e = errno; close(fd); errno = e; return err(); }
     if (listen(fd, 16) < 0) { int e = errno; close(fd); errno = e; return err(); }
     return ok(fd);
+}
+
+/* Binds 127.0.0.1:port only: the default listener, reachable from this host alone. */
+silica_sockets_tagged silica_sockets_tcp_listen(int64_t port) {
+    return tcp_listen_on(port, INADDR_LOOPBACK);
+}
+
+/* Binds every IPv4 interface (INADDR_ANY, 0.0.0.0:port): the explicit wildcard form a program asks for with
+   the carrier address "listen:any:<port>", until interface binding ((:interface, name), links design) exists.
+   Plain TCP with no authentication: anyone who can reach the port can connect, so the host's firewall is the
+   only protection. */
+silica_sockets_tagged silica_sockets_tcp_listen_any(int64_t port) {
+    return tcp_listen_on(port, INADDR_ANY);
 }
 
 /* The port a listener was given 0 for: the one the system chose. */
