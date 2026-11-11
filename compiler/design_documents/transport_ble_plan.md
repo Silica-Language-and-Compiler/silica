@@ -31,7 +31,7 @@ Bluetooth has two halves that meet at a standard interface, the Host Controller 
 owns the radio and the link timing. The **host** owns connections, services and characteristics (GAP, L2CAP, ATT and
 GATT).
 
-| Layer | On the Mac (built, stage 3) | On the ESP32-S3 board (stages 4 to 8) |
+| Layer | On the Mac (built, stage 3) | On the ESP32-S3 board (stages 4 to 9) |
 | --- | --- | --- |
 | Program | casts to the carrier, receives from it | the same program |
 | Carrier, the owner-facing end | `dangerous_ble_gatt_carrier`, a dangerous actor | an actor with the same messages |
@@ -76,7 +76,7 @@ environment it was written for:
 These are not built by any stage here, and no stage's code should lean toward them.
 
 - **Silica owning the chip with the controller as its guest** (the Wi-Fi plan's R1). The Silica host would not
-  change, because it speaks HCI either way. It is a possible later project, considered only once stage 8 has closed.
+  change, because it speaks HCI either way. It is a possible later project, considered only once stage 9 has closed.
 - **A second chip as a modem.** Dropped.
 - **Espressif's own Bluetooth host, or any host in C, on the board.** The host is Silica from the start.
 - **A controller written in Silica.** Not possible: the radio hardware is undocumented.
@@ -142,15 +142,38 @@ unrun, so its result serves both plans.
   cannot is written into §6. If it cannot, the plan stops there and is reconsidered with what the spike found; no
   other route is started without that.
 
-### Stage 5. The new target, and HCI as an actor
+### Stage 5. The guest target, made sound
 
-- The new target in the compiler and the board tools, in place of the spike's throwaway code: its pack, its
-  start-up and memory pieces, its image build, and the existing board trials run on it.
+The new target of §2.1 in the compiler and the board tools, in place of the spike's throwaway code, with what
+stage 4 found settled (§6, stage 4):
+
+- The target itself: its pack, its start-up and memory pieces, its image build and flash, its place in the board
+  trial driver.
+- **A fault in an actor ends that actor, not the program**, as on `ESP32-S3_raw`: Silica's fault handling is
+  reached from ESP-IDF's exception path.
+- **A scheduler with nothing to do blocks** until there is work, so FreeRTOS's idle tasks run and the watchdog's
+  idle check stays on.
+- **Silica's code runs from flash**, as ESP-IDF's does: the runtime's read of a marker through the data-bus alias
+  of a function's address is replaced.
+- **The stack reserve is derived**, not guessed: what an interrupt needs on the stack that is running, added to
+  what the bare-metal build measures.
+- The stack guards and the runtime's spinlocks under interrupts: a guard hit is Silica's fault report; a lock is
+  not held across a pause.
+- **A foreign call can answer a record on the board**, so the board's wrappers use the hosted wrappers'
+  `{ tag, value, error_code }`.
+- **One ESP-IDF version is chosen** for the target and for the board scripts, and this machine's tools match it.
+  The four `.esp32_s3.ascomp` goldens left stale in stage 3 are refreshed by a bare-metal board run.
+- **Closes when:** the existing board trials pass on the new target; a trial shows an actor's fault ending only
+  that actor; the bare-metal board trials still pass on `ESP32-S3_raw`.
+
+### Stage 6. HCI as an actor; the board advertises
+
 - The HCI actor (§2.2) over the virtual HCI calls, through a Fifi wrapper.
 - The host's first piece in Silica: set the advertising data and start advertising.
-- **Closes when:** a phone's scanner shows the board advertising the service.
+- **Closes when:** a phone's scanner shows the board advertising the service, and goes on showing it while a
+  Silica program keeps both cores busy.
 
-### Stage 6. The board carrier, peripheral role
+### Stage 7. The board carrier, peripheral role
 
 - The Silica host, the least that one service needs: accept a connection, the MTU exchange, an attribute table with
   the service and its two characteristics, writes with response in, indications out, disconnection.
@@ -158,33 +181,36 @@ unrun, so its result serves both plans.
   (compile-time, assembly, diagnostics and one direction, §8 decision 7).
 - No pairing and no encryption (§8, decision 4).
 - **Closes when:** a board program compiles with `carried_on phone: (:ble_gatt) (:bluetooth, 0);` and exchanges a
-  segmented frame with a phone.
+  segmented frame with a phone, the connection held while a Silica program keeps both cores busy.
 
-### Stage 7. End to end: Mac and board
+### Stage 8. End to end: Mac and board
 
 - The Mac as central, the board as peripheral: the board sends accelerometer readings, the Mac replies with an LED
   command; both ends Silica. This is also the first run of the Mac carrier's central role against a real peripheral.
 - **Closes when:** the demo runs by script with only the `carried_on` line differing from the USB-Serial-JTAG demo.
 
-### Stage 8. Central role on the board
+### Stage 9. Central role on the board
 
 - The host's central side: scan, connect, discover the service, subscribe, write.
 - **Closes when:** the board as central and the Mac as peripheral exchange the frame.
 
-### Stage 9. Hardening, Linux and docs
+### Stage 10. Hardening, Linux and docs
 
-- Pairing and encryption; reconnect; a soak; `frame_seq` if more than one frame is ever in flight.
+- Pairing and encryption; `frame_seq` if more than one frame is ever in flight.
+- On both carriers: reconnect; a soak; more than one session at a time; a link lost in the middle of a frame; the
+  `:timeout` reason.
 - BlueZ wrapper and the Linux pack rows in lock-step with the stale Linux goldens of the Wi-Fi plan's stage S-C.
 - The transport design §6.3 to §6.5 and §10, the links design §3.1, the board plan §4.4, the demo README.
 
 ## 5. Risks, ranked
 
-1. **Silica's runtime as a guest of ESP-IDF (stage 4).** The board runtime was written to own the chip: it replaces
-   the bootloader, masks interrupts and polls, and lays out all of memory. How cleanly those parts separate from the
-   schedulers is not known. The spike answers it before anything is built on it.
-2. **The size of the Silica host.** A one-service peripheral is small; the central role and pairing are not. Stages 6,
-   8 and 9 take them in that order so each closes on its own.
-3. **No pairing or encryption until stage 9.** Any nearby device can connect and read or write the link. Nothing
+1. **The controller's timing beside Silica's actors (stages 6 and 7).** Stage 4 showed the runtime runs as a guest
+   and that the controller answers; nothing was on the air. Silica's actors are never interrupted by each other, and
+   its locks are taken with interrupts on. Advertising and then a held connection, each with both cores busy, are
+   the tests.
+2. **The size of the Silica host.** A one-service peripheral is small; the central role and pairing are not. Stages 7,
+   9 and 10 take them in that order so each closes on its own.
+3. **No pairing or encryption until stage 10.** Any nearby device can connect and read or write the link. Nothing
    sensitive crosses it before then.
 4. **Trials.** A radio and a second device cannot be in `make integrate`; most evidence is scripted runs, as for the
    board demos.
@@ -305,7 +331,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     `accel x=1 y=-2 z=512 at_ms=1000`, `link down :closed`, and exited 0. Also run with no peer: an address that
     names no role, and an unreadable UUID, each give `link down :fault`.
   - Not covered:
-    - The central role against a real peripheral. The code is written and compiles; stage 7 is its first run.
+    - The central role against a real peripheral. The code is written and compiles; stage 8 is its first run.
     - More than one session at a time; a link lost in mid-frame; the `:timeout` reason.
     - Which application macOS credits with the Bluetooth permission.
   - Left stale:
@@ -377,7 +403,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
        timer and Silica's clock.
     8. C code called from a Silica task sees Silica's THREADPTR, so a wrapper must not use C thread-local
        variables.
-  - Not covered: the controller's timing while a Silica program is busy (nothing was on the air; stage 5's
+  - Not covered: the controller's timing while a Silica program is busy (nothing was on the air; stage 6's
     advertising is the first test of it); more than one program; the existing board trials on the new target;
     PSRAM.
   - Tools on this machine: ESP-IDF 5.3.5 and the `esp-13.2.0` toolchain, where the board scripts name the 6.2
@@ -408,7 +434,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
 
 3. **Silica keeps both cores.** Its two schedulers run as two tasks, each on the core it uses today.
 
-4. **Pairing and encryption wait for stage 9.** Until then the link is open to any nearby device (§5, risk 3).
+4. **Pairing and encryption wait for stage 10.** Until then the link is open to any nearby device (§5, risk 3).
 
 5. **`mtu` is the literal 20; the negotiated value arrives in `:link_up`.** Every `Carrier` method body is a literal,
    `Carrier@mtu(<name>)` resolves to the kind's row, and `wireframe@frame` takes the `mtu` as an argument, so an
@@ -421,4 +447,4 @@ Each stage's result is recorded here when it closes: date, what was built, trial
 7. **Decision 15 of the links design holds for BLE trials.** Board trials stay compile-time, assembly, diagnostics
    and one direction. The two-way runs are scripts outside `make integrate`.
 
-8. **Linux comes after the board** (stage 9), together with the Linux goldens that already wait to be regenerated.
+8. **Linux comes after the board** (stage 10), together with the Linux goldens that already wait to be regenerated.
