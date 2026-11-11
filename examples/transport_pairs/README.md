@@ -10,12 +10,24 @@ what both ends print with the expected output.
 | [`usb_accel_led_erlang_and_silica`](usb_accel_led_erlang_and_silica/) | a sequence of (synthetic) accelerometer readings; each answered by an LED command that the board carries out on the RGB LED; an end-of-stream frame; byte-identical replies from both peers (stage S-D) | Silica, Erlang | `accel_led_board/` |
 | [`usb_silica_pair`](usb_silica_pair/) | Silica on both ends; requests from both sides, several in flight, matched by id; credit flow control with an outbox | Silica | `silica_pair_board/` |
 
+Two pairs need no board:
+
+| Pair | Shows | Ends |
+| --- | --- | --- |
+| [`ethernet_remote`](ethernet_remote/) | Silica on both ends of TCP across the Internet: this Mac and a Linux x86-64 host (`manager@aalang.org`). Each end listens and dials, so there are two connections, with requests from both sides interleaved and matched by id. The links are `ssh -L` and `ssh -R` forwards to loopback-only listeners. The carrier is declared `carried_on wire: (:tcp) (:loopback);`. The Linux end is built on the remote with the hosted Linux compiler. Run with `ethernet_remote/run_mac_linux.sh`, outside `run_all.sh` (it needs the network and the remote). `check_remote.sh` is the earlier readiness check (stage E0), against an Erlang peer | Mac (Silica, the `(:tcp)` carrier), Linux x86-64 (Silica, the same source) |
+| [`ethernet_direct`](ethernet_direct/) | Silica on both ends of **one direct TCP connection** across the Internet, no tunnel: the Mac (behind NAT) dials the Linux end's listener at `138.197.209.113:4550` (`"listen:any:4550"`, bound to every interface; the remote firewall admits that port from the Mac's address only), and requests flow both ways over that connection, matched by id (odd ids from the Mac, even from Linux). The carrier is declared `(:interface, "en0")` on the Mac and `(:interface, "eth0")` on Linux, a declaration only: hosted interface binding is not enforced yet (stage E2), the address strings decide. The Linux end is built on the remote and runs under `timeout` only during a run. Run with `ethernet_direct/run_direct.sh` (`--local` runs both ends on the Mac), outside `run_all.sh` | Mac (Silica, the `(:tcp)` carrier), Linux x86-64 (Silica, the same source) |
+| [`ethernet_mac_erlang_remote_silica`](ethernet_mac_erlang_remote_silica/) | `ethernet_direct` with an **Erlang** peer on the Mac: it dials the Silica Linux end (the program `ethernet_direct` built on the remote, reused) at `138.197.209.113:4550`, one connection, requests both ways, matched by id; the Erlang terms are byte-identical to Silica's (`term_to_binary(T, [deterministic])`, and every Silica frame is checked against it). Run with `ethernet_mac_erlang_remote_silica/run.sh` (`--local` runs both ends on the Mac), outside `run_all.sh` | Mac (Erlang, `gen_tcp` `{packet, 4}`), Linux x86-64 (Silica) |
+| [`ethernet_mac_silica_remote_erlang`](ethernet_mac_silica_remote_erlang/) | `ethernet_direct` with an **Erlang** peer on the remote: the Silica Mac end dials an OTP 27 `gen_tcp` listener on `0.0.0.0:4550` (compiled there with `erlc`, run under `timeout` only during a run), one connection, requests both ways, matched by id, byte-identical terms as above. Run with `ethernet_mac_silica_remote_erlang/run.sh` (`--local` runs both ends on the Mac), outside `run_all.sh` | Mac (Silica, the `(:tcp)` carrier), Linux x86-64 (Erlang, OTP 27) |
+
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
+
 Not included:
 
 - The UART1 pair (`compiler/src/emitter/ESP32-S3_raw/board/apps/silica_32_transport_uart1_etf` with
   `programmer_tools/transport_uart1_demo`). It needs a 3.3 V USB-serial adapter wired to the UART1 header (GPIO35/36),
   so it cannot run with the board's two USB jacks alone.
 - The hosted BEAM demo (`programmer_tools/transport_beam_demo`). It runs over TCP on the Mac and needs no board.
+  (`ethernet_remote` and `ethernet_direct`, also boardless, are listed above because they are Silica pairs.)
 
 ## What every pair has in common
 
