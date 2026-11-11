@@ -8,11 +8,16 @@ sides interleaved, every reply matched to its request by id.
   with sed at compile time. It sets the ports and the host name, and it picks the side (see below).
 - The Mac end is built with `binaries/silica-compiler`.
 - The Linux end is built **on the remote** with `binaries/silica-compiler-linux_x86_64`, the hosted Linux compiler.
-  - **Which build.** It was silica-999959 for the results below. Since late 2026-11-10 it is silica-999958, which has
-    `carried_on`.
+  - **Which build.** It was silica-999959 for the 2026-11-10 results. Since 2026-11-11 it is silica-999958, which
+    has `carried_on`.
   - **Staging.** The script copies the compiler into `~/silica_demo/toolchain` when its checksum differs.
-- Both ends use the hosted `(:tcp)` carrier (`dangerous_tcp_carrier`): one listener and one connecting carrier per
-  end.
+- Both ends declare the hosted `(:tcp)` carrier on the loopback link, `carried_on wire: (:tcp) (:loopback);`, and
+  start one listener and one connecting carrier per end with `spawn_dangerous_carrier(wire, ...)` (the compiler
+  expands it to `dangerous_tcp_carrier`). `Carrier@mtu(wire)` and `Carrier@boundaries(wire)` are the kind's row.
+  - **Why `(:loopback)`.** Both ends only touch 127.0.0.1; the ssh tunnels carry the bytes between the hosts.
+  - **Not enforced.** A hosted link declaration binds nothing yet (`compiler/design_documents/transport_links_design.md`
+    §3.2; binding is the future stage E2). The compiler checks only its tags. The address strings
+    (`"listen:<port>"`, `127.0.0.1:<port>`) are what keep this program on loopback, not the declaration.
 
 ```
             Mac (accel side)                                        Linux x86-64 (status side)
@@ -148,6 +153,16 @@ MATCH: linux end
 === PASS
 ```
 
+## Results (2026-11-11, `carried_on`)
+
+The source was switched to `carried_on wire: (:tcp) (:loopback);`. The first run staged silica-999958 into the
+remote toolchain (`copying silica-999958-linux-x86_64 to the remote toolchain`, sha256 `bbf3fe21...`).
+
+- **The pair: two runs, both PASS.** Both ends printed `pair complete: 3 replies matched, 3 peer requests answered`
+  and exited 0; `MATCH: mac end`, `MATCH: linux end`. Teardown after each:
+  `remote: no program, no listener on 4550 or 4561` and `mac: no program, no listener on 4551 or 4560`.
+- **`--timeout-check`: PASS.** `timeout: dialer done no listener done no`, exit 5; teardown clean.
+
 ## Compiler problems found, and the workarounds
 
 1. **The Linux compiler runs out of memory in its type-surface cache on the remote.** The remote has 3.9 GB of RAM
@@ -176,13 +191,11 @@ MATCH: linux end
      with no crash: the module-named version with both 999959 and 999958, and the `carried_on` version with 999958.
      So the limit grows with physical memory, as inferred. It is presumably still there on a 4 GB host.
 
-2. **The Linux compiler predates `carried_on`.** silica-999959 does not expand `carried_on` declarations. The
-   `usb_silica_pair` Mac peer fails there with E2005 at the first use of its declared name (`Carrier@mtu(board)`).
-   This program names its carrier by module instead: `spawn_dangerous` of `dangerous_tcp_carrier@carrier`, with the
-   address string. Installing a Linux x86-64 compiler built from the current tree would allow `carried_on` here.
-   - **Done 2026-11-10.** silica-999958-linux-x86_64 was built on the remote from the current tree, with the Linux
-     x86-64 transport pack given the Mac's link rows. It compiles `carried_on wire: (:tcp) (:loopback);`. The program
-     here has not been switched to that form yet.
+2. **The old Linux compiler predated `carried_on`. Fixed.** silica-999959 does not expand `carried_on` declarations
+   (the `usb_silica_pair` Mac peer fails there with E2005 at the first use of its declared name), so this program
+   first named its carrier by module. silica-999958-linux-x86_64, built on the remote from the current tree with
+   the Linux x86-64 transport pack given the Mac's link rows, compiles `carried_on`, and since 2026-11-11 the
+   program uses it.
 
 3. **The compiler defects found by `../usb_silica_pair`.**
    - A nested tagged tuple written inline in `encode` is encoded flattened, so each term is bound to an annotated

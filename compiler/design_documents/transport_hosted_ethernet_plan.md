@@ -125,8 +125,9 @@ checkout `~/silica` there is not used.
     `ping 7 / pong 8 / done`, exit 0.
   - **Gaps.** silica-999959 predates `carried_on`, so the program names its carrier by module. `silica_sockets.c`
     needs `-D_GNU_SOURCE` with `-std=c11` on glibc, as the trials already pass. **Update 2026-11-10:**
-    silica-999958-linux-x86_64 now has `carried_on`; see "Compiler problems found". The demos have not been switched
-    to it yet: `~/silica_demo/toolchain` still holds 999959.
+    silica-999958-linux-x86_64 now has `carried_on`; see "Compiler problems found". **Update 2026-11-11:** the demos
+    are switched to `carried_on` and `~/silica_demo/toolchain` holds 999958 (sha256 `bbf3fe21...`); see the
+    "Carrier declaration" item of §5b.
 - **L1. One program for both ends. Done.**
   - **Shape.** `dangerous_ethernet_silica_pair.silica` is a listener and a dialer in one program. The vocabulary is
     decision 5's: `(:request, id, (:accel, {x,y,z,at_ms}))` is answered by `(:reply, id, (:led, {which,on}))`
@@ -220,9 +221,21 @@ from 157.201.64.9) was made by the user beforehand.
     connection carries both directions.
   - **Side blocks.** As in §5a, the side is chosen by swapping two blocks with sed. Each end compiles only its own
     side, because of the Linux compiler's memory limit.
-  - **Carrier naming.** The carrier is named by module, because silica-999959 predates `carried_on`. The Linux
-    x86-64 compiler installed on 2026-11-10 (999958) accepts `carried_on wire: (:tcp) (:loopback);`. The example still
-    uses the module-named form and the 999959 toolchain copy.
+  - **Carrier declaration (2026-11-11).** The four ethernet examples declare their carrier with `carried_on`
+    (`spawn_dangerous_carrier(wire, ...)`, `Carrier@mtu(wire)`, `Carrier@boundaries(wire)`), compiled on the Mac
+    with `binaries/silica-compiler` and on the remote with silica-999958. The link choice:
+    - `ethernet_remote` (ssh-tunnelled loopback ports): `carried_on wire: (:tcp) (:loopback);`;
+    - `ethernet_direct` and its two Erlang siblings (direct TCP): a per-host line that `side_copy` rewrites,
+      `(:interface, "en0")` on the Mac (the interface of its default route, read from `route -n get default`;
+      `MAC_IFACE`), `(:interface, "eth0")` on the remote (its public interface, 138.197.209.113; `LINUX_IFACE`), and
+      `(:loopback)` for `--local`.
+    - **Not enforced.** A hosted link declaration binds nothing yet (`transport_links_design.md` §3.2; binding is
+      stage E2). The compiler checks the declaration's tags only and does not look the interface up; the traffic is
+      not pinned to `en0` or `eth0`. The address strings (`"listen:any:4550"`, the dial address) still decide where
+      each end listens and dials. The sources and READMEs say so.
+    - **Re-verified 2026-11-11 against `manager@aalang.org`:** `ethernet_remote` two runs and `--timeout-check`;
+      `ethernet_direct`, `ethernet_mac_erlang_remote_silica` and `ethernet_mac_silica_remote_erlang` each `--runs 2`,
+      `--timeout-check` and `--local`: all PASS, teardown clean after every run.
   - **Self-test.** `run_direct.sh --local` runs both sides on the Mac (`listen:any:45550`, dial 127.0.0.1).
 - **D2. `run_direct.sh`. Done 2026-11-10 (20:2x UTC), after the remote was rebooted and temporarily upgraded to 16 GB / 8 CPUs.**
   - **Result against `manager@aalang.org` (Linux x86_64) over direct TCP 4550, no tunnels:** `--runs 2` PASS. The Mac end

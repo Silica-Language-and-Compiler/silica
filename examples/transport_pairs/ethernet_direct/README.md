@@ -6,16 +6,28 @@ Silica listener at `138.197.209.113:4550`. Requests then flow **both ways over t
 full duplex. Every reply is matched to its request by id.
 
 - **One source.** `dangerous_ethernet_direct_pair.silica` holds both ends. `run_direct.sh` makes the per-host copy
-  with sed at compile time. It sets the addresses and the host name, and it picks the side.
+  with sed at compile time. It sets the carrier's declared link, the addresses and the host name, and it picks the
+  side.
 - **The Mac end** is built with `binaries/silica-compiler`.
 - **The Linux end** is built on the remote with the hosted Linux compiler: `binaries/silica-compiler-linux_x86_64`
-  (silica-999959 when this pair was written), which `../ethernet_remote` stages at
+  (silica-999958 since 2026-11-11; silica-999959 for the first runs), which `../ethernet_remote` stages at
   `~/silica_demo/toolchain/silica-compiler`. This pair only reads that file.
-  - **Since late 2026-11-10** the link points at silica-999958, which accepts `carried_on`. The next
-    `../ethernet_remote` run stages it.
-- **The carrier.** Both ends use the hosted `(:tcp)` carrier, `dangerous_tcp_carrier`, named by module
-  (`spawn_dangerous` with an address string). silica-999959 predates `carried_on`. With 999958 the form
-  `carried_on wire: (:tcp) (:loopback);` also compiles on Linux. This example still uses the module-named form.
+- **The carrier.** Both ends declare the hosted `(:tcp)` carrier and start every carrier with
+  `spawn_dangerous_carrier(wire, ...)`, which the compiler expands to `dangerous_tcp_carrier`;
+  `Carrier@mtu(wire)` and `Carrier@boundaries(wire)` are the kind's row. The declaration is per host:
+
+  | copy | declaration |
+  |---|---|
+  | Mac end | `carried_on wire: (:tcp) (:interface, "en0");` (the interface of the Mac's default route; `run_direct.sh` reads it from `route -n get default`, override with `MAC_IFACE`) |
+  | Linux end | `carried_on wire: (:tcp) (:interface, "eth0");` (the remote's public interface, 138.197.209.113; override with `LINUX_IFACE`) |
+  | `--local` (both ends on the Mac) | `carried_on wire: (:tcp) (:interface, "lo0");` |
+
+- **The interface binding is NOT enforced.** A hosted link declaration binds nothing yet
+  (`compiler/design_documents/transport_links_design.md` §3.2; binding is the future stage E2). The compiler
+  checks only that the declaration's tags are valid; it does not look the interface name up, and the traffic is
+  **not** pinned to `en0` or `eth0`. The address strings still decide everything: the Linux end's
+  `"listen:any:4550"` binds every interface, and the Mac's dial to `138.197.209.113:4550` leaves by whatever route
+  the routing table picks. The declaration records the intent.
 
 ```
         Mac (accel side, behind the campus NAT)                Linux x86-64 (status side, public address)
@@ -104,9 +116,9 @@ The source ends with two blocks, as in `../ethernet_remote`:
 - **The status side** is the Linux end. It listens, sends status requests and answers accel requests by the rule.
 
 As written, the accel block is code and the status block is a `{- -}` comment. For the Linux copy, `run_direct.sh`
-swaps them with sed. Each end compiles only its own block because of a limit of the Linux compiler: on the 3.9 GB
-remote it runs out of memory (`(:explicit, :out_of_memory)` in its type-surface cache) when a unit holds both sides'
-decoders. `../ethernet_remote/README.md` describes the limit.
+swaps them with sed. Each end compiles only its own block because of a limit of the Linux compiler: with the remote
+at 3.9 GB it ran out of memory (`(:explicit, :out_of_memory)` in its type-surface cache) when a unit held both
+sides' decoders. `../ethernet_remote/README.md` describes the limit.
 
 ## Running it
 
@@ -121,7 +133,9 @@ Options and overrides:
 
 - `REMOTE_IP` (default 138.197.209.113) and `--port` (default 4550);
 - `SILICA_COMPILER` for the Mac end;
-- `LINUX_COMPILER` for the Linux end (a path on the remote).
+- `LINUX_COMPILER` for the Linux end (a path on the remote);
+- `MAC_IFACE` and `LINUX_IFACE` for the declared links (declarations only; see "The interface binding is NOT
+  enforced" above).
 
 `--local` builds both sides on the Mac. The status side listens on `listen:any:45550` and the accel side dials
 `127.0.0.1:45550`. It compares the outputs with the same `expected/` files. It is the self-test of the logic, and it
@@ -159,6 +173,19 @@ and `peer.out`). Nothing is left running.
   `mac: no program left`.
 - **`--timeout-check`: PASS.** The Mac end dialed `138.197.209.113:4550` and was refused, since nothing listened.
   It printed `timeout: pair not complete` and exited 5.
-- **The run against the remote has not been done yet.** The remote stopped answering ssh during an unrelated
-  compiler build, and remote work was halted. Status: `compiler/design_documents/transport_hosted_ethernet_plan.md`
+- **The run against the remote: `--runs 2` PASS** (20:2x UTC, after the remote was upgraded to 16 GB), with the
+  module-named carrier and the 999959 Linux compiler. Status: `compiler/design_documents/transport_hosted_ethernet_plan.md`
   §5b, D2.
+
+## Results (2026-11-11, `carried_on`)
+
+The source was switched to the `carried_on` declarations above. The Mac end was built with `binaries/silica-compiler`
+and the Linux end on the remote with silica-999958 (`~/silica_demo/toolchain/silica-compiler`, sha256 `bbf3fe21...`).
+
+- **`--runs 2`: PASS.** Both runs: the Mac dialed `138.197.209.113:4550`, the Linux end (on `listen:any:4550`)
+  accepted, the three accel requests were answered `led red on/off/on` and the three status requests went back over
+  the same connection and were answered; both ends printed
+  `pair complete: 3 replies matched, 3 peer requests answered`, exit 0, `MATCH` on both ends. After each run and at
+  exit: `remote: no program, no listener on 4550` and `mac: no program left`.
+- **`--timeout-check`: PASS.** `timeout: pair not complete`, exit 5; teardown clean.
+- **`--local`: PASS** (both ends on the Mac, declared `(:interface, "lo0")`); `mac: no program left`.

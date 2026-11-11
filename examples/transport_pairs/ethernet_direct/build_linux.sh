@@ -24,7 +24,7 @@ MODS="Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_carr
 for m in $MODS; do ln -sf "$HERE/stdlib/$m.silica" "$m.silica"; done
 { for m in $MODS; do echo "$m.silica"; done; echo "$NAME.silica"; } > silica.config
 ec=0
-for i in $(seq 1 12); do "$COMPILER" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
+for i in $(seq 1 12); do nice -n 19 ionice -c3 "$COMPILER" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
 if [ ! -f "$NAME.sams" ]; then
     echo "build_linux: compile failed (exit $ec); see $WORK/compile.log"
     grep -A10 "Compilation error\|crashed" compile.log | head -20

@@ -44,6 +44,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 CC="${SILICA_COMPILER:-$ROOT/binaries/silica-compiler}"
+# The carrier's declared link (not enforced; see the source's "NOT ENFORCED" note): the Mac end names the interface
+# that carries this Mac's default route, the Linux end the remote's public interface, --local declares (:interface, "lo0").
+MAC_IFACE="${MAC_IFACE:-$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')}"; MAC_IFACE="${MAC_IFACE:-en0}"
+LINUX_IFACE="${LINUX_IFACE:-eth0}"
 LINUX_COMPILER="${LINUX_COMPILER:-\$HOME/silica_demo/toolchain/silica-compiler}"
 NAME=dangerous_ethernet_direct_pair
 WORK="$HERE/build"
@@ -81,8 +85,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-side_copy() {   # SRC OUT SIDE LISTEN DIAL HOST: the per-host copy (SIDE mac = the accel side, linux = the status side)
-    local args=(-e "s/^fn listen_address() -> string { \"[^\"]*\" }/fn listen_address() -> string { \"$4\" }/"
+side_copy() {   # SRC OUT SIDE LISTEN DIAL HOST LINK: the per-host copy (SIDE mac = the accel side, linux = the status side)
+    local args=(-e "s/^carried_on wire: (:tcp) .*;\$/carried_on wire: (:tcp) $7;/"
+                -e "s/^fn listen_address() -> string { \"[^\"]*\" }/fn listen_address() -> string { \"$4\" }/"
                 -e "s/^fn dial_address() -> string { \"[^\"]*\" }/fn dial_address() -> string { \"$5\" }/"
                 -e "s/^fn host_name() -> string { \"[^\"]*\" }/fn host_name() -> string { \"$6\" }/")
     if [ "$3" = linux ]; then
@@ -98,7 +103,7 @@ normalize() {   # sorted, uptimes replaced
     sed -E 's/uptime_ms=[0-9]+/uptime_ms=<n>/' "$1" | LC_ALL=C sort
 }
 
-build_mac() {   # DIR SIDE LISTEN DIAL HOST
+build_mac() {   # DIR SIDE LISTEN DIAL HOST LINK
     local D=$1
     rm -rf "$D"; mkdir -p "$D/dangerous_exposure_source/lib"
     (
@@ -108,7 +113,7 @@ build_mac() {   # DIR SIDE LISTEN DIAL HOST
         ar rcs dangerous_exposure_source/lib/libsilica_sockets.a silica_sockets.o
         for m in Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
         ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" trial_wait_int64.silica
-        side_copy "$HERE/$NAME.silica" "$NAME.silica" "$2" "$3" "$4" "$5"
+        side_copy "$HERE/$NAME.silica" "$NAME.silica" "$2" "$3" "$4" "$5" "$6"
         printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_sockets.silica\ndangerous_tcp_carrier.silica\ntrial_wait_int64.silica\n%s.silica\n' "$NAME" > silica.config
         ec=0
         for i in $(seq 1 12); do "$CC" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
@@ -146,8 +151,8 @@ if [ "$MODE" = local ]; then
     echo "== local: the status side listens on listen:any:$LOCAL_PORT, the accel side dials 127.0.0.1:$LOCAL_PORT"
     busy=$(lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN 2>/dev/null)
     [ -z "$busy" ] || { echo "run_direct: Mac port $LOCAL_PORT in use"; exit 1; }
-    build_mac "$WORK/local/accel" mac "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" mac-arm64
-    build_mac "$WORK/local/status" linux "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64
+    build_mac "$WORK/local/accel" mac "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" mac-arm64 '(:interface, "lo0")'
+    build_mac "$WORK/local/status" linux "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64 '(:interface, "lo0")'
     all=1
     for r in $(seq 1 "$RUNS"); do
         echo "== local run $r"
@@ -162,7 +167,7 @@ if [ "$MODE" = local ]; then
 fi
 
 echo "== 1. Mac end (accel side): dials $REMOTE_IP:$PORT"
-build_mac "$WORK/mac" mac "listen:any:$PORT" "$REMOTE_IP:$PORT" mac-arm64
+build_mac "$WORK/mac" mac "listen:any:$PORT" "$REMOTE_IP:$PORT" mac-arm64 "(:interface, \"$MAC_IFACE\")"
 
 if [ "$MODE" = pair ]; then
     echo "== 2. Linux end (status side) on $REMOTE: listen:any:$PORT"
@@ -183,7 +188,7 @@ if [ "$MODE" = pair ]; then
     scp -q "${SSH_OPTS[@]}" "$ROOT"/compiler/stdlib/{Supervisor,wire_etf,wireframe,Carrier,dangerous_sockets,dangerous_tcp_carrier}.silica \
         "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$REMOTE:silica_demo/ethernet_direct/stdlib/" || exit 1
     scp -q "${SSH_OPTS[@]}" "$ROOT"/compiler/stdlib/net/{silica_sockets.c,silica_sockets_wrapper.meta} "$REMOTE:silica_demo/ethernet_direct/stdlib/net/" || exit 1
-    side_copy "$HERE/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:any:$PORT" "$REMOTE_IP:$PORT" linux-x86_64
+    side_copy "$HERE/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:any:$PORT" "$REMOTE_IP:$PORT" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
     scp -q "${SSH_OPTS[@]}" "$WORK/$NAME.linux.silica" "$REMOTE:silica_demo/ethernet_direct/build/$NAME.silica" || exit 1
     rsh "chmod +x $RDIR/build_linux.sh && $RDIR/build_linux.sh $RDIR/build $NAME $LINUX_COMPILER" || exit 1
 fi

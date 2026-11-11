@@ -22,7 +22,7 @@ ar rcs dangerous_exposure_source/lib/libsilica_sockets.a silica_sockets.o
 for m in Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_carrier trial_wait_int64; do ln -sf "$TC/stdlib/$m.silica" "$m.silica"; done
 printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_sockets.silica\ndangerous_tcp_carrier.silica\ntrial_wait_int64.silica\n%s.silica\n' "$NAME" > silica.config
 ec=0
-for i in $(seq 1 12); do "$TC/silica-compiler" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
+for i in $(seq 1 12); do nice -n 19 ionice -c3 "$TC/silica-compiler" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
 if [ ! -f "$NAME.sams" ]; then
     echo "build_linux: compile failed (exit $ec); see $WORK/compile.log"
     grep -A10 "Compilation error\|crashed" compile.log | head -20

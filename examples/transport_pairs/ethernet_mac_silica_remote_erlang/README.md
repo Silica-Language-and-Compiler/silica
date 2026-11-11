@@ -47,6 +47,12 @@ compares each frame it receives with `term_to_binary(binary_to_term(F), [determi
 
 - **The Mac end** is the accel side of `../ethernet_direct`, built here with `binaries/silica-compiler` from that
   source. It dials `138.197.209.113:4550`, sends accel requests and answers status requests.
+  - Its carrier declaration is `carried_on wire: (:tcp) (:interface, "en0");`, the interface of this Mac's
+    default route (`run.sh` reads it from `route -n get default`; `MAC_IFACE` overrides it; the `--local` copy
+    declares `(:interface, "lo0")`). **The interface binding is NOT enforced:** a hosted link declaration binds nothing yet
+    (`compiler/design_documents/transport_links_design.md` §3.2, future stage E2); the compiler checks only its
+    tags, and the dial to `138.197.209.113:4550` leaves by whatever route the routing table picks. See
+    `../ethernet_direct/README.md`.
 - **The remote end: `status_side_peer.erl`.** `run.sh` copies it to the remote and compiles it there with `erlc`
   (OTP 27). It runs with `erl -noshell` under `timeout 90` and does what the Silica status side does, printing the
   same lines:
@@ -130,3 +136,12 @@ Nothing is left running.
   4550 on the remote, nothing left on the Mac.
 - **`--timeout-check`: PASS.** The Silica Mac end dialed `138.197.209.113:4550`, was refused, printed
   `timeout: pair not complete` and exited 5.
+
+## Results (2026-11-11, `carried_on`)
+
+After the switch of `../ethernet_direct` to `carried_on` (the Mac end declares `(:interface, "en0")`):
+
+- **`--runs 2`: PASS.** Both runs: both ends printed `pair complete: 3 replies matched, 3 peer requests answered`,
+  exit 0, the Erlang peer printed `etf: 6 frames received, 6 in deterministic form`, `MATCH` on both ends; after each
+  run `remote: no peer, no listener on 4550`, `mac: no program left`.
+- **`--timeout-check`: PASS** (exit 5, teardown clean). **`--local`: PASS.**

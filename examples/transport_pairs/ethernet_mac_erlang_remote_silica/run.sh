@@ -49,6 +49,10 @@ while [ $# -gt 0 ]; do
     esac
 done
 CC="${SILICA_COMPILER:-$ROOT/binaries/silica-compiler}"
+# The carrier's declared link (not enforced; see the source's "NOT ENFORCED" note): the Mac end names the interface
+# that carries this Mac's default route, the Linux end the remote's public interface, --local declares (:interface, "lo0").
+MAC_IFACE="${MAC_IFACE:-$(route -n get default 2>/dev/null | awk '/interface:/ {print $2}')}"; MAC_IFACE="${MAC_IFACE:-en0}"
+LINUX_IFACE="${LINUX_IFACE:-eth0}"
 LINUX_COMPILER="${LINUX_COMPILER:-\$HOME/silica_demo/toolchain/silica-compiler}"
 NAME=dangerous_ethernet_direct_pair
 EX=ethernet_mac_erlang_remote_silica
@@ -98,8 +102,9 @@ trap cleanup EXIT
 
 # The per-host copy of ../ethernet_direct's source, exactly as its run_direct.sh makes it (SIDE linux = the
 # status side). SRC OUT SIDE LISTEN DIAL HOST
-side_copy() {
-    local args=(-e "s/^fn listen_address() -> string { \"[^\"]*\" }/fn listen_address() -> string { \"$4\" }/"
+side_copy() {   # SRC OUT SIDE LISTEN DIAL HOST LINK
+    local args=(-e "s/^carried_on wire: (:tcp) .*;\$/carried_on wire: (:tcp) $7;/"
+                -e "s/^fn listen_address() -> string { \"[^\"]*\" }/fn listen_address() -> string { \"$4\" }/"
                 -e "s/^fn dial_address() -> string { \"[^\"]*\" }/fn dial_address() -> string { \"$5\" }/"
                 -e "s/^fn host_name() -> string { \"[^\"]*\" }/fn host_name() -> string { \"$6\" }/")
     if [ "$3" = linux ]; then
@@ -113,7 +118,7 @@ side_copy() {
 
 normalize() { sed -E 's/uptime_ms=[0-9]+/uptime_ms=<n>/' "$1" | LC_ALL=C sort; }
 
-build_mac_silica() {   # DIR SIDE LISTEN DIAL HOST: the Silica end on this Mac (only for --local)
+build_mac_silica() {   # DIR SIDE LISTEN DIAL HOST LINK: the Silica end on this Mac (only for --local)
     local D=$1
     rm -rf "$D"; mkdir -p "$D/dangerous_exposure_source/lib"
     (
@@ -123,7 +128,7 @@ build_mac_silica() {   # DIR SIDE LISTEN DIAL HOST: the Silica end on this Mac (
         ar rcs dangerous_exposure_source/lib/libsilica_sockets.a silica_sockets.o
         for m in Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
         ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" trial_wait_int64.silica
-        side_copy "$DIRECT/$NAME.silica" "$NAME.silica" "$2" "$3" "$4" "$5"
+        side_copy "$DIRECT/$NAME.silica" "$NAME.silica" "$2" "$3" "$4" "$5" "$6"
         printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_sockets.silica\ndangerous_tcp_carrier.silica\ntrial_wait_int64.silica\n%s.silica\n' "$NAME" > silica.config
         ec=0
         for i in $(seq 1 12); do "$CC" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
@@ -182,7 +187,7 @@ if [ "$MODE" = local ]; then
         exit 0
     fi
     echo "== local: the Silica status side listens on listen:any:$LOCAL_PORT, the Erlang peer dials 127.0.0.1:$LOCAL_PORT"
-    build_mac_silica "$WORK/local/status" linux "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64
+    build_mac_silica "$WORK/local/status" linux "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64 '(:interface, "lo0")'
     all=1
     for r in $(seq 1 "$RUNS"); do
         echo "== local run $r"
@@ -207,7 +212,7 @@ fi
 echo "== 2. Linux end (Silica, status side) on $REMOTE: listen:any:$PORT"
 rsh 'echo "remote: $(hostname) ($(uname -sm))"' || { echo "run: ssh failed"; exit 1; }
 remote_port_free || { echo "run: remote port $PORT in use (or ssh failed):"; remote_listener; exit 1; }
-side_copy "$DIRECT/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:any:$PORT" "$REMOTE_IP:$PORT" linux-x86_64
+side_copy "$DIRECT/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:any:$PORT" "$REMOTE_IP:$PORT" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
 want=$(shasum -a 256 "$WORK/$NAME.linux.silica" | cut -c1-64)
 rsh "mkdir -p $RDIR/build" || exit 1
 if [ $REBUILD = 0 ]; then
