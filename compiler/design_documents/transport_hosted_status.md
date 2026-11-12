@@ -19,7 +19,7 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
   checked, and spawn the same carrier. The socket is NOT bound to the interface address (no `getifaddrs`; none in
   `compiler/stdlib`), so traffic uses the host's default route, and an absent interface does NOT fail at open with
   `(:explicit, :link_unavailable)` today. The address strings decide where each end listens and dials. Planned: plan
-  stage E2, links design §3.2; trials `link_interface_absent`, `link_family_absent` wait for it.
+  stage E2 (next, widened 2026-11-11: all three hosted targets, `listen:<ipv4>:<port>`, refusal rules, interim guard; PLANNED), links design §3.2; trials `link_interface_absent`, `link_family_absent` wait for it.
 - **No authentication, no encryption, no peer identity.** See the Security note in the plan (§5b) and
   `examples/transport_pairs/README.md`.
 
@@ -43,7 +43,7 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
   outside `make integrate`; I did not re-run them for this note.
 - **Not verified:** linux_aarch64 anything (pack rows only); the fixed point of the Linux x86-64 compiler (plan line
   180); Linux goldens of the transport trials are known stale in places (plan §5b D0).
-- **Planned, not built:** interface binding and `link_unavailable` at open (E2); `getpeername` (listener reports
+- **Planned, not built:** interface binding and `link_unavailable` at open (E2, next; widened 2026-11-11 to apple_silicon_mac, linux_x86_64 and linux_aarch64, the `listen:<ipv4>:<port>` form, refusal of `listen:any:`/`listen:<ip>` under `(:loopback)` and named links, and an interim guard `E24xx`); `getpeername` (listener reports
   `"peer:accepted"`); connect timeout (E8); TLS/auth (Project BEES, not built as of 2026-11-10).
 
 ## Wording to use

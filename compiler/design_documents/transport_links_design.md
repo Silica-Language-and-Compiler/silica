@@ -204,7 +204,13 @@ form (2026-11-10): the address `"listen:any:<port>"` binds every IPv4 interface 
 `dangerous_sockets@tcp_listen_any`, while `"listen:<port>"` stays loopback-only. It is chosen only by writing it,
 and no `carried_on` link maps to it (the hosted links bind nothing yet); `(:interface, name)` and `(:ethernet, n)`
 will replace it with a bind to one interface's address, and once `(:loopback)` refuses non-loopback addresses as
-above, it must refuse this form too. The direct Mac-to-Linux pair
+above, it must refuse this form too. **Planned, not built (Lee, 2026-11-11, plan stage E2):** a further form
+`"listen:<ipv4>:<port>"` binding one given IPv4 address (`dangerous_sockets@tcp_listen_addr`), because today a
+multi-homed host cannot restrict an off-host listener to one network and a declared `(:interface, ...)` does not
+restrict it. Refusal rules: `(:loopback)` refuses `"listen:any:"` and non-loopback `"listen:<ip>"`; a named
+interface/ethernet/wifi link refuses `"listen:any:"` and any `listen:<ip>` that is not that interface's address, and
+a bare `"listen:<port>"` under it binds that interface. An interim guard (runtime refusal plus a diagnostic
+`E24xx`, number assigned at implementation) comes first. The direct Mac-to-Linux pair
 (`examples/transport_pairs/ethernet_direct`) is its first user, and it is the non-loopback listener Project BEES's
 milestone N1 needs.
 
