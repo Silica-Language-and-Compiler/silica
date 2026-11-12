@@ -209,13 +209,28 @@
 // reloaded from the entry's saved r2:r3 slots (sp + 8 / 12 under ENTRY_SAVE, which bl leaves in
 // place: an AAPCS call such as silica_rt_frame_alloc or silica_rt_in_aux_chain has clobbered the
 // registers by now), stored as a scalar's two words, or the aggregate's bytes copied from the address
-// it holds. Clobbers r0, r2, r3, r12; keeps r1.
+// it holds. A scalar is stored at its slot's width, as the ESP32-S3's STORE_ELEMENT does: two words
+// for an 8-byte slot, one word, a halfword or a byte for the narrow ones (a 4-byte slot written as two
+// words overwrote the element behind it, and the chunk's next word for the last slot: a List[uint32]
+// longer than one chunk faulted at its fifth element). Clobbers r0, r2, r3, r12; keeps r1.
     LFUNC rt_list_store_element
     ldr     r2, [sp, #8]                    // X1 lo
     ldr     r3, [sp, #12]                   // X1 hi
     cmp     r6, #0
     bne.w   1f
-    str     r2, [r1, #0]
+    cmp     r8, #8
+    bhs.w   4f
+    cmp     r8, #4
+    beq.w   5f
+    cmp     r8, #2
+    beq.w   6f
+    strb    r2, [r1, #0]
+    bx      lr
+6:  strh    r2, [r1, #0]
+    bx      lr
+5:  str     r2, [r1, #0]
+    bx      lr
+4:  str     r2, [r1, #0]
     str     r3, [r1, #4]
     bx      lr
 1:  movw    r0, #0

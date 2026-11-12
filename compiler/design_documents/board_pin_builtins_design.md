@@ -1,7 +1,7 @@
 # Board pin builtins (ESP32-S3 and STM32L476RG): design
 
-Status: design, 2026-11-09 (Lee). Nothing is implemented. Implementation starts after the Nucleo actor
-groups and FFI/device behaviours are in (see §9).
+Status: design, 2026-11-09 (Lee); implemented 2026-11-10 (§10 records what was decided at
+implementation and what is still open).
 
 ## 1. Decision
 
@@ -192,3 +192,96 @@ trials name them. E2220 is the existing code for a target that lacks the builtin
 3. Board packs: GPIOD/GPIOH windows and the reserved-pin tables.
 4. Each board's tests and failure trials, then a board run.
 5. This document is updated with what was decided at implementation (types, codes, pin numbering).
+
+## 10. Implementation (2026-11-10)
+
+What the code does, where it lives, and the choices made while writing it. Items marked *(to confirm)*
+are implementation choices Lee has not reviewed yet.
+
+**Types (as proposed in §2, kept).** `pin_mode(pin: uint32, mode: atom) -> atom`, `pin_pull(pin: uint32,
+pull: atom) -> atom`, `pin_write(pin: uint32, high: boolean) -> atom`, `pin_read(pin: uint32) -> boolean`.
+The first three answer `:ok`.
+
+**Mode and pull are atom literals** *(to confirm)*. The checker accepts only the listed atoms written as
+literals (a variable is rejected, E2226), the same rule as a register name in `peek` / `poke`. The SIR then
+carries a small code instead of the atom (mode `:input` 0, `:output` 1, `:output_open_drain` 2; pull
+`:none` 0, `:up` 1, `:down` 2), so no emitter or runtime decodes an atom index, and a wrong atom cannot
+reach a register (§5: it would write the wrong bits).
+
+**Pin numbering (as §2).** ESP32-S3: the GPIO number. STM32L476RG: `16 * port + bit`, A = 0, B = 1, C = 2,
+D = 3, H = 7 (PD2 = 50, PH0 = 112, PH1 = 113). The board pack's `pin_class(pin)` is the single authority:
+0 not a pin, 1 reserved, 2 read-only (`pin_read` only), 3 usable; `pin_use(pin)` names what a reserved pin
+is wired to, `pin_number_limit()` is one past the highest number, `pin_numbering()` is the diagnostics'
+one-line summary. The older `pin_is_reserved` of the ESP32-S3 pack is the bring-up apps' narrower rule and
+is not consulted by the builtins.
+- STM32L476RG (LQFP64): usable are PA0-PA15, PB0-PB15, PC0-PC15 and PD2, less the reserved PA2, PA3, PA13,
+  PA14, PB3, PC14, PC15, PH0, PH1: 42 pins. No read-only pins.
+- ESP32-S3 e-badge: the §5.1 table exactly (usable GPIO13-18, 35, 36; read-only 8, 9, 10, 11, 21, 33, 34, 47;
+  22-25 and 27-32 not pins; every other number up to 48 reserved).
+
+**Error codes** (the next free numbers of the device range, `error_codes.md`):
+
+| Code | Name | Where |
+| --- | --- | --- |
+| E2221 | PinNotOnBoard | pre-emit pass, literal pin, `pin_class` 0 |
+| E2222 | PinReserved | pre-emit pass, literal pin, `pin_class` 1 |
+| E2226 | PinModeOrPullUnknown | type checker: mode / pull not one of the listed atom literals |
+| E2227 | PinReadOnly | pre-emit pass: `pin_mode` / `pin_pull` / `pin_write` on a `pin_class` 2 pin (this is the "input-only pin" check of §5; neither board has a pin the chip itself makes input-only, so the read-only class is what it rejects) |
+| E2220 | PrimNotCompilableForTarget | the hosted emitters ("this target has no GPIO pins") |
+
+The placement, effect and module rules are the device prims' own codes, unchanged: E2216 (outside a
+`device_*` module, with a pin-specific message), E2219 (in `main`), E2223 (in a `spawn` behaviour), E2232
+(`register_rwr` outside a `device_*` module), E2217 (a `device_*` module defining a function named
+`pin_mode` ...), E3xxx for a missing `register_rwr`.
+
+**Where the checks run.** The atoms, the arity and the argument types are checked by the shared type checker
+(`type_checker_expressions_device.silica`, `check_pin_call`). Whether a literal pin exists, is reserved or is
+read-only is the target's question, so it is answered before emission by the driver's pre-emit pass
+(`sir_generator/sir_target_verify.silica`, `verify_pin_literal`), which asks the target's
+`emitter_core@pin_literal_reason` / `pin_literal_code` (board emitters: `terms/prims/prims_pin.silica` over
+`board_pack@pin_class`; hosted emitters: never reached, they answer E2220 first). The diagnostic names the
+module, the function, the builtin and the pin.
+
+**Run time.** A literal pin calls the runtime's unchecked entry (`silica_rt_pin_<builtin>_lit`); a computed
+pin calls the checked entry (`silica_rt_pin_<builtin>`), which tests the pin against the runtime twin of
+`pin_class` (`silica_rt_pin_class`) and otherwise ends the program with the abort report
+`[silica] abort: <builtin>: pin <n> is not a pin it may use on this board at <site>`, status 71, even inside
+an actor (as `illegal device map` does). STM32: `board/runtime/rt_support.S` (the port's clock on in
+`RCC_AHB2ENR` at every call, MODER / OTYPER / PUPDR read-modify-writes, BSRR, IDR). ESP32-S3:
+`board/runtime/rt_board.S` (IO_MUX: GPIO function and input buffer on in `pin_mode`, pulls in `pin_pull`;
+matrix: FUNCn_OUT_SEL = GPIO_OUT, PINn open drain, ENABLE / OUT set-clear words, IN / IN1, bank 1 from
+GPIO32); `pin_read` changes no configuration, so on the read-only pins it only samples.
+
+**Front end.** The four names are device prims everywhere the device prims are listed: the type checker
+(`is_device_prim_name`), the effect checker (`register_rwr`), the module checker (E2217), the SIR generator
+(`sir_device_calls.silica` `build_pin`, and the runtime-prim list of `sir_generator_core`). SIR shapes:
+`pin_mode` / `pin_pull` — kind 6, inner = the pin (uint32), right = the code constant; `pin_write` — right =
+the level (bool); `pin_read` — typed bool. In the board emitters they are device prims too
+(`prims_device@is_device_prim`): the pin is staged in X1, `pin_write`'s level in X2.
+
+**Board packs.** STM32: windows 12 `:stm32l4_gpiod` (0x48000C00) and 13 `:stm32l4_gpioh` (0x48001C00), the pin
+table above; hand-written device descriptions from RM0351 in `board/pack/` (`device_stm32l4_<gpioa..d, gpioh,
+rcc, usart2>_registers`), listed in `pack_descriptions.silica`. ESP32-S3: the pin table; nothing about the
+display, LED, button, joystick or buzzer code changed.
+
+**Tests.** Board-specific, in `compiler/src/emitter/<TARGET>/board/tests/pins/`, run by that board's
+`board/tools/run_pin_tests.sh` (through `trials/targets/board_suite.sh`); no hosted run executes them. Hosted
+rejection: `trials/error_enforcement_addition/device_pin_<builtin>_hosted_rejection_trial` (E2220 on Mac,
+pix and nix).
+
+**Results (2026-11-10).** ESP32-S3 e-badge (empty minibadge slots): 22 of 22 (7 programs, 15 compile
+failures). NUCLEO-L476RG: 18 of 18 (6 programs, 12 compile failures); B1 (PC13) reads high with the chip's
+pull-down, as §5 expected. Hosted: the four E2220 trials pass on the Mac with a compiler built from this
+tree (pix and nix goldens are derived, not yet run).
+
+**Found while testing, fixed with a trial each** (outside the pin code): a guarded case arm whose guard
+calls a function lost its scrutinee (every emitter; `case_addition/case_guard_call_keeps_scrutinee`); a
+64-bit let in a uint32 function did not assemble (every emitter;
+`functions_addition/let_wide_rhs_in_uint32_function`); the board copiers walked list chunks with CDATA =
+2 * slot instead of max(16, slot) (both board runtimes); the STM32 runtime stored narrow list elements as
+two words (`list_literal_from_atom_case_addition`).
+
+**Open.** The optional wired fixture (§7) is not written. `pin_read` on an ESP32-S3 pad whose input buffer
+is off reads 0; the builtins do not switch the buffer on for a read-only pin (the buttons' configuration is
+not touched).
+

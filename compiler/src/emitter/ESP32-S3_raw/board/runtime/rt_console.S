@@ -587,8 +587,10 @@ silica_rt_abort_with:
     FAILURE_ENTRY silica_rt_region_alloc_failed, silica_registry_atom_out_of_memory, silica_rt_reason_out_of_memory
     FAILURE_ENTRY silica_rt_list_index_failed, silica_registry_atom_list_index, silica_rt_reason_list_index
 
-// a2 = reason, a0 = return address of the CALL8 into the entry. Never returns.
+// a2 = reason, a0 = return address of the CALL8 into the entry. Never returns. Global for the entries
+// in other files that compose their reason first (rt_board.S silica_rt_pin_bad).
     .align  4
+    .global silica_rt_abort_body
 silica_rt_abort_body:
     movi    a8, 0x3fffffff
     and     a3, a0, a8

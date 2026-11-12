@@ -1,0 +1,62 @@
+// A device actor that ends on a CPU exception reports the hardware fault: the standard failure block
+// gains exccause (the Cortex-M exception number and its name), epc and excvaddr after reason_tag (device
+// spec §8, runtime_failure_reporting.md §3.2; rt_failure.S rt_report_device_fault). Plain spawn_device
+// sets the ACB device flag through silica_rt_actor_mark_device right after the spawn. The worker maps
+// GPIOA on :init, then on :boom reads the head of an empty list: the nil handle is 0, and the runtime's
+// MPU null guard makes 0x0000_0000-0x000F_FFFF no-access (rt_start.S), so the load of the chunk word is
+// a MemManage fault with MMFAR = 8 inside the behaviour. Nothing supervises the worker, so the report
+// goes to the console; main then quiesces with status 0. The NUCLEO twin of
+// device_actor_addition/device_fault_lines (ESP32-S3: exccause 28, LoadProhibited).
+// Expected (folded by compare_scout_normalized.sh): reason_tag 3, exccause 4 (MemManage),
+// excvaddr 0x00000008, the epc and actor_id folded.
+use device_stm32l4_gpioa_registers;
+use trial_wait_int64;
+
+fn first_of(xs: List[int64, mem(normal)]) -> int64 {
+    xs.head
+}
+
+fn worker(msg: { op: atom, n: int64 }, state: :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa)))) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa)))) {
+    sequence proc[register_rwr, mem(normal)]
+        next: :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa))) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    w: device_window(L, (:stm32l4_gpioa)) <- map_device((:stm32l4_gpioa), 0x48000000);
+                    (:mapped, w)
+                };
+                _: atom -> :unmapped
+            };
+            (:mapped, w: device_window(L, (:stm32l4_gpioa))) -> case msg.op of {
+                :boom -> {
+                    none: List[int64, mem(normal)] <- [];
+                    v: int64 <- first_of(none) + msg.n;
+                    case v == 0 of {
+                        true -> :unmapped;
+                        false -> (:mapped, w)
+                    }
+                };
+                _: atom -> (:mapped, w)
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                d: device_actor_ref <- spawn_device(:unmapped, worker, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast_device(d, { op: :init, n: 0 } impl ActorMessage {});
+                _: boolean <- cast_device(d, { op: :boom, n: 1 } impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

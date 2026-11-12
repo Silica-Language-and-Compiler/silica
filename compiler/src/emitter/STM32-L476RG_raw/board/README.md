@@ -137,6 +137,24 @@ runs from SRAM); AHB, APB1 and APB2 undivided, so PCLK1, USART2's clock, is 80 M
 (reload 79,999) at 1 ms keeps `silica_rt_ticks_ms`. Console: USART2 on PA2/PA3 (AF7), 115200 8N1
 (BRR 694: 0.06% fast), transmit polled, receive through the RXNE interrupt into a ring, the Nucleo's ST-LINK virtual COM port (`/dev/cu.usbmodem21103`).
 
+**Flash images, by hand only (2026-11-12).** `BOARD_EXEC=flash tools/build_image.sh ...` links with
+`runtime/silica_stm32l476rg_flash.ld` (code and constants at 0x0800_0000, `.data` copied from flash by `_start`;
+the RAM default is unchanged and byte-identical), and `tools/run_on_board.py --exec flash --yes-wear-flash`
+programs it. Every load wears the flash, so the trials never use it: `build_image.sh` refuses flash with `-r`
+(the harness's runtime cache) and the RAM loader refuses a flash image. Design:
+`compiler/design_documents/stm32_flash_execution_design.md`; example: `examples/nucleo_flash_max_actors/`.
+
+**Open item: image headroom (found 2026-11-10, no trial).** The image runs from SRAM1, so every byte of
+`.text`, `.rodata` and `.data` comes out of the heap, and `silica_stm32l476rg.ld` refuses an image that leaves
+less than 16 KiB of heap (`ASSERT(_silica_heap_start + 0x4000 < _silica_heap_end, "program too large: less
+than 16 KiB left for the heap")`). A Nucleo program that added a few more print statements tripped it: each
+`print_*` call site and its string literal grow `.text` and `.rodata`, and there is no spare SRAM1 left after
+the runtime. This is a capacity limit, not a compiler defect with an observable fixed behaviour (the correct
+output of such a program is the same on every target), so no staged trial exists; a trial would only encode
+today's image size. The levers are a smaller image (emitted code size, shared print helpers) or running
+`.text`/`.rodata` from flash (the part has 1 MiB; the image runs from RAM only because the probe loads nothing
+into flash). Whichever is chosen, re-measure the budget above.
+
 ## Runtime: what is here (stage 1) and what is not
 
 | File | Here | Not yet |
