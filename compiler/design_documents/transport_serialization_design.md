@@ -480,7 +480,7 @@ required {
     fn mtu(c: Carrier) -> uint64;            // largest segment, in bytes; 0 means unbounded
     fn boundaries(c: Carrier) -> atom;       // :stream | :datagram | :storage
     fn delivery(c: Carrier) -> atom;         // :reliable_ordered | :ordered_lossy | :unreliable
-    fn addressing(c: Carrier) -> atom;       // :none | :endpoint | :characteristic | :block
+    fn addressing(c: Carrier) -> atom;       // :none | :endpoint | :characteristic | :block | :region (§6.8)
 }
 ```
 
@@ -637,7 +637,7 @@ on the Apple Silicon Mac and the ESP32-S3_raw board**; the Linux packs list no l
 
 **Status: design, 2026-11-11 (Lee's four decisions are recorded at the end); nothing here is built.** A program
 that must keep values past a restart sends them to a **storage carrier**. The peer is the program's own future
-self (or another program reading the same medium). Everything else is the transport the rest of §6 already
+self (or another program that opens the same medium afterwards; one owner at a time, §6.8.2). Everything else is the transport the rest of §6 already
 describes: the same `carried_on` declaration, the same pack rows, the same `WireFormat` traits, the same
 `wireframe` framing, the same actor contract with credit-based flow control. A storage carrier adds a medium that
 remembers and a few messages that say so.
@@ -655,60 +655,84 @@ afterthought.
 ```silica
 carried_on audit:  (:store) (:sd_blocks, 0, :ring);          // board: region 0 of the SD card, oldest records overwritten
 carried_on config: (:store) (:flash_region, 1, :stop);       // board: region 1 of the internal flash, refuse when full
-carried_on trace:  (:store) (:backing, "/var/lib/app/trace", :trim);   // hosted: where the bytes live; the path appears only here
-carried_on scratch:(:store) (:memory, 65536);                // any target: RAM medium, nothing survives; for trials
+carried_on trace:  (:store) (:backing, "/var/lib/app/trace", 67108864, :trim);   // hosted: where the bytes live and how many; the path appears only here
+carried_on scratch:(:store) (:memory, 65536, :stop);         // any target: RAM medium, nothing survives; for trials
 ```
 
 The links are the medium under the carrier (§6.7), the same way `(:uart, 1, 115200)` and `(:serial_port, path,
-baud)` are. A **region** is a span of the medium that one declaration owns: the board pack names the regions of
-the card and of the flash (a static table, the way it names register windows), and the hosted `(:backing, path)`
-is one region sized by the first open. A region claimed by two declarations in one build is E2415, exactly as one
-UART or one serial path is; an unknown link is E2417, a link the target does not provide E2412, a parameter outside
-the link's rules E2413 (retention not in `:ring | :stop | :trim`, a region number the pack does not list), a link
-that cannot carry the kind E2414. No new code is needed for the declaration. The hosted port's C sidecar is the
-only place a host file exists (`pwrite` and a full flush); the word is not part of the language.
+baud)` are. Every store link takes a fixed number of parameters, as `Link@arity` requires, and the retention mode is
+always written (decided 2026-11-12: there is no default): `(:memory, capacity, retention)`, `(:backing, path, capacity,
+retention)`, `(:sd_blocks, n, retention)`, `(:flash_region, n, retention)`. A **region** is a span of the medium that
+one declaration owns: the board pack names the regions of the card and of the flash (a static table, the way it names
+register windows), and the hosted `(:backing, path, capacity, retention)` is one region of `capacity` bytes, created at
+that size by the first open. A backing that already exists at another size is not resized: the open ends with
+`(:link_down, :mismatch)`. The write-behind buffer's size is the pack's number, not a link parameter (§6.8.2).
+
+The declaration needs no new diagnostic. A region claimed by two declarations in one build is E2415, exactly as one
+UART or one serial path is; an unknown link tag is E2413; a link the target does not provide is E2412, a region number
+the pack does not list included (as `(:uart, 3)` is); a parameter that fails the link's rules is E2417 (a retention not
+in `:ring | :stop | :trim`, a capacity that is not a literal or not a multiple of the block size, a wrong parameter
+count); a link that cannot carry the kind is E2414. The hosted port's C sidecar is the only place a host file exists
+(`pwrite` and a full flush); the word is not part of the language.
 
 **The kind's row.** `Carrier@boundaries(store)` is `:storage`: a record is the unit, and records keep their
 boundaries and their order. `Carrier@delivery(store)` is `:reliable_ordered` with the loss window of §6.8.5.
-`Carrier@addressing(store)` is `:region`. `Carrier@mtu(store)` is the largest record payload the medium takes in
-one piece (the pack's number: a multiple of the block size on a card, the program's own limit on `(:memory)`), so
-`wireframe` already knows how to cut a bigger frame into records (§5, segmentation) and how to put it back.
+`Carrier@addressing(store)` is `:region`, a value this kind adds to the list of §6.1. `Carrier@mtu` is the largest
+record payload: the medium's block size less the block header and the record envelope (§6.8.4), because a record never
+spans two blocks. The block size is the pack's number for each medium, so for a store `Carrier@mtu(<name>)` answers
+from the link; this is the first kind whose link narrows the row (§6.7). `wireframe` gains a `:storage` mode (§6.8.3)
+that cuts a bigger frame into records and puts it back.
 
 #### 6.8.2 The vocabulary
 
-The §6.2 messages carry over unchanged where the meaning fits. The additions are marked.
+The §6.2 messages carry over unchanged where the meaning fits. The additions are marked. Every sequence number in a
+message is **exclusive**: it names the first record *not* covered, so an empty log has an answer for each of them.
 
 | Direction | Message | Meaning |
 | --- | --- | --- |
 | program to carrier | `(:open, owner: actor_ref, address: string)` | claim the region; `address` is `""` (the stores take no address; reserved) |
-| program to carrier | `(:tx, segment: string, from: actor_ref)` | append one record to the write-behind buffer; consumes one send credit; the carrier numbers it |
-| program to carrier | `(:sync)` **new** | make everything accepted so far durable; answered by `(:synced, seq)` |
+| program to carrier | `(:tx, segment: string, from: actor_ref)` | append one record to the write-behind buffer; consumes one send credit; the carrier numbers it. A record that is not accepted takes no number |
+| program to carrier | `(:sync)` **new** | make everything accepted so far durable; answered by `(:synced, next)` |
 | program to carrier | `(:read, from: uint64)` **new** | replay the records from sequence number `from`, in order, as `:rx`, under receive credit |
+| program to carrier | `(:read_stop)` **new** | end the replay in progress; answered by `(:rx_end, next)` with the number of the first record not delivered |
 | program to carrier | `(:credit, n: uint32)` | the owner will accept n more `:rx` messages (replay is paced by this, as a TCP receive window is) |
-| program to carrier | `(:trim, upto: uint64)` **new** | release every record with a sequence number below `upto` |
+| program to carrier | `(:trim, upto: uint64)` **new** | release every record with a sequence number below `upto`; answered by `:log` once the release is durable |
 | program to carrier | `(:close)` | drain the buffer to the medium, make it durable, then `(:link_down, :closed)` |
-| carrier to owner | `(:link_up, info: string)` | the region is claimed and its log recovered (§6.8.4); `info` names the medium and carries `oldest=<seq> next=<seq>` and the capacity |
+| carrier to owner | `(:link_up, info: string)` | the region is claimed and its log recovered (§6.8.4); `info` names the medium, for people to read. It is followed at once by `:log` |
+| carrier to owner | `(:log, oldest: uint64, next: uint64, capacity: uint64)` **new** | the state of the log: the oldest record held, the number the next accepted record will get, the region's capacity in bytes. Sent after `:link_up`, after a `:trim` has become durable, and after `(:read_failed, :trimmed)` |
 | carrier to owner | `(:tx_credit, n: uint32)` | n buffer slots were freed: those records have reached the medium (written, not necessarily durable) |
-| carrier to owner | `(:synced, seq: uint64)` **new** | every record up to and including `seq` is durable (the medium's flush has returned) |
-| carrier to owner | `(:rx, segment: string)` | one replayed record |
-| carrier to owner | `(:rx_end, next: uint64)` **new** | the replay reached the end of the log; `next` is the sequence number the next appended record will get |
-| carrier to owner | `(:tx_failed, reason: atom)` | a record was not accepted: `:no_credit`, `:too_long`, `:full` (a `:stop` or `:trim` region with no room), `:medium` (the write failed; this record and everything after it are lost) |
-| carrier to owner | `(:read_failed, reason: atom)` **new** | `:trimmed` (the cursor is below `oldest`), `:beyond_tail`, `:corrupt` (a record failed its check; the replay stopped before it) |
-| carrier to owner | `(:link_down, reason: atom)` | `:closed`, `:fault`, `:medium`, `:in_use` (the region was already open) |
+| carrier to owner | `(:synced, next: uint64)` **new** | every record numbered below `next` is durable (the medium's flush has returned); `next` is also the number the next accepted record will get |
+| carrier to owner | `(:rx, segment: string)` | one replayed record; the owner counts from `from` to know its number |
+| carrier to owner | `(:rx_end, next: uint64)` **new** | the replay is over: it reached the `next` that held when the `:read` was accepted, or a `:read_stop` ended it at `next` |
+| carrier to owner | `(:tx_failed, reason: atom)` | a record was not accepted and took no number: `:no_credit`, `:too_long`, `:full` (a `:stop` or `:trim` region with no room) |
+| carrier to owner | `(:read_failed, reason: atom)` **new** | `:trimmed` (the cursor is below `oldest`, at the `:read` or because a `:ring` writer overtook the replay; a `:log` follows), `:beyond_tail`, `:busy` (a replay is already in progress), `:corrupt` (a record failed its check; the replay stopped before it) |
+| carrier to owner | `(:link_down, reason: atom)` | `:closed`, `:fault`, `:medium` (a write or a flush failed; the carrier ends, and what the log holds is what the next open's `:log` reports), `:in_use` (the region was already open), `:mismatch` (a backing of another size) |
 
 **Two acknowledgements.** `:tx_credit` and `:synced` are the two levels, as a TCP program has the window space and the
-peer's acknowledgement. A program that must not lose a record waits for `(:synced, seq)` with `seq` at or past that
-record's number (the carrier numbers records from 0 in acceptance order; the owner counts its own `:tx` to know
-which one). A program that only wants room to keep writing waits for `:tx_credit`.
+peer's acknowledgement. The carrier numbers records in acceptance order, the first accepted record after an open taking
+the `next` of that open's `:log`, and the owner counts its own accepted `:tx` from there. A program that must not lose a
+record waits for a `(:synced, next)` with `next` above that record's number. A program that only wants room to keep
+writing waits for `:tx_credit`. An owner that has lost count (a `:tx_failed` does not say which record it refused) sends
+`:sync`: the `next` of the answer is exactly the number of records accepted so far.
 
 **Write-behind.** The carrier drains its buffer when it is full to a threshold, when the carrier is idle, on `:sync` and
-on `:close`, in units the medium likes (a card block of 512 bytes, a flash page, an erase block), so lazy writing is
-what keeps a flash alive. The buffer's size is part of the link's declaration in the pack's terms (a default per
-target, a parameter to override) and is charged to the actor's `mem` budget at the declaration, as stack budgets are
-on the board. A `:read` first drains the buffer, so a replay sees every record accepted before it.
+on `:close`, in units the medium likes (a card block of 512 bytes, a flash page), so lazy writing is what keeps a flash
+alive. The buffer is counted in **slots**: one slot holds one record of up to `mtu` bytes with its envelope, and one
+send credit is one slot, so credit and buffer space are the same count. This is worst-case sizing: short records leave
+part of their slot unused in RAM, and are still packed back to back on the medium. The slot count is the pack's number
+for the target. The buffer lives on the carrier actor's own stack, and the compile-time check of its size arrives with
+the per-target ceiling of §12 item 12. A `:read` first drains the buffer, so a replay sees every record accepted before
+it.
 
-**Exclusive.** One owner per region. The compile-time claim is above; at run time a second open of an open region ends
-with `(:link_down, :in_use)`. Replaying and appending by the same owner at once is allowed.
+**Replay.** One replay runs at a time; a `:read` during one is answered `(:read_failed, :busy)`. A replay covers the
+records from `from` up to the `next` that held when the `:read` was accepted and ends there with `(:rx_end, next)`.
+Records the owner appends meanwhile are not part of it: an owner that follows the tail reads again from that `next`.
+Appending during a replay is allowed.
+
+**Exclusive.** One owner per region, and so one reader: a consumer in another actor is served by the owner. The
+compile-time claim is above; at run time a second open of an open region ends with `(:link_down, :in_use)`. On a host
+the sidecar holds an exclusive lock on the backing (`flock`), so a second process gets the same answer. Another program
+may open the region after the first has closed it.
 
 #### 6.8.3 Records, framing and the codecs
 
@@ -716,79 +740,120 @@ All codecs are available: a record is `encode(<any WireFormat>, value)`, framed 
 what a medium needs, and neither touches the derivation.
 
 1. **Frame header (program level, in `wireframe`).** `wireframe@record(format: atom, schema: uint16, frame: string)
-   -> string` puts a one-byte format id (`(:etf)` is 1, `(:cbor)` 2, further ids as protocols land) and a two-byte
+   -> string` puts a one-byte format id and a two-byte
    schema version the program chooses in front of the encoded frame, and `wireframe@unrecord` takes them off,
    answering `(:ok, format, schema, frame) | (:rejected, atom)`. Records in different formats and versions can share a
-   region, and a program reads an old version with `decode` for the old type and migrates in its own code.
+   region, and a program reads an old version with `decode` for the old type and migrates in its own code. The id is a
+   column of the `WireFormat` table, `WireFormat@id(tag)`: `(:etf)` is 1, `(:cbor)` 2, further ids as protocols land,
+   and 0 is never a format, so a zero-filled medium is `(:rejected, _)`. The ids are normative (§11).
 2. **Record envelope (carrier level).** The carrier writes `{ length, seq, crc32c, payload }` and nothing else is the
    program's business: the sequence number and the check belong to the medium, which has to find the end of the
-   log after a crash. A payload larger than `mtu` is segmented by `wireframe` (§5), so a value, or a stream of
-   values, of any size is a run of records. The owner feeds segments as credit arrives, so RAM use stays flat.
+   log after a crash. A payload larger than `mtu` is segmented by `wireframe` (§5) into a run of records.
 
-Everything read from the medium goes through `decode` as a validator before use: on a board the bytes come from a device
-worker and are not external-danger-touched (§6.4); on a host they come through the sidecar and are, so `decode` runs inside the
-owner's `sequence` block and only the re-created value leaves it (§12 item 11), exactly as for a TCP segment.
+**How large.** One value is one frame, and a frame is held whole in memory by `encode` and by `unframe`: it is bounded
+by the `max_bytes` of its `decode`, by the target's ceiling (§12 item 12) and by the 32768 segments of `mtu - 4` bytes
+the 15-bit segment index allows. Data larger than that is a **stream of values**, one frame each; the owner feeds
+records as credit arrives, and that is what keeps RAM use flat however long the log is.
+
+**The `:storage` framing mode (decided 2026-11-12).** A log can hold the front of a frame whose rest never arrived: a
+crash in the middle of a frame, a `:ring` reclaim or a `:trim` that removed its first records, a `(:read, from)` that
+lands inside it. So in `:storage` mode every record carries the §5 segment header, a frame that fits in one record
+included (index 0 with the last bit set), and index 0 is the frame-start marker `unframe` resynchronises on:
+
+- a record with index 0 that arrives while a reassembly is in progress drops the unfinished frame and starts the new one;
+- a record with a non-zero index that arrives when no reassembly is in progress, or out of order, is skipped with
+  `(:more, state)` and the state emptied, and the next index 0 starts a frame.
+
+A replay therefore never fails on an orphaned segment and never joins two frames; the orphan is dropped without a
+report. `frame` and `unframe` take the mode from `Carrier@boundaries`, as they do for `:stream` and `:datagram`, and the
+carrier itself still knows nothing about frames.
+
+Everything read from the medium goes through `decode` before use, and `decode` is where the danger is resolved, exactly
+as for every other carrier (§4.5; decided 2026-11-12): the bytes of a record are untrusted whatever the medium and
+whatever the target, a card that another machine wrote included, and only the value `decode` re-creates is used.
 
 #### 6.8.4 The layout and recovery
 
-The region is divided into blocks of the medium's erase or sector size. Each block begins with a header
-`{ first_seq, state }`; records follow it back to back. A `:ring` region reuses blocks in order, a `:stop` or
+The region is divided into blocks. The block size is the pack's number for the medium: a multiple of its write unit
+(the 512-byte sector of a card or of a backing) and of its erase size where it has one. A record never spans two
+blocks, which is what makes `mtu` the block size less the header and the envelope, and a block whose remaining space
+cannot take the next record is closed with a pad marker. Each block begins with a header
+`{ first_seq, state, crc32c }`; records follow it back to back. A `:ring` region reuses blocks in order, a `:stop` or
 `:trim` region leaves blocks free until released. This is the standard log-structured layout and it is why open and
-seek are cheap on a log of any size.
+seek are cheap on a log of any size. A block header that fails its own check is a block that is not part of the log.
 
 **Open** reads only the block headers to find `oldest` and the tail block, then scans the tail block record by record,
-checking each envelope. The first record that fails its length or CRC ends the log: the tail is logically truncated
-there (a torn write is expected after a power loss) and `next` is the number after the last good record.
+checking each envelope. The log ends at the first record that fails its length or its CRC, **or whose sequence number
+is not the one after the record before it** (the first record of a block must carry the header's `first_seq`). The
+sequence test is what stops the scan at the tail of a reused block: on a medium that is not erased, the records of
+the previous lap are still there after the tail with good CRCs, and only their numbers show they are old (decided
+2026-11-12). The tail is logically truncated there (a torn write is expected after a power loss) and `next` is the
+number after the last good record.
+
+**A sync pads; synced bytes are never rewritten (decided 2026-11-12).** `:sync` writes the buffered records, then a
+pad marker (a zero length) that fills the rest of the medium's write unit: the 512-byte sector of a card or of a host
+backing, nothing on a flash that programs single bytes into an erased page. The next record starts on the next write
+unit. A torn write after a sync can then only damage bytes that were never reported as `:synced`, which is what the
+contract of §6.8.5 needs. A scan that meets a pad marker goes on at the next write unit. A `:sync` with nothing
+accepted since the last one writes nothing. The cost is the program's to choose: a sync after every small record spends
+a write unit on each, a sync after a batch spends at most one.
 `(:link_up, info)` reports `oldest` and `next`. **A seek** by `(:read, from)` is a binary search over the block headers
 and a scan inside one block. A record that fails its check in the middle of a replay stops the replay with
 `(:read_failed, :corrupt)`; the carrier never skips a bad record, because the rest of the log after it is not trusted.
 
-An unfinished segmented frame at the tail is the owner's to drop: `wireframe@unframe` returns `(:more, state)` at
-`:rx_end` and the program starts the next frame fresh.
+An unfinished segmented frame, at the tail or anywhere else in the log, is dropped by `wireframe@unframe` in `:storage`
+mode (§6.8.3): the next frame-start record begins a fresh frame, in this replay and in every later one.
 
 #### 6.8.5 What a program may rely on
 
-After a crash, a power loss or a restart, the log holds **every record up to the last `(:synced, seq)` it saw**, in order,
+After a crash, a power loss or a restart, the log holds **every record below the last `(:synced, next)` it saw**, in order,
 with no holes, plus possibly some of the records after it and never a reordered or a partial one. Records still in the
 write-behind buffer at the time are lost. Nothing is flushed on a low-power signal in this design: that needs the
 interrupt support the ESP32-S3 port does not have yet (peripherals plan item K). A medium that cannot honour its flush
 is a defect of its worker, not a weaker contract.
 
-**Retention.** The link's third parameter picks one of three, because each has a different failure story:
+**Retention.** The link's last parameter picks one of three, because each has a different failure story:
 
 | Mode | When the region is full | A reader behind `oldest` |
 | --- | --- | --- |
 | `:ring` | the oldest block is reclaimed and `oldest` advances; writing never stops | `(:read_failed, :trimmed)` |
 | `:stop` | `:tx_credit` stops, further `:tx` fail with `(:tx_failed, :full)`; nothing is ever overwritten | none |
-| `:trim` | as `:stop`, until the owner sends `(:trim, upto)`, which releases the blocks below `upto` (a durable queue: a consumer reads, then trims) | `(:read_failed, :trimmed)` |
+| `:trim` | as `:stop`, until the owner sends `(:trim, upto)`, which releases the blocks that lie wholly below `upto` (a durable queue: a consumer reads, then trims) | `(:read_failed, :trimmed)` |
 
-`:stop` is the proposed default when the parameter is omitted, because it never discards data silently. `(:trim, upto)`
-is accepted in every mode (a `:ring` program may release early).
+The mode is always written; there is no default (§6.8.1). `(:trim, upto)` is accepted in every mode (a `:ring` program
+may release early), and is answered by `:log` once the release is durable.
+
+**A trimmed queue delivers at least once.** Release is by whole blocks, so after a `(:trim, upto)` the `oldest` of the
+`:log` can be below `upto`, and a consumer that restarts and reads from `oldest` sees those records again. A consumer
+that cannot tolerate a repeat keeps its own position as a record.
 
 #### 6.8.6 What each target provides
 
 | Link | Target | State |
 | --- | --- | --- |
-| `(:memory, capacity)` | every target | the test medium: the region is a RAM buffer, `:synced` follows every drain, nothing survives; it makes every trial of the contract run without hardware, as `(:loopback)` does for TCP |
-| `(:backing, path)` | the hosted paths | a sidecar over `pwrite` and a full flush (`F_FULLFSYNC` on macOS, `fdatasync` on Linux); one backing object per declaration, claimed once per path |
-| `(:sd_blocks, n)` | the ESP32-S3 | needs the SPI3 block worker (peripherals plan item I, not built) |
-| `(:flash_region, n)` | the ESP32-S3, the STM32 | needs a flash controller worker; which medium comes first is open (§6.8.8) |
+| `(:memory, capacity, retention)` | every target | the test medium: the region is a RAM buffer, `:synced` follows every drain, nothing survives; it makes every trial of the contract run without hardware, as `(:loopback)` does for TCP |
+| `(:backing, path, capacity, retention)` | the hosted paths | a sidecar over `pwrite` and a full flush (`F_FULLFSYNC` on macOS, `fdatasync` on Linux); one backing object per declaration, claimed once per path and held under an exclusive `flock` while open |
+| `(:sd_blocks, n, retention)` | the ESP32-S3 | needs the SPI3 block worker (peripherals plan item I, not built) |
+| `(:flash_region, n, retention)` | the ESP32-S3, the STM32 | needs a flash controller worker; which medium comes first is open (§6.8.8) |
 
 The row `(:sd_blocks)` of §6.4 is superseded by this section: it is a link of the `(:store)` kind, not a carrier tag of its own.
 
 #### 6.8.7 Trials and phases
 
-Trials, all on `(:memory)` first so they run everywhere: append and replay of every row of §4.2 under `(:etf)` and, once
+Trials, on `(:memory)` first so they run everywhere: append and replay of every row of §4.2 under `(:etf)` and, once
 it lands, `(:cbor)`; two acknowledgement levels (`:tx_credit` before `:synced`); credit-paced replay of a log many times
 the buffer; a value larger than `mtu` across records and back; `:ring` wrap with a reader behind `oldest`; `:stop` and
-`:trim` full and release; `:in_use`; a torn tail (a backing truncated mid-record), a flipped byte (`:corrupt`), and a restart of the
-carrier actor that finds its log again. Failure trials for each declaration error above. Hosted `(:backing)` adds a
-second program run that reads what the first wrote. The board adds the medium's own trials.
+`:trim` full and release, with the `:log` answer; `:in_use`; `:busy` and `:read_stop`; a replay across an orphaned
+partial frame and a `(:read, from)` that lands inside a frame (§6.8.3). Failure trials for each declaration error above.
+The trials that need a medium that survives are on `(:backing)`, since `(:memory)` keeps nothing: a second program run
+that reads what the first wrote, a torn tail (a backing truncated mid-record), a flipped byte (`:corrupt`), stale
+records after the tail of a reused block, a sync's padding, `:mismatch`, and a restart of the carrier actor that finds
+its log again. The board adds the medium's own trials.
 
 | Phase | Delivers | Closes when |
 | --- | --- | --- |
-| S0 | the §6.8.2 vocabulary, the envelope, `wireframe@record` and `unrecord`, the `(:store)` kind and `Link.silica` rows, `(:memory)`; Apple Silicon | every trial above passes on `(:memory)`; failure trials green; goldens regenerated |
-| S1 | `(:backing, path)` with its sidecar; restart trials across two program runs | a second program reads the first one's log; the torn-tail and corruption trials pass on a real backing |
+| S0 | the §6.8.2 vocabulary, the envelope, `wireframe@record` and `unrecord`, the `(:store)` kind and `Link.silica` rows, `(:memory)`; Apple Silicon | every `(:memory)` trial above passes; failure trials green; goldens regenerated |
+| S1 | `(:backing, path)` with its sidecar; restart trials across two program runs | every `(:backing)` trial above passes on a real backing |
 | S2 | Linux AArch64 and x86-64 lock-step | the suite is green on both; goldens regenerated on a Linux host |
 | S3 | the board medium and its worker (flash or SD), `:ring` wear behaviour measured | the board trials of §6.8.7 pass on the real board |
 | later | the keyed in-memory library over a replay; BEES's ETS and DETS substrate; a hash chain or encryption at rest | their own designs |
@@ -801,8 +866,23 @@ loss window of §6.8.5 is accepted: the unsynced tail is lost on power loss. Als
 transport as a carrier kind, the data held in memory is the write-behind buffer (the analog of a TCP send buffer), and
 logging of large volumes is a requirement.
 
+**Decided (Lee, 2026-11-12).** (5) `wireframe` has a `:storage` mode in which every record carries the segment header and
+index 0 is the frame-start marker a replay resynchronises on (§6.8.3). (6) Recovery ends the log at a break in the
+sequence numbers as well as at a bad length or CRC, and the block header carries its own check (§6.8.4). (7) A sync pads
+to the medium's write unit, so synced bytes are never rewritten (§6.8.4). (8) `decode` is where the danger of stored
+bytes is resolved, on every target, as for every other carrier (§6.8.3).
+
+(9) One value is one frame and is bounded by RAM; large data is a stream of values (§6.8.3). (10) `:log` carries the
+log's numbers as typed values, every sequence number is exclusive, a refused record takes no number and a medium failure
+ends the carrier (§6.8.2). (11) One send credit is one buffer slot of `mtu` bytes plus the envelope; the slot count is
+the pack's and the buffer is on the carrier actor's stack (§6.8.2). (12) Store links take fixed parameters with the
+retention always written and a capacity on `(:backing)`; a host backing is locked while open (§6.8.1). (13) One replay
+at a time, ending at the `next` of its `:read`, with `:read_stop` and `:busy` (§6.8.2). (14) `:trim` is answered by
+`:log` and a trimmed queue delivers at least once (§6.8.5). (15) Format ids are `WireFormat@id`, 0 reserved (§6.8.3).
+(16) A record never spans two blocks; the block size is the pack's number and gives the `mtu` (§6.8.4).
+
 **Open.**
-1. Whether `:stop` is the default retention (proposed yes).
+1. (Closed 2026-11-12: there is no default retention.)
 2. Which medium comes first on the board, internal flash or the SD card, and the board pack's region table.
 3. The record envelope's exact layout: sequence number width (uint64 proposed), CRC-32C proposed, the block header, the
    largest record per medium.
@@ -816,7 +896,7 @@ logging of large volumes is a requirement.
 
 **Follow-ups when it is built.** `Carrier.silica` gains the `(:store)` row; `Link.silica` the links and their parameters;
 each pack lists the links it provides; a new subsection of specification §16.4 carries the vocabulary and the loss
-window as normative text; §10 gains one row for phases S0 to S3 (detailed in §6.8.7); the diagnostics table keeps E2412 to E2415 and E2417 as they
+window as normative text, with the `:region` addressing value and the `WireFormat@id` column; §10 gains one row for phases S0 to S3 (detailed in §6.8.7); the diagnostics table keeps E2412 to E2415 and E2417 as they
 are.
 
 ---
@@ -987,7 +1067,7 @@ on every suite with goldens refreshed under the usual rule, and a hosted phase e
 | §22 | the builtins of §9.2 |
 | FFI wrapper specification §7.7 | `decode` and `recreate` are one mechanism (§4.1): no marker trait, limits as a call argument, one derivation, the same rejection atoms and call-site rule; `decode` is listed as the second validator |
 | device specification §5.2 | client messages to a carrier worker follow the §6.2 contract |
-| §16.4 (storage subsection, when built) | the `(:store)` kind, its links and retention parameters, the vocabulary of §6.8.2 and the loss window of §6.8.5 as normative text |
+| §16.4 (storage subsection, when built) | the `(:store)` kind, its links and retention parameters, the vocabulary of §6.8.2, the loss window of §6.8.5, the `:region` addressing value and the format ids (`WireFormat@id`, §6.8.3) as normative text |
 
 ---
 
