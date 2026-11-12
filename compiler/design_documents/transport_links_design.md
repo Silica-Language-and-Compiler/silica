@@ -27,7 +27,7 @@ sends four ETF readings, each answered by an LED command from a Mac peer that de
 (plan §7). **Not done:** the hosted `(:interface, name)`, `(:ethernet, n)` and
 `(:wifi, n)` links are accepted and checked but the TCP and UDP carriers do not bind to the interface yet (no
 `getifaddrs`, no `(:explicit, :link_unavailable)` at open; the `link_interface_absent` and `link_family_absent` trials of
-§10 wait for it); the Linux packs list no link (E2412 there until their rows are written in lock-step); the Nucleo
+§10 wait for it); the Linux x86-64 pack lists the hosted links since 2026-11-10 and the linux_aarch64 pack has the same rows in the tree (2026-11-11; not yet built or run on an AArch64 host); the Nucleo
 (phase C); UART2 on the ESP32-S3 (no window yet); E2416 (phase D: nothing reaches it); the supervised form of the
 board bring-up (a device worker cannot be a supervisor child yet). It extends
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below), §6 (carriers),
@@ -137,8 +137,8 @@ numbers are different series, and the question numbers are kept (§12).
   (`NotProvidedOnTarget`) from `sir_target_verify`, wherever it appears. This paragraph described the state before
   phase A, when every pack answered `false` for every carrier and the hosted carriers were provided through
   `compiler/stdlib/Carrier.silica` rather than the pack. Since phase A the Mac pack (2026-11-09) and the Linux x86-64
-  pack (2026-11-10) list `tcp`, `udp` and `serial` and the hosted links. The linux_aarch64 pack still answers `false`
-  and lists no link.
+  pack (2026-11-10) list `tcp`, `udp` and `serial` and the hosted links. The linux_aarch64 pack has the same rows as the x86-64 pack since 2026-11-11
+  (not yet built or run on an AArch64 host).
 - **Board packs.** The ESP32-S3 draft (`ports/board_pack.silica`) is pure indexed functions with no allocation and no
   effects, and already holds `pin_uart0_tx/rx` (43/44), `pin_uart1_tx/rx` (35/36), `uart_txfifo_max` and a
   window-name table (`":esp32s3_uart"`). The Nucleo pack (`emitter/STM32-L476RG_raw/board_pack.silica`) holds
@@ -373,8 +373,10 @@ E2410 keeps its meaning (the kind is provided) and the new E2412 says the hardwa
     `.linux_x86_64.golden_fail` goldens that differ from the Mac's only in the target name.
   - **Interface binding.** A `(:interface, "lo")` copy of the loopback app also ran. Interface binding itself is still
     not built (§3.2).
-- **Linux AArch64.** Not done. Its pack still lists no link, so `carried_on` is E2410/E2412 there, and no AArch64
-  host was available to verify the change.
+- **Linux AArch64.** Rows written 2026-11-11: `emitter/linux_aarch64/transport_pack.silica` now has the same carriers, links,
+  baud check and `carrier_spawn` as the x86-64 pack (the two files differ only in their header comment). **Pending:** a
+  build of the compiler on an AArch64 host (pix) and the trials there (`app_transport_tcp_loopback_link`,
+  `transport_link_tags`, the `link_*` error trials). Until that runs, "works on AArch64" is not established.
 
 ### 5.2 Diagnostics
 
