@@ -1,0 +1,318 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The carrier of the mutual-TLS example: the standard (:tcp) carrier, compiler/stdlib/dangerous_tcp_carrier.silica,
+// with the socket wrappers replaced by the TLS wrappers of dangerous_tls. Everything below the module line is that
+// carrier's text with dangerous_sockets@ read as dangerous_tls@, and nothing else is changed: the carrier
+// contract of transport_serialization_design.md 6.2 is the same, message for message, so the program that owns
+// this carrier is written exactly as it would be over plain TCP. That is the point of the example: mutual TLS
+// sits BELOW the carrier contract, in the wrapper, and a program gains it by naming another carrier.
+//
+// What the owner sees that it would not see over plain TCP:
+//   - a dial to a peer that does not accept this node, or that this node does not accept, ends with
+//     (:link_down, :fault), as a refused connection does (the wrapper says why on standard error);
+//   - a listener never announces a peer that failed the handshake: there is no (:accepted, ...) for it;
+//   - in TLS 1.3 a server that refuses the client's certificate says so after the client's own handshake has
+//     finished, so the refused client sees (:link_up, ...) and then (:link_down, :fault) on its first read.
+//
+// This is an example's carrier, started with spawn_dangerous and not declared with carried_on: the language's
+// carrier kinds are the compiler's, and TLS is not one of them. Silica's secure interchange is being built in
+// Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees), TRUST over mutual TLS 1.3 with a
+// certificate whitelist, which is the trust rule this example's wrapper applies.
+//
+// A connection carrier answers :link_up, grants 8 send credits, and then moves bytes: each :tx consumes one
+// credit and :tx_credit hands it back once the bytes are written; received bytes are delivered as :rx only
+// while the owner has granted :credit. A listener answers (:link_up, "port:<n>") once bound and, for every
+// peer that passes the handshake, spawns one connection carrier and tells its owner
+// (:accepted, conn: dangerous_actor_ref, "peer:accepted"); whoever sends that carrier (:open, owner, _)
+// becomes the connection's owner. A carrier polls its descriptor between mailbox messages with a 20 ms
+// timeout; a handshake is bounded at 5 seconds and runs on the listener's thread.
+module dangerous_tls_carrier;
+
+use dangerous_tls;
+
+export initial/0;
+export carrier/2;
+
+fn initial() -> { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean } {
+    { owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }
+}
+
+fn starts(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+// byte_at is a transport operation (specification §9.1.1, §16.4): called inside a sequence that
+// declares `transport`, here, so the address parsers stay pure.
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+fn digits_from(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            d: int64 <- at(s, i) - 48;
+            case d < 0 or d > 9 of {
+                true -> acc;
+                false -> digits_from(s, i + 1, acc * 10 + d)
+            }
+        }
+    }
+}
+
+fn host_of(address: string) -> string {
+    substring_until_char(address, 0, ':')
+}
+
+fn port_of(address: string) -> int64 {
+    h: string <- host_of(address);
+    digits_from(address, length_bytes(h) + 1, 0)
+}
+
+// The port of a listener address: "listen:any:<port>" or "listen:<port>".
+fn listen_port_of(address: string) -> int64 {
+    case starts(address, "listen:any:") of {
+        true -> digits_from(address, 11, 0);
+        false -> port_of(address)
+    }
+}
+
+fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
+    case r of {
+        (:ok, v: int64) -> v;
+        (:rejected, _why: atom) -> 0 - 1
+    }
+}
+
+fn int_text_from(n: int64, acc: string) -> string {
+    case n < 10 of {
+        true -> concat(substring("0123456789", n, n + 1), acc);
+        false -> int_text_from(n / 10, concat(substring("0123456789", n % 10, n % 10 + 1), acc))
+    }
+}
+
+fn int_text(n: int64) -> string {
+    int_text_from(n, "")
+}
+
+// The message read without the worker's effects: pure selectors a sequence can bind.
+fn msg_kind(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> atom {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> :open;
+        (:tx, _s: string, _f: actor_ref) -> :tx;
+        (:credit, _n: int64) -> :credit;
+        :close -> :close;
+        :poll -> :poll
+    }
+}
+
+fn msg_owner(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, fallback: actor_ref) -> actor_ref {
+    case msg of {
+        (:open, o: actor_ref, _a: string) -> o;
+        (:tx, _s: string, _f: actor_ref) -> fallback;
+        (:credit, _n: int64) -> fallback;
+        :close -> fallback;
+        :poll -> fallback
+    }
+}
+
+fn msg_text(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> string {
+    case msg of {
+        (:open, _o: actor_ref, a: string) -> a;
+        (:tx, s: string, _f: actor_ref) -> s;
+        (:credit, _n: int64) -> "";
+        :close -> "";
+        :poll -> ""
+    }
+}
+
+fn msg_count(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll) -> int64 {
+    case msg of {
+        (:open, _o: actor_ref, _a: string) -> 0;
+        (:tx, _s: string, _f: actor_ref) -> 0;
+        (:credit, n: int64) -> n;
+        :close -> 0;
+        :poll -> 0
+    }
+}
+
+fn none_res() -> { tag: int64, value: int64, error_code: int64 } {
+    { tag: 2, value: 0 - 1, error_code: 0 }
+}
+
+// One mailbox message, one pass over the socket: the sequence proc[external_danger] is the whole body
+// (the language allows it only there), so the work is chosen by the message and the state and each
+// wrapper is called at most once per message. Received bytes reach the owner in the one tainted cast
+// a worker may make per message.
+//
+// The state tells the three roles apart: `listening` is a listener; `up` is a connection carrying
+// bytes; a descriptor with neither (fd >= 0, not up, not listening) is a connection a listener
+// accepted that is waiting for its (:open, owner, _).
+fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean }) {
+    sequence proc[external_danger, concurrency, transport]
+        kind: atom <- msg_kind(msg);
+        owner: actor_ref <- msg_owner(msg, state.owner);
+        text: string <- msg_text(msg);
+        adoptable: boolean <- state.fd >= 0 and state.up == false and state.listening == false;
+        do_adopt: boolean <- kind == :open and adoptable;
+        listen_mode: boolean <- starts(text, "listen:");
+        listen_any: boolean <- starts(text, "listen:any:");
+        do_connect: boolean <- kind == :open and adoptable == false and listen_mode == false;
+        do_listen: boolean <- kind == :open and adoptable == false and listen_mode;
+        res_open: { tag: int64, value: int64, error_code: int64 } <- case do_connect of {
+            true -> dangerous_tls@tcp_connect(host_of(text), port_of(text));
+            false -> case do_listen and listen_any of {
+                true -> dangerous_tls@tcp_listen_any(listen_port_of(text));
+                false -> case do_listen of {
+                    true -> dangerous_tls@tcp_listen(listen_port_of(text));
+                    false -> none_res()
+                }
+            }
+        };
+        open_tag_raw: int64 <- res_open.tag;
+        open_fd_raw: int64 <- res_open.value;
+        open_tag: int64 <- pure_int(recreate(open_tag_raw));
+        open_fd: int64 <- pure_int(recreate(open_fd_raw));
+        do_accept: boolean <- kind == :poll and state.listening;
+        res_acc: { tag: int64, value: int64, error_code: int64 } <- case do_accept of {
+            true -> dangerous_tls@tcp_accept(state.fd, 20);
+            false -> none_res()
+        };
+        acc_tag_raw: int64 <- res_acc.tag;
+        acc_fd_raw: int64 <- res_acc.value;
+        acc_tag: int64 <- pure_int(recreate(acc_tag_raw));
+        acc_fd: int64 <- pure_int(recreate(acc_fd_raw));
+        accepted: boolean <- do_accept and acc_tag == 0;
+        bound: boolean <- do_listen and open_tag == 0;
+        res_port: { tag: int64, value: int64, error_code: int64 } <- case bound of {
+            true -> dangerous_tls@local_port(open_fd);
+            false -> none_res()
+        };
+        port_raw: int64 <- res_port.value;
+        port: int64 <- pure_int(recreate(port_raw));
+        do_tx: boolean <- kind == :tx and state.up;
+        res_tx: { tag: int64, value: int64, error_code: int64 } <- case do_tx of {
+            true -> dangerous_tls@send_bytes(state.fd, text, 1000);
+            false -> none_res()
+        };
+        tx_tag_raw: int64 <- res_tx.tag;
+        tx_tag: int64 <- pure_int(recreate(tx_tag_raw));
+        do_rx: boolean <- kind == :poll and state.up and state.listening == false and state.rx_credit > 0;
+        res_rx: { tag: int64, value: int64, error_code: int64 } <- case do_rx of {
+            true -> dangerous_tls@recv_bytes(state.fd, 65536, 20);
+            false -> none_res()
+        };
+        rx_tag_raw: int64 <- res_rx.tag;
+        rx_tag: int64 <- pure_int(recreate(rx_tag_raw));
+        got: boolean <- do_rx and rx_tag == 0;
+        bytes_in: string <- case got of {
+            true -> dangerous_tls@take(state.fd);
+            false -> ""
+        };
+        do_close: boolean <- kind == :close and state.fd >= 0;
+        _: { tag: int64, value: int64, error_code: int64 } <- case do_close of {
+            true -> dangerous_tls@close_fd(state.fd);
+            false -> none_res()
+        };
+        // An accepted peer gets a connection carrier of its own, holding the accepted descriptor;
+        // the owner learns of it and chooses who opens it.
+        _: boolean <- case accepted of {
+            true -> {
+                sequence proc[concurrency]
+                    conn: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: acc_fd, rx_credit: 0, up: false, listening: false }, carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    told: boolean <- cast(owner, (:accepted, conn, "peer:accepted") impl ActorMessage {})
+                produces
+                    pure told
+                end
+            };
+            false -> true
+        };
+        // :link_up once when connected, once when a listener is bound ("port:<n>", the port the
+        // system chose when asked for 0), and once when an accepted connection is opened.
+        connected: boolean <- do_connect and open_tag == 0;
+        link_up_now: boolean <- connected or bound or do_adopt;
+        link_down_now: boolean <- (kind == :open and adoptable == false and open_tag != 0) or (do_rx and (rx_tag == 1 or rx_tag == 3)) or (kind == :close);
+        down_reason: atom <- case kind == :close of {
+            true -> :closed;
+            false -> case do_rx and rx_tag == 3 of {
+                true -> :closed;
+                false -> :fault
+            }
+        };
+        _: boolean <- case link_up_now of {
+            true -> cast(owner, (:link_up, case bound of { true -> concat("port:", int_text(port)); false -> case do_adopt of { true -> "peer:accepted"; false -> text } }) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case connected or do_adopt of {
+            true -> cast(owner, (:tx_credit, 8) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case do_tx of {
+            true -> case tx_tag == 0 of {
+                true -> cast(owner, (:tx_credit, 1) impl ActorMessage {});
+                false -> cast(owner, (:tx_failed, :link_down) impl ActorMessage {})
+            };
+            false -> case kind == :tx of {
+                true -> cast(owner, (:tx_failed, :link_down) impl ActorMessage {});
+                false -> true
+            }
+        };
+        _: boolean <- case got of {
+            true -> cast(owner, (:rx, bytes_in) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case link_down_now of {
+            true -> cast(owner, (:link_down, down_reason) impl ActorMessage {});
+            false -> true
+        };
+        up_next: boolean <- case link_down_now of {
+            true -> false;
+            false -> state.up or connected or do_adopt
+        };
+        listening_next: boolean <- case link_down_now of {
+            true -> false;
+            false -> bound or state.listening
+        };
+        fd_next: int64 <- case kind == :open and adoptable == false of {
+            true -> open_fd;
+            false -> case kind == :close of { true -> 0 - 1; false -> state.fd }
+        };
+        credit_next: int64 <- case kind == :credit of {
+            true -> state.rx_credit + msg_count(msg);
+            false -> case got of { true -> state.rx_credit - 1; false -> state.rx_credit }
+        };
+        keep_polling: boolean <- connected or bound or do_adopt or (kind == :poll and (up_next or listening_next));
+        poll_delay: uint64 <- case kind == :poll and up_next and listening_next == false and state.rx_credit == 0 of { true -> 20; false -> 1 };
+        _: boolean <- case keep_polling of {
+            true -> {
+                sequence proc[concurrency]
+                    _: timer_ref <- send_after(poll_delay, self(), :poll impl ActorMessage {})
+                produces
+                    pure true
+                end
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, { owner: owner, fd: fd_next, rx_credit: credit_next, up: up_next, listening: listening_next })
+    end
+}
