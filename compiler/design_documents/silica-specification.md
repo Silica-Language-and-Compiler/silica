@@ -10672,6 +10672,20 @@ socket wrappers behind the hosted carriers are the dangerous module `dangerous_s
 
 **Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
 
+**What ends a hosted carrier (as implemented, 2026-11-12).** A `(:tcp)`, `(:udp)` or `(:serial)` carrier ends with its
+link. After `:close`, and after a peer closes, it answers `(:link_down, :closed)` and ends with `stop_self(:normal)`.
+After a failed open it answers `(:link_down, :fault)` and ends with `stop_self((:explicit, :link_unavailable))`; after
+a failed read or write, with `(:explicit, :link_lost)`, so a supervisor restarts a faulted link and leaves a closed one.
+`:link_down` is the last message the owner receives, and the carrier's reference is dead afterwards. A write that fails
+is a link failure: the owner receives `(:tx_failed, :link_down)` and then `:link_down`. A write to a peer that has gone
+fails with an error and never raises `SIGPIPE`.
+
+Because a `cast` to an ended actor ends its sender with `actor_not_found` (§16.1.4), **an owner must not send to a hosted
+carrier after it has received that carrier's `:link_down`**, and a carrier can end before its owner has read that
+message: an owner that sends in that interval is ended. A storage carrier does not have this hazard (§16.4.11). *Planned
+change (transport design §6.2, upgrade note):* a `cast` to an ended carrier is to stop ending its sender, and every
+carrier, the storage carriers included, is then to end on a failure.
+
 #### 16.4.9 Carrier links
 
 **Status (2026-11-09).** Implemented for the Apple Silicon macOS target and the ESP32-S3_raw board (stage S-C of
@@ -10838,6 +10852,14 @@ exclusive: it names the first record not covered. `:sync`, `:read_stop` and `:cl
 | to the owner | `(:tx_failed, why)` | the record was refused and took no number: `:too_long`, `:empty`, `:no_credit`, `:full`, `:link_down` |
 | to the owner | `(:read_failed, why)` | `:trimmed` (below `oldest`; a `:log` follows), `:beyond_tail`, `:busy`, `:corrupt` |
 | to the owner | `(:link_down, why)` | `:closed`; `:in_use` (a second `:open`, or a backing locked by another carrier); `:mismatch` (a backing of another size); `:medium` (the backing could not be opened, read, written or flushed: the carrier stays, not open, until `:close`) |
+
+**What ends a storage carrier.** Only its owner's `:close`: the carrier drains, answers `(:link_down, :closed)` and ends
+with `stop_self(:normal)`, and its reference is dead afterwards. A refused open (`:in_use`, `:mismatch`) and a medium
+failure (`:medium`) give the medium back and leave the carrier, not open; the owner may open it again or close it. This
+differs from the hosted network carriers of §16.4.8, which end on a fault, and exists because a `cast` to an ended actor
+ends its sender (§16.1.4): an owner must always find its store carrier. *Planned change (transport design §6.2, upgrade
+note):* every carrier is to end on a failure with an exit reason, once a `cast` to an ended carrier no longer ends its
+sender; a program should not rely on a failed store carrier staying.
 
 **What a program may rely on.** After a crash, a power loss or a restart the log holds every record below the last
 `(:synced, next)` the owner saw, in order and with no holes, possibly some records after it, and never a reordered or a

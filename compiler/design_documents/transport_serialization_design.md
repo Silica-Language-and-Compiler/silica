@@ -515,6 +515,43 @@ credit, and the receive window a TCP carrier advertises follows the owner's `:cr
 sender is mailbox order. Failure is the carrier actor exiting with a reason, handled by links, monitors and
 supervisors like any actor; a program that needs the link back restarts the carrier under its supervisor.
 
+**What ends a carrier, as built (2026-11-12).** The two families differ today, and the difference is to be removed by the
+upgrade below.
+
+| Carriers | `:close` | A fault (failed open, read, write or flush) | A peer that closes |
+| --- | --- | --- | --- |
+| hosted `(:tcp)`, `(:udp)`, `(:serial)` | `(:link_down, :closed)`, then the carrier ends, `stop_self(:normal)` | `(:link_down, :fault)`, then the carrier ends with `stop_self((:explicit, :link_unavailable))` for a failed open and `(:explicit, :link_lost)` for a failed read or write, so its supervisor restarts it | `(:link_down, :closed)`, then the carrier ends, `stop_self(:normal)` |
+| `(:store)` on `(:memory)` and `(:backing)` (§6.8) | the same | `(:link_down, :medium)` (or `:in_use`, `:mismatch` for a refused open); the backing is closed and **the carrier stays**, not open, until its owner sends `:close` | does not apply |
+
+**The hazard.** A `cast` to an actor that has ended ends the sender with `actor_not_found` (specification §16.1.4). A
+carrier that ends on its own can end before its owner has read `:link_down`, and an owner that then sends a `:tx`, a
+`:credit` or a `:close` it had already decided on is ended too. Nothing the owner does closes that window. The hosted
+network carriers have it on every fault and on a peer's close; the store carriers do not, because only their owner's
+`:close` ends them. For a store the owner is usually the actor that holds the application's unsaved data, which is why
+the store carriers were built the safe way first.
+
+**Upgrade note: end on failure everywhere, and change the language (decided in direction, Lee, 2026-11-12; not built).**
+The intended rule is the one this section states: every carrier ends when its link fails, with an exit reason, and its
+supervisor decides what happens next. Making that safe is a change to the language, not to the carriers:
+
+1. **The language.** A `cast` to an ended carrier must not end its sender. The change is to what a `cast` to an ended
+   actor does (for instance: it answers `false` and the sender goes on), in specification §16.1.4, §15.1.2.3 and
+   §15.4.11, and in the runtime of every target (Apple Silicon, Linux AArch64, Linux x86-64, ESP32-S3_raw,
+   STM32-L476RG_raw). Whether it holds for every actor reference or only for a carrier's is part of that design.
+2. **The store carriers.** `store_memory_carrier` and `dangerous_store_backing_carrier` then end on a medium failure and
+   on a refused open, with `stop_self((:explicit, :link_lost))` and `(:explicit, :link_unavailable)`, as the network
+   carriers do, and §6.8.2 and §6.8.10 lose their exception.
+3. **Owners.** An owner written against today's store carriers sends `:close` after `(:link_down, :medium)`. After the
+   upgrade that `:close` reaches an ended carrier and is harmless, so such an owner needs no change; an owner that relies
+   on the carrier staying to be opened again must start a new carrier, or leave that to its supervisor.
+4. **Trials.** A trial in which an owner sends to a carrier that has already ended, for each carrier kind; the
+   `ethernet_direct` example's dial retry, which closes a carrier that a refused dial has already ended, is the case
+   that exists today.
+
+Until then a program that owns a hosted network carrier should treat `:link_down` as the last use of that reference
+and should not send to a carrier it has not heard from, and a program that owns a store carrier must send `:close` to
+be rid of it.
+
 **Listeners.** A carrier whose `addressing` is `:endpoint` and whose `boundaries` are `:stream` may be opened to
 listen instead of connect (`(:tcp)`: `"listen:<port>"` binds 127.0.0.1 only; `"listen:any:<port>"` binds every IPv4
 interface, 0.0.0.0, and is otherwise the same). A listener carries no bytes itself: it answers
@@ -719,7 +756,7 @@ Sequence numbers and counts are `int64` in messages; a sequence number is 8 byte
 | carrier to owner | `(:rx_end, next: int64)` **new** | the replay is over: it reached the `next` that held when the `:read` was accepted, or a `:read_stop` ended it at `next` |
 | carrier to owner | `(:tx_failed, reason: atom)` | a record was not accepted and took no number: `:no_credit`, `:too_long`, `:full` (a `:stop` or `:trim` region with no room) |
 | carrier to owner | `(:read_failed, reason: atom)` **new** | `:trimmed` (the cursor is below `oldest`, at the `:read` or because a `:ring` writer overtook the replay; a `:log` follows), `:beyond_tail`, `:busy` (a replay is already in progress), `:corrupt` (a record failed its check; the replay stopped before it) |
-| carrier to owner | `(:link_down, reason: atom)` | `:closed`, `:fault`, `:medium` (a write or a flush failed; the carrier ends, and what the log holds is what the next open's `:log` reports), `:in_use` (the region was already open), `:mismatch` (a backing of another size) |
+| carrier to owner | `(:link_down, reason: atom)` | `:closed`, `:fault`, `:medium` (the backing could not be opened, or a read, a write or a flush failed: the medium is given back and the carrier stays, not open, until its owner sends `:close`; what the log holds is what the next open's `:log` reports. §6.2 says why it stays and what is to change), `:in_use` (the region was already open), `:mismatch` (a backing of another size) |
 
 **Two acknowledgements.** `:tx_credit` and `:synced` are the two levels, as a TCP program has the window space and the
 peer's acknowledgement. The carrier numbers records in acceptance order, the first accepted record after an open taking
@@ -889,7 +926,8 @@ bytes is resolved, on every target, as for every other carrier (§6.8.3).
 
 (9) One value is one frame and is bounded by RAM; large data is a stream of values (§6.8.3). (10) `:log` carries the
 log's numbers as typed values, every sequence number is exclusive, a refused record takes no number and a medium failure
-ends the carrier (§6.8.2). (11) One send credit is one buffer slot of `mtu` bytes plus the envelope; the slot count is
+answers `(:link_down, :medium)` (§6.8.2; as built the carrier then stays until `:close`, and ends on the failure once
+the upgrade of §6.2 is made). (11) One send credit is one buffer slot of `mtu` bytes plus the envelope; the slot count is
 the pack's and the buffer is on the carrier actor's stack (§6.8.2). (12) Store links take fixed parameters with the
 retention always written and a capacity on `(:backing)`; a host backing is locked while open (§6.8.1). (13) One replay
 at a time, ending at the `next` of its `:read`, with `:read_stop` and `:busy` (§6.8.2). (14) `:trim` is answered by
@@ -1011,7 +1049,8 @@ actor either. Composite `recreate` is not built. So the backing carrier keeps no
 
 **Where the implementation differs from the text above.**
 
-- **A medium failure does not end the carrier.** A write, a flush or a read that fails answers `(:link_down, :medium)`
+- **A medium failure does not end the carrier (now the documented behaviour, §6.2 and §6.8.2; to change with the upgrade
+  note of §6.2).** A write, a flush or a read that fails answers `(:link_down, :medium)`
   and closes the backing; the carrier stays, not open, until its owner sends `:close`. An owner that sends a late message
   then finds an actor: a cast to an ended actor ends its sender with `actor_not_found`. Only `:close` ends the carrier.
 - **A refused open leaves the carrier too:** `(:link_down, :in_use)`, `(:link_down, :mismatch)` or `(:link_down, :medium)`,
