@@ -1,0 +1,98 @@
+// The on-medium form of a storage carrier's log (transport_serialization_design.md §6.8.3, §6.8.4;
+// compiler/stdlib/storelog.silica), without a carrier: the checks a recovery and a replay rest on.
+//   - crc32c("123456789") is 3808858755 (0xE3069283), the check value of CRC-32C.
+//   - A block header answers its first_seq; a released header and an all-zero one are not part of
+//     the log (-1).
+//   - A block of 256 bytes with a 64-byte write unit holds records 7 and 8 back to back, then, after
+//     a sync, record 9 at the unit boundary (64), then a record of an earlier lap (seq 2) with a good
+//     check. A scan reads 7, 8 and 9 and ends at the stale record: its number, not its check, ends
+//     the block, and the next record would be written at the following boundary (128).
+//   - A flipped byte in record 8 ends the block there: the scan looks once more at the unit boundary,
+//     finds record 9 where 8 was expected, and stops (at 64).
+//   - A torn tail (record 9 cut short) ends the block at the boundary too.
+//   - A 4000-byte record: the check walks every byte.
+module transport_storelog;
+
+use storelog;
+
+fn show(label: string, r: (:record, string, int64) | (:end, int64)) -> int64 {
+    case r of {
+        (:record, p: string, nx: int64) -> said_record(label, p, nx);
+        (:end, nx: int64) -> said_end(label, nx)
+    }
+}
+
+fn said_record(label: string, p: string, nx: int64) -> int64 {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print(" record ");
+        _: atom <- print(p);
+        _: atom <- print(" next=");
+        _: atom <- print_int64(nx);
+        _: atom <- println("")
+    produces
+        pure nx
+    end
+}
+
+fn said_end(label: string, nx: int64) -> int64 {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print(" end at=");
+        _: atom <- print_int64(nx);
+        _: atom <- println("")
+    produces
+        pure nx
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[device_io]
+        _: atom <- print("crc32c=");
+        _: atom <- print_int64(storelog@crc32c("123456789"));
+        _: atom <- println("");
+        _: atom <- print("zeros=");
+        _: atom <- print_int64(length_bytes(storelog@zeros(1000)));
+        _: atom <- println("");
+        b0: string <- storelog@block_header(7, 1);
+        _: atom <- print("header first_seq=");
+        _: atom <- print_int64(storelog@header_first_seq(b0, 0));
+        _: atom <- print(" released=");
+        _: atom <- print_int64(storelog@header_first_seq(storelog@block_header(7, 0), 0));
+        _: atom <- print(" zero=");
+        _: atom <- print_int64(storelog@header_first_seq(storelog@zeros(16), 0));
+        _: atom <- println("");
+        b1: string <- storelog@put(b0, 16, storelog@envelope(7, "alpha"));
+        b2: string <- storelog@put(b1, 37, storelog@envelope(8, "beta"));
+        // a sync: the next record starts at the unit boundary (64 here)
+        b3: string <- storelog@put(b2, 64, storelog@envelope(9, "gamma"));
+        // a stale record of an earlier lap after the tail: good check, old number
+        b4: string <- storelog@put(b3, 85, storelog@envelope(2, "stale"));
+        p1: int64 <- show("r7", storelog@scan(b4, 16, 256, 64, 7));
+        p2: int64 <- show("r8", storelog@scan(b4, p1, 256, 64, 8));
+        p3: int64 <- show("r9", storelog@scan(b4, p2, 256, 64, 9));
+        _: int64 <- show("r10", storelog@scan(b4, p3, 256, 64, 10));
+        // a flipped byte in record 8's payload: the block ends there (9 is at a boundary but 8 was expected)
+        bad: string <- storelog@put(b4, 54, "X");
+        q1: int64 <- show("f7", storelog@scan(bad, 16, 256, 64, 7));
+        _: int64 <- show("f8", storelog@scan(bad, q1, 256, 64, 8));
+        // a torn tail: record 9 cut short
+        torn: string <- storelog@put("", 0, b3);
+        _: int64 <- show("t9", storelog@scan(storelog@put(b2, 64, "ab"), p2, 256, 64, 9));
+        _: atom <- print("torn length=");
+        _: atom <- print_int64(length_bytes(torn));
+        _: atom <- println("");
+        // a 4000-byte record: the check walks every byte
+        big: string <- storelog@zeros(4000);
+        _: int64 <- show_len("big", storelog@scan(storelog@put(b0, 16, storelog@envelope(7, big)), 16, 4096, 512, 7))
+    produces
+        pure 0
+    end
+}
+
+fn show_len(label: string, r: (:record, string, int64) | (:end, int64)) -> int64 {
+    case r of {
+        (:record, p: string, nx: int64) -> said_end(label, length_bytes(p));
+        (:end, nx: int64) -> said_end("big missing", nx)
+    }
+}
