@@ -5,6 +5,9 @@ Status (2026-11-12): directory created; nothing is built yet.
 - Board: Raspberry Pi Pico 2 W (a microcontroller board, not a hosted computer).
 - Chip: RP2350, dual Arm Cortex-M33 (ARMv8-M Mainline, Thumb-2) at up to 150 MHz, about 520 KB SRAM, 4 MB flash.
   This target uses the Arm cores. (The chip can also boot its Hazard3 RISC-V cores; they are not currently targeted.)
+  Whether the two core types can run together (one Arm core and one RISC-V core at once) is open: sources disagree.
+  It could be explored through the datasheet (the Arm/RISC-V architecture switching section) and early
+  experimentation on the board.
 - Closest existing chip, assembly wise: **STM32-L476RG (Arm Cortex-M4, ARMv7E-M, Thumb-2)**, the chip of `STM32-L476RG_raw` (Nucleo).
   The M33 runs the same Thumb-2 instruction family as the M4 (the ESP32-S3's Xtensa LX7 is a different ISA), so
   the `STM32-L476RG_raw` (Nucleo) emitter is the base and `ESP32-S3_raw` is not.
@@ -25,6 +28,13 @@ Status (2026-11-12): directory created; nothing is built yet.
    firmware (and its CLM/calibration data and the Bluetooth controller firmware), which are proprietary Infineon
    binaries loaded into the chip at boot and embedded in the build as data. The gSPI bus protocol, the Wi-Fi host
    driver, the Bluetooth HCI transport and the host stack are written in Silica.
+
+## Datasheets
+
+- [RP2350 datasheet](https://datasheets.raspberrypi.com/rp2350/rp2350-datasheet.pdf) (the chip: cores, memory map,
+  peripherals, boot, the Arm/RISC-V architecture select).
+- [Pico 2 W datasheet](https://pip-assets.raspberrypi.com/categories/1088-raspberry-pi-pico-2-w/documents/RP-008304-DS-2-pico-2-w-datasheet.pdf)
+  (the board: pinout, the CYW43439 wiring).
 
 ## References (read for understanding; none is a source being ported)
 
