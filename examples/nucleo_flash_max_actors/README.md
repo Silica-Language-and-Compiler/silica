@@ -129,10 +129,22 @@ halts. The RAM-loading trial flow still works, because its `reset halt` stops th
 program runs. To erase the program, which costs another erase cycle, run:
 `openocd -f interface/stlink.cfg -f target/stm32l4x.cfg -c init -c "reset halt" -c "stm32l4x mass_erase 0" -c shutdown`.
 
-Not yet checked on the board (see `compiler/design_documents/stm32_flash_execution_design.md`):
+## First run on the board (2026-11-12, by hand, compiler 999990)
 
-- OpenOCD's `program ... verify` on this ST-LINK.
-- Booting from main flash (BOOT0 low, option bytes).
+`make flash` programmed and verified the image, the board booted from flash, and the program printed:
+
+```
+[silica] stacks: machine 268/6144 aux 16/2048 heap: in use 76336 free 12544 sram2: in use 29568 free 128
+spawned: 34
+answered: 34 (estimate 37)
+```
+
+and exited 0. So OpenOCD's `program ... verify` works on this ST-LINK, the board boots from main flash, `.data` is
+copied from flash correctly, and every worker's first dispatch stayed within its first chunks. SRAM2's chunk arena
+ended 128 bytes from full and the SRAM1 heap 12,544 bytes from full, which is consistent with MAX = 37 (three more
+workers would need about 8,448 bytes). The run cost one erase cycle on each of the 22 flash pages.
+
+Still not checked on the board (see `compiler/design_documents/stm32_flash_execution_design.md`):
+
 - Whether the ART enable in `_start` reads back.
 - The flash-mode wall clock: it is not written, so `current_time` counts from the start.
-- That every worker's first dispatch really stays within its first chunks.
