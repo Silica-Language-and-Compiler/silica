@@ -49,10 +49,11 @@ compares each frame it receives with `term_to_binary(binary_to_term(F), [determi
   source. It dials `138.197.209.113:4550`, sends accel requests and answers status requests.
   - Its carrier declaration is `carried_on wire: (:tcp) (:interface, "en0");`, the interface of this Mac's
     default route (`run.sh` reads it from `route -n get default`; `MAC_IFACE` overrides it; the `--local` copy
-    declares `(:interface, "lo0")`). **The interface binding is NOT enforced:** a hosted link declaration binds nothing yet
-    (`compiler/design_documents/transport_links_design.md` §3.2, future stage E2); the compiler checks only its
-    tags, and the dial to `138.197.209.113:4550` leaves by whatever route the routing table picks. See
-    `../ethernet_direct/README.md`.
+    declares `(:interface, "lo0")`). The interface binding is enforced since stage E2 (built 2026-11-12; not yet re-run here):
+    the dial leaves from `en0`'s address, which is the address the default route would pick. This end never listens,
+    so the `listen:any` refusal does not touch it; its build script still passes a listen address, now
+    `"listen:<port>"` for consistency with `../ethernet_direct`. **Choice made: the declaration is kept.** The
+    remote end is the Erlang peer, which listens on 0.0.0.0 as before. See `../ethernet_direct/README.md`.
 - **The remote end: `status_side_peer.erl`.** `run.sh` copies it to the remote and compiles it there with `erlc`
   (OTP 27). It runs with `erl -noshell` under `timeout 90` and does what the Silica status side does, printing the
   same lines:

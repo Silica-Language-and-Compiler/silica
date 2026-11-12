@@ -6,20 +6,20 @@
 #   REMOTE=manager@aalang.org ./run.sh                    run once, compare
 #   REMOTE=manager@aalang.org ./run.sh --runs 2           the run twice in a row
 #   REMOTE=manager@aalang.org ./run.sh --timeout-check    no remote end: the Erlang peer must time out (exit 5)
-#   ./run.sh --local                                      both ends on this Mac (listen:any:45560, dial 127.0.0.1)
+#   ./run.sh --local                                      both ends on this Mac (listen:45560, dial 127.0.0.1)
 #   ./run.sh --local --timeout-check                      the Erlang peer alone on this Mac, nothing to dial: exit 5
 #   REMOTE=manager@aalang.org ./run.sh --rebuild-linux    rebuild the Linux end in this example's remote directory
 #
 # 1. Compile accel_side_peer.erl with erlc on the Mac (into build/).
 # 2. The Linux end (the status side of ../ethernet_direct/dangerous_ethernet_direct_pair.silica, listening on
-#    "listen:any:4550"). By default it is NOT compiled: the program ../ethernet_direct/run_direct.sh built on the
+#    "listen:4550"). By default it is NOT compiled: the program ../ethernet_direct/run_direct.sh built on the
 #    remote (~/silica_demo/ethernet_direct/build/dangerous_ethernet_direct_pair) is copied into
 #    ~/silica_demo/ethernet_mac_erlang_remote_silica/build, after checking that the source it was built from is
 #    the Linux copy run_direct.sh makes today (same sha256). --rebuild-linux instead stages the sources in this
 #    example's remote directory and builds there with ../ethernet_direct/build_linux.sh, and only when no other
 #    silica-compiler or make runs on the remote.
 # 3. For each run: check the remote's 1-minute load (a run is skipped, and counts as failed, above 4); start the
-#    Linux end under `timeout 90` and wait until it listens on 0.0.0.0:<port>; run the Erlang peer, which dials
+#    Linux end under `timeout 90` and wait until it listens on the interface's address, port <port>; run the Erlang peer, which dials
 #    <remote-ip>:<port>; wait for the Linux end to exit; compare both outputs with expected/ (sorted: the two
 #    directions' lines interleave differently from run to run; uptime_ms becomes <n>).
 # 4. Tear down (trap and after each run): kill the remote program, then check that the remote has no program and
@@ -186,8 +186,8 @@ if [ "$MODE" = local ]; then
         timeout_verdict "$WORK/local_timeout.out" $rc && echo "=== PASS" || { echo "=== FAIL"; exit 1; }
         exit 0
     fi
-    echo "== local: the Silica status side listens on listen:any:$LOCAL_PORT, the Erlang peer dials 127.0.0.1:$LOCAL_PORT"
-    build_mac_silica "$WORK/local/status" linux "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64 '(:interface, "lo0")'
+    echo "== local: the Silica status side listens on listen:$LOCAL_PORT, the Erlang peer dials 127.0.0.1:$LOCAL_PORT"
+    build_mac_silica "$WORK/local/status" linux "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64 '(:interface, "lo0")'
     all=1
     for r in $(seq 1 "$RUNS"); do
         echo "== local run $r"
@@ -209,10 +209,10 @@ if [ $TCHECK = 1 ]; then
     exit 0
 fi
 
-echo "== 2. Linux end (Silica, status side) on $REMOTE: listen:any:$PORT"
+echo "== 2. Linux end (Silica, status side) on $REMOTE: listen:$PORT"
 rsh 'echo "remote: $(hostname) ($(uname -sm))"' || { echo "run: ssh failed"; exit 1; }
 remote_port_free || { echo "run: remote port $PORT in use (or ssh failed):"; remote_listener; exit 1; }
-side_copy "$DIRECT/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:any:$PORT" "$REMOTE_IP:$PORT" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
+side_copy "$DIRECT/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:$PORT" "$REMOTE_IP:$PORT" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
 want=$(shasum -a 256 "$WORK/$NAME.linux.silica" | cut -c1-64)
 rsh "mkdir -p $RDIR/build" || exit 1
 if [ $REBUILD = 0 ]; then
@@ -239,7 +239,7 @@ all=1
 for r in $(seq 1 "$RUNS"); do
     echo "== 3. run $r: remote load"
     remote_load_ok || { echo "SKIPPED: run $r (remote load)"; all=0; continue; }
-    echo "== 3. run $r: start the Linux end (timeout 90), listening on 0.0.0.0:$PORT"
+    echo "== 3. run $r: start the Linux end (timeout 90), listening on the declared interface's address, port $PORT"
     rsh "cd $RDIR/build && rm -f peer.out && (setsid nohup bash -c 'timeout 90 $RDIR/build/$NAME > peer.out 2>&1; echo \"exit \$?\" >> peer.out' > /dev/null 2>&1 &)" || exit 1
     up=0
     for i in $(seq 1 20); do remote_listener >/dev/null && { up=1; break; }; sleep 0.5; done

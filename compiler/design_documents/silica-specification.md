@@ -10772,6 +10772,7 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2415 | two carrier declarations, in one module or across the modules of a compile, claim the same exclusive hardware: a UART or USB CDC instance, a serial port path, or the USB-Serial-JTAG controller |
 | E2416 | reserved: the link needs a board configuration function that is not defined (phase D; nothing reaches it yet) |
 | E2417 | a link parameter is not a literal, is of the wrong kind, is missing or is one too many, a baud is not positive, or the pack rejects the baud |
+| E2418 | a `(:tcp)` carrier on a link the target serves (`(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`) is opened by a `cast(x, (:open, owner, "<address>"))` whose address literal the link refuses: `"listen:any:<port>"` under any of them, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; `x` is bound in the same function by `spawn_dangerous_carrier`. An address the checker cannot see (a variable, a function's result) is refused at run time instead: the carrier tells its owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)` |
 
 #### 16.4.10 Diagnostics
 
@@ -10787,7 +10788,7 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2409 | a program `impl` of `WireFormat` or `Carrier` |
 | E2410 | a protocol or carrier tag the build's target does not provide |
 | E2411 | an `impl Transportable` or `impl Recreatable` declaration |
-| E2412 to E2417 | carrier link diagnostics, with E1081 for a malformed `carried_on` line: §16.4.9 |
+| E2412 to E2418 | carrier link diagnostics, with E1081 for a malformed `carried_on` line: §16.4.9 |
 | W2401 | advisory: a decoder was derived; foreign bytes become values here |
 
 ## 17. Atomic Operations

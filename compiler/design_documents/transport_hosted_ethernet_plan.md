@@ -4,7 +4,7 @@ Status: 2026-11-10. E0 done. E1 dropped: work-network restrictions rule out the 
 L0 to L3 (§5a) ran a Silica-to-Silica interchange between this Mac and the remote Linux x86-64 host; they are done.
 **Tunnels dropped the same day (user ruling): stages D0 to D2 (§5b) run that interchange over one direct TCP
 connection, with the Mac dialing `138.197.209.113:4550` and requests flowing both ways. This adds the carrier's
-`"listen:any:<port>"` wildcard listener.** **Next (Lee, 2026-11-11): E2 is the next stage and is widened (PLANNED, not built): all three hosted targets, a new `"listen:<ipv4>:<port>"` listener form, interface binding, refusal rules and an interim guard (see E2 below).** The rest of the stages below are not started. Companion to `transport_serialization_design.md` (carriers, ETF,
+`"listen:any:<port>"` wildcard listener.** **E2 is IN PROGRESS (Lee, 2026-11-12: started on branch `E2-transport-work`, implemented by Fable 2026-11-12; code in the tree, compilers being rebuilt, nothing run in the suite yet; the Mac loopback matrix of the probe is the only run) and is widened (Lee, 2026-11-11): all three hosted targets, a new `"listen:<ipv4>:<port>"` listener form, interface binding, refusal rules and an interim guard `E2418` (see E2 below).** The rest of the stages below are not started. Companion to `transport_serialization_design.md` (carriers, ETF,
 wire framing), `transport_links_design.md` (`carried_on`, `(:ethernet, n)`, `(:interface, name)`) and
 `transport_esp32s3_wifi_plan.md` (the serial plan whose demos this one mirrors).
 
@@ -85,14 +85,14 @@ Missing:
   `ethernet_peer.erl` (listens; dials), both with the `(:request, id, body)` rule, both exiting 0 after N exchanges.
   First on one Mac (127.0.0.1, both directions, no ssh): proves the logic before the network. Output compared with an
   `expected.txt`.
-- **E2. Hosted link binding. PLANNED, not built; next stage after the current board trial runs and push (Lee,
-  2026-11-11), widened as follows.** Today the only listener choices are loopback (`listen:<port>`) or every interface
+- **E2. Hosted link binding. IN PROGRESS (started 2026-11-12 on branch `E2-transport-work`, implemented by Fable: the
+  Linux x86-64, Linux AArch64 and Mac packs together; nothing built yet). Widened (Lee, 2026-11-11) as follows.** Today the only listener choices are loopback (`listen:<port>`) or every interface
   (`listen:any:<port>`), and `(:interface, name)`/`(:ethernet, n)` are accepted but not enforced, so a declaration can
   imply a restriction it does not give; a multi-homed host cannot restrict an off-host listener to one network.
   1. **Interim guard (first inside E2; may land before the full binding).** A `(:interface, ...)`, `(:ethernet, n)` or
      `(:wifi, n)` declaration next to a `listen:any:` address must not pass silently. Decision: a runtime refusal at
      `:open` in `dangerous_tcp_carrier` (`(:explicit, :link_unavailable)`), plus a compile diagnostic with a
-     placeholder code `E24xx` (number assigned at implementation) where the checker sees both literals.
+     code `E2418` where the checker sees both literals.
   2. **New listener form `"listen:<ipv4>:<port>"`.** Binds one given IPv4 address: a new
      `dangerous_sockets@tcp_listen_addr`, parsed in `dangerous_tcp_carrier` next to `"listen:any:"` and
      `"listen:<port>"`.
@@ -114,7 +114,38 @@ Missing:
   7. **`"listen:any:<port>"` stays** (Lee, 2026-11-11: "don't remove"). E2 only adds the refusal rules of item 4 and
      the guard of item 1; the form is not deprecated or removed. Its users (`ethernet_direct`, `ethernet_remote`,
      trial `app_transport_tcp_listen_any`, BEES N1) keep working when no named link is declared.
-  8. **Who:** Fable implements (compiler/stdlib and packs are compiler code); Sonnet writes the trials; Haiku
+     **As implemented (2026-11-12).** `ethernet_direct` declared `(:interface, "en0")` and listened on `listen:any:4550`;
+     that combination is now refused (the named link refuses `listen:any`), so its source and `run_direct.sh` use
+     `"listen:4550"`, which binds `en0`'s address. The examples that declare no named link keep `listen:any`.
+     Family counting: `(:ethernet, n)` and `(:wifi, n)` count only interfaces that hold an IPv4 address (n counts from 0
+     in `getifaddrs` order, an interface once). Dials under `(:loopback)` are unchanged; a dial under a named link leaves
+     from the interface's address. The UDP carrier still binds nothing. Behaviour table (also links design §3.2,
+     transport design §6.3): no link: `listen:<port>` 127.0.0.1, `listen:any:<port>` 0.0.0.0, `listen:<ip>:<port>` that
+     ip; `(:loopback)`: `listen:<port>` 127.0.0.1, `listen:any` refused, `listen:<ip>` only in 127.0.0.0/8; named links:
+     `listen:<port>` that interface's first IPv4 address, `listen:any` refused, `listen:<ip>` only that interface's
+     addresses. Refusal: `(:link_down, :fault)` to the owner, then the carrier ends `(:explicit, :link_unavailable)`;
+     malformed IPv4 ends `(:explicit, :bad_address)`. E2418 (compile) covers `spawn_dangerous_carrier` plus a
+     `cast(x, (:open, _, "<literal>"))` in one function, TCP carriers on a link the target serves; else E2412.
+     **Built vs verified.** Built: all three packs, `silica_sockets.c`, `dangerous_sockets`, `dangerous_tcp_carrier`,
+     the E2418 scan. Verified: on the Mac over loopback only (Fable's probe matrix). Not verified: the Linux
+     classifier (sysfs wireless/device/type), Wi-Fi interfaces, a non-loopback interface, any suite run.
+     **Open point:** IPv4 literals with leading zeros (`010.0.0.1`) are parsed by `inet_aton`/`inet_pton`; macOS and
+     glibc differ on them (octal or rejected), so `parse_ipv4` can accept on one host and refuse on the other.
+     **Trials written (2026-11-12, not run):** `trials/transport_addition/app_transport_tcp_link_rules` (interface and
+     family absent, listen_ip, `(:loopback)` refusing 10.x, a named link refusing any: each runtime refusal is one
+     program; refusal scouts are drafts, since the actor-failure banner order against stdout is unconfirmed),
+     `trials/error_enforcement_addition/link_{interface_listen_any,loopback_listen_any,loopback_listen_ip}_trial`
+     (E2418, one directory each; one Mac `golden_fail` each, the text is host-independent), and the host-dependent
+     `programmer_tools/transport_interface_link` (lo0 on macOS, lo on Linux, outside `make integrate`).
+  8. **Sequencing and merge (Lee, 2026-11-12: "start E2 and update the plan. do no work for the persistence").** E2
+     merges to main FIRST. The separate branch `origin/local-data-storage-as-transport` (a docs-only design, §6.8 of
+     `transport_serialization_design.md`, storage carriers `(:store)`) is NOT part of E2 and no E2 work is done for it.
+     When that design is later built it will add rows to the same three transport packs and to `Link.silica` and
+     `Carrier.silica`. Rules for both streams: pack changes are added rows and new helper functions (do not reformat or
+     reorder existing arms); `.ascomp` and `.golden_fail` goldens are never merged by hand (regenerate with the
+     trial-then-update rule after a merge); the persistence sidecar goes in a new C file (not `silica_sockets.c`); error
+     codes: E2418 is E2's, and the persistence design reuses E2412 to E2415 and E2417 and needs no new code.
+  9. **Who:** Fable implements (compiler/stdlib and packs are compiler code); Sonnet writes the trials; Haiku
      builds and runs. ESP32-S3 and Nucleo are unaffected.
 - **E3. In-suite trials** (`trials/transport_addition` and `trials/ffi_addition`): two Silica peers on loopback doing
   the request/reply exchange from both sides (dial and listen in the same program, two connections), plus a failure

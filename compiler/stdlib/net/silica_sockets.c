@@ -39,6 +39,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <sys/ioctl.h>
+#if defined(__APPLE__)
+#include <sys/sockio.h>
+#endif
+#include <stdio.h>
 
 typedef struct silica_sockets_tagged {
     int64_t tag;
@@ -141,11 +148,192 @@ silica_sockets_tagged silica_sockets_tcp_listen(int64_t port) {
 }
 
 /* Binds every IPv4 interface (INADDR_ANY, 0.0.0.0:port): the explicit wildcard form a program asks for with
-   the carrier address "listen:any:<port>", until interface binding ((:interface, name), links design) exists.
-   Plain TCP with no authentication: anyone who can reach the port can connect, so the host's firewall is the
+   the carrier address "listen:any:<port>" when no link is declared (a declared link refuses it: links design
+   §3.2, hosted Ethernet plan E2). Plain TCP with no authentication: anyone who can reach the port can connect, so the host's firewall is the
    only protection. */
 silica_sockets_tagged silica_sockets_tcp_listen_any(int64_t port) {
     return tcp_listen_on(port, INADDR_ANY);
+}
+
+/* Binds one given IPv4 address (dotted quad, "10.0.0.5"): the carrier address "listen:<ipv4>:<port>", and the
+   address of the interface a named link selected (silica_sockets_link_select). A text that is not a dotted quad is
+   EINVAL; the carrier checks it first with silica_sockets_parse_ipv4 and refuses it with its own reason.
+   port: set_args a */
+silica_sockets_tagged silica_sockets_tcp_listen_addr(const uint8_t *host_ptr, uint64_t host_len) {
+    char host[64];
+    struct in_addr a;
+    int64_t port = silica_sockets_arg_a;
+    if (!copy_host(host_ptr, host_len, host, sizeof host)) { errno = EINVAL; return err(); }
+    if (inet_pton(AF_INET, host, &a) != 1) { errno = EINVAL; return err(); }
+    return tcp_listen_on(port, ntohl(a.s_addr));
+}
+
+/* Connects from the given local IPv4 address (host order): the source bind of a carrier on a named link, so
+   the connection leaves by that interface's address (links design §3.2, decision 10).
+   port: set_args a, local address: set_args b */
+silica_sockets_tagged silica_sockets_tcp_connect_from(const uint8_t *host_ptr, uint64_t host_len) {
+    char host[256];
+    struct sockaddr_in addr;
+    struct sockaddr_in local;
+    int64_t port = silica_sockets_arg_a;
+    uint32_t from = (uint32_t)silica_sockets_arg_b;
+    if (!copy_host(host_ptr, host_len, host, sizeof host)) { errno = EINVAL; return err(); }
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { errno = EINVAL; return err(); }
+    memset(&local, 0, sizeof local);
+    local.sin_family = AF_INET;
+    local.sin_port = 0;
+    local.sin_addr.s_addr = htonl(from);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return err();
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    if (bind(fd, (struct sockaddr *)&local, sizeof local) < 0) { int e = errno; close(fd); errno = e; return err(); }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { int e = errno; close(fd); errno = e; return err(); }
+    return ok(fd);
+}
+
+/* A dotted-quad IPv4 text as its address in host order (value), or EINVAL: the check of "listen:<ipv4>:<port>"
+   before anything is bound. */
+silica_sockets_tagged silica_sockets_parse_ipv4(const uint8_t *host_ptr, uint64_t host_len) {
+    char host[64];
+    struct in_addr a;
+    if (!copy_host(host_ptr, host_len, host, sizeof host)) { errno = EINVAL; return err(); }
+    if (inet_pton(AF_INET, host, &a) != 1) { errno = EINVAL; return err(); }
+    return ok((int64_t)ntohl(a.s_addr));
+}
+
+/* ---- links: the interface a carrier binds to (transport_links_design.md §3.2) ------------------- */
+
+/* The interface the last silica_sockets_link_select of this thread chose. */
+static __thread char silica_sockets_link_ifname[IFNAMSIZ + 1] = "";
+
+#define SILICA_LINK_BY_NAME 0
+#define SILICA_LINK_ETHERNET 1
+#define SILICA_LINK_WIFI 2
+
+/* The family the OS gives an interface: SILICA_LINK_ETHERNET for wired, SILICA_LINK_WIFI for wireless, 0 for any
+   other (loopback, tunnels, bridges, virtual interfaces, cellular). macOS answers with the interface's functional
+   type (SIOCGIFFUNCTIONALTYPE, the "type:" line of ifconfig -v). Linux answers through sysfs: a wireless
+   interface has /sys/class/net/<if>/wireless (or phy80211); a wired one has ARPHRD_ETHER (type 1) and a
+   backing device (/sys/class/net/<if>/device), which leaves out bridges, veth pairs and other virtual links. */
+static int link_family_of(const char *name) {
+#if defined(__APPLE__)
+    struct ifreq ifr;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return 0;
+    memset(&ifr, 0, sizeof ifr);
+    strncpy(ifr.ifr_name, name, sizeof ifr.ifr_name - 1);
+    int rc = ioctl(s, SIOCGIFFUNCTIONALTYPE, &ifr);
+    close(s);
+    if (rc < 0) return 0;
+    switch (ifr.ifr_ifru.ifru_functional_type) {
+        case IFRTYPE_FUNCTIONAL_WIRED: return SILICA_LINK_ETHERNET;
+        case IFRTYPE_FUNCTIONAL_WIFI_INFRA: return SILICA_LINK_WIFI;
+        default: return 0;
+    }
+#elif defined(__linux__)
+    char path[96];
+    char text[16];
+    snprintf(path, sizeof path, "/sys/class/net/%s/wireless", name);
+    if (access(path, F_OK) == 0) return SILICA_LINK_WIFI;
+    snprintf(path, sizeof path, "/sys/class/net/%s/phy80211", name);
+    if (access(path, F_OK) == 0) return SILICA_LINK_WIFI;
+    snprintf(path, sizeof path, "/sys/class/net/%s/device", name);
+    if (access(path, F_OK) != 0) return 0;
+    snprintf(path, sizeof path, "/sys/class/net/%s/type", name);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, text, sizeof text - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    text[n] = 0;
+    return atoi(text) == 1 ? SILICA_LINK_ETHERNET : 0;
+#else
+    (void)name;
+    return 0;
+#endif
+}
+
+/* Whether name already appears among the IPv4 entries before stop in the getifaddrs list: an interface with
+   several IPv4 addresses is counted once, at its first. */
+static int link_seen_before(struct ifaddrs *list, struct ifaddrs *stop, const char *name) {
+    for (struct ifaddrs *p = list; p != 0 && p != stop; p = p->ifa_next) {
+        if (p->ifa_addr != 0 && p->ifa_addr->sa_family == AF_INET && p->ifa_name != 0 && strcmp(p->ifa_name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+/* Chooses the interface of a link for this thread and answers its first IPv4 address in host order (value).
+   family: set_args a (0 by name, 1 ethernet, 2 wifi), instance: set_args b (the n of (:ethernet, n) and
+   (:wifi, n), counting from 0 in interface enumeration order); name: the interface name, read only for
+   family 0. Only interfaces holding an IPv4 address are counted, since an address is what the carrier binds.
+   ENXIO when the interface is absent, has no IPv4 address, or fewer than n+1 of the family hold one: the
+   carrier then ends with (:explicit, :link_unavailable). */
+silica_sockets_tagged silica_sockets_link_select(const uint8_t *name_ptr, uint64_t name_len) {
+    char want[IFNAMSIZ + 1];
+    int64_t family = silica_sockets_arg_a;
+    int64_t instance = silica_sockets_arg_b;
+    struct ifaddrs *list = 0;
+    int64_t seen = 0;
+    silica_sockets_link_ifname[0] = 0;
+    if (family == SILICA_LINK_BY_NAME && !copy_host(name_ptr, name_len, want, sizeof want)) { errno = ENXIO; return err(); }
+    if (getifaddrs(&list) < 0) return err();
+    for (struct ifaddrs *p = list; p != 0; p = p->ifa_next) {
+        if (p->ifa_addr == 0 || p->ifa_addr->sa_family != AF_INET || p->ifa_name == 0) continue;
+        int match = 0;
+        if (family == SILICA_LINK_BY_NAME) {
+            match = strcmp(p->ifa_name, want) == 0;
+        } else if ((p->ifa_flags & IFF_LOOPBACK) == 0 && !link_seen_before(list, p, p->ifa_name) && link_family_of(p->ifa_name) == family) {
+            match = seen == instance;
+            seen = seen + 1;
+        }
+        if (match && strlen(p->ifa_name) <= IFNAMSIZ) {
+            uint32_t a = ntohl(((struct sockaddr_in *)p->ifa_addr)->sin_addr.s_addr);
+            memcpy(silica_sockets_link_ifname, p->ifa_name, strlen(p->ifa_name) + 1);
+            freeifaddrs(list);
+            return ok((int64_t)a);
+        }
+    }
+    freeifaddrs(list);
+    errno = ENXIO;
+    return err();
+}
+
+/* 1 when the interface the last silica_sockets_link_select chose holds the IPv4 address addr (host order),
+   else 0: the check that a "listen:<ipv4>:<port>" under a named link names that interface's address. */
+silica_sockets_tagged silica_sockets_link_owns(int64_t addr) {
+    struct ifaddrs *list = 0;
+    int64_t found = 0;
+    if (silica_sockets_link_ifname[0] == 0) return ok(0);
+    if (getifaddrs(&list) < 0) return err();
+    for (struct ifaddrs *p = list; p != 0; p = p->ifa_next) {
+        if (p->ifa_addr == 0 || p->ifa_addr->sa_family != AF_INET || p->ifa_name == 0) continue;
+        if (strcmp(p->ifa_name, silica_sockets_link_ifname) != 0) continue;
+        if (ntohl(((struct sockaddr_in *)p->ifa_addr)->sin_addr.s_addr) == (uint32_t)addr) { found = 1; break; }
+    }
+    freeifaddrs(list);
+    return ok(found);
+}
+
+/* The peer of a connected descriptor: its IPv4 address in host order (silica_sockets_peer_addr) and its port
+   (silica_sockets_peer_port), so a listener reports who connected ("peer:<ipv4>:<port>"). */
+silica_sockets_tagged silica_sockets_peer_addr(int64_t fd) {
+    struct sockaddr_in addr;
+    socklen_t n = sizeof addr;
+    if (getpeername((int)fd, (struct sockaddr *)&addr, &n) < 0) return err();
+    if (addr.sin_family != AF_INET) { errno = EAFNOSUPPORT; return err(); }
+    return ok((int64_t)ntohl(addr.sin_addr.s_addr));
+}
+
+silica_sockets_tagged silica_sockets_peer_port(int64_t fd) {
+    struct sockaddr_in addr;
+    socklen_t n = sizeof addr;
+    if (getpeername((int)fd, (struct sockaddr *)&addr, &n) < 0) return err();
+    if (addr.sin_family != AF_INET) { errno = EAFNOSUPPORT; return err(); }
+    return ok((int64_t)ntohs(addr.sin_port));
 }
 
 /* The port a listener was given 0 for: the one the system chose. */

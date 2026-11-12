@@ -6,17 +6,17 @@
 #   REMOTE=manager@aalang.org ./run_direct.sh                  build both ends, run once, compare
 #   REMOTE=manager@aalang.org ./run_direct.sh --runs 2         ... the run (not the builds) twice in a row
 #   REMOTE=manager@aalang.org ./run_direct.sh --timeout-check  no Linux end: the Mac end must time out (exit 5)
-#   ./run_direct.sh --local                                    both ends on this Mac (listen:any, dial 127.0.0.1)
+#   ./run_direct.sh --local                                    both ends on this Mac (listen:<port>, dial 127.0.0.1)
 #
 # 1. Build the Mac end (the accel side, it dials) from dangerous_ethernet_direct_pair.silica with SILICA_COMPILER
 #    (default binaries/silica-compiler).
 # 2. Wait until the remote is idle (no silica-compiler or make running there: another build may share its two
 #    CPUs and 3.9 GB), then stage under ~/silica_demo/ethernet_direct on the remote the stdlib sources,
 #    silica_sockets.c and build_linux.sh, and build the Linux end (the status side, it listens on
-#    "listen:any:<port>"; the same source with the side blocks swapped by sed) there with LINUX_COMPILER (default
+#    "listen:<port>"; the same source with the side blocks swapped by sed) there with LINUX_COMPILER (default
 #    ~/silica_demo/toolchain/silica-compiler, the Mac checkout's binaries/silica-compiler-linux_x86_64 staged by
 #    ../ethernet_remote; only read).
-# 3. For each run: start the Linux end under `timeout 90` and wait until it listens on 0.0.0.0:<port>; run the
+# 3. For each run: start the Linux end under `timeout 90` and wait until it listens on the interface's address, port <port>; run the
 #    Mac end, which dials <remote-ip>:<port> directly; wait for the Linux end to exit; compare both outputs with
 #    expected/ (sorted: the two directions' lines interleave differently from run to run; uptime_ms becomes <n>).
 # 4. Tear down (trap and after each run): kill the remote program, then check that the remote has no program and
@@ -146,13 +146,13 @@ compare_both() {   # MAC_OUT LINUX_OUT
     [ $ok = 1 ]
 }
 
-# ---- --local: both ends on this Mac (the listener binds 0.0.0.0:<local port>, the dialer uses 127.0.0.1) ----
+# ---- --local: both ends on this Mac (the listener binds the declared lo0 address, 127.0.0.1:<local port>, the dialer uses 127.0.0.1) ----
 if [ "$MODE" = local ]; then
-    echo "== local: the status side listens on listen:any:$LOCAL_PORT, the accel side dials 127.0.0.1:$LOCAL_PORT"
+    echo "== local: the status side listens on listen:$LOCAL_PORT, the accel side dials 127.0.0.1:$LOCAL_PORT"
     busy=$(lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN 2>/dev/null)
     [ -z "$busy" ] || { echo "run_direct: Mac port $LOCAL_PORT in use"; exit 1; }
-    build_mac "$WORK/local/accel" mac "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" mac-arm64 '(:interface, "lo0")'
-    build_mac "$WORK/local/status" linux "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64 '(:interface, "lo0")'
+    build_mac "$WORK/local/accel" mac "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" mac-arm64 '(:interface, "lo0")'
+    build_mac "$WORK/local/status" linux "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64 '(:interface, "lo0")'
     all=1
     for r in $(seq 1 "$RUNS"); do
         echo "== local run $r"
@@ -167,10 +167,10 @@ if [ "$MODE" = local ]; then
 fi
 
 echo "== 1. Mac end (accel side): dials $REMOTE_IP:$PORT"
-build_mac "$WORK/mac" mac "listen:any:$PORT" "$REMOTE_IP:$PORT" mac-arm64 "(:interface, \"$MAC_IFACE\")"
+build_mac "$WORK/mac" mac "listen:$PORT" "$REMOTE_IP:$PORT" mac-arm64 "(:interface, \"$MAC_IFACE\")"
 
 if [ "$MODE" = pair ]; then
-    echo "== 2. Linux end (status side) on $REMOTE: listen:any:$PORT"
+    echo "== 2. Linux end (status side) on $REMOTE: listen:$PORT"
     rsh 'echo "remote: $(hostname) ($(uname -sm))"' || { echo "run_direct: ssh failed"; exit 1; }
     remote_port_free || { echo "run_direct: remote port $PORT in use (or ssh failed):"; remote_listener; exit 1; }
     # Never compile while another build runs there (two CPUs, 3.9 GB, no swap).
@@ -188,7 +188,7 @@ if [ "$MODE" = pair ]; then
     scp -q "${SSH_OPTS[@]}" "$ROOT"/compiler/stdlib/{Supervisor,wire_etf,wireframe,Carrier,dangerous_sockets,dangerous_tcp_carrier}.silica \
         "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$REMOTE:silica_demo/ethernet_direct/stdlib/" || exit 1
     scp -q "${SSH_OPTS[@]}" "$ROOT"/compiler/stdlib/net/{silica_sockets.c,silica_sockets_wrapper.meta} "$REMOTE:silica_demo/ethernet_direct/stdlib/net/" || exit 1
-    side_copy "$HERE/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:any:$PORT" "$REMOTE_IP:$PORT" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
+    side_copy "$HERE/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:$PORT" "$REMOTE_IP:$PORT" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
     scp -q "${SSH_OPTS[@]}" "$WORK/$NAME.linux.silica" "$REMOTE:silica_demo/ethernet_direct/build/$NAME.silica" || exit 1
     rsh "chmod +x $RDIR/build_linux.sh && $RDIR/build_linux.sh $RDIR/build $NAME $LINUX_COMPILER" || exit 1
 fi
@@ -196,7 +196,7 @@ fi
 all=1
 for r in $(seq 1 "$RUNS"); do
     if [ "$MODE" = pair ]; then
-        echo "== 3. run $r: start the Linux end (timeout 90), listening on 0.0.0.0:$PORT"
+        echo "== 3. run $r: start the Linux end (timeout 90), listening on the declared interface's address, port $PORT"
         rsh "cd $RDIR/build && rm -f peer.out && (setsid nohup bash -c 'timeout 90 ./$NAME > peer.out 2>&1; echo \"exit \$?\" >> peer.out' > /dev/null 2>&1 &)" || exit 1
         up=0
         for i in $(seq 1 20); do remote_listener >/dev/null && { up=1; break; }; sleep 0.5; done
