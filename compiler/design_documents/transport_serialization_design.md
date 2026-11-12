@@ -502,11 +502,11 @@ way down" (§4.6) made concrete. All messages are cast-only (`:no_reply`), as de
 | --- | --- | --- |
 | program to carrier | `(:open, owner: actor_ref, address: string)` | bind or connect; `address` is carrier-specific text (`"10.0.0.2:4369"`, `"listen:4369"` to listen on 127.0.0.1, `"listen:any:4369"` to listen on every interface, `""` for a UART, a characteristic UUID for BLE). On a connection a listener accepted (next table) `address` is ignored: the peer is already there, and the sender becomes the connection's owner |
 | program to carrier | `(:tx, segment: string, from: actor_ref)` | send one segment; consumes one send credit |
-| program to carrier | `(:credit, n: uint32)` | the owner will accept n more `:rx` messages |
-| program to carrier | `(:close)` | orderly close; the carrier ends after `:link_down` |
+| program to carrier | `(:credit, n: int64)` | the owner will accept n more `:rx` messages |
+| program to carrier | `:close` | orderly close; the carrier ends after `:link_down`. A bare atom: a one-atom tuple is not a run-time value |
 | carrier to owner | `(:link_up, info: string)` | connected or bound; `info` is carrier-specific (negotiated MTU for BLE, peer address for TCP) |
 | carrier to owner | `(:rx, segment: string)` | one received segment; consumes one receive credit |
-| carrier to owner | `(:tx_credit, n: uint32)` | the carrier can take n more `:tx` messages |
+| carrier to owner | `(:tx_credit, n: int64)` | the carrier can take n more `:tx` messages |
 | carrier to owner | `(:tx_failed, reason: atom)` | a segment was not sent (`:no_credit`, `:link_down`, `:too_long`) |
 | carrier to owner | `(:link_down, reason: atom)` | the link ended (`:closed`, `:reset`, `:timeout`, `:fault`) |
 
@@ -635,7 +635,9 @@ on the Apple Silicon Mac and the ESP32-S3_raw board**; the Linux packs list no l
 
 ### 6.8 Storage carriers: durable logs, transport through time
 
-**Status: design, 2026-11-11 (Lee's four decisions are recorded at the end); nothing here is built.** A program
+**Status: design, 2026-11-11 (Lee's decisions are recorded at the end). Phases S0 and S1 are implemented on Apple
+Silicon (2026-11-12; §6.8.9 and §6.8.10 say what was built and where it differs from the text below); S2 and S3 are not
+built.** A program
 that must keep values past a restart sends them to a **storage carrier**. The peer is the program's own future
 self (or another program that opens the same medium afterwards; one owner at a time, §6.8.2). Everything else is the transport the rest of §6 already
 describes: the same `carried_on` declaration, the same pack rows, the same `WireFormat` traits, the same
@@ -655,7 +657,7 @@ afterthought.
 ```silica
 carried_on audit:  (:store) (:sd_blocks, 0, :ring);          // board: region 0 of the SD card, oldest records overwritten
 carried_on config: (:store) (:flash_region, 1, :stop);       // board: region 1 of the internal flash, refuse when full
-carried_on trace:  (:store) (:backing, "/var/lib/app/trace", 67108864, :trim);   // hosted: where the bytes live and how many; the path appears only here
+carried_on trace:  (:store) (:backing, "/var/lib/app/trace.sildat", 67108864, :trim);   // hosted: where the bytes live and how many; the path appears only here
 carried_on scratch:(:store) (:memory, 65536, :stop);         // any target: RAM medium, nothing survives; for trials
 ```
 
@@ -667,6 +669,15 @@ one declaration owns: the board pack names the regions of the card and of the fl
 register windows), and the hosted `(:backing, path, capacity, retention)` is one region of `capacity` bytes, created at
 that size by the first open. A backing that already exists at another size is not resized: the open ends with
 `(:link_down, :mismatch)`. The write-behind buffer's size is the pack's number, not a link parameter (§6.8.2).
+**A backing's name ends in `.sildat`** (Lee, 2026-11-12): every hosted example, trial and document names its storage
+location that way (`"/var/lib/app/trace.sildat"`), so a Silica data file is recognisable on a host and can be kept out of a
+repository by one ignore rule.
+
+**The medium decides the kind of actor.** The `(:memory)` carrier touches nothing foreign, so it is an ordinary actor and
+not a dangerous one: `spawn_dangerous_carrier(<name>, ...)` answers an `actor_ref` for a `(:memory)` store. The hosted
+`(:backing)` carrier goes through a C sidecar, so it is a dangerous actor and the same call answers a
+`dangerous_actor_ref` for it. A program that holds the carrier's reference in a typed binding therefore names the
+reference type of its medium.
 
 The declaration needs no new diagnostic. A region claimed by two declarations in one build is E2415, exactly as one
 UART or one serial path is; an unknown link tag is E2413; a link the target does not provide is E2412, a region number
@@ -687,23 +698,25 @@ that cuts a bigger frame into records and puts it back.
 
 The §6.2 messages carry over unchanged where the meaning fits. The additions are marked. Every sequence number in a
 message is **exclusive**: it names the first record *not* covered, so an empty log has an answer for each of them.
+Sequence numbers and counts are `int64` in messages; a sequence number is 8 bytes on the medium. `:sync` and
+`:read_stop` are bare atoms, as `:close` is, because a one-atom tagged tuple is not a run-time value.
 
 | Direction | Message | Meaning |
 | --- | --- | --- |
 | program to carrier | `(:open, owner: actor_ref, address: string)` | claim the region; `address` is `""` (the stores take no address; reserved) |
 | program to carrier | `(:tx, segment: string, from: actor_ref)` | append one record to the write-behind buffer; consumes one send credit; the carrier numbers it. A record that is not accepted takes no number |
-| program to carrier | `(:sync)` **new** | make everything accepted so far durable; answered by `(:synced, next)` |
-| program to carrier | `(:read, from: uint64)` **new** | replay the records from sequence number `from`, in order, as `:rx`, under receive credit |
-| program to carrier | `(:read_stop)` **new** | end the replay in progress; answered by `(:rx_end, next)` with the number of the first record not delivered |
-| program to carrier | `(:credit, n: uint32)` | the owner will accept n more `:rx` messages (replay is paced by this, as a TCP receive window is) |
-| program to carrier | `(:trim, upto: uint64)` **new** | release every record with a sequence number below `upto`; answered by `:log` once the release is durable |
-| program to carrier | `(:close)` | drain the buffer to the medium, make it durable, then `(:link_down, :closed)` |
+| program to carrier | `:sync` **new** | make everything accepted so far durable; answered by `(:synced, next)` |
+| program to carrier | `(:read, from: int64)` **new** | replay the records from sequence number `from`, in order, as `:rx`, under receive credit |
+| program to carrier | `:read_stop` **new** | end the replay in progress; answered by `(:rx_end, next)` with the number of the first record not delivered |
+| program to carrier | `(:credit, n: int64)` | the owner will accept n more `:rx` messages (replay is paced by this, as a TCP receive window is). The credit is the carrier's, not one replay's: credit left over when a replay ends is still good for the next replay |
+| program to carrier | `(:trim, upto: int64)` **new** | release every record with a sequence number below `upto`; answered by `:log` once the release is durable |
+| program to carrier | `:close` | drain the buffer to the medium, make it durable, then `(:link_down, :closed)` |
 | carrier to owner | `(:link_up, info: string)` | the region is claimed and its log recovered (§6.8.4); `info` names the medium, for people to read. It is followed at once by `:log` |
-| carrier to owner | `(:log, oldest: uint64, next: uint64, capacity: uint64)` **new** | the state of the log: the oldest record held, the number the next accepted record will get, the region's capacity in bytes. Sent after `:link_up`, after a `:trim` has become durable, and after `(:read_failed, :trimmed)` |
-| carrier to owner | `(:tx_credit, n: uint32)` | n buffer slots were freed: those records have reached the medium (written, not necessarily durable) |
-| carrier to owner | `(:synced, next: uint64)` **new** | every record numbered below `next` is durable (the medium's flush has returned); `next` is also the number the next accepted record will get |
+| carrier to owner | `(:log, oldest: int64, next: int64, capacity: int64)` **new** | the state of the log: the oldest record held, the number the next accepted record will get, the region's capacity in bytes. Sent after `:link_up`, after a `:trim` has become durable, and after `(:read_failed, :trimmed)` |
+| carrier to owner | `(:tx_credit, n: int64)` | n buffer slots were freed: those records have reached the medium (written, not necessarily durable) |
+| carrier to owner | `(:synced, next: int64)` **new** | every record numbered below `next` is durable (the medium's flush has returned); `next` is also the number the next accepted record will get |
 | carrier to owner | `(:rx, segment: string)` | one replayed record; the owner counts from `from` to know its number |
-| carrier to owner | `(:rx_end, next: uint64)` **new** | the replay is over: it reached the `next` that held when the `:read` was accepted, or a `:read_stop` ended it at `next` |
+| carrier to owner | `(:rx_end, next: int64)` **new** | the replay is over: it reached the `next` that held when the `:read` was accepted, or a `:read_stop` ended it at `next` |
 | carrier to owner | `(:tx_failed, reason: atom)` | a record was not accepted and took no number: `:no_credit`, `:too_long`, `:full` (a `:stop` or `:trim` region with no room) |
 | carrier to owner | `(:read_failed, reason: atom)` **new** | `:trimmed` (the cursor is below `oldest`, at the `:read` or because a `:ring` writer overtook the replay; a `:log` follows), `:beyond_tail`, `:busy` (a replay is already in progress), `:corrupt` (a record failed its check; the replay stopped before it) |
 | carrier to owner | `(:link_down, reason: atom)` | `:closed`, `:fault`, `:medium` (a write or a flush failed; the carrier ends, and what the log holds is what the next open's `:log` reports), `:in_use` (the region was already open), `:mismatch` (a backing of another size) |
@@ -727,7 +740,9 @@ it.
 **Replay.** One replay runs at a time; a `:read` during one is answered `(:read_failed, :busy)`. A replay covers the
 records from `from` up to the `next` that held when the `:read` was accepted and ends there with `(:rx_end, next)`.
 Records the owner appends meanwhile are not part of it: an owner that follows the tail reads again from that `next`.
-Appending during a replay is allowed.
+Appending during a replay is allowed. Receive credit outlives a replay: credit left over when a replay ends, at its
+`next` or by `:read_stop`, is still good for the next replay, because the credit of §6.2 belongs to the carrier and not
+to one replay.
 
 **Exclusive.** One owner per region, and so one reader: a consumer in another actor is served by the owner. The
 compile-time claim is above; at run time a second open of an open region ends with `(:link_down, :in_use)`. On a host
@@ -739,12 +754,12 @@ may open the region after the first has closed it.
 All codecs are available: a record is `encode(<any WireFormat>, value)`, framed like every other frame. Two layers add
 what a medium needs, and neither touches the derivation.
 
-1. **Frame header (program level, in `wireframe`).** `wireframe@record(format: atom, schema: uint16, frame: string)
+1. **Frame header (program level, in `wireframe`).** `wireframe@record(format: atom, schema: int64, frame: string)
    -> string` puts a one-byte format id and a two-byte
    schema version the program chooses in front of the encoded frame, and `wireframe@unrecord` takes them off,
    answering `(:ok, format, schema, frame) | (:rejected, atom)`. Records in different formats and versions can share a
    region, and a program reads an old version with `decode` for the old type and migrates in its own code. The id is a
-   column of the `WireFormat` table, `WireFormat@id(tag)`: `(:etf)` is 1, `(:cbor)` 2, further ids as protocols land,
+   column of the `WireFormat` table, `WireFormat@id(tag)`: `(:etf)` is 1, `(:cbor)` 2 (fixed before the build order was settled, so it stays 2 although `(:silica_shape)` lands first), `(:silica_shape)` 3, further ids as protocols land,
    and 0 is never a format, so a zero-filled medium is `(:rejected, _)`. The ids are normative (§11).
 2. **Record envelope (carrier level).** The carrier writes `{ length, seq, crc32c, payload }` and nothing else is the
    program's business: the sequence number and the check belong to the medium, which has to find the end of the
@@ -831,8 +846,8 @@ that cannot tolerate a repeat keeps its own position as a record.
 
 | Link | Target | State |
 | --- | --- | --- |
-| `(:memory, capacity, retention)` | every target | the test medium: the region is a RAM buffer, `:synced` follows every drain, nothing survives; it makes every trial of the contract run without hardware, as `(:loopback)` does for TCP |
-| `(:backing, path, capacity, retention)` | the hosted paths | a sidecar over `pwrite` and a full flush (`F_FULLFSYNC` on macOS, `fdatasync` on Linux); one backing object per declaration, claimed once per path and held under an exclusive `flock` while open |
+| `(:memory, capacity, retention)` | every target | the test medium: the region is a RAM buffer, nothing survives; it makes every trial of the contract run without hardware, as `(:loopback)` does for TCP. Its carrier is an ordinary actor and its reference an `actor_ref` (§6.8.1) |
+| `(:backing, path, capacity, retention)` | the hosted paths | a sidecar over `pwrite` and a full flush (`F_FULLFSYNC` on macOS, `fdatasync` on Linux); one backing object per declaration, claimed once per path and held under an exclusive `flock` while open. Its carrier is a dangerous actor and its reference a `dangerous_actor_ref` (§6.8.1) |
 | `(:sd_blocks, n, retention)` | the ESP32-S3 | needs the SPI3 block worker (peripherals plan item I, not built) |
 | `(:flash_region, n, retention)` | the ESP32-S3, the STM32 | needs a flash controller worker; which medium comes first is open (§6.8.8) |
 
@@ -841,7 +856,7 @@ The row `(:sd_blocks)` of §6.4 is superseded by this section: it is a link of t
 #### 6.8.7 Trials and phases
 
 Trials, on `(:memory)` first so they run everywhere: append and replay of every row of §4.2 under `(:etf)` and, once
-it lands, `(:cbor)`; two acknowledgement levels (`:tx_credit` before `:synced`); credit-paced replay of a log many times
+they land, `(:silica_shape)` and `(:cbor)`; two acknowledgement levels (`:tx_credit` before `:synced`); credit-paced replay of a log many times
 the buffer; a value larger than `mtu` across records and back; `:ring` wrap with a reader behind `oldest`; `:stop` and
 `:trim` full and release, with the `:log` answer; `:in_use`; `:busy` and `:read_stop`; a replay across an orphaned
 partial frame and a `(:read, from)` that lands inside a frame (§6.8.3). Failure trials for each declaration error above.
@@ -881,11 +896,16 @@ at a time, ending at the `next` of its `:read`, with `:read_stop` and `:busy` (�
 `:log` and a trimmed queue delivers at least once (§6.8.5). (15) Format ids are `WireFormat@id`, 0 reserved (§6.8.3).
 (16) A record never spans two blocks; the block size is the pack's number and gives the `mtu` (§6.8.4).
 
+(17) Sequence numbers and counts in messages are `int64`; a sequence number is 8 bytes on the medium (§6.8.2). (18)
+`:sync` and `:read_stop` are bare atoms, as `:close` is (§6.8.2). (19) The `(:memory)` carrier is an ordinary actor and
+its reference an `actor_ref`; a hosted `(:backing)` carrier is a dangerous actor (§6.8.1). (20) Receive credit outlives
+a replay (§6.8.2).
+
 **Open.**
 1. (Closed 2026-11-12: there is no default retention.)
 2. Which medium comes first on the board, internal flash or the SD card, and the board pack's region table.
-3. The record envelope's exact layout: sequence number width (uint64 proposed), CRC-32C proposed, the block header, the
-   largest record per medium.
+3. The record envelope's exact layout: sequence number width (settled: 8 bytes on the medium, `int64` in messages;
+   §6.8.9), CRC-32C proposed, the block header, the largest record per medium.
 4. Whether `:close` implies `:sync` (proposed yes: it drains and makes durable before `:link_down`).
 5. Whether a replay sees records that are only in the buffer (proposed yes, by draining first, §6.8.2).
 6. Hash chain or MAC per record for tamper evidence, and encryption at rest: not in this design; the CRC detects accidents
@@ -898,6 +918,118 @@ at a time, ending at the `next` of its `:read`, with `:read_stop` and `:busy` (�
 each pack lists the links it provides; a new subsection of specification §16.4 carries the vocabulary and the loss
 window as normative text, with the `:region` addressing value and the `WireFormat@id` column; §10 gains one row for phases S0 to S3 (detailed in §6.8.7); the diagnostics table keeps E2412 to E2415 and E2417 as they
 are.
+
+#### 6.8.9 Implementation status: phase S0 (2026-11-12, Apple Silicon)
+
+**Built.**
+
+| Piece | Where |
+| --- | --- |
+| the `:storage` framing mode, `record`, `unrecord`, `format_id`, `format_of` | `compiler/stdlib/wireframe.silica` |
+| the on-medium form: CRC-32C, block header, record envelope, `scan`, pending writes | `compiler/stdlib/storelog.silica` (new) |
+| the `(:memory)` carrier with the whole §6.8.2 vocabulary | `compiler/stdlib/store_memory_carrier.silica` (new) |
+| the `(:store)` row and the four store links | `compiler/stdlib/Carrier.silica`, `Link.silica`, `type_checker/type_checker_links.silica` |
+| `(:store)` and `(:memory)` provided, with the spawn text | `emitter/apple_silicon_mac/transport_pack.silica` |
+| normative text | specification §16.4.11 |
+| trials | `trials/transport_addition/transport_storage_framing`, `transport_storelog`, `app_transport_store_memory/` (seven programs), `trials/error_enforcement_addition/store_*` (eight) |
+
+**Settled while building (open question 3).** The block is 4096 bytes and the write unit 512 on every medium built so
+far. The block header is 16 bytes: `first_seq` (8), `state` (4: 1 in use, 0 released), CRC-32C of those 12 bytes (4). The
+record envelope is 16 bytes: `length` (4), `seq` (8), CRC-32C over length, seq and payload (4). All integers are
+big-endian. The largest record is therefore 4064 bytes.
+
+**How a block is read.** One rule serves recovery and replay: a record is good when its length is not zero, it lies
+inside the block, its check holds and its `seq` is the expected one. When the bytes at a position are not a good record
+and the position is not on a write-unit boundary, the reader looks once more at the next boundary, where the record
+after a sync lies; when that is not a good record either, the block has no more records. No pad marker is needed on the
+medium beyond the zeros a sync writes, and stale records of an earlier lap, a torn write and a flipped byte all end a
+block the same way.
+
+**Where the implementation differs from the text above.**
+
+- **`Carrier@mtu(<name>)` answers the kind's row, 4064,** for every store: the name is resolved to the kind's atom, as for
+  every other carrier, and every medium built so far has the 4096-byte block. A medium with another block size needs the
+  link-aware answer §6.8.1 describes.
+- **The format ids are `wireframe@format_id(tag)` and `wireframe@format_of(id)`,** not a `WireFormat@id` column:
+  `WireFormat` is a trait of required functions with no table of its own.
+- **`(:tx_failed, :empty)`** refuses a record of no bytes (a zero length cannot be told from unwritten space), and
+  `:link_down` one sent before `:open`. `:no_credit` cannot happen on `(:memory)`: its buffer drains the moment it fills.
+- **`:read_stop` with no replay in progress is ignored.** `(:synced, next)` answers a `:sync` only; a drain alone does
+  not send it.
+- **The write-behind buffer is 8 slots,** drained when it fills, 50 ms after its first record, and on `:sync`, `:read`,
+  `:trim` and `:close`.
+
+**Not exercised in S0** (they need a medium that survives; S1): recovery at open, a torn tail and a flipped byte through
+a carrier, a restart that finds its log, `:mismatch`. The scan those rest on is tried without a carrier in
+`transport_storelog`.
+
+#### 6.8.10 Implementation status: phase S1 (2026-11-12, Apple Silicon)
+
+**Built.**
+
+| Piece | Where |
+| --- | --- |
+| the backing's Fifi wrappers: open under an exclusive lock, read, write a list of pending writes, full flush, close | `compiler/stdlib/net/silica_store.c`, `silica_store_wrapper.meta` (archive `libsilica_store.a`) |
+| their bindings | `compiler/stdlib/dangerous_store.silica` (new) |
+| the `(:backing)` carrier, a dangerous actor, with recovery at open | `compiler/stdlib/dangerous_store_backing_carrier.silica` (new) |
+| reading a record through numbers, and counting a tail block | `compiler/stdlib/storelog.silica` (`env_len`, `env_seq`, `env_crc`, `env_check`, `tail_next`, `tail_at`) |
+| `(:backing)` provided, with the spawn text | `emitter/apple_silicon_mac/transport_pack.silica` |
+| trials | `trials/transport_addition/app_transport_store_backing/` (six programs, a second process run, `make_backings.py`) |
+
+**What closes S1, and how each was tried.**
+
+| Gate | Trial | Result |
+| --- | --- | --- |
+| a second program run reads the first one's log | the restart program run a second time, as a second process, on the backing the first run left | it reports `(:log, 0, 6, ...)` and replays the first run's records |
+| a restarted carrier finds its log | `dangerous_store_backing_restart`: `:close`, then a new carrier on the same declaration | `(:log, 0, 5, ...)`, five records replayed, a sixth appended |
+| a sync's padding is read across | the same trial: two syncs, the second pair of records at the next write unit | replayed in order |
+| a torn tail | `dangerous_store_backing_torn`: three records and 20 bytes of a fourth | `(:log, 0, 3, ...)`; the next record is written past the torn bytes and replayed |
+| a flipped byte | `dangerous_store_backing_flipped`: one payload byte of record 1 wrong | record 0, then `(:read_failed, :corrupt)`; the next block is still readable from 3 |
+| stale records after the tail of a reused block | `dangerous_store_backing_stale`: records 10 and 11, then whole records 2 and 3 of the lap before | `(:log, 10, 12, ...)`; only 10 and 11 replayed |
+| a backing of another size | `dangerous_store_backing_mismatch` | `(:link_down, :mismatch)` |
+| a locked backing | `dangerous_store_backing_in_use`: a second carrier on the same declaration while the first is open | `(:link_down, :in_use)` |
+
+The damaged backings are written by `make_backings.py`, in Python and independently of the Silica code, from the
+on-medium form of §6.8.9; that the carrier reads them is a second check of that form.
+
+**The taint rules decide the carrier's shape.** Bytes a foreign call reads are external-danger-touched (FFI wrapper
+specification §7.4, §7.6): they may not enter the state of the actor that read them, and they may not be cast to that
+actor either. Composite `recreate` is not built. So the backing carrier keeps no byte of the log:
+
+- It takes **numbers** from what it reads, with `storelog`'s functions, inside the root block of its behaviour, and
+  re-creates each number (`recreate`) before it relies on it: a block header gives a first sequence number; a record's
+  envelope gives a length, a sequence number and a check; the check computed over the payload is compared with the
+  stored one.
+- A record's **payload** leaves the block one way only: as the foreign result `(:rx, payload)` cast to the owner, whose
+  `decode` re-creates the value. This is decision 8 of §6.8.8 enforced by the compiler.
+- A foreign call may be made only in the root block of a dangerous behaviour, and a block has no loop. A dispatch
+  therefore makes a fixed run of calls, each only when wanted: the open; eight block headers; the tail block; one write
+  of the pending bytes; the flush; a record's reads; the close. Longer work continues by a message the carrier sends
+  itself: recovery reads eight headers to a dispatch (`:recover`), a replay one record (`:step`).
+- A replay reads a record in two parts, its 16-byte envelope and then its payload, and makes the same two reads once
+  more at the next write-unit boundary when the first position does not hold the record expected.
+
+**Where the implementation differs from the text above.**
+
+- **A medium failure does not end the carrier.** A write, a flush or a read that fails answers `(:link_down, :medium)`
+  and closes the backing; the carrier stays, not open, until its owner sends `:close`. An owner that sends a late message
+  then finds an actor: a cast to an ended actor ends its sender with `actor_not_found`. Only `:close` ends the carrier.
+- **A refused open leaves the carrier too:** `(:link_down, :in_use)`, `(:link_down, :mismatch)` or `(:link_down, :medium)`,
+  and the owner may open again or close.
+- **`(:tx_credit, n)` and `(:synced, next)` follow the write and the flush** they report, in the same dispatch.
+- **A program that starts a `(:backing)` carrier is itself named `dangerous_`** (E4021: a module that uses a dangerous
+  module carries the prefix), and its carrier reference is a `dangerous_actor_ref`.
+- **The sidecar has one call beyond `pwrite` and the flush that is more than a plain read:** it reads the 16-byte headers
+  of several blocks into one buffer. It interprets nothing.
+
+**Not built, not tried.**
+
+- **Only the tail block is checked at open.** A hole between two blocks (the header of a new block written, the last
+  records of the block before it not) is found by a replay, as `:corrupt`, not by the open. A process that dies leaves no
+  such hole (the writes of one drain are made in order); a power loss that reorders writes can.
+- **`(:link_down, :medium)` has no trial:** there is no way yet to make a write or a flush fail on demand.
+- **The lock across two processes** rests on the same `flock` the in-process trial exercises, and has no trial of its own.
+- **Linux** (S2): the wrappers use `fdatasync` and `flock` there and are not compiled or run yet.
 
 ---
 
@@ -934,7 +1066,7 @@ change to the derivation, which is what keeps each such addition small:
 | MessagePack | `(:msgpack)` | `:keyed`, string keys | direct | `bin` for byte strings, `str` for `utf8: true` strings; atoms as `str` |
 | JSON (RFC 8259) | `(:json)` | `:keyed`, string keys | direct, with losses | text; byte strings as base64 text; integers above 2^53 lose precision in most readers, so encoding one fails the calling actor with `(:explicit, :json_precision)`; tuples as arrays; atoms as strings; `unit` as `null` |
 | Protocol Buffers | `(:protobuf)` | `:numbered` | needs one addition | fields are numbered, not named: the `encode` and `decode` calls gain an optional `fields: [...]` entry in the limits record assigning numbers, and `record_layout` gains `:numbered`, under which the walk passes the number instead of the name. Tuples encode as nested messages with fields 1..n. Decision 7 in §12 |
-| Silica native | `(:silica_native)` | `:positional` | direct | the fastest Silica-to-Silica form: no keys, no tags for scalars, a 64-bit structural hash of the type string as the term prefix so that a mismatched type is `:bad_version` rather than garbage. The shape word of §3.7 is **not** used: it is numbered per build |
+| Silica shape | `(:silica_shape)` | `:positional` | direct | the fastest Silica-to-Silica form: no keys, no tags for scalars, a 64-bit structural hash of the type string as the term prefix so that a mismatched type is `:bad_version` rather than garbage. The shape word of §3.7 is **not** used: it is numbered per build |
 | ASN.1 DER, Cap'n Proto, FlatBuffers | | | not planned | schema-driven formats with their own type languages; adding one would mean a translator in the language, not a `WireFormat` |
 
 A protocol that is not a serialization of Silica values (a text line protocol, HTTP, MQTT's fixed headers) is
@@ -943,7 +1075,7 @@ or `(:cbor)` frames. Whether such a protocol later becomes a language carrier or
 carrier over `(:tcp)`, say) is a roadmap decision taken protocol by protocol, under the same rule: in the
 language, or not at all.
 
-The test of the expansion requirement is concrete: the second protocol in the tree (CBOR, §10 phase 6) must be
+The test of the expansion requirement is concrete: the second protocol in the tree (`(:silica_shape)`, §10 phase 6) must be
 added without a change to the derivation or to any trial program's `encode` and `decode` calls.
 Its whole cost must be its specification subsection, its implementation module and its trials.
 
@@ -1034,15 +1166,16 @@ on every suite with goldens refreshed under the usual rule, and a hosted phase e
 | 3 | Linux AArch64 and x86-64 lock-step | the same suite green on both; fixed points |
 | 4 | the board: `(:uart1)` carrier worker, the contract on the existing console workers, `board_values.silica`; the ETF-over-UART demo: accelerometer and button readings arrive in an Erlang shell through a port program on the host | board suite trials for the worker; the demo recorded in `board/README.md` as the other apps are |
 | 5 | `(:ble_gatt)` on macOS and Linux through Fifi; the board over an external UART BLE module (§6.5 item 2) | a Silica peripheral on one host and a Silica central on another exchange segmented frames; the board's readings reach a phone or laptop over BLE |
-| 6 | `(:cbor)` as the second protocol: its §16.4 subsection, `wire_cbor.silica`, goldens | added without a change to the derivation or the trait; the `transport_addition` suite runs its round-trip rows under both tags from one source |
+| 6 | `(:silica_shape)` as the second protocol (decided 2026-11-12, ahead of CBOR): its §16.4 subsection, `wire_silica_shape.silica`, goldens; the first `:positional` record layout | added without a change to the derivation or the trait; the `transport_addition` suite runs its round-trip rows under both tags from one source |
+| 7 | `(:cbor)` as the third protocol: its §16.4 subsection, `wire_cbor.silica`, goldens | added without a change to the derivation or the trait; the round-trip rows run under all three tags from one source |
 | S0 to S3 | storage carriers (§6.8): the `(:store)` kind, the vocabulary and record envelope on `(:memory)`, the hosted `(:backing)` sidecar, Linux lock-step, then the board medium | the trials of §6.8.7 pass; see §6.8.7 for each phase's gate |
-| later | `(:msgpack)`, `(:json)`, `(:silica_native)`, `(:protobuf)` after decision 7; the distribution protocol design (§7); `(:usb_cdc)` in the device role when plan item L lands and in the host role when its host-side enumeration does; `(:sd_blocks)` and `(:i2c0)` carriers when plan items I and G land; `(:unix_dgram)` if IPC_OS is built | each with its own trials; `(:usb_cdc)` device role proven by the Mac's `(:serial)` carrier against `/dev/cu.usbmodem*`, host role by two boards back to back |
+| later | `(:msgpack)`, `(:json)`, `(:protobuf)` after decision 7; the distribution protocol design (§7); `(:usb_cdc)` in the device role when plan item L lands and in the host role when its host-side enumeration does; `(:sd_blocks)` and `(:i2c0)` carriers when plan items I and G land; `(:unix_dgram)` if IPC_OS is built | each with its own trials; `(:usb_cdc)` device role proven by the Mac's `(:serial)` carrier against `/dev/cu.usbmodem*`, host role by two boards back to back |
 
 **Proposed ROADMAP row** (for Lee to place; chunk numbers are identifiers, not an order):
 
 > | 16 | **Transport serialization.** The compiler-derived `encode` and `decode` with call-site limits,
 > the `WireFormat` trait with the ETF binding, the `Carrier` trait and actor contract with framing, hosted
-> TCP/UDP/BLE carriers through Fifi and the board's UART1 carrier worker; CBOR as the second protocol. All of
+> TCP/UDP/BLE carriers through Fifi and the board's UART1 carrier worker; `(:silica_shape)` as the second protocol. All of
 > it language, specified in §16.4 and shipped with the compiler.
 > **Prerequisites:** chunk 9 (sockets) for the hosted carriers; chunk 13 shares the derivation.
 > | [transport_serialization_design.md](compiler/design_documents/transport_serialization_design.md) | Every
@@ -1161,15 +1294,15 @@ export owner/2;
 
 // State: the carrier actor, the send credits it has granted, and the framing reassembly state.
 // Messages: the carrier contract of §6.2, plus (:sample, ...) from whoever produces readings.
-fn owner(msg: (:link_up, string) | (:tx_credit, uint32) | (:rx, string) | (:link_down, atom)
+fn owner(msg: (:link_up, string) | (:tx_credit, int64) | (:rx, string) | (:link_down, atom)
             | (:sample, int16, int16, int16, uint64),
-         state: { link: dangerous_actor_ref, credits: uint32,
+         state: { link: dangerous_actor_ref, credits: int64,
                   rx: { expected: uint64, parts: List[string, normal] } })
-    -> { link: dangerous_actor_ref, credits: uint32,
+    -> { link: dangerous_actor_ref, credits: int64,
          rx: { expected: uint64, parts: List[string, normal] } } {
     case msg of {
         (:link_up, _info: string) -> state;
-        (:tx_credit, n: uint32) -> { link: state.link, credits: state.credits + n, rx: state.rx };
+        (:tx_credit, n: int64) -> { link: state.link, credits: state.credits + n, rx: state.rx };
         (:sample, x: int16, y: int16, z: int16, at: uint64) if state.credits > 0 -> send_reading(state, x, y, z, at);
         (:sample, _x: int16, _y: int16, _z: int16, _at: uint64) -> state;   // no credit: the reading is dropped
         (:rx, segment: string) -> receive_segment(state, segment);
@@ -1182,10 +1315,10 @@ fn owner(msg: (:link_up, string) | (:tx_credit, uint32) | (:rx, string) | (:link
 `:stream` carrier with `mtu` 0, so there is exactly one segment; the cast moves it to the carrier.
 
 ```silica
-fn send_reading(state: { link: dangerous_actor_ref, credits: uint32,
+fn send_reading(state: { link: dangerous_actor_ref, credits: int64,
                          rx: { expected: uint64, parts: List[string, normal] } },
                 x: int16, y: int16, z: int16, at: uint64)
-    -> { link: dangerous_actor_ref, credits: uint32,
+    -> { link: dangerous_actor_ref, credits: int64,
          rx: { expected: uint64, parts: List[string, normal] } } {
     sequence proc[mem(normal), concurrency, transport]
         frame: string <- encode((:etf), (:accel, { x: x, y: y, z: z, at_ms: at }));
@@ -1202,17 +1335,17 @@ is permitted (§4.5); its `(:ok, ...)` result is pure and may go anywhere. The b
 what tells the compiler which type to build.
 
 ```silica
-fn receive_segment(state: { link: dangerous_actor_ref, credits: uint32,
+fn receive_segment(state: { link: dangerous_actor_ref, credits: int64,
                             rx: { expected: uint64, parts: List[string, normal] } },
                    segment: string)
-    -> { link: dangerous_actor_ref, credits: uint32,
+    -> { link: dangerous_actor_ref, credits: int64,
          rx: { expected: uint64, parts: List[string, normal] } } {
     sequence proc[mem(normal), concurrency]
         unframed: (:more, { expected: uint64, parts: List[string, normal] })
                 | (:frame, string, { expected: uint64, parts: List[string, normal] })
                 | (:rejected, atom)
             <- wireframe@unframe(state.rx, segment, 4096);
-        next: { link: dangerous_actor_ref, credits: uint32,
+        next: { link: dangerous_actor_ref, credits: int64,
                 rx: { expected: uint64, parts: List[string, normal] } } <- case unframed of {
             (:more, rx2: { expected: uint64, parts: List[string, normal] }) ->
                 { link: state.link, credits: state.credits, rx: rx2 };
@@ -1227,9 +1360,9 @@ fn receive_segment(state: { link: dangerous_actor_ref, credits: uint32,
 }
 
 fn apply_command(frame: string,
-                 state: { link: dangerous_actor_ref, credits: uint32,
+                 state: { link: dangerous_actor_ref, credits: int64,
                           rx: { expected: uint64, parts: List[string, normal] } })
-    -> { link: dangerous_actor_ref, credits: uint32,
+    -> { link: dangerous_actor_ref, credits: int64,
          rx: { expected: uint64, parts: List[string, normal] } } {
     sequence proc[mem(normal), concurrency, transport]
         decoded: (:ok, (:led, { which: :single | :red | :green | :blue, on: boolean })) | (:rejected, atom)
@@ -1473,7 +1606,7 @@ with phase 2.
 `sequence proc[external_danger]` block, in `ffi/ffi_taint_checker.silica`; trial
 `error_enforcement_addition/ffi_addition/error_app_ffi_result_cast/dangerous_decode_outside_external_danger`),
 E2409 (a program `impl WireFormat` or `impl Carrier`; trial `transport_err_closed_trait`), E2410 (a wire
-protocol the language names but this build's pack does not provide: `(:cbor)` is such a tag until phase 6,
+protocol the language names but this build's pack does not provide: `(:cbor)` is such a tag until phase 7,
 so `transport_err_not_on_target` exercises the rejection on Apple Silicon), and W2401 (printed once per
 decode family by `transport_pipeline`, naming the unit and the type; the derived calls carry no source
 position). Not checked: the handler that receives an FFI result cast is not yet a taint source

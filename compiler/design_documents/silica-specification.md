@@ -10790,6 +10790,82 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2412 to E2417 | carrier link diagnostics, with E1081 for a malformed `carried_on` line: §16.4.9 |
 | W2401 | advisory: a decoder was derived; foreign bytes become values here |
 
+#### 16.4.11 Storage carriers
+
+**Status (2026-11-12).** Phases S0 and S1 of transport design §6.8 are implemented for the Apple Silicon macOS target:
+the `(:store)` kind, the `(:memory, capacity, retention)` and `(:backing, path, capacity, retention)` links, the
+vocabulary below, the `:storage` framing mode and the stored-frame header of §16.4.7's module, and the on-medium form
+(`storelog`). The `(:sd_blocks, ...)` and `(:flash_region, ...)` links are named and checked by the language and provided
+by no target yet (E2412). A `(:memory)` carrier is an ordinary actor (`actor_ref`); a `(:backing)` carrier is a dangerous
+actor (`dangerous_actor_ref`), and a module that starts one is named `dangerous_` (E4021).
+
+A program that must keep values past a restart sends them to a **storage carrier**: a carrier of kind `(:store)` whose
+link is a medium that remembers. The language has no files, directories, names or paths, and no update or delete in
+place: records are appended, replayed and released.
+
+**Declaration.** `carried_on <name>: (:store) (<:medium>, <params>..., <retention>);`. Every store link has a fixed number
+of parameters and ends in its retention mode, which is always written:
+
+| Link | Parameters |
+| --- | --- |
+| `(:memory, capacity, retention)` | a region of `capacity` bytes of RAM; nothing survives the carrier |
+| `(:backing, path, capacity, retention)` | a hosted region of `capacity` bytes; `path` ends in `.sildat` by convention |
+| `(:sd_blocks, n, retention)`, `(:flash_region, n, retention)` | region `n` of a board's card or flash, from the board pack's table |
+
+`capacity` is a positive multiple of the 4096-byte block. `retention` is `:ring` (when the region is full the oldest
+block is reclaimed), `:stop` (the record is refused) or `:trim` (refused until the owner releases records). The kind's
+properties are `Carrier@boundaries` `:storage`, `Carrier@delivery` `:reliable_ordered`, `Carrier@addressing` `:region`
+and `Carrier@mtu` 4064, the largest record.
+
+**Messages.** The carrier contract of §16.4.8 with these additions. Every sequence number is an `int64` and is
+exclusive: it names the first record not covered. `:sync`, `:read_stop` and `:close` are bare atoms.
+
+| Direction | Message | Meaning |
+| --- | --- | --- |
+| to the carrier | `(:open, owner, "")` | claim the region; answered by `:link_up`, `:log` and `(:tx_credit, n)` |
+| to the carrier | `(:tx, record, from)` | append one record; it is numbered when accepted and waits in the write-behind buffer |
+| to the carrier | `:sync` | make every accepted record durable; answered by `(:synced, next)` |
+| to the carrier | `(:read, from)` | replay the records from `from` to the `next` of this moment, one per receive credit |
+| to the carrier | `:read_stop` | end the replay in progress; answered by `(:rx_end, next)` |
+| to the carrier | `(:credit, n)` | the owner accepts n more `:rx`; credit left when a replay ends is good for the next |
+| to the carrier | `(:trim, upto)` | release the blocks that lie wholly below `upto`; answered by `:log` |
+| to the carrier | `:close` | drain, then `(:link_down, :closed)`; the carrier ends and its reference is dead |
+| to the owner | `(:link_up, info)` | the region is claimed and its log recovered |
+| to the owner | `(:log, oldest, next, capacity)` | the oldest record held, the number the next accepted record gets, the region's size |
+| to the owner | `(:tx_credit, n)` | n records left the buffer for the medium (written, not necessarily durable) |
+| to the owner | `(:synced, next)` | every record below `next` is durable |
+| to the owner | `(:rx, record)`, `(:rx_end, next)` | one replayed record; the replay is over |
+| to the owner | `(:tx_failed, why)` | the record was refused and took no number: `:too_long`, `:empty`, `:no_credit`, `:full`, `:link_down` |
+| to the owner | `(:read_failed, why)` | `:trimmed` (below `oldest`; a `:log` follows), `:beyond_tail`, `:busy`, `:corrupt` |
+| to the owner | `(:link_down, why)` | `:closed`; `:in_use` (a second `:open`, or a backing locked by another carrier); `:mismatch` (a backing of another size); `:medium` (the backing could not be opened, read, written or flushed: the carrier stays, not open, until `:close`) |
+
+**What a program may rely on.** After a crash, a power loss or a restart the log holds every record below the last
+`(:synced, next)` the owner saw, in order and with no holes, possibly some records after it, and never a reordered or a
+partial record. Records still in the write-behind buffer are lost. A trimmed log delivers at least once: release is by
+whole blocks, so `oldest` may be below the `upto` of a `:trim`.
+
+**Stored frames.** `wireframe@frame(f, mtu, :storage)` heads every record with the segment header of §16.4.7, a frame
+that fits in one record included; index 0 marks the start of a frame, and `wireframe@unframe` in `:storage` mode drops an
+unfinished frame when the next frame-start record arrives and skips a record that continues nothing. A frame spans at
+most 32768 records. `wireframe@record(format, schema, frame)` puts a one-byte format id and a two-byte schema version in
+front of a frame and `wireframe@unrecord` answers `(:ok, format, schema, frame) | (:rejected, :truncated | :bad_format)`.
+The ids are `(:etf)` 1 and `(:cbor)` 2 (`wireframe@format_id`); 0 is never a format. Every stored byte is untrusted on
+every target: only the value `decode` re-creates is used (§16.4.4).
+
+**On the medium.** A region is a run of 4096-byte blocks. A block begins with a 16-byte header, `first_seq` (8 bytes),
+`state` (4 bytes: 1 in use, 0 released) and a CRC-32C of those 12 bytes (4 bytes). Records follow back to back, each
+`length` (4 bytes), `seq` (8 bytes), CRC-32C over length, seq and payload (4 bytes), then the payload; a record never
+spans two blocks and all integers are big-endian. A record is good when its check holds and its `seq` is the one
+expected; the first position that holds no good record ends the block, after one more look at the next write-unit
+boundary (512 bytes), where the record after a sync lies. A sync fills the rest of its write unit with zeros and that
+unit is never written again.
+
+**Diagnostics.** E2414 when a store link is paired with another kind or `(:store)` with another link; E2415 when two
+declarations claim one backing path or one board region; E2417 for a retention that is not `:ring`, `:stop` or `:trim`,
+a capacity that is not a positive multiple of 4096, a parameter that is not a literal of the right class, or a wrong
+parameter count; E2412 for a medium the target does not provide.
+
+
 ## 17. Atomic Operations
 
 ### 17.1 Atomic Types and Memory Spaces
