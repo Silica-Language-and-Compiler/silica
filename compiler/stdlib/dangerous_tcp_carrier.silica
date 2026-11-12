@@ -240,7 +240,13 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
             true -> dangerous_sockets@take(state.fd);
             false -> ""
         };
-        do_close: boolean <- kind == :close and state.fd >= 0;
+        // The descriptor is given back whenever the link ends, not only on :close: the peer closed
+        // or the read failed, or a write failed (a peer that went away, or a write that timed out
+        // part way and left a torn frame in the stream).
+        open_failed: boolean <- kind == :open and adoptable == false and open_tag != 0;
+        rx_ended: boolean <- do_rx and (rx_tag == 1 or rx_tag == 3);
+        tx_broke: boolean <- do_tx and tx_tag != 0;
+        do_close: boolean <- (kind == :close or rx_ended or tx_broke) and state.fd >= 0;
         _: { tag: int64, value: int64, error_code: int64 } <- case do_close of {
             true -> dangerous_sockets@close_fd(state.fd);
             false -> none_res()
@@ -262,7 +268,8 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         // system chose when asked for 0), and once when an accepted connection is opened.
         connected: boolean <- do_connect and open_tag == 0;
         link_up_now: boolean <- connected or bound or do_adopt;
-        link_down_now: boolean <- (kind == :open and adoptable == false and open_tag != 0) or (do_rx and (rx_tag == 1 or rx_tag == 3)) or (kind == :close);
+        link_down_now: boolean <- open_failed or rx_ended or tx_broke or (kind == :close);
+        ended_normally: boolean <- kind == :close or (do_rx and rx_tag == 3);
         down_reason: atom <- case kind == :close of {
             true -> :closed;
             false -> case do_rx and rx_tag == 3 of {
@@ -296,6 +303,21 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
             true -> cast(owner, (:link_down, down_reason) impl ActorMessage {});
             false -> true
         };
+        // The carrier ends with its link (transport design 6.2): :link_down is the last message its
+        // owner receives and the carrier's reference is dead afterwards. A :close, and a peer that
+        // closed, are a normal end; a failed open, a failed read and a failed write end it with the
+        // link exit reasons of the links design 6.3, so a supervisor restarts a faulted link and
+        // leaves a closed one alone. stop_self takes effect when this dispatch returns.
+        _: atom <- case link_down_now of {
+            true -> case ended_normally of {
+                true -> stop_self(:normal);
+                false -> case open_failed of {
+                    true -> stop_self((:explicit, :link_unavailable));
+                    false -> stop_self((:explicit, :link_lost))
+                }
+            };
+            false -> :ok
+        };
         up_next: boolean <- case link_down_now of {
             true -> false;
             false -> state.up or connected or do_adopt
@@ -306,7 +328,7 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         };
         fd_next: int64 <- case kind == :open and adoptable == false of {
             true -> open_fd;
-            false -> case kind == :close of { true -> 0 - 1; false -> state.fd }
+            false -> case link_down_now of { true -> 0 - 1; false -> state.fd }
         };
         credit_next: int64 <- case kind == :credit of {
             true -> state.rx_credit + msg_count(msg);

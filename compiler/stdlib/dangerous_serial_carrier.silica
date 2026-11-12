@@ -188,12 +188,16 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
             true -> dangerous_sockets@take(state.fd);
             false -> ""
         };
+        // The descriptor is given back whenever the link ends, not only on :close.
+        open_failed: boolean <- do_open and open_tag != 0;
+        rx_ended: boolean <- (do_rx and (rx_tag == 1 or rx_tag == 3));
+        tx_broke: boolean <- do_tx and tx_tag != 0;
         do_close: boolean <- kind == :close;
-        _: { tag: int64, value: int64, error_code: int64 } <- case do_close of {
+        _: { tag: int64, value: int64, error_code: int64 } <- case (do_close or rx_ended or tx_broke) and state.fd >= 0 of {
             true -> dangerous_sockets@close_fd(state.fd);
             false -> none_res()
         };
-        link_down_now: boolean <- (do_open and open_tag != 0) or (do_rx and (rx_tag == 1 or rx_tag == 3)) or do_close;
+        link_down_now: boolean <- open_failed or rx_ended or tx_broke or do_close;
         _: boolean <- case opened of {
             true -> cast(owner, (:link_up, port_text) impl ActorMessage {});
             false -> true
@@ -220,8 +224,22 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
             true -> cast(owner, (:link_down, case do_close of { true -> :closed; false -> :fault }) impl ActorMessage {});
             false -> true
         };
+        // The carrier ends with its link (transport design 6.2): :link_down is the last message its
+        // owner receives. A :close is a normal end; a failed open, read or write ends the carrier
+        // with the link exit reasons of the links design 6.3. stop_self takes effect when this
+        // dispatch returns.
+        _: atom <- case link_down_now of {
+            true -> case do_close of {
+                true -> stop_self(:normal);
+                false -> case open_failed of {
+                    true -> stop_self((:explicit, :link_unavailable));
+                    false -> stop_self((:explicit, :link_lost))
+                }
+            };
+            false -> :ok
+        };
         up_next: boolean <- case link_down_now of { true -> false; false -> state.up or opened };
-        fd_next: int64 <- case do_open of { true -> open_fd; false -> case do_close of { true -> 0 - 1; false -> state.fd } };
+        fd_next: int64 <- case do_open of { true -> open_fd; false -> case link_down_now of { true -> 0 - 1; false -> state.fd } };
         credit_next: int64 <- case kind == :credit of {
             true -> state.rx_credit + msg_count(msg);
             false -> case got of { true -> state.rx_credit - 1; false -> state.rx_credit }
