@@ -137,6 +137,13 @@ runs from SRAM); AHB, APB1 and APB2 undivided, so PCLK1, USART2's clock, is 80 M
 (reload 79,999) at 1 ms keeps `silica_rt_ticks_ms`. Console: USART2 on PA2/PA3 (AF7), 115200 8N1
 (BRR 694: 0.06% fast), transmit polled, receive through the RXNE interrupt into a ring, the Nucleo's ST-LINK virtual COM port (`/dev/cu.usbmodem21103`).
 
+**Flash images, by hand only (2026-11-12).** `BOARD_EXEC=flash tools/build_image.sh ...` links with
+`runtime/silica_stm32l476rg_flash.ld` (code and constants at 0x0800_0000, `.data` copied from flash by `_start`;
+the RAM default is unchanged and byte-identical), and `tools/run_on_board.py --exec flash --yes-wear-flash`
+programs it. Every load wears the flash, so the trials never use it: `build_image.sh` refuses flash with `-r`
+(the harness's runtime cache) and the RAM loader refuses a flash image. Design:
+`compiler/design_documents/stm32_flash_execution_design.md`; example: `examples/nucleo_flash_max_actors/`.
+
 **Open item: image headroom (found 2026-11-10, no trial).** The image runs from SRAM1, so every byte of
 `.text`, `.rodata` and `.data` comes out of the heap, and `silica_stm32l476rg.ld` refuses an image that leaves
 less than 16 KiB of heap (`ASSERT(_silica_heap_start + 0x4000 < _silica_heap_end, "program too large: less
