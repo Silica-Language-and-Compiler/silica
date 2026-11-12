@@ -763,9 +763,11 @@ silica_rt_ccb_block:
     mov     r6, r0
     movw    r0, #24
     bl      rt_sm_add
-    ldr     r0, [r5, #8]                    // SLOT: the chunk slot bytes; a chunk is 2 slots, next, claim
+    ldr     r0, [r5, #8]                    // SLOT: the chunk slot bytes; then the chunk's data, next, claim
     str     r0, [sp, #0]
-    lsl     r0, r0, #1
+    cmp     r0, #16                         // CDATA = max(SLOT, 16), prims_list chunk_data_bytes (a 4-byte
+    it      lo                              // slot had 8 here and read the next chunk from inside the data)
+    movlo   r0, #16
     str     r0, [sp, #4]                    // CDATA
     ldr     r7, [r4, #0]                    // elements left
     ldr     r8, [r4, #8]                    // chunk
@@ -1010,9 +1012,11 @@ silica_rt_ccb_block:
     str     r2, [sp, #12]                   // where the next chunk's final address is stored
     ldr     r7, [r4, #8]                    // source chunk
     ldr     r4, [r4, #16]                   // cursor
-    ldr     r0, [r5, #8]                    // SLOT; a chunk is 2 slots, then next, then claim
+    ldr     r0, [r5, #8]                    // SLOT; then the chunk's data, next, claim
     str     r0, [sp, #16]
-    lsl     r0, r0, #1
+    cmp     r0, #16                         // CDATA = max(SLOT, 16), prims_list chunk_data_bytes
+    it      lo
+    movlo   r0, #16
     str     r0, [sp, #20]                   // CDATA
 71: ldr     r0, [sp, #8]
     cmp     r0, #0

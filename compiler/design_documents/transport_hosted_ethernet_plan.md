@@ -178,7 +178,8 @@ checkout `~/silica` there is not used.
     `ping 7 / pong 8 / done`. The whole linux_x86_64 trial tree passes, apart from goldens that were already stale
     with 999959.
   - **Not verified.** The fixed-point check (the new compiler rebuilding itself byte-identically) was not run.
-  - **Still to do.** linux_aarch64 is not done.
+  - **linux_aarch64.** Its pack has the same rows since 2026-11-11 (`emitter/linux_aarch64/transport_pack.silica`). Pending:
+    a build on an AArch64 host (pix) and trial verification there.
 - **Two defects seen in `usb_silica_pair` and worked around on both ends:** an inline nested tuple in `encode` is
   encoded flattened, and a `to_int64(...)` argument can clobber an earlier argument.
 

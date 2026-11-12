@@ -126,9 +126,13 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E2217 DevicePrimNameDefined — a device_* module defines a function named after a device prim
 - E2219 DevicePrimInMain — device access (map_device, peek, poke) appears in main
 - E2220 PrimNotCompilableForTarget — a device prim cannot be compiled for this target
+- E2221 PinNotOnBoard — a board pin builtin (pin_mode, pin_pull, pin_write, pin_read) names a literal pin number the target board does not have (board_pin_builtins_design.md §5; reported before emission by the board's emitter, board_pack pin_class)
+- E2222 PinReserved — a board pin builtin names a literal pin the board reserves (console, debug port, clock, display, LEDs, ...); the pin builtins never touch it
 - E2223 SpawnStartsDeviceCode — spawn or spawn_registered starts a behavior that uses register_rwr or device prims; use spawn_device
 - E2224 SpawnDeviceStartsDangerousCode — spawn_device starts a behavior that uses external_danger or dangerous_* code
 - E2225 MessageTargetIsDeviceActor — cast, call or send targets a device_actor_ref; use cast_device
+- E2226 PinModeOrPullUnknown — pin_mode's mode is not one of the atom literals :input, :output, :output_open_drain, or pin_pull's pull is not one of :none, :up, :down (a variable is rejected too)
+- E2227 PinReadOnly — pin_mode, pin_pull or pin_write names a literal pin the board allows for pin_read only (the ESP32-S3 e-badge's buttons and joystick)
 - E2230 DeviceUserNeedsDevicePrefix — a module that uses a device_* module must use the device_ prefix in its own name
 - E2231 DeviceAndDangerousDependency — a dangerous_* module uses a device_* module (or the reverse)
 - E2232 DeviceSurfaceOutsideDeviceModule — spawn_device, cast_device, device_actor_ref, device_window or register_rwr outside a device_* module
