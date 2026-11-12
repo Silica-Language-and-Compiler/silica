@@ -4,6 +4,15 @@ Status: design only, written 2026-11-10. Nothing here is built; the board image 
 and nothing is written to flash. This records the option so the work can be picked up without rediscovering
 the constraints. Everything not read from a file or measured is marked **unverified**.
 
+Update 2026-11-12: sections 2.1-2.5 are implemented and link-verified, not run on the board:
+`runtime/silica_stm32l476rg_flash.ld`, `BOARD_EXEC=flash` in `tools/build_image.sh` (refused with `-r`/`--prepare`,
+the harness's runtime cache, instead of a second cache directory), the `.ifdef BOARD_EXEC_FLASH` parts of
+`rt_start.S` (.data copy first, ART on) and `rt_actors.S` (convention-word guard accepts flash, flash in the
+memory ranges), and `tools/run_on_board.py --exec flash --yes-wear-flash` (no wall clock written in flash mode;
+the RAM mode refuses a flash image). RAM images are byte-identical to before. The vector table is 98 words, not
+82; `.align 7` is kept and the flash script asserts the table is at 0x0800_0000. The by-hand user is
+`examples/nucleo_flash_max_actors/`.
+
 Paths below are relative to `compiler/src/emitter/STM32-L476RG_raw/board/` unless they start with `trials/`.
 
 ## 1. Why

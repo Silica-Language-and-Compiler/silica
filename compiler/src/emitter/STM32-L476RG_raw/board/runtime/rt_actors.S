@@ -1787,12 +1787,24 @@ rt_publish_context:
     // nibble is kept (bit 2 is the state-release proof); anything else is 0 (not checked).
     movw    r0, #0
     bic     r1, r6, #1
+.ifdef BOARD_EXEC_FLASH
+    // a flash image (build_image.sh BOARD_EXEC=flash): code lies in the 1 MiB flash as well
+    MOV32   r2, 0x08000000
+    cmp     r1, r2
+    blo.w   1f
+    MOV32   r2, 0x08100000
+    cmp     r1, r2
+    blo.w   12f
+.endif
     MOV32   r2, 0x20000000
     cmp     r1, r2
     blo.w   1f
     MOV32   r2, 0x20020000
     cmp     r1, r2
     bhs.w   1f
+.ifdef BOARD_EXEC_FLASH
+12:
+.endif
     ldr     r1, [r1, #-4]
     lsr     r2, r1, #4
     MOV32   r3, 0x5C1AC0F
@@ -3368,11 +3380,15 @@ silica_rt_timer_head:                       // the earliest pending timer, 0 non
     .size   silica_rt_get_performance_cores, . - silica_rt_get_performance_cores
 
 // silica_rt_get_cpu_topology() -> X0 { cores, numa_nodes, cache_hierarchy }: cores [core 0]; numa_nodes
-// [{ id 0, cores [0], memory_ranges [SRAM1, SRAM2] }] (latency 0: both are zero-wait SRAM); cache_hierarchy
-// { levels: nil }.
+// [{ id 0, cores [0], memory_ranges [SRAM1, SRAM2] }] (latency 0: both are zero-wait SRAM; a flash image,
+// BOARD_EXEC_FLASH, adds [flash] third, also reported with latency 0); cache_hierarchy { levels: nil }.
     FUNC silica_rt_get_cpu_topology
     ENTRY_SAVE
+.ifdef BOARD_EXEC_FLASH
+    sub     sp, sp, #24                     // [sp] three 8-byte words: a flash image lists flash too
+.else
     sub     sp, sp, #16                     // [sp] two 8-byte words for the lists built below
+.endif
     movw    r0, #0
     bl      rt_core_info_record
     str     r0, [sp, #0]
@@ -3394,7 +3410,18 @@ silica_rt_timer_head:                       // the earliest pending timer, 0 non
     movw    r0, #0
     str     r0, [sp, #4]
     str     r0, [sp, #12]
+.ifdef BOARD_EXEC_FLASH
+    // a flash image (build_image.sh BOARD_EXEC=flash): its code and constants are in the 1 MiB flash
+    MOV32   r0, 0x08000000
+    MOV32   r1, 1048576
+    bl      rt_memory_range_record
+    str     r0, [sp, #16]
+    movw    r0, #0
+    str     r0, [sp, #20]
+    movw    r0, #3
+.else
     movw    r0, #2
+.endif
     mov     r1, sp
     bl      rt_list_from_words
     mov     r7, r0                          // r7 = the memory ranges
@@ -3427,7 +3454,11 @@ silica_rt_timer_head:                       // the earliest pending timer, 0 non
     str     r6, [r0, #8]
     str     r7, [r0, #16]
     str     r8, [r0, #24]
+.ifdef BOARD_EXEC_FLASH
+    add     sp, sp, #24
+.else
     add     sp, sp, #16
+.endif
     movw    r1, #0
     ENTRY_RET_X0
     .size   silica_rt_get_cpu_topology, . - silica_rt_get_cpu_topology

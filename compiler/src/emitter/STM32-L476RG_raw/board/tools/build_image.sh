@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Build a bare-metal STM32L476RG (Nucleo-L476RG) RAM image from program sources plus the board runtime.
+# Build a bare-metal STM32L476RG (Nucleo-L476RG) RAM image (or, by hand only, a flash image: BOARD_EXEC
+# below) from program sources plus the board runtime.
 #
 #   build_image.sh [-q] [-r <runtime-cache-dir>] -o <out_dir>/<name> <source>...
 #   build_image.sh -r <runtime-cache-dir> --prepare
@@ -28,7 +29,15 @@
 # functions of board/runtime/rt_support.S; -ffixed-r9; BOARD_CFLAGS adds flags), and prebuilt .o objects and .a
 # archives for this triple (archives are placed after every object on the link line).
 # Produces <name>.elf (what the probe loads: board/tools/run_on_board.py), <name>.map and <name>.bin
-# (the raw image at 0x20000000, for a loader that takes binaries).
+# (the raw image at 0x20000000, for a loader that takes binaries; at 0x08000000 for a flash image).
+#
+# BOARD_EXEC=ram|flash (default ram). ram: the image runs from SRAM1 (runtime/silica_stm32l476rg.ld),
+# what the trial harness builds and loads. flash: the image runs from the 1 MiB flash
+# (runtime/silica_stm32l476rg_flash.ld; every source assembled with BOARD_EXEC_FLASH defined, so
+# rt_start.S copies .data from flash and turns the ART on, and rt_actors.S accepts flash code addresses;
+# design: compiler/design_documents/stm32_flash_execution_design.md). Loading a flash image wears the
+# flash (run_on_board.py --exec flash --yes-wear-flash, by hand only), so flash is refused together with
+# -r/--prepare, the runtime cache only the trial harness uses: no trial run can build a flash image.
 #
 # main's stacks are the linker script's defaults (6 KiB machine, 2 KiB auxiliary); BOARD_MAIN_STACK=N
 # and BOARD_MAIN_AUX=N override them (the ESP32-S3 port's per-image bound is not ported yet).
@@ -76,6 +85,18 @@ fi
 ARCH="-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=softfp"
 # The runtime sources are preprocessed (.S: rt_defs.h); emitted .sams are plain assembler.
 ASFLAGS="-c $ARCH -I$RT"
+LDSCRIPT="$RT/silica_stm32l476rg.ld"
+case "${BOARD_EXEC:-ram}" in
+    ram) ;;
+    flash)
+        if [ -n "$rtcache" ]; then
+            echo "$0: BOARD_EXEC=flash is refused with -r/--prepare (the trial harness's runtime cache): trial runs never use flash" >&2
+            exit 2
+        fi
+        ASFLAGS="$ASFLAGS -Wa,--defsym,BOARD_EXEC_FLASH=1"
+        LDSCRIPT="$RT/silica_stm32l476rg_flash.ld" ;;
+    *) echo "$0: BOARD_EXEC must be ram or flash (got '$BOARD_EXEC')" >&2; exit 2 ;;
+esac
 CFLAGS="-c $ARCH -Os -ffreestanding -fno-builtin -ffixed-r9 -ffunction-sections -fdata-sections -Wall -Wextra ${BOARD_CFLAGS:-}"
 defsyms=""
 [ -n "${BOARD_MAIN_STACK:-}" ] && defsyms="$defsyms -Wl,--defsym,_silica_main_stack_req=$BOARD_MAIN_STACK"
@@ -127,7 +148,7 @@ for src in "$@"; do
 done
 
 # the --defsym options must precede -T: the script tests DEFINED() on them
-"$CC" -nostdlib -nostartfiles $ARCH -Wl,--gc-sections $defsyms -Wl,-T,"$RT/silica_stm32l476rg.ld" \
+"$CC" -nostdlib -nostartfiles $ARCH -Wl,--gc-sections $defsyms -Wl,-T,"$LDSCRIPT" \
     -Wl,-Map,"$out.map" -o "$out.elf" $objs $libs -lgcc
 "$ARM_BIN/arm-none-eabi-objcopy" -O binary "$out.elf" "$out.bin"
 
@@ -138,4 +159,13 @@ he=$("$ARM_BIN/arm-none-eabi-nm" "$out.elf" | awk '$3 == "_silica_heap_end" {pri
 ms=$("$ARM_BIN/arm-none-eabi-nm" "$out.elf" | awk '$3 == "_silica_main_stack_size" {print $1}')
 ma=$("$ARM_BIN/arm-none-eabi-nm" "$out.elf" | awk '$3 == "_silica_main_aux_size" {print $1}')
 echo "  main stacks: machine $((0x$ms)) aux $((0x$ma)); heap $((0x$he - 0x$hs)) bytes"
+if [ "${BOARD_EXEC:-ram}" = flash ]; then
+    fb=$("$ARM_BIN/arm-none-eabi-nm" "$out.elf" | awk '$3 == "_silica_image_start" {print $1}')
+    fe=$("$ARM_BIN/arm-none-eabi-nm" "$out.elf" | awk '$3 == "_silica_flash_image_end" {print $1}')
+    dl=$("$ARM_BIN/arm-none-eabi-nm" "$out.elf" | awk '$3 == "_silica_data_load" {print $1}')
+    s2s=$("$ARM_BIN/arm-none-eabi-nm" "$out.elf" | awk '$3 == "_silica_sram2_heap_start" {print $1}')
+    s2e=$("$ARM_BIN/arm-none-eabi-nm" "$out.elf" | awk '$3 == "_silica_sram2_heap_end" {print $1}')
+    fbytes=$((0x$fe - 0x$fb))
+    echo "  flash: $fbytes bytes at 0x$fb ($(( (fbytes + 2047) / 2048 )) pages of 2 KiB; .data loaded from 0x$dl); sram2 chunk arena $((0x$s2e - 0x$s2s)) bytes"
+fi
 echo "  image: $out.elf"

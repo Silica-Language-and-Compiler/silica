@@ -1,0 +1,188 @@
+// nucleo_flash_max_actors: spawn as many actors as the ST Nucleo-L476RG's SRAM can hold, less three,
+// from a flash image (code and constants in flash, all of SRAM1 and SRAM2 for data). Run by hand only:
+// see README.md. Never part of the trials (each run reprograms the flash).
+//
+// main registers the FailureReporter, starts the supervisor, sends the spawner its first message and
+// waits. The spawner spawns one worker per dispatch and casts itself the next step, so no function
+// recurses and every stack stays in its first chunk. Each worker is cast one message at once (its stack
+// chunks are allocated at its first dispatch, so every worker really occupies its memory) and answers
+// the tally, which ends the program with status 0 when every worker has answered.
+
+use Supervisor;
+
+impl AppSupervisor for Supervisor;
+
+// The estimate (README.md, "The actor-count estimate"): the number of worker actors that fit in the
+// SRAM of the flash image beside the four actors the program itself needs. Derived once from the
+// image's linker map; `make size` recomputes it from the current map and warns when this disagrees.
+fn estimated_max_actors() -> int64 {
+    37
+}
+
+// Spawn three fewer than the estimate.
+fn actors_to_spawn() -> int64 {
+    estimated_max_actors() - 3
+}
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// A worker answers the tally once per message. Its state counts the messages it has handled.
+fn worker(msg: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: boolean <- cast_registered(:tally, msg impl ActorMessage {})
+    produces
+        pure (:no_reply, state + 1)
+    end
+}
+
+fn report_spawned(spawned: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print_string("spawned: ");
+        _: atom <- print_int64(spawned);
+        println("")
+    produces
+        pure :ok
+    end
+}
+
+// One spawn step: the worker, its one message, then the next step for the spawner itself. Answers the
+// new number of workers spawned.
+fn spawn_one(spawned: int64) -> int64 {
+    sequence proc[concurrency]
+        worker_ref: actor_ref <- spawn(0, worker, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- case spawned + 1 == actors_to_spawn() of {
+            true -> report_spawned(spawned + 1);
+            false -> :ok
+        };
+        _: boolean <- cast(worker_ref, 1 impl ActorMessage {});
+        _: boolean <- cast(self(), 0 impl ActorMessage {})
+    produces
+        pure spawned + 1
+    end
+}
+
+// The spawner's state is the number of workers spawned so far.
+fn spawner(msg: int64, state: int64) -> (:no_reply, int64) {
+    case state < actors_to_spawn() of {
+        true -> (:no_reply, spawn_one(state));
+        false -> (:no_reply, state)
+    }
+}
+
+fn finish(answered: int64) -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- print_string("answered: ");
+        _: atom <- print_int64(answered);
+        _: atom <- print_string(" (estimate ");
+        _: atom <- print_int64(estimated_max_actors());
+        _: atom <- println(")");
+        _: boolean <- cast_exit(0)
+    produces
+        pure answered
+    end
+}
+
+// The tally's state is the number of answers so far; the last one ends the program with status 0.
+fn tally(msg: int64, state: int64) -> (:no_reply, int64) {
+    answered: int64 <- state + msg;
+    case answered == actors_to_spawn() of {
+        true -> (:no_reply, finish(answered));
+        false -> (:no_reply, answered)
+    }
+}
+
+fn init(initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: int64,
+            behavior: fn(msg: int64, state: int64) -> (:no_reply, int64),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous,
+            state_policy: state_policy
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+            strategy: :one_for_one | :one_for_all | :rest_for_one,
+            allowed_restart_count: int64,
+            restarts_time_frame: int64
+        } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 5 };
+        children: List[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: int64,
+                behavior: fn(msg: int64, state: int64) -> (:no_reply, int64),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous,
+                state_policy: state_policy
+            },
+            mem(normal)
+        ] <- [
+            {
+                id: :tally,
+                agent_type: :worker,
+                initial_state: 0,
+                behavior: tally,
+                restart: :permanent,
+                shutdown: 0,
+                flavor: :plain,
+                state_policy: state_policy(:keep_state_area)
+            },
+            {
+                id: :spawner,
+                agent_type: :worker,
+                initial_state: 0,
+                behavior: spawner,
+                restart: :permanent,
+                shutdown: 0,
+                flavor: :plain,
+                state_policy: state_policy(:keep_state_area)
+            }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(reporter_ref);
+        _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_registered(:spawner, 0 impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
