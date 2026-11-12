@@ -67,11 +67,26 @@
 #define FLASH_ACR        0x40022000
 #define FLASH_ACR_LATENCY_MASK 0x7
 #define FLASH_ACR_LATENCY_4WS  0x4
+#define FLASH_ACR_ART_ON       0x700
 
     .section .text.silica_rt_start, "ax", %progbits
     FUNC _start
     // 1. No interrupts; our vectors; our stack; the FPU.
     cpsid   i
+.ifdef BOARD_EXEC_FLASH
+    // A flash image (build_image.sh BOARD_EXEC=flash, silica_stm32l476rg_flash.ld): .data is copied
+    // from its load image in flash before anything reads it, the fault path included
+    // (silica_rt_fatal_depth lives there). No stack is used; r0-r3 only.
+    MOV32   r0, _silica_data_load
+    MOV32   r1, _silica_data_start
+    MOV32   r2, _silica_data_end
+5:  cmp     r1, r2
+    bhs.w   6f
+    ldr     r3, [r0], #4
+    str     r3, [r1], #4
+    b.w     5b
+6:
+.endif
     MOV32   r0, silica_rt_vectors
     MOV32   r1, SCB_VTOR
     str     r0, [r1]
@@ -138,6 +153,17 @@
     and     r0, r0, #FLASH_ACR_LATENCY_MASK
     cmp     r0, #FLASH_ACR_LATENCY_4WS
     bne.w   4b
+.ifdef BOARD_EXEC_FLASH
+    // Code runs from flash: the ART accelerator's prefetch, instruction cache and data cache on
+    // (PRFTEN | ICEN | DCEN, bits 8-10; the latency field kept), read back like the latency.
+    ldr     r0, [r2]
+    orr     r0, r0, #FLASH_ACR_ART_ON
+    str     r0, [r2]
+7:  ldr     r0, [r2]
+    and     r0, r0, #FLASH_ACR_ART_ON
+    cmp     r0, #FLASH_ACR_ART_ON
+    bne.w   7b
+.endif
     ldr     r0, [r1, #RCC_CFGR]
     bic     r0, r0, #0x3
     orr     r0, r0, #RCC_CFGR_SW_PLL
