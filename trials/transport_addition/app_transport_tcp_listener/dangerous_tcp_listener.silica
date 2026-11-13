@@ -10,7 +10,30 @@ use wireframe;
 use Carrier;
 use dangerous_sockets;
 use dangerous_tcp_carrier;
-use trial_wait_int64;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The program's own failure reporter makes the ending deterministic (the runtime's stderr banners are written by the
+// carriers' threads, not the program's, so their order against standard output and each other would be a race): each of the five carriers (the listener, two client links, two accepted connections)
+// ends normally and the runtime delivers its report here instead of printing it; after the last the reporter prints the
+// trial's last line and ends the program.
+fn reporter(_report: string, state: { seen: int64 }) -> (:no_reply, { seen: int64 }) {
+    sequence proc[concurrency, device_io]
+        seen: int64 <- state.seen + 1;
+        _: boolean <- case seen == 5 of {
+            true -> {
+                _: atom <- println("done");
+                cast_exit(0)
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, { seen: seen })
+    end
+}
+
 
 fn first_segment(xs: List[string, mem(normal)]) -> string {
     case xs of {
@@ -164,7 +187,7 @@ fn client(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_f
 // The listener's owner: starts the first client once the listener is bound, gives each accepted
 // connection a session, starts the second client when the first is done, and ends the trial after
 // the second.
-fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:client_done, int64) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | :settled,
+fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:client_done, int64) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
                state: { car: dangerous_actor_ref, port: string })
     -> (:no_reply, { car: dangerous_actor_ref, port: string }) {
     case msg of {
@@ -172,7 +195,7 @@ fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string
             true -> {
                 sequence proc[concurrency]
                     port: string <- substring(info, 5, length_bytes(info));
-                    link1: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    link1: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                     cli1: actor_ref <- spawn({ car: link1, rx: wireframe@fresh(Carrier@boundaries((:tcp))), n: 7, boss: self() }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                     _: boolean <- cast(link1, (:open, cli1, concat("127.0.0.1:", port)) impl ActorMessage {})
                 produces
@@ -192,7 +215,7 @@ fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string
         (:client_done, n: int64) -> case n == 7 of {
             true -> {
                 sequence proc[concurrency]
-                    link2: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                    link2: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                     cli2: actor_ref <- spawn({ car: link2, rx: wireframe@fresh(Carrier@boundaries((:tcp))), n: 9, boss: self() }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                     _: boolean <- cast(link2, (:open, cli2, concat("127.0.0.1:", state.port)) impl ActorMessage {})
                 produces
@@ -200,23 +223,13 @@ fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string
                 end
             };
             false -> {
-                // the closed carriers end and, having no supervisor, report their normal exit on standard
-                // error: the trial's last line is printed after those reports (:settled, below)
+                // closing the listener ends its carrier; the reporter counts the five carriers' reports
                 sequence proc[concurrency]
-                    _: boolean <- cast(state.car, :close impl ActorMessage {});
-                    _: timer_ref <- send_after(300, self(), :settled impl ActorMessage {})
+                    _: boolean <- cast(state.car, :close impl ActorMessage {})
                 produces
                     pure (:no_reply, state)
                 end
             }
-        };
-        :settled -> {
-            sequence proc[concurrency, device_io]
-                _: atom <- println("done");
-                _: boolean <- cast_exit(0)
-            produces
-                pure (:no_reply, state)
-            end
         };
         (:tx_credit, _n2: int64) -> (:no_reply, state);
         (:rx, _segment: string) -> (:no_reply, state);
@@ -231,16 +244,11 @@ fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string
 
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
-        _: supervisor_ref <- trial_wait_int64@start();
-        _: boolean <- trial_wait_int64@run(fn() -> int64 {
-            sequence proc[concurrency]
-                lst: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-                boss: actor_ref <- spawn({ car: lst, port: "" }, coordinator, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-                _: boolean <- cast(lst, (:open, boss, "listen:0") impl ActorMessage {})
-            produces
-                pure 0
-            end
-        });
+        rep: actor_ref <- spawn({ seen: 0 }, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        lst: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        boss: actor_ref <- spawn({ car: lst, port: "" }, coordinator, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(lst, (:open, boss, "listen:0") impl ActorMessage {});
         code: int64 <- wait_for_exit()
     produces
         pure code

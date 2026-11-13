@@ -32,7 +32,8 @@ SUB_TRIALS      := ffi_addition module_duplicate_name_trial module_nonexported_c
 	board_pack_tag_described_trial board_pack_tag_described_bad_body_trial board_pack_wrong_pack_module_trial \
 	$(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,$(DEVICE_APP_TRIALS)) \
 	e2236_supervisor_without_reporter_trial e2236_supervisor_before_registration_trial e2236_helper_starts_supervisor_trial e2236_lib_start_without_reporter_trial e2236_lib_start_through_local_call_trial \
-	cast_check_supervisor_child_trial cast_check_cross_module_trial cast_check_cross_module_param_trial
+	cast_check_supervisor_child_trial cast_check_cross_module_trial cast_check_cross_module_param_trial \
+	link_interface_listen_any_trial link_loopback_listen_any_trial link_loopback_listen_ip_trial
 
 # Single-file trial sources: every *.silica directly in this directory. $(wildcard)
 # rather than $(shell find): the tree holds ~20k files and this file is parsed several times.

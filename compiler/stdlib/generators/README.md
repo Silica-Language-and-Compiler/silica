@@ -20,7 +20,7 @@ from any module of this shape.
 
 **`gen_backing_carrier.py`** holds the backing carrier's text with named placeholders for its record literals
 (`OPENING`, `DRAINED`, ...) and prints the carrier's initial-state literal. That literal is also spelled in
-`compiler/src/emitter/apple_silicon_mac/transport_pack.silica`, in the spawn text of the `(:backing)` link, because a
+the three hosted packs (`compiler/src/emitter/apple_silicon_mac/transport_pack.silica`, `linux_aarch64/transport_pack.silica`, `linux_x86_64/transport_pack.silica`), in the spawn text of the `(:backing)` link, because a
 program cannot call a dangerous module's `initial`: when a field of the state changes, change the pack's text too.
 
 The trial programs of both carriers are generated as well: `trials/transport_addition/generators/`.

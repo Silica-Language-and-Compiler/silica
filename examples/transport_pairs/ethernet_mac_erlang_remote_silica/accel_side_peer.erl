@@ -1,5 +1,5 @@
 %% The Erlang accel side of examples/transport_pairs/ethernet_mac_erlang_remote_silica (run.sh): it runs on the
-%% Mac and DIALS the Silica status side (the Linux end of ../ethernet_direct, listening on "listen:any:4550").
+%% Mac and DIALS the Silica status side (the Linux end of ../ethernet_direct, listening on "listen:4550").
 %% There is one TCP connection, and requests flow both ways over it:
 %%
 %%   this side -> peer  {request, 1 | 3 | 5, {accel, #{x, y, z, at_ms}}}   peer -> {reply, Id, {led, #{which => red, on => Z > 256}}}

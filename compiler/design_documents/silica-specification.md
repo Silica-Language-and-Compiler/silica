@@ -10786,6 +10786,7 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2415 | two carrier declarations, in one module or across the modules of a compile, claim the same exclusive hardware: a UART or USB CDC instance, a serial port path, or the USB-Serial-JTAG controller |
 | E2416 | reserved: the link needs a board configuration function that is not defined (phase D; nothing reaches it yet) |
 | E2417 | a link parameter is not a literal, is of the wrong kind, is missing or is one too many, a baud is not positive, or the pack rejects the baud |
+| E2418 | a `(:tcp)` carrier on a link the target serves (`(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`) is opened by a `cast(x, (:open, owner, "<address>"))` whose address literal the link refuses: `"listen:any:<port>"` under any of them, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; `x` is bound in the same function by `spawn_dangerous_carrier`. An address the checker cannot see (a variable, a function's result) is refused at run time instead: the carrier tells its owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)` |
 
 #### 16.4.10 Diagnostics
 
@@ -10801,12 +10802,12 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2409 | a program `impl` of `WireFormat` or `Carrier` |
 | E2410 | a protocol or carrier tag the build's target does not provide |
 | E2411 | an `impl Transportable` or `impl Recreatable` declaration |
-| E2412 to E2417 | carrier link diagnostics, with E1081 for a malformed `carried_on` line: §16.4.9 |
+| E2412 to E2418 | carrier link diagnostics, with E1081 for a malformed `carried_on` line: §16.4.9 |
 | W2401 | advisory: a decoder was derived; foreign bytes become values here |
 
 #### 16.4.11 Storage carriers
 
-**Status (2026-11-12).** Phases S0 and S1 of transport design §6.8 are implemented for the Apple Silicon macOS target:
+**Status (2026-11-12).** Phases S0 and S1 of transport design §6.8 are implemented for the Apple Silicon macOS target and, in the source, in the two Linux transport packs (linux_aarch64, linux_x86_64; the Linux compiler build and trial runs are still pending):
 the `(:store)` kind, the `(:memory, capacity, retention)` and `(:backing, path, capacity, retention)` links, the
 vocabulary below, the `:storage` framing mode and the stored-frame header of §16.4.7's module, and the on-medium form
 (`storelog`). The `(:sd_blocks, ...)` and `(:flash_region, ...)` links are named and checked by the language and provided

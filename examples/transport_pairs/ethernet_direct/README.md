@@ -22,16 +22,18 @@ full duplex. Every reply is matched to its request by id.
   | Linux end | `carried_on wire: (:tcp) (:interface, "eth0");` (the remote's public interface, 138.197.209.113; override with `LINUX_IFACE`) |
   | `--local` (both ends on the Mac) | `carried_on wire: (:tcp) (:interface, "lo0");` |
 
-- **The interface binding is NOT enforced.** A hosted link declaration binds nothing yet
-  (`compiler/design_documents/transport_links_design.md` §3.2; binding is the future stage E2). The compiler
-  checks only that the declaration's tags are valid; it does not look the interface name up, and the traffic is
-  **not** pinned to `en0` or `eth0`. The address strings still decide everything: the Linux end's
-  `"listen:any:4550"` binds every interface, and the Mac's dial to `138.197.209.113:4550` leaves by whatever route
-  the routing table picks. The declaration records the intent.
+- **The interface binding is enforced (stage E2, built 2026-11-12; not yet re-run here).** A named link binds the
+  carrier to that interface's first IPv4 address (`transport_links_design.md` §3.2): the Linux end's
+  `"listen:4550"` listens on `eth0`'s address, and the Mac's dial leaves from `en0`'s address. A named link refuses
+  `"listen:any:4550"`, and `(:interface, "en0")` with `listen:any` was exactly what this example declared before E2,
+  so the source and `run_direct.sh` now write `"listen:4550"`. **Choice made: the declaration is kept** (it now
+  means something), and the listener binds the declared interface instead of every interface. Nothing changes on
+  the wire: the status side still listens on 4550 and the Mac still dials `138.197.209.113:4550`; only the
+  listening address narrows from 0.0.0.0 to eth0's address. `--local` declares `lo0`, so its listener binds 127.0.0.1.
 
 ```
         Mac (accel side, behind the campus NAT)                Linux x86-64 (status side, public address)
-  dialer -> 138.197.209.113:4550  ===== one TCP connection =====  listener "listen:any:4550" (0.0.0.0:4550)
+  dialer -> 138.197.209.113:4550  ===== one TCP connection =====  listener "listen:4550" (eth0's address, port 4550)
 
   Mac -> Linux   (:request, 1 | 3 | 5, (:accel, { x, y, z, at_ms }))   Linux -> Mac  (:reply, id, (:led, { which: :red, on: z > 256 }))
   Linux -> Mac   (:request, 2 | 4 | 6, :status)                          Mac -> Linux  (:reply, id, (:status, { host, uptime_ms, requests_seen }))
@@ -52,15 +54,16 @@ The terms are ETF, and each frame has a 4-byte length prefix (`wireframe`, the s
 - **This replaces `../ethernet_remote`.** That pair has two connections, one dialed by each side, and carries both
   through `ssh -L`/`ssh -R` forwards to loopback-only listeners.
 
-## The listener binds every interface
+## The listener binds the declared interface (and the wildcard form)
 
 `"listen:<port>"` binds 127.0.0.1 only. For this pair, `dangerous_tcp_carrier` gained one explicit form:
 
 - **`"listen:any:<port>"`** binds `0.0.0.0:<port>` (`dangerous_sockets@tcp_listen_any`, the C wrapper
   `silica_sockets_tcp_listen_any`).
 - **Nothing selects it by default.** A program must write it.
-- **It is temporary.** It stands in until interface binding (`(:interface, name)`, `(:ethernet, n)`) exists: stage
-  E2 of `compiler/design_documents/transport_hosted_ethernet_plan.md`.
+- **It is for a carrier with no named link.** Interface binding now exists (stage E2 of
+  `compiler/design_documents/transport_hosted_ethernet_plan.md`): under `(:interface, name)`, `(:ethernet, n)`,
+  `(:wifi, n)` or `(:loopback)` this form is refused, so this pair writes `"listen:4550"` instead.
 - **Trial.** `trials/transport_addition/app_transport_tcp_listen_any` binds it on port 0 and connects through
   127.0.0.1.
 
@@ -137,7 +140,7 @@ Options and overrides:
 - `MAC_IFACE` and `LINUX_IFACE` for the declared links (declarations only; see "The interface binding is NOT
   enforced" above).
 
-`--local` builds both sides on the Mac. The status side listens on `listen:any:45550` and the accel side dials
+`--local` builds both sides on the Mac. The status side listens on `listen:45550` (the `lo0` address) and the accel side dials
 `127.0.0.1:45550`. It compares the outputs with the same `expected/` files. It is the self-test of the logic, and it
 needs no network.
 

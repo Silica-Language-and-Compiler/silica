@@ -1,0 +1,75 @@
+// A named link refuses "listen:any:<port>" whether or not the interface exists. The address is built at run time so
+// the compile-time check (E2418) does not see it and the carrier's own refusal is what runs.
+//
+// The owner is told (:link_down, :fault) when the carrier refuses the open and tells its own failure reporter; the carrier itself ends (:explicit, :link_unavailable), which the runtime delivers to that reporter as the failure report.
+// The reporter waits for both, prints the report on stderr and ends the program with exit code 0 (any other reason from the owner: 2), so the run ends on the carrier's failure report.
+module dangerous_link_listen_any_refused_interface;
+
+use dangerous_sockets;
+
+carried_on net: (:tcp) (:interface, "nope0");
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(msg: string, state: { seen: int64, report: string }) -> (:no_reply, { seen: int64, report: string }) {
+    sequence proc[concurrency, device_io]
+        from_owner: boolean <- msg == "link_down:fault";
+        seen: int64 <- case from_owner of {
+            true -> state.seen + 1;
+            false -> case contains(msg, "(:explicit, :link_unavailable)") of {
+                true -> state.seen + 2;
+                false -> state.seen
+            }
+        };
+        report: string <- case from_owner of {
+            true -> state.report;
+            false -> msg
+        };
+        _: boolean <- case seen == 3 of {
+            true -> {
+                _: atom <- println_stderr(report);
+                cast_exit(0)
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, { seen: seen, report: report })
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { reporter: actor_ref })
+    -> (:no_reply, { reporter: actor_ref }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, state);
+        (:accepted, _conn: dangerous_actor_ref, _peer: string) -> (:no_reply, state);
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n2: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> {
+            sequence proc[concurrency]
+                _: boolean <- case why2 of {
+                    :fault -> cast(state.reporter, "link_down:fault" impl ActorMessage {});
+                    _: atom -> cast_exit(2)
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn({ seen: 0, report: "" }, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(net, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        own: actor_ref <- spawn({ reporter: rep }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, own, concat("listen:any", ":0")) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

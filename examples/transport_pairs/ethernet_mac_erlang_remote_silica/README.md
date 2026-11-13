@@ -12,7 +12,7 @@ and Erlang on the remote, is [`../ethernet_mac_silica_remote_erlang`](../etherne
 
 ```
         Mac (Erlang, accel side, behind the campus NAT)        Linux x86-64 (Silica, status side, public address)
-  gen_tcp:connect -> 138.197.209.113:4550  === one TCP connection ===  listener "listen:any:4550" (0.0.0.0:4550)
+  gen_tcp:connect -> 138.197.209.113:4550  === one TCP connection ===  listener "listen:4550" (eth0's address, port 4550)
 
   Mac -> Linux   {request, 1 | 3 | 5, {accel, #{x, y, z, at_ms}}}   Linux -> Mac  {reply, Id, {led, #{which => red, on => Z > 256}}}
   Linux -> Mac   {request, 2 | 4 | 6, status}                       Mac -> Linux  {reply, Id, {status, #{host, uptime_ms, requests_seen}}}
@@ -54,7 +54,7 @@ monotonic clock. The expected file has the Erlang host, and `uptime_ms` is repla
   - with 3 replies matched and 3 requests answered it prints `pair complete`, waits 1.5 s so the peer can read the
     last reply, and exits 0;
   - with no completion 45 s after start it prints `timeout: pair not complete` and exits 5.
-- **The Linux end** is the status side of `../ethernet_direct`. It listens on `"listen:any:4550"`, sends status
+- **The Linux end** is the status side of `../ethernet_direct`. It listens on `"listen:4550"` (the address of its declared `eth0`), sends status
   requests and answers accel requests by the rule (red on when z > 256). **It is not rebuilt here.** `run.sh` copies
   the program that `../ethernet_direct/run_direct.sh` built on the remote
   (`~/silica_demo/ethernet_direct/build/dangerous_ethernet_direct_pair`) into this example's remote directory. It
@@ -63,9 +63,11 @@ monotonic clock. The expected file has the Erlang host, and `uptime_ms` is repla
   `../ethernet_direct/build_linux.sh`, and only when no other `silica-compiler` or `make` runs on the remote.
 - **The Silica end's carrier declaration.** The Linux end declares `carried_on wire: (:tcp) (:interface, "eth0");`
   (the remote's public interface; `LINUX_IFACE` overrides it, and the `--local` copy declares `(:interface, "lo0")`). **The
-  interface binding is NOT enforced:** a hosted link declaration binds nothing yet
-  (`compiler/design_documents/transport_links_design.md` §3.2, future stage E2); the compiler checks only its tags,
-  and the address string `"listen:any:4550"` still binds every interface. See `../ethernet_direct/README.md`.
+  interface binding is enforced since stage E2 (built 2026-11-12; not yet re-run here)**: the named link binds the
+  carrier to that interface's first IPv4 address and refuses `listen:any`, so the status side was changed from
+  `"listen:any:4550"` to `"listen:4550"` in `../ethernet_direct`. **Choice made: the declaration is kept** and the
+  listener narrows from 0.0.0.0 to `eth0`'s address; the port, the dial address and the traffic are unchanged. See
+  `../ethernet_direct/README.md`.
 
 ## Security
 

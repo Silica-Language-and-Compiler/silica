@@ -11,7 +11,7 @@ sides interleaved, every reply matched to its request by id.
   - **Which build.** It was silica-999959 for the 2026-11-10 results. Since 2026-11-11 it is silica-999958, which
     has `carried_on`.
   - **Staging.** The script copies the compiler into `~/silica_demo/toolchain` when its checksum differs.
-- Both ends declare the hosted `(:tcp)` carrier on the loopback link, `carried_on wire: (:tcp) (:loopback);`, and
+- Both ends declare the hosted `(:tcp)` carrier on the loopback link, `carried_on wire: (:tcp) (:loopback);` (stage E2 leaves this example unchanged: it listens on `"listen:<port>"`, 127.0.0.1, which `(:loopback)` allows; it never used `listen:any`), and
   start one listener and one connecting carrier per end with `spawn_dangerous_carrier(wire, ...)` (the compiler
   expands it to `dangerous_tcp_carrier`). `Carrier@mtu(wire)` and `Carrier@boundaries(wire)` are the kind's row.
   - **Why `(:loopback)`.** Both ends only touch 127.0.0.1; the ssh tunnels carry the bytes between the hosts.

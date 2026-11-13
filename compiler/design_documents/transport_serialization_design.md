@@ -554,7 +554,7 @@ be rid of it.
 
 **Listeners.** A carrier whose `addressing` is `:endpoint` and whose `boundaries` are `:stream` may be opened to
 listen instead of connect (`(:tcp)`: `"listen:<port>"` binds 127.0.0.1 only; `"listen:any:<port>"` binds every IPv4
-interface, 0.0.0.0, and is otherwise the same). A listener carries no bytes itself: it answers
+interface, 0.0.0.0, and is otherwise the same; the full address forms and the link rules are in the `(:tcp)` row of §6.3). A listener carries no bytes itself: it answers
 `(:link_up, info)` once bound, and for every peer it accepts it spawns **one connection carrier** holding that
 peer, a carrier actor like any other, and tells its owner about it. The owner decides who owns each connection
 by opening it, the way `gen_tcp:controlling_process/2` hands an accepted socket to the process that will read
@@ -581,7 +581,7 @@ not list the same rows (BLE on a headless server, for instance).
 
 | Tag | Provided by | `mtu` | `boundaries` | `delivery` | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor (`"listen:<port>"` on 127.0.0.1, `"listen:any:<port>"` on 0.0.0.0, the explicit wildcard until interface binding exists, §6.7) spawns one per accepted peer and announces it with `(:accepted, conn, info)` (§6.2). **Plain TCP: no authentication, no encryption, no peer identity** (see the security note under this table) |
+| `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor spawns one per accepted peer and announces it with `(:accepted, conn, "peer:<ipv4>:<port>")` (§6.2). Address forms (hosted Ethernet plan stage E2, built 2026-11-12; loopback, refusals and E2418 verified on the three hosted targets; Linux classifier, Wi-Fi and a real non-loopback interface not verified): with no link declared, `"listen:<port>"` binds 127.0.0.1, `"listen:any:<port>"` binds 0.0.0.0 and `"listen:<ipv4>:<port>"` binds that address; under `(:loopback)`, `"listen:<port>"` binds 127.0.0.1, `"listen:any:<port>"` is refused and `"listen:<ipv4>:<port>"` is allowed only inside 127.0.0.0/8; under `(:interface, name)`, `(:ethernet, n)` or `(:wifi, n)`, `"listen:<port>"` binds that interface's first IPv4 address, `"listen:any:<port>"` is refused and `"listen:<ipv4>:<port>"` is allowed only for one of that interface's addresses, and a dial leaves from the interface's address (dials under `(:loopback)` are unchanged). A refusal makes the carrier tell its owner `(:link_down, :fault)` and end `(:explicit, :link_unavailable)`; a malformed IPv4 ends `(:explicit, :bad_address)`. `(:ethernet, n)` and `(:wifi, n)` count only interfaces holding an IPv4 address. Where the checker sees the spawn and a refused address literal in one function it is E2418 (specification §16.4.9). The `(:udp)` carrier still binds nothing. **Plain TCP: no authentication, no encryption, no peer identity** (see the security note under this table) |
 | `(:udp)` | the same wrappers | 65507 | `:datagram` | `:unreliable` | an endpoint actor per bound port |
 | `(:serial)` | a dangerous actor over a Fifi wrapper of the host's serial port (termios on macOS and Linux) | 0 | `:stream` | `:reliable_ordered` | the port and line speed come from the carrier's declaration, `carried_on <name>: (:serial) (:serial_port, "/dev/cu.usbmodem101", 115200);` (§6.7; `spawn_dangerous_carrier(<name>, ...)` puts them in the initial state and `:open`'s `address` is `""`); an `address` `"path@baud"` still names a port directly. This is the host end of the board's USB-UART, USB-Serial-JTAG and USB CDC carriers, so a Mac and the board exchange frames Silica to Silica with no Erlang in between. The wrapper does not flush the port's input at open, which this path needs (§14, board carrier notes) |
 | `(:ble_gatt)` | a dangerous actor over a Fifi wrapper of the host's Bluetooth stack (CoreBluetooth on macOS, BlueZ D-Bus on Linux) | negotiated ATT_MTU minus 3 (20 by default, up to 244 after MTU exchange; a characteristic value is at most 512 bytes) | `:datagram` | `:ordered_lossy` for notifications, `:reliable_ordered` for indications and writes with response | `address` is a characteristic UUID; `:link_up` carries the negotiated MTU |
@@ -673,8 +673,9 @@ on the Apple Silicon Mac and the ESP32-S3_raw board**; the Linux packs list no l
 ### 6.8 Storage carriers: durable logs, transport through time
 
 **Status: design, 2026-11-11 (Lee's decisions are recorded at the end). Phases S0 and S1 are implemented on Apple
-Silicon (2026-11-12; §6.8.9 and §6.8.10 say what was built and where it differs from the text below); S2 and S3 are not
-built.** A program
+Silicon (2026-11-12; §6.8.9 and §6.8.10 say what was built and where it differs from the text below). S2 is implemented in
+the source of the Linux packs (the storage carriers are in all three hosted packs); the Linux packs are built and run in
+the next trial pass, so S2 is not yet verified on Linux. S3 is not built.** A program
 that must keep values past a restart sends them to a **storage carrier**. The peer is the program's own future
 self (or another program that opens the same medium afterwards; one owner at a time, §6.8.2). Everything else is the transport the rest of §6 already
 describes: the same `carried_on` declaration, the same pack rows, the same `WireFormat` traits, the same
@@ -906,7 +907,7 @@ its log again. The board adds the medium's own trials.
 | --- | --- | --- |
 | S0 | the §6.8.2 vocabulary, the envelope, `wireframe@record` and `unrecord`, the `(:store)` kind and `Link.silica` rows, `(:memory)`; Apple Silicon | every `(:memory)` trial above passes; failure trials green; goldens regenerated |
 | S1 | `(:backing, path)` with its sidecar; restart trials across two program runs | every `(:backing)` trial above passes on a real backing |
-| S2 | Linux AArch64 and x86-64 lock-step | the suite is green on both; goldens regenerated on a Linux host |
+| S2 | Linux AArch64 and x86-64 lock-step (implemented in the packs' source; built and run in the next trial pass) | the suite is green on both; goldens regenerated on a Linux host |
 | S3 | the board medium and its worker (flash or SD), `:ring` wear behaviour measured | the board trials of §6.8.7 pass on the real board |
 | later | the keyed in-memory library over a replay; BEES's ETS and DETS substrate; a hash chain or encryption at rest | their own designs |
 
@@ -959,6 +960,8 @@ are.
 
 #### 6.8.9 Implementation status: phase S0 (2026-11-12, Apple Silicon)
 
+*Update:* the `(:memory)` link is since ported to the linux_aarch64 and linux_x86_64 packs (source only; built and run in the next trial pass). The text below is the Apple Silicon record.
+
 **Built.**
 
 | Piece | Where |
@@ -1002,6 +1005,8 @@ a carrier, a restart that finds its log, `:mismatch`. The scan those rest on is 
 `transport_storelog`.
 
 #### 6.8.10 Implementation status: phase S1 (2026-11-12, Apple Silicon)
+
+*Update:* the `(:backing)` link is since ported to the linux_aarch64 and linux_x86_64 packs (source only; built and run in the next trial pass). The text below is the Apple Silicon record.
 
 **Built.**
 
@@ -1068,7 +1073,7 @@ actor either. Composite `recreate` is not built. So the backing carrier keeps no
   such hole (the writes of one drain are made in order); a power loss that reorders writes can.
 - **`(:link_down, :medium)` has no trial:** there is no way yet to make a write or a flush fail on demand.
 - **The lock across two processes** rests on the same `flock` the in-process trial exercises, and has no trial of its own.
-- **Linux** (S2): the wrappers use `fdatasync` and `flock` there and are not compiled or run yet.
+- **Linux** (S2): the wrappers use `fdatasync` and `flock` there. The `(:store)` kind with `(:memory)` and `(:backing)` is implemented in the linux_aarch64 and linux_x86_64 packs; the Linux compiler build and trial runs are pending, so nothing is verified on Linux yet.
 
 ---
 

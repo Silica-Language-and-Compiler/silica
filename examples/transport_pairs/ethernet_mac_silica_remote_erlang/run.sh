@@ -173,7 +173,7 @@ if [ "$MODE" = local ]; then
         exit 0
     fi
     echo "== local: the Erlang peer listens on 127.0.0.1:$LOCAL_PORT, the Silica accel side dials it"
-    build_mac_silica "$WORK/local/accel" mac "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" mac-arm64 '(:interface, "lo0")'
+    build_mac_silica "$WORK/local/accel" mac "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" mac-arm64 '(:interface, "lo0")'
     all=1
     for r in $(seq 1 "$RUNS"); do
         echo "== local run $r"
@@ -188,7 +188,7 @@ if [ "$MODE" = local ]; then
 fi
 
 echo "== 1. Mac end (Silica, accel side): dials $REMOTE_IP:$PORT"
-build_mac_silica "$WORK/mac" mac "listen:any:$PORT" "$REMOTE_IP:$PORT" mac-arm64 "(:interface, \"$MAC_IFACE\")"
+build_mac_silica "$WORK/mac" mac "listen:$PORT" "$REMOTE_IP:$PORT" mac-arm64 "(:interface, \"$MAC_IFACE\")"
 
 if [ $TCHECK = 1 ]; then
     echo "== timeout check: no remote peer; the Mac end dials $REMOTE_IP:$PORT and is refused until it times out"
