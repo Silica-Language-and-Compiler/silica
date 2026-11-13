@@ -134,8 +134,8 @@ fn session(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_
     }
 }
 
-// A client: on :link_up it sends (:ping, n); the answer is shown, the connection closed and the
-// coordinator told.
+// A client: on :link_up it sends (:ping, n); the answer is shown and the coordinator told. The coordinator closes the
+// connection (every carrier ends only after the last answer is shown, so no root-exit note can precede output).
 fn client(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
           state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, n: int64, boss: actor_ref })
     -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, n: int64, boss: actor_ref }) {
@@ -161,7 +161,6 @@ fn client(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_f
                                 (:ok, v: (:ping, int64) | (:pong, int64)) -> show_term(v);
                                 (:rejected, why: atom) -> print_atom(why)
                             };
-                            _: boolean <- cast(state.car, :close impl ActorMessage {});
                             _: boolean <- cast(state.boss, (:client_done, state.n) impl ActorMessage {})
                         produces pure r2 end
                     };
@@ -186,10 +185,10 @@ fn client(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_f
 
 // The listener's owner: starts the first client once the listener is bound, gives each accepted
 // connection a session, starts the second client when the first is done, and ends the trial after
-// the second.
+// the second, then closes both client links and the listener.
 fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:client_done, int64) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
-               state: { car: dangerous_actor_ref, port: string })
-    -> (:no_reply, { car: dangerous_actor_ref, port: string }) {
+               state: { car: dangerous_actor_ref, port: string, c1: dangerous_actor_ref, c2: dangerous_actor_ref })
+    -> (:no_reply, { car: dangerous_actor_ref, port: string, c1: dangerous_actor_ref, c2: dangerous_actor_ref }) {
     case msg of {
         (:link_up, info: string) -> case starts_with(info, "port:") of {
             true -> {
@@ -199,7 +198,7 @@ fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string
                     cli1: actor_ref <- spawn({ car: link1, rx: wireframe@fresh(Carrier@boundaries((:tcp))), n: 7, boss: self() }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                     _: boolean <- cast(link1, (:open, cli1, concat("127.0.0.1:", port)) impl ActorMessage {})
                 produces
-                    pure (:no_reply, { car: state.car, port: port })
+                    pure (:no_reply, { car: state.car, port: port, c1: link1, c2: state.c2 })
                 end
             };
             false -> (:no_reply, state)
@@ -219,12 +218,15 @@ fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string
                     cli2: actor_ref <- spawn({ car: link2, rx: wireframe@fresh(Carrier@boundaries((:tcp))), n: 9, boss: self() }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                     _: boolean <- cast(link2, (:open, cli2, concat("127.0.0.1:", state.port)) impl ActorMessage {})
                 produces
-                    pure (:no_reply, state)
+                    pure (:no_reply, { car: state.car, port: state.port, c1: state.c1, c2: link2 })
                 end
             };
             false -> {
-                // closing the listener ends its carrier; the reporter counts the five carriers' reports
+                // both answers are shown: closing the two client links and the listener ends the five carriers
+                // (the accepted connections end when their peers close); the reporter counts their reports
                 sequence proc[concurrency]
+                    _: boolean <- cast(state.c1, :close impl ActorMessage {});
+                    _: boolean <- cast(state.c2, :close impl ActorMessage {});
                     _: boolean <- cast(state.car, :close impl ActorMessage {})
                 produces
                     pure (:no_reply, state)
@@ -247,7 +249,7 @@ fn main() -> int64 {
         rep: actor_ref <- spawn({ seen: 0 }, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
         _: atom <- register_failure_reporter(rep);
         lst: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-        boss: actor_ref <- spawn({ car: lst, port: "" }, coordinator, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        boss: actor_ref <- spawn({ car: lst, port: "", c1: lst, c2: lst }, coordinator, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
         _: boolean <- cast(lst, (:open, boss, "listen:0") impl ActorMessage {});
         code: int64 <- wait_for_exit()
     produces

@@ -21,12 +21,10 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
   `(:interface, n)`/`(:ethernet, n)`/`(:wifi, n)`: `listen:<port>` binds that interface's first IPv4 address, `listen:any`
   refused, `listen:<ipv4>` only one of that interface's addresses, dials leave from the interface's address.
   Refusal: the owner gets `(:link_down, :fault)` and the carrier ends `(:explicit, :link_unavailable)`; a malformed IPv4
-  ends `(:explicit, :bad_address)`. Ethernet/Wi-Fi counting counts only interfaces holding an IPv4 address. The UDP
-  carrier still binds nothing. Compile-time E2418 for a spawn plus refused literal in one function. A listener now
+  ends `(:explicit, :bad_address)`. Ethernet/Wi-Fi counting counts only interfaces holding an IPv4 address. UDP binds the same way (local forms `<port>`, `<ipv4>:<port>`, `any:<port>`, `silica_sockets_udp_bind_on`) and IPv4 literals use the strict dotted-quad parse (leading zeros rejected, `:bad_address` on all three platforms; Lee's ruling): built; trials added, run in the next trial pass. Compile-time E2418 (TCP and UDP) for a spawn plus refused literal in one function. A listener now
   reports `"peer:<ipv4>:<port>"` (getpeername). `ethernet_direct` declared `(:interface, "en0")` with `listen:any`, which
   is now refused, so it uses `listen:4550`. **Verified by runs (all three hosted targets):** loopback and refusal behaviour, `E2418`; macOS classifier only against `lo0`. **Built, not verified:** the Linux
-  interface classifier, Wi-Fi, binding a real non-loopback address, the final regenerated goldens (no confirming run). **Open:** supervisor-restart retry not met by any trial (`spawn_dangerous_carrier` is unsupervised); UDP binds nothing; macOS and glibc differ on
-  IPv4 literals with leading zeros; listener round-2 start order; BEES N1 check. See the plan's E2 status.
+  interface classifier, Wi-Fi, binding a real non-loopback address, the final regenerated goldens (no confirming run). **Open:** supervisor-restart retry not met by any trial (`spawn_dangerous_carrier` is unsupervised); listener round-2 start order; BEES N1 check. See the plan's E2 status.
 - **No authentication, no encryption, no peer identity.** See the Security note in the plan (§5b) and
   `examples/transport_pairs/README.md`.
 
@@ -36,7 +34,7 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
 | --- | --- | --- | --- | --- |
 | apple_silicon_mac | tcp, udp, serial | loopback, interface, ethernet n, wifi n, serial_port | yes: verified (Mac dialed Linux x86-64, 2026-11-10/11) | built E2 (loopback and refusals verified; interface classifier on lo0 only) |
 | linux_x86_64 | tcp, udp, serial | same rows as the Mac | yes: verified as the listening end on `manager@aalang.org` | built E2 (loopback and refusals verified; Linux classifier, Wi-Fi unverified) |
-| linux_aarch64 | same rows in the tree since 2026-11-11 (pack is identical to x86-64's apart from the header comment) | same | UNKNOWN: pack not built or run on an AArch64 host (pix) | built E2 (loopback and refusals verified on pix before the final fixes; classifier, Wi-Fi unverified) |
+| linux_aarch64 | same rows in the tree since 2026-11-11 (pack is identical to x86-64's apart from the header comment) | same | UNKNOWN: pack not built or run on an AArch64 host (pix) | built E2, verified on pix (full hosted integrate on the merged tree, then the transport_addition and ffi_addition suites with the rewritten TCP programs, all outputs matching .scout; assembly goldens regenerated afterward); classifier, Wi-Fi unverified |
 | ESP32-S3_raw | serial, uart1, usb_serial_jtag (no tcp/udp) | `(:uart, 1, baud)`, `(:usb_serial_jtag)` | no (no Ethernet or Wi-Fi link; out of scope, links design §8) | n/a |
 | STM32-L476RG_raw | none (`provides_carrier` is false for every tag) | none | no | n/a |
 

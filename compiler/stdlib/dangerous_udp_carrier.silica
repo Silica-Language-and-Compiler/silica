@@ -18,9 +18,28 @@
 // The (:udp) carrier of transport_serialization_design.md §6.3: a dangerous actor over the socket
 // wrappers (dangerous_sockets) speaking the carrier contract of §6.2, one endpoint per bound port.
 // It is opened with (:open, owner, address) where address is "host:port@local": the peer every :tx
-// segment goes to, and the local port to bind on 127.0.0.1 (0 picks a free port; :link_up carries
-// "port:<n>"). Every :rx is one datagram, delivered against the owner's :credit; the endpoint polls
-// its socket between mailbox messages with a 20 ms timeout.
+// segment goes to (host a dotted quad), and the local address the endpoint binds, where it receives and
+// from which every datagram leaves (port 0 picks a free port; :link_up carries "port:<n>"):
+//
+//   local "<port>"         127.0.0.1:port, or with a named link that interface's first IPv4 address;
+//   local "<ipv4>:<port>"  that one IPv4 address (dotted quad);
+//   local "any:<port>"     0.0.0.0:port, every IPv4 interface of the host, only when no link is declared.
+//
+// The link (transport_links_design.md §3.2, hosted Ethernet plan stage E2) is read as the TCP carrier
+// reads it: the state's `link_spec`, written by the target's transport pack when spawn_dangerous_carrier
+// expands a `carried_on` declaration ("" for a carrier spawned directly, "loopback", "interface:<name>",
+// "ethernet:<n>", "wifi:<n>"). Every link refuses "any:<port>"; (:loopback) refuses a "<ipv4>:<port>"
+// outside 127.0.0.0/8; a named link (interface, ethernet, wifi) binds "<port>" to the interface's address
+// and refuses a "<ipv4>:<port>" that is not one of its addresses, so its datagrams leave from that
+// interface. An interface that is absent or has no IPv4 address, fewer than n+1 interfaces of the family,
+// or a refused local address end the carrier with (:explicit, :link_unavailable); a peer host or a local
+// address that is not a dotted quad (dangerous_sockets@parse_ipv4, strict) ends it with
+// (:explicit, :bad_address). Before ending, the carrier tells its owner (:link_down, :fault). The peer is
+// not restricted by the link (as a TCP dial under (:loopback) is not); a socket bound to 127.0.0.1 cannot
+// reach an off-host peer, so such a :tx fails and ends the link (:explicit, :link_lost).
+//
+// Every :rx is one datagram, delivered against the owner's :credit; the endpoint polls its socket
+// between mailbox messages with a 20 ms timeout.
 module dangerous_udp_carrier;
 
 use dangerous_sockets;
@@ -28,8 +47,8 @@ use dangerous_sockets;
 export initial/0;
 export carrier/2;
 
-fn initial() -> { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64 } {
-    { owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, peer_host: "", peer_port: 0 }
+fn initial() -> { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64, link_spec: string } {
+    { owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, peer_host: "", peer_port: 0, link_spec: "" }
 }
 
 // "host:port@local": the peer and the local port.
@@ -54,8 +73,84 @@ fn peer_part(address: string) -> string {
     substring(address, 0, at_index(address, 0))
 }
 
-fn local_port_of(address: string) -> int64 {
-    digits_from(address, at_index(address, 0) + 1, 0)
+// The local part of "host:port@local" ("" when there is no '@').
+fn local_part(address: string) -> string {
+    at_i: int64 <- at_index(address, 0);
+    case at_i >= length_bytes(address) of {
+        true -> "";
+        false -> substring(address, at_i + 1, length_bytes(address))
+    }
+}
+
+// The local forms: "any:<port>" -> :any; "<ipv4>:<port>" -> :ip; "<port>" -> :port.
+fn local_form(spec_local: string) -> atom {
+    case starts(spec_local, "any:") of {
+        true -> :any;
+        false -> case length_bytes(substring_until_char(spec_local, 0, ':')) == length_bytes(spec_local) of {
+            true -> :port;
+            false -> :ip
+        }
+    }
+}
+
+// The address text of "<ipv4>:<port>".
+fn local_ip_text(spec_local: string) -> string {
+    substring_until_char(spec_local, 0, ':')
+}
+
+fn local_port_of(spec_local: string) -> int64 {
+    first: string <- substring_until_char(spec_local, 0, ':');
+    case length_bytes(first) == length_bytes(spec_local) of {
+        true -> digits_from(spec_local, 0, 0);
+        false -> digits_from(spec_local, length_bytes(first) + 1, 0)
+    }
+}
+
+// The kind of the state's link ("" when the carrier was spawned without a carried_on declaration).
+fn link_kind(spec: string) -> atom {
+    case substring_until_char(spec, 0, ':') of {
+        "loopback" -> :loopback;
+        "interface" -> :interface;
+        "ethernet" -> :ethernet;
+        "wifi" -> :wifi;
+        _: string -> :none
+    }
+}
+
+// The family code of dangerous_sockets@link_select: 0 by name, 1 wired, 2 wireless.
+fn link_family(kind: atom) -> int64 {
+    case kind of {
+        :ethernet -> 1;
+        :wifi -> 2;
+        _: atom -> 0
+    }
+}
+
+// What follows the link's tag: the interface name of "interface:<name>", the instance of "ethernet:<n>".
+fn link_param(spec: string) -> string {
+    tag: string <- substring_until_char(spec, 0, ':');
+    substring(spec, length_bytes(tag) + 1, length_bytes(spec))
+}
+
+fn link_instance(spec: string) -> int64 {
+    digits_from(link_param(spec), 0, 0)
+}
+
+fn is_loopback_ipv4(a: int64) -> boolean {
+    a / 16777216 == 127
+}
+
+// The local address the socket binds, in host order: every interface for "any:", the literal for
+// "<ipv4>:", the link's interface for a bare port on a named link, else 127.0.0.1.
+fn bind_addr_of(form: atom, named: boolean, ip_addr: int64, sel_addr: int64) -> int64 {
+    case form of {
+        :any -> 0;
+        :ip -> ip_addr;
+        _: atom -> case named of {
+            true -> sel_addr;
+            false -> 2130706433
+        }
+    }
 }
 
 fn starts(s: string, p: string) -> boolean {
@@ -147,7 +242,7 @@ fn none_res() -> { tag: int64, value: int64, error_code: int64 } {
     { tag: 2, value: 0 - 1, error_code: 0 }
 }
 
-fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64 }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64 }) {
+fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64, link_spec: string }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, peer_host: string, peer_port: int64, link_spec: string }) {
     sequence proc[external_danger, concurrency, transport]
         kind: atom <- msg_kind(msg);
         owner: actor_ref <- msg_owner(msg, state.owner);
@@ -156,8 +251,50 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         peer: string <- case do_open of { true -> peer_part(text); false -> "" };
         host: string <- case do_open of { true -> host_of(peer); false -> state.peer_host };
         pport: int64 <- case do_open of { true -> port_of(peer); false -> state.peer_port };
-        res_open: { tag: int64, value: int64, error_code: int64 } <- case do_open of {
-            true -> dangerous_sockets@udp_bind(local_port_of(text));
+        // The link's address rules (header): the interface's address from link_select, the peer host and the
+        // literal of "<ipv4>:<port>" from parse_ipv4, and link_owns for a literal under a named link.
+        local_text: string <- local_part(text);
+        form: atom <- local_form(local_text);
+        lkind: atom <- link_kind(state.link_spec);
+        named: boolean <- lkind == :interface or lkind == :ethernet or lkind == :wifi;
+        do_select: boolean <- do_open and named and form != :any;
+        res_sel: { tag: int64, value: int64, error_code: int64 } <- case do_select of {
+            true -> dangerous_sockets@link_select(link_param(state.link_spec), link_family(lkind), link_instance(state.link_spec));
+            false -> none_res()
+        };
+        sel_tag_raw: int64 <- res_sel.tag;
+        sel_addr_raw: int64 <- res_sel.value;
+        sel_tag: int64 <- pure_int(recreate(sel_tag_raw));
+        sel_addr: int64 <- pure_int(recreate(sel_addr_raw));
+        res_peer: { tag: int64, value: int64, error_code: int64 } <- case do_open of {
+            true -> dangerous_sockets@parse_ipv4(host);
+            false -> none_res()
+        };
+        peer_tag_raw: int64 <- res_peer.tag;
+        peer_tag: int64 <- pure_int(recreate(peer_tag_raw));
+        do_parse: boolean <- do_open and form == :ip;
+        res_ip: { tag: int64, value: int64, error_code: int64 } <- case do_parse of {
+            true -> dangerous_sockets@parse_ipv4(local_ip_text(local_text));
+            false -> none_res()
+        };
+        ip_tag_raw: int64 <- res_ip.tag;
+        ip_addr_raw: int64 <- res_ip.value;
+        ip_tag: int64 <- pure_int(recreate(ip_tag_raw));
+        ip_addr: int64 <- pure_int(recreate(ip_addr_raw));
+        bad_local: boolean <- do_parse and ip_tag != 0;
+        bad_address: boolean <- (do_open and peer_tag != 0) or bad_local;
+        do_owns: boolean <- do_parse and named and bad_local == false and sel_tag == 0;
+        res_owns: { tag: int64, value: int64, error_code: int64 } <- case do_owns of {
+            true -> dangerous_sockets@link_owns(ip_addr);
+            false -> none_res()
+        };
+        owns_raw: int64 <- res_owns.value;
+        owns: int64 <- pure_int(recreate(owns_raw));
+        link_refused: boolean <- (do_open and form == :any and lkind != :none) or (do_select and sel_tag != 0) or (do_parse and bad_local == false and lkind == :loopback and is_loopback_ipv4(ip_addr) == false) or (do_owns and owns != 1);
+        refused: boolean <- bad_address or link_refused;
+        // A refusal or a malformed address is a failed open: nothing is bound, so open_tag is not 0.
+        res_open: { tag: int64, value: int64, error_code: int64 } <- case do_open and refused == false of {
+            true -> dangerous_sockets@udp_bind_on(local_port_of(local_text), bind_addr_of(form, named, ip_addr, sel_addr));
             false -> none_res()
         };
         open_tag_raw: int64 <- res_open.tag;
@@ -228,13 +365,17 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         };
         // The carrier ends with its link (transport design 6.2): :link_down is the last message its
         // owner receives. A :close is a normal end; a failed open, read or write ends the carrier
-        // with the link exit reasons of the links design 6.3. stop_self takes effect when this
-        // dispatch returns.
+        // with the link exit reasons of the links design 6.3: a link refusal or a failed bind
+        // (:link_unavailable), a malformed peer or local address (:bad_address). stop_self takes
+        // effect when this dispatch returns.
         _: atom <- case link_down_now of {
             true -> case do_close of {
                 true -> stop_self(:normal);
                 false -> case open_failed of {
-                    true -> stop_self((:explicit, :link_unavailable));
+                    true -> case bad_address of {
+                        true -> stop_self((:explicit, :bad_address));
+                        false -> stop_self((:explicit, :link_unavailable))
+                    };
                     false -> stop_self((:explicit, :link_lost))
                 }
             };
@@ -259,6 +400,6 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
             false -> true
         }
     produces
-        pure (:no_reply, { owner: owner, fd: fd_next, rx_credit: credit_next, up: up_next, peer_host: host, peer_port: pport })
+        pure (:no_reply, { owner: owner, fd: fd_next, rx_credit: credit_next, up: up_next, peer_host: host, peer_port: pport, link_spec: state.link_spec })
     end
 }

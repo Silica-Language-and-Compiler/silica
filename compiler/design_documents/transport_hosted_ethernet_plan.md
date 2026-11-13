@@ -113,23 +113,22 @@ Missing:
      `make integrate`.
   7. **`"listen:any:<port>"` stays** (Lee, 2026-11-11: "don't remove"). E2 only adds the refusal rules of item 4 and
      the guard of item 1; the form is not deprecated or removed. Its users (`ethernet_direct`, `ethernet_remote`,
-     trial `app_transport_tcp_listen_any`, BEES N1) keep working when no named link is declared.
+     trial `app_transport_tcp_listen_any`) keep working when no named link is declared.
      **As implemented (2026-11-12).** `ethernet_direct` declared `(:interface, "en0")` and listened on `listen:any:4550`;
      that combination is now refused (the named link refuses `listen:any`), so its source and `run_direct.sh` use
      `"listen:4550"`, which binds `en0`'s address. The examples that declare no named link keep `listen:any`.
      Family counting: `(:ethernet, n)` and `(:wifi, n)` count only interfaces that hold an IPv4 address (n counts from 0
      in `getifaddrs` order, an interface once). Dials under `(:loopback)` are unchanged; a dial under a named link leaves
-     from the interface's address. The UDP carrier still binds nothing. Behaviour table (also links design §3.2,
+     from the interface's address. The UDP carrier binds the same way (`silica_sockets_udp_bind_on`; local forms in the links design §3.2). Behaviour table (also links design §3.2,
      transport design §6.3): no link: `listen:<port>` 127.0.0.1, `listen:any:<port>` 0.0.0.0, `listen:<ip>:<port>` that
      ip; `(:loopback)`: `listen:<port>` 127.0.0.1, `listen:any` refused, `listen:<ip>` only in 127.0.0.0/8; named links:
      `listen:<port>` that interface's first IPv4 address, `listen:any` refused, `listen:<ip>` only that interface's
      addresses. Refusal: `(:link_down, :fault)` to the owner, then the carrier ends `(:explicit, :link_unavailable)`;
      malformed IPv4 ends `(:explicit, :bad_address)`. E2418 (compile) covers `spawn_dangerous_carrier` plus a
-     `cast(x, (:open, _, "<literal>"))` in one function, TCP carriers on a link the target serves; else E2412.
+     `cast(x, (:open, _, "<literal>"))` in one function, TCP and UDP carriers on a link the target serves (for UDP: `any` under any declared link, a non-127/8 ip under `(:loopback)`; a leading-zero literal gets no E2418, it ends `:bad_address` at run time); else E2412.
      **Built vs verified.** Built: all three packs, `silica_sockets.c`, `dangerous_sockets`, `dangerous_tcp_carrier`,
      the E2418 scan. Verified and unverified: see the E2 status lists below (superseded: the probe-only and "no suite run" wording was 2026-11-12 morning).
-     **Open point:** IPv4 literals with leading zeros (`010.0.0.1`) are parsed by `inet_aton`/`inet_pton`; macOS and
-     glibc differ on them (octal or rejected), so `parse_ipv4` can accept on one host and refuse on the other.
+     **Resolved (Lee's ruling):** IPv4 literals use our own strict parse (`parse_ipv4`, `ipv4_strict` in `silica_sockets.c`): four decimal parts, 0-255, no leading zeros except a bare `0`, no libc parser (`inet_aton`/`inet_pton` differed between macOS and glibc). A malformed peer host, local ip or TCP dial host ends `(:explicit, :bad_address)` on all three platforms (a dial host malformed used to end `:link_unavailable` through EINVAL).
      **Trials written (2026-11-12; since run, see the status lists below):** `trials/transport_addition/app_transport_tcp_link_rules` (interface and
      family absent, listen_ip, `(:loopback)` refusing 10.x, a named link refusing any: each runtime refusal is one
      program; refusal programs end on the failure report through the program's own reporter, see the trial lesson below),
@@ -143,7 +142,7 @@ Missing:
     `wireless`/`phy80211` and `type==1` plus `device` for wired); `listen:<ipv4>:<port>`; `listen:any` retained; the
     refusal rules of the behaviour table; the refusal path (owner gets `(:link_down, :fault)`, the carrier ends
     `(:explicit, :link_unavailable)`, or `(:explicit, :bad_address)` for a malformed IPv4, folded into main's failed-open
-    branch); `E2418` (TCP only, link served by the target, literal address refused by the link, same function);
+    branch); `E2418` (TCP; the UDP form is under "Built, trials added"; link served by the target, literal address refused by the link, same function);
     `SO_NOSIGPIPE` on `tcp_connect_from`; the three hosted compilers rebuilt and the hosted trials run (Mac 35,225 pass;
     pix and nix ran before the final fixes); goldens regenerated on Mac, pix and nix. Trials: `app_transport_tcp_link_rules`
     (6 programs), three `E2418` compile-defect trials, two `dangerous_carrier_spawn_*` `golden_fail` trials, four
@@ -157,13 +156,12 @@ Missing:
     `compiler_addition` and `modules_addition` on x86 only (not run on Mac or pix, whose emitters already had it); the
     ESP32-S3 and Nucleo cross compilers were not rebuilt (`E2418` is gated on the pack serving the link, so they should
     be unaffected; unchecked).
+  - **Built, trials added, not yet run:** UDP link binding (`silica_sockets_udp_bind_on`, `dangerous_udp_carrier`, the three packs, `E2418` for `(:udp)` in `carried_on_expand.silica`) and the strict IPv4 parser (`ipv4_strict`; `:bad_address` for a malformed peer host, local ip or TCP dial host). Status: built; trials added, run in the next trial pass.
   - **Open (gaps):** (1) `spawn_dangerous_carrier` expands to a plain unsupervised spawn, so the supervisor restart as
     retry (specification 16.4.9, links design 6.3) happens only if the program supervises the carrier; the links design
-    test plan ("a supervisor restart is counted") is met by no trial. (2) The UDP carrier binds nothing, so
-    `listen:<ip>:<port>` and the refusal rules do not apply to UDP. (3) Leading-zero IPv4 literals (`010.0.0.1`) parse
-    differently on macOS and glibc: needs a ruling. (4) `dangerous_tcp_listener` round 2 can in principle start before
+    test plan ("a supervisor restart is counted") is met by no trial. (2) `dangerous_tcp_listener` round 2 can in principle start before
     round 1's header lines are written (held in 100 parallel runs); a real fix has the reporter trigger round 2.
-    (5) BEES N1: check the interface link plus `listen:any` pattern. (6) The three Linux packs do not cover
+    (3) The three Linux packs do not cover
     `(:sd_blocks)` and `(:flash_region)` on hosted targets (`E2412`), unchanged and not E2.
   - **Trial lesson:** a run that ends on a carrier failure must end on the failure report itself, through the program's
     own failure reporter (`trial_wait_int64` registers its own reporter); otherwise the stdout and stderr banners race.
@@ -299,8 +297,6 @@ from 157.201.64.9) was made by the user beforehand.
       `app_transport_tcp_listener`, `app_transport_tcp_loopback_link` and `ffi_addition/app_transport_tcp_loopback`;
     - four `error_enforcement_addition/dangerous_carrier_*` `.golden_fail` files: one more W4001 FFI warning, and
       shifted line numbers and offsets.
-  - **Prerequisite for BEES.** This form and the direct dial to a non-loopback address are what Project BEES's
-    milestone N1 needs. N1 is "a transport that is not loopback-only", and BEES lists that part as not started.
 - **D1. One program, one connection, requests both ways. Done.**
   - **Vocabulary.** As in §5a: odd ids carry `(:accel, ...)` from the Mac, even ids carry `:status` from Linux.
   - **Roles.** The Linux end (the status side) listens on `"listen:any:4550"`. The Mac end (the accel side) dials
@@ -356,7 +352,7 @@ from 157.201.64.9) was made by the user beforehand.
 
 ### Security
 
-**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes.
 
 - **This pair.** The remote's source-address rule (TCP 4550 from 157.201.64.9 only) is the listener's only
   protection, and every host behind the campus NAT shares that address.

@@ -4,12 +4,14 @@
 # owner on this host; none picks a fixed port (listeners take port 0, refused or absent links bind nothing), so
 # parallel runs cannot collide. Same shape as app_transport_tcp_listen_any: it links the socket wrappers like the
 # ffi_addition apps do, so it reuses that suite's fixtures and integrate body. The Mac goldens (.scout) are the
-# only ones; the Linux hosts are unverified. The refusal trials end with an actor-failure banner (the carrier's
+# only ones; the Linux hosts are unverified. The strict IPv4 parser's refusals (a leading zero, five parts, in a listen
+# address or a dial host) end (:explicit, :bad_address) after the owner got (:link_down, :fault); the four
+# dangerous_link_*_leading_zero / _five_parts programs cover them. The refusal trials end with an actor-failure banner (the carrier's
 # :link_unavailable), which the normalized compare reduces to <PTR> lines.
 THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 APP_TRIAL_DIR := $(abspath $(THIS_DIR))
 APP_LABEL := app_transport_tcp_link_rules
-APP_EXECUTABLES := dangerous_link_interface_absent dangerous_link_wifi_absent dangerous_link_ethernet_absent dangerous_link_listen_ip dangerous_link_listen_ip_refused_loopback dangerous_link_listen_any_refused_interface
+APP_EXECUTABLES := dangerous_link_interface_absent dangerous_link_wifi_absent dangerous_link_ethernet_absent dangerous_link_listen_ip dangerous_link_listen_ip_refused_loopback dangerous_link_listen_any_refused_interface dangerous_link_listen_ip_leading_zero dangerous_link_listen_ip_five_parts dangerous_link_dial_ip_leading_zero dangerous_link_listen_ip_leading_zero_loopback
 APP_LINK_OBJECTS := wire_etf.o wireframe.o Carrier.o dangerous_sockets.o dangerous_tcp_carrier.o
 
 FFI_TRIAL_DIR := $(abspath $(THIS_DIR)/../../ffi_addition)

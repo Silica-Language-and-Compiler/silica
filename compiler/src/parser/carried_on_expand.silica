@@ -450,14 +450,17 @@ fn rewrite_spawn(ts: List[{ kind: int64, lexeme: string, location: { file: strin
 
 // ---- E2418: a listen address the declared link refuses ------------------------------------------------
 //
-// Hosted Ethernet plan E2 items 1 and 4 (transport_links_design.md §3.2): a (:tcp) carrier on a declared
-// link refuses "listen:any:<port>", and on (:loopback) a "listen:<ipv4>:<port>" outside 127.0.0.0/8; the
-// carrier ends with (:explicit, :link_unavailable) at :open. Where this pass sees both literals it rejects
+// Hosted Ethernet plan E2 items 1, 2 and 4 (transport_links_design.md §3.2): a (:tcp) carrier on a declared
+// link refuses "listen:any:<port>", and on (:loopback) a "listen:<ipv4>:<port>" outside 127.0.0.0/8; a (:udp)
+// carrier applies the same two rules to the local part of its "host:port@local" address ("any:<port>",
+// "<ipv4>:<port>"); the carrier ends with (:explicit, :link_unavailable) at :open. Where this pass sees both literals it rejects
 // the program instead: `<x>: <type> <- spawn_dangerous_carrier(<name>, ...)` and, after it in the same
 // function, `cast(<x>, (:open, <owner>, "<address>") ...)`. A carrier name is looked up as its nearest
 // binding above the cast; bindings are forgotten at every `fn`, so a binding in another function is never
 // used. An address this pass cannot see (a variable, a function's result) is left to the carrier's refusal
-// at run time, and so is a named interface's own address, which only the host knows.
+// at run time, and so is a named interface's own address, which only the host knows. A literal that is not a
+// strict dotted quad (a leading zero, "010.0.0.1", a fifth part) is not an address the link refuses: the
+// carrier ends it (:explicit, :bad_address) at run time, so this pass leaves it alone.
 
 fn nil_binds() -> List[{ var: string, decl: string }, mem(normal)] {
     sequence proc[mem(normal)]
@@ -502,7 +505,8 @@ fn index_of_char(s: string, c: string, i: int64) -> int64 {
 }
 
 // Whether s from i on is the rest of a dotted quad: `parts` parts read so far, `digits` digits and value
-// `value` in the current part.
+// `value` in the current part. Strict, as the carriers' parse_ipv4 is: four decimal parts 0 to 255 and no
+// leading zero except a bare "0".
 fn quad_from(s: string, i: int64, parts: int64, digits: int64, value: int64) -> boolean {
     case i >= length_bytes(s) of {
         true -> parts == 3 and digits > 0 and value <= 255;
@@ -510,7 +514,7 @@ fn quad_from(s: string, i: int64, parts: int64, digits: int64, value: int64) -> 
             c: string <- substring(s, i, i + 1);
             d: int64 <- digit_value(c);
             case d >= 0 of {
-                true -> digits < 3 and quad_from(s, i + 1, parts, digits + 1, value * 10 + d);
+                true -> digits < 3 and (digits == 0 or value > 0) and quad_from(s, i + 1, parts, digits + 1, value * 10 + d);
                 false -> c == "." and digits > 0 and value <= 255 and parts < 3 and quad_from(s, i + 1, parts + 1, 0, 0)
             }
         }
@@ -532,22 +536,44 @@ fn link_restricts_listen(link_tag: string) -> boolean {
     }
 }
 
-// The E2418 message for a (:tcp) declaration and an address literal (with its quotes), "" when the link
-// allows the address.
+// The local address an :open literal binds, without the form's own prefix: what follows "listen:" for (:tcp),
+// what follows '@' for (:udp) ("host:port@local"), "" when the literal binds nothing the link rules apply to
+// (a TCP dial, a UDP address without '@').
+fn bound_part(kind: string, address: string) -> string {
+    at_i: int64 <- index_of_char(address, "@", 0);
+    case kind of {
+        "tcp" -> case has_prefix(address, "listen:") of {
+            true -> substring(address, 7, length_bytes(address));
+            false -> ""
+        };
+        "udp" -> case at_i < length_bytes(address) of {
+            true -> substring(address, at_i + 1, length_bytes(address));
+            false -> ""
+        };
+        _: string -> ""
+    }
+}
+
+// The E2418 message for a (:tcp) or (:udp) declaration and an address literal (with its quotes), "" when the
+// link allows the address.
 fn listen_conflict(d: { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, literal: string) -> string {
     address: string <- substring(literal, 1, length_bytes(literal) - 1);
-    rest: string <- substring(address, 7, length_bytes(address));
+    rest: string <- bound_part(d.kind, address);
     ip: string <- substring(rest, 0, index_of_char(rest, ":", 0));
+    is_udp: boolean <- d.kind == "udp";
+    any_form: string <- case is_udp of { true -> "\"<host>:<port>@any:<port>\" binds"; false -> "\"listen:any:<port>\" listens on" };
+    port_form: string <- case is_udp of { true -> "\"<host>:<port>@<port>\""; false -> "\"listen:<port>\"" };
+    own_form: string <- case is_udp of { true -> " to bind the link's own address"; false -> " to listen on the link's own address" };
     head: string <- concat(concat(concat(concat(concat("carried_on ", d.name), ": link "), d.text), concat(" refuses the address ", literal)), " at :open, where the carrier would end with (:explicit, :link_unavailable)");
     tail: string <- " (transport_links_design.md §3.2)";
     // A link this target does not serve is E2412 at the spawn instead (rewrite_spawn).
     served: boolean <- transport_pack@provides_carrier(d.kind) and transport_pack@provides_link(d.link_tag, d.instance);
-    case served and d.kind == "tcp" and link_restricts_listen(d.link_tag) and has_prefix(address, "listen:") of {
+    case served and (d.kind == "tcp" or is_udp) and link_restricts_listen(d.link_tag) and length_bytes(rest) > 0 of {
         false -> "";
-        true -> case has_prefix(address, "listen:any:") of {
-            true -> concat(concat(head, ": \"listen:any:<port>\" listens on every interface, which a declared link does not allow; write \"listen:<port>\" to listen on the link's own address, or spawn the carrier without a link"), tail);
+        true -> case has_prefix(rest, "any:") of {
+            true -> concat(concat(concat(concat(concat(concat(head, ": "), any_form), " every interface, which a declared link does not allow; write "), port_form), concat(own_form, ", or spawn the carrier without a link")), tail);
             false -> case d.link_tag == "loopback" and length_bytes(ip) < length_bytes(rest) and is_dotted_quad(ip) and has_prefix(ip, "127.") == false of {
-                true -> concat(concat(head, ": it is not a loopback address (127.0.0.0/8); write \"listen:<port>\" for 127.0.0.1"), tail);
+                true -> concat(concat(concat(concat(head, ": it is not a loopback address (127.0.0.0/8); write "), port_form), " for 127.0.0.1"), tail);
                 false -> ""
             }
         }
