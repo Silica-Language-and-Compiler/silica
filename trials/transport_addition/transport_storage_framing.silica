@@ -1,0 +1,146 @@
+// The :storage framing mode and the stored-frame header (transport_serialization_design.md §6.8.3).
+// frame cuts "abcdefghij" for an 8-byte record into three records (a0, a1, a2), each with the 4-byte
+// segment header, and heads the one-record frame "xy" as well (b0). unframe then reads them as a
+// replay of a log would deliver them:
+//   - whole frames in order;
+//   - an orphaned front (a0, a1) followed by b0: the unfinished frame is dropped at the frame-start
+//     record and "xy" is given;
+//   - a read that lands inside a frame (a1, a2 first): both are skipped, and the frame after them is
+//     reassembled;
+//   - a record out of order inside a reassembly: skipped, and the state is emptied;
+//   - a frame over max_frame is :too_large, a record shorter than its header :truncated.
+// record puts the format id and the schema version in front of a frame and unrecord takes them off;
+// a format the language does not have is written as id 0, which unrecord rejects, as it rejects a
+// record too short to hold the three bytes.
+module transport_storage_framing;
+
+use wireframe;
+
+fn nth(xs: List[string, mem(normal)], i: int64) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> case i == 0 of { true -> h; false -> nth(t, i - 1) }
+    }
+}
+
+fn count(xs: List[string, mem(normal)]) -> int64 {
+    sequence proc[mem(normal)]
+        n: int64 <- length[string, mem(normal)](xs)
+    produces
+        pure n
+    end
+}
+
+fn show(label: string, r: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom)) -> { mode: atom, expected: int64, pending: string } {
+    case r of {
+        (:more, st: { mode: atom, expected: int64, pending: string }) -> said_more(label, st);
+        (:frame, f: string, st: { mode: atom, expected: int64, pending: string }) -> said_frame(label, f, st);
+        (:rejected, why: atom) -> said_rejected(label, why)
+    }
+}
+
+fn said_more(label: string, st: { mode: atom, expected: int64, pending: string }) -> { mode: atom, expected: int64, pending: string } {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print(" more expected=");
+        _: atom <- print_int64(st.expected);
+        _: atom <- println("")
+    produces
+        pure st
+    end
+}
+
+fn said_frame(label: string, f: string, st: { mode: atom, expected: int64, pending: string }) -> { mode: atom, expected: int64, pending: string } {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print(" frame ");
+        _: atom <- println(f)
+    produces
+        pure st
+    end
+}
+
+fn said_rejected(label: string, why: atom) -> { mode: atom, expected: int64, pending: string } {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print(" rejected ");
+        _: atom <- print_atom(why);
+        _: atom <- println("")
+    produces
+        pure wireframe@fresh(:storage)
+    end
+}
+
+fn show_unrecord(r: (:ok, atom, int64, string) | (:rejected, atom)) -> atom {
+    case r of {
+        (:ok, f: atom, schema: int64, body: string) -> said_ok(f, schema, body);
+        (:rejected, why: atom) -> said_no(why)
+    }
+}
+
+fn said_ok(f: atom, schema: int64, body: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("unrecord ok format=");
+        _: atom <- print_atom(f);
+        _: atom <- print(" schema=");
+        _: atom <- print_int64(schema);
+        _: atom <- print(" body=");
+        o: atom <- println(body)
+    produces
+        pure o
+    end
+}
+
+fn said_no(why: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("unrecord rejected ");
+        _: atom <- print_atom(why);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[device_io]
+        a: List[string, mem(normal)] <- wireframe@frame("abcdefghij", 8, :storage);
+        b: List[string, mem(normal)] <- wireframe@frame("xy", 8, :storage);
+        _: atom <- print("a records=");
+        _: atom <- print_int64(count(a));
+        _: atom <- print(" b records=");
+        _: atom <- print_int64(count(b));
+        _: atom <- print(" first_length=");
+        _: atom <- print_int64(length_bytes(nth(a, 0)));
+        _: atom <- println("");
+        s0: { mode: atom, expected: int64, pending: string } <- wireframe@fresh(:storage);
+        // whole frame a, then b
+        s1: { mode: atom, expected: int64, pending: string } <- show("a0", wireframe@unframe(s0, nth(a, 0), 100));
+        s2: { mode: atom, expected: int64, pending: string } <- show("a1", wireframe@unframe(s1, nth(a, 1), 100));
+        s3: { mode: atom, expected: int64, pending: string } <- show("a2", wireframe@unframe(s2, nth(a, 2), 100));
+        s4: { mode: atom, expected: int64, pending: string } <- show("b0", wireframe@unframe(s3, nth(b, 0), 100));
+        // an orphaned front (a0, a1) followed by a fresh frame: the orphan is dropped
+        s5: { mode: atom, expected: int64, pending: string } <- show("a0", wireframe@unframe(s4, nth(a, 0), 100));
+        s6: { mode: atom, expected: int64, pending: string } <- show("a1", wireframe@unframe(s5, nth(a, 1), 100));
+        s7: { mode: atom, expected: int64, pending: string } <- show("b0", wireframe@unframe(s6, nth(b, 0), 100));
+        // a read that lands inside a frame: the tail (a1, a2) is skipped, then a whole frame
+        s8: { mode: atom, expected: int64, pending: string } <- show("a1", wireframe@unframe(s7, nth(a, 1), 100));
+        s9: { mode: atom, expected: int64, pending: string } <- show("a2", wireframe@unframe(s8, nth(a, 2), 100));
+        s10: { mode: atom, expected: int64, pending: string } <- show("a0", wireframe@unframe(s9, nth(a, 0), 100));
+        s11: { mode: atom, expected: int64, pending: string } <- show("a1", wireframe@unframe(s10, nth(a, 1), 100));
+        // out of order inside a reassembly: skipped, state emptied
+        s12: { mode: atom, expected: int64, pending: string } <- show("a1", wireframe@unframe(s11, nth(a, 1), 100));
+        s13: { mode: atom, expected: int64, pending: string } <- show("a2", wireframe@unframe(s12, nth(a, 2), 100));
+        _: { mode: atom, expected: int64, pending: string } <- show("big", wireframe@unframe(s13, nth(a, 0), 2));
+        _: { mode: atom, expected: int64, pending: string } <- show("short", wireframe@unframe(s13, "ab", 100));
+        r: string <- wireframe@record(:etf, 513, "payload");
+        _: atom <- print("record length=");
+        _: atom <- print_int64(length_bytes(r));
+        _: atom <- println("");
+        _: atom <- show_unrecord(wireframe@unrecord(r));
+        _: atom <- show_unrecord(wireframe@unrecord(wireframe@record(:cbor, 0, "")));
+        _: atom <- show_unrecord(wireframe@unrecord(wireframe@record(:nope, 1, "x")));
+        _: atom <- show_unrecord(wireframe@unrecord("ab"))
+    produces
+        pure 0
+    end
+}

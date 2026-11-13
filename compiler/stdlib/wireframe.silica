@@ -26,6 +26,17 @@
 //   :datagram carriers with a smaller mtu (BLE): the frame is cut into segments of mtu bytes, each
 //   with a 4-byte header { frame_seq: uint16, index: uint16 }, bit 15 of index marking the last;
 //   unframe reassembles them in order. frame_seq is 0 in this phase (one frame in flight per link).
+//   :storage carriers (the (:store) kind, design §6.8.3): EVERY record carries that 4-byte header, a
+//   frame that fits in one record included (index 0 with the last bit set), because a log can hold
+//   the front of a frame whose rest never arrived (a crash mid-frame, a reclaimed or trimmed block,
+//   a read that starts inside a frame). Index 0 is the frame-start marker unframe resynchronises on:
+//   an index 0 during a reassembly drops the unfinished frame and starts the new one, and any other
+//   record that does not continue the reassembly in progress is skipped. A frame may span at most
+//   32768 records (the 15-bit index); frame answers no records at all for a longer one.
+//
+// A stored frame is wrapped by record before it is framed and unwrapped by unrecord after it is
+// reassembled (§6.8.3): one byte of format id (format_id: (:etf) is 1, (:cbor) 2, and 0 is never a
+// format, so a zero-filled medium is rejected) and a two-byte schema version the program chooses.
 //
 // The reassembly state is { mode: atom, expected: int64, pending: string }: mode is the carrier's
 // boundaries, expected the frame length once its prefix is known (0 before), pending the bytes
@@ -34,6 +45,10 @@
 export fresh/1;
 export frame/3;
 export unframe/3;
+export format_id/1;
+export format_of/1;
+export record/3;
+export unrecord/1;
 
 fn fresh(boundaries: atom) -> { mode: atom, expected: int64, pending: string } {
     { mode: boundaries, expected: 0, pending: "" }
@@ -80,11 +95,39 @@ fn frame(f: string, mtu: int64, boundaries: atom) -> List[string, mem(normal)] {
     n: int64 <- length_bytes(f);
     case boundaries == :stream of {
         true -> one(join2(u32_prefix(n), f));
-        false -> case mtu == 0 or n <= mtu of {
-            true -> one(f);
-            false -> segments(f, mtu - 4, 0, n)
+        false -> case boundaries == :storage of {
+            true -> storage_records(f, mtu, n);
+            false -> case mtu == 0 or n <= mtu of {
+                true -> one(f);
+                false -> segments(f, mtu - 4, 0, n)
+            }
         }
     }
+}
+
+// The records of a stored frame: always headed, cut at mtu - 4 bytes of payload (one record when the
+// carrier names no mtu). No records when the frame would need more than 32768 of them, or when the
+// mtu leaves no room for a payload.
+fn storage_records(f: string, mtu: int64, n: int64) -> List[string, mem(normal)] {
+    payload: int64 <- case mtu == 0 of {
+        true -> case n == 0 of { true -> 1; false -> n };
+        false -> mtu - 4
+    };
+    case payload <= 0 of {
+        true -> no_segments();
+        false -> case n > payload * 32768 of {
+            true -> no_segments();
+            false -> segments(f, payload, 0, n)
+        }
+    }
+}
+
+fn no_segments() -> List[string, mem(normal)] {
+    sequence proc[mem(normal)]
+        none: List[string, mem(normal)] <- empty[string, mem(normal)]()
+    produces
+        pure none
+    end
 }
 
 fn segments(f: string, payload: int64, index: int64, n: int64) -> List[string, mem(normal)] {
@@ -130,9 +173,88 @@ fn be32_at(s: string, i: int64) -> int64 {
 fn unframe(state: { mode: atom, expected: int64, pending: string }, segment: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
     case state.mode == :stream of {
         true -> unframe_stream(state.mode, state.expected, join2(state.pending, segment), max_frame);
-        false -> case length_bytes(segment) > max_frame of {
-            true -> (:rejected, :too_large);
-            false -> unframe_datagram(state, segment, max_frame)
+        false -> case state.mode == :storage of {
+            true -> unframe_storage(state, segment, max_frame);
+            false -> case length_bytes(segment) > max_frame of {
+                true -> (:rejected, :too_large);
+                false -> unframe_datagram(state, segment, max_frame)
+            }
+        }
+    }
+}
+
+// One stored record in. expected is the index the reassembly in progress waits for (0: none in
+// progress). A record of index 0 always starts a frame; a record that does not continue the
+// reassembly in progress is an orphan and is skipped, leaving the state empty.
+fn unframe_storage(state: { mode: atom, expected: int64, pending: string }, segment: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
+    n: int64 <- length_bytes(segment);
+    case n < 4 of {
+        true -> (:rejected, :truncated);
+        false -> {
+            index: int64 <- at(segment, 2) * 256 + at(segment, 3);
+            last: boolean <- index >= 32768;
+            idx: int64 <- case last of { true -> index - 32768; false -> index };
+            continues: boolean <- idx > 0 and state.expected > 0 and idx == state.expected;
+            case idx == 0 or continues of {
+                false -> (:more, { mode: state.mode, expected: 0, pending: "" });
+                true -> {
+                    joined: string <- case idx == 0 of { true -> slice(segment, 4, n); false -> join2(state.pending, slice(segment, 4, n)) };
+                    case length_bytes(joined) > max_frame of {
+                        true -> (:rejected, :too_large);
+                        false -> case last of {
+                            true -> (:frame, joined, { mode: state.mode, expected: 0, pending: "" });
+                            false -> (:more, { mode: state.mode, expected: idx + 1, pending: joined })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The format ids of stored frames (§6.8.3); 0 is never a format.
+fn format_id(tag: atom) -> int64 {
+    case tag of {
+        :etf -> 1;
+        :cbor -> 2;
+        _: atom -> 0
+    }
+}
+
+// The format an id names; :unknown for 0 and for an id no protocol has.
+fn format_of(id: int64) -> atom {
+    case id of {
+        1 -> :etf;
+        2 -> :cbor;
+        _: int64 -> :unknown
+    }
+}
+
+fn record_header(id: int64, schema: int64) -> string {
+    sequence proc[mem(normal), transport]
+        xs: List[int64, mem(normal)] <- [id, (schema / 256) % 256, schema % 256];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+// A frame with its format id and schema version (0 to 65535) in front: what a program stores.
+fn record(format: atom, schema: int64, frame: string) -> string {
+    join2(record_header(format_id(format), schema), frame)
+}
+
+// The format, the schema version and the frame of a stored record's payload.
+fn unrecord(r: string) -> (:ok, atom, int64, string) | (:rejected, atom) {
+    n: int64 <- length_bytes(r);
+    case n < 3 of {
+        true -> (:rejected, :truncated);
+        false -> {
+            format: atom <- format_of(at(r, 0));
+            case format == :unknown of {
+                true -> (:rejected, :bad_format);
+                false -> (:ok, format, at(r, 1) * 256 + at(r, 2), slice(r, 3, n))
+            }
         }
     }
 }

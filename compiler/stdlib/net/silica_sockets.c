@@ -84,6 +84,31 @@ static int copy_host(const uint8_t *ptr, uint64_t len, char *out, size_t cap) {
     return 1;
 }
 
+/* A write to a connection whose peer has gone must fail with EPIPE, which the carrier reports to its
+   owner, and must never raise SIGPIPE, which would end the whole program. Each platform's own
+   per-socket mechanism is used, so the program's signal dispositions are left alone: macOS marks the
+   socket (SO_NOSIGPIPE); Linux has no such socket option and marks each send instead (MSG_NOSIGNAL,
+   in write_no_sigpipe below). */
+static void no_sigpipe(int fd) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#else
+    (void)fd;
+#endif
+}
+
+/* One write to any descriptor. On Linux a socket is written with send(MSG_NOSIGNAL); a descriptor that
+   is not a socket (a serial port) answers ENOTSOCK and is written with write(), which cannot raise
+   SIGPIPE on a terminal. */
+static ssize_t write_no_sigpipe(int fd, const uint8_t *ptr, size_t len) {
+#if defined(MSG_NOSIGNAL) && !defined(SO_NOSIGPIPE)
+    ssize_t w = send(fd, ptr, len, MSG_NOSIGNAL);
+    if (w >= 0 || errno != ENOTSOCK) return w;
+#endif
+    return write(fd, ptr, len);
+}
+
 static int wait_fd(int fd, short events, int64_t timeout_ms) {
     struct pollfd p;
     p.fd = fd;
@@ -123,6 +148,7 @@ silica_sockets_tagged silica_sockets_tcp_connect(const uint8_t *host_ptr, uint64
     if (fd < 0) return err();
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    no_sigpipe(fd);
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { int e = errno; close(fd); errno = e; return err(); }
     return ok(fd);
 }
@@ -190,6 +216,7 @@ silica_sockets_tagged silica_sockets_tcp_connect_from(const uint8_t *host_ptr, u
     if (fd < 0) return err();
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    no_sigpipe(fd);
     if (bind(fd, (struct sockaddr *)&local, sizeof local) < 0) { int e = errno; close(fd); errno = e; return err(); }
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { int e = errno; close(fd); errno = e; return err(); }
     return ok(fd);
@@ -352,6 +379,7 @@ silica_sockets_tagged silica_sockets_tcp_accept(int64_t fd, int64_t timeout_ms) 
     if (c < 0) return err();
     int one = 1;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    no_sigpipe(c);
     return ok(c);
 }
 
@@ -441,7 +469,7 @@ silica_sockets_tagged silica_sockets_send(const uint8_t *data_ptr, uint64_t data
         int n = wait_fd((int)fd, POLLOUT, timeout_ms);
         if (n < 0) return err();
         if (n == 0) return timeout();
-        ssize_t w = write((int)fd, data_ptr + done, (size_t)(data_len - done));
+        ssize_t w = write_no_sigpipe((int)fd, data_ptr + done, (size_t)(data_len - done));
         if (w < 0) { if (errno == EINTR || errno == EAGAIN) continue; return err(); }
         done += (uint64_t)w;
     }
