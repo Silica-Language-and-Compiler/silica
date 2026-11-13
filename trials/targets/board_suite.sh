@@ -62,6 +62,16 @@ ONLY="${BOARD_ONLY_STEM:-}"
 mark_ok()   { { printf P >> "$MARK_ROOT/.integrate_pass_marks"; } 2>/dev/null || true; }
 mark_fail() { { printf F >> "$MARK_ROOT/.integrate_fail_marks"; } 2>/dev/null || true; }
 
+# target_golden <dir> <stem> <scout|golden_fail>: the golden written for this target, <stem>.<target>.<ext>,
+# else the one written for the target whose goldens this one shares (BOARD_GOLDEN_TARGET, from the conf's
+# TARGET_GOLDENS: ESP32-S3_idf runs the code the ESP32-S3_raw compiler emits and prints what ESP32-S3_raw
+# prints), else nothing: the caller then uses the common <stem>.<ext>.
+target_golden() {
+    if [ -f "$1/$2.$target.$3" ]; then printf '%s\n' "$1/$2.$target.$3"
+    elif [ -n "${BOARD_GOLDEN_TARGET:-}" ] && [ -f "$1/$2.$BOARD_GOLDEN_TARGET.$3" ]; then printf '%s\n' "$1/$2.$BOARD_GOLDEN_TARGET.$3"
+    fi
+}
+
 # Program output against its golden, the host Makefiles' way: a trial marked <stem>.scout.multiset is
 # compared with the suite's compare_scout_multiset.sh (actor failure reports as a set, pointers folded:
 # the order of concurrent actors' output is not fixed); otherwise through the suite's
@@ -139,7 +149,7 @@ if [ "${1:-}" = "--fail-one" ]; then
     rm -rf "$tmp"
     cp "$work/build/$stem.cur_fail" "$src/$stem.$target.cur_fail"
     golden="$src/$stem.golden_fail"
-    [ -f "$src/$stem.$target.golden_fail" ] && golden="$src/$stem.$target.golden_fail"
+    tg=$(target_golden "$src" "$stem" golden_fail); [ -n "$tg" ] && golden="$tg"
     if diff -q "$work/build/$stem.cur_fail" "$golden" > /dev/null 2>&1; then
         mark_ok
         printf '✅✅ %s%s\n' "$prefix" "$stem"
@@ -226,9 +236,15 @@ while IFS= read -r f; do
     if [ -n "$reason" ]; then
         printf 'SKIP: %s%s (%s)\n' "$prefix" "$stem" "$reason"
         skipped=$((skipped + 1))
+        # Skipped by this target alone (.skip_run_only, from trial_target.sh): compiled with the rest, not run.
+        if grep -qxF "$stem" "$work/.skip_run_only" 2>/dev/null && [ ! -f "$src/$stem.golden_fail" ] \
+           && [ -z "$(target_golden "$src" "$stem" golden_fail)" ]; then
+            ln -s "$src/$f" "src/$f"
+            staged=$((staged + 1))
+        fi
         continue
     fi
-    if [ -f "$src/$stem.golden_fail" ] || [ -f "$src/$stem.$target.golden_fail" ]; then
+    if [ -f "$src/$stem.golden_fail" ] || [ -n "$(target_golden "$src" "$stem" golden_fail)" ]; then
         [ -z "$ONLY" ] || [ "$ONLY" = "$stem" ] || continue
         failtrials+=("$stem")
         continue
@@ -240,7 +256,7 @@ while IFS= read -r f; do
     # and the programs in the suite link against it. Stage it so they can, but never build an image
     # from it, which is what produced "undefined reference to `main'" for every such module, and
     # "undefined reference to <Module>_<fn>" for the programs that needed one.
-    if [ ! -f "$src/$stem.scout" ] && [ ! -f "$src/$stem.$target.scout" ]; then
+    if [ ! -f "$src/$stem.scout" ] && [ -z "$(target_golden "$src" "$stem" scout)" ]; then
         modules+=("$stem")
         own_modules+=("$stem")
         ln -s "$src/$f" "src/$f"
@@ -346,7 +362,7 @@ gen_ascomp() {
     else
         sout="$gdir/$stem.$target.sout"
         golden="$gdir/$stem.scout"
-        [ -f "$gdir/$stem.$target.scout" ] && golden="$gdir/$stem.$target.scout"
+        tg=$(target_golden "$gdir" "$stem" scout); [ -n "$tg" ] && golden="$tg"
         if [ ! -f "$sout" ]; then printf 'GEN-SKIP\t%s\tno last board result (%s.%s.sout)\n' "$label" "$stem" "$target"; return 0; fi
         if [ ! -f "$golden" ]; then printf 'GEN-SKIP\t%s\tno .scout golden\n' "$label"; return 0; fi
         if ! scout_matches "$sout" "$golden" "$stem"; then
@@ -472,7 +488,7 @@ run_program() {
     fi
     cp "build/$stem.sout" "$gdir/$stem.$target.sout"
     golden="$gdir/$stem.scout"
-    [ -f "$gdir/$stem.$target.scout" ] && golden="$gdir/$stem.$target.scout"
+    tg=$(target_golden "$gdir" "$stem" scout); [ -n "$tg" ] && golden="$tg"
     if [ ! -f "$golden" ]; then
         mark_fail; printf '❌❌ %s%s has no .scout file\n' "$prefix" "$stem"; ko=$((ko + 1))
     elif scout_matches "build/$stem.sout" "$golden" "$stem"; then
@@ -544,7 +560,7 @@ if [ "${#appdirs[@]}" -gt 0 ]; then
                 skipped=$((skipped + 1)); app_skipped=$((app_skipped + 1))
                 continue
             fi
-            if [ -f "$adir/$stem.scout" ] || [ -f "$adir/$stem.$target.scout" ]; then
+            if [ -f "$adir/$stem.scout" ] || [ -n "$(target_golden "$adir" "$stem" scout)" ]; then
                 app_programs+=("$stem")
             else
                 app_modules+=("$stem")

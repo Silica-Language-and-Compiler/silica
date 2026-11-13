@@ -57,18 +57,19 @@ conf="$here/$target.conf"
 
 TARGET_DESCRIPTION=""; TARGET_BOARD_DIR=""; TARGET_PYTHON=""; TARGET_ASCOMP_PLATFORM=""
 TARGET_IMAGE_EXT="bin"; TARGET_PORT_DEFAULT=""; TARGET_PY_MODULES="esptool serial"; TARGET_TOOLS=""
+TARGET_COMPILER=""; TARGET_GOLDENS=""
 # shellcheck disable=SC1090
 . "$conf"
 tools="$repo_root/$TARGET_BOARD_DIR/tools"
 py="${BOARD_PYTHON:-$TARGET_PYTHON}"
-compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/silica-compiler-$target}"
+compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/silica-compiler-${TARGET_COMPILER:-$target}}"
 
 # The per-target trial lock (trials/.integrate.lock.<target>): refuses while a run of this target is in
 # progress, and keeps one off while this trial runs; other targets are not affected.
 bash "$here/trial_target.sh" lock $$ "run_one_trial $target $suite/$stem" "$target" || exit 2
 trap 'bash "$here/trial_target.sh" unlock $$' EXIT
 trap 'exit 130' INT TERM
-[ -x "$compiler" ] || die "missing $compiler (cd compiler/src && make TARGET=$target)"
+[ -x "$compiler" ] || die "missing $compiler (cd compiler/src && make TARGET=${TARGET_COMPILER:-$target})"
 [ -x "$py" ] || die "no Python at $py (set BOARD_PYTHON)"
 "$py" -c "import ${TARGET_PY_MODULES// /, }" 2>/dev/null || die "$py cannot import ${TARGET_PY_MODULES// /, }"
 for t in $TARGET_TOOLS; do command -v "$t" > /dev/null 2>&1 || die "$t not found on PATH"; done
@@ -101,7 +102,7 @@ printf 'run_one_trial: %s %s/%s on %s (%s); work area %s\n' "$target" "$suite" "
 
 export TRIAL_TARGET="$target" BOARD_PORT="$port" BOARD_SILICA_COMPILER="$compiler" BOARD_PYTHON="$py" \
     BOARD_TOOLS="$tools" BOARD_RT_CACHE="$work/.rt" TRIALS_ROOT="$trials_root" \
-    BOARD_ASCOMP_PLATFORM="$platform" BOARD_IMAGE_EXT="$TARGET_IMAGE_EXT" \
+    BOARD_ASCOMP_PLATFORM="$platform" BOARD_IMAGE_EXT="$TARGET_IMAGE_EXT" BOARD_GOLDEN_TARGET="$TARGET_GOLDENS" \
     BOARD_ONLY_STEM="$stem" SILICA_INTEGRATE_ROOT="$work"
 bash "$here/board_suite.sh" "$target" "$suite" "$work"
 st=$?

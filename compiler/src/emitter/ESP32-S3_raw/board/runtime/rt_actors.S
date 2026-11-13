@@ -297,6 +297,7 @@
 #define CORE_RQ_LEN      40
 #define CORE_WF_TIER     52
 #define CORE_WF_CREDIT   56
+#define CORE_ASLEEP      60     // guest of ESP-IDF only: 1 while this core's scheduler task is blocked with nothing ready
 #define CORE_SIZE        64
 #define NCORES_MAX       2
 
@@ -1214,9 +1215,28 @@ silica_rt_rq_push:
     beqz    a5, 1f
     s32i    a2, a5, ACB_NEXT_READY
     s32i    a2, a3, CORE_RQ_TAIL
+#ifdef SILICA_GUEST
+    j       2f
+#else
     retw
+#endif
 1:  s32i    a2, a3, CORE_RQ_HEAD
     s32i    a2, a3, CORE_RQ_TAIL
+#ifdef SILICA_GUEST
+    // Guest of ESP-IDF: the scheduler task of acb's core may be blocked with nothing ready
+    // (silica_rt_sched_loop); wake it. The store above and the load below are each followed or
+    // preceded by MEMW, as the sleeper's store and re-peek are, so one of the two sees the other.
+2:  memw
+    l8ui    a3, a2, ACB_CORE
+    slli    a4, a3, 6
+    movi    a5, silica_rt_cores
+    add     a4, a4, a5
+    l32i    a5, a4, CORE_ASLEEP
+    beqz    a5, 3f
+    mov     a10, a3
+    call8   silica_guest_wake
+3:
+#endif
     retw
     .size   silica_rt_rq_push, . - silica_rt_rq_push
 
@@ -1374,13 +1394,24 @@ silica_rt_wake:
 
 // silica_rt_ctx_switch(save acb, load acb). Returns, in the loaded context, from that context's
 // own call to this function (or lands in its trampoline the first time). Interrupts are never
-// enabled by this runtime, so nothing else touches the window state meanwhile.
+// enabled by this runtime on bare metal, so nothing else touches the window state meanwhile; as a
+// guest of ESP-IDF they are masked for the spill (below).
     .align  4
     .global silica_rt_ctx_switch
 silica_rt_ctx_switch:
     entry   a1, 32
     call8   silica_rt_console_release_if_mine   // a context leaving mid-line gives the console up
+#ifdef SILICA_GUEST
+    // Guest of ESP-IDF: interrupts are on. While the spill has the window rotated, a1 is some other
+    // frame's register, and an interrupt would put its frame wherever that points: none is let in
+    // until the window is back (the overflow exceptions the spill relies on are not interrupts).
+    rsil    a4, 3
     SPILL_ALL_WINDOWS
+    wsr     a4, ps
+    rsync
+#else
+    SPILL_ALL_WINDOWS
+#endif
     s32i    a0, a2, ACB_CTX_A0
     s32i    a1, a2, ACB_CTX_A1
     rur     a4, threadptr               // this core's register block: the emitter's SP lives there
@@ -2379,6 +2410,25 @@ silica_rt_sched_loop:
     movi    a5, 0
     s32i    a5, a3, CORE_BUSY           // this core's own word (get_actor_memory_usage and diagnostics)
     memw
+#ifdef SILICA_GUEST
+    // Guest of ESP-IDF: nothing is ready, so this scheduler's task blocks instead of spinning, until
+    // another core queues work for this one (silica_rt_rq_push wakes it) or one tick passes (timers,
+    // the console's exit line and device registers are polled by the passes above). The flag is set
+    // before the queues are read again, so a push that missed the flag is seen here.
+    movi    a5, 1
+    s32i    a5, a3, CORE_ASLEEP
+    memw
+    l32i    a5, a3, CORE_RQ_HEAD
+    l32i    a6, a3, CORE_RQ_HEAD + 4
+    or      a5, a5, a6
+    l32i    a6, a3, CORE_RQ_HEAD + 8
+    or      a5, a5, a6
+    bnez    a5, 13f
+    call8   silica_guest_idle_wait
+13: movi    a5, 0
+    s32i    a5, a3, CORE_ASLEEP
+    memw
+#endif
     j       1b
 10: SCHED_LOCK a8, a9
     mov     a10, a3
@@ -3306,12 +3356,23 @@ silica_rt_spawn_common:
     // through the data-bus alias of the instruction-bus address; anything else is 0 (not checked).
     l32i    a3, a1, 8
     movi    a4, 0
+#ifdef SILICA_GUEST
+    // Guest of ESP-IDF: the code is in flash, mapped on the instruction bus from 0x42000000, where a
+    // word load reads it as an L32R does; no data-bus alias is involved.
+    movi    a8, 0x42000000
+    bltu    a3, a8, 63f
+    movi    a8, 0x44000000
+    bgeu    a3, a8, 63f
+    addi    a5, a3, -4
+    l32i    a5, a5, 0
+#else
     movi    a8, 0x40378000
     bltu    a3, a8, 63f
     movi    a8, _silica_iram_dram_offset
     sub     a5, a3, a8
     addi    a5, a5, -4
     l32i    a5, a5, 0
+#endif
     srli    a6, a5, 4
     movi    a8, 0x5C1AC0F
     bne     a6, a8, 63f
@@ -6623,11 +6684,13 @@ silica_rt_timer_next:                   // the next number, low word first (0: 1
     .type   silica_rt_timer_now_ticks, @function
 silica_rt_timer_now_ticks:
     entry   a1, 32
+#ifndef SILICA_GUEST    // a guest of ESP-IDF finds the unit running, and the register is ESP-IDF's to update
     movi    a3, TMR_SYSTIMER_CONF
     l32i    a4, a3, 0
     movi    a5, 0xC0000000              // CLK_EN | UNIT0_WORK_EN
     or      a4, a4, a5
     s32i    a4, a3, 0
+#endif
 1:  movi    a3, TMR_SYSTIMER_OP
     movi    a4, 0x40000000              // UNIT0_UPDATE
     s32i    a4, a3, 0

@@ -15,7 +15,7 @@
 
 """Static stack bounds for one linked ESP32-S3 image (actor_memory_budget_plan.md §4.1, item D).
 
-    main_stack_bound.py [--objdump PATH] [--runtime-syms FILE] [--root SYM] [--report] IMAGE.elf
+    main_stack_bound.py [--objdump PATH] [--runtime-syms FILE | --emitted-syms FILE] [--root SYM] [--report] IMAGE.elf
 
 Walks the image's call graph from `_start` and reports what `main`'s two stacks need:
 
@@ -105,11 +105,12 @@ class Block:
 
 
 class Image:
-    def __init__(self, objdump, elf):
+    def __init__(self, objdump, elf, sections=(".iram0.text",)):
         self.objdump, self.elf = objdump, elf
+        self.sections = list(sections)
+        self.ranges = []         # [lo, hi) of each code section
         self.insns = {}
         self.syms = {}
-        self.text_lo, self.text_hi = None, None
         self.words = {}
         self.bounds = {}         # function name -> declared bound (an absolute symbol <name>__stack_bound)
         self.extras = {}         # function name -> bytes added to its frame (<name>__stack_extra)
@@ -125,17 +126,18 @@ class Image:
             sys.exit(2)
 
     def load(self):
-        self.parse(self.run([self.objdump, "-d", "-j", ".iram0.text", self.elf]), keep_syms=True)
+        jflags = [x for sec in self.sections for x in ("-j", sec)]
+        self.parse(self.run([self.objdump, "-d"] + jflags + [self.elf]), keep_syms=True)
         self.load_bounds()
         for line in self.run([self.objdump, "-h", self.elf]).splitlines():
             parts = line.split()
-            if len(parts) >= 4 and parts[1] == ".iram0.text":
-                self.text_lo = int(parts[3], 16)
-                self.text_hi = self.text_lo + int(parts[2], 16)
-        if self.text_lo is None:
-            sys.stderr.write("main_stack_bound: no .iram0.text in %s\n" % self.elf)
+            if len(parts) >= 4 and parts[1] in self.sections:
+                lo = int(parts[3], 16)
+                self.ranges.append((lo, lo + int(parts[2], 16)))
+        if len(self.ranges) != len(self.sections):
+            sys.stderr.write("main_stack_bound: not every section of %s is in %s\n" % (" ".join(self.sections), self.elf))
             sys.exit(2)
-        for line in self.run([self.objdump, "-s", "-j", ".iram0.text", self.elf]).splitlines():
+        for line in self.run([self.objdump, "-s"] + jflags + [self.elf]).splitlines():
             parts = line.split()
             if len(parts) < 2 or not line.startswith(" "):
                 continue
@@ -146,6 +148,13 @@ class Image:
             raw = bytes.fromhex("".join(p for p in parts[1:5] if re.fullmatch(r"[0-9a-f]+", p)))
             for i in range(0, len(raw) - 3, 4):
                 self.words[base + i] = int.from_bytes(raw[i:i + 4], "little")
+
+    def in_text(self, addr):
+        return any(lo <= addr < hi for lo, hi in self.ranges)
+
+    def text_end(self, addr):
+        """The end of the code section that holds addr."""
+        return next(hi for lo, hi in self.ranges if lo <= addr < hi)
 
     def load_bounds(self):
         for line in self.run([self.objdump, "-t", self.elf]).splitlines():
@@ -173,7 +182,7 @@ class Image:
         ins = self.insns.get(addr)
         if ins is not None:
             return ins
-        if addr in self.decoded_from or not (self.text_lo <= addr < self.text_hi):
+        if addr in self.decoded_from or not self.in_text(addr):
             return None
         self.decoded_from.add(addr)
         self.parse(self.run([self.objdump, "-d", "--start-address=0x%x" % addr, "--stop-address=0x%x" % stop, self.elf]), keep_syms=False)
@@ -200,7 +209,7 @@ def walk(img, b, starts):
         if not (b.start <= a < b.end):
             # control flows into the next block (a label that is a symbol, such as the emitter's
             # L_case_* labels, starts one): the same frame continues there
-            if img.text_lo <= a < img.text_hi and a not in (t for t, _ in b.edges):
+            if img.in_text(a) and a not in (t for t, _ in b.edges):
                 b.edges.append((a, "j"))
                 found.add(a)
             continue
@@ -226,7 +235,7 @@ def walk(img, b, starts):
             r = args.split(",")[0].strip()
             lit = last_l32r.get(r)
             target = img.words.get(lit) if lit is not None else None
-            if target is not None and img.text_lo <= target < img.text_hi:
+            if target is not None and img.in_text(target):
                 b.edges.append((target, op))
                 found.add(target)
             elif target is not None and ROM_LOW <= target < ROM_HIGH:
@@ -385,7 +394,7 @@ def aux_usage(b, is_runtime):
 
 def build(img):
     """Blocks at every symbol and every discovered call target, walked to a fixed point."""
-    starts = set(a for a in img.syms if img.text_lo <= a < img.text_hi)
+    starts = set(a for a in img.syms if img.in_text(a))
     while True:
         order = sorted(starts)
         blocks = {}
@@ -395,12 +404,12 @@ def build(img):
                 prev = max((x for x in img.syms if x < s), default=None)
                 name = "%s+0x%x" % (img.syms[prev], s - prev) if prev is not None else "0x%x" % s
             b = Block(s, name)
-            b.end = order[i + 1] if i + 1 < len(order) else img.text_hi
+            b.end = min(order[i + 1], img.text_end(s)) if i + 1 < len(order) else img.text_end(s)
             blocks[s] = b
         found = set()
         for b in blocks.values():
             found |= walk(img, b, starts)
-        new = {t for t in found if img.text_lo <= t < img.text_hi} - starts
+        new = {t for t in found if img.in_text(t)} - starts
         if not new:
             return blocks
         starts |= new
@@ -508,6 +517,11 @@ def main():
         "xtensa-esp32s3-elf-objdump"))
     ap.add_argument("--runtime-syms", help="file naming the runtime's symbols, one per line (nm over the runtime objects); "
                                            "without it, symbols starting with silica_rt_, silica_pid_, silica_dangerous_, silica_device_ or _ are the runtime")
+    ap.add_argument("--emitted-syms", help="file naming the emitted code's symbols, one per line (nm over the program's objects): "
+                                           "everything else in the image is the runtime. For an image that also holds code that is "
+                                           "neither (the guest of ESP-IDF, board/guest), where the name rule would count that code as emitted")
+    ap.add_argument("--section", action="append", default=[], help="a code section of the image (repeatable; default .iram0.text, "
+                                                                    "the bare-metal image's only one)")
     ap.add_argument("--root", default="_start", help="symbol to bound (default _start: main's machine stack)")
     ap.add_argument("--report", action="store_true", help="print the deepest chain")
     ap.add_argument("--ignore-callx", action="store_true", help="count an unreadable CALLX8 as depth 0 (the fixed overhead "
@@ -516,7 +530,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="print every function's bounded depth, deepest first")
     a = ap.parse_args()
 
-    img = Image(a.objdump, a.elf)
+    img = Image(a.objdump, a.elf, a.section or [".iram0.text"])
     blocks = build(img)
     names = {b.name: s for s, b in blocks.items()}
 
@@ -525,8 +539,15 @@ def main():
         with open(a.runtime_syms) as f:
             runtime_syms = {ln.strip() for ln in f if ln.strip()}
 
+    emitted_syms = None
+    if a.emitted_syms:
+        with open(a.emitted_syms) as f:
+            emitted_syms = {ln.strip() for ln in f if ln.strip()}
+
     def is_runtime(name):
         base = name.split("+")[0]
+        if emitted_syms is not None:
+            return base not in emitted_syms
         if runtime_syms is not None:
             return base in runtime_syms or base.startswith("_")
         return base.startswith(("silica_rt_", "silica_pid_", "silica_dangerous_", "silica_device_", "_"))

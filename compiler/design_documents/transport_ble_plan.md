@@ -1,7 +1,7 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-10. Stages 1 to 4 are closed (§6); stage 5 is next. The goal, the design and the
-vocabulary are decided (§8: Matt Manley, 2026-11-10).** It refines §6.5 and phase 5 of
+Status: **2026-11-12. Stages 1 to 5 are closed (§6). The goal, the design and the
+vocabulary are decided (§8: Matt Manley).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
 [transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md) (the "Wi-Fi plan") decided, its route R2. Branch:
@@ -20,7 +20,8 @@ carried_on phone: (:ble_gatt) (:bluetooth, 0);
 - **Contract:** the carrier contract of transport design §6.2 on every target, in both roles (central and
   peripheral). A program written against the Mac carrier runs against the board carrier unchanged.
 - **Codec:** ETF, `(:etf)`, with `wireframe` between `encode` and the carrier, as in the serial demos.
-- **On the board, the Bluetooth host is written in Silica**, as actors, above Espressif's closed controller (§2).
+- **On the board, the carrier comes first**, over ESP-IDF's own Bluetooth host (NimBLE) behind a wrapper, as the
+  Wi-Fi plan puts its carrier over lwIP. A host written in Silica is the long-term path (§2.4).
 - **Demo:** the accelerometer frame and the LED reply of `silica_33_transport_usb_serial_jtag_etf`, over BLE, between
   the board and the Mac.
 - **Hardware:** one board. Its peers are the Mac and a phone.
@@ -35,8 +36,8 @@ GATT).
 | --- | --- | --- |
 | Program | casts to the carrier, receives from it | the same program |
 | Carrier, the owner-facing end | `dangerous_ble_gatt_carrier`, a dangerous actor | an actor with the same messages |
-| Host | CoreBluetooth, behind an Objective-C Fifi wrapper | **written in Silica**, as actors |
-| HCI | inside macOS | one Silica actor owns it |
+| Host | CoreBluetooth, behind an Objective-C Fifi wrapper | NimBLE, ESP-IDF's host, behind a C Fifi wrapper |
+| HCI | inside macOS | inside ESP-IDF |
 | Controller and radio | macOS and Apple's hardware | Espressif's closed controller, run by ESP-IDF |
 | Who owns the machine | macOS; Silica's runtime is its guest | ESP-IDF and FreeRTOS; Silica's runtime is their guest |
 
@@ -47,38 +48,68 @@ clocks, power, timers, interrupts). The radio hardware is not documented, so the
 environment it was written for:
 
 - **ESP-IDF owns the chip.** Its bootloader and start-up run first, its vector table and watchdogs stay, and
-  FreeRTOS schedules both cores. It is built with the Bluetooth controller and **without a Bluetooth host**.
+  FreeRTOS schedules both cores. It is built with the Bluetooth controller and NimBLE.
 - **Silica's runtime is a guest, as it is on the Mac and on Linux.** Its two schedulers, one per core, each run as
   a FreeRTOS task on the core they use today. Actors stay pinned to their core and are never interrupted by another
   actor; FreeRTOS pauses a scheduler task briefly when the radio needs the core, and the actors see only that a turn
   took longer. Silica takes its memory as a block from ESP-IDF.
-- **This is a new target beside `ESP32-S3_raw`, not a change to it.** The new target shares the raw target's code
-  generation and its scheduler logic and replaces the parts that own the chip: start-up, the vector table, the
-  memory layout, and polling with interrupts masked. `ESP32-S3_raw` stays as it is, owning the chip, for programs
-  that need no radio. A program that wants the radio is built for the new target.
-- **HCI is the boundary.** ESP-IDF hands HCI packets to the application through its virtual HCI calls
-  (`CONFIG_BT_CONTROLLER_ONLY`; run on the board in stage 4). They are foreign code, reached through Fifi.
+- **One compiler, two board runtimes.** The `ESP32-S3_raw` compiler emits the same code for both. The bare-metal
+  runtime owns the chip, as today, for programs that need no radio. The guest runtime
+  (`compiler/src/emitter/ESP32-S3_raw/board/guest`) shares the bare-metal runtime's scheduler, heap and device code
+  and replaces the parts that own the chip: start-up, the vector table, the memory layout. A program that wants the
+  radio is built into a guest image; the trial target for guest images is `ESP32-S3_idf`.
+- **The wrapper is the boundary.** NimBLE's calls (advertise, connect, the attribute table, write, indicate) are
+  foreign code, reached through Fifi. NimBLE's callbacks run in its own task and must not call the Silica runtime:
+  they hand each event to a wrapper call through a FreeRTOS queue.
 - **AtomVM's ESP32 port is the model**: an actor runtime started by ESP-IDF, with its schedulers as tasks and radio
   events delivered as messages. It is open source.
 
-### 2.2 The actors above HCI
+### 2.2 The actors above the wrapper
 
-- **The HCI actor** owns the pipe to the controller. Every packet the controller sends becomes a message; every
-  command and data packet is a cast to it.
+- **The radio actor** owns the wrapper. Every event NimBLE reports becomes a message; every request to the host is
+  a cast to it. Nothing else calls the wrapper.
 - **One connection actor per link** holds that link's state (the negotiated MTU, the subscription, the credit), as
   the TCP listener spawns one connection carrier per accepted peer. Two peers are two actors, and one failing does
   not touch the other.
 - **The carrier** is the owner-facing end of a connection actor and speaks the §6.2 contract.
 - A lost link is an actor ending, handled by supervision (links design §6.3), not a value the sender checks.
 
-### 2.3 Outside this plan
+### 2.3 Shared with Wi-Fi
+
+A board program may use Bluetooth, Wi-Fi or both. On this chip the two are one piece of work below the carriers,
+so they are built on one base and to one pattern, and neither plan owns what is shared:
+
+- **One radio.** Wi-Fi and Bluetooth share the 2.4 GHz hardware, and ESP-IDF arbitrates between them. A program
+  that uses both depends on that arbitration being in the build.
+- **One guest image.** One ESP-IDF application, one configuration, one image build (§2.1). The links a program
+  declares choose what is enabled: Bluetooth, Wi-Fi or both. There is no Bluetooth image and Wi-Fi image.
+- **One memory budget.** The controller, NimBLE, the Wi-Fi driver and lwIP take internal RAM from the pool
+  Silica's block comes from. Both radios at once is the tightest case, and it decides whether Silica's heap moves
+  to the board's PSRAM.
+- **One pattern above the closed code.** A wrapper around the ESP-IDF library, one actor that owns the wrapper,
+  callbacks handed to it through a queue, and a carrier that speaks the §6.2 contract (§2.2). The Wi-Fi plan's
+  carrier over lwIP has the same shape.
+- **The guest runtime is the common base.** It goes to the branch both plans start from when stage 5 closes,
+  before either carrier is built on it.
+
+To settle with Lee, whose decisions the Wi-Fi plan records: one owner for what is shared (the guest runtime, the
+image build, the configuration and the memory budget), and how the two plans' stages are ordered against each
+other.
+
+### 2.4 Outside this plan
 
 These are not built by any stage here, and no stage's code should lean toward them.
 
-- **Silica owning the chip with the controller as its guest** (the Wi-Fi plan's R1). The Silica host would not
-  change, because it speaks HCI either way. It is a possible later project, considered only once stage 9 has closed.
+- **A Bluetooth host written in Silica**, as actors above HCI, in place of NimBLE. It is the long-term path, as the
+  Silica network stack is in the Wi-Fi plan: moderate to large work (the central role and pairing most of all) and
+  not on the path to the demo. HCI is a published standard, and stage 4 showed a Silica program reaching the
+  controller through ESP-IDF's virtual HCI calls. The carrier's contract would not change, so a program written
+  against the carrier would not see the host replaced.
+- **Silica owning the chip with the controller as its guest** (the Wi-Fi plan's R1). A possible later project.
+- **The stack check before a large frame is opened**, in the compiler's emitted code, in place of after it. It
+  would close, on any runtime, the two-instruction window the guest's builder now covers with a larger reserve
+  (§6, stage 5). It changes emitted code and its assembly goldens on the board target.
 - **A second chip as a modem.** Dropped.
-- **Espressif's own Bluetooth host, or any host in C, on the board.** The host is Silica from the start.
 - **A controller written in Silica.** Not possible: the radio hardware is undocumented.
 
 ## 3. Vocabulary
@@ -123,7 +154,7 @@ The kind and the link in the compiler's checks, the specification and the error 
 
 ### Stage 4. Board spike: Silica as a guest of ESP-IDF (time-boxed decision gate)
 
-The new target of §2.1, far enough to answer whether it works. It is also the radio spike the Wi-Fi plan left
+The guest runtime of §2.1, far enough to answer whether it works. It is also the radio spike the Wi-Fi plan left
 unrun, so its result serves both plans.
 
 - Read first: AtomVM's ESP32 port, and which parts of Silica's board runtime own the chip (`rt_start.S`,
@@ -136,21 +167,21 @@ unrun, so its result serves both plans.
      runtime had to be replaced to get there?
   2. Does a Silica program send an HCI Reset through the virtual HCI calls and receive the Command Complete event?
   3. What do ESP-IDF and the controller cost in flash and RAM, and what is left for the program?
-  4. How is an image of the new target built, flashed and trialled?
+  4. How is a guest image built, flashed and trialled?
 - Throwaway code, as stage 1 was. Hardware: the board.
 - **Closes when:** a Silica program on the board prints the controller's answer to an HCI Reset, or the reason it
   cannot is written into §6. If it cannot, the plan stops there and is reconsidered with what the spike found; no
   other route is started without that.
 
-### Stage 5. The guest target, made sound
+### Stage 5. The guest target, made sound (closed, §6)
 
-The new target of §2.1 in the compiler and the board tools, in place of the spike's throwaway code, with what
-stage 4 found settled (§6, stage 4):
+The guest runtime of §2.1 in the board tools, in place of the spike's throwaway code, with what stage 4 found
+settled (§6, stage 4):
 
-- The target itself: its pack, its start-up and memory pieces, its image build and flash, its place in the board
-  trial driver.
-- **A fault in an actor ends that actor, not the program**, as on `ESP32-S3_raw`: Silica's fault handling is
-  reached from ESP-IDF's exception path.
+- The guest runtime itself: its start-up, fault and memory pieces, its image build and flash, and the trial
+  target `ESP32-S3_idf` in the board trial driver.
+- **A fault in an actor ends that actor, not the program**, as on bare metal: Silica's fault handling is reached
+  from ESP-IDF's exception path.
 - **A scheduler with nothing to do blocks** until there is work, so FreeRTOS's idle tasks run and the watchdog's
   idle check stays on.
 - **Silica's code runs from flash**, as ESP-IDF's does: the runtime's read of a marker through the data-bus alias
@@ -158,26 +189,32 @@ stage 4 found settled (§6, stage 4):
 - **The stack reserve is derived**, not guessed: what an interrupt needs on the stack that is running, added to
   what the bare-metal build measures.
 - The stack guards and the runtime's spinlocks under interrupts: a guard hit is Silica's fault report; a lock is
-  not held across a pause.
+  taken only by the two scheduler tasks, so a holder that is paused makes the other core wait and cannot deadlock.
 - **A foreign call can answer a record on the board**, so the board's wrappers use the hosted wrappers'
   `{ tag, value, error_code }`.
-- **One ESP-IDF version is chosen** for the target and for the board scripts, and this machine's tools match it.
+- **One ESP-IDF version is chosen** for guest images and for the board scripts, and this machine's tools match it.
   The four `.esp32_s3.ascomp` goldens left stale in stage 3 are refreshed by a bare-metal board run.
-- **Closes when:** the existing board trials pass on the new target; a trial shows an actor's fault ending only
-  that actor; the bare-metal board trials still pass on `ESP32-S3_raw`.
+- **Closes when:** the board trials that exercise the runtime (actors, supervisors, timers, faults, stacks,
+  devices, transports, foreign calls) pass in full as guest images (`ESP32-S3_idf`), and a sample of each language
+  suite; the core of them passes in the stress build as well; a trial shows an actor's fault ending only that
+  actor; the bare-metal trials those changes touch still pass on `ESP32-S3_raw`. The whole board tree is run on
+  both runtimes once, before the branch merges.
 
-### Stage 6. HCI as an actor; the board advertises
+### Stage 6. NimBLE behind a wrapper; the board advertises
 
-- The HCI actor (§2.2) over the virtual HCI calls, through a Fifi wrapper.
-- The host's first piece in Silica: set the advertising data and start advertising.
+- The guest's ESP-IDF application built with NimBLE; what NimBLE and the controller cost in RAM, and the size of
+  Silica's block beside them.
+- The same application built with Wi-Fi and lwIP enabled as well, measured the same way (§2.3): what is left for
+  Silica with both radios, and whether the heap has to move to PSRAM. Nothing of Wi-Fi is run.
+- The wrapper and the radio actor (§2.2), as far as advertising: set the advertising data and start advertising.
 - **Closes when:** a phone's scanner shows the board advertising the service, and goes on showing it while a
   Silica program keeps both cores busy.
 
 ### Stage 7. The board carrier, peripheral role
 
-- The Silica host, the least that one service needs: accept a connection, the MTU exchange, an attribute table with
+- The wrapper, the least that one service needs: accept a connection, the MTU exchange, an attribute table with
   the service and its two characteristics, writes with response in, indications out, disconnection.
-- The connection actor and the carrier (§2.2); the new target's pack rows; `carrier_spawn`; board trials
+- The connection actor and the carrier (§2.2); the board's pack rows; `carrier_spawn`; board trials
   (compile-time, assembly, diagnostics and one direction, §8 decision 7).
 - No pairing and no encryption (§8, decision 4).
 - **Closes when:** a board program compiles with `carried_on phone: (:ble_gatt) (:bluetooth, 0);` and exchanges a
@@ -191,12 +228,12 @@ stage 4 found settled (§6, stage 4):
 
 ### Stage 9. Central role on the board
 
-- The host's central side: scan, connect, discover the service, subscribe, write.
+- The wrapper's central side: scan, connect, discover the service, subscribe, write.
 - **Closes when:** the board as central and the Mac as peripheral exchange the frame.
 
 ### Stage 10. Hardening, Linux and docs
 
-- Pairing and encryption; `frame_seq` if more than one frame is ever in flight.
+- Pairing and encryption, NimBLE's; `frame_seq` if more than one frame is ever in flight.
 - On both carriers: reconnect; a soak; more than one session at a time; a link lost in the middle of a frame; the
   `:timeout` reason.
 - BlueZ wrapper and the Linux pack rows in lock-step with the stale Linux goldens of the Wi-Fi plan's stage S-C.
@@ -208,8 +245,9 @@ stage 4 found settled (§6, stage 4):
    and that the controller answers; nothing was on the air. Silica's actors are never interrupted by each other, and
    its locks are taken with interrupts on. Advertising and then a held connection, each with both cores busy, are
    the tests.
-2. **The size of the Silica host.** A one-service peripheral is small; the central role and pairing are not. Stages 7,
-   9 and 10 take them in that order so each closes on its own.
+2. **Memory.** NimBLE takes RAM of its own beside the controller, and Silica's block (208 KB with the controller
+   alone, stage 5) shrinks by that much; Wi-Fi beside it takes more (§2.3). Stage 6 measures both. The board's
+   2 MB of PSRAM is unused.
 3. **No pairing or encryption until stage 10.** Any nearby device can connect and read or write the link. Nothing
    sensitive crosses it before then.
 4. **Trials.** A radio and a second device cannot be in `make integrate`; most evidence is scripted runs, as for the
@@ -300,7 +338,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     - A central that unsubscribes ends the link for a peripheral. It is the only sign CoreBluetooth gives a
       peripheral that its central went away.
     - `(:esp_at, n)`, added in stage 2, is removed from the compiler, `Link.silica`, the specification and the
-      trials: the modem route it named is not built (§2.3).
+      trials: the modem route it named is not built (§2.4).
   - Trials:
     - `transport_addition/transport_ble_segments` (new, no radio): a 48-byte frame at the row's mtu is three
       20-byte segments and reassembles; a short last segment; a frame the mtu holds travels bare; a negotiated
@@ -411,6 +449,129 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     load it with this environment's esptool, so no bare-metal run was made for comparison, and the four board
     goldens left stale in stage 3 are still stale.
 
+- **Stage 5, 2026-11-12, closed: the guest runtime is in the tree, the runtime's board suites pass on it in the
+  ordinary and the stress build, and the whole board tree has been run on both runtimes with no difference
+  left between them.** Built: `compiler/src/emitter/ESP32-S3_raw/board/guest`
+  (its `README.md` describes it), the trial target `trials/targets/ESP32-S3_idf.conf` and `.skip`,
+  `run_app.sh --guest`. The spike's own ESP-IDF project is deleted; `run_hci_reset.sh` runs its HCI program on
+  the guest runtime (`hci reset length=7 event=040E0405030C00`, exit 0).
+  - One compiler: `ESP32-S3_raw` emits the same code for both runtimes, and the guest target compares against
+    the bare-metal goldens. The shared runtime files changed (`rt_actors.S`, `rt_console.S`, `rt_ffi.S`,
+    `rt_supervisors.S`) assemble to the same bare-metal objects as before, byte for byte: every change is
+    inside `SILICA_GUEST`.
+  - ESP-IDF version: 6.2, its development branch until 6.2 is released (commit `0e6b480f858c`, toolchain
+    `esp-16.1.0_20260609`), the version the bare-metal scripts already name. This machine's tools match it.
+  - Stage 4's findings:
+    1. A fault in an actor ends that actor. CPU exceptions reach Silica through
+       `xt_set_exception_handler`, stack-guard hits through ESP-IDF's weak `xt_debugexception`; a fault outside
+       a Silica scheduler task, or with interrupts masked, stays ESP-IDF's panic.
+    2. A scheduler with nothing ready blocks for a notification or one tick; the watchdog's idle check is on.
+       A scheduler that never goes idle is held back one tick a second by a task above it.
+    3. Code and constants are in flash; the marker word is read from the flash mapping.
+    4. The stack reserve is the bare-metal measurement plus one ESP-IDF exception frame and 192 bytes
+       (`silica_guest_stack_allowance`); the runtime's calls into FreeRTOS declare their stack need.
+    5. A stack-guard hit is Silica's fault report: `actor_aux_overflow_ends_actor` and
+       `actor_machine_overflow_ends_actor` print on the guest what they print on bare metal (their goldens are
+       stale on both).
+    6. The locks are left unmasked. Only the two scheduler tasks take them, so a holder that is paused makes
+       the other core wait and cannot deadlock. The window spill in the context switch is masked: an
+       interrupt taken while the register window is rotated puts its frame on the wrong stack.
+    7. The console is shared as before. The runtime no longer writes the system timer's configuration
+       register as a guest: ESP-IDF updates that register for its own timer and a second writer can undo it.
+  - A foreign call answers a record on the board (`ffi_foreign.silica`): the C struct is copied field by field
+    into a record of the caller's frame. Trial `ffi_addition/app_foreign_tagged_result_e2e`, passing on the
+    Mac, bare metal and the guest. A 16-byte record, which comes back in registers, was run by hand on bare metal and
+    read back correctly; it is not in the trial because of the Mac defect below.
+  - Memory: Silica has one block (`GUEST_RAM`) for the heap and main's stacks: 240 KB, or 208 KB for a program
+    whose foreign code calls ESP-IDF's Bluetooth or Wi-Fi, so that the controller fits beside it. Bare metal
+    has about 340 KB. Measured: 208 KB fails `cancelled_timers_release_messages`, `actor_deep_recursion_grows`
+    and `thousand_actors_at_rest`; 224 KB fails the last; at 240 KB all three print what bare metal prints.
+    About 260 KB is the most that links: the block shares a 342 KB region with ESP-IDF's own data. Each of
+    main's two stacks is sized from its own bound when the walk reaches one; before, a main with one stack
+    unbounded got the default for both (160 KB), which failed
+    `report_sink_inherited_by_added_child_supervisor`. A main the walk cannot bound (recursion) gets the
+    default for both: 128 KB and 32 KB.
+  - Found and fixed on the way:
+    - **The fault stack's first frame had no caller.** When that frame was spilled (an interrupt arriving
+      while the fault report was a few calls deep), the window-overflow handler stored four registers at
+      address -32: a double exception, and the core hung with interrupts masked. The frame now carries a
+      caller's stack pointer. Bare metal has the same frame and is not affected: the store does nothing there
+      (shown by forcing the spill).
+    - **An interrupt between a large frame's allocation and its stack check landed on the guard.** Emitted
+      code opens a function's frame and then checks the stack limit. With a frame larger than the reserve
+      (the LED-row worker's is about 4 KB) the stack pointer is for two instructions at or below the guard
+      band, and ESP-IDF's interrupt frame goes under it: a panic in `device_led_row_constant_heap` nine runs
+      in ten, and with a larger frame a write below the stack with no fault. The builder's reserve now also
+      covers the largest emitted frame of the image (11 of about 30,000 frames in the board goldens are
+      larger than the runtime's depth). The trial passes six runs in six. The check could instead come
+      before the allocation, in the compiler, which would close the window on any runtime; not done here.
+    - **`device_esp32s3_uart1` took a full transmit FIFO for a stuck one.** Under ESP-IDF the CPU writes a
+      204-byte segment faster than the FIFO drains, so the last byte leaves it full. The check now waits for
+      room first. Both UART1 trials pass on both runtimes.
+    - ESP-IDF's linker script scattered the table of function names, so failure reports printed
+      `<unknown behavior>`; images link with a patched copy of the script.
+    - **`device_esp32s3_usb_serial_jtag` timed its check that a host is attached by a loop count**, which
+      under ESP-IDF's CPU speed was too short. It now reads the clock: it answers as soon as the frame counter
+      moves and waits up to a second. Both USB trials pass on both runtimes; their two assembly goldens are
+      refreshed.
+    - **The trial driver left a trial skipped by the guest out of its suite's compile**, which changed numbers
+      in the assembly of the suite's other programs (four timer trials differed from their goldens). Such a
+      trial is now compiled with the rest and not run.
+  - Stress build (`GUEST_STRESS=1`, the guest's `README.md`): a timer with an irregular period wakes a task above
+    each scheduler, the breather runs every 50 ms, and every fault entry spills the fault stack's first frame.
+  - Runs on the board as guest images (2026-11-11):
+    - In full, about 800 trials: `ffi_addition`, `supervisors_addition`, `timers_addition`,
+      `supervisors_board_defects_addition`, `supervisor_exit_reports_addition`, `scheduler_policy_addition`,
+      `record_shapes_actors_addition`, `cast_exit_board_addition`, `transport_board_addition`,
+      `device_actor_addition`, `stack_budget_board_addition`, `traits_addition`,
+      `recursive_function_addition`. About 350 trials each of `list_addition`, `memory_region_addition` and
+      `string_addition`, and 695 trials from the start of the whole tree, all matching.
+    - What does not pass, and why. Fails on bare metal the same way (stale goldens in suites marked pending,
+      or a hang): `actor_aux_overflow_ends_actor`, `actor_machine_overflow_ends_actor`,
+      `stack_release_algorithms`, `actor_heap_exhausted_on_core1_aborts`, `supervisor_ref_after_calls`,
+      `device_fault_lines`, `device_fault_lines_registered`. (`thousand_actors_at_rest` and `actor_deep_recursion_grows`
+      are in that suite too: stale goldens, and bare metal's output since the block is 240 KB.)
+    - Skipped with a reason in `ESP32-S3_idf.skip`: `current_time_plausible` (no loader sets the wall clock).
+    - Stress build: `ffi_addition`, `supervisors_addition`, `timers_addition`,
+      `supervisors_board_defects_addition`, `supervisor_exit_reports_addition`, `scheduler_policy_addition`,
+      `cast_exit_board_addition`, `record_shapes_actors_addition`, `transport_board_addition` and
+      `stack_budget_board_addition` print what the ordinary build prints, but for
+      `timer_ref_equality_and_storage`: its two cancel lines came in the other order. The two actors that
+      print them are on different cores and nothing in the program orders them, so the trial's expected order
+      holds by timing, on any target.
+    - After the last change (the reserve), the same suites and `device_actor_addition` again, in the
+      ordinary build and in the stress build: as above.
+  - Bare metal after the changes: `transport_board_addition` and `timers_addition` pass, and
+    `device_fault_lines` and `device_fault_lines_registered` hang there as on the guest; the shared runtime
+    objects are unchanged.
+  - The whole board tree, 2026-11-11 to 12, ordinary build, 57 suites (the 21 suites of the shared skip list
+    left out), a 40 s limit per program. Guest: 15 h 32 min, 11 failures. Bare metal: 5 h 17 min, 12 failures.
+    - On both, 8: compile-error trials in `error_enforcement_addition` written for the Mac's links
+      (`dangerous_carrier_*`, `dangerous_link_spawn_not_provided`, `link_baud_unsupported`,
+      `link_ble_adapter_not_provided`, `link_not_provided_hosted`). The board compiler refuses the link
+      first, with another error. They need a board expected file or a skip entry.
+    - Guest only, 3: `recursive_ackermann` and two `train_recursive_function_ackermann_*` hung. Cause: the
+      builder sized main's auxiliary stack from the walk's figure even when the walk had stopped at a
+      recursion, which gave 256 bytes. Fixed: when the walk has no bound, both stacks get the default. The
+      three pass, and `recursive_function_addition`, `supervisors_addition`, `timers_addition`,
+      `ffi_addition`, `deep_frame_spill_addition`, `base`, `actor_registration_addition`,
+      `failure_reason_line_addition`, `stack_budget_board_addition` and `device_actor_addition` were run
+      again on the guest after the fix: clean, apart from the stale expected files and the two
+      `device_fault_lines` hangs noted above.
+    - Bare metal only, 4: `bees_sd7_message_region_released`, `bees_sd7_message_region_released_in_flight`,
+      `tail_recursion_runs_in_constant_stack` and `report_hundred_thousand_reports_rss` ran past the 40 s
+      limit of this run (the driver's default is 300 s). With a 200 s limit they pass on both runtimes.
+      Bare metal is the slower of the two on them: 157 s against 52 s for the tail recursion trial, build
+      and flash included.
+    - After the fix, the stress build: `supervisors_addition`, `timers_addition`, `ffi_addition`,
+      `supervisor_exit_reports_addition`, `scheduler_policy_addition`, `deep_frame_spill_addition`,
+      `transport_board_addition`, the four pending board suites and the three Ackermann trials: clean, apart
+      from the stale expected files, the two `device_fault_lines` hangs and `timer_ref_equality_and_storage`.
+    - The eight error trials are now in `trials/targets/ESP32-S3_raw.skip`.
+  - Found, not fixed: main running out of auxiliary stack on the guest hangs without a report.
+  - Found, not fixed: on the Mac a 16-byte record returned by a foreign call reads back as 0. The new trial
+    uses the 24-byte record only.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
@@ -419,18 +580,20 @@ Each stage's result is recorded here when it closes: date, what was built, trial
 - ESP-IDF's controller has an HCI interface for an application that brings its own host
   ([Controller and HCI](https://docs.espressif.com/projects/esp-idf/en/v6.0/esp32h2/api-reference/bluetooth/controller_vhci.html);
   the page read is for another chip of the family).
+- Guest images are built against ESP-IDF 6.2 (commit `0e6b480f858c` of its development branch, 2026-11-10).
 - ESP-IDF does not support bare-metal code on one core beside FreeRTOS on the other
   ([pull request 12481](https://github.com/espressif/esp-idf/pull/12481)), which is why Silica's schedulers are
   tasks and not code outside FreeRTOS.
 
-## 8. Decisions (Matt Manley, 2026-11-10)
+## 8. Decisions (Matt Manley, 2026-11-10 unless dated)
 
-1. **The goal is a Bluetooth host written in Silica above Espressif's closed controller.** HCI is a published
-   standard, so everything above it can be Silica; the radio under it is undocumented.
+1. **The goal is the carrier, on the Mac and on the board. On the board it runs over NimBLE first** (2026-11-11),
+   as the Wi-Fi plan's carrier runs over lwIP first: one approach for both radios, and the shortest path to a
+   working, paired link. A host written in Silica above HCI is the long-term path (§2.4).
 
-2. **On the board, ESP-IDF owns the chip and Silica's runtime is its guest**, as a new target beside
-   `ESP32-S3_raw`, which is not changed. This is the Wi-Fi plan's route R2, so the two plans host the shared radio
-   code the same way.
+2. **On the board, ESP-IDF owns the chip and Silica's runtime is its guest**, as a second board runtime under the
+   one `ESP32-S3_raw` compiler (§2.1). The bare-metal runtime keeps working unchanged for programs that need no
+   radio. The route is the Wi-Fi plan's R2; the result of stage 4 serves that plan too.
 
 3. **Silica keeps both cores.** Its two schedulers run as two tasks, each on the core it uses today.
 

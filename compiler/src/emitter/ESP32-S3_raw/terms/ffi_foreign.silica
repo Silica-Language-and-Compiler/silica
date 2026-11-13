@@ -48,7 +48,13 @@
 // a `_ptr`/`_len` pair expected as a string is copied into a fresh frame string
 // (silica_rt_ffi_string_out). Nothing is allocated on the heap. What the target does not lower is refused
 // with an `.error` line, the tree's convention for unsupported constructs: more than six argument words,
-// a record or tuple argument, a float16, and a record result that is not consumed as a string.
+// a record or tuple argument, a float16.
+//
+// A struct result that is not consumed as a string becomes a Silica record when it is a flat record of
+// scalar fields of at most 32 C bytes, the hosted wrappers' { tag: int64, value: int64, error_code: int64 }
+// among them: a block of the caller's frame holding the shape word and one 8-byte slot a field
+// (prims_record), filled field by field from the C struct, whose layout is C's and not the record's
+// (emit_record_out). Any other record or tuple result is refused, as is such a call in tail position.
 
 use var;
 use emitter_effects;
@@ -730,11 +736,130 @@ fn narrow_result_fix(return_type: string) -> string {
     }
 }
 
+// A record result that is not consumed as a string: (the C struct's size, "") when the return type is a
+// flat record of scalar fields of at most 32 C bytes, else (0, why not). A `name_ptr` / `name_len` pair
+// is a text result and is taken only as a string.
+fn record_result_layout(return_type: string) -> (int64, string) {
+    fields: string <- record_field_text(return_type);
+    case length_bytes(fields) == 0 of {
+        true -> (0, concat("a foreign call's result is supported on this target as a scalar, as a text result consumed as a string (a tag, name_ptr: uint8, name_len: uint64 record), or as a flat record of scalar fields; ", concat(return_type, " is none of these")));
+        false -> case fields_have_pointer(fields, fields) of {
+            true -> (0, concat("the result record ", concat(return_type, " holds a name_ptr / name_len pair: on this target that is a text result, taken only by a call consumed as a string")));
+            false -> {
+                size: int64 <- c_struct_size(fields);
+                case size < 0 of {
+                    true -> (0, concat("the result record ", concat(return_type, " has a field type with no C layout on this target (the fields must be integers, booleans or floats of 8 to 64 bits)")));
+                    false -> case size > 32 of {
+                        true -> (0, "a result record larger than 32 bytes is not supported on this target");
+                        false -> (size, "")
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fields_have_pointer(fields: string, rest: string) -> boolean {
+    case length_bytes(rest) == 0 of {
+        true -> false;
+        false -> {
+            sep: int64 <- find_field_sep(rest, ",", 0);
+            field: string <- case sep < 0 of { true -> rest; false -> substring(rest, 0, sep) };
+            more: string <- case sep < 0 of { true -> ""; false -> substring_to_end(rest, sep + 1) };
+            case field_is_pointer(fields, field) of {
+                true -> true;
+                false -> fields_have_pointer(fields, more)
+            }
+        }
+    }
+}
+
+fn count_fields(rest: string) -> int64 {
+    case length_bytes(rest) == 0 of {
+        true -> 0;
+        false -> {
+            sep: int64 <- find_field_sep(rest, ",", 0);
+            case sep < 0 of {
+                true -> 1;
+                false -> 1 + count_fields(substring_to_end(rest, sep + 1))
+            }
+        }
+    }
+}
+
+// One field of the C struct at a9 + 32 into its 8-byte slot of the record at a10: the low word as C has
+// it (sign- or zero-extended from a narrow field), the high word the 64-bit field's own or 0.
+fn record_out_field(t: string, c_off: int64, slot: int64) -> string {
+    low_store: string <- ins("s32i", concat("a8, a10, ", itos(slot)));
+    high_zero: string <- concat(ins("movi", "a8, 0"), ins("s32i", concat("a8, a10, ", itos(slot + 4))));
+    size: int64 <- c_size_of_scalar(t);
+    case size == 8 of {
+        true -> {
+            lo: string <- concat(ins("l32i", concat("a8, a9, ", itos(c_off))), low_store);
+            hi: string <- concat(ins("l32i", concat("a8, a9, ", itos(c_off + 4))), ins("s32i", concat("a8, a10, ", itos(slot + 4))));
+            concat(lo, hi)
+        };
+        false -> {
+            load: string <- case size == 4 of {
+                true -> ins("l32i", concat("a8, a9, ", itos(c_off)));
+                false -> case size == 2 of {
+                    true -> case t == "int16" of {
+                        true -> ins("l16si", concat("a8, a9, ", itos(c_off)));
+                        false -> ins("l16ui", concat("a8, a9, ", itos(c_off)))
+                    };
+                    false -> case t == "int8" of {
+                        true -> concat(ins("l8ui", concat("a8, a9, ", itos(c_off))), ins("sext", "a8, a8, 7"));
+                        false -> ins("l8ui", concat("a8, a9, ", itos(c_off)))
+                    }
+                }
+            };
+            concat(load, concat(low_store, high_zero))
+        }
+    }
+}
+
+fn record_out_fields(fields: string, rest: string, slot: int64) -> string {
+    case length_bytes(rest) == 0 of {
+        true -> "";
+        false -> {
+            sep: int64 <- find_field_sep(rest, ",", 0);
+            field: string <- case sep < 0 of { true -> rest; false -> substring(rest, 0, sep) };
+            more: string <- case sep < 0 of { true -> ""; false -> substring_to_end(rest, sep + 1) };
+            one: string <- record_out_field(field_type_of(field), 32 + c_field_offset(fields, field_name_of(field)), slot);
+            concat(one, record_out_fields(fields, more, slot + 8))
+        }
+    }
+}
+
+// X0 = the result as a Silica record: a block of this frame's dynamic part (shape word, then one 8-byte
+// slot a field, prims_record), filled from the C struct at +32 of the call block. The allocation
+// (xt_frame dyn_alloc_asm's sequence: the size in VRG_ARG, silica_rt_dyn_alloc, the block back in
+// VRG_ARG) moves the transient pushes, the call block among them, so the block's base is loaded again
+// after it. The block lives as long as the frame: the pop of the call block that follows leaves it.
+fn emit_record_out(return_type: string, shape: int64) -> string {
+    fields: string <- record_field_text(return_type);
+    block_size: int64 <- align_up(8 + 8 * count_fields(fields), 16);
+    alloc: string <- concat(ins("movi", concat("a8, ", itos(block_size))), concat(xt_vr@tp_load("a9"), concat(ins("s32i", "a8, a9, 136"), ins("call8", "silica_rt_dyn_alloc"))));
+    take: string <- concat(xt_vr@tp_load("a9"), concat(ins("l32i", "a10, a9, 136"), ins("movi", "a11, 0")));
+    shape_word: int64 <- case shape < 0 of { true -> 0; false -> shape };
+    shape_store: string <- concat(ins("movi", concat("a8, ", itos(shape_word))), concat(ins("s32i", "a8, a10, 0"), concat(ins("movi", "a8, 0"), ins("s32i", "a8, a10, 4"))));
+    concat(alloc, concat(take, concat(block_base_load(), concat(shape_store, record_out_fields(fields, fields, 8)))))
+}
+
 fn result_mode(return_type: string, expects_string: boolean) -> (int64, string) {
     case foreign_return_is_aggregate(return_type) of {
         false -> (0, "");
         true -> case expects_string of {
-            false -> (0, "a foreign call returning a record or tuple is supported on this target only as a text result consumed as a string (a tag, name_ptr: uint8, name_len: uint64 record)");
+            false -> {
+                (rsize: int64, rerr: string) <- record_result_layout(return_type);
+                case length_bytes(rerr) > 0 of {
+                    true -> (0, rerr);
+                    false -> case rsize > 16 of {
+                        true -> (2, "");
+                        false -> (1, "")
+                    }
+                }
+            };
             true -> {
                 (size: int64, _: int64, ptr_off: int64, len_off: int64) <- string_result_layout(return_type);
                 case size < 0 or ptr_off < 0 or len_off < 0 of {
@@ -755,7 +880,7 @@ fn result_mode(return_type: string, expects_string: boolean) -> (int64, string) 
 fn foreign_call_body(
     term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
     dest: string,
-    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string }
+    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, sret_shape: int64, outer_reg: string }
 ) -> string {
     expects_string: boolean <- foreign_call_expects_string(term, ctx.return_type, ctx.outer_reg);
     (mode: int64, mode_err: string) <- result_mode(ctx.return_type, expects_string);
@@ -781,7 +906,10 @@ fn foreign_call_body(
                             (_: int64, tag_off: int64, ptr_off: int64, len_off: int64) <- string_result_layout(ctx.return_type);
                             emit_string_out_unmarshal(tag_off, ptr_off, len_off)
                         };
-                        false -> narrow_result_fix(ctx.return_type)
+                        false -> case mode > 0 of {
+                            true -> emit_record_out(ctx.return_type, ctx.sret_shape);
+                            false -> narrow_result_fix(ctx.return_type)
+                        }
                     };
                     pop: string <- xt_vr@vsp_adjust(call_block_bytes());
                     concat(marshal, concat(stage, concat(string_out, concat(pop, emit_result_mov(dest)))))
@@ -794,7 +922,7 @@ fn foreign_call_body(
 fn emit_foreign_user_call(
     term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
     dest: string,
-    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string }
+    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, sret_shape: int64, outer_reg: string }
 ) -> string {
     pre_barrier: string <- emitter_effects@barrier_before_call(ctx.call_effects);
     post_barrier: string <- emitter_effects@barrier_after_call(ctx.call_effects);
@@ -816,8 +944,13 @@ fn emit_foreign_user_call(
 // epilogue (a C result names nothing in this frame).
 fn emit_foreign_tail_call(
     term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
-    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, outer_reg: string },
+    ctx: { call_effects: string, c_symbol: string, param_types: string, return_type: string, arg1_type: string, sret_setup: string, sret_bytes: int64, sret_shape: int64, outer_reg: string },
     fn_effects: string
 ) -> string {
-    concat(emit_foreign_user_call(term, "X0", ctx), control@function_epilogue_with_effects(fn_effects))
+    // A record result is a block of this frame, which this epilogue gives back: such a call is not
+    // lowered in tail position.
+    case foreign_return_is_aggregate(ctx.return_type) and foreign_call_expects_string(term, ctx.return_type, ctx.outer_reg) == false of {
+        true -> error_line("a foreign call returning a record cannot be the tail call of a function on this target: bind its result first");
+        false -> concat(emit_foreign_user_call(term, "X0", ctx), control@function_epilogue_with_effects(fn_effects))
+    }
 }

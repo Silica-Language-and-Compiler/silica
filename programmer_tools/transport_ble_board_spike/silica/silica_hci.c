@@ -14,16 +14,19 @@
    limitations under the License.
 */
 
-/* Stage 4 spike: the Fifi wrapper between a Silica program and ESP-IDF's virtual HCI calls. One
-   command out, one event back, bounded by a timeout. The board's emitter does not yet take a record
+/* Stage 4 spike: the Fifi wrapper between a Silica program and ESP-IDF's virtual HCI calls. The
+   first call starts the Bluetooth controller (no Bluetooth host is built in). One command out, one
+   event back, bounded by a timeout. The board's emitter does not yet take a record
    back from a foreign call (only a scalar, or the text record a string is made from), so the result
    is one integer: the event's length, or -1 error, -2 timeout. Throwaway. */
 
 #include <stdint.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_bt.h"
+#include "nvs_flash.h"
 
 typedef struct { int64_t tag; const uint8_t *text_ptr; uint64_t text_len; int64_t error_code; } silica_hci_bytes;
 
@@ -43,14 +46,31 @@ static int from_controller(uint8_t *data, uint16_t len) {
 
 static esp_vhci_host_callback_t callbacks = { controller_ready, from_controller };
 
+/* The controller, once: its calibration data is kept in NVS. 0 when it is up. */
+static int controller_start(void) {
+    static int started;
+    if (started) return 0;
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        ret = nvs_flash_init();
+    }
+    if (ret != ESP_OK) return -1;
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    if (esp_bt_controller_init(&cfg) != ESP_OK) return -1;
+    if (esp_bt_controller_enable(ESP_BT_MODE_BLE) != ESP_OK) return -1;
+    answered = xSemaphoreCreateBinary();
+    if (answered == NULL) return -1;
+    esp_vhci_host_register_callback(&callbacks);
+    for (int i = 0; i < 50 && !esp_vhci_host_check_send_available(); i++) vTaskDelay(pdMS_TO_TICKS(20));
+    started = 1;
+    return 0;
+}
+
 /* Sends HCI Reset and waits up to timeout_ms for the controller's event; answers its length. */
 int64_t silica_hci_reset(int64_t timeout_ms) {
     static uint8_t reset[] = { 0x01, 0x03, 0x0C, 0x00 };
-    if (answered == NULL) {
-        answered = xSemaphoreCreateBinary();
-        if (answered == NULL) return -1;
-    }
-    esp_vhci_host_register_callback(&callbacks);
+    if (controller_start() != 0) return -1;
     xSemaphoreTake(answered, 0);
     event_len = 0;
     if (!esp_vhci_host_check_send_available()) return -1;

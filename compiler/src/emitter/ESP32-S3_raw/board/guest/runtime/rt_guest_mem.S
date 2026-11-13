@@ -1,5 +1,5 @@
 /*
-   Copyright 2026 COPYRIGHT-HOLDER-PLACEHOLDER (to be decided before this leaves the spike)
+   Copyright 2026 COPYRIGHT-HOLDER-PLACEHOLDER (to be decided before this is merged)
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -14,29 +14,27 @@
    limitations under the License.
 */
 
-// Stage 4 spike: the memory silica_esp32s3.ld lays out for the bare-metal image, as one block of
-// ESP-IDF's .bss (zeroed by ESP-IDF's start-up, as rt_start.S zeroes it). The names and their order
-// are the linker script's: main's auxiliary stack, the heap, main's machine stack. Throwaway.
-
-#define GUEST_AUX_SIZE        0x1000     // main's auxiliary stack (a multiple of 64)
-#define GUEST_HEAP_SIZE       0x18000    // 96 KB
-#define GUEST_MAIN_STACK_SIZE 0x8000     // main's machine stack
-// The machine-stack reserve every emitted prologue keeps above a chunk's guard band. The bare-metal
-// image measures it per program (2768 for a small one); here an interrupt frame can land on whatever
-// stack is running, so it is larger.
-#define GUEST_DEPTH_RESERVE   0x1000
-#define GUEST_FFI_STACK       0x2000     // a foreign call now reaches ESP-IDF code
+// The memory ../../runtime/silica_esp32s3.ld lays out for the bare-metal image, as one block of
+// ESP-IDF's .bss (zeroed by ESP-IDF's start-up): main's auxiliary stack, the heap, main's machine
+// stack, in the linker script's order and under its names. tools/build_image.sh assembles this file
+// for each image with the sizes it chose:
+//   GUEST_HEAP_SIZE        the Silica heap (actors' stacks are chunks of it)
+//   GUEST_MAIN_STACK_SIZE  main's machine stack, GUEST_AUX_SIZE its auxiliary stack: from
+//                          main_stack_bound.py, or the defaults for a main the walk cannot bound
+//   GUEST_DEPTH_RESERVE    what every emitted prologue keeps above a stack's guard band: the deepest
+//                          runtime chain emitted code calls (main_stack_bound.py rt_depth) plus what
+//                          ESP-IDF puts on whatever stack is running when an interrupt or a fault
+//                          arrives (silica_guest_stack_allowance, guest.c)
+//   GUEST_FFI_STACK        the machine stack a foreign call runs on
 
     .global _silica_main_stack_size
     .global _silica_main_aux_size
     .global _silica_rt_depth_reserve
     .global _silica_ffi_stack_size
-    .global _silica_iram_dram_offset
     .set    _silica_main_stack_size, GUEST_MAIN_STACK_SIZE
     .set    _silica_main_aux_size, GUEST_AUX_SIZE
     .set    _silica_rt_depth_reserve, GUEST_DEPTH_RESERVE
     .set    _silica_ffi_stack_size, GUEST_FFI_STACK
-    .set    _silica_iram_dram_offset, 0x6F0000
 
     .section .bss.silica_guest_mem, "aw", @nobits
     .balign 64
@@ -54,15 +52,6 @@ _silica_heap_start:
     .balign 64
 _silica_heap_end:
     .space  GUEST_MAIN_STACK_SIZE
+    .balign 16
 _silica_stack_top:
     .space  64                           // the caller's spill area of the first frame
-
-// The {function address, name} table the linker script collects: empty here, so a failure report
-// names no behaviour.
-    .section .rodata.silica_guest_mem, "a"
-    .balign 4
-    .global _silica_fnames_start
-    .global _silica_fnames_end
-_silica_fnames_start:
-_silica_fnames_end:
-    .word   0

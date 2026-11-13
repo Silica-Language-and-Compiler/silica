@@ -205,7 +205,11 @@ silica_rt_console_fatal_reset:
     s32c1i  a5, a4, 0
     beqz    a5, 2f                     // claimed
     beq     a5, a3, 2f
+#ifdef SILICA_GUEST
+1:  call8   silica_guest_halt          // guest of ESP-IDF: this core's scheduler task stops for good
+#else
 1:  waiti   15                         // the other core owns the end and stalls this one
+#endif
     j       1b
 2:  call8   silica_rt_stall_other_cpu
     movi    a4, silica_rt_console_lock
@@ -461,7 +465,11 @@ silica_rt_halt:
     entry   a1, 32
     call8   silica_rt_flush
     call8   silica_rt_stall_other_cpu
+#ifdef SILICA_GUEST
+1:  call8   silica_guest_halt          // guest of ESP-IDF: this core's scheduler task stops for good
+#else
 1:  waiti   15
+#endif
     j       1b
     .size   silica_rt_halt, . - silica_rt_halt
 

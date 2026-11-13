@@ -188,6 +188,7 @@ silica_rt_ffi_string_out:
     retw
     .size   silica_rt_ffi_string_out, . - silica_rt_ffi_string_out
 
+#ifndef SILICA_GUEST    // a guest of ESP-IDF links ESP-IDF's C library, which has these
 // ---------------------------------------------------------------------------------------------
 // The C memory functions (windowed ABI, as GCC calls them).
 
@@ -279,3 +280,4 @@ strlen:                                 // (s) -> the bytes before the NUL
 2:  sub     a2, a3, a2
     retw
     .size   strlen, . - strlen
+#endif

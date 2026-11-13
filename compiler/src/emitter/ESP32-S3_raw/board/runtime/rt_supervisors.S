@@ -188,11 +188,13 @@ silica_rt_duplicate_child_id_msg:
     .type   silica_rt_now_seconds, @function
 silica_rt_now_seconds:
     entry   a1, 32
+#ifndef SILICA_GUEST    // a guest of ESP-IDF finds the unit running, and the register is ESP-IDF's to update
     movi    a3, SYSTIMER_CONF_REG
     l32i    a4, a3, 0
     movi    a5, SYSTIMER_CLK_EN | SYSTIMER_UNIT0_WORK_EN
     or      a4, a4, a5
     s32i    a4, a3, 0
+#endif
     movi    a3, SYSTIMER_UNIT0_OP_REG
     movi    a4, SYSTIMER_UNIT0_UPDATE
     s32i    a4, a3, 0
@@ -219,11 +221,13 @@ silica_rt_now_seconds:
     .type   silica_rt_now_ticks, @function
 silica_rt_now_ticks:
     entry   a1, 32
+#ifndef SILICA_GUEST    // a guest of ESP-IDF finds the unit running, and the register is ESP-IDF's to update
     movi    a3, SYSTIMER_CONF_REG
     l32i    a4, a3, 0
     movi    a5, SYSTIMER_CLK_EN | SYSTIMER_UNIT0_WORK_EN
     or      a4, a4, a5
     s32i    a4, a3, 0
+#endif
     movi    a3, SYSTIMER_UNIT0_OP_REG
     movi    a4, SYSTIMER_UNIT0_UPDATE
     s32i    a4, a3, 0
