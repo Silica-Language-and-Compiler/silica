@@ -15,7 +15,7 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
   `dangerous_tcp_carrier.silica:24`, `:190-196`); the dialing end gives `"<ip>:4550"` as the remote address
   (example: Mac dials `138.197.209.113:4550`). Plain `"listen:<port>"` still binds 127.0.0.1 only.
   Requests flow both ways over the one connection (plan §5b D1).
-- **Interface binding (stage E2, built 2026-11-12, not yet run in the suite).** Behaviour, all three hosted targets:
+- **Interface binding (stage E2, built 2026-11-12 and pushed; trials run, with the gaps listed at the end of this item).** Behaviour, all three hosted targets:
   no link: `listen:<port>` 127.0.0.1, `listen:any:<port>` 0.0.0.0, `listen:<ipv4>:<port>` that address.
   `(:loopback)`: `listen:<port>` 127.0.0.1, `listen:any` refused, `listen:<ipv4>` only inside 127.0.0.0/8, dials unchanged.
   `(:interface, n)`/`(:ethernet, n)`/`(:wifi, n)`: `listen:<port>` binds that interface's first IPv4 address, `listen:any`
@@ -24,9 +24,9 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
   ends `(:explicit, :bad_address)`. Ethernet/Wi-Fi counting counts only interfaces holding an IPv4 address. The UDP
   carrier still binds nothing. Compile-time E2418 for a spawn plus refused literal in one function. A listener now
   reports `"peer:<ipv4>:<port>"` (getpeername). `ethernet_direct` declared `(:interface, "en0")` with `listen:any`, which
-  is now refused, so it uses `listen:4550`. **Verified:** Mac, loopback only (probe matrix). **Unverified:** the Linux
-  interface classifier, Wi-Fi, non-loopback interfaces, every trial of the suite. **Open:** macOS and glibc differ on
-  IPv4 literals with leading zeros.
+  is now refused, so it uses `listen:4550`. **Verified by runs (all three hosted targets):** loopback and refusal behaviour, `E2418`; macOS classifier only against `lo0`. **Built, not verified:** the Linux
+  interface classifier, Wi-Fi, binding a real non-loopback address, the final regenerated goldens (no confirming run). **Open:** supervisor-restart retry not met by any trial (`spawn_dangerous_carrier` is unsupervised); UDP binds nothing; macOS and glibc differ on
+  IPv4 literals with leading zeros; listener round-2 start order; BEES N1 check. See the plan's E2 status.
 - **No authentication, no encryption, no peer identity.** See the Security note in the plan (§5b) and
   `examples/transport_pairs/README.md`.
 
@@ -34,9 +34,9 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
 
 | Target | Carriers | Links | IP between machines | Interface binding |
 | --- | --- | --- | --- | --- |
-| apple_silicon_mac | tcp, udp, serial | loopback, interface, ethernet n, wifi n, serial_port | yes: verified (Mac dialed Linux x86-64, 2026-11-10/11) | built E2 (Mac loopback verified) |
-| linux_x86_64 | tcp, udp, serial | same rows as the Mac | yes: verified as the listening end on `manager@aalang.org` | built E2, unverified on Linux |
-| linux_aarch64 | same rows in the tree since 2026-11-11 (pack is identical to x86-64's apart from the header comment) | same | UNKNOWN: pack not built or run on an AArch64 host (pix) | built E2, unbuilt and unrun on AArch64 |
+| apple_silicon_mac | tcp, udp, serial | loopback, interface, ethernet n, wifi n, serial_port | yes: verified (Mac dialed Linux x86-64, 2026-11-10/11) | built E2 (loopback and refusals verified; interface classifier on lo0 only) |
+| linux_x86_64 | tcp, udp, serial | same rows as the Mac | yes: verified as the listening end on `manager@aalang.org` | built E2 (loopback and refusals verified; Linux classifier, Wi-Fi unverified) |
+| linux_aarch64 | same rows in the tree since 2026-11-11 (pack is identical to x86-64's apart from the header comment) | same | UNKNOWN: pack not built or run on an AArch64 host (pix) | built E2 (loopback and refusals verified on pix before the final fixes; classifier, Wi-Fi unverified) |
 | ESP32-S3_raw | serial, uart1, usb_serial_jtag (no tcp/udp) | `(:uart, 1, baud)`, `(:usb_serial_jtag)` | no (no Ethernet or Wi-Fi link; out of scope, links design §8) | n/a |
 | STM32-L476RG_raw | none (`provides_carrier` is false for every tag) | none | no | n/a |
 
@@ -57,6 +57,6 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
 - "The hosted `(:tcp)` carrier connects a Mac and a Linux x86-64 machine by IP: one end writes `listen:any:4550`, the
   other dials `<ip>:4550`. Verified Mac to Linux x86-64."
 - "`(:interface, ...)`, `(:ethernet, n)`, `(:wifi, n)` bind the carrier to that interface's IPv4 address and refuse
-  `listen:any` (E2, built; verified on the Mac over loopback only)."
+  `listen:any` (E2, built; loopback and refusals verified on the three hosted targets; Linux classifier and Wi-Fi not verified)."
 - "The linux_aarch64 pack has the same rows as linux_x86_64 (written 2026-11-11); not yet built or run on pix."
 - Do not write "Linux AArch64 is not done" (stale) or "AArch64 works" (unproven).
