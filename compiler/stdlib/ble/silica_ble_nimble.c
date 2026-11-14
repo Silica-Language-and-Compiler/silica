@@ -45,6 +45,8 @@
                        indications (1) or has stopped (0)
      7 sent            field 0 the connection's handle, field 1 0 when the central confirmed the
                        segment, otherwise NimBLE's code: the segment was not delivered
+     8 written         field 0 the connection's handle: the central wrote a segment, which waits for
+                       silica_nimble_recv. One event for each segment, in the order things happened
 
    Advertising. The advertisement carries the flags and the service's UUID; the scan response carries
    the device's name, "Silica". The UUID text is that of the Mac's wrapper: 4, 8 or 36 characters of
@@ -55,9 +57,10 @@
    the host starts). Two characteristics, as the Mac's wrapper publishes them: the one the central
    writes, with response, at the service's UUID plus 1 in its first group, and the one this end
    indicates on at plus 2. One central at a time: advertising stops when it connects.
-     In:  a write is one segment. It is kept in a queue of eight until silica_nimble_recv takes it; a
-          write that finds the queue full is refused (insufficient resources), so the central sees
-          that segment fail and the others stay in order.
+     In:  a write is one segment. It is kept in a queue of eight until silica_nimble_recv takes it, and
+          a :written event says it is there; a write that finds the queue full (or no room for its
+          event) is refused (insufficient resources), so the central sees that segment fail and the
+          others stay in order.
      Out: silica_nimble_send queues one segment, at most eight. ATT allows one indication at a time, so
           the next goes out when the central has confirmed the one before; each ends in a :sent event.
    The largest segment is the connection's ATT_MTU minus 3 (silica_nimble_mtu), never more than
@@ -102,7 +105,7 @@ _Static_assert(sizeof(silica_nimble_bytes) == 32, "32-byte result");
 typedef struct { uint8_t kind; int32_t field[2]; } radio_event;
 
 enum { EV_SYNCED = 1, EV_RESET = 2, EV_ADV_ENDED = 3, EV_CONNECTED = 4, EV_DISCONNECTED = 5,
-       EV_SUBSCRIBED = 6, EV_SENT = 7 };
+       EV_SUBSCRIBED = 6, EV_SENT = 7, EV_WRITTEN = 8 };
 
 #define SEG_MAX (MYNEWT_VAL(BLE_ATT_PREFERRED_MTU) - 3)
 #define SEGMENTS 8
@@ -164,12 +167,15 @@ static void send_next(void) {
 /* On NimBLE's task: the central wrote one segment. */
 static int on_write(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg) {
     static segment s;                /* NimBLE's task only */
-    (void)conn_handle; (void)attr_handle; (void)arg;
+    (void)attr_handle; (void)arg;
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
     uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
     if (len == 0 || len > SEG_MAX) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    /* only this task fills the two queues, so room seen here is still there below */
+    if (uxQueueSpacesAvailable(rx_queue) == 0 || uxQueueSpacesAvailable(events) == 0) return BLE_ATT_ERR_INSUFFICIENT_RES;
     if (ble_hs_mbuf_to_flat(ctxt->om, s.bytes, SEG_MAX, &s.len) != 0) return BLE_ATT_ERR_UNLIKELY;
-    if (xQueueSend(rx_queue, &s, 0) != pdTRUE) return BLE_ATT_ERR_INSUFFICIENT_RES;
+    xQueueSend(rx_queue, &s, 0);
+    post(EV_WRITTEN, conn_handle, 0);
     return 0;
 }
 
@@ -243,7 +249,7 @@ static void host_task(void *param) {
 silica_nimble_tagged silica_nimble_start(int64_t reserved) {
     (void)reserved;
     if (started) return ok(0);
-    if (events == NULL) events = xQueueCreate(16, sizeof(radio_event));
+    if (events == NULL) events = xQueueCreate(32, sizeof(radio_event));
     if (events == NULL) return fail(8);
     /* The controller keeps its calibration data in NVS. Flashing an image erases NVS, so the first start
        after it calibrates in full and ESP-IDF says so in a warning on the console, which is the

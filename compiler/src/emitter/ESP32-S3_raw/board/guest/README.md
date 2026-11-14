@@ -81,8 +81,10 @@ enough to spill the fault stack's first frame. Programs print what they print in
 - **Memory.** Silica's heap is a fixed block (`GUEST_RAM`, shared by the heap and main's two stacks): 240 KB by
   default, 208 KB for a program whose foreign code calls ESP-IDF's Bluetooth or Wi-Fi, which need memory of
   their own (with the controller and NimBLE advertising, ESP-IDF's heap has 42 KB left beside 208 KB, and
-  37 KB with a central connected to the `(:ble_gatt)` carrier). An actor costs some 10 KB of the block, a
-  dangerous actor some 16 KB, so a radio program has room for about a dozen. The rest of the RAM is ESP-IDF's. Bare metal has about 340 KB. Each of main's stacks is sized from its own bound; one the builder
+  37 KB with a central connected to the `(:ble_gatt)` carrier). An actor costs some 5 to 9 KB of the block.
+  Every actor's stack carries a reserve of the largest frame in the program when that is more than the
+  runtime's 2,800 bytes (the builder prints it), so one function with a very large frame, such as a long
+  sequence that keeps many records, costs every actor memory. The rest of the RAM is ESP-IDF's. Bare metal has about 340 KB. Each of main's stacks is sized from its own bound; one the builder
   cannot bound gets a default (128 KB for the machine stack, 32 KB for the auxiliary stack).
 - **Bluetooth.** `carried_on <name>: (:ble_gatt) (:bluetooth, 0);` is the chip's radio in the peripheral role
   (`compiler/stdlib/dangerous_ble_gatt_board_carrier.silica`, above the radio actor `dangerous_ble_radio` and

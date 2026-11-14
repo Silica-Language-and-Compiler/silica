@@ -1,6 +1,6 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-13. Stages 1 to 7 are closed (§6). The goal, the design and the
+Status: **2026-11-13. Stages 1 to 8 are closed (§6). The goal, the design and the
 vocabulary are decided (§8: Matt Manley).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
@@ -222,11 +222,13 @@ settled (§6, stage 4):
 - **Closes when:** a board program compiles with `carried_on phone: (:ble_gatt) (:bluetooth, 0);` and exchanges a
   segmented frame with a phone, the connection held while a Silica program keeps both cores busy.
 
-### Stage 8. End to end: Mac and board
+### Stage 8. End to end: Mac and board (closed, §6)
 
 - The Mac as central, the board as peripheral: the board sends accelerometer readings, the Mac replies with an LED
   command; both ends Silica. This is also the first run of the Mac carrier's central role against a real peripheral.
-- **Closes when:** the demo runs by script with only the `carried_on` line differing from the USB-Serial-JTAG demo.
+- **Closes when:** the demo runs by script; the board and Mac programs differ from the USB-Serial-JTAG demo's
+  only in the carrier's declaration, its reference type and send call, the `:open` address, and the segment size
+  given to the framing (the link's, from `:link_up`).
 
 ### Stage 9. Central role on the board
 
@@ -696,6 +698,42 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     the middle of a message, so the owner waited for the busy actors' rounds.
   - Fixed on the way: `run_board_advertise.sh` as committed at stage 6 lacked a space in its last line and did
     not run the board; `run_peer.sh` cleared the whole `build` directory, the board scripts' work with it.
+- **Stage 8, 2026-11-14, closed: the end-to-end demo runs by one script on the board's own address, both ends
+  Silica.**
+  - Built, in `programmer_tools/transport_ble_demo`: `dangerous_ble_board_accel_led.silica` (the USB-C demo's
+    board program, `board/apps/silica_33_transport_usb_serial_jtag_etf`, on the `(:ble_gatt)` carrier),
+    `dangerous_ble_mac_led.silica` (the USB-C demo's Mac peer on the hosted carrier as central) and
+    `run_accel_led.sh`, which builds both, flashes and starts the board, starts the Mac's program when the
+    Mac hears the board advertising, and prints both consoles.
+  - Run, `run_accel_led.sh`, status 0:
+    - Board: `link up mtu:253`, `tx credit 8`, `sent 48 bytes`, `led red on`, `link down :closed`, 0.
+    - Mac: `link up mtu:253`, `frame 48 bytes`, `accel x=1 y=-2 z=512 at_ms=1000`, `sent 35 bytes`,
+      `link down :closed`, 0.
+  - What differs from the USB-C demo's two programs: the carrier's declaration, its reference type and send
+    call on the board (`actor_ref` and `cast` for `device_actor_ref` and `cast_device`), the `:open` address,
+    and the mtu given to `wireframe@frame`, which is the link's, read from `:link_up` (decision 5), where the
+    USB-C programs give the kind's (added to the closing condition, Matt Manley, 2026-11-14). At the kind's own mtu of 20 the
+    frame would be three segments, and the USB-C programs send one. The Mac's program also prints `link up`
+    where the USB-C peer prints `serial open`.
+  - The Mac's stale table (stage 7) was cleared by switching its Bluetooth off and on (Matt Manley): on the
+    board's own address the Mac then found both characteristics, and the stage 7 exchange ran to status 0 on
+    both ends with nothing changed for the test.
+  - Fixed in the radio actor, found by this demo:
+    - Order. The actor looked for a written segment before the host's events, so the Mac's reply overtook
+      the event that said the board's own segment was confirmed; the carrier had closed by then and the
+      owner never got its `:tx_credit`. The wrapper now reports each write as an event (8, written) in the
+      one queue, and the actor takes the segment when that event comes, or when the owner's credit does.
+    - Memory. The image builder gives every actor's stack a reserve of the largest frame in the program
+      when that is more than the runtime's 2,800 bytes, and the radio actor's behaviour had a frame of 4,352
+      bytes (4,144 at stage 6). With the notifications and the next state in small functions and
+      `dangerous_nimble` answering scalars (a record costs a frame far more than its fields: passing the
+      values as three records made the frame 6,000 bytes), the frame is 2,432. The stage 7 demo then has 162
+      KB of its 208 KB in use at its end, with 44 KB never touched (196 KB of 206 KB before); the advertising
+      demo of stage 6 has 93 KB in use (155 KB before). Before this fix the stage 7 demo, which had run at
+      its close, ended with `:out_of_memory` once the order fix had added 208 bytes to the frame.
+  - Trials: the three assembly goldens of `transport_ble_board_addition` were regenerated (the radio actor's
+    atoms changed order). `transport_ble_board_addition` and `transport_board_addition` on the guest: 16 of
+    16. The stage 6 and stage 7 demos run to status 0.
 
 ## 7. Facts the design rests on
 

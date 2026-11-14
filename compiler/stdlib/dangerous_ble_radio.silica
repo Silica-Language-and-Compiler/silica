@@ -58,8 +58,9 @@
 //   (:radio, :start_failed, code)     the controller or the host did not start
 //   (:radio, :serve_failed, code)     the service was not published (6: the text is no UUID)
 //
-// No call into the host waits. The actor looks for one segment or one event each 20 ms (1 ms after
-// it found one), so it never holds its core's scheduler.
+// No call into the host waits. The actor looks for one event each 20 ms (1 ms after it found one), so
+// it never holds its core's scheduler. What the host reports reaches the owner in the order it
+// happened; a segment the owner had no credit for is delivered when the credit comes.
 module dangerous_ble_radio;
 
 use dangerous_nimble;
@@ -68,9 +69,10 @@ export initial/0;
 export radio/2;
 
 // phase: 0 not started, 1 started and waiting for the host, 2 the host is ready. central: the central's
-// connection, -1 when there is none. up: the central has subscribed.
-fn initial() -> { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64 } {
-    { owner: actor_ref_of_word(0), phase: 0, service: "", wanted: false, serving: false, up: false, central: 0 - 1, rx_credit: 0 }
+// connection, -1 when there is none. up: the central has subscribed. waiting: segments the central
+// wrote that the owner has given no credit for yet.
+fn initial() -> { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } {
+    { owner: actor_ref_of_word(0), phase: 0, service: "", wanted: false, serving: false, up: false, central: 0 - 1, rx_credit: 0, waiting: 0 }
 }
 
 fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
@@ -78,10 +80,6 @@ fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
         (:ok, v: int64) -> v;
         (:rejected, _why: atom) -> 0 - 1
     }
-}
-
-fn none_res() -> { tag: int64, value: int64, error_code: int64 } {
-    { tag: 2, value: 0, error_code: 0 }
 }
 
 fn msg_kind(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll) -> atom {
@@ -141,9 +139,117 @@ fn msg_count(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertis
     }
 }
 
+// What the owner is told, in small functions so that the behaviour's own frame stays small: the
+// largest frame in a program sets the stack reserve of every actor on the board. Scalars only: a
+// record costs a frame far more than its fields.
+fn tell_start(owner: actor_ref, serve_failed: boolean, serve_code: int64, start_failed: boolean, start_code: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case serve_failed of {
+            true -> cast(owner, (:radio, :serve_failed, serve_code) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case start_failed of {
+            true -> cast(owner, (:radio, :start_failed, start_code) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_host(owner: actor_ref, ready_now: boolean, reset_now: boolean, connected: boolean, f0: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case ready_now of {
+            true -> cast(owner, (:radio, :ready, 0) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case reset_now of {
+            true -> cast(owner, (:radio, :reset, f0) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case connected of {
+            true -> cast(owner, (:radio, :connected, f0) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_up(owner: actor_ref, subscribed: boolean, mtu: int64, sent_now: boolean, f1: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case subscribed of {
+            true -> cast(owner, (:radio, :link_up, mtu) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case sent_now of {
+            true -> cast(owner, (:radio, :sent, f1) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_data(owner: actor_ref, got_rx: boolean, bytes_in: string, sending: boolean, do_send: boolean, send_code: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case got_rx of {
+            true -> cast(owner, (:radio_rx, bytes_in) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case sending of {
+            true -> case do_send and send_code == 0 of {
+                true -> true;
+                false -> cast(owner, (:radio, :send_failed, case do_send of { true -> send_code; false -> 3 }) impl ActorMessage {})
+            };
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_down(owner: actor_ref, disconnected: boolean, f1: int64, do_adv: boolean, adv_code: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case disconnected of {
+            true -> cast(owner, (:radio, :disconnected, f1) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case do_adv of {
+            true -> case adv_code == 0 of {
+                true -> cast(owner, (:radio, :advertising, 0) impl ActorMessage {});
+                false -> cast(owner, (:radio, :advertise_failed, adv_code) impl ActorMessage {})
+            };
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_memory(owner: actor_ref, do_memory: boolean, m0: int64, m1: int64, m2: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case do_memory of {
+            true -> cast(owner, (:radio_memory, m0, m1, m2) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+// The next state, built in two functions for the same reason.
+fn with_host(state: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 }, owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean) -> { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } {
+    { owner: owner, phase: phase, service: service, wanted: wanted, serving: serving, up: state.up, central: state.central, rx_credit: state.rx_credit, waiting: state.waiting }
+}
+
+fn with_link(state: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 }, up: boolean, central: int64, rx_credit: int64, waiting: int64) -> { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } {
+    { owner: state.owner, phase: state.phase, service: state.service, wanted: state.wanted, serving: state.serving, up: up, central: central, rx_credit: rx_credit, waiting: waiting }
+}
+
 // One mailbox message, one pass: the sequence proc[external_danger] is the whole body.
-fn radio(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll, state: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64 }) -> (:no_reply, { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64 }) {
-    sequence proc[external_danger, concurrency, transport]
+fn radio(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll, state: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 }) -> (:no_reply, { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 }) {
+    sequence proc[external_danger, transport]
         kind: atom <- msg_kind(msg);
         serve_now: boolean <- kind == :serve;
         start_now: boolean <- kind == :start and state.phase == 0;
@@ -151,75 +257,47 @@ fn radio(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertise, s
         service: string <- case serve_now or kind == :advertise of { true -> msg_text(msg, state.service); false -> state.service };
         // the heap before the radio takes its share, and whenever the owner asks
         do_memory: boolean <- start_now or (kind == :memory and state.phase != 0);
-        res_m0: { tag: int64, value: int64, error_code: int64 } <- case do_memory of { true -> dangerous_nimble@memory(0); false -> none_res() };
-        res_m1: { tag: int64, value: int64, error_code: int64 } <- case do_memory of { true -> dangerous_nimble@memory(1); false -> none_res() };
-        res_m2: { tag: int64, value: int64, error_code: int64 } <- case do_memory of { true -> dangerous_nimble@memory(2); false -> none_res() };
-        m0_raw: int64 <- res_m0.value;
-        m1_raw: int64 <- res_m1.value;
-        m2_raw: int64 <- res_m2.value;
+        m0_raw: int64 <- case do_memory of { true -> dangerous_nimble@memory_value(0); false -> 0 };
+        m1_raw: int64 <- case do_memory of { true -> dangerous_nimble@memory_value(1); false -> 0 };
+        m2_raw: int64 <- case do_memory of { true -> dangerous_nimble@memory_value(2); false -> 0 };
         m0: int64 <- pure_int(recreate(m0_raw));
         m1: int64 <- pure_int(recreate(m1_raw));
         m2: int64 <- pure_int(recreate(m2_raw));
         // the service goes to the host before it starts
-        res_serve: { tag: int64, value: int64, error_code: int64 } <- case serve_now of {
-            true -> dangerous_nimble@serve(service);
-            false -> none_res()
+        serve_code_raw: int64 <- case serve_now of {
+            true -> dangerous_nimble@serve_error(service);
+            false -> 0
         };
-        serve_tag_raw: int64 <- res_serve.tag;
-        serve_code_raw: int64 <- res_serve.error_code;
-        serve_tag: int64 <- pure_int(recreate(serve_tag_raw));
         serve_code: int64 <- pure_int(recreate(serve_code_raw));
-        served: boolean <- serve_now and serve_tag == 0;
+        served: boolean <- serve_now and serve_code == 0;
         serve_failed: boolean <- serve_now and served == false;
         starting: boolean <- start_now or (served and state.phase == 0);
-        res_start: { tag: int64, value: int64, error_code: int64 } <- case starting of {
-            true -> dangerous_nimble@start();
-            false -> none_res()
+        start_code_raw: int64 <- case starting of {
+            true -> dangerous_nimble@start_error();
+            false -> 0
         };
-        start_tag_raw: int64 <- res_start.tag;
-        start_code_raw: int64 <- res_start.error_code;
-        start_tag: int64 <- pure_int(recreate(start_tag_raw));
         start_code: int64 <- pure_int(recreate(start_code_raw));
-        started: boolean <- starting and start_tag == 0;
+        started: boolean <- starting and start_code == 0;
         start_failed: boolean <- starting and started == false;
 
-        // one segment the central wrote, while the owner takes them; a segment that arrived before
-        // the link went down is still delivered, so this comes before the events
         polling: boolean <- kind == :poll and state.phase != 0;
-        do_rx: boolean <- polling and state.up and state.rx_credit > 0;
-        res_rx: { tag: int64, value: int64, error_code: int64 } <- case do_rx of {
-            true -> dangerous_nimble@recv_bytes(state.central);
-            false -> none_res()
-        };
-        rx_tag_raw: int64 <- res_rx.tag;
-        rx_tag: int64 <- pure_int(recreate(rx_tag_raw));
-        got_rx: boolean <- do_rx and rx_tag == 0;
-        bytes_in: string <- case got_rx of {
-            true -> dangerous_nimble@take(state.central);
-            false -> ""
-        };
 
         // one event from the host
-        do_event: boolean <- polling and got_rx == false;
-        res_event: { tag: int64, value: int64, error_code: int64 } <- case do_event of {
-            true -> dangerous_nimble@event(0);
-            false -> none_res()
+        do_event: boolean <- polling;
+        event_kind_raw: int64 <- case do_event of {
+            true -> dangerous_nimble@event_kind();
+            false -> 0
         };
-        event_tag_raw: int64 <- res_event.tag;
-        event_kind_raw: int64 <- res_event.value;
-        event_tag: int64 <- pure_int(recreate(event_tag_raw));
         event_kind: int64 <- pure_int(recreate(event_kind_raw));
-        got: boolean <- do_event and event_tag == 0;
-        res_f0: { tag: int64, value: int64, error_code: int64 } <- case got of {
-            true -> dangerous_nimble@event_field(0);
-            false -> none_res()
+        got: boolean <- do_event and event_kind > 0;
+        f0_raw: int64 <- case got of {
+            true -> dangerous_nimble@event_value(0);
+            false -> 0
         };
-        res_f1: { tag: int64, value: int64, error_code: int64 } <- case got of {
-            true -> dangerous_nimble@event_field(1);
-            false -> none_res()
+        f1_raw: int64 <- case got of {
+            true -> dangerous_nimble@event_value(1);
+            false -> 0
         };
-        f0_raw: int64 <- res_f0.value;
-        f1_raw: int64 <- res_f1.value;
         f0: int64 <- pure_int(recreate(f0_raw));
         f1: int64 <- pure_int(recreate(f1_raw));
         ready_now: boolean <- got and event_kind == 1;
@@ -230,11 +308,28 @@ fn radio(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertise, s
         disconnected: boolean <- got and event_kind == 5;
         subscribed: boolean <- got and event_kind == 6 and f1 == 1 and f0 == state.central and state.up == false;
         sent_now: boolean <- got and event_kind == 7;
-        res_mtu: { tag: int64, value: int64, error_code: int64 } <- case subscribed of {
-            true -> dangerous_nimble@mtu(f0);
-            false -> none_res()
+        written: boolean <- got and event_kind == 8;
+
+        // one segment the central wrote, when the owner has credit for it: as its :written event comes,
+        // so that what the host reports reaches the owner in the order it happened, or later, when the
+        // credit does
+        credit: int64 <- case kind == :rx_credit of { true -> state.rx_credit + msg_count(msg); false -> state.rx_credit };
+        waiting: int64 <- case written of { true -> state.waiting + 1; false -> state.waiting };
+        do_rx: boolean <- (polling or kind == :rx_credit) and state.up and waiting > 0 and credit > 0;
+        rx_length_raw: int64 <- case do_rx of {
+            true -> dangerous_nimble@recv_length(state.central);
+            false -> 0
         };
-        mtu_raw: int64 <- res_mtu.value;
+        rx_length: int64 <- pure_int(recreate(rx_length_raw));
+        got_rx: boolean <- do_rx and rx_length > 0;
+        bytes_in: string <- case got_rx of {
+            true -> dangerous_nimble@take(state.central);
+            false -> ""
+        };
+        mtu_raw: int64 <- case subscribed of {
+            true -> dangerous_nimble@mtu_value(f0);
+            false -> 0
+        };
         mtu: int64 <- pure_int(recreate(mtu_raw));
         phase_next: int64 <- case started of {
             true -> 1;
@@ -265,94 +360,43 @@ fn radio(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertise, s
         // advertising ended or the central left
         resume: boolean <- ready_now or adv_ended or connect_failed or disconnected;
         do_adv: boolean <- wanted and phase_next == 2 and (kind == :advertise or served or resume);
-        res_adv: { tag: int64, value: int64, error_code: int64 } <- case do_adv of {
-            true -> dangerous_nimble@advertise(service);
-            false -> none_res()
+        adv_code_raw: int64 <- case do_adv of {
+            true -> dangerous_nimble@advertise_error(service);
+            false -> 0
         };
-        adv_tag_raw: int64 <- res_adv.tag;
-        adv_code_raw: int64 <- res_adv.error_code;
-        adv_tag: int64 <- pure_int(recreate(adv_tag_raw));
         adv_code: int64 <- pure_int(recreate(adv_code_raw));
         do_stop: boolean <- (kind == :stop_advertising or dropping) and state.phase == 2;
-        _: { tag: int64, value: int64, error_code: int64 } <- case do_stop of {
-            true -> dangerous_nimble@stop_advertising();
-            false -> none_res()
+        _: int64 <- case do_stop of {
+            true -> dangerous_nimble@stop_advertising_error();
+            false -> 0
         };
         do_drop: boolean <- dropping and state.central >= 0;
-        _: { tag: int64, value: int64, error_code: int64 } <- case do_drop of {
-            true -> dangerous_nimble@drop(state.central);
-            false -> none_res()
+        _: int64 <- case do_drop of {
+            true -> dangerous_nimble@drop_error(state.central);
+            false -> 0
         };
         sending: boolean <- kind == :send;
         do_send: boolean <- sending and state.up;
-        res_send: { tag: int64, value: int64, error_code: int64 } <- case do_send of {
-            true -> dangerous_nimble@send_bytes(state.central, msg_text(msg, ""));
-            false -> none_res()
+        segment: string <- msg_text(msg, "");
+        send_code_raw: int64 <- case do_send of {
+            true -> dangerous_nimble@send_error(state.central, segment);
+            false -> 0
         };
-        send_tag_raw: int64 <- res_send.tag;
-        send_code_raw: int64 <- res_send.error_code;
-        send_tag: int64 <- pure_int(recreate(send_tag_raw));
         send_code: int64 <- pure_int(recreate(send_code_raw));
 
-        _: boolean <- case serve_failed of {
-            true -> cast(owner, (:radio, :serve_failed, serve_code) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case start_failed of {
-            true -> cast(owner, (:radio, :start_failed, start_code) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case got_rx of {
-            true -> cast(owner, (:radio_rx, bytes_in) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case ready_now of {
-            true -> cast(owner, (:radio, :ready, 0) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case reset_now of {
-            true -> cast(owner, (:radio, :reset, f0) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case connected of {
-            true -> cast(owner, (:radio, :connected, f0) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case subscribed of {
-            true -> cast(owner, (:radio, :link_up, mtu) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case sent_now of {
-            true -> cast(owner, (:radio, :sent, f1) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case sending of {
-            true -> case do_send and send_tag == 0 of {
-                true -> true;
-                false -> cast(owner, (:radio, :send_failed, case do_send of { true -> send_code; false -> 3 }) impl ActorMessage {})
-            };
-            false -> true
-        };
-        _: boolean <- case disconnected of {
-            true -> cast(owner, (:radio, :disconnected, f1) impl ActorMessage {});
-            false -> true
-        };
-        _: boolean <- case do_adv of {
-            true -> case adv_tag == 0 of {
-                true -> cast(owner, (:radio, :advertising, 0) impl ActorMessage {});
-                false -> cast(owner, (:radio, :advertise_failed, adv_code) impl ActorMessage {})
-            };
-            false -> true
-        };
-        _: boolean <- case do_memory of {
-            true -> cast(owner, (:radio_memory, m0, m1, m2) impl ActorMessage {});
-            false -> true
-        };
+        _: boolean <- tell_start(owner, serve_failed, serve_code, start_failed, start_code);
+        _: boolean <- tell_host(owner, ready_now, reset_now, connected, f0);
+        _: boolean <- tell_up(owner, subscribed, mtu, sent_now, f1);
+        _: boolean <- tell_data(owner, got_rx, bytes_in, sending, do_send, send_code);
+        _: boolean <- tell_down(owner, disconnected, f1, do_adv, adv_code);
+        _: boolean <- tell_memory(owner, do_memory, m0, m1, m2);
         // an :advertise the host refused is not asked again
-        wanted_next: boolean <- wanted and (do_adv == false or adv_tag == 0);
-        credit_next: int64 <- case kind == :rx_credit of {
-            true -> state.rx_credit + msg_count(msg);
-            false -> case got_rx of { true -> state.rx_credit - 1; false -> state.rx_credit }
+        wanted_next: boolean <- wanted and (do_adv == false or adv_code == 0);
+        credit_next: int64 <- case got_rx of { true -> credit - 1; false -> credit };
+        // a new central starts with nothing waiting; a segment the wrapper no longer has is not waited for
+        waiting_next: int64 <- case connected or (do_rx and got_rx == false) of {
+            true -> 0;
+            false -> case got_rx of { true -> waiting - 1; false -> waiting }
         };
         keep_polling: boolean <- started or (polling and phase_next != 0);
         poll_delay: uint64 <- case got or got_rx of { true -> 1; false -> 20 };
@@ -365,8 +409,10 @@ fn radio(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertise, s
                 end
             };
             false -> true
-        }
+        };
+        host_next: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } <- with_host(state, owner, phase_next, service, wanted_next, serving);
+        next: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } <- with_link(host_next, up_next, link_next, credit_next, waiting_next)
     produces
-        pure (:no_reply, { owner: owner, phase: phase_next, service: service, wanted: wanted_next, serving: serving, up: up_next, central: link_next, rx_credit: credit_next })
+        pure (:no_reply, next)
     end
 }
