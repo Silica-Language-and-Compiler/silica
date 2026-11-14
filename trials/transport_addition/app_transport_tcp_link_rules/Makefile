@@ -11,7 +11,7 @@
 THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 APP_TRIAL_DIR := $(abspath $(THIS_DIR))
 APP_LABEL := app_transport_tcp_link_rules
-APP_EXECUTABLES := dangerous_link_interface_absent dangerous_link_wifi_absent dangerous_link_ethernet_absent dangerous_link_listen_ip dangerous_link_listen_ip_refused_loopback dangerous_link_listen_any_refused_interface dangerous_link_listen_ip_leading_zero dangerous_link_listen_ip_five_parts dangerous_link_dial_ip_leading_zero dangerous_link_listen_ip_leading_zero_loopback
+APP_EXECUTABLES := dangerous_link_refused_supervised_retry dangerous_link_interface_absent dangerous_link_wifi_absent dangerous_link_ethernet_absent dangerous_link_listen_ip dangerous_link_listen_ip_refused_loopback dangerous_link_listen_any_refused_interface dangerous_link_listen_ip_leading_zero dangerous_link_listen_ip_five_parts dangerous_link_dial_ip_leading_zero dangerous_link_listen_ip_leading_zero_loopback
 APP_LINK_OBJECTS := wire_etf.o wireframe.o Carrier.o dangerous_sockets.o dangerous_tcp_carrier.o
 
 FFI_TRIAL_DIR := $(abspath $(THIS_DIR)/../../ffi_addition)

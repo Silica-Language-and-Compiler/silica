@@ -4,7 +4,7 @@ Status: 2026-11-10. E0 done. E1 dropped: work-network restrictions rule out the 
 L0 to L3 (§5a) ran a Silica-to-Silica interchange between this Mac and the remote Linux x86-64 host; they are done.
 **Tunnels dropped the same day (user ruling): stages D0 to D2 (§5b) run that interchange over one direct TCP
 connection, with the Mac dialing `138.197.209.113:4550` and requests flowing both ways. This adds the carrier's
-`"listen:any:<port>"` wildcard listener.** **E2 is BUILT and partly verified (branch `E2-transport-work`, pushed in `b943620c00` and merge `2423f477b4`, 2026-11-12; widened by Lee 2026-11-11 to all three hosted targets, a `"listen:<ipv4>:<port>"` listener form, interface binding, refusal rules and the compile guard `E2418`). What is verified, what is only built and what is open are listed in the E2 status table below.** The rest of the stages below are not started. Companion to `transport_serialization_design.md` (carriers, ETF,
+`"listen:any:<port>"` wildcard listener.** **E2 is BUILT and verified by real runs except the items listed under "Still not verified" (updated 2026-11-14; branch `E2-transport-work`, pushed in `b943620c00` and merge `2423f477b4`, 2026-11-12; widened by Lee 2026-11-11 to all three hosted targets, a `"listen:<ipv4>:<port>"` listener form, interface binding, refusal rules and the compile guard `E2418`). What is verified, what is only built and what is open are listed in the E2 status table below.** The rest of the stages below are not started. Companion to `transport_serialization_design.md` (carriers, ETF,
 wire framing), `transport_links_design.md` (`carried_on`, `(:ethernet, n)`, `(:interface, name)`) and
 `transport_esp32s3_wifi_plan.md` (the serial plan whose demos this one mirrors).
 
@@ -147,21 +147,20 @@ Missing:
     pix and nix ran before the final fixes); goldens regenerated on Mac, pix and nix. Trials: `app_transport_tcp_link_rules`
     (6 programs), three `E2418` compile-defect trials, two `dangerous_carrier_spawn_*` `golden_fail` trials, four
     `silica.link.scout` symbol additions. Verified by runs on all three hosted targets: loopback behaviour, the refusal
-    behaviours and `E2418`; the macOS interface-classifier path only against `lo0`.
-  - **Built, not verified:** the Linux interface classifier and the Wi-Fi family; the Linux branch of
-    `programmer_tools/transport_interface_link/run.sh`; binding to a real non-loopback interface address (every trial
-    uses loopback or a refused address); the final regenerated goldens had no confirming run (Lee's instruction), and the
-    169 rewritten goldens and the wireframe golden (differs from main's) are not reviewed by hand; the x86-64
+    behaviours and `E2418`. (2026-11-13/14: the classifier and real interface binding are now also verified; see "Verified 2026-11-13/14" below.)
+  - **Verified 2026-11-13/14 by real runs (replaces "built, not verified" for these items):**
+    - Interface classifier: a harness calling `link_family_of` from `silica_sockets.c` classified `enp5s0f0` as ethernet and `lo` as none on nix; `eth0` ethernet and `wlan0` wifi on pix; `en0` ethernet and `en1` wifi on the Mac (`en2`-`en7` and `bridge0` also classify ethernet).
+    - `programmer_tools/transport_interface_link/run.sh` passed on the Mac (`lo0`) and on the Linux branch on nix and pix (`lo`).
+    - Real non-loopback TCP binds across the LAN in three directions: nix listens on 192.168.88.211 with a Mac client, pix on .224 with a nix client, the Mac on .250 with a pix client. Bare `listen` under `(:ethernet, 0)` or `(:interface, name)` binds the interface's first IPv4 address; a connect to 127.0.0.1 on that port is refused. Refusals verified: `(:wifi, 0)` with no wifi address (Mac, pix, nix), `(:ethernet, 1)`, an unknown interface, `(:ethernet, 0)` with `listen:127.0.0.1`, an address that is not the link's interface, malformed host `192.168.88.0300` gives `:bad_address`, and `listen:any` under a link is `E2418`.
+    - Real Wi-Fi on pix (`wlan0` connected at 192.168.88.207 beside `eth0` .224 on the same subnet): `(:wifi, 0)` with explicit .207 or bare `listen` binds .207; `(:wifi, 0)` with eth0's address is refused; `(:ethernet, 0)` with .207 is refused and bare `(:ethernet, 0)` still binds eth0; `(:interface, "wlan0")` binds .207; a pix client over `(:wifi, 0)` is seen by the peer as 192.168.88.207 (source-address selection by the link); UDP with a `(:wifi, 0)` receiver on pix and the Mac sending to .207 delivered all 5 numbers; `(:wifi, 1)` is refused. Same-subnet asymmetric routing had no effect (strict `rp_filter` on both interfaces dropped nothing).
+    - UDP example `examples/transport_pairs/ethernet_direct_udp`: run Mac to nix over the LAN with `silica-999916` (Mac) and `silica-999949` (nix); both ends exit 0 and the outputs match `expected/`.
+    - UDP link binding and the strict IPv4 parser verified by trials (`app_transport_udp_link_rules`, the strict-parser programs, the three `E2418` UDP trials). Full hosted trials green on all three hosted targets (35296, 35305, 35305 passed, 0 failed) before the later work; the two suites touched afterwards passed 54/54.
+    - Compiler fixes made during this work: SD-41 (`silica_rt_stack_trim_scratch` in `copy_all` and `evacuate`) and the interner fix (`type_interner_surface_text.silica`, `strip_named_params_work`).
+  - **Still not verified:** the nix host has no wireless hardware (only the `(:wifi, 0)` refusal is verified there); the Mac's Wi-Fi port `en1` was inactive (refusal only); two IPv4 addresses on one interface; a second wired interface so that `(:ethernet, 1)` succeeds; the UDP example over the Internet to aalang.org (it passed Mac to nix over the LAN only). Earlier unreviewed items remain: the 169 rewritten goldens and the wireframe golden (differs from main's) are not reviewed by hand; the x86-64
     `emitter_core` `use_full_param_shadow` change (`n >= 2` for string helpers) regenerated goldens in `string_addition`,
-    `compiler_addition` and `modules_addition` on x86 only (not run on Mac or pix, whose emitters already had it); the
-    ESP32-S3 and Nucleo cross compilers were not rebuilt (`E2418` is gated on the pack serving the link, so they should
-    be unaffected; unchecked).
-  - **Built, trials added, not yet run:** UDP link binding (`silica_sockets_udp_bind_on`, `dangerous_udp_carrier`, the three packs, `E2418` for `(:udp)` in `carried_on_expand.silica`) and the strict IPv4 parser (`ipv4_strict`; `:bad_address` for a malformed peer host, local ip or TCP dial host). Status: built; trials added, run in the next trial pass.
-  - **Open (gaps):** (1) `spawn_dangerous_carrier` expands to a plain unsupervised spawn, so the supervisor restart as
-    retry (specification 16.4.9, links design 6.3) happens only if the program supervises the carrier; the links design
-    test plan ("a supervisor restart is counted") is met by no trial. (2) `dangerous_tcp_listener` round 2 can in principle start before
-    round 1's header lines are written (held in 100 parallel runs); a real fix has the reporter trigger round 2.
-    (3) The three Linux packs do not cover
+    `compiler_addition` and `modules_addition` on x86 only; the ESP32-S3 and Nucleo cross compilers were not rebuilt (`E2418` is gated on the pack serving the link, so they should be unaffected; unchecked).
+  - **Closed gaps (2026-11-13/14):** (1) the supervised retry is met by the trial `trials/transport_addition/app_transport_tcp_link_rules/dangerous_link_refused_supervised_retry` (the supervisor allows 2 restarts, 3 refusals are counted, then the supervisor gives up; 20 identical runs). (2) `dangerous_tcp_listener` round 2 is now started by the failure reporter (the only stdout writer) after it prints `pong 8`; deterministic by construction (100 identical runs).
+  - **Open (gaps):** (3) The three Linux packs do not cover
     `(:sd_blocks)` and `(:flash_region)` on hosted targets (`E2412`), unchanged and not E2.
   - **Trial lesson:** a run that ends on a carrier failure must end on the failure report itself, through the program's
     own failure reporter (`trial_wait_int64` registers its own reporter); otherwise the stdout and stderr banners race.

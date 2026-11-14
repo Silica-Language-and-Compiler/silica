@@ -25,7 +25,7 @@ on a real board with the Silica and Erlang peers). Stage S-D (2026-11-10) ran a 
 sends four ETF readings, each answered by an LED command from a Mac peer that declares its port
 (`(:serial_port, path, 115200)`) or from the Erlang peer behind the serial bridge, and drives the LED each reply names
 (plan §7). **Not done:** the hosted `(:interface, name)`, `(:ethernet, n)` and
-`(:wifi, n)` links are accepted and checked but see E2 below for the binding, which is built (TCP verified in part, UDP built, trials added, run in the next trial pass); all three hosted packs list the hosted links (Mac 2026-11-09, Linux x86-64 2026-11-10, Linux AArch64 ported from x86-64 on 2026-11-11; the AArch64 pack not yet built or run on an AArch64 host), so `(:interface, name)` etc. are accepted but binding is E2 (built 2026-11-12, branch `E2-transport-work`; Linux classifier, Wi-Fi and non-loopback binding unverified; see the plan's E2 status); the Nucleo
+`(:wifi, n)` links are accepted and checked but see E2 below for the binding, which is built and verified by real runs 2026-11-13/14 (TCP and UDP; see the plan's E2 status); all three hosted packs list the hosted links (Mac 2026-11-09, Linux x86-64 2026-11-10, Linux AArch64 ported from x86-64 on 2026-11-11; the AArch64 pack not yet built or run on an AArch64 host), so `(:interface, name)` etc. are accepted but binding is E2 (built 2026-11-12, branch `E2-transport-work`; classifier, LAN binding and real Wi-Fi on pix verified 2026-11-13/14; wireless on nix and the Mac and two addresses on one interface not verified; see the plan's E2 status); the Nucleo
 (phase C); UART2 on the ESP32-S3 (no window yet); E2416 (phase D: nothing reaches it); the supervised form of the
 board bring-up (a device worker cannot be a supervisor child yet). It extends
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below), §6 (carriers),
@@ -202,7 +202,7 @@ form (2026-11-10): the address `"listen:any:<port>"` binds every IPv4 interface 
 `dangerous_sockets@tcp_listen_any`, while `"listen:<port>"` stays loopback-only. It is chosen only by writing it,
 and no `carried_on` link maps to it (the hosted links bind nothing yet); `(:interface, name)` and `(:ethernet, n)`
 will replace it with a bind to one interface's address, and once `(:loopback)` refuses non-loopback addresses as
-above, it must refuse this form too. **Built 2026-11-12 (plan stage E2; TCP verified by runs for loopback, refusals and E2418 on the three hosted targets; the Linux classifier, Wi-Fi and a real non-loopback interface are built, not verified; UDP link binding and the strict IPv4 parser: built; trials added, run in the next trial pass; open: no trial for the supervisor-restart retry below the test plan's "a supervisor restart is counted"):** a further form
+above, it must refuse this form too. **Built 2026-11-12, verified 2026-11-13/14 (plan stage E2; verified by runs on the three hosted targets: loopback, refusals, `E2418`, the classifier, real non-loopback TCP binds across the LAN, real Wi-Fi on pix, the UDP link binding and strict IPv4 parser by trials, the UDP example Mac to nix; the supervisor-restart retry is met by trial `dangerous_link_refused_supervised_retry`; not verified: wireless on nix and the Mac, two IPv4 addresses on one interface, a second wired interface, the UDP example over the Internet):** a further form
 `"listen:<ipv4>:<port>"` binding one given IPv4 address (`dangerous_sockets@tcp_listen_addr`), because today a
 multi-homed host cannot restrict an off-host listener to one network and a declared `(:interface, ...)` does not
 restrict it. Refusal rules: `(:loopback)` refuses `"listen:any:"` and non-loopback `"listen:<ip>"`; a named
@@ -552,7 +552,7 @@ the `TRIAL_TARGET` driver; goldens hand-derived.
   `link_carrier_mismatch` (E2414: `:tcp` on `(:uart, 1, 115200)`), `link_instance_conflict` (E2415: two carriers on
   `(:uart, 1, ...)`), `link_parameter_invalid` (E2417: non-literal baud).
 - `link_interface_absent` (run-time): `(:interface, "nope0")`; asserts the carrier ends with `(:explicit,
-  :link_unavailable)` and that a supervisor restart is counted under the default restart policy.
+  :link_unavailable)` and that a supervisor restart is counted under the default restart policy. (Hosted E2 status 2026-11-14: the restart-counting form is met for the interface-refusal case by `dangerous_link_refused_supervised_retry` in `app_transport_tcp_link_rules`: 2 restarts allowed, 3 refusals counted, then the supervisor gives up.)
 - `link_family_absent` (run-time): `(:wifi, 7)` (and `(:ethernet, 7)`), an instance no host has; asserts the same
   `(:explicit, :link_unavailable)` exit at open (decision 11) and a counted restart.
 - `app_transport_family_link` (success, host-dependent, outside `make integrate` like the serial trial): `(:ethernet,

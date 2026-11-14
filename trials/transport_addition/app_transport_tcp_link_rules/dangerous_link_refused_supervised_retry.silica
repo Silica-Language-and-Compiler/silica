@@ -1,0 +1,207 @@
+// A refused link under a supervisor: the restart policy is the retry (specification §16.4.9,
+// transport_links_design.md §6.3). The carrier of an interface the host does not have, (:interface, "nope0"),
+// refuses :open: the owner is told (:link_down, :fault) and the carrier ends (:explicit, :link_unavailable).
+// spawn_dangerous_carrier is a plain unsupervised spawn, so the program puts the same carrier under a Supervisor
+// of its own: a :dangerous child row whose behaviour is dangerous_tcp_carrier@carrier and whose initial state is
+// the literal the transport pack spells for this link (a dangerous_* function cannot be called outside an
+// external_danger block). The supervisor is :one_for_one with a :permanent child and allows 2 restarts, so the
+// carrier is started 3 times and refuses 3 times; the third death exceeds the limit and the supervisor ends.
+// A restarted carrier is a fresh actor that has not been opened, so main re-opens each replacement (the retry).
+// The failure reporter is the only writer: it counts the owner's 3 (:link_down, :fault) messages, the 3 carrier
+// reports and the supervisor's own report, prints nothing until all seven have arrived and then prints the
+// counts and ends the program, so stdout and stderr cannot race.
+module dangerous_link_refused_supervised_retry;
+
+use Supervisor;
+use dangerous_sockets;
+use dangerous_tcp_carrier;
+
+impl RefusedLinkSup for Supervisor;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(msg: string, state: { faults: int64, carriers: int64, sup: int64 }) -> (:no_reply, { faults: int64, carriers: int64, sup: int64 }) {
+    sequence proc[concurrency, device_io]
+        is_fault: boolean <- msg == "link_down:fault";
+        is_sup: boolean <- report_is_from_root_supervisor(msg);
+        is_carrier: boolean <- contains(msg, "(:explicit, :link_unavailable)");
+        faults: int64 <- case is_fault of { true -> state.faults + 1; false -> state.faults };
+        sup: int64 <- case is_sup of { true -> state.sup + 1; false -> state.sup };
+        carriers: int64 <- case is_carrier of { true -> state.carriers + 1; false -> state.carriers };
+        _: boolean <- case faults + carriers + sup == 7 of {
+            true -> {
+                _: atom <- print("link_down fault messages: ");
+                _: atom <- print_int64(faults);
+                _: atom <- println("");
+                _: atom <- print("carrier link_unavailable reports: ");
+                _: atom <- print_int64(carriers);
+                _: atom <- println("");
+                _: atom <- print("supervisor gave up: ");
+                _: atom <- print_int64(sup);
+                _: atom <- println("");
+                cast_exit(0)
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, { faults: faults, carriers: carriers, sup: sup })
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { reporter: actor_ref })
+    -> (:no_reply, { reporter: actor_ref }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, state);
+        (:accepted, _conn: dangerous_actor_ref, _peer: string) -> (:no_reply, state);
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n2: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> {
+            sequence proc[concurrency]
+                _: boolean <- case why2 of {
+                    :fault -> cast(state.reporter, "link_down:fault" impl ActorMessage {});
+                    _: atom -> cast_exit(2)
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+fn init(_initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string },
+            behavior: fn(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous, state_policy: state_policy
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+            strategy: :one_for_one | :one_for_all | :rest_for_one,
+            allowed_restart_count: int64,
+            restarts_time_frame: int64
+        } <- { strategy: :one_for_one, allowed_restart_count: 2, restarts_time_frame: 60 };
+        children: List[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string },
+                behavior: fn(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous, state_policy: state_policy
+            },
+            mem(normal)
+        ] <- [
+            {
+                id: :dangerous_refused_carrier,
+                agent_type: :worker,
+                initial_state: { owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "interface:nope0" },
+                behavior: dangerous_tcp_carrier@carrier,
+                restart: :permanent,
+                shutdown: 0,
+                flavor: :dangerous, state_policy: state_policy(:keep_state_area)
+            }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn current_child_ref(sup: supervisor_ref) -> actor_ref {
+    sequence
+        g: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, { op: :get_child, id: :dangerous_refused_carrier } impl SupervisorMessage {})
+    produces
+        pure g.child
+    end
+}
+
+// Polls the supervisor until it hands back a child other than `original` (identities are never reused).
+// Bounded, so a missed restart ends the trial with the original reference instead of hanging.
+fn child_after_restart(sup: supervisor_ref, original: actor_ref, tries_left: int64) -> actor_ref {
+    sequence
+        current: actor_ref <- current_child_ref(sup);
+        replacement: actor_ref <- case actor_ref_not_equal(current, original) of {
+            true -> current;
+            false -> case tries_left <= 0 of {
+                true -> current;
+                false -> child_after_restart(sup, original, tries_left - 1)
+            }
+        }
+    produces
+        pure replacement
+    end
+}
+
+// Opens `child` and, while retries remain, waits for the supervisor's replacement and opens that.
+fn open_and_retry(sup: supervisor_ref, own: actor_ref, child: actor_ref, retries: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- cast(child, (:open, own, "listen:0") impl ActorMessage {});
+        ok: boolean <- case retries <= 0 of {
+            true -> true;
+            false -> open_and_retry(sup, own, child_after_restart(sup, child, 1000000), retries - 1)
+        }
+    produces
+        pure ok
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn({ faults: 0, carriers: 0, sup: 0 }, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        own: actor_ref <- spawn({ reporter: rep }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        sup: supervisor_ref <- spawn_registered_supervisor(
+            RefusedLinkSup,
+            0,
+            :refused_link_sup, stack_policy(0, :keep_last_message), state_policy(:keep_state_area)
+        );
+        first: actor_ref <- current_child_ref(sup);
+        _: boolean <- open_and_retry(sup, own, first, 2);
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
