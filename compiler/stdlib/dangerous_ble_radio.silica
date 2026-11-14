@@ -1,0 +1,231 @@
+{-
+
+   Copyright 2026 COPYRIGHT-HOLDER-PLACEHOLDER (to be decided before this is merged)
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The radio actor of transport_ble_plan.md §2.2, as far as advertising (stage 6): the one actor that
+// owns the Bluetooth host on the ESP32-S3 (NimBLE, through dangerous_nimble). Every request to the
+// host is a cast to it, and everything the host reports reaches the owner as a message.
+//
+//   (:start, owner)        starts the controller and the host; the owner gets what follows, first a
+//                          (:radio_memory, ...) taken before the radio has any memory
+//   (:advertise, service)  advertises the service whose UUID is the text ("" for the Nordic UART
+//                          Service), now or as soon as the host is ready, and again after a central
+//                          that connected has left
+//   :stop_advertising
+//   :memory                the owner gets (:radio_memory, free, least_free, largest_block): ESP-IDF's
+//                          internal heap in bytes. Ignored before :start: there is no owner yet
+//
+// The owner gets (:radio, what, n):
+//   (:radio, :ready, 0)               the host is ready
+//   (:radio, :advertising, 0)         advertising has started
+//   (:radio, :advertise_failed, code) the wrapper's error code (6: the text is no UUID)
+//   (:radio, :connected, handle)      a central connected; advertising has stopped
+//   (:radio, :disconnected, handle)   it left
+//   (:radio, :reset, reason)          the host lost the controller; :ready follows when it is back
+//   (:radio, :start_failed, code)     the controller or the host did not start
+//
+// No call into the host waits. The actor looks for one event each 20 ms (1 ms after it found one), so
+// it never holds its core's scheduler.
+module dangerous_ble_radio;
+
+use dangerous_nimble;
+
+export initial/0;
+export radio/2;
+
+// phase: 0 not started, 1 started and waiting for the host, 2 the host is ready.
+fn initial() -> { owner: actor_ref, phase: int64, service: string, wanted: boolean } {
+    { owner: actor_ref_of_word(0), phase: 0, service: "", wanted: false }
+}
+
+fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
+    case r of {
+        (:ok, v: int64) -> v;
+        (:rejected, _why: atom) -> 0 - 1
+    }
+}
+
+fn none_res() -> { tag: int64, value: int64, error_code: int64 } {
+    { tag: 2, value: 0, error_code: 0 }
+}
+
+fn msg_kind(msg: (:start, actor_ref) | (:advertise, string) | :stop_advertising | :memory | :poll) -> atom {
+    case msg of {
+        (:start, _o: actor_ref) -> :start;
+        (:advertise, _s: string) -> :advertise;
+        :stop_advertising -> :stop_advertising;
+        :memory -> :memory;
+        :poll -> :poll
+    }
+}
+
+fn msg_owner(msg: (:start, actor_ref) | (:advertise, string) | :stop_advertising | :memory | :poll, fallback: actor_ref) -> actor_ref {
+    case msg of {
+        (:start, o: actor_ref) -> o;
+        (:advertise, _s: string) -> fallback;
+        :stop_advertising -> fallback;
+        :memory -> fallback;
+        :poll -> fallback
+    }
+}
+
+fn msg_text(msg: (:start, actor_ref) | (:advertise, string) | :stop_advertising | :memory | :poll, fallback: string) -> string {
+    case msg of {
+        (:start, _o: actor_ref) -> fallback;
+        (:advertise, s: string) -> s;
+        :stop_advertising -> fallback;
+        :memory -> fallback;
+        :poll -> fallback
+    }
+}
+
+// One mailbox message, one pass: the sequence proc[external_danger] is the whole body.
+fn radio(msg: (:start, actor_ref) | (:advertise, string) | :stop_advertising | :memory | :poll, state: { owner: actor_ref, phase: int64, service: string, wanted: boolean }) -> (:no_reply, { owner: actor_ref, phase: int64, service: string, wanted: boolean }) {
+    sequence proc[external_danger, concurrency, transport]
+        kind: atom <- msg_kind(msg);
+        starting: boolean <- kind == :start and state.phase == 0;
+        owner: actor_ref <- case starting of { true -> msg_owner(msg, state.owner); false -> state.owner };
+        service: string <- msg_text(msg, state.service);
+        // the heap before the radio takes its share, and whenever the owner asks
+        do_memory: boolean <- starting or (kind == :memory and state.phase != 0);
+        res_m0: { tag: int64, value: int64, error_code: int64 } <- case do_memory of { true -> dangerous_nimble@memory(0); false -> none_res() };
+        res_m1: { tag: int64, value: int64, error_code: int64 } <- case do_memory of { true -> dangerous_nimble@memory(1); false -> none_res() };
+        res_m2: { tag: int64, value: int64, error_code: int64 } <- case do_memory of { true -> dangerous_nimble@memory(2); false -> none_res() };
+        m0_raw: int64 <- res_m0.value;
+        m1_raw: int64 <- res_m1.value;
+        m2_raw: int64 <- res_m2.value;
+        m0: int64 <- pure_int(recreate(m0_raw));
+        m1: int64 <- pure_int(recreate(m1_raw));
+        m2: int64 <- pure_int(recreate(m2_raw));
+        res_start: { tag: int64, value: int64, error_code: int64 } <- case starting of {
+            true -> dangerous_nimble@start();
+            false -> none_res()
+        };
+        start_tag_raw: int64 <- res_start.tag;
+        start_code_raw: int64 <- res_start.error_code;
+        start_tag: int64 <- pure_int(recreate(start_tag_raw));
+        start_code: int64 <- pure_int(recreate(start_code_raw));
+        started: boolean <- starting and start_tag == 0;
+        start_failed: boolean <- starting and started == false;
+
+        // one event from the host
+        polling: boolean <- kind == :poll and state.phase != 0;
+        res_event: { tag: int64, value: int64, error_code: int64 } <- case polling of {
+            true -> dangerous_nimble@event(0);
+            false -> none_res()
+        };
+        event_tag_raw: int64 <- res_event.tag;
+        event_kind_raw: int64 <- res_event.value;
+        event_tag: int64 <- pure_int(recreate(event_tag_raw));
+        event_kind: int64 <- pure_int(recreate(event_kind_raw));
+        got: boolean <- polling and event_tag == 0;
+        res_f0: { tag: int64, value: int64, error_code: int64 } <- case got of {
+            true -> dangerous_nimble@event_field(0);
+            false -> none_res()
+        };
+        res_f1: { tag: int64, value: int64, error_code: int64 } <- case got of {
+            true -> dangerous_nimble@event_field(1);
+            false -> none_res()
+        };
+        f0_raw: int64 <- res_f0.value;
+        f1_raw: int64 <- res_f1.value;
+        f0: int64 <- pure_int(recreate(f0_raw));
+        f1: int64 <- pure_int(recreate(f1_raw));
+        ready_now: boolean <- got and event_kind == 1;
+        reset_now: boolean <- got and event_kind == 2;
+        adv_ended: boolean <- got and event_kind == 3;
+        connected: boolean <- got and event_kind == 4 and f1 == 0;
+        connect_failed: boolean <- got and event_kind == 4 and f1 != 0;
+        disconnected: boolean <- got and event_kind == 5;
+        phase_next: int64 <- case started of {
+            true -> 1;
+            false -> case ready_now of {
+                true -> 2;
+                false -> case reset_now of { true -> 1; false -> state.phase }
+            }
+        };
+        wanted: boolean <- case kind == :advertise of {
+            true -> true;
+            false -> case kind == :stop_advertising of { true -> false; false -> state.wanted }
+        };
+
+        // advertise: when asked and the host is ready, when it becomes ready, and again when
+        // advertising ended or the central left
+        resume: boolean <- ready_now or adv_ended or connect_failed or disconnected;
+        do_adv: boolean <- wanted and phase_next == 2 and (kind == :advertise or resume);
+        res_adv: { tag: int64, value: int64, error_code: int64 } <- case do_adv of {
+            true -> dangerous_nimble@advertise(service);
+            false -> none_res()
+        };
+        adv_tag_raw: int64 <- res_adv.tag;
+        adv_code_raw: int64 <- res_adv.error_code;
+        adv_tag: int64 <- pure_int(recreate(adv_tag_raw));
+        adv_code: int64 <- pure_int(recreate(adv_code_raw));
+        do_stop: boolean <- kind == :stop_advertising and state.phase == 2;
+        _: { tag: int64, value: int64, error_code: int64 } <- case do_stop of {
+            true -> dangerous_nimble@stop_advertising();
+            false -> none_res()
+        };
+
+        _: boolean <- case start_failed of {
+            true -> cast(owner, (:radio, :start_failed, start_code) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case ready_now of {
+            true -> cast(owner, (:radio, :ready, 0) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case reset_now of {
+            true -> cast(owner, (:radio, :reset, f0) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case connected of {
+            true -> cast(owner, (:radio, :connected, f0) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case disconnected of {
+            true -> cast(owner, (:radio, :disconnected, f0) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case do_adv of {
+            true -> case adv_tag == 0 of {
+                true -> cast(owner, (:radio, :advertising, 0) impl ActorMessage {});
+                false -> cast(owner, (:radio, :advertise_failed, adv_code) impl ActorMessage {})
+            };
+            false -> true
+        };
+        _: boolean <- case do_memory of {
+            true -> cast(owner, (:radio_memory, m0, m1, m2) impl ActorMessage {});
+            false -> true
+        };
+        // an :advertise the host refused is not asked again
+        wanted_next: boolean <- wanted and (do_adv == false or adv_tag == 0);
+        keep_polling: boolean <- started or (polling and phase_next != 0);
+        poll_delay: uint64 <- case got of { true -> 1; false -> 20 };
+        _: boolean <- case keep_polling of {
+            true -> {
+                sequence proc[concurrency]
+                    _: timer_ref <- send_after(poll_delay, self(), :poll impl ActorMessage {})
+                produces
+                    pure true
+                end
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, { owner: owner, phase: phase_next, service: service, wanted: wanted_next })
+    end
+}

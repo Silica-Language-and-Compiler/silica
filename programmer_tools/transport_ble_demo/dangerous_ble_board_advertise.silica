@@ -1,0 +1,135 @@
+{-
+
+   Copyright 2026 COPYRIGHT-HOLDER-PLACEHOLDER (to be decided before this is merged)
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The board end of the Bluetooth demo, as far as advertising (transport_ble_plan.md stage 6): a Silica
+// program on the ESP32-S3, a guest of ESP-IDF, starts the radio actor (dangerous_ble_radio, NimBLE)
+// and advertises the service while four actors keep both cores busy. A phone's scanner shows a device
+// named "Silica" offering the service. Every five seconds the program prints how far the busy actors
+// have got and what ESP-IDF's internal heap has left (report 0 is taken before the radio starts);
+// after `reports()` reports it exits 0. Run it through run_board_advertise.sh, which puts the service
+// and the number of reports in place of the two functions below.
+module dangerous_ble_board_advertise;
+
+use dangerous_ble_radio;
+use trial_wait_int64;
+
+fn service() -> string { "" }
+
+fn reports() -> int64 { 6 }
+
+// A busy actor: each message is a long computation, and the next message is already in its mailbox
+// when it ends, so its core's scheduler never goes idle.
+fn churn(n: int64, acc: int64) -> int64 {
+    case n == 0 of {
+        true -> acc;
+        false -> churn(n - 1, (acc * 31 + n) % 1000003)
+    }
+}
+
+fn busy(msg: actor_ref, rounds: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: int64 <- churn(100000, rounds);
+        _: boolean <- case rounds % 10 == 9 of {
+            true -> cast(msg, (:rounds, 10) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- cast(self(), msg impl ActorMessage {})
+    produces
+        pure (:no_reply, rounds + 1)
+    end
+}
+
+fn owner(msg: (:begin, dangerous_actor_ref) | :tick | (:rounds, int64) | (:radio, atom, int64) | (:radio_memory, int64, int64, int64), state: { radio: dangerous_actor_ref, rounds: int64, ticks: int64 }) -> (:no_reply, { radio: dangerous_actor_ref, rounds: int64, ticks: int64 }) {
+    case msg of {
+        (:begin, r: dangerous_actor_ref) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(r, (:start, self()) impl ActorMessage {});
+                _: boolean <- cast(r, (:advertise, service()) impl ActorMessage {});
+                _: timer_ref <- send_after(5000, self(), :tick impl ActorMessage {})
+            produces
+                pure (:no_reply, { radio: r, rounds: 0, ticks: 0 })
+            end
+        };
+        :tick -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.radio, :memory impl ActorMessage {});
+                _: timer_ref <- send_after(5000, self(), :tick impl ActorMessage {})
+            produces
+                pure (:no_reply, { radio: state.radio, rounds: state.rounds, ticks: state.ticks + 1 })
+            end
+        };
+        (:rounds, n: int64) -> (:no_reply, { radio: state.radio, rounds: state.rounds + n, ticks: state.ticks });
+        (:radio, what: atom, n: int64) -> {
+            sequence proc[device_io]
+                _: atom <- print("radio ");
+                _: atom <- print_atom(what);
+                _: atom <- print(" ");
+                _: atom <- print_int64(n);
+                _: atom <- println("")
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:radio_memory, free: int64, least: int64, largest: int64) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("report ");
+                _: atom <- print_int64(state.ticks);
+                _: atom <- print(": busy rounds ");
+                _: atom <- print_int64(state.rounds);
+                _: atom <- print(", ESP-IDF heap free ");
+                _: atom <- print_int64(free);
+                _: atom <- print(" least ");
+                _: atom <- print_int64(least);
+                _: atom <- print(" largest block ");
+                _: atom <- print_int64(largest);
+                _: atom <- println("");
+                _: boolean <- case state.ticks >= reports() of {
+                    true -> cast_exit(0);
+                    false -> true
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                r: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), phase: 0, service: "", wanted: false }, dangerous_ble_radio@radio, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- spawn({ radio: r, rounds: 0, ticks: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                b1: actor_ref <- spawn(0, busy, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                b2: actor_ref <- spawn(0, busy, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                b3: actor_ref <- spawn(0, busy, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                b4: actor_ref <- spawn(0, busy, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(b1, me impl ActorMessage {});
+                _: boolean <- cast(b2, me impl ActorMessage {});
+                _: boolean <- cast(b3, me impl ActorMessage {});
+                _: boolean <- cast(b4, me impl ActorMessage {});
+                _: boolean <- cast(me, (:begin, r) impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

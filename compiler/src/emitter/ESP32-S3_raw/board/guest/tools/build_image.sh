@@ -41,8 +41,9 @@
 # Silica's memory is one block of GUEST_RAM bytes: main's two stacks, sized per image, and the heap,
 # which gets the rest, as on bare metal the stack sizes move only the heap's end. The rest of the
 # chip's RAM is ESP-IDF's (about 350 KB in all before a program is added, of which some 260 KB can
-# hold a program's static data such as this block, less some 32 KB when the Bluetooth controller is
-# linked in; the controller takes some 35 KB more from ESP-IDF's heap when it starts).
+# hold a program's static data such as this block, less some 59 KB when the Bluetooth controller and
+# NimBLE are linked in; the two take some 67 KB more from ESP-IDF's heap when they start, which
+# leaves it 43 KB beside a block of 208 KB: transport_ble_plan.md §6, stage 6).
 #
 # Environment: IDF_PATH (default ~/esp/esp-idf-v6.2), XTENSA_BIN, ESPTOOL, BOARD_PYTHON as for the
 # bare-metal builder; GUEST_RAM (bytes) Silica's block, by default 245760 (240 KB), or 212992 (208 KB)

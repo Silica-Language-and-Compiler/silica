@@ -1,6 +1,6 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-12. Stages 1 to 5 are closed (§6). The goal, the design and the
+Status: **2026-11-13. Stages 1 to 6 are closed (§6). The goal, the design and the
 vocabulary are decided (§8: Matt Manley).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
@@ -200,7 +200,7 @@ settled (§6, stage 4):
   actor; the bare-metal trials those changes touch still pass on `ESP32-S3_raw`. The whole board tree is run on
   both runtimes once, before the branch merges.
 
-### Stage 6. NimBLE behind a wrapper; the board advertises
+### Stage 6. NimBLE behind a wrapper; the board advertises (closed, §6)
 
 - The guest's ESP-IDF application built with NimBLE; what NimBLE and the controller cost in RAM, and the size of
   Silica's block beside them.
@@ -571,6 +571,64 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Found, not fixed: main running out of auxiliary stack on the guest hangs without a report.
   - Found, not fixed: on the Mac a 16-byte record returned by a foreign call reads back as 0. The new trial
     uses the 24-byte record only.
+- **Stage 6, 2026-11-13, closed: the board advertises the service from a Silica program while both cores are
+  busy; a phone's scanner and the Mac show it throughout; the memory is measured for Bluetooth and for both
+  radios.**
+  - The closing run: `run_board_advertise.sh --seconds 600`, with a phone's scanner and `find_service.sh ""
+    540` on the Mac. The phone showed "Silica" offering the Nordic UART Service and went on showing it (Matt
+    Manley). The phone connected and left twice in the first minute; the board printed `radio :connected 1`,
+    `radio :disconnected 1` and `radio :advertising 0` each time. The Mac heard the service in 106 of 108
+    five-second windows, 5 to 24 advertisements in each; the two silent windows are in the first twenty seconds,
+    about when the phone was first connected (the board does not advertise while a central is connected;
+    the times were not matched exactly). ESP-IDF's heap stayed at 43 KB free from the first report
+    to the last, the least 43,304 bytes, the connections included.
+  - Found in that run: with the four busy actors a five-second report comes some 5.7 s after the last, so
+    the program had made 111 of its 120 reports when the driver's limit of 630 s ended the run. Nothing
+    failed on the board. `run_board_advertise.sh` now allows a quarter more time. Why a timer's message
+    waits some 0.7 s behind the busy actors is not looked into; a round of a busy actor takes about half a
+    second.
+  - Built: NimBLE in the guest's ESP-IDF application (`sdkconfig.defaults`: both roles, four connections, no
+    pairing or encryption); the wrapper `compiler/stdlib/ble/silica_ble_nimble.c` and its
+    `silica_ble_nimble_wrapper.meta`; `compiler/stdlib/dangerous_nimble.silica` (the bindings) and
+    `dangerous_ble_radio.silica` (the radio actor); in `programmer_tools/transport_ble_demo`,
+    `dangerous_ble_board_advertise.silica` with `run_board_advertise.sh` (the board) and `find_service.m`
+    with `find_service.sh` (the Mac's scan for the service).
+  - The wrapper never waits for the radio. A request answers at once; what NimBLE reports later (ready,
+    reset, advertising ended, connected, disconnected) is put in a FreeRTOS queue by NimBLE's task and taken
+    out by the radio actor, which looks for one event each 20 ms. The advertisement carries the flags and
+    the service's UUID, the scan response the name "Silica". Advertising is connectable; after a central
+    that connected has left, the radio actor advertises again.
+  - Run: `run_board_advertise.sh --seconds 120` with `find_service.sh "" 100` on the Mac. The board printed
+    `radio :ready 0`, `radio :advertising 0` and 24 reports, four busy actors on the two cores completing
+    1020 rounds of 100,000 steps, and exited 0. The Mac heard "Silica" in 20 of 20 five-second windows, 4 to
+    22 advertisements in each. The stage 4 HCI program still answers `hci reset length=7
+    event=040E0405030C00` on this configuration.
+  - Memory, Bluetooth alone (Silica's block 208 KB, the demo's image):
+    - Static, against an image with no radio: 59 KB (code kept in RAM 30 KB, data 4 KB, zeroed data 25 KB).
+    - ESP-IDF's internal heap: 110 KB free before the radio starts, 43 KB free while advertising, steady for
+      two minutes. The controller and NimBLE take 67 KB when they start.
+    - So the block stays at 208 KB for a radio program: 43 KB is left for connections (stage 7 measures
+      them).
+  - Memory, both radios. Measured in a copy of the board tools outside the tree, with `esp_wifi`,
+    `esp_netif`, `esp_event` and `lwip` added to the application and a copy of the wrapper that also starts
+    Wi-Fi in station mode without connecting. Starting it was needed to see what Wi-Fi takes from the heap;
+    nothing of Wi-Fi is in the tree.
+    - Static, Wi-Fi on top of Bluetooth: 40 KB (code kept in RAM 21 KB, data 4.5 KB, zeroed data 14 KB). A
+      208 KB block no longer links.
+    - Block 176 KB: Wi-Fi starts, then NimBLE fails to start for lack of memory (`BLE_INIT: hci inits
+      failed`).
+    - Block 136 KB: both start and the board advertises. ESP-IDF's heap has 144 KB free before, 29 KB after:
+      Wi-Fi takes 50 KB when it starts, Bluetooth 65 KB. A Wi-Fi connection and traffic take more (its
+      receive buffers are allocated as packets arrive).
+    - So with both radios Silica's block in internal RAM is about 120 to 136 KB, against 208 KB with
+      Bluetooth alone and 240 KB with no radio. A program that needs more heap than that beside both radios
+      needs the heap in PSRAM; Bluetooth alone does not.
+  - The guest suites on the NimBLE configuration, ordinary build: `supervisors_addition`, `timers_addition`,
+    `ffi_addition`, `supervisor_exit_reports_addition`, `scheduler_policy_addition`,
+    `deep_frame_spill_addition`, `transport_board_addition`, `stack_budget_board_addition` and
+    `device_actor_addition`: as at the close of stage 5.
+  - Noted: each flash of an image erases NVS, so the radio calibrates in full at every start and ESP-IDF
+    prints `phy_init: failed to load RF calibration data` on the console before the program's own output.
 
 ## 7. Facts the design rests on
 

@@ -7,7 +7,8 @@ in a FreeRTOS task pinned to its core. The emitted code is the same; only the ru
 differ, and a few places in the shared runtime that are marked `SILICA_GUEST`.
 
 It exists for what needs ESP-IDF's closed libraries, first the Bluetooth controller
-(`compiler/design_documents/transport_ble_plan.md` §2.1). The compiler is not changed and there is one of it:
+(`compiler/design_documents/transport_ble_plan.md` §2.1). The application is configured with the controller
+and NimBLE, ESP-IDF's Bluetooth host; a program that calls neither links neither. The compiler is not changed and there is one of it:
 `binaries/silica-compiler-ESP32-S3_raw`.
 
 ## Layout
@@ -79,7 +80,8 @@ enough to spill the fault stack's first frame. Programs print what they print in
   the Silica runtime: it hands its data to a wrapper call through a FreeRTOS queue.
 - **Memory.** Silica's heap is a fixed block (`GUEST_RAM`, shared by the heap and main's two stacks): 240 KB by
   default, 208 KB for a program whose foreign code calls ESP-IDF's Bluetooth or Wi-Fi, which need memory of
-  their own. The rest of the RAM is ESP-IDF's. Bare metal has about 340 KB. Each of main's stacks is sized from its own bound; one the builder
+  their own (with the controller and NimBLE advertising, ESP-IDF's heap has 43 KB left beside 208 KB). The
+  rest of the RAM is ESP-IDF's. Bare metal has about 340 KB. Each of main's stacks is sized from its own bound; one the builder
   cannot bound gets a default (128 KB for the machine stack, 32 KB for the auxiliary stack).
 - **The wall clock** is not set by the loader (the image is flashed, not loaded): `current_time` answers
   milliseconds since start.
