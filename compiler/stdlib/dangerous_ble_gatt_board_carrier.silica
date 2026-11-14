@@ -16,7 +16,7 @@
 -}
 
 // The (:ble_gatt) carrier of transport_serialization_design.md §6.3 and §6.5 on the ESP32-S3
-// (transport_ble_plan.md stage 7): the connection actor of §2.2, speaking the carrier contract of §6.2
+// (transport_ble_plan.md stages 7 and 9): the connection actor of §2.2, speaking the carrier contract of §6.2
 // to its owner and casting to the radio actor (dangerous_ble_radio), which alone calls the Bluetooth
 // host. The program runs as a guest of ESP-IDF (board/guest) with compiler/stdlib/ble/
 // silica_ble_nimble.c in its image. The carrier is declared on the chip's radio,
@@ -25,26 +25,27 @@
 // (dangerous_ble_gatt_carrier). It calls no foreign code itself, so it is an ordinary actor and the
 // spawn answers an actor_ref, where the hosted carrier is a dangerous_actor_ref:
 //
+//   "central:<uuid>"     scans for a peripheral offering the service, connects and subscribes;
 //   "peripheral:<uuid>"  publishes and advertises the service and waits for a central to subscribe.
-//   "central:<uuid>"     is not provided on the board yet (the plan's stage 9): (:link_down, :fault).
 //
 // <uuid> is the service's UUID in text (4, 8 or 36 characters); nothing after the colon means the
-// Nordic UART Service. :open answers nothing while the carrier waits for its central; when one has
-// subscribed the owner gets (:link_up, "mtu:<n>"), n being the largest segment the link carries (the
-// negotiated ATT_MTU minus 3, at least 20), and 8 send credits.
+// Nordic UART Service. :open answers nothing while the carrier seeks its peer; when the link is up the
+// owner gets (:link_up, "mtu:<n>"), n being the largest segment the link carries (the negotiated ATT_MTU
+// minus 3, at least 20), and 8 send credits.
 //
-// One :tx is one segment, an indication: :tx_credit comes back when the central has confirmed it.
-// A segment longer than the link's mtu is (:tx_failed, :too_long); a :tx while the link is not up,
-// or one the central did not confirm, is (:tx_failed, :link_down). Received segments (the central's
-// writes with response) are delivered as :rx, one per :credit the owner granted.
+// One :tx is one segment: an indication toward a central, a write with response toward a peripheral, so
+// :tx_credit comes back when the peer has taken it. A segment longer than the link's mtu is
+// (:tx_failed, :too_long); a :tx while the link is not up, or one the peer did not confirm, is
+// (:tx_failed, :link_down). Received segments are delivered as :rx, one per :credit the owner granted.
 //
-// (:link_down, reason): :closed after :close or when the central ended the link, :timeout when the
-// link was lost, :fault for an address that names no role the board provides, a UUID that cannot be
-// read, a radio that did not start, or any other failure. After :link_down the carrier can be opened
-// again, with the same service: the host publishes one service for as long as the program runs.
+// (:link_down, reason): :closed after :close or when the peer ended the link, :timeout when the link
+// was lost, :fault for an address that names no role, a UUID that cannot be read, a radio that did not
+// start, a peripheral without the service's characteristics, or any other failure. After :link_down
+// the carrier can be opened again; as a peripheral with the same service, since the host publishes one
+// service for as long as the program runs.
 //
 // The first :open spawns the radio actor under the name :dangerous_ble_radio. One carrier at a time
-// holds the radio: the board serves one central (the plan's stage 9 adds the other roles).
+// holds the radio, and the radio has one link.
 module dangerous_ble_gatt_board_carrier;
 
 use dangerous_ble_radio;
@@ -102,13 +103,13 @@ fn tag_of(n: int64) -> atom {
 
 // Tells the radio actor, spawning it first when this carrier has not done so (a cast to a name that
 // no actor holds ends the sender, so the name is not tried).
-fn to_radio(spawned: boolean, msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll) -> boolean {
+fn to_radio(spawned: boolean, msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:seek, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll) -> boolean {
     sequence proc[concurrency]
         _: boolean <- case spawned of {
             true -> true;
             false -> {
                 sequence proc[concurrency]
-                    _: dangerous_actor_ref <- spawn_dangerous_registered({ owner: actor_ref_of_word(0), phase: 0, service: "", wanted: false, serving: false, up: false, central: 0 - 1, rx_credit: 0, waiting: 0 }, dangerous_ble_radio@radio, :dangerous_ble_radio, stack_policy(0, :keep_last_message), state_policy(:keep_state_area))
+                    _: dangerous_actor_ref <- spawn_dangerous_registered({ owner: actor_ref_of_word(0), phase: 0, service: "", wanted: false, serving: false, seeking: false, up: false, central: 0 - 1, rx_credit: 0, waiting: 0 }, dangerous_ble_radio@radio, :dangerous_ble_radio, stack_policy(0, :keep_last_message), state_policy(:keep_state_area))
                 produces
                     pure true
                 end
@@ -153,12 +154,20 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
                     _: boolean <- to_radio(state.radio, (:serve, me, service));
                     (:no_reply, { owner: o, phase: 1, radio: true })
                 };
-                false -> {
-                    sequence proc[concurrency]
-                        _: boolean <- cast(o, (:link_down, :fault) impl ActorMessage {})
-                    produces
-                        pure (:no_reply, { owner: o, phase: 0, radio: state.radio })
-                    end
+                false -> case starts(address, "central:") of {
+                    true -> {
+                        me: actor_ref <- own_ref();
+                        service: string <- substring(address, 8, length_bytes(address));
+                        _: boolean <- to_radio(state.radio, (:seek, me, service));
+                        (:no_reply, { owner: o, phase: 1, radio: true })
+                    };
+                    false -> {
+                        sequence proc[concurrency]
+                            _: boolean <- cast(o, (:link_down, :fault) impl ActorMessage {})
+                        produces
+                            pure (:no_reply, { owner: o, phase: 0, radio: state.radio })
+                        end
+                    }
                 }
             }
         };
@@ -224,7 +233,7 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
                     false -> true
                 };
                 // the radio did not start or would not publish the service: nothing to drop
-                failed: boolean <- state.phase != 0 and (what == :start_failed or what == :serve_failed or what == :advertise_failed);
+                failed: boolean <- state.phase != 0 and (what == :start_failed or what == :serve_failed or what == :seek_failed or what == :advertise_failed);
                 // the central left, or the host lost the controller, under a link that was up
                 lost: boolean <- state.phase == 2 and (what == :disconnected or what == :reset);
                 _: boolean <- case failed and what == :advertise_failed of {

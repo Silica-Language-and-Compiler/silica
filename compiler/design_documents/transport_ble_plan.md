@@ -1,6 +1,6 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-13. Stages 1 to 8 are closed (§6). The goal, the design and the
+Status: **2026-11-13. Stages 1 to 9 are closed (§6). The goal, the design and the
 vocabulary are decided (§8: Matt Manley).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
@@ -230,7 +230,7 @@ settled (§6, stage 4):
   only in the carrier's declaration, its reference type and send call, the `:open` address, and the segment size
   given to the framing (the link's, from `:link_up`).
 
-### Stage 9. Central role on the board
+### Stage 9. Central role on the board (closed, §6)
 
 - The wrapper's central side: scan, connect, discover the service, subscribe, write.
 - **Closes when:** the board as central and the Mac as peripheral exchange the frame.
@@ -734,6 +734,28 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Trials: the three assembly goldens of `transport_ble_board_addition` were regenerated (the radio actor's
     atoms changed order). `transport_ble_board_addition` and `transport_board_addition` on the guest: 16 of
     16. The stage 6 and stage 7 demos run to status 0.
+- **Stage 9, 2026-11-14, closed: the board as central and the Mac as peripheral exchange the segmented frame.**
+  - Built:
+    - The wrapper's central side (`silica_ble_nimble.c`, `silica_nimble_seek`): an active scan for a peripheral
+      that advertises the service, the connection, the MTU exchange, the service's characteristic to write
+      and the one that indicates found by their properties (as the Mac's wrapper finds them), the
+      subscription, writes with response out, indications in. A peripheral without those is a fault event;
+      a connection that fails, or a peripheral that goes before the link is up, is sought again.
+    - The radio actor's `:seek`, and the carrier's `"central:<uuid>"` address. The rest of the carrier is as
+      it was: the radio actor reports the same events in either role.
+    - `run_board_peer.sh --central`.
+  - Run: `run_peer.sh peripheral` on the Mac, then `run_board_peer.sh --central`. The board found the Mac,
+    the link came up with an mtu of 253, each end sent the 48-byte frame in three 20-byte segments and
+    reassembled and decoded the other's (`accel x=1 y=-2 z=512 at_ms=1000`), and both ended with status 0,
+    the two busy actors running on the board throughout. ESP-IDF's heap with the link up: 37 KB free, as in
+    the peripheral's role. The radio actor's frame is 2,624 bytes, still under the runtime's reserve.
+  - Not covered: an indication that arrives while eight wait untaken is lost (NimBLE confirms it before the
+    wrapper sees it); a peripheral other than the Mac; a peripheral that offers notifications only (the code
+    subscribes to those, untried).
+  - Trials: `transport_ble_board_addition/dangerous_ble_gatt_link_central` now opens as a central for a UUID
+    nothing offers, sends with no link, and closes (it used to show the role refused); the three assembly
+    goldens regenerated. `transport_ble_board_addition` and `transport_board_addition` on the guest: 16 of
+    16. The stage 8 script still runs to status 0 on both ends.
 
 ## 7. Facts the design rests on
 

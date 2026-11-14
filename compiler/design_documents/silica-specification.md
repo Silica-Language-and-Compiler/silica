@@ -10715,8 +10715,8 @@ tag like a protocol tag (§16.4.1). The language names these links:
 `:ble_gatt` and the link `(:bluetooth, n)` are named by the language and checked by the compiler
 (E2408, E2413, E2414, E2417), and have their rows in `Carrier` and `Link`. The Apple Silicon macOS pack
 provides the kind on `(:bluetooth, 0)`, the carrier of §16.4.8; another adapter instance is E2412
-there. The ESP32-S3 pack provides the kind on `(:bluetooth, 0)`, the chip's own radio, in the peripheral
-role (2026-11-14, stage 7 of the same plan), for a program built as a guest of ESP-IDF; its carrier is an
+there. The ESP32-S3 pack provides the kind on `(:bluetooth, 0)`, the chip's own radio, in both roles
+(2026-11-14, stages 7 and 9 of the same plan), for a program built as a guest of ESP-IDF; its carrier is an
 ordinary actor, so `spawn_dangerous_carrier` answers an `actor_ref` there. No other target's pack provides
 the kind, so the declaration is E2410 on them.
 

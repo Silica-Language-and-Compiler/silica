@@ -86,7 +86,7 @@ enough to spill the fault stack's first frame. Programs print what they print in
   runtime's 2,800 bytes (the builder prints it), so one function with a very large frame, such as a long
   sequence that keeps many records, costs every actor memory. The rest of the RAM is ESP-IDF's. Bare metal has about 340 KB. Each of main's stacks is sized from its own bound; one the builder
   cannot bound gets a default (128 KB for the machine stack, 32 KB for the auxiliary stack).
-- **Bluetooth.** `carried_on <name>: (:ble_gatt) (:bluetooth, 0);` is the chip's radio in the peripheral role
+- **Bluetooth.** `carried_on <name>: (:ble_gatt) (:bluetooth, 0);` is the chip's radio, as peripheral or central
   (`compiler/stdlib/dangerous_ble_gatt_board_carrier.silica`, above the radio actor `dangerous_ble_radio` and
   NimBLE). The program lists `dangerous_nimble`, `dangerous_ble_radio` and the carrier in its `silica.config`,
   places `compiler/stdlib/ble/silica_ble_nimble_wrapper.meta` under `dangerous_exposure_source/ble`, and names

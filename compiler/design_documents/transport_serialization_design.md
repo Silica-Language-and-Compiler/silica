@@ -565,7 +565,7 @@ reads are not external-danger-touched, so `decode` may run anywhere the frame re
 | `(:spi2)`, `(:spi3)` | SPI2 (display) and SPI3 (SD card) controllers, both as master | 64 (the controller's data buffer) | `:datagram` | `:reliable_ordered` | SPI2 driver exists (item A) | a carrier only toward an SPI peer that speaks the §5 segment protocol; the display and the SD card are not peers (next row) |
 | `(:sd_blocks)` | SD card on SPI3 | 512 | `:storage` | `:reliable_ordered` | plan item I | a **storage carrier**: `:tx` appends a frame to the block log, `:rx` replays frames from it. `address` is a block range. Logging ETF-encoded readings to the card is the use |
 | `(:i2c0)` | I2C0 (SCL GPIO42, SDA GPIO41) as master | 32 | `:datagram` | `:reliable_ordered` | plan item G | `address` is the 7-bit peer address; the accelerometer (0x1C) is a sensor, not a carrier (§6.6) |
-| `(:ble_gatt)` | see §6.5 | 20 to 244 | `:datagram` | per §6.3 | peripheral role, in a program built as a guest of ESP-IDF (transport_ble_plan.md stage 7) | same tag and contract as on the hosted paths |
+| `(:ble_gatt)` | see §6.5 | 20 to 244 | `:datagram` | per §6.3 | both roles, in a program built as a guest of ESP-IDF (transport_ble_plan.md stages 7 and 9) | same tag and contract as on the hosted paths |
 
 Not carriers: GPIO, LEDC (buzzer), RMT (the 24 addressable LEDs), the display on SPI2, the buttons, the joystick
 and battery analog inputs, the accelerometer. They are sources and sinks of transportable values (§6.6).

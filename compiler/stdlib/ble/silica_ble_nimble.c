@@ -16,7 +16,7 @@
 
 /* The Fifi wrapper around NimBLE, ESP-IDF's Bluetooth host, for a Silica program that runs on the
    ESP32-S3 as a guest of ESP-IDF (transport_ble_plan.md §2.1; stage 6 advertising, stage 7 the
-   peripheral role: one service, one central at a time). It is
+   peripheral role, stage 9 the central role: one service and one link at a time). It is
    compiled into the guest image as ESP-IDF code (board/guest/tools/build_image.sh). One Silica actor,
    the radio actor (dangerous_ble_radio), makes every call here.
 
@@ -45,8 +45,13 @@
                        indications (1) or has stopped (0)
      7 sent            field 0 the connection's handle, field 1 0 when the central confirmed the
                        segment, otherwise NimBLE's code: the segment was not delivered
-     8 written         field 0 the connection's handle: the central wrote a segment, which waits for
-                       silica_nimble_recv. One event for each segment, in the order things happened
+     8 written         field 0 the connection's handle: the peer sent a segment (a central's write, a
+                       peripheral's indication), which waits for silica_nimble_recv. One event for
+                       each segment, in the order things happened
+     9 fault           field 0 the connection's handle, field 1 why the peripheral this end connected
+                       to cannot be used: 1 it does not have the service, 2 the service lacks a
+                       characteristic to write or one that indicates, 3 that one cannot be subscribed
+                       to, otherwise 1000 + NimBLE's code. The connection is being ended
 
    Advertising. The advertisement carries the flags and the service's UUID; the scan response carries
    the device's name, "Silica". The UUID text is that of the Mac's wrapper: 4, 8 or 36 characters of
@@ -64,7 +69,19 @@
      Out: silica_nimble_send queues one segment, at most eight. ATT allows one indication at a time, so
           the next goes out when the central has confirmed the one before; each ends in a :sent event.
    The largest segment is the connection's ATT_MTU minus 3 (silica_nimble_mtu), never more than
-   SEG_MAX, which follows NimBLE's preferred MTU (CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU, 256). */
+   SEG_MAX, which follows NimBLE's preferred MTU (CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU, 256).
+
+   The central role (silica_nimble_seek, once the host is ready). This end scans for a peripheral that
+   advertises the service, connects, exchanges the MTU, finds the service's characteristic to write
+   and the one that indicates (by their properties, as the Mac's wrapper does) and subscribes; the
+   :subscribed event then says the link is up. A connection that fails, or a peripheral that goes
+   before that, is a :connected event with a status or a :disconnected event, and the caller seeks
+   again; a peripheral without the service's characteristics is a :fault event.
+     Out: silica_nimble_send queues one segment; it goes out as a write with response when the one
+          before has been answered, and ends in a :sent event.
+     In:  an indication is one segment, kept in the queue of eight with a :written event. NimBLE
+          confirms an indication before this code sees it, so one that finds the queue full is lost;
+          the peer was told it arrived. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -105,7 +122,7 @@ _Static_assert(sizeof(silica_nimble_bytes) == 32, "32-byte result");
 typedef struct { uint8_t kind; int32_t field[2]; } radio_event;
 
 enum { EV_SYNCED = 1, EV_RESET = 2, EV_ADV_ENDED = 3, EV_CONNECTED = 4, EV_DISCONNECTED = 5,
-       EV_SUBSCRIBED = 6, EV_SENT = 7, EV_WRITTEN = 8 };
+       EV_SUBSCRIBED = 6, EV_SENT = 7, EV_WRITTEN = 8, EV_FAULT = 9 };
 
 #define SEG_MAX (MYNEWT_VAL(BLE_ATT_PREFERRED_MTU) - 3)
 #define SEGMENTS 8
@@ -119,6 +136,12 @@ static radio_event last_event;       /* the event silica_nimble_event answered l
 
 /* The service. `link` and `subscribed` are written by NimBLE's task and read by the radio actor's calls. */
 static int serving;                  /* silica_nimble_serve has named the service */
+static volatile int seeking;         /* scanning for, or connecting to, a peripheral with seek_uuid */
+static ble_uuid_any_t seek_uuid;
+static volatile int central;         /* this end is the central of `link` */
+static uint16_t peer_start, peer_end;        /* the peripheral's service */
+static uint16_t peer_rx, peer_tx, peer_tx_end, peer_cccd;   /* its characteristics' value handles; the indicated one's descriptors */
+static int peer_tx_indicates;
 static ble_uuid_any_t service_uuid, rx_uuid, tx_uuid;
 static uint16_t tx_handle;           /* the indicated characteristic's value handle */
 static volatile uint16_t link = BLE_HS_CONN_HANDLE_NONE;
@@ -153,12 +176,32 @@ static void on_reset(int reason) {
     post(EV_RESET, reason, 0);
 }
 
+static void send_next(void);
+
+/* On NimBLE's task: the peripheral answered this end's write. */
+static int on_written(uint16_t conn_handle, const struct ble_gatt_error *error, struct ble_gatt_attr *attr, void *arg) {
+    (void)attr; (void)arg;
+    xSemaphoreTakeRecursive(tx_lock, portMAX_DELAY);
+    if (tx_in_flight) {
+        tx_in_flight = 0;
+        post(EV_SENT, conn_handle, error->status);
+        send_next();
+    }
+    xSemaphoreGiveRecursive(tx_lock);
+    return 0;
+}
+
 /* With tx_lock held: sends the next waiting segment unless one is in flight. A segment NimBLE refuses
    ends in a :sent event with its code, and the one after it is tried. */
 static void send_next(void) {
     while (!tx_in_flight && link != BLE_HS_CONN_HANDLE_NONE && xQueueReceive(tx_queue, &tx_now, 0) == pdTRUE) {
-        struct os_mbuf *om = ble_hs_mbuf_from_flat(tx_now.bytes, tx_now.len);
-        int rc = om == NULL ? BLE_HS_ENOMEM : ble_gatts_indicate_custom(link, tx_handle, om);
+        int rc;
+        if (central) {
+            rc = ble_gattc_write_flat(link, peer_rx, tx_now.bytes, tx_now.len, on_written, NULL);
+        } else {
+            struct os_mbuf *om = ble_hs_mbuf_from_flat(tx_now.bytes, tx_now.len);
+            rc = om == NULL ? BLE_HS_ENOMEM : ble_gatts_indicate_custom(link, tx_handle, om);
+        }
         if (rc == 0) tx_in_flight = 1;
         else post(EV_SENT, link, rc);
     }
@@ -185,28 +228,144 @@ static int on_tx_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_g
     return BLE_ATT_ERR_UNLIKELY;
 }
 
+/* The central's way to a link, each step on NimBLE's task when the one before has answered. */
+static void give_up(uint16_t conn, int why) {
+    post(EV_FAULT, conn, why);
+    ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+}
+
+static int on_subscribed(uint16_t conn, const struct ble_gatt_error *error, struct ble_gatt_attr *attr, void *arg) {
+    (void)attr; (void)arg;
+    if (error->status != 0) { give_up(conn, 3); return 0; }
+    subscribed = 1;
+    post(EV_SUBSCRIBED, conn, 1);
+    return 0;
+}
+
+static int on_descriptor(uint16_t conn, const struct ble_gatt_error *error, uint16_t chr_val_handle, const struct ble_gatt_dsc *dsc, void *arg) {
+    (void)chr_val_handle; (void)arg;
+    if (error->status == 0) {
+        if (ble_uuid_u16(&dsc->uuid.u) == BLE_GATT_DSC_CLT_CFG_UUID16) peer_cccd = dsc->handle;
+        return 0;
+    }
+    if (error->status == BLE_HS_EDONE && peer_cccd != 0) {
+        uint8_t value[2] = { peer_tx_indicates ? 2 : 1, 0 };
+        int rc = ble_gattc_write_flat(conn, peer_cccd, value, sizeof value, on_subscribed, NULL);
+        if (rc != 0) give_up(conn, 1000 + rc);
+    } else {
+        give_up(conn, 3);
+    }
+    return 0;
+}
+
+static int on_characteristic(uint16_t conn, const struct ble_gatt_error *error, const struct ble_gatt_chr *chr, void *arg) {
+    (void)arg;
+    if (error->status == 0) {
+        if (peer_tx != 0 && peer_tx_end == 0 && chr->def_handle > peer_tx) peer_tx_end = chr->def_handle - 1;
+        if (peer_rx == 0 && (chr->properties & (BLE_GATT_CHR_PROP_WRITE | BLE_GATT_CHR_PROP_WRITE_NO_RSP))) peer_rx = chr->val_handle;
+        if (peer_tx == 0 && (chr->properties & (BLE_GATT_CHR_PROP_INDICATE | BLE_GATT_CHR_PROP_NOTIFY))) {
+            peer_tx = chr->val_handle;
+            peer_tx_indicates = (chr->properties & BLE_GATT_CHR_PROP_INDICATE) != 0;
+        }
+        return 0;
+    }
+    if (error->status == BLE_HS_EDONE && peer_rx != 0 && peer_tx != 0) {
+        if (peer_tx_end == 0) peer_tx_end = peer_end;
+        int rc = ble_gattc_disc_all_dscs(conn, peer_tx, peer_tx_end, on_descriptor, NULL);
+        if (rc != 0) give_up(conn, 1000 + rc);
+    } else {
+        give_up(conn, 2);
+    }
+    return 0;
+}
+
+static int on_service(uint16_t conn, const struct ble_gatt_error *error, const struct ble_gatt_svc *service, void *arg) {
+    (void)arg;
+    if (error->status == 0) {
+        peer_start = service->start_handle;
+        peer_end = service->end_handle;
+        return 0;
+    }
+    if (error->status == BLE_HS_EDONE && peer_start != 0) {
+        int rc = ble_gattc_disc_all_chrs(conn, peer_start, peer_end, on_characteristic, NULL);
+        if (rc != 0) give_up(conn, 1000 + rc);
+    } else {
+        give_up(conn, 1);
+    }
+    return 0;
+}
+
+/* Whatever the exchange answered, the connection has an MTU: the service is looked for next. */
+static int on_mtu(uint16_t conn, const struct ble_gatt_error *error, uint16_t mtu, void *arg) {
+    (void)error; (void)mtu; (void)arg;
+    int rc = ble_gattc_disc_svc_by_uuid(conn, &seek_uuid.u, on_service, NULL);
+    if (rc != 0) give_up(conn, 1000 + rc);
+    return 0;
+}
+
+static int advertises(const struct ble_hs_adv_fields *f, const ble_uuid_any_t *uuid) {
+    for (int i = 0; i < f->num_uuids16; i++) if (ble_uuid_cmp(&f->uuids16[i].u, &uuid->u) == 0) return 1;
+    for (int i = 0; i < f->num_uuids32; i++) if (ble_uuid_cmp(&f->uuids32[i].u, &uuid->u) == 0) return 1;
+    for (int i = 0; i < f->num_uuids128; i++) if (ble_uuid_cmp(&f->uuids128[i].u, &uuid->u) == 0) return 1;
+    return 0;
+}
+
 static struct ble_gatt_chr_def characteristics[3];
 static struct ble_gatt_svc_def services[2];
 
 static int on_gap_event(struct ble_gap_event *event, void *arg) {
     (void)arg;
     switch (event->type) {
+    case BLE_GAP_EVENT_DISC: {
+        /* an advertisement, or the answer to this end's scan request, of something nearby */
+        struct ble_hs_adv_fields f;
+        if (!seeking || link != BLE_HS_CONN_HANDLE_NONE) break;
+        if (ble_hs_adv_parse_fields(&f, event->disc.data, event->disc.length_data) != 0) break;
+        if (!advertises(&f, &seek_uuid)) break;
+        ble_gap_disc_cancel();
+        int rc = ble_gap_connect(own_addr_type, &event->disc.addr, 10000, NULL, on_gap_event, NULL);
+        if (rc != 0) post(EV_CONNECTED, BLE_HS_CONN_HANDLE_NONE, rc);
+        break;
+    }
+    case BLE_GAP_EVENT_DISC_COMPLETE:
+        if (seeking && link == BLE_HS_CONN_HANDLE_NONE) post(EV_ADV_ENDED, event->disc_complete.reason, 0);
+        break;
     case BLE_GAP_EVENT_CONNECT:
-        if (event->connect.status == 0 && serving) {
-            xQueueReset(rx_queue);   /* segments of the central before, never taken */
+        if (event->connect.status == 0 && (serving || seeking)) {
+            struct ble_gap_conn_desc desc;
+            xQueueReset(rx_queue);   /* segments of the peer before, never taken */
             subscribed = 0;
+            central = ble_gap_conn_find(event->connect.conn_handle, &desc) == 0 && desc.role == BLE_GAP_ROLE_MASTER;
             link = event->connect.conn_handle;
+            if (central) {
+                seeking = 0;
+                peer_start = peer_end = peer_rx = peer_tx = peer_tx_end = peer_cccd = 0;
+                int rc = ble_gattc_exchange_mtu(link, on_mtu, NULL);
+                if (rc != 0) give_up(link, 1000 + rc);
+            }
         }
         post(EV_CONNECTED, event->connect.conn_handle, event->connect.status);
         break;
+    case BLE_GAP_EVENT_NOTIFY_RX:
+        /* the peripheral's indication: one segment */
+        if (central && event->notify_rx.conn_handle == link && event->notify_rx.attr_handle == peer_tx) {
+            static segment in;       /* NimBLE's task only */
+            uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
+            if (len == 0 || len > SEG_MAX || uxQueueSpacesAvailable(rx_queue) == 0 || uxQueueSpacesAvailable(events) == 0) break;
+            if (ble_hs_mbuf_to_flat(event->notify_rx.om, in.bytes, SEG_MAX, &in.len) != 0) break;
+            xQueueSend(rx_queue, &in, 0);
+            post(EV_WRITTEN, link, 0);
+        }
+        break;
     case BLE_GAP_EVENT_DISCONNECT:
-        if (serving && event->disconnect.conn.conn_handle == link) {
-            xSemaphoreTake(tx_lock, portMAX_DELAY);
+        if (event->disconnect.conn.conn_handle == link) {
+            xSemaphoreTakeRecursive(tx_lock, portMAX_DELAY);
             link = BLE_HS_CONN_HANDLE_NONE;
+            central = 0;
             subscribed = 0;
             tx_in_flight = 0;
             xQueueReset(tx_queue);
-            xSemaphoreGive(tx_lock);
+            xSemaphoreGiveRecursive(tx_lock);
         }
         post(EV_DISCONNECTED, event->disconnect.conn.conn_handle, event->disconnect.reason);
         break;
@@ -221,13 +380,13 @@ static int on_gap_event(struct ble_gap_event *event, void *arg) {
            answered where it was sent (send_next). The two that come later end the segment. */
         if (serving && event->notify_tx.indication && event->notify_tx.attr_handle == tx_handle
             && (event->notify_tx.status == BLE_HS_EDONE || event->notify_tx.status == BLE_HS_ETIMEOUT)) {
-            xSemaphoreTake(tx_lock, portMAX_DELAY);
+            xSemaphoreTakeRecursive(tx_lock, portMAX_DELAY);
             if (tx_in_flight) {
                 tx_in_flight = 0;
                 post(EV_SENT, event->notify_tx.conn_handle, event->notify_tx.status == BLE_HS_EDONE ? 0 : event->notify_tx.status);
                 send_next();
             }
-            xSemaphoreGive(tx_lock);
+            xSemaphoreGiveRecursive(tx_lock);
         }
         break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -346,6 +505,14 @@ static void uuid_plus(const ble_uuid_any_t *from, uint32_t add, ble_uuid_any_t *
     }
 }
 
+/* The two segment queues and their lock, made by the first call that needs them. */
+static int link_queues(void) {
+    if (rx_queue == NULL) rx_queue = xQueueCreate(SEGMENTS, sizeof(segment));
+    if (tx_queue == NULL) tx_queue = xQueueCreate(SEGMENTS, sizeof(segment));
+    if (tx_lock == NULL) tx_lock = xSemaphoreCreateRecursiveMutex();
+    return rx_queue != NULL && tx_queue != NULL && tx_lock != NULL;
+}
+
 /* Names the service the host will publish: before silica_nimble_start. Called again with the same
    UUID it answers ok; after the start with another, error 9. */
 silica_nimble_tagged silica_nimble_serve(const uint8_t *uuid_ptr, uint64_t uuid_len) {
@@ -353,10 +520,7 @@ silica_nimble_tagged silica_nimble_serve(const uint8_t *uuid_ptr, uint64_t uuid_
     if (uuid_from_text(uuid_ptr, uuid_len, &uuid) != 0) return fail(6);
     if (serving && ble_uuid_cmp(&uuid.u, &service_uuid.u) == 0) return ok(0);
     if (started) return fail(9);
-    if (rx_queue == NULL) rx_queue = xQueueCreate(SEGMENTS, sizeof(segment));
-    if (tx_queue == NULL) tx_queue = xQueueCreate(SEGMENTS, sizeof(segment));
-    if (tx_lock == NULL) tx_lock = xSemaphoreCreateMutex();
-    if (rx_queue == NULL || tx_queue == NULL || tx_lock == NULL) return fail(8);
+    if (!link_queues()) return fail(8);
     service_uuid = uuid;
     uuid_plus(&uuid, 1, &rx_uuid);
     uuid_plus(&uuid, 2, &tx_uuid);
@@ -396,16 +560,16 @@ silica_nimble_tagged silica_nimble_mtu(int64_t conn) {
 /* Queues one segment for the connection of silica_nimble_set_args. A :sent event says how it ended. */
 silica_nimble_tagged silica_nimble_send(const uint8_t *data_ptr, uint64_t data_len) {
     static segment s;                /* the radio actor only */
-    if (!serving || link == BLE_HS_CONN_HANDLE_NONE || arg_a != link || !subscribed) return fail(3);
+    if (link == BLE_HS_CONN_HANDLE_NONE || arg_a != link || !subscribed) return fail(3);
     int mtu = (int)ble_att_mtu(link) - 3;
     if (mtu > SEG_MAX) mtu = SEG_MAX;
     if (data_len == 0 || data_len > (uint64_t)mtu) return fail(4);
     s.len = (uint16_t)data_len;
     memcpy(s.bytes, data_ptr, data_len);
-    xSemaphoreTake(tx_lock, portMAX_DELAY);
+    xSemaphoreTakeRecursive(tx_lock, portMAX_DELAY);
     int queued = link != BLE_HS_CONN_HANDLE_NONE && xQueueSend(tx_queue, &s, 0) == pdTRUE;
     if (queued) send_next();
-    xSemaphoreGive(tx_lock);
+    xSemaphoreGiveRecursive(tx_lock);
     return queued ? ok(0) : fail(5);
 }
 
@@ -423,9 +587,35 @@ silica_nimble_bytes silica_nimble_take(int64_t conn) {
     return (silica_nimble_bytes){ 0, rx_now.bytes, rx_now.len, 0 };
 }
 
-/* Ends the connection; the :disconnected event follows. */
+/* Looks for a peripheral that advertises the service and makes the link to it (the central role, in
+   the header). The :subscribed event says the link is up. */
+silica_nimble_tagged silica_nimble_seek(const uint8_t *uuid_ptr, uint64_t uuid_len) {
+    struct ble_gap_disc_params params;
+    if (!synced) return fail(7);
+    if (uuid_from_text(uuid_ptr, uuid_len, &seek_uuid) != 0) return fail(6);
+    if (!link_queues()) return fail(8);
+    if (ble_gap_disc_active()) ble_gap_disc_cancel();
+    memset(&params, 0, sizeof params);
+    params.filter_duplicates = 1;    /* each device is reported once; a new scan starts afresh */
+    seeking = 1;
+    /* an active scan: a peripheral may give its service only in the answer to a scan request */
+    int rc = ble_gap_disc(own_addr_type, BLE_HS_FOREVER, &params, on_gap_event, NULL);
+    if (rc != 0) { seeking = 0; return fail(1000 + rc); }
+    return ok(0);
+}
+
+/* Ends the connection; the :disconnected event follows. With no connection, ends the search for a
+   peripheral. */
 silica_nimble_tagged silica_nimble_drop(int64_t conn) {
-    if (link == BLE_HS_CONN_HANDLE_NONE || conn != link) return ok(0);
+    if (link == BLE_HS_CONN_HANDLE_NONE) {
+        if (seeking) {
+            seeking = 0;
+            ble_gap_disc_cancel();
+            ble_gap_conn_cancel();
+        }
+        return ok(0);
+    }
+    if (conn != link) return ok(0);
     int rc = ble_gap_terminate((uint16_t)conn, BLE_ERR_REM_USER_CONN_TERM);
     if (rc != 0 && rc != BLE_HS_EALREADY && rc != BLE_HS_ENOTCONN) return fail(1000 + rc);
     return ok(0);
