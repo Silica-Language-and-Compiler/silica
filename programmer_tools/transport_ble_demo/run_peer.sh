@@ -34,7 +34,7 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$ROLE" ] || [ "$BUILD_ONLY" = 1 ] || { echo "run_peer: peripheral | central [uuid], or --build-only" >&2; exit 2; }
 [ -n "$ROLE" ] || ROLE=peripheral
-WORK="$HERE/build"
+WORK="$HERE/build/peer"
 rm -rf "$WORK"; mkdir -p "$WORK/dangerous_exposure_source/lib"
 cd "$WORK" || exit 1
 

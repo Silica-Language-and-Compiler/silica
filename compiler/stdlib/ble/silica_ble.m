@@ -182,7 +182,7 @@ static void trace(NSString *what) {
         if (rx == nil && (c.properties & (CBCharacteristicPropertyWrite | CBCharacteristicPropertyWriteWithoutResponse))) rx = c;
         if (tx == nil && (c.properties & (CBCharacteristicPropertyIndicate | CBCharacteristicPropertyNotify))) tx = c;
     }
-    trace([NSString stringWithFormat:@"characteristics: rx %@, tx %@", rx.UUID, tx.UUID]);
+    trace([NSString stringWithFormat:@"characteristics: %lu found, error %@, rx %@, tx %@", (unsigned long)service.characteristics.count, error, rx.UUID, tx.UUID]);
     if (rx == nil || tx == nil) { [self setPhaseAndSignal:PHASE_FAULT]; return; }
     self.peerRx = rx;
     self.peerWriteType = (rx.properties & CBCharacteristicPropertyWrite) ? CBCharacteristicWriteWithResponse : CBCharacteristicWriteWithoutResponse;

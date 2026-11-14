@@ -15,7 +15,8 @@
 */
 
 /* The Fifi wrapper around NimBLE, ESP-IDF's Bluetooth host, for a Silica program that runs on the
-   ESP32-S3 as a guest of ESP-IDF (transport_ble_plan.md §2.1, stage 6: as far as advertising). It is
+   ESP32-S3 as a guest of ESP-IDF (transport_ble_plan.md §2.1; stage 6 advertising, stage 7 the
+   peripheral role: one service, one central at a time). It is
    compiled into the guest image as ESP-IDF code (board/guest/tools/build_image.sh). One Silica actor,
    the radio actor (dangerous_ble_radio), makes every call here.
 
@@ -25,9 +26,11 @@
    FreeRTOS queue, and the radio actor takes them out with silica_nimble_event.
 
    Result conventions (as compiler/stdlib/ble/silica_ble.m): { tag, value, error_code } with tag 0 = ok,
-   1 = error, 2 = nothing yet. Error codes: 6 bad UUID text, 7 the host is not ready (no :synced event
-   yet), 8 the event queue could not be made, 1000 + n NimBLE's return code n, and for silica_nimble_start
-   2000 + n ESP-IDF's error n.
+   1 = error, 2 = nothing yet. Error codes: 3 no central is subscribed, 4 a segment that is empty or
+   longer than the link carries, 5 eight segments already wait to be sent, 6 bad UUID text, 7 the host
+   is not ready (no :synced event yet), 8 a queue could not be made, 9 the host is already started
+   with another service, 1000 + n NimBLE's return code n, and for silica_nimble_start 2000 + n ESP-IDF's
+   error n.
 
    Events (the value of silica_nimble_event; the two fields of the event are read with
    silica_nimble_event_field):
@@ -35,25 +38,47 @@
      2 reset           the host lost the controller; field 0 the reason. A :synced follows when it is back
      3 advertising ended without a connection; field 0 the reason
      4 connected       field 0 the connection's handle, field 1 the status (0 when the link is up)
-     5 disconnected    field 0 the connection's handle, field 1 the reason
+     5 disconnected    field 0 the connection's handle, field 1 the reason (NimBLE's: 0x200 + the
+                       controller's code, so 0x213 the peer ended the link, 0x216 this end did,
+                       0x208 the link was lost)
+     6 subscribed      field 0 the connection's handle, field 1 whether the central now takes
+                       indications (1) or has stopped (0)
+     7 sent            field 0 the connection's handle, field 1 0 when the central confirmed the
+                       segment, otherwise NimBLE's code: the segment was not delivered
 
    Advertising. The advertisement carries the flags and the service's UUID; the scan response carries
    the device's name, "Silica". The UUID text is that of the Mac's wrapper: 4, 8 or 36 characters of
    the usual hexadecimal form, or empty for the Nordic UART Service. Advertising is connectable and
-   stops when a central connects. */
+   stops when a central connects.
 
+   The service (silica_nimble_serve, before silica_nimble_start: NimBLE takes its attribute table when
+   the host starts). Two characteristics, as the Mac's wrapper publishes them: the one the central
+   writes, with response, at the service's UUID plus 1 in its first group, and the one this end
+   indicates on at plus 2. One central at a time: advertising stops when it connects.
+     In:  a write is one segment. It is kept in a queue of eight until silica_nimble_recv takes it; a
+          write that finds the queue full is refused (insufficient resources), so the central sees
+          that segment fail and the others stay in order.
+     Out: silica_nimble_send queues one segment, at most eight. ATT allows one indication at a time, so
+          the next goes out when the central has confirmed the one before; each ends in a :sent event.
+   The largest segment is the connection's ATT_MTU minus 3 (silica_nimble_mtu), never more than
+   SEG_MAX, which follows NimBLE's preferred MTU (CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU, 256). */
+
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_log.h"
 #include "nvs_flash.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 
 typedef struct silica_nimble_tagged {
     int64_t tag;
@@ -61,15 +86,46 @@ typedef struct silica_nimble_tagged {
     int64_t error_code;
 } silica_nimble_tagged;
 
+/* A foreign result that carries bytes: the board's layout of the Silica "struct" result, four
+   8-byte words (as trials/ffi_addition/fixtures/board/ESP32-S3_raw/src/silica_text_board.c). The
+   bytes stay in a static buffer; the Silica side copies them out. */
+typedef struct silica_nimble_bytes {
+    int64_t tag;
+    const uint8_t *text_ptr;
+    uint64_t text_len;
+    int64_t error_code;
+} silica_nimble_bytes;
+_Static_assert(offsetof(silica_nimble_bytes, text_ptr) == 8, "text_ptr at 8");
+_Static_assert(offsetof(silica_nimble_bytes, text_len) == 16, "text_len at 16");
+_Static_assert(sizeof(silica_nimble_bytes) == 32, "32-byte result");
+
 typedef struct { uint8_t kind; int32_t field[2]; } radio_event;
 
-enum { EV_SYNCED = 1, EV_RESET = 2, EV_ADV_ENDED = 3, EV_CONNECTED = 4, EV_DISCONNECTED = 5 };
+enum { EV_SYNCED = 1, EV_RESET = 2, EV_ADV_ENDED = 3, EV_CONNECTED = 4, EV_DISCONNECTED = 5,
+       EV_SUBSCRIBED = 6, EV_SENT = 7 };
+
+#define SEG_MAX (MYNEWT_VAL(BLE_ATT_PREFERRED_MTU) - 3)
+#define SEGMENTS 8
+typedef struct { uint16_t len; uint8_t bytes[SEG_MAX]; } segment;
 
 static QueueHandle_t events;         /* from NimBLE's task to the radio actor */
 static volatile int synced;          /* written by NimBLE's task, read by the radio actor's calls */
 static uint8_t own_addr_type;
 static int started;
 static radio_event last_event;       /* the event silica_nimble_event answered last */
+
+/* The service. `link` and `subscribed` are written by NimBLE's task and read by the radio actor's calls. */
+static int serving;                  /* silica_nimble_serve has named the service */
+static ble_uuid_any_t service_uuid, rx_uuid, tx_uuid;
+static uint16_t tx_handle;           /* the indicated characteristic's value handle */
+static volatile uint16_t link = BLE_HS_CONN_HANDLE_NONE;
+static volatile int subscribed;
+static QueueHandle_t rx_queue;       /* segments the central wrote, until silica_nimble_recv */
+static QueueHandle_t tx_queue;       /* segments waiting for the indication before them */
+static SemaphoreHandle_t tx_lock;    /* guards tx_in_flight and the taking of tx_queue */
+static int tx_in_flight;             /* an indication waits for the central's confirmation */
+static segment tx_now, rx_now;       /* under tx_lock; the radio actor's last silica_nimble_recv */
+static int64_t arg_a;                /* silica_nimble_set_args, for the calls that take bytes */
 
 static silica_nimble_tagged ok(int64_t value) { return (silica_nimble_tagged){ 0, value, 0 }; }
 static silica_nimble_tagged fail(int64_t code) { return (silica_nimble_tagged){ 1, 0, code }; }
@@ -94,14 +150,79 @@ static void on_reset(int reason) {
     post(EV_RESET, reason, 0);
 }
 
+/* With tx_lock held: sends the next waiting segment unless one is in flight. A segment NimBLE refuses
+   ends in a :sent event with its code, and the one after it is tried. */
+static void send_next(void) {
+    while (!tx_in_flight && link != BLE_HS_CONN_HANDLE_NONE && xQueueReceive(tx_queue, &tx_now, 0) == pdTRUE) {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(tx_now.bytes, tx_now.len);
+        int rc = om == NULL ? BLE_HS_ENOMEM : ble_gatts_indicate_custom(link, tx_handle, om);
+        if (rc == 0) tx_in_flight = 1;
+        else post(EV_SENT, link, rc);
+    }
+}
+
+/* On NimBLE's task: the central wrote one segment. */
+static int on_write(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    static segment s;                /* NimBLE's task only */
+    (void)conn_handle; (void)attr_handle; (void)arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    if (len == 0 || len > SEG_MAX) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    if (ble_hs_mbuf_to_flat(ctxt->om, s.bytes, SEG_MAX, &s.len) != 0) return BLE_ATT_ERR_UNLIKELY;
+    if (xQueueSend(rx_queue, &s, 0) != pdTRUE) return BLE_ATT_ERR_INSUFFICIENT_RES;
+    return 0;
+}
+
+/* The indicated characteristic has no value to read or write. */
+static int on_tx_access(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    (void)conn_handle; (void)attr_handle; (void)ctxt; (void)arg;
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static struct ble_gatt_chr_def characteristics[3];
+static struct ble_gatt_svc_def services[2];
+
 static int on_gap_event(struct ble_gap_event *event, void *arg) {
     (void)arg;
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
+        if (event->connect.status == 0 && serving) {
+            xQueueReset(rx_queue);   /* segments of the central before, never taken */
+            subscribed = 0;
+            link = event->connect.conn_handle;
+        }
         post(EV_CONNECTED, event->connect.conn_handle, event->connect.status);
         break;
     case BLE_GAP_EVENT_DISCONNECT:
+        if (serving && event->disconnect.conn.conn_handle == link) {
+            xSemaphoreTake(tx_lock, portMAX_DELAY);
+            link = BLE_HS_CONN_HANDLE_NONE;
+            subscribed = 0;
+            tx_in_flight = 0;
+            xQueueReset(tx_queue);
+            xSemaphoreGive(tx_lock);
+        }
         post(EV_DISCONNECTED, event->disconnect.conn.conn_handle, event->disconnect.reason);
+        break;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (serving && event->subscribe.attr_handle == tx_handle && event->subscribe.conn_handle == link) {
+            subscribed = event->subscribe.cur_indicate;
+            post(EV_SUBSCRIBED, event->subscribe.conn_handle, event->subscribe.cur_indicate);
+        }
+        break;
+    case BLE_GAP_EVENT_NOTIFY_TX:
+        /* Status 0 says only that the indication left, and comes on the sender's task; a refusal is
+           answered where it was sent (send_next). The two that come later end the segment. */
+        if (serving && event->notify_tx.indication && event->notify_tx.attr_handle == tx_handle
+            && (event->notify_tx.status == BLE_HS_EDONE || event->notify_tx.status == BLE_HS_ETIMEOUT)) {
+            xSemaphoreTake(tx_lock, portMAX_DELAY);
+            if (tx_in_flight) {
+                tx_in_flight = 0;
+                post(EV_SENT, event->notify_tx.conn_handle, event->notify_tx.status == BLE_HS_EDONE ? 0 : event->notify_tx.status);
+                send_next();
+            }
+            xSemaphoreGive(tx_lock);
+        }
         break;
     case BLE_GAP_EVENT_ADV_COMPLETE:
         post(EV_ADV_ENDED, event->adv_complete.reason, 0);
@@ -124,7 +245,10 @@ silica_nimble_tagged silica_nimble_start(int64_t reserved) {
     if (started) return ok(0);
     if (events == NULL) events = xQueueCreate(16, sizeof(radio_event));
     if (events == NULL) return fail(8);
-    /* The controller keeps its calibration data in NVS. */
+    /* The controller keeps its calibration data in NVS. Flashing an image erases NVS, so the first start
+       after it calibrates in full and ESP-IDF says so in a warning on the console, which is the
+       program's standard output; only its errors are let through. */
+    esp_log_level_set("phy_init", ESP_LOG_ERROR);
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
@@ -136,7 +260,13 @@ silica_nimble_tagged silica_nimble_start(int64_t reserved) {
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
     ble_svc_gap_init();
+    ble_svc_gatt_init();
     ble_svc_gap_device_name_set("Silica");
+    if (serving) {
+        int rc = ble_gatts_count_cfg(services);
+        if (rc == 0) rc = ble_gatts_add_svcs(services);
+        if (rc != 0) return fail(1000 + rc);
+    }
     ret = nimble_port_freertos_init(host_task);
     if (ret != ESP_OK) return fail(2000 + ret);
     started = 1;
@@ -193,6 +323,106 @@ static int uuid_from_text(const uint8_t *text, uint64_t len, ble_uuid_any_t *out
         for (int i = 0; i < 16; i++) out->u128.value[i] = bytes[15 - i];   /* NimBLE keeps it low byte first */
     }
     return 0;
+}
+
+/* The UUID whose first group is `add` more than the service's. */
+static void uuid_plus(const ble_uuid_any_t *from, uint32_t add, ble_uuid_any_t *out) {
+    *out = *from;
+    if (from->u.type == BLE_UUID_TYPE_16) {
+        out->u16.value = (uint16_t)(from->u16.value + add);
+    } else if (from->u.type == BLE_UUID_TYPE_32) {
+        out->u32.value = from->u32.value + add;
+    } else {
+        uint32_t group = (uint32_t)from->u128.value[12] | (uint32_t)from->u128.value[13] << 8
+                       | (uint32_t)from->u128.value[14] << 16 | (uint32_t)from->u128.value[15] << 24;
+        group += add;
+        for (int i = 0; i < 4; i++) out->u128.value[12 + i] = (uint8_t)(group >> (8 * i));
+    }
+}
+
+/* Names the service the host will publish: before silica_nimble_start. Called again with the same
+   UUID it answers ok; after the start with another, error 9. */
+silica_nimble_tagged silica_nimble_serve(const uint8_t *uuid_ptr, uint64_t uuid_len) {
+    ble_uuid_any_t uuid;
+    if (uuid_from_text(uuid_ptr, uuid_len, &uuid) != 0) return fail(6);
+    if (serving && ble_uuid_cmp(&uuid.u, &service_uuid.u) == 0) return ok(0);
+    if (started) return fail(9);
+    if (rx_queue == NULL) rx_queue = xQueueCreate(SEGMENTS, sizeof(segment));
+    if (tx_queue == NULL) tx_queue = xQueueCreate(SEGMENTS, sizeof(segment));
+    if (tx_lock == NULL) tx_lock = xSemaphoreCreateMutex();
+    if (rx_queue == NULL || tx_queue == NULL || tx_lock == NULL) return fail(8);
+    service_uuid = uuid;
+    uuid_plus(&uuid, 1, &rx_uuid);
+    uuid_plus(&uuid, 2, &tx_uuid);
+    memset(characteristics, 0, sizeof characteristics);
+    characteristics[0].uuid = &rx_uuid.u;
+    characteristics[0].access_cb = on_write;
+    characteristics[0].flags = BLE_GATT_CHR_F_WRITE;
+    characteristics[1].uuid = &tx_uuid.u;
+    characteristics[1].access_cb = on_tx_access;
+    characteristics[1].flags = BLE_GATT_CHR_F_INDICATE;
+    characteristics[1].val_handle = &tx_handle;
+    memset(services, 0, sizeof services);
+    services[0].type = BLE_GATT_SVC_TYPE_PRIMARY;
+    services[0].uuid = &service_uuid.u;
+    services[0].characteristics = characteristics;
+    serving = 1;
+    return ok(0);
+}
+
+/* The FFI carries a pointer and a length only as a binding's sole parameters, so silica_nimble_send
+   takes its connection from here (as silica_ble_set_args). Only the radio actor calls the wrapper. */
+silica_nimble_tagged silica_nimble_set_args(int64_t a, int64_t b) {
+    (void)b;
+    arg_a = a;
+    return ok(0);
+}
+
+/* The largest segment the connection carries: its ATT_MTU minus 3, at most SEG_MAX. */
+silica_nimble_tagged silica_nimble_mtu(int64_t conn) {
+    if (link == BLE_HS_CONN_HANDLE_NONE || conn != link) return fail(3);
+    int mtu = (int)ble_att_mtu((uint16_t)conn) - 3;
+    if (mtu < 20) mtu = 20;
+    if (mtu > SEG_MAX) mtu = SEG_MAX;
+    return ok(mtu);
+}
+
+/* Queues one segment for the connection of silica_nimble_set_args. A :sent event says how it ended. */
+silica_nimble_tagged silica_nimble_send(const uint8_t *data_ptr, uint64_t data_len) {
+    static segment s;                /* the radio actor only */
+    if (!serving || link == BLE_HS_CONN_HANDLE_NONE || arg_a != link || !subscribed) return fail(3);
+    int mtu = (int)ble_att_mtu(link) - 3;
+    if (mtu > SEG_MAX) mtu = SEG_MAX;
+    if (data_len == 0 || data_len > (uint64_t)mtu) return fail(4);
+    s.len = (uint16_t)data_len;
+    memcpy(s.bytes, data_ptr, data_len);
+    xSemaphoreTake(tx_lock, portMAX_DELAY);
+    int queued = link != BLE_HS_CONN_HANDLE_NONE && xQueueSend(tx_queue, &s, 0) == pdTRUE;
+    if (queued) send_next();
+    xSemaphoreGive(tx_lock);
+    return queued ? ok(0) : fail(5);
+}
+
+/* Takes the next segment the central wrote; value its length, tag 2 when there is none. The bytes
+   are read with silica_nimble_take. */
+silica_nimble_tagged silica_nimble_recv(int64_t conn) {
+    (void)conn;
+    if (rx_queue == NULL || xQueueReceive(rx_queue, &rx_now, 0) != pdTRUE) return (silica_nimble_tagged){ 2, 0, 0 };
+    return ok(rx_now.len);
+}
+
+/* The bytes of the last silica_nimble_recv. */
+silica_nimble_bytes silica_nimble_take(int64_t conn) {
+    (void)conn;
+    return (silica_nimble_bytes){ 0, rx_now.bytes, rx_now.len, 0 };
+}
+
+/* Ends the connection; the :disconnected event follows. */
+silica_nimble_tagged silica_nimble_drop(int64_t conn) {
+    if (link == BLE_HS_CONN_HANDLE_NONE || conn != link) return ok(0);
+    int rc = ble_gap_terminate((uint16_t)conn, BLE_ERR_REM_USER_CONN_TERM);
+    if (rc != 0 && rc != BLE_HS_EALREADY && rc != BLE_HS_ENOTCONN) return fail(1000 + rc);
+    return ok(0);
 }
 
 /* Advertises the service whose UUID is the text, until a central connects or silica_nimble_stop_advertising.

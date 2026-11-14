@@ -16,6 +16,7 @@ bring-up checks that SOFs arrive); nothing needs to read that port.
 | `device_uart1_link_tx` | the same UART1 program through its link declaration (transport_links_design.md §3.3, stage S-C of transport_esp32s3_wifi_plan.md §8): `carried_on host_line: (:serial) (:uart, 1, 115200);`, `spawn_dangerous_carrier(host_line, ...)` (expanded by the ESP32-S3 pack's `carrier_spawn` to `spawn_device(:idle, device_esp32s3_uart1@uart1_carrier, ...)`) and `Carrier@mtu(host_line)` / `Carrier@boundaries(host_line)` (the `(:serial)` kind's rows); same output as `device_uart1_carrier_tx` |
 | `device_usb_serial_jtag_link_tx` | the same USB-Serial-JTAG program through `carried_on usb: (:serial) (:usb_serial_jtag);` and `spawn_dangerous_carrier(usb, ...)`; same output as `device_usb_serial_jtag_carrier_tx` |
 | `link_uart0_console_reserved` | compile-failure trial (`link_uart0_console_reserved.ESP32-S3_raw.golden_fail`, the board driver's `--fail-one` mode): `carried_on console_line: (:serial) (:uart, 0, 115200);` is E2412 with the console note of links design decision 17 (UART0 is the console) and the list of links this board provides |
+| `link_bluetooth_instance_not_provided` | compile-failure trial: `carried_on phone: (:ble_gatt) (:bluetooth, 1);` is E2412 with the list of links this board provides; the chip has one radio, `(:bluetooth, 0)` (transport_ble_plan.md stage 7) |
 
 ## Goldens and targets
 

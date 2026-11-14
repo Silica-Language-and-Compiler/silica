@@ -54,4 +54,4 @@ for i in $(seq 1 12); do "$CC" > ../compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && br
 
 BOARD_PYTHON="$PY" sh "$GUEST/tools/build_image.sh" -o "$WORK/image/board_advertise" ./*.sams "$ROOT/compiler/stdlib/ble/silica_ble_nimble.c" || exit 1
 [ "$BUILD_ONLY" = 1 ] && exit 0
-"$PY" "$GUEST/tools/run_on_board.py" --timeout $((SECONDS_TO_RUN * 5 / 4 + 30))"$WORK/image/board_advertise.bin"
+"$PY" "$GUEST/tools/run_on_board.py" --timeout $((SECONDS_TO_RUN * 5 / 4 + 30)) "$WORK/image/board_advertise.bin"

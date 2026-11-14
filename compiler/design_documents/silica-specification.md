@@ -10709,13 +10709,16 @@ tag like a protocol tag (§16.4.1). The language names these links:
 | `(:serial_port, path, baud)` | a string literal, an integer literal | `:serial` | hosted: a termios port |
 | `(:usb_cdc, n)` | an integer literal | `:serial` | board, later |
 | `(:usb_serial_jtag)` | none | `:serial` | ESP32-S3: the native USB-C jack through the USB-Serial-JTAG controller |
-| `(:bluetooth, n)` | an integer literal | `:ble_gatt` | hosted: the host's n-th Bluetooth adapter; Apple Silicon macOS provides instance 0 |
+| `(:bluetooth, n)` | an integer literal | `:ble_gatt` | hosted: the host's n-th Bluetooth adapter; Apple Silicon macOS provides instance 0. ESP32-S3: instance 0, the chip's own radio, in a program built as a guest of ESP-IDF |
 
 **Bluetooth (2026-11-10, stages 2 and 3 of [transport_ble_plan.md](transport_ble_plan.md)).** The carrier kind
 `:ble_gatt` and the link `(:bluetooth, n)` are named by the language and checked by the compiler
 (E2408, E2413, E2414, E2417), and have their rows in `Carrier` and `Link`. The Apple Silicon macOS pack
 provides the kind on `(:bluetooth, 0)`, the carrier of §16.4.8; another adapter instance is E2412
-there. No other target's pack provides the kind, so the declaration is E2410 on them.
+there. The ESP32-S3 pack provides the kind on `(:bluetooth, 0)`, the chip's own radio, in the peripheral
+role (2026-11-14, stage 7 of the same plan), for a program built as a guest of ESP-IDF; its carrier is an
+ordinary actor, so `spawn_dangerous_carrier` answers an `actor_ref` there. No other target's pack provides
+the kind, so the declaration is E2410 on them.
 
 **The carrier declaration.** A top-level form, a pure declaration with no effects; `carried_on` is a reserved word:
 

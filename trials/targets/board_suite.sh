@@ -33,6 +33,14 @@
 #     mode: compiled alone with the trial-support modules and the board's C fixtures
 #     (fixtures_board.mk), one image per program with the compiler's silica.link archives, goldens and
 #     .wait_for_exit read from the app directory (<stem>.scout.sorted selects the unordered compare).
+#   - guest_c_sources: a suite whose programs call ESP-IDF's libraries through a Fifi wrapper (the
+#     NimBLE wrapper of transport_ble_board_addition) lists the wrapper's C sources there, one path
+#     per line relative to the repository root. Each is compiled into every program's image as ESP-IDF
+#     code, which only the guest's build_image.sh does: on a target whose board tools are not the
+#     guest's the suite's programs are skipped. For the compile, the directory of each source is
+#     linked under dangerous_exposure_source/ (its .meta files resolve there) and every .meta's
+#     link_library gets an archive holding only its symbols, which the compiler's existence check
+#     wants; the image links the real code.
 #   - other subdirectories with their own Makefile are sub-suites; they are skipped and reported;
 #     hidden directories (.pid_registry_impl) hold no trials, as for the host's `*.silica` globs.
 # Assembly: after each compile, every program's .sams (and each top-level module's of the suite) is compared with
@@ -304,6 +312,39 @@ while IFS= read -r m; do
     fi
 done < <(cd "$src" && cat ./*.silica 2>/dev/null | sed -nE 's/^use (trial_(support|wait|call)_[a-z0-9_]+);.*/\1/p' | LC_ALL=C sort -u)
 
+# --- guest_c_sources: wrappers compiled into the image as ESP-IDF code (see the header) ----------
+guest_c=()
+if [ -f "$src/guest_c_sources" ]; then
+    # (the generator compiles only and has no board tools: it stages the wrapper as the guest does)
+    if [ -z "$GEN" ] && [ ! -f "$BOARD_TOOLS/../idf_app/CMakeLists.txt" ]; then
+        printf 'SKIP: %s (target: its programs call ESP-IDF code; they run as a guest of ESP-IDF only)\n' "$prefix"
+        skipped=$((skipped + 1))
+        programs=()
+    elif [ "${#programs[@]}" -gt 0 ]; then
+        xt="${XTENSA_BIN:-$HOME/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin}"
+        mkdir -p src/dangerous_exposure_source/lib build/guest_stub
+        while IFS= read -r c; do
+            case "$c" in ''|'#'*) continue ;; esac
+            c="$TRIALS_ROOT/../$c"
+            if [ ! -f "$c" ]; then
+                mark_fail; printf '❌❌ %sguest_c_sources names %s, which is not there\n' "$prefix" "$c"; ko=$((ko + 1)); continue
+            fi
+            guest_c+=("$(cd "$(dirname "$c")" && pwd)/$(basename "$c")")
+            d=$(dirname "${guest_c[${#guest_c[@]}-1]}")
+            ln -sfn "$d" "src/dangerous_exposure_source/$(basename "$d")"
+            for meta in "$d"/*.meta; do
+                [ -f "$meta" ] || continue
+                lib=$(sed -n 's/^link_library: *"\(.*\)".*/\1/p' "$meta" | head -n 1)
+                [ -n "$lib" ] || continue
+                [ -f "src/dangerous_exposure_source/lib/lib$lib.a" ] && continue
+                sed -n 's/^ *symbol: "\(.*\)"$/long long \1(void) { return 0; }/p' "$meta" > "build/guest_stub/$lib.c"
+                "$xt/xtensa-esp32s3-elf-gcc" -c -mlongcalls -Os -ffreestanding "build/guest_stub/$lib.c" -o "build/guest_stub/$lib.o" \
+                    && "$xt/xtensa-esp32s3-elf-ar" rcs "src/dangerous_exposure_source/lib/lib$lib.a" "build/guest_stub/$lib.o"
+            done
+        done < "$src/guest_c_sources"
+    fi
+fi
+
 # --- program trials: one compile, then image + board run + golden per program -------------------
 # Each program links only the units it transitively reaches through `use` declarations, plus the
 # runtime support unit. Board memory is small and a unit cannot be garbage-collected (each
@@ -420,7 +461,7 @@ run_program() {
         case " ${extra[*]:-} " in *" $m "*) ;; *) extra+=("$m") ;; esac
     done
     # Archives (C wrappers, spec §20.4) go last: build_image.sh places .a files after every object.
-    if ! sh "$BOARD_TOOLS/build_image.sh" -q -r "$BOARD_RT_CACHE" -o "$img" "$cdir/$stem.sams" ${extra[@]+"${extra[@]}"} ${link_archives[@]+"${link_archives[@]}"} > "build/$stem.image.log" 2>&1; then
+    if ! sh "$BOARD_TOOLS/build_image.sh" -q -r "$BOARD_RT_CACHE" -o "$img" "$cdir/$stem.sams" ${extra[@]+"${extra[@]}"} ${guest_c[@]+"${guest_c[@]}"} ${link_archives[@]+"${link_archives[@]}"} > "build/$stem.image.log" 2>&1; then
         mark_fail
         printf '❌❌ %s%s: image build failed (assembler or linker)\n' "$prefix" "$stem"
         grep -m 12 -i 'error\|undefined' "build/$stem.image.log" || head -n 12 "build/$stem.image.log"

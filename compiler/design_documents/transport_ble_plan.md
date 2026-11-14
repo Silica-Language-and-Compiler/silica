@@ -1,6 +1,6 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-13. Stages 1 to 6 are closed (§6). The goal, the design and the
+Status: **2026-11-13. Stages 1 to 7 are closed (§6). The goal, the design and the
 vocabulary are decided (§8: Matt Manley).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
@@ -71,7 +71,9 @@ environment it was written for:
 - **One connection actor per link** holds that link's state (the negotiated MTU, the subscription, the credit), as
   the TCP listener spawns one connection carrier per accepted peer. Two peers are two actors, and one failing does
   not touch the other.
-- **The carrier** is the owner-facing end of a connection actor and speaks the §6.2 contract.
+- **The carrier** is the owner-facing end of a connection actor and speaks the §6.2 contract. It calls no foreign
+  code, so on the board it is an ordinary actor (an `actor_ref`); the Mac's carrier calls its wrapper itself and is
+  a `dangerous_actor_ref`.
 - A lost link is an actor ending, handled by supervision (links design §6.3), not a value the sender checks.
 
 ### 2.3 Shared with Wi-Fi
@@ -121,8 +123,8 @@ These are not built by any stage here, and no stage's code should lean toward th
   - `:reliable_ordered` holds because the carrier uses writes with response toward the peripheral and indications
     toward the central, never notifications (transport design §6.5).
 - **Link:** `(:bluetooth, n)`, the n-th Bluetooth adapter of the target. It carries `:ble_gatt` only (E2414
-  otherwise). The Mac provides instance 0 (CoreBluetooth offers no choice of adapter); the board will provide
-  instance 0, the chip's own radio.
+  otherwise). The Mac provides instance 0 (CoreBluetooth offers no choice of adapter); the board provides
+  instance 0, the chip's own radio, to a program built as a guest of ESP-IDF.
 - **Role and service at `:open`.** `"central:<uuid>"` scans for the service and connects; `"peripheral:<uuid>"`
   advertises it and waits. `<uuid>` is the service's UUID; nothing after the colon means the Nordic UART Service,
   which phone test applications know.
@@ -210,7 +212,7 @@ settled (§6, stage 4):
 - **Closes when:** a phone's scanner shows the board advertising the service, and goes on showing it while a
   Silica program keeps both cores busy.
 
-### Stage 7. The board carrier, peripheral role
+### Stage 7. The board carrier, peripheral role (closed, §6)
 
 - The wrapper, the least that one service needs: accept a connection, the MTU exchange, an attribute table with
   the service and its two characteristics, writes with response in, indications out, disconnection.
@@ -629,6 +631,71 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     `device_actor_addition`: as at the close of stage 5.
   - Noted: each flash of an image erases NVS, so the radio calibrates in full at every start and ESP-IDF
     prints `phy_init: failed to load RF calibration data` on the console before the program's own output.
+- **Stage 7, 2026-11-14, closed: a board program declared `carried_on phone: (:ble_gatt) (:bluetooth, 0);`
+  exchanges a segmented frame with a phone, and with the Mac as central, with a busy actor on each core.**
+  - The closing run: `run_board_peer.sh` on the board's own address, the central a phone with nRF Connect
+    (Matt Manley). The board's console: `link up mtu:253`, the three 20-byte segments sent, the same three
+    received in order, `frame in 48 bytes`, `accel x=1 y=-2 z=512 at_ms=1000`, `link down :closed`, status 0.
+    The two busy actors went from 2,860 rounds to 3,540 while the link was held. On the phone: the service's
+    two characteristics were listed; the values the board indicated were shown as "invalid data" on the
+    characteristic and appear in the application's log; the three values were then written by hand. Earlier in the run the phone listed no
+    characteristics and then, for a while, no "Silica" in its scan; what cleared each was not recorded (a
+    table the phone kept from stage 6 is the likely cause of the first).
+  - Built:
+    - The wrapper's peripheral role (`silica_ble_nimble.c`): one service with the characteristic the central
+      writes (with response) and the one the board indicates on, as the Mac's wrapper publishes them. Writes
+      wait in a queue of eight segments; a write that finds it full is refused. Indications go out one at a
+      time from a queue of eight (NimBLE allows one outstanding per connection). One central at a time.
+    - The radio actor's peripheral role (`dangerous_ble_radio`): `:serve`, `:send`, `:rx_credit`, `:drop`.
+    - `compiler/stdlib/dangerous_ble_gatt_board_carrier.silica`, the connection actor and carrier, and the
+      board's pack rows (`(:ble_gatt)`, `(:bluetooth, 0)`, `carrier_spawn`).
+    - `programmer_tools/transport_ble_demo`: `dangerous_ble_board_peer.silica` with `run_board_peer.sh`.
+  - Run: `run_board_peer.sh` on the board and `run_peer.sh central` on the Mac. The link came up with an mtu of
+    253. The board sent the 48-byte frame in three 20-byte segments and the Mac sent it back; each end
+    reassembled and decoded it (`accel x=1 y=-2 z=512 at_ms=1000`) and closed the link, and both ended with
+    status 0. The two busy actors went on throughout.
+  - That run used a random address on the board, a change made for the test and not kept: on the board's own
+    address the Mac answers characteristic discovery itself, with error 8 ("UUID not allowed"), and lists the
+    Nordic UART Service even when the board serves another. The Mac holds a stale table for that address; it
+    is not looked into further, and switching the Mac's Bluetooth off and on is the expected remedy (not
+    tried). A phone that connected during stage 6 may hold the stage 6 table in the same way.
+  - Memory, Silica's block 208 KB:
+    - ESP-IDF's heap: 109 KB free before the radio, 42 KB while advertising, 37 KB with the link up and after
+      the exchange. The service's two queues take 4 KB of that, the connection under 1 KB.
+    - Silica's block is the tight one. The demo (carrier, radio actor, owner, a heap meter, two busy actors
+      and the trial support's, 12 actors in all) had 196 KB of its 206 KB in use at its end. An actor costs some
+      10 KB of the block, a dangerous actor some 16 KB. With four busy actors and the meter the radio actor
+      ended with `:out_of_memory`.
+  - Trials:
+    - `transport_board_addition/link_bluetooth_instance_not_provided` (E2412 for `(:bluetooth, 1)`);
+      `link_uart0_console_reserved`'s expected text now lists `(:bluetooth, 0)`. The suite on the guest: 10
+      of 10.
+    - A new suite, `transport_ble_board_addition`, runs the carrier on the board with no peer: the central
+      role refused, a service that is no UUID refused, and open, a `:tx` with no central, close. Its programs
+      need the NimBLE wrapper in the image, so the board driver (`trials/targets/board_suite.sh`) now reads
+      a suite's `guest_c_sources`: the C sources are compiled into each image as ESP-IDF code on
+      `ESP32-S3_idf`, and the suite's programs are skipped on bare metal. On the guest: 6 of 6 (three runs,
+      three assembly goldens).
+    - The advertising demo of stage 6 still runs to status 0.
+  - The wrapper now lets only errors of ESP-IDF's `phy_init` through: its warning that the radio calibrates
+    in full (stage 6) was the first line of a radio program's output.
+  - Found in the compiler, not fixed; the carrier is written round both:
+    - An atom that a program first meets as the tag of a tuple pattern is numbered 0 in that module's code on
+      the first compiler pass, and the compiler ends with status 0. No message then matches (`no case arm
+      matched`) until the program is compiled a second time. Seen on the Mac and the board with a ten-line
+      program: a behaviour in one module, `(:open, n: int64) -> ...`, cast to from another.
+    - In a call `f(a, (:tag, b, g(...)))` the call inside the later argument's tuple overwrites the earlier
+      argument: `a`, a boolean, reached `f` as neither true nor false.
+  - Found in the language, as it stands:
+    - `spawn_dangerous` refuses a behaviour that calls no foreign code (E4045), so the board's carrier is an
+      ordinary actor (§2.2).
+    - A `cast_dangerous_registered` to a name no actor holds ends the sender with `(:explicit,
+      :actor_not_found)`, so the carrier keeps a flag for having spawned the radio actor. Two carriers opened
+      in one program would both spawn it; the board has one carrier until stage 9.
+  - The timer delay noted at stage 6 is the scheduler's rule, not a defect: an actor is never interrupted in
+    the middle of a message, so the owner waited for the busy actors' rounds.
+  - Fixed on the way: `run_board_advertise.sh` as committed at stage 6 lacked a space in its last line and did
+    not run the board; `run_peer.sh` cleared the whole `build` directory, the board scripts' work with it.
 
 ## 7. Facts the design rests on
 
