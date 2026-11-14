@@ -38,6 +38,16 @@ carried_on phone: (:ble_gatt) (:bluetooth, 0);
 // Patched per run by run_peer.sh: "peripheral:" or "central:", then the service UUID or nothing.
 fn address() -> string { "peripheral:" }
 
+// Patched per run by the script: how many whole exchanges, each on a link of its own, before the program
+// ends with status 0, and which link (counted from 0) this end cuts short, -1 for none.
+fn links() -> int64 { 1 }
+
+fn cut_link() -> int64 { 0 - 1 }
+
+// Patched per run by the script: how long the link is kept after the exchange is whole, for the tests
+// that take one end away while the link is up.
+fn hold_ms() -> uint64 { 0 }
+
 fn show_reading(r: { x: int16, y: int16, z: int16, at_ms: uint64 }) -> atom {
     sequence proc[device_io]
         _: atom <- print("accel x=");
@@ -73,37 +83,82 @@ fn send_all(car: dangerous_actor_ref, segs: List[string, mem(normal)], sent: int
     }
 }
 
-fn send_reading(car: dangerous_actor_ref) -> int64 {
+fn only_first(segs: List[string, mem(normal)]) -> List[string, mem(normal)] {
+    case segs of {
+        []: List[string, mem(normal)] -> segs;
+        [h: string, _t: List[string, mem(normal)]] -> [h]
+    }
+}
+
+// cutting: only the frame's first segment goes out.
+fn send_reading(car: dangerous_actor_ref, cutting: boolean) -> int64 {
     sequence proc[mem(normal), device_io, transport]
         frame: string <- encode((:etf), (:accel, { x: 1, y: 0 - 2, z: 512, at_ms: 1000 }));
         _: atom <- print("frame out ");
         _: atom <- print_int64(length_bytes(frame));
         _: atom <- println(" bytes");
         segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(phone), Carrier@boundaries(phone));
-        n: int64 <- send_all(car, segs, 0)
+        n: int64 <- send_all(car, case cutting of { true -> only_first(segs); false -> segs }, 0)
     produces
         pure n
     end
 }
 
-fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
-         state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64 })
-    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64 }) {
+// The exchange is over: close now, or after hold_ms() when the link is to be kept (never when cutting).
+fn finish(car: dangerous_actor_ref, cutting: boolean) -> boolean {
+    sequence proc[concurrency]
+        done: boolean <- case hold_ms() == 0 or cutting of {
+            true -> cast(car, :close impl ActorMessage {});
+            false -> {
+                sequence proc[concurrency]
+                    _: timer_ref <- send_after(hold_ms(), self(), :finish impl ActorMessage {})
+                produces
+                    pure true
+                end
+            }
+        }
+    produces
+        pure done
+    end
+}
+
+// One link: on :link_up the owner sends its frame, and it closes the link when the peer's frame is in
+// and the peer has confirmed every segment of its own. The exchange is whole when the peer's frame is
+// in: the peer closes as soon as it has finished, and the confirmation of this end's last segment can
+// be lost in that. A link that ends before the frame is in (the peer closed in the middle of it, or
+// the link was lost) is not counted: the owner starts its framing afresh and
+// opens the carrier again. It ends with status 0 after links() whole exchanges, 5 after four that were
+// cut short. cut_link() names one link, by its place in the run, on which this end sends only its first
+// segment and closes: the other end's test of a frame cut short.
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | :reopen | :finish,
+         state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, up: boolean, sent: int64, acked: int64, got: boolean, cut: boolean, done: int64, lost: int64 })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, up: boolean, sent: int64, acked: int64, got: boolean, cut: boolean, done: int64, lost: int64 }) {
     case msg of {
         (:link_up, info: string) -> {
             sequence proc[concurrency, device_io]
                 _: atom <- print("link up ");
                 _: atom <- println(info);
-                _: boolean <- cast(state.car, (:credit, 8) impl ActorMessage {});
-                n: int64 <- send_reading(state.car);
+                _: boolean <- case state.done + state.lost == 0 of {
+                    true -> cast(state.car, (:credit, 8) impl ActorMessage {});
+                    false -> true
+                };
+                cutting: boolean <- state.done + state.lost == cut_link();
+                n: int64 <- send_reading(state.car, cutting);
                 _: atom <- print("sent ");
                 _: atom <- print_int64(n);
                 _: atom <- println(" segments; waiting for a frame from the peer")
             produces
-                pure (:no_reply, state)
+                pure (:no_reply, { car: state.car, rx: state.rx, code: 4, up: true, sent: n, acked: 0, got: false, cut: cutting, done: state.done, lost: state.lost })
             end
         };
-        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_credit, n: int64) -> {
+            acked: int64 <- case n == 1 of { true -> state.acked + 1; false -> state.acked };
+            _: boolean <- case state.up and acked == state.sent and (state.got or state.cut) and n == 1 of {
+                true -> finish(state.car, state.cut);
+                false -> true
+            };
+            (:no_reply, { car: state.car, rx: state.rx, code: state.code, up: state.up, sent: state.sent, acked: acked, got: state.got, cut: state.cut, done: state.done, lost: state.lost })
+        };
         (:rx, segment: string) -> {
             sequence proc[concurrency, device_io]
                 _: atom <- print("rx segment ");
@@ -112,7 +167,7 @@ fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_fa
                 code2: int64 <- case un of {
                     (:more, _r0: { mode: atom, expected: int64, pending: string }) -> state.code;
                     (:frame, frame0: string, _r3: { mode: atom, expected: int64, pending: string }) -> {
-                        sequence proc[mem(normal), device_io, concurrency, transport]
+                        sequence proc[mem(normal), device_io, transport]
                             _: atom <- print("frame in ");
                             _: atom <- print_int64(length_bytes(frame0));
                             _: atom <- println(" bytes");
@@ -128,11 +183,15 @@ fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_fa
                                     _: atom <- println("");
                                     2
                                 }
-                            };
-                            _: boolean <- cast(state.car, :close impl ActorMessage {})
+                            }
                         produces pure code end
                     };
                     (:rejected, _why1: atom) -> 3
+                };
+                got2: boolean <- case un of {
+                    (:more, _r5: { mode: atom, expected: int64, pending: string }) -> state.got;
+                    (:frame, _f5: string, _r6: { mode: atom, expected: int64, pending: string }) -> true;
+                    (:rejected, _why5: atom) -> state.got
                 };
                 rx2: { mode: atom, expected: int64, pending: string } <- case un of {
                     (:more, r1: { mode: atom, expected: int64, pending: string }) -> r1;
@@ -145,9 +204,13 @@ fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_fa
                         produces pure wireframe@fresh(Carrier@boundaries(phone)) end
                     }
                 };
-                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {})
+                _: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {});
+                _: boolean <- case state.up and got2 and state.acked == state.sent of {
+                    true -> finish(state.car, false);
+                    false -> true
+                }
             produces
-                pure (:no_reply, { car: state.car, rx: rx2, code: code2 })
+                pure (:no_reply, { car: state.car, rx: rx2, code: code2, up: state.up, sent: state.sent, acked: state.acked, got: got2, cut: state.cut, done: state.done, lost: state.lost })
             end
         };
         (:tx_failed, why3: atom) -> {
@@ -157,16 +220,50 @@ fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_fa
                 _: atom <- println("")
             produces pure (:no_reply, state) end
         };
-        (:link_down, why4: atom) -> {
-            sequence proc[device_io, concurrency]
-                _: atom <- print("link down ");
-                _: atom <- print_atom(why4);
-                _: atom <- println("");
-                _: boolean <- case why4 == :closed of {
-                    true -> cast_exit(state.code);
-                    false -> cast_exit(1)
-                }
-            produces pure (:no_reply, state) end
+        // a carrier answers :close with :link_down even when the peer ended the link first, so only the
+        // first :link_down of a link counts
+        (:link_down, why4: atom) -> case state.up of {
+            false -> (:no_reply, state);
+            true -> {
+                sequence proc[device_io, concurrency]
+                    whole: boolean <- state.got and state.cut == false and state.code == 0;
+                    done: int64 <- case whole of { true -> state.done + 1; false -> state.done };
+                    lost: int64 <- case whole of { true -> state.lost; false -> state.lost + 1 };
+                    _: atom <- print("link down ");
+                    _: atom <- print_atom(why4);
+                    _: atom <- println(case whole of { true -> ""; false -> case state.cut of { true -> " (cut short by this end)"; false -> " (before the exchange was whole)" } });
+                    again: boolean <- why4 != :fault and done < links() and lost < 4;
+                    _: boolean <- case again of {
+                        true -> {
+                            sequence proc[concurrency]
+                                _: timer_ref <- send_after(500, self(), :reopen impl ActorMessage {})
+                            produces
+                                pure true
+                            end
+                        };
+                        false -> cast_exit(case done == links() of { true -> 0; false -> case why4 == :fault of { true -> 1; false -> 5 } })
+                    }
+                produces
+                    pure (:no_reply, { car: state.car, rx: wireframe@fresh(Carrier@boundaries(phone)), code: state.code, up: false, sent: state.sent, acked: state.acked, got: state.got, cut: state.cut, done: done, lost: lost })
+                end
+            }
+        };
+        :finish -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.car, :close impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        :reopen -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- print("link ");
+                _: atom <- print_int64(state.done + state.lost);
+                _: atom <- println(": opening again");
+                _: boolean <- cast(state.car, (:open, self(), address()) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
         }
     }
 }
@@ -177,7 +274,7 @@ fn main() -> int64 {
         _: boolean <- trial_wait_int64@run(fn() -> int64 {
             sequence proc[concurrency]
                 car: dangerous_actor_ref <- spawn_dangerous_carrier(phone, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-                me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries(phone)), code: 4 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries(phone)), code: 4, up: false, sent: 0, acked: 0, got: false, cut: false, done: 0, lost: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                 _: boolean <- cast(car, (:open, me, address()) impl ActorMessage {})
             produces
                 pure 0

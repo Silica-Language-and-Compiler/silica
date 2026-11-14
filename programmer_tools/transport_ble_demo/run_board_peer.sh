@@ -7,6 +7,9 @@
 #
 #   ./run_board_peer.sh [uuid] [--central] [--timeout <seconds>] [--build-only]
 #
+# --links <n> (default 1) and --cut <k>: as run_peer.sh's: n whole exchanges, each on a link of its own;
+# on link k this end sends only its first segment and closes. --hold <seconds>: the link is kept that
+# long after the exchange.
 # --central: the board scans for a peripheral offering the service and connects to it (the plan's stage
 # 9); the peripheral is then the Mac (./run_peer.sh peripheral [uuid], started first).
 # uuid is the service's UUID (4, 8 or 36 characters); without it the service is the Nordic UART
@@ -27,10 +30,13 @@ GUEST="$ROOT/compiler/src/emitter/ESP32-S3_raw/board/guest"
 CC="${SILICA_COMPILER:-$ROOT/compiler/build/ESP32-S3_raw/silica-compiler}"
 XT="${XTENSA_BIN:-$HOME/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin}"
 PY="${BOARD_PYTHON:-$HOME/.espressif/python_env/idf6.2_py3.14_env/bin/python}"
-UUID="" TIMEOUT=300 BUILD_ONLY=0 ROLE=peripheral
+UUID="" TIMEOUT=300 BUILD_ONLY=0 ROLE=peripheral LINKS=1 CUT=-1 HOLD=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-only) BUILD_ONLY=1; shift ;;
+        --links) LINKS=$2; shift 2 ;;
+        --cut) CUT=$2; shift 2 ;;
+        --hold) HOLD=$2; shift 2 ;;
         --central) ROLE=central; shift ;;
         --timeout) TIMEOUT=$2; shift 2 ;;
         -*) echo "run_board_peer: unknown argument $1" >&2; exit 2 ;;
@@ -46,7 +52,9 @@ ln -sfn "$ROOT/compiler/stdlib/ble" dangerous_exposure_source/ble
 for m in Supervisor wire_etf wireframe Carrier dangerous_nimble dangerous_ble_radio dangerous_ble_gatt_board_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" trial_wait_int64.silica
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" trial_support_hex.silica
-sed "s|^fn address() -> string { \"peripheral:\" }|fn address() -> string { \"$ROLE:$UUID\" }|" "$HERE/dangerous_ble_board_peer.silica" > dangerous_ble_board_peer.silica
+sed -e "s|^fn address() -> string { \"peripheral:\" }|fn address() -> string { \"$ROLE:$UUID\" }|" \
+    -e "s|^fn links() -> int64 { 1 }|fn links() -> int64 { $LINKS }|" -e "s|^fn cut_link() -> int64 { 0 - 1 }|fn cut_link() -> int64 { 0 - 1 + 1 + $CUT }|" \
+    -e "s|^fn hold_ms() -> uint64 { 0 }|fn hold_ms() -> uint64 { ${HOLD}000 }|" "$HERE/dangerous_ble_board_peer.silica" > dangerous_ble_board_peer.silica
 printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_nimble.silica\ndangerous_ble_radio.silica\ndangerous_ble_gatt_board_carrier.silica\ntrial_support_hex.silica\ntrial_wait_int64.silica\ndangerous_ble_board_peer.silica\n' > silica.config
 # The compiler wants the archive the .meta names; the wrapper itself is compiled into the image as
 # ESP-IDF code, so the archive here holds only the symbols.

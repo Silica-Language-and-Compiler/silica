@@ -51,7 +51,8 @@
      9 fault           field 0 the connection's handle, field 1 why the peripheral this end connected
                        to cannot be used: 1 it does not have the service, 2 the service lacks a
                        characteristic to write or one that indicates, 3 that one cannot be subscribed
-                       to, otherwise 1000 + NimBLE's code. The connection is being ended
+                       to, 4 it sent a segment while eight waited untaken, otherwise 1000 + NimBLE's
+                       code. The connection is being ended
 
    Advertising. The advertisement carries the flags and the service's UUID; the scan response carries
    the device's name, "Silica". The UUID text is that of the Mac's wrapper: 4, 8 or 36 characters of
@@ -80,8 +81,8 @@
      Out: silica_nimble_send queues one segment; it goes out as a write with response when the one
           before has been answered, and ends in a :sent event.
      In:  an indication is one segment, kept in the queue of eight with a :written event. NimBLE
-          confirms an indication before this code sees it, so one that finds the queue full is lost;
-          the peer was told it arrived. */
+          confirms an indication before this code sees it, so one that finds the queue full cannot
+          be refused: the link is ended with a :fault event (4), and nothing is lost in silence. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -351,8 +352,14 @@ static int on_gap_event(struct ble_gap_event *event, void *arg) {
         if (central && event->notify_rx.conn_handle == link && event->notify_rx.attr_handle == peer_tx) {
             static segment in;       /* NimBLE's task only */
             uint16_t len = OS_MBUF_PKTLEN(event->notify_rx.om);
-            if (len == 0 || len > SEG_MAX || uxQueueSpacesAvailable(rx_queue) == 0 || uxQueueSpacesAvailable(events) == 0) break;
-            if (ble_hs_mbuf_to_flat(event->notify_rx.om, in.bytes, SEG_MAX, &in.len) != 0) break;
+            if (len == 0 || len > SEG_MAX || uxQueueSpacesAvailable(rx_queue) == 0 || uxQueueSpacesAvailable(events) < 3
+                || ble_hs_mbuf_to_flat(event->notify_rx.om, in.bytes, SEG_MAX, &in.len) != 0) {
+                /* NimBLE has told the peripheral the segment arrived, and it cannot be kept: the link
+                   ends with a fault, so that nothing is lost in silence (room is kept in the event
+                   queue for the fault and the disconnection) */
+                give_up(link, 4);
+                break;
+            }
             xQueueSend(rx_queue, &in, 0);
             post(EV_WRITTEN, link, 0);
         }

@@ -1,6 +1,6 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-13. Stages 1 to 9 are closed (§6). The goal, the design and the
+Status: **2026-11-13. Stages 1 to 9 are closed and stage 10 is open (§6). The goal, the design and the
 vocabulary are decided (§8: Matt Manley).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
@@ -237,11 +237,18 @@ settled (§6, stage 4):
 
 ### Stage 10. Hardening, Linux and docs
 
-- Pairing and encryption, NimBLE's; `frame_seq` if more than one frame is ever in flight.
-- On both carriers: reconnect; a soak; more than one session at a time; a link lost in the middle of a frame; the
-  `:timeout` reason.
-- BlueZ wrapper and the Linux pack rows in lock-step with the stale Linux goldens of the Wi-Fi plan's stage S-C.
-- The transport design §6.3 to §6.5 and §10, the links design §3.1, the board plan §4.4, the demo README.
+In this order, each part with its own entry in §6:
+
+1. **Links that end and come back, on both carriers:** a carrier opened again after `:link_down`; many rounds in a
+   row (a soak); a link lost in the middle of a frame; the `:timeout` reason; a segment that arrives while the
+   receive queue is full.
+2. **More than one session at a time.**
+3. **Pairing and encryption**, NimBLE's on the board and CoreBluetooth's on the Mac.
+4. **`frame_seq`**, if more than one frame is ever in flight.
+5. **Linux:** the BlueZ wrapper and the Linux pack rows, in lock-step with the stale Linux goldens of the Wi-Fi
+   plan's stage S-C.
+6. **Documents:** the transport design §6.3 to §6.5 and §10, the links design §3.1, the board plan §4.4, the demo
+   README.
 
 ## 5. Risks, ranked
 
@@ -756,6 +763,37 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     nothing offers, sends with no link, and closes (it used to show the role refused); the three assembly
     goldens regenerated. `transport_ble_board_addition` and `transport_board_addition` on the guest: 16 of
     16. The stage 8 script still runs to status 0 on both ends.
+- **Stage 10, part 1, 2026-11-14, done: links that end and come back, on both carriers. Not covered: the
+  `:timeout` reason on the board; a segment arriving at a full receive queue (the link now ends with a fault,
+  untried).**
+  - Built: the two demo peers (`dangerous_ble_peer`, `dangerous_ble_board_peer`) make any number of exchanges,
+    each on a link of its own, opening the carrier again after `:link_down` and starting their framing
+    afresh; an end can cut one link short after its first segment, and can keep a link for a time after the
+    exchange. `run_peer.sh` and `run_board_peer.sh`: `--links`, `--cut`, `--hold`.
+  - A carrier opened again, and a soak. Twenty exchanges in a row, each on a new link, both ends to status 0:
+    - Mac central, board peripheral: 20 of 20. ESP-IDF's heap with the link up: 36,980 bytes free at the first
+      link and at the twentieth.
+    - Board central, Mac peripheral: 20 of 20; 36,876 bytes free at the first and at the twentieth.
+  - A link ended in the middle of a frame (Mac central, board peripheral, each end cutting in turn): the end
+    that had one segment of three reported `link down :closed`, discarded it, opened again, and the next two
+    exchanges were whole on both ends.
+  - Reasons:
+    - The Mac reports `link down :timeout` when the board is restarted under a link that is held, opens
+      again, and makes the next exchange with the restarted board.
+    - The board reports `link down :closed` when the Mac's program is killed under a held link (macOS ends
+      the link) and advertises again within two seconds.
+    - The board's `:timeout` (the peer's radio gone, NimBLE's 0x208) is mapped and not seen: it needs the Mac
+      or a phone taken out of range. The carrier now also reads 0x214 and 0x215 (the peer short of resources,
+      powering off) as `:closed`, and 0x222 and 0x23E (no answer, never established) as `:timeout`.
+  - Found: both ends close as soon as they have finished, and the confirmation of an end's last segment can
+    be lost in the other's close. The demo counts an exchange whole when the peer's frame is in; a program
+    that must know its last segment arrived needs an answer from the peer's program, not the carrier's
+    `:tx_credit` alone, before the link is closed.
+  - Changed: an indication that reaches the board (as central) while eight segments wait for the owner's
+    credit used to be lost, since NimBLE confirms it before the wrapper sees it. The wrapper now ends the link
+    with a fault (`:link_down :fault`). Not tried: the demo's frame is three segments.
+  - Rechecked: `transport_ble_board_addition` on the guest 6 of 6; three links with the board as central;
+    the stage 8 script.
 
 ## 7. Facts the design rests on
 
