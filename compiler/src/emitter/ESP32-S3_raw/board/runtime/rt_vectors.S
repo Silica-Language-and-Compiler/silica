@@ -243,14 +243,20 @@ silica_rt_double_vector:
 // controller) stores its handler in silica_rt_level3_handler and enables a level-3 line in INTENABLE.
 // With no handler stored the vector is a fatal report, as before.
 //
-// The handler is called as if the interrupted code had made the call itself: by call8, in the
-// interrupted window, on the interrupted stack, the stack pointer untouched. A callee's frame keeps
-// the 16 bytes under its caller's stack pointer for that caller's caller, so the window overflow and
-// underflow paths find every frame where they would after an ordinary call. What an ordinary call
-// may change and interrupted code does not expect changed is kept in silica_rt_level3_save and put
-// back: a8 to a15, the shift amount, the loop registers and the compare register. a0 is in EXCSAVE3;
-// a1 to a7 a callee leaves alone. The handler runs with PS.INTLEVEL 3, so it is not interrupted by
-// its own level, and with window exceptions on. It must not use the floating-point registers.
+// The handler is called as if the interrupted code had made the call itself: in the interrupted
+// window, on the interrupted stack, the stack pointer untouched. A callee's frame keeps the 16 bytes
+// under its caller's stack pointer for that caller's caller, so the window overflow and underflow
+// paths find every frame where they would after an ordinary call.
+//
+// The call is call4, not call8. If the handler's calls go deep enough to spill the interrupted
+// window, a window that made a call8 has a4 to a7 stored in the top of its own frame, 32 to 16
+// bytes under its caller's stack pointer, room a function has only if it makes such calls itself. A
+// leaf with a 16-byte frame has its caller's saved a0 to a3 there (a ROM memcpy, interrupted, lost
+// its caller's return address this way). A window that made a call4 has only a0 to a3 stored, in
+// its callee's frame. So a4 to a15, which a call4 gives to the callee, are kept here and put back,
+// with the shift amount, the loop registers and the compare register. a0 is in EXCSAVE3; a1 to a3
+// the callee leaves alone. The handler runs with PS.INTLEVEL 3, so it is not interrupted by its
+// own level, and with window exceptions on. It must not use the floating-point registers.
 //
 // One save area: one core takes these interrupts. The interrupted code must have a valid stack
 // pointer and window state, so runtime code that has neither for a moment (a switch of stacks) is
@@ -266,51 +272,59 @@ silica_rt_level3_interrupt:
     movi    a0, 1003
     j       silica_rt_fatal_trampoline
 1:  movi    a0, silica_rt_level3_save
-    s32i    a8,  a0, 0
-    s32i    a9,  a0, 4
-    s32i    a10, a0, 8
-    s32i    a11, a0, 12
-    s32i    a12, a0, 16
-    s32i    a13, a0, 20
-    s32i    a14, a0, 24
-    s32i    a15, a0, 28
-    rsr     a8, sar
-    s32i    a8, a0, 32
-    rsr     a8, lbeg
-    s32i    a8, a0, 36
-    rsr     a8, lend
-    s32i    a8, a0, 40
-    rsr     a8, lcount
-    s32i    a8, a0, 44
-    rsr     a8, scompare1
-    s32i    a8, a0, 48
-    movi    a8, 0
-    wsr     a8, lcount            // no loop of the interrupted code closes inside the handler
-    movi    a8, 0x40023           // PS: WOE=1, EXCM=0, UM=1, INTLEVEL=3
-    wsr     a8, ps
+    s32i    a4, a0, 0
+    s32i    a5, a0, 4
+    s32i    a6, a0, 8
+    s32i    a7, a0, 12
+    s32i    a8, a0, 16
+    s32i    a9, a0, 20
+    s32i    a10, a0, 24
+    s32i    a11, a0, 28
+    s32i    a12, a0, 32
+    s32i    a13, a0, 36
+    s32i    a14, a0, 40
+    s32i    a15, a0, 44
+    rsr     a4, sar
+    s32i    a4, a0, 48
+    rsr     a4, lbeg
+    s32i    a4, a0, 52
+    rsr     a4, lend
+    s32i    a4, a0, 56
+    rsr     a4, lcount
+    s32i    a4, a0, 60
+    rsr     a4, scompare1
+    s32i    a4, a0, 64
+    movi    a4, 0
+    wsr     a4, lcount            // no loop of the interrupted code closes inside the handler
+    movi    a4, 0x40023           // PS: WOE=1, EXCM=0, UM=1, INTLEVEL=3
+    wsr     a4, ps
     rsync
     movi    a0, silica_rt_level3_handler
     l32i    a0, a0, 0
-    callx8  a0
+    callx4  a0
     movi    a0, silica_rt_level3_save
-    l32i    a8, a0, 32
-    wsr     a8, sar
-    l32i    a8, a0, 36
-    wsr     a8, lbeg
-    l32i    a8, a0, 40
-    wsr     a8, lend
-    l32i    a8, a0, 44
-    wsr     a8, lcount
-    l32i    a8, a0, 48
-    wsr     a8, scompare1
-    l32i    a8,  a0, 0
-    l32i    a9,  a0, 4
-    l32i    a10, a0, 8
-    l32i    a11, a0, 12
-    l32i    a12, a0, 16
-    l32i    a13, a0, 20
-    l32i    a14, a0, 24
-    l32i    a15, a0, 28
+    l32i    a4, a0, 48
+    wsr     a4, sar
+    l32i    a4, a0, 52
+    wsr     a4, lbeg
+    l32i    a4, a0, 56
+    wsr     a4, lend
+    l32i    a4, a0, 60
+    wsr     a4, lcount
+    l32i    a4, a0, 64
+    wsr     a4, scompare1
+    l32i    a4, a0, 0
+    l32i    a5, a0, 4
+    l32i    a6, a0, 8
+    l32i    a7, a0, 12
+    l32i    a8, a0, 16
+    l32i    a9, a0, 20
+    l32i    a10, a0, 24
+    l32i    a11, a0, 28
+    l32i    a12, a0, 32
+    l32i    a13, a0, 36
+    l32i    a14, a0, 40
+    l32i    a15, a0, 44
     rsr     a0, excsave3
     rfi     3
 
@@ -320,7 +334,7 @@ silica_rt_level3_interrupt:
 silica_rt_level3_handler:
     .space  4
 silica_rt_level3_save:
-    .space  52
+    .space  68
 
 // a0 = cause code (EXCCAUSE for user exceptions, 1001+ for the other vectors). The faulting
 // context is abandoned: a fresh stack and a single live window are set up, the diagnostic is

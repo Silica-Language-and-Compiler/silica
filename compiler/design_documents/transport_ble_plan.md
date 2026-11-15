@@ -1259,9 +1259,9 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Next: NimBLE on the shim (the 21 functions, a second task, timers that fire), then the wrapper under
     a C main: the frame exchanged with the Mac, pairing included.
 
-- **Stage 12, part 4, step 2, 2026-11-14, working but not sound: NimBLE runs on the chip Silica owns and
-  the stage 7 exchange, pairing included, has passed against the Mac. One run in three ended in a fault
-  that is not yet found.**
+- **Stage 12, part 4, step 2, 2026-11-14, done: NimBLE runs on the chip Silica owns and the stage 7
+  exchange, pairing included, passes against the Mac. The fault that ended one run in three was in step
+  5's interrupt path, and is fixed (step 3 below).**
   - Built, in `board/spike_r1`:
     - `hci_shim.c` grown for the host: up to three tasks as coroutines beside main, passed control in
       turn; ESP-IDF's one-shot timers, run when a line of control yields; a memory block that takes
@@ -1296,12 +1296,42 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     - With the handler polled, the link was lost during the 0.8 s of the key pair: nothing serves the
       controller while a task computes. This is step 4's rule seen from the host's side, and why the
       handler is an interrupt.
-  - Not found: what corrupts a return address now and then with the handler by interrupt (an illegal
-    instruction in the ROM with a meaningless caller, once; a null read in NimBLE's event queue, once).
-    The polled runs did not show it. The suspects are the level-3 path's assumptions about the code it
-    interrupts and the fairness of the turn-taking between the tasks.
+  - Left for step 3: what corrupted a return address now and then with the handler by interrupt (an
+    illegal instruction in the ROM with a meaningless caller, once; a null read in NimBLE's event queue,
+    once). The polled runs did not show it.
   - `stdlib/ble/silica_ble.m`, `silica_ble_nimble.c` and the demo's Mac program are unchanged: the same
     wrapper and the same peer as on the guest.
+
+- **Stage 12, part 4, step 3, 2026-11-14, done: the fault found, in the level-3 path of step 5, and
+  fixed. The handler is now called by call4.**
+  - The fault: step 5 called the handler by `call8` from the interrupted window, "as the interrupted
+    code would". When the handler's calls go deep enough to spill that window, a window that made a
+    `call8` has a4 to a7 stored 32 to 16 bytes under its caller's stack pointer: the top of its own
+    frame, room a function has only if it makes such calls itself. A leaf with a 16-byte frame has its
+    caller's saved a0 to a3 there, so the store replaced its caller's return address. The ROM's
+    `memcpy` is such a leaf. Step 5's runs did not go deep enough to spill; NimBLE's did.
+  - The fix, `runtime/rt_vectors.S`: the call is `call4`. A window that made a `call4` has only a0 to a3
+    stored when it is spilled, in its callee's frame. A `call4` gives a4 to a15 to the callee, so the path
+    keeps and puts back those twelve.
+  - Run after the fix, the NimBLE exchange with the Mac, pairing included:
+
+    | Main busy between visits to the tasks | Runs | The frame whole on both ends |
+    | --- | --- | --- |
+    | not busy | 4 | 4 |
+    | 30 ms | 4 | 4 |
+    | 100 ms | 5 | 5 |
+
+    No run faulted. At 100 ms the board sees two of its three segments confirmed: the Mac ends the link
+    when it has the frame, and main, taking one event each 100 ms, loses the third confirmation to the
+    disconnection. The Mac had all three. `nimble_main.c` first counted that as a failure; it now prints
+    the count and requires the segments sent and received.
+  - `silica_04_print`, `silica_08_stack_guard` and `silica_09_lists` match with the changed vectors.
+  - Where route R1 stands: on a chip the bare-metal runtime owns, the clocks, the radio, the controller,
+    NimBLE, pairing and the frame both ways, with the Bluetooth code in flash and the handler by
+    interrupt. What is left is the runtime's own part: the tasks and the turn-taking, done here by a C
+    main and coroutines, made the scheduler's, so that a Silica program's actors run beside the
+    controller (stack room for the handler, the level masked where the runtime switches stacks, Silica's
+    code in flash).
 
 ## 7. Facts the design rests on
 
