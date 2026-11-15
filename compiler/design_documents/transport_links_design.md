@@ -163,6 +163,7 @@ carriers):
 | `(:serial_port, path: string, baud: uint32)` | OS device path, baud | `:serial` | hosted: a termios port; today's `(:serial)` carrier with its `"path@baud"` address split out |
 | `(:usb_cdc, n: uint32)` | instance | `:serial` | board, later (plan item L) |
 | `(:usb_serial_jtag)` | none | `:serial` | ESP32-S3: the native USB-C jack through the USB-Serial-JTAG controller (the stage S-A carrier; added to the vocabulary 2026-11-09, stage S-C) |
+| `(:bluetooth, n: uint32)` | instance | `:ble_gatt` | the n-th Bluetooth adapter; 0 is the only instance, the Mac's adapter on macOS and the chip's own radio on the ESP32-S3. The role and the service are in the `:open` address, not in the link ([transport_ble_plan.md](transport_ble_plan.md) §8, decision 6) |
 
 The pairing of link and carrier kind is a table in the pack module's shared vocabulary (`Link@carries(link, kind)`,
 §3.4); a mismatch is E2414.

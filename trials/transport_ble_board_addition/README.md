@@ -1,6 +1,6 @@
 # transport_ble_board_addition
 
-Board-only trials of the `(:ble_gatt)` carrier on the ESP32-S3's own radio (`transport_ble_plan.md` stages 7 and 9):
+Board-only trials of the `(:ble_gatt)` carrier on the ESP32-S3's own radio (`transport_ble_plan.md` stages 7, 9 and 10):
 `carried_on phone: (:ble_gatt) (:bluetooth, 0);`, the carrier `dangerous_ble_gatt_board_carrier` above the radio
 actor `dangerous_ble_radio` and NimBLE, ESP-IDF's Bluetooth host. The programs only spawn, cast and wait; the
 framing module, the NimBLE bindings, the radio actor and the carrier are named by the Makefile from
@@ -19,6 +19,7 @@ peer is `programmer_tools/transport_ble_demo/run_board_peer.sh` (the board as pe
 | --- | --- |
 | `dangerous_ble_gatt_link_central` | the declaration and `spawn_dangerous_carrier(phone, ...)` (expanded by the ESP32-S3 pack's `carrier_spawn` to `spawn({...}, dangerous_ble_gatt_board_carrier@carrier, ...)`, an `actor_ref`); `Carrier@mtu(phone)` is 20; `(:open, owner, "central:<uuid>")` with a UUID nothing nearby offers: the radio actor starts the controller and NimBLE and scans; a `:tx` while the link is not up is `(:tx_failed, :link_down)`; six seconds later `:close` ends the scan and answers `(:link_down, :closed)` |
 | `dangerous_ble_gatt_link_bad_service` | `(:open, owner, "peripheral:not-a-uuid")`: the carrier spawns the radio actor, the wrapper refuses the service before the host starts, and the owner gets `(:link_down, :fault)` |
+| `dangerous_ble_gatt_link_second_carrier` | the board holds one link: with one carrier open as a peripheral, `(:open, owner, "peripheral:")` to a second carrier answers `(:link_down, :fault)`, and the first then closes with `(:link_down, :closed)` |
 | `dangerous_ble_gatt_link_open_close` | `(:open, owner, "peripheral:")`: the radio actor publishes the Nordic UART Service, starts the controller and NimBLE and advertises; a `:tx` while no central has subscribed is `(:tx_failed, :link_down)`; six seconds later `:close` stops the advertising and answers `(:link_down, :closed)`. The board is on the air as "Silica" for those seconds |
 
 ## Goldens and targets

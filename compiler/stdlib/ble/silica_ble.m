@@ -409,6 +409,7 @@ silica_ble_tagged silica_ble_open(const uint8_t *uuid_ptr, uint64_t uuid_len) {
         }
         NSInteger st = s.managerState;
         [s.cond unlock];
+        trace([NSString stringWithFormat:@"open: role %d, session %lld, manager state %ld", (int)role, (long long)handle, (long)st]);
         if (st == CBManagerStatePoweredOn) return ok(handle);
         [sessions_lock() lock];
         sessions[handle - 1] = nil;

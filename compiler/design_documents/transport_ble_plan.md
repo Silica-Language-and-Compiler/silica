@@ -1,6 +1,6 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-13. Stages 1 to 9 are closed and stage 10 is open (§6). The goal, the design and the
+Status: **2026-11-14. Stages 1 to 9 are closed, stage 10 is open (§6), stage 11, Linux, is deferred, and stage 12 studies the route on which Silica owns the chip. The goal, the design and the
 vocabulary are decided (§8: Matt Manley).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
@@ -69,8 +69,10 @@ environment it was written for:
 - **The radio actor** owns the wrapper. Every event NimBLE reports becomes a message; every request to the host is
   a cast to it. Nothing else calls the wrapper.
 - **One connection actor per link** holds that link's state (the negotiated MTU, the subscription, the credit), as
-  the TCP listener spawns one connection carrier per accepted peer. Two peers are two actors, and one failing does
-  not touch the other.
+  the TCP listener spawns one connection carrier per accepted peer. On the Mac two peers are two actors (up to
+  four), and one failing does not touch the other. The board holds one link: the first carrier a program opens
+  takes the radio, and an `:open` to another answers `(:link_down, :fault)`. One board reaches several peers in
+  turn, by closing and opening again.
 - **The carrier** is the owner-facing end of a connection actor and speaks the §6.2 contract. It calls no foreign
   code, so on the board it is an ordinary actor (an `actor_ref`); the Mac's carrier calls its wrapper itself and is
   a `dangerous_actor_ref`.
@@ -107,10 +109,13 @@ These are not built by any stage here, and no stage's code should lean toward th
   not on the path to the demo. HCI is a published standard, and stage 4 showed a Silica program reaching the
   controller through ESP-IDF's virtual HCI calls. The carrier's contract would not change, so a program written
   against the carrier would not see the host replaced.
-- **Silica owning the chip with the controller as its guest** (the Wi-Fi plan's R1). A possible later project.
 - **The stack check before a large frame is opened**, in the compiler's emitted code, in place of after it. It
   would close, on any runtime, the two-instruction window the guest's builder now covers with a larger reserve
   (§6, stage 5). It changes emitted code and its assembly goldens on the board target.
+- **More than one link at a time on the board** (decided 2026-11-14): a board as the hub of several boards, or
+  linked to a board and a phone at once. It is confined to the wrapper, the radio actor and the board carrier
+  (the link's state by connection handle in each), costs about 9 KB of ESP-IDF's heap for each further link, and
+  does not change the carrier's contract. A Mac can be the hub today.
 - **A second chip as a modem.** Dropped.
 - **A controller written in Silica.** Not possible: the radio hardware is undocumented.
 
@@ -235,20 +240,45 @@ settled (§6, stage 4):
 - The wrapper's central side: scan, connect, discover the service, subscribe, write.
 - **Closes when:** the board as central and the Mac as peripheral exchange the frame.
 
-### Stage 10. Hardening, Linux and docs
+### Stage 10. Hardening and docs
 
 In this order, each part with its own entry in §6:
 
 1. **Links that end and come back, on both carriers:** a carrier opened again after `:link_down`; many rounds in a
    row (a soak); a link lost in the middle of a frame; the `:timeout` reason; a segment that arrives while the
    receive queue is full.
-2. **More than one session at a time.**
-3. **Pairing and encryption**, NimBLE's on the board and CoreBluetooth's on the Mac.
-4. **`frame_seq`**, if more than one frame is ever in flight.
-5. **Linux:** the BlueZ wrapper and the Linux pack rows, in lock-step with the stale Linux goldens of the Wi-Fi
-   plan's stage S-C.
-6. **Documents:** the transport design §6.3 to §6.5 and §10, the links design §3.1, the board plan §4.4, the demo
+2. **More than one session at a time:** two links held at once by one Mac program; on the board, a second
+   carrier refused while the first holds the radio (§2.2).
+3. **Pairing and encryption**, NimBLE's on the board and CoreBluetooth's on the Mac: a board as peripheral
+   requires an encrypted link, and a central pairs when its peripheral requires it.
+4. **`frame_seq`**, if more than one frame is ever in flight (closed as not needed, §6).
+5. **Documents:** the transport design §6.3 to §6.5 and §10, the links design §3.1, the board plan §4.4, the demo
    README.
+
+### Stage 11. Linux (deferred, decided 2026-11-14)
+
+- The BlueZ wrapper and the Linux pack rows, in lock-step with the stale Linux goldens of the Wi-Fi plan's
+  stage S-C.
+- It waits for a Linux machine with Bluetooth. Until then the Linux pack provides no `(:ble_gatt)` carrier.
+- **Closes when:** a Linux program and the board exchange the frame, in each role.
+
+### Stage 12. Route R1: Silica owns the chip, the controller its guest (a study, opened 2026-11-14)
+
+The route the Wi-Fi plan names R1. The bare-metal runtime keeps the chip, and Espressif's closed controller and
+radio libraries run inside it, given the operating system they expect by Silica's runtime in place of
+FreeRTOS. Nothing above the controller changes: the wrapper's calls, the radio actor and the carrier stay. The
+guest of ESP-IDF (§2.1) stays the built route and the reference an R1 build is compared against. Lee's
+decisions on the radio routes are in the Wi-Fi plan.
+
+The spike is an experiment on a branch of its own, `ble-r1-spike`, cut from `ble-transport-support` (Matt
+Manley, 2026-11-14). If it succeeds it is merged into `ble-transport-support`; Wi-Fi development is taken up
+after that, on the merged base.
+
+1. **A reading pass**, with no board: every call the closed libraries make outside themselves, sorted into
+   what the bare-metal runtime answers today, what needs new runtime work, and what is unclear.
+2. **A decision** from that list: whether a spike is worth its time.
+3. **A spike, time-boxed:** the controller answers one HCI command on a chip Silica owns. The guest route is
+   the fallback.
 
 ## 5. Risks, ranked
 
@@ -259,8 +289,10 @@ In this order, each part with its own entry in §6:
 2. **Memory.** NimBLE takes RAM of its own beside the controller, and Silica's block (208 KB with the controller
    alone, stage 5) shrinks by that much; Wi-Fi beside it takes more (§2.3). Stage 6 measures both. The board's
    2 MB of PSRAM is unused.
-3. **No pairing or encryption until stage 10.** Any nearby device can connect and read or write the link. Nothing
-   sensitive crosses it before then.
+3. **The peer is not proved.** A link to a board as peripheral is encrypted (stage 10), so a listener reads
+   nothing; the pairing has no code, so any nearby device can still pair and use the link. A link to a Mac
+   program as peripheral is open, since macOS does not let such a program pair. Nothing that needs the peer
+   proved crosses the link.
 4. **Trials.** A radio and a second device cannot be in `make integrate`; most evidence is scripted runs, as for the
    board demos.
 5. **Throughput.** 16 payload bytes per segment at the default MTU, each acknowledged. Enough for readings, not for
@@ -794,6 +826,181 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     with a fault (`:link_down :fault`). Not tried: the demo's frame is three segments.
   - Rechecked: `transport_ble_board_addition` on the guest 6 of 6; three links with the board as central;
     the stage 8 script.
+- **Stage 10, part 2, 2026-11-14, done: one Mac program held two links at once, to the board and to an iPhone,
+  and a frame crossed whole on each; the board holds one link and refuses a second carrier. Found: of two Mac
+  carriers opened at the same moment, one stays closed and says nothing (not explained; worked round).**
+  - Decided (Matt Manley): the board holds one link at a time. Several at once is outside this plan (§2.4).
+  - Built:
+    - `dangerous_ble_peer` and `run_peer.sh --second <address>`: a second session with a carrier and an owner
+      of its own, its lines marked `A:` and `B:`; the program ends when both sessions have, with the worse
+      status.
+    - `dangerous_ble_gatt_board_carrier`: the first carrier a program opens takes the radio, by registering
+      itself as `:dangerous_ble_gatt_board_carrier`, and keeps it for as long as the program runs. An `:open`
+      to any other carrier answers `(:link_down, :fault)`. Before, the second carrier ended at its spawn of
+      the radio actor (the name was taken) and its owner heard nothing.
+    - Trial `transport_ble_board_addition/dangerous_ble_gatt_link_second_carrier`: the refusal, and the first
+      carrier closing as usual afterwards. Its `.scout` was written by hand before the first run.
+    - `silica_ble.m`: a trace line for what `open` answers.
+  - The two links (Mac: session A central to the board's service, session B peripheral of the Nordic UART
+    Service; iPhone with nRF Connect as B's central; both links held after their exchange):
+    - A: `link up mtu:253`, the 48-byte frame out and the board's in. B, with A's link still up:
+      `link up mtu:512`, three segments indicated to the phone, the phone's three writes, `frame in 48 bytes`
+      and the reading. Then `A: link down :closed`, `B: link down :closed`, status 0; the board status 0.
+    - A write of 40 bytes from the phone (one value entered twice) gave a 68-byte frame, `rejected :bad_tag`,
+      and the next three writes a whole frame on the same link.
+    - Earlier, with no phone: A made three exchanges with the board, each on a new link, while B advertised.
+  - Found, not explained: two hosted `(:ble_gatt)` carriers opened at the same moment. The wrapper opens both
+    sessions and answers each `open` with its handle; one of the two carriers is afterwards in phase 0, sends
+    its owner no `:link_down`, does not poll, and leaves its session advertising. A second `:open` to it then
+    works. All eight runs showed it, on one carrier or the other. With the second `:open` two seconds after
+    the first, both carriers polled in nine runs of nine; spawning both at once makes no difference, and a
+    timer armed before either opens makes none. It lies between the wrapper's answer and the carrier's next
+    state, in the runtime or the emitted call, not in the Bluetooth code. The demo opens its second session
+    two seconds after the first; the carrier's header says to open carriers one after another.
+  - Fixed, from part 1: the two demo owners ignored a `:link_down` that came before `:link_up`, so a carrier
+    that failed at `:open` left the program waiting for its time limit. They now count it (status 1 for
+    `:fault`). Seen on the Mac with an unreadable UUID; the board's program was built and ran one whole link
+    with the change, its failing case not tried.
+  - Rechecked: `transport_ble_board_addition` and `transport_board_addition` on the guest, 18 of 18, after
+    the Bluetooth suite's assembly goldens were written again (the carrier names one more atom); two links
+    between the Mac with one session and the board, both ends status 0, 36,980 and 36,968 bytes of ESP-IDF's
+    heap free at the two.
+  - Not covered: more than two sessions on the Mac; two links with the Mac as the central of both.
+- **Stage 10, part 3, 2026-11-14, done: a link to a board as peripheral is paired and encrypted, from the Mac
+  and from an iPhone. A Mac program as peripheral cannot pair, so the board as central has an open link to it.
+  Not covered: board to board.**
+  - The rule: the peripheral decides.
+    - A board as peripheral requires an encrypted link. It asks its central to pair as soon as it is
+      connected; its written characteristic and its subscription are refused until the link is encrypted,
+      and `:link_up` comes only then. A central whose pairing fails is disconnected.
+    - A central pairs when its peripheral requires it: macOS and iOS do so by themselves; the board does when
+      the peripheral asks or refuses its subscription for want of encryption, and subscribes again.
+    - A Mac program as peripheral has an open link. macOS lets a peripheral pair only from an application
+      with a window (reports on Apple's developer forum say the same); with the Mac's characteristics marked
+      as needing encryption, the board's pairing request was refused within 150 ms (the Security Manager's
+      "unspecified reason"), with and without bonding asked for, and macOS asked for no pairing of its own.
+  - The pairing: LE Secure Connections with no code ("Just Works"), a 16-byte key. It keeps a listener out
+    and does not prove who the peer is (§5, risk 3).
+  - No keys are kept (no bonding): every link pairs afresh. Flashing a guest image erases the board's NVS,
+    where keys would be, and a Mac or phone that still held keys for the board would then be refused until
+    its user removed the device by hand. The cost: about a second for each link, and an iPhone asks its user
+    at every connection.
+  - Built:
+    - `silica_ble_nimble.c`: NimBLE's Security Manager set up at the start; the written characteristic with
+      `WRITE_ENC`, the indicated one with `NOTIFY_INDICATE_ENC`; the `:subscribed` event of a peripheral held
+      until the link is encrypted; as central, pairing and a second subscription when the first is refused
+      for want of encryption; fault 5, the pairing failed.
+    - `sdkconfig.defaults`: NimBLE's security on, Secure Connections only, nothing kept in NVS.
+    - The carriers' and the radio actor's headers say the rule. The contract and the Mac's wrapper are
+      unchanged.
+  - Results:
+    - Mac central, board peripheral: three exchanges, each on a new link, both ends status 0. The board read
+      each link as encrypted, not authenticated, not bonded, key size 16 (a line added to the wrapper for
+      the run and removed). Before the subscription needed encryption, the Mac declared its link up while
+      the pairing ran and two of its three writes passed their two-second limit (`tx failed`), though they
+      arrived; with it, none failed.
+    - Board central, Mac peripheral (open): three of three, both ends status 0.
+    - iPhone (nRF Connect) central, board peripheral: the phone asked to pair when indications were enabled;
+      three segments each way, `frame in 48 bytes`, the reading, status 0. Done twice with the board flashed
+      between: the phone asked both times and the second pairing worked.
+    - The stage 8 script (Mac central, board peripheral): status 0 on both ends, over an encrypted link.
+    - `transport_ble_board_addition` and `transport_board_addition` on the guest: 18 of 18.
+    - The core suites on the guest, since ESP-IDF's configuration changed for every guest image:
+      `supervisors_addition` 284, `timers_addition` 26, `ffi_addition` 67, `deep_frame_spill_addition` 16,
+      `scheduler_policy_addition` 12, `supervisor_exit_reports_addition` 25, all passing. In the two suites
+      marked pending the output differs only where it did at the close of stage 5
+      (`stack_release_algorithms`, `thousand_actors_at_rest`, and the two `device_fault_lines` hangs).
+  - Memory: ESP-IDF's heap with a link up 35,150 bytes free (36,980 before); the application's code 30 KB
+    larger.
+  - Not covered: board to board (one board); a peripheral other than a board that requires encryption, with
+    the board as central.
+
+- **Stage 10, part 4, 2026-11-14, closed with nothing built: `frame_seq` stays 0, since no link has more than
+  one frame in flight.**
+  - A link's owner frames one frame and sends its segments in order through one carrier. Each segment is
+    confirmed by the peer (an indication, or a write with response), and the link delivers them in order.
+  - The receiver rejects a segment whose index is not the next (`:bad_tag`), so a segment lost or repeated is
+    seen. A link that ends in the middle of a frame starts the next with fresh reassembly state (part 1).
+  - `frame_seq` would be needed by an owner that sent the segments of two frames interleaved on one link, as
+    to let a short urgent frame pass a long one. Nothing does. The receiver also tells the first segment of a
+    segmented frame from a bare frame by its four zero bytes, so a sequence other than 0 would change
+    `wireframe@unframe` as well as `wireframe@frame`.
+
+- **Stage 10, part 5, 2026-11-14, done: the documents say what was built.**
+  - The transport design: §6.3 (the Mac's row: four sessions, opened one after another; Linux not built),
+    §6.4 (the board's row: an ordinary actor above the radio actor, one link), §6.5 rewritten (the three
+    providers as built, the service, what BLE asks of the carrier's properties, the encryption rule, how many
+    links) and §10 (phase 5 as delivered).
+  - The links design §3.1: the `(:bluetooth, n)` row.
+  - The board plan §4.4: Bluetooth as built, through the guest of ESP-IDF.
+  - The guest's README: one link, the encrypted link, the heap figure with a paired link.
+  - `programmer_tools/transport_ble_demo/README.md`, new: the scripts, the runs in each role, the phone's
+    steps and the limits.
+  - Not changed: the specification, whose §16.4.7 and §16.4.8 already give the framing and the carrier
+    contract.
+
+- **Stage 12, part 1, 2026-11-14, done: the closed libraries ask for little by name. What they need comes
+  through one table of functions and through ESP-IDF's open start-up code. One question is left that reading
+  cannot answer: how long the controller may be kept waiting.** Read in ESP-IDF 6.2
+  (`components/bt/controller`, `esp_phy`, `esp_coex`), the libraries' symbols listed with the toolchain's `nm`.
+  - The controller, `libbtdm_app.a` (104 objects): 184 symbols from outside itself. 179 are in the chip's ROM
+    (60 controller functions, the controller's data, `memcpy` and its kind, `ets_delay_us`, `ets_printf`); the
+    other 5 are in the radio library (`bt_bb_*`, `bt_track_pll_cap`). It names nothing of FreeRTOS or ESP-IDF.
+  - Its operating system is a table of 61 functions (`osi_funcs_t`, filled by the open `esp32c3/bt.c`, 2,472
+    lines, which the ESP32-S3 shares):
+    - interrupts: allocate on a core at level 3, free, enable, disable, mask all and restore, "am I in a
+      handler";
+    - one task (the controller's, 3,584 bytes of stack, near the highest priority), yield, yield from a
+      handler;
+    - semaphores, mutexes and queues, each with a form called from a handler;
+    - memory, the MAC address from eFuse, random numbers, the time in microseconds, a delay;
+    - sleep (five phases and the slow clock's conversions), radio power up and down;
+    - coexistence with Wi-Fi (ten entries).
+  - The radio libraries: `libphy.a` needs five symbols beyond the ROM (a critical section, two prints,
+    `sprintf`), `libbtbb.a` four, `libcoexist.a` two.
+  - Behind the table, `bt.c` calls ESP-IDF's own services: `esp_intr_alloc` (through a call to the other
+    core), FreeRTOS tasks, queues and semaphores, `esp_timer`, power-management locks, the modem's clock and
+    power domain (`periph_module_enable`, `esp_wifi_bt_power_domain_on`), the slow clock's calibration, and
+    `esp_phy_enable`.
+  - Radio start-up, `esp_phy/src/phy_init.c` (1,253 lines, open): the modem's clocks on, then the closed
+    `register_chipv7_phy` with the board's init data and calibration data. The calibration data is kept in
+    NVS, or made afresh at each start.
+  - Sorted, so far:
+    - Answered today or small: memory, the MAC address, random numbers, time and delay, the prints, the
+      `memcpy` kind (in ROM).
+    - Answered by saying no:
+      - Sleep. The guest image already runs the controller with its sleep off and ESP-IDF's power management
+        off, so "never sleeps" is the configuration every stage here ran on.
+      - Coexistence with Wi-Fi. Each of `bt.c`'s wrappers has a form for a build without it that answers 0.
+      - Five entries of the table are empty in ESP-IDF itself.
+    - Memory, no conflict: the ROM's Bluetooth code keeps its data at fixed addresses, `0x3FCEF81C` to
+      `0x3FCEFFFC`. The bare-metal runtime's RAM ends at `0x3FCE9700`, below them.
+    - New runtime work:
+      - Interrupts. The controller takes its interrupts at level 3 on one core; the bare-metal runtime masks
+        them all (the board plan's item K). Stage 5 worked out what an interrupt costs a Silica stack.
+      - The controller's task: run when a handler gives its semaphore, ahead of the actors on its core, on a
+        stack of its own.
+      - Semaphores, mutexes and queues, each usable from a handler.
+      - Clocks. The bare-metal start leaves the chip as the ROM does, on the 40 MHz crystal. The radio needs
+        the 480 MHz PLL running and the bus clock at 80 MHz (`bt.c` holds ESP-IDF's "bus clock at its
+        highest" lock while the controller is on). ESP-IDF's bootloader and start-up do this in open code:
+        `rtc_clk.c`, `rtc_clk_init.c` and `rtc_init.c`, 993 lines for this chip. A faster bus clock changes
+        the divisor of every peripheral clocked from it, the console's UART first.
+      - Radio start-up. `phy_init.c` and `phy_common.c` (1,700 lines, open) turn the modem's clocks and power
+        domain on and call the closed `register_chipv7_phy`. Without NVS the radio is calibrated in full at
+        every start, which ESP-IDF offers as an option; its cost in time is not measured.
+    - Not answered by reading: how long the controller's handlers and its task may be kept waiting. The link
+      layer is closed. It can be measured on the guest image, by holding the controller's task back by a known
+      time and watching the link, before any R1 code is written.
+  - What this says for the decision (part 2):
+    - For a spike: the seam is clean (one table), the memory does not collide, sleep and coexistence drop
+      out, and every piece of start-up the radio needs is open code that can be read and carried over.
+    - Against: R1 needs interrupts in the bare-metal runtime, which changes its central rule that nothing
+      interrupts an actor's core, and a pre-empting task beside the schedulers. That is the work of item K
+      and more, and it is the same work whatever the timing turns out to be.
+    - The spike's first two steps need no interrupts and little time: the clocks and the radio's start-up
+      on a chip Silica owns (the closed `register_chipv7_phy` returning), then the timing measurement on the
+      guest.
 
 ## 7. Facts the design rests on
 
@@ -821,6 +1028,9 @@ Each stage's result is recorded here when it closes: date, what was built, trial
 3. **Silica keeps both cores.** Its two schedulers run as two tasks, each on the core it uses today.
 
 4. **Pairing and encryption wait for stage 10.** Until then the link is open to any nearby device (§5, risk 3).
+   As built (2026-11-14): pairing with no code and no keys kept; the peripheral decides whether a link is
+   encrypted, and a board as peripheral always requires it. A code shown on the board's console, which would
+   prove the peer, is not built.
 
 5. **`mtu` is the literal 20; the negotiated value arrives in `:link_up`.** Every `Carrier` method body is a literal,
    `Carrier@mtu(<name>)` resolves to the kind's row, and `wireframe@frame` takes the `mtu` as an argument, so an
@@ -833,4 +1043,5 @@ Each stage's result is recorded here when it closes: date, what was built, trial
 7. **Decision 15 of the links design holds for BLE trials.** Board trials stay compile-time, assembly, diagnostics
    and one direction. The two-way runs are scripts outside `make integrate`.
 
-8. **Linux comes after the board** (stage 10), together with the Linux goldens that already wait to be regenerated.
+8. **Linux comes after the board** (stage 11), together with the Linux goldens that already wait to be regenerated.
+   Deferred on 2026-11-14 until a Linux machine with Bluetooth is at hand.

@@ -51,8 +51,9 @@
      9 fault           field 0 the connection's handle, field 1 why the peripheral this end connected
                        to cannot be used: 1 it does not have the service, 2 the service lacks a
                        characteristic to write or one that indicates, 3 that one cannot be subscribed
-                       to, 4 it sent a segment while eight waited untaken, otherwise 1000 + NimBLE's
-                       code. The connection is being ended
+                       to, 4 it sent a segment while eight waited untaken, 5 it requires an encrypted
+                       link and the pairing failed, otherwise 1000 + NimBLE's code. The connection is
+                       being ended
 
    Advertising. The advertisement carries the flags and the service's UUID; the scan response carries
    the device's name, "Silica". The UUID text is that of the Mac's wrapper: 4, 8 or 36 characters of
@@ -71,6 +72,16 @@
           the next goes out when the central has confirmed the one before; each ends in a :sent event.
    The largest segment is the connection's ATT_MTU minus 3 (silica_nimble_mtu), never more than
    SEG_MAX, which follows NimBLE's preferred MTU (CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU, 256).
+
+   Pairing and encryption (stage 10). The peripheral decides. As peripheral this end requires an
+   encrypted link: it asks its central to pair as soon as it is connected, its characteristic refuses
+   a write and its subscription until the link is encrypted, and the :subscribed event comes only
+   then; a central that does not pair gets nothing, and one whose pairing fails is disconnected. As
+   central this end pairs when the peripheral asks or refuses the subscription for want of
+   encryption, and takes an open link from a peripheral that asks for none (a program on a Mac:
+   macOS lets only an application with a window pair as peripheral). The pairing is LE Secure
+   Connections with no code ("Just Works"): it keeps a listener out, and does not prove who the peer
+   is. No keys are kept, so every link pairs afresh and neither end can hold keys the other has lost.
 
    The central role (silica_nimble_seek, once the host is ready). This end scans for a peripheral that
    advertises the service, connects, exchanges the MTU, finds the service's characteristic to write
@@ -100,6 +111,8 @@
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+
+void ble_store_config_init(void);    /* NimBLE's key store, which has no header of its own */
 
 typedef struct silica_nimble_tagged {
     int64_t tag;
@@ -147,6 +160,8 @@ static ble_uuid_any_t service_uuid, rx_uuid, tx_uuid;
 static uint16_t tx_handle;           /* the indicated characteristic's value handle */
 static volatile uint16_t link = BLE_HS_CONN_HANDLE_NONE;
 static volatile int subscribed;
+static volatile int encrypted;       /* the link is encrypted; as peripheral nothing passes on it before */
+static int subscribe_again;          /* as central: the subscription was refused for want of encryption */
 static QueueHandle_t rx_queue;       /* segments the central wrote, until silica_nimble_recv */
 static QueueHandle_t tx_queue;       /* segments waiting for the indication before them */
 static SemaphoreHandle_t tx_lock;    /* guards tx_in_flight and the taking of tx_queue */
@@ -235,11 +250,31 @@ static void give_up(uint16_t conn, int why) {
     ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
 }
 
+static int on_subscribed(uint16_t conn, const struct ble_gatt_error *error, struct ble_gatt_attr *attr, void *arg);
+
+static int subscribe(uint16_t conn) {
+    uint8_t value[2] = { peer_tx_indicates ? 2 : 1, 0 };
+    return ble_gattc_write_flat(conn, peer_cccd, value, sizeof value, on_subscribed, NULL);
+}
+
+/* As central, the peripheral decides whether the link is encrypted. One that requires it refuses the
+   subscription until the link is: a board asks for the pairing itself as soon as it is connected, a
+   phone waits for this end to start it. Either way this end subscribes once more when the link is
+   encrypted. A peripheral that takes the subscription on an open link (a program on a Mac, which
+   macOS lets pair only from an application with a window) has an open link. */
 static int on_subscribed(uint16_t conn, const struct ble_gatt_error *error, struct ble_gatt_attr *attr, void *arg) {
     (void)attr; (void)arg;
-    if (error->status != 0) { give_up(conn, 3); return 0; }
-    subscribed = 1;
-    post(EV_SUBSCRIBED, conn, 1);
+    if (error->status == 0) {
+        subscribed = 1;
+        post(EV_SUBSCRIBED, conn, 1);
+    } else if (!subscribe_again
+               && (error->status == BLE_HS_ATT_ERR(BLE_ATT_ERR_INSUFFICIENT_AUTHEN) || error->status == BLE_HS_ATT_ERR(BLE_ATT_ERR_INSUFFICIENT_ENC))) {
+        subscribe_again = 1;
+        int rc = encrypted ? subscribe(conn) : ble_gap_security_initiate(conn);
+        if (rc != 0 && rc != BLE_HS_EALREADY) give_up(conn, 5);
+    } else {
+        give_up(conn, 3);
+    }
     return 0;
 }
 
@@ -250,8 +285,7 @@ static int on_descriptor(uint16_t conn, const struct ble_gatt_error *error, uint
         return 0;
     }
     if (error->status == BLE_HS_EDONE && peer_cccd != 0) {
-        uint8_t value[2] = { peer_tx_indicates ? 2 : 1, 0 };
-        int rc = ble_gattc_write_flat(conn, peer_cccd, value, sizeof value, on_subscribed, NULL);
+        int rc = subscribe(conn);
         if (rc != 0) give_up(conn, 1000 + rc);
     } else {
         give_up(conn, 3);
@@ -336,17 +370,45 @@ static int on_gap_event(struct ble_gap_event *event, void *arg) {
             struct ble_gap_conn_desc desc;
             xQueueReset(rx_queue);   /* segments of the peer before, never taken */
             subscribed = 0;
+            encrypted = 0;
             central = ble_gap_conn_find(event->connect.conn_handle, &desc) == 0 && desc.role == BLE_GAP_ROLE_MASTER;
             link = event->connect.conn_handle;
             if (central) {
                 seeking = 0;
+                subscribe_again = 0;
                 peer_start = peer_end = peer_rx = peer_tx = peer_tx_end = peer_cccd = 0;
                 int rc = ble_gattc_exchange_mtu(link, on_mtu, NULL);
                 if (rc != 0) give_up(link, 1000 + rc);
+            } else {
+                /* a peripheral asks its central to pair; its attributes refuse it until then */
+                ble_gap_security_initiate(link);
             }
         }
         post(EV_CONNECTED, event->connect.conn_handle, event->connect.status);
         break;
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        if (event->enc_change.conn_handle != link) break;
+        if (event->enc_change.status != 0) {
+            /* no pairing, no link: a peripheral waits for its next central, a central reports it */
+            if (central) give_up(link, 5);
+            else ble_gap_terminate(link, BLE_ERR_AUTH_FAIL);
+            break;
+        }
+        if (encrypted) break;
+        encrypted = 1;
+        if (central && subscribe_again && !subscribed) {
+            int rc = subscribe(link);
+            if (rc != 0) give_up(link, 1000 + rc);
+        } else if (!central && subscribed) {
+            post(EV_SUBSCRIBED, link, 1);
+        }
+        break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        /* the peer pairs again and this end still holds keys for it: they go, and the pairing is new */
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc) == 0) ble_store_util_delete_peer(&desc.peer_id_addr);
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
     case BLE_GAP_EVENT_NOTIFY_RX:
         /* the peripheral's indication: one segment */
         if (central && event->notify_rx.conn_handle == link && event->notify_rx.attr_handle == peer_tx) {
@@ -370,6 +432,7 @@ static int on_gap_event(struct ble_gap_event *event, void *arg) {
             link = BLE_HS_CONN_HANDLE_NONE;
             central = 0;
             subscribed = 0;
+            encrypted = 0;
             tx_in_flight = 0;
             xQueueReset(tx_queue);
             xSemaphoreGiveRecursive(tx_lock);
@@ -379,7 +442,8 @@ static int on_gap_event(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_SUBSCRIBE:
         if (serving && event->subscribe.attr_handle == tx_handle && event->subscribe.conn_handle == link) {
             subscribed = event->subscribe.cur_indicate;
-            post(EV_SUBSCRIBED, event->subscribe.conn_handle, event->subscribe.cur_indicate);
+            /* a subscription made before the link is encrypted counts when it is */
+            if (encrypted || !subscribed) post(EV_SUBSCRIBED, event->subscribe.conn_handle, event->subscribe.cur_indicate);
         }
         break;
     case BLE_GAP_EVENT_NOTIFY_TX:
@@ -431,6 +495,17 @@ silica_nimble_tagged silica_nimble_start(int64_t reserved) {
     if (ret != ESP_OK) return fail(2000 + ret);
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
+    /* Pairing without a code ("Just Works", LE Secure Connections): this end has no display and no
+       keys to press. Nothing is kept: every link pairs afresh, so there are no keys for one end to
+       lose while the other still has them. */
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    ble_hs_cfg.sm_bonding = 0;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = 0;
+    ble_hs_cfg.sm_their_key_dist = 0;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_store_config_init();
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ble_svc_gap_device_name_set("Silica");
@@ -534,10 +609,10 @@ silica_nimble_tagged silica_nimble_serve(const uint8_t *uuid_ptr, uint64_t uuid_
     memset(characteristics, 0, sizeof characteristics);
     characteristics[0].uuid = &rx_uuid.u;
     characteristics[0].access_cb = on_write;
-    characteristics[0].flags = BLE_GATT_CHR_F_WRITE;
+    characteristics[0].flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC;
     characteristics[1].uuid = &tx_uuid.u;
     characteristics[1].access_cb = on_tx_access;
-    characteristics[1].flags = BLE_GATT_CHR_F_INDICATE;
+    characteristics[1].flags = BLE_GATT_CHR_F_INDICATE | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC;
     characteristics[1].val_handle = &tx_handle;
     memset(services, 0, sizeof services);
     services[0].type = BLE_GATT_SVC_TYPE_PRIMARY;
@@ -567,7 +642,7 @@ silica_nimble_tagged silica_nimble_mtu(int64_t conn) {
 /* Queues one segment for the connection of silica_nimble_set_args. A :sent event says how it ended. */
 silica_nimble_tagged silica_nimble_send(const uint8_t *data_ptr, uint64_t data_len) {
     static segment s;                /* the radio actor only */
-    if (link == BLE_HS_CONN_HANDLE_NONE || arg_a != link || !subscribed) return fail(3);
+    if (link == BLE_HS_CONN_HANDLE_NONE || arg_a != link || !subscribed || (!central && !encrypted)) return fail(3);
     int mtu = (int)ble_att_mtu(link) - 3;
     if (mtu > SEG_MAX) mtu = SEG_MAX;
     if (data_len == 0 || data_len > (uint64_t)mtu) return fail(4);

@@ -17,7 +17,8 @@
 # block (the guest's README).
 #
 # The central is the Mac (./run_peer.sh central [uuid], in another terminal) or a phone (nRF
-# Connect): connect to "Silica", enable indications on the TX characteristic (6E400003): the board
+# Connect): connect to "Silica", enable indications on the TX characteristic (6E400003) and accept the
+# phone's pairing request (the board requires an encrypted link): the board
 # prints the three segments it sent and the phone shows them. Write the same three values, as byte
 # arrays and in order, to the RX characteristic (6E400002): the board prints the reading and exits 0.
 #

@@ -543,7 +543,7 @@ not list the same rows (BLE on a headless server, for instance).
 | `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor (`"listen:<port>"`) spawns one per accepted peer and announces it with `(:accepted, conn, info)` (§6.2) |
 | `(:udp)` | the same wrappers | 65507 | `:datagram` | `:unreliable` | an endpoint actor per bound port |
 | `(:serial)` | a dangerous actor over a Fifi wrapper of the host's serial port (termios on macOS and Linux) | 0 | `:stream` | `:reliable_ordered` | the port and line speed come from the carrier's declaration, `carried_on <name>: (:serial) (:serial_port, "/dev/cu.usbmodem101", 115200);` (§6.7; `spawn_dangerous_carrier(<name>, ...)` puts them in the initial state and `:open`'s `address` is `""`); an `address` `"path@baud"` still names a port directly. This is the host end of the board's USB-UART, USB-Serial-JTAG and USB CDC carriers, so a Mac and the board exchange frames Silica to Silica with no Erlang in between. The wrapper does not flush the port's input at open, which this path needs (§14, board carrier notes) |
-| `(:ble_gatt)` | a dangerous actor over a Fifi wrapper of the host's Bluetooth stack (CoreBluetooth on macOS, BlueZ D-Bus on Linux) | negotiated ATT_MTU minus 3 (20 by default, up to 244 after MTU exchange; a characteristic value is at most 512 bytes) | `:datagram` | `:ordered_lossy` for notifications, `:reliable_ordered` for indications and writes with response | `address` names the role and the service, `"central:<uuid>"` or `"peripheral:<uuid>"` (the service has one characteristic toward each side; [transport_ble_plan.md](transport_ble_plan.md) §4 and stage 3); `:link_up` carries the negotiated MTU as `"mtu:<n>"`. Built on macOS (2026-11-10): `dangerous_ble_gatt_carrier`, writes with response and indications only, so its row in `Carrier` is `:reliable_ordered` with `mtu` 20 |
+| `(:ble_gatt)` | a dangerous actor over a Fifi wrapper of the host's Bluetooth stack (CoreBluetooth on macOS, BlueZ D-Bus on Linux) | negotiated ATT_MTU minus 3 (20 by default, up to 244 after MTU exchange; a characteristic value is at most 512 bytes) | `:datagram` | `:ordered_lossy` for notifications, `:reliable_ordered` for indications and writes with response | `address` names the role and the service, `"central:<uuid>"` or `"peripheral:<uuid>"` (the service has one characteristic toward each side; [transport_ble_plan.md](transport_ble_plan.md) §4 and stage 3); `:link_up` carries the negotiated MTU as `"mtu:<n>"`. Built on macOS (2026-11-10): `dangerous_ble_gatt_carrier`, writes with response and indications only, so its row in `Carrier` is `:reliable_ordered` with `mtu` 20. One program holds up to four sessions, each a carrier of its own, opened one after another. Encryption is as §6.5 says. Not built on Linux (the plan's stage 11, deferred) |
 | `(:unix_dgram)` | later, if [IPC_OS.md](IPC_OS.md) is ever built | per OS | `:datagram` | `:reliable_ordered` | cross-process actors on one host |
 
 Hosted carriers are all Fifi, as specification §20.4 requires; the bytes they deliver are external-danger-touched,
@@ -565,7 +565,7 @@ reads are not external-danger-touched, so `decode` may run anywhere the frame re
 | `(:spi2)`, `(:spi3)` | SPI2 (display) and SPI3 (SD card) controllers, both as master | 64 (the controller's data buffer) | `:datagram` | `:reliable_ordered` | SPI2 driver exists (item A) | a carrier only toward an SPI peer that speaks the §5 segment protocol; the display and the SD card are not peers (next row) |
 | `(:sd_blocks)` | SD card on SPI3 | 512 | `:storage` | `:reliable_ordered` | plan item I | a **storage carrier**: `:tx` appends a frame to the block log, `:rx` replays frames from it. `address` is a block range. Logging ETF-encoded readings to the card is the use |
 | `(:i2c0)` | I2C0 (SCL GPIO42, SDA GPIO41) as master | 32 | `:datagram` | `:reliable_ordered` | plan item G | `address` is the 7-bit peer address; the accelerometer (0x1C) is a sensor, not a carrier (§6.6) |
-| `(:ble_gatt)` | see §6.5 | 20 to 244 | `:datagram` | per §6.3 | both roles, in a program built as a guest of ESP-IDF (transport_ble_plan.md stages 7 and 9) | same tag and contract as on the hosted paths |
+| `(:ble_gatt)` | the chip's own radio, see §6.5 | 20 to 244 | `:datagram` | per §6.3 | both roles, in a program built as a guest of ESP-IDF (transport_ble_plan.md stages 7, 9 and 10) | same tag and contract as on the hosted paths. Not a device worker: `dangerous_ble_gatt_board_carrier`, an ordinary actor above the radio actor that alone calls the Bluetooth host. The board holds one link at a time: the first carrier a program opens takes the radio, and an `:open` to another answers `(:link_down, :fault)` |
 
 Not carriers: GPIO, LEDC (buzzer), RMT (the 24 addressable LEDs), the display on SPI2, the buttons, the joystick
 and battery analog inputs, the accelerometer. They are sources and sinks of transportable values (§6.6).
@@ -574,20 +574,43 @@ and battery analog inputs, the accelerometer. They are sources and sinks of tran
 
 Bluetooth Low Energy is a carrier with one tag, `(:ble_gatt)`, and one contract (§6.2), whatever provides it:
 
-1. **Hosted paths:** a Fifi wrapper of the OS stack (§6.3). This is the first BLE carrier to build, because it
-   needs no radio decision and gives the trials a peer.
-2. **The board, through an external module:** a BLE module on the UART1 header running a transparent-serial
-   firmware (an HM-10 class module, or a second ESP32 running Espressif's AT firmware) is reachable today under the
-   device-actor rules: the `(:uart1)` worker carries the bytes and a small protocol actor turns the module's
-   connection events into `:link_up` / `:link_down`. The pair presents as `(:ble_gatt)` to the program.
-3. **The board, through the chip's own radio:** the ESP32-S3's BLE 5 controller and host exist only as closed
-   ESP-IDF libraries that expect an RTOS (board plan §4.4). If the radio decision ever adopts them, they arrive
-   as foreign code through Fifi on the board pack's C runtime (ROADMAP chunk 13), inside a dangerous actor, and
-   present the same `(:ble_gatt)` carrier. Nothing in this design depends on that decision.
+1. **Hosted paths:** a Fifi wrapper of the OS stack (§6.3). Built on macOS over CoreBluetooth; the Linux wrapper
+   over BlueZ is deferred.
+2. **The board, through the chip's own radio.** The ESP32-S3's controller is a closed ESP-IDF library written
+   for FreeRTOS, so a program that declares the carrier is built as a guest of ESP-IDF: ESP-IDF owns the chip,
+   and Silica's two schedulers run as its tasks, one per core. The host is NimBLE, foreign code behind a Fifi
+   wrapper. One radio actor owns the wrapper, and the carrier is an ordinary actor above it. Built in both roles.
+3. **The board, through an external module** on the UART1 header (an HM-10 class module, or a second ESP32
+   running Espressif's AT firmware). Not built, and dropped once the chip's own radio worked.
 
-BLE's constraints are what the `Carrier` properties exist for: the 20-byte default payload makes segmentation
-(§5) the normal case, notifications are `:ordered_lossy` so a segmented frame must use indications or writes
-with response, and the MTU is only known after `:link_up`.
+[transport_ble_plan.md](transport_ble_plan.md) is the plan these were built to, and its §6 records what each
+stage measured.
+
+**The service.** A link is one GATT service with one characteristic toward each side: the peripheral indicates
+on one, and the central writes with response on the other. The `:open` address names the role and the service,
+`"central:<uuid>"` or `"peripheral:<uuid>"`; with no UUID the service is the Nordic UART Service, which phone
+test applications know. A phone is therefore a peer with no Silica on it.
+
+**What BLE asks of the `Carrier` properties.** The 20-byte default payload makes segmentation (§5) the normal
+case. Notifications are `:ordered_lossy`, so the carriers use indications and writes with response, which the
+peer confirms one by one; `:tx_credit` comes back when the peer has taken the segment. The MTU is known only
+after `:link_up`, which carries it as `"mtu:<n>"`, and the owner passes that figure to `wireframe@frame`. One
+frame is in flight on a link at a time, so `frame_seq` is 0.
+
+**Pairing and encryption: the peripheral decides.**
+
+- A board as peripheral requires an encrypted link. It asks its central to pair when the central connects, and
+  `:link_up` comes when the central has paired and subscribed.
+- A central pairs when its peripheral requires it. macOS and iOS do so by themselves; the board does so when its
+  subscription is refused for want of encryption.
+- A Mac program as peripheral has an open link. macOS lets a peripheral pair only from an application with a
+  window, so a command-line program cannot require it.
+- The pairing is LE Secure Connections with no code. It keeps a listener out and does not prove who the peer
+  is: any nearby device can pair. No keys are kept, so every link pairs afresh, and a phone asks its user each
+  time.
+
+**How many links.** A Mac program holds up to four sessions, each a carrier of its own. The board holds one
+link; it reaches several peers in turn by closing and opening again.
 
 ### 6.6 The board's sensors and actuators as transportable values
 
@@ -761,7 +784,7 @@ on every suite with goldens refreshed under the usual rule, and a hosted phase e
 | 2 | `WireFrame`; the carrier contract; `(:tcp)`, `(:udp)` and `(:serial)` carriers over chunk 9 (its prerequisite); the hosted BEAM demo: a Silica program connects to a BEAM node's `gen_tcp` listener with `{packet, 4}` and exchanges terms | loopback trials Silica-to-Silica; a scripted `erl` peer trial run outside `make integrate` |
 | 3 | Linux AArch64 and x86-64 lock-step | the same suite green on both; fixed points |
 | 4 | the board: `(:uart1)` carrier worker, the contract on the existing console workers, `board_values.silica`; the ETF-over-UART demo: accelerometer and button readings arrive in an Erlang shell through a port program on the host | board suite trials for the worker; the demo recorded in `board/README.md` as the other apps are |
-| 5 | `(:ble_gatt)` on macOS and Linux through Fifi; the board over an external UART BLE module (§6.5 item 2) | a Silica peripheral on one host and a Silica central on another exchange segmented frames; the board's readings reach a phone or laptop over BLE |
+| 5 | `(:ble_gatt)` on macOS through Fifi and on the board through the chip's own radio (§6.5), by [transport_ble_plan.md](transport_ble_plan.md); Linux deferred (its stage 11) | a Silica peripheral on one machine and a Silica central on another exchange segmented frames; the board's readings reach a phone or laptop over BLE. Met on 2026-11-14 between the Mac, the board and a phone, in both roles |
 | 6 | `(:cbor)` as the second protocol: its §16.4 subsection, `wire_cbor.silica`, goldens | added without a change to the derivation or the trait; the `transport_addition` suite runs its round-trip rows under both tags from one source |
 | later | `(:msgpack)`, `(:json)`, `(:silica_native)`, `(:protobuf)` after decision 7; the distribution protocol design (§7); `(:usb_cdc)` in the device role when plan item L lands and in the host role when its host-side enumeration does; `(:sd_blocks)` and `(:i2c0)` carriers when plan items I and G land; `(:unix_dgram)` if IPC_OS is built | each with its own trials; `(:usb_cdc)` device role proven by the Mac's `(:serial)` carrier against `/dev/cu.usbmodem*`, host role by two boards back to back |
 

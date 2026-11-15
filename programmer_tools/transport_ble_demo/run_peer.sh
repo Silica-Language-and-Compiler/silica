@@ -14,6 +14,10 @@
 # first segment and closes, the other end's test of a frame cut short; that link is not counted.
 # --hold <seconds>: the link is kept that long after the exchange, for the tests that take one end away
 # while it is up (the reason is then :timeout).
+# --second <address>: a second session held at the same time by a carrier and an owner of its own, its
+# address as the carrier takes it ("central:<uuid>" or "peripheral:<uuid>"); the lines of the two are
+# marked A: and B:, and the program ends when both have made their exchanges. The second session opens
+# two seconds after the first.
 # SILICA_BLE_TRACE=1 prints the wrapper's CoreBluetooth events.
 #
 # With a phone as the central (nRF Connect): connect to "Silica", enable indications on the TX
@@ -28,7 +32,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 CC="${SILICA_COMPILER:-$ROOT/compiler/build/apple_silicon_mac/silica-compiler}"
 CLANG=/usr/bin/clang
-ROLE="" UUID="" TIMEOUT=300 BUILD_ONLY=0 LINKS=1 CUT=-1 HOLD=0
+ROLE="" UUID="" TIMEOUT=300 BUILD_ONLY=0 LINKS=1 CUT=-1 HOLD=0 SECOND=""
 while [ $# -gt 0 ]; do
     case "$1" in
         peripheral|central) ROLE=$1; if [ $# -ge 2 ] && [ "${2#-}" = "$2" ]; then UUID=$2; shift; fi; shift ;;
@@ -36,6 +40,7 @@ while [ $# -gt 0 ]; do
         --links) LINKS=$2; shift 2 ;;
         --cut) CUT=$2; shift 2 ;;
         --hold) HOLD=$2; shift 2 ;;
+        --second) SECOND=$2; shift 2 ;;
         --timeout) TIMEOUT=$2; shift 2 ;;
         *) echo "run_peer: unknown argument $1" >&2; exit 2 ;;
     esac
@@ -67,7 +72,8 @@ ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" trial_wait_int64
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" trial_support_hex.silica
 sed -e "s|^fn address() -> string { \"peripheral:\" }|fn address() -> string { \"$ROLE:$UUID\" }|" \
     -e "s|^fn links() -> int64 { 1 }|fn links() -> int64 { $LINKS }|" -e "s|^fn cut_link() -> int64 { 0 - 1 }|fn cut_link() -> int64 { 0 - 1 + 1 + $CUT }|" \
-    -e "s|^fn hold_ms() -> uint64 { 0 }|fn hold_ms() -> uint64 { ${HOLD}000 }|" "$HERE/dangerous_ble_peer.silica" > dangerous_ble_peer.silica
+    -e "s|^fn hold_ms() -> uint64 { 0 }|fn hold_ms() -> uint64 { ${HOLD}000 }|" \
+    -e "s|^fn second_address() -> string { \"\" }|fn second_address() -> string { \"$SECOND\" }|" "$HERE/dangerous_ble_peer.silica" > dangerous_ble_peer.silica
 printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_ble.silica\ndangerous_ble_gatt_carrier.silica\ntrial_support_hex.silica\ntrial_wait_int64.silica\ndangerous_ble_peer.silica\n' > silica.config
 for i in $(seq 1 12); do "$CC" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
 if [ ! -f dangerous_ble_peer.sams ]; then echo "compile failed (exit $ec); see $WORK/compile.log"; grep -A8 "Compilation error" compile.log | head -12; exit 1; fi
