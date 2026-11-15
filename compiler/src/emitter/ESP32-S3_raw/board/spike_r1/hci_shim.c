@@ -19,7 +19,10 @@
 // FreeRTOS and of ESP-IDF, answered on the bare-metal runtime with no interrupts and no scheduler:
 //
 //   interrupts  esp_intr_alloc routes the source to a CPU interrupt line that stays disabled; spike_poll
-//               reads the line's pending bit and calls the handler in ordinary context.
+//               reads the line's pending bit and calls the handler in ordinary context. Built with
+//               SPIKE_INTERRUPT the line is a level-3 one that is enabled, and the runtime's level-3
+//               path (rt_vectors.S) calls the handler when the interrupt comes; what the handler shares
+//               with the rest (the queues, the switch of control) is then done with the level masked.
 //   the task    xTaskCreatePinnedToCore makes one coroutine (spike_co.S). A call that would block polls
 //               the interrupts and passes control to the other line of control until it can go on.
 //   queues, semaphores, mutexes   one structure, a ring of items (none for a semaphore).
@@ -89,8 +92,38 @@ static struct irq {
 static int irq_count;
 static int in_handler;
 uint32_t spike_handler_calls;
+#ifdef SPIKE_INTERRUPT
+// the CPU's level-3 lines that take a level from a peripheral
+static const uint8_t lines[MAX_IRQ] = { 23, 27, 23, 27, 23, 27, 23, 27 };
+extern void (*silica_rt_level3_handler)(void);
+
+static inline uint32_t mask_level3(void)
+{
+    uint32_t ps;
+    __asm__ volatile("rsil %0, 3" : "=r"(ps));
+    return ps;
+}
+
+static inline void unmask(uint32_t ps)
+{
+    __asm__ volatile("wsr.ps %0\n rsync" : : "r"(ps));
+}
+
+static void dispatch(void);
+#else
 // CPU interrupt lines that take a level from a peripheral (level 1; they stay disabled)
 static const uint8_t lines[MAX_IRQ] = { 0, 1, 2, 3, 4, 5, 8, 9 };
+
+static inline uint32_t mask_level3(void)
+{
+    return 0;
+}
+
+static inline void unmask(uint32_t ps)
+{
+    (void)ps;
+}
+#endif
 
 int esp_intr_alloc(int source, int flags, void (*handler)(void *), void *arg, void **ret_handle)
 {
@@ -113,6 +146,13 @@ int esp_intr_alloc(int source, int flags, void (*handler)(void *), void *arg, vo
     if (ret_handle) {
         *ret_handle = q;
     }
+#ifdef SPIKE_INTERRUPT
+    silica_rt_level3_handler = dispatch;
+    uint32_t enabled;
+    __asm__ volatile("rsr.intenable %0" : "=r"(enabled));
+    enabled |= 1u << q->line;
+    __asm__ volatile("wsr.intenable %0\n rsync" : : "r"(enabled));
+#endif
     return 0;
 }
 
@@ -141,7 +181,16 @@ int esp_ipc_call_blocking(uint32_t cpu, void (*fn)(void *), void *arg)
     return 0;
 }
 
+#ifdef SPIKE_INTERRUPT
 void spike_poll(void)
+{
+}
+
+// called by the runtime's level-3 path
+static void dispatch(void)
+#else
+void spike_poll(void)
+#endif
 {
     if (in_handler) {
         return;
@@ -163,16 +212,25 @@ int xPortInIsrContext(void)
     return in_handler;
 }
 
+static uint32_t critical_depth, critical_ps;
+
 int xPortEnterCriticalTimeout(void *mux, int timeout)
 {
     (void)mux;
     (void)timeout;
+    uint32_t ps = mask_level3();
+    if (critical_depth++ == 0) {
+        critical_ps = ps;
+    }
     return 1;
 }
 
 void vPortExitCritical(void *mux)
 {
     (void)mux;
+    if (--critical_depth == 0) {
+        unmask(critical_ps);
+    }
 }
 
 void _frxt_setup_switch(void)
@@ -188,6 +246,18 @@ static void *co_arg;
 static int co_have, co_started, co_cur;
 uint32_t spike_switches;
 
+// Where the controller's task starts: the level was masked for the switch that started it.
+static void co_entry(void *unused)
+{
+    (void)unused;
+#ifdef SPIKE_INTERRUPT
+    __asm__ volatile("rsil a2, 0" : : : "a2");
+#endif
+    co_fn(co_arg);
+    for (;;) {
+    }
+}
+
 // Lets the interrupts and the other line of control run once.
 void spike_yield(void)
 {
@@ -196,14 +266,17 @@ void spike_yield(void)
         return;
     }
     spike_switches++;
+    // no handler runs while the stacks and the register windows change hands
+    uint32_t ps = mask_level3();
     int from = co_cur;
     co_cur = 1 - co_cur;
     if (!co_started) {
         co_started = 1;
-        spike_co_start(co_ctx[from], &co_stack[2048 - 16], co_fn, co_arg);
+        spike_co_start(co_ctx[from], &co_stack[2048 - 16], co_entry, NULL);
     } else {
         spike_co_switch(co_ctx[from], co_ctx[co_cur]);
     }
+    unmask(ps);
 }
 
 int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack, void *arg, uint32_t prio, void **handle, int core)
@@ -244,13 +317,17 @@ static size_t arena_used;
 void *malloc(size_t n)
 {
     n = (n + 15) & ~(size_t)15;
-    if (arena_used + n > sizeof(arena)) {
+    uint32_t ps = mask_level3();
+    size_t at = arena_used;
+    if (at + n <= sizeof(arena)) {
+        arena_used = at + n;
+    }
+    unmask(ps);
+    if (at + n > sizeof(arena)) {
         silica_rt_puts("shim: out of memory\n");
         return NULL;
     }
-    void *p = &arena[arena_used];
-    arena_used += n;
-    return p;
+    return &arena[at];
 }
 
 void free(void *p)
@@ -334,27 +411,31 @@ void vQueueDelete(void *q)
 
 static int put(struct queue *q, const void *item)
 {
-    if (q->count == q->length) {
-        return 0;
+    uint32_t ps = mask_level3();
+    int ok = q->count != q->length;
+    if (ok) {
+        if (q->item) {
+            memcpy(q->items + ((q->head + q->count) % q->length) * q->item, item, q->item);
+        }
+        q->count++;
     }
-    if (q->item) {
-        memcpy(q->items + ((q->head + q->count) % q->length) * q->item, item, q->item);
-    }
-    q->count++;
-    return 1;
+    unmask(ps);
+    return ok;
 }
 
 static int get(struct queue *q, void *item)
 {
-    if (q->count == 0) {
-        return 0;
+    uint32_t ps = mask_level3();
+    int ok = q->count != 0;
+    if (ok) {
+        if (q->item) {
+            memcpy(item, q->items + q->head * q->item, q->item);
+            q->head = (q->head + 1) % q->length;
+        }
+        q->count--;
     }
-    if (q->item) {
-        memcpy(item, q->items + q->head * q->item, q->item);
-        q->head = (q->head + 1) % q->length;
-    }
-    q->count--;
-    return 1;
+    unmask(ps);
+    return ok;
 }
 
 // ticks are milliseconds (the guest's FreeRTOS runs at 1000 Hz); 0xFFFFFFFF waits for ever

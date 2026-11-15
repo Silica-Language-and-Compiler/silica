@@ -1150,6 +1150,41 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     coroutine made the runtime's (a task run when its semaphore is given); NimBLE on the same shim or a
     host in Silica (§2.4); and room for the code, 155 KB of the 399 KB a RAM-loaded image has.
 
+- **Stage 12, part 3, step 5, 2026-11-14, done: the controller's handler as a real interrupt, through a
+  level-3 path added to the bare-metal runtime. With it the link holds while the main program is busy for
+  100 ms at a time.**
+  - Built:
+    - `runtime/rt_vectors.S`: the level-3 vector, a fatal report until now, calls a handler that foreign
+      code stores in `silica_rt_level3_handler`; with none stored it is the fatal report still. The
+      handler is called as if the interrupted code had made the call: by `call8`, in the interrupted
+      window, on the interrupted stack, the stack pointer untouched, so the window overflow and underflow
+      paths find every frame where an ordinary call leaves it. Kept and put back: a8 to a15, the shift
+      amount, the loop registers, the compare register. 50 instructions, no register windows spilled, no
+      stack switched.
+    - `hci_shim.c`, built with `SPIKE_INTERRUPT`: the controller's source on CPU line 23 (level 3),
+      enabled; the queues, the memory block and the switch between the two lines of control done with the
+      level masked.
+  - Run, the Mac connecting as in step 4:
+
+    | Main between visits to the controller's task | Link | Handler calls |
+    | --- | --- | --- |
+    | not busy | up 30.4 s | 2,928 |
+    | busy 30 ms | up 30.6 s | 2,940 |
+    | busy 100 ms | up 30.8 s | 2,958 |
+
+    With the handler polled, step 4's link failed at 2 ms.
+  - The bare-metal apps `silica_04_print`, `silica_08_stack_guard` (a fault report) and `silica_09_lists`
+    match their expected output with the changed vectors.
+  - What the path asks of the runtime before actors run beside it:
+    - Room on every stack for the handler's frames, as the guest's builder adds for ESP-IDF's interrupts
+      (stage 5), or a stack of its own for the handler.
+    - The level masked wherever the runtime has no valid stack pointer or window state for a moment (a
+      switch of stacks). The guest runtime met the same need under ESP-IDF's interrupts.
+    - A save area for each core, if the second core is to take interrupts.
+    - The handler must not use the floating-point registers; the controller's was not checked for it.
+  - Not shown: data in both directions (no host), actors beside the controller, both cores, the board as
+    central.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
