@@ -108,20 +108,39 @@ silica_rt_empty_bytes:
     ENTRY_RET_X0
     .size   silica_rt_string_length_bytes, . - silica_rt_string_length_bytes
 
+// length_chars: the hosts' rule (L_length_chars_helper) -- every byte that starts a sequence counts
+// one character and the cursor skips the sequence's length (110xxxxx 2, 1110xxxx 3, 11110xxx 4); a
+// byte outside a well-formed sequence (a stray continuation byte, 0xF8..0xFF) counts one by itself
+// (spec §5.3.1), so "\x80\xFE\xFF" has 3 characters. A lead whose sequence runs past the end stops.
     FUNC silica_rt_string_length_chars
     ENTRY_SAVE
     bl      rt_str_check
     ldr     r1, [r0, #16]
     ldr     r2, [r0, #8]
+    add     r1, r2, r1                      // end
     movw    r0, #0
-1:  cmp     r1, #0
-    beq.w   3f
-    ldrb    r3, [r2], #1
-    sub     r1, r1, #1
-    and     r3, r3, #0xC0
-    cmp     r3, #0x80
-    beq.w   1b                              // a continuation byte
+1:  cmp     r2, r1
+    bhs.w   3f
+    ldrb    r3, [r2]
     add     r0, r0, #1
+    cmp     r3, #0x80
+    blo.w   11f
+    and     r12, r3, #0xE0
+    cmp     r12, #0xC0
+    beq.w   12f
+    and     r12, r3, #0xF0
+    cmp     r12, #0xE0
+    beq.w   13f
+    and     r12, r3, #0xF8
+    cmp     r12, #0xF0
+    beq.w   14f
+11: add     r2, r2, #1
+    b.w     1b
+12: add     r2, r2, #2
+    b.w     1b
+13: add     r2, r2, #3
+    b.w     1b
+14: add     r2, r2, #4
     b.w     1b
 3:  movw    r1, #0
     ENTRY_RET_X0
@@ -327,7 +346,9 @@ silica_rt_empty_bytes:
     .size   silica_rt_string_contains, . - silica_rt_string_contains
 
 // rt_char_offset(r0 = bytes, r1 = byte length, r2 = character index) -> r0 = the byte offset of
-// character r2 (clamped to the length). Clobbers r2, r3, r12.
+// character r2 (clamped to the length). Clobbers r2, r3, r12. The lead-byte classes are the hosts'
+// (L_substring_helper) and the ESP32's UTF8_ADVANCE: < 0xC2 one byte (ASCII, or a stray continuation
+// byte that counts as one character), < 0xE0 two, < 0xF0 three, < 0xF8 four, else one.
     LFUNC rt_char_offset
     movw    r3, #0                          // byte offset
 1:  cmp     r2, #0
@@ -336,12 +357,14 @@ silica_rt_empty_bytes:
     bhs.w   9f
     ldrb    r12, [r0, r3]
     add     r3, r3, #1
-    cmp     r12, #0x80
+    cmp     r12, #0xC2
     blo.w   2f
     cmp     r12, #0xE0
     blo.w   3f
     cmp     r12, #0xF0
     blo.w   4f
+    cmp     r12, #0xF8
+    bhs.w   2f
     add     r3, r3, #3
     b.w     2f
 4:  add     r3, r3, #2

@@ -10650,7 +10650,7 @@ mailbox order. Failure is the carrier actor exiting with a reason, handled by li
 like any actor. The bytes a hosted carrier delivers are external-danger-touched, so the owner's `decode` runs
 in the handler that receives them, where §16.4.4 permits it.
 
-A carrier opened to listen (`"listen:<port>"` on `:tcp`) carries no bytes itself: it answers `:link_up` once
+A carrier opened to listen (`"listen:<port>"` on `:tcp`, or `"listen:any:<port>"` to bind every interface) carries no bytes itself: it answers `:link_up` once
 bound and `(:accepted, conn, info)` for every peer, each in a connection carrier of its own, so a program that
 serves many peers gives each connection an owner of its own. `:close` to a listener closes the listening
 socket only; the connections it spawned live on.
@@ -10659,7 +10659,7 @@ socket only; the connections it spawned live on.
 
 | Tag | Module and behaviour | `address` | `mtu` | `boundaries` | `delivery` |
 | --- | --- | --- | --- | --- | --- |
-| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound) and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
+| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"` the same on every IPv4 interface (0.0.0.0), and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
 | `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx`, and the local port to bind (`:link_up` carries `"port:<n>"`) | 65507 | `:datagram` | `:unreliable` |
 | `:serial` | `dangerous_serial_carrier@carrier` | `""` when the port is declared (`carried_on ... (:serial_port, path, baud)`, §16.4.9), else `"path@baud"`; raw 8N1; `:link_up` carries `"path@baud"` | 0 | `:stream` | `:reliable_ordered` |
 | `:ble_gatt` | `dangerous_ble_gatt_carrier@carrier` (Apple Silicon macOS only) | `"central:<uuid>"` scans for a peripheral offering the service and connects; `"peripheral:<uuid>"` advertises the service and waits for a central; `<uuid>` is the service's UUID, and nothing after the colon means the Nordic UART Service; `:link_up` carries `"mtu:<n>"`, the largest segment the link negotiated | 20 | `:datagram` | `:reliable_ordered` |
@@ -10682,6 +10682,22 @@ a program that declares the carrier with `carried_on` installs it with `spawn_da
 compiler writes the literal (§16.4.9). The
 socket wrappers behind the hosted carriers are the dangerous module `dangerous_sockets` over
 `libsilica_sockets.a`, shipped with the compiler under `compiler/stdlib/net/`.
+
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
+
+**What ends a hosted carrier (as implemented, 2026-11-12).** A `(:tcp)`, `(:udp)` or `(:serial)` carrier ends with its
+link. After `:close`, and after a peer closes, it answers `(:link_down, :closed)` and ends with `stop_self(:normal)`.
+After a failed open it answers `(:link_down, :fault)` and ends with `stop_self((:explicit, :link_unavailable))`; after
+a failed read or write, with `(:explicit, :link_lost)`, so a supervisor restarts a faulted link and leaves a closed one.
+`:link_down` is the last message the owner receives, and the carrier's reference is dead afterwards. A write that fails
+is a link failure: the owner receives `(:tx_failed, :link_down)` and then `:link_down`. A write to a peer that has gone
+fails with an error and never raises `SIGPIPE`.
+
+Because a `cast` to an ended actor ends its sender with `actor_not_found` (§16.1.4), **an owner must not send to a hosted
+carrier after it has received that carrier's `:link_down`**, and a carrier can end before its owner has read that
+message: an owner that sends in that interval is ended. A storage carrier does not have this hazard (§16.4.11). *Planned
+change (transport design §6.2, upgrade note):* a `cast` to an ended carrier is to stop ending its sender, and every
+carrier, the storage carriers included, is then to end on a failure.
 
 #### 16.4.9 Carrier links
 
@@ -10793,6 +10809,7 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2415 | two carrier declarations, in one module or across the modules of a compile, claim the same exclusive hardware: a UART or USB CDC instance, a serial port path, or the USB-Serial-JTAG controller |
 | E2416 | reserved: the link needs a board configuration function that is not defined (phase D; nothing reaches it yet) |
 | E2417 | a link parameter is not a literal, is of the wrong kind, is missing or is one too many, a baud is not positive, or the pack rejects the baud |
+| E2418 | a `(:tcp)` carrier on a link the target serves (`(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`) is opened by a `cast(x, (:open, owner, "<address>"))` whose address literal the link refuses: `"listen:any:<port>"` under any of them, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; `x` is bound in the same function by `spawn_dangerous_carrier`. An address the checker cannot see (a variable, a function's result) is refused at run time instead: the carrier tells its owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)` |
 
 #### 16.4.10 Diagnostics
 
@@ -10808,8 +10825,92 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2409 | a program `impl` of `WireFormat` or `Carrier` |
 | E2410 | a protocol or carrier tag the build's target does not provide |
 | E2411 | an `impl Transportable` or `impl Recreatable` declaration |
-| E2412 to E2417 | carrier link diagnostics, with E1081 for a malformed `carried_on` line: §16.4.9 |
+| E2412 to E2418 | carrier link diagnostics, with E1081 for a malformed `carried_on` line: §16.4.9 |
 | W2401 | advisory: a decoder was derived; foreign bytes become values here |
+
+#### 16.4.11 Storage carriers
+
+**Status (2026-11-12).** Phases S0 and S1 of transport design §6.8 are implemented for the Apple Silicon macOS target and, in the source, in the two Linux transport packs (linux_aarch64, linux_x86_64; the Linux compiler build and trial runs are still pending):
+the `(:store)` kind, the `(:memory, capacity, retention)` and `(:backing, path, capacity, retention)` links, the
+vocabulary below, the `:storage` framing mode and the stored-frame header of §16.4.7's module, and the on-medium form
+(`storelog`). The `(:sd_blocks, ...)` and `(:flash_region, ...)` links are named and checked by the language and provided
+by no target yet (E2412). A `(:memory)` carrier is an ordinary actor (`actor_ref`); a `(:backing)` carrier is a dangerous
+actor (`dangerous_actor_ref`), and a module that starts one is named `dangerous_` (E4021).
+
+A program that must keep values past a restart sends them to a **storage carrier**: a carrier of kind `(:store)` whose
+link is a medium that remembers. The language has no files, directories, names or paths, and no update or delete in
+place: records are appended, replayed and released.
+
+**Declaration.** `carried_on <name>: (:store) (<:medium>, <params>..., <retention>);`. Every store link has a fixed number
+of parameters and ends in its retention mode, which is always written:
+
+| Link | Parameters |
+| --- | --- |
+| `(:memory, capacity, retention)` | a region of `capacity` bytes of RAM; nothing survives the carrier |
+| `(:backing, path, capacity, retention)` | a hosted region of `capacity` bytes; `path` ends in `.sildat` by convention |
+| `(:sd_blocks, n, retention)`, `(:flash_region, n, retention)` | region `n` of a board's card or flash, from the board pack's table |
+
+`capacity` is a positive multiple of the 4096-byte block. `retention` is `:ring` (when the region is full the oldest
+block is reclaimed), `:stop` (the record is refused) or `:trim` (refused until the owner releases records). The kind's
+properties are `Carrier@boundaries` `:storage`, `Carrier@delivery` `:reliable_ordered`, `Carrier@addressing` `:region`
+and `Carrier@mtu` 4064, the largest record.
+
+**Messages.** The carrier contract of §16.4.8 with these additions. Every sequence number is an `int64` and is
+exclusive: it names the first record not covered. `:sync`, `:read_stop` and `:close` are bare atoms.
+
+| Direction | Message | Meaning |
+| --- | --- | --- |
+| to the carrier | `(:open, owner, "")` | claim the region; answered by `:link_up`, `:log` and `(:tx_credit, n)` |
+| to the carrier | `(:tx, record, from)` | append one record; it is numbered when accepted and waits in the write-behind buffer |
+| to the carrier | `:sync` | make every accepted record durable; answered by `(:synced, next)` |
+| to the carrier | `(:read, from)` | replay the records from `from` to the `next` of this moment, one per receive credit |
+| to the carrier | `:read_stop` | end the replay in progress; answered by `(:rx_end, next)` |
+| to the carrier | `(:credit, n)` | the owner accepts n more `:rx`; credit left when a replay ends is good for the next |
+| to the carrier | `(:trim, upto)` | release the blocks that lie wholly below `upto`; answered by `:log` |
+| to the carrier | `:close` | drain, then `(:link_down, :closed)`; the carrier ends and its reference is dead |
+| to the owner | `(:link_up, info)` | the region is claimed and its log recovered |
+| to the owner | `(:log, oldest, next, capacity)` | the oldest record held, the number the next accepted record gets, the region's size |
+| to the owner | `(:tx_credit, n)` | n records left the buffer for the medium (written, not necessarily durable) |
+| to the owner | `(:synced, next)` | every record below `next` is durable |
+| to the owner | `(:rx, record)`, `(:rx_end, next)` | one replayed record; the replay is over |
+| to the owner | `(:tx_failed, why)` | the record was refused and took no number: `:too_long`, `:empty`, `:no_credit`, `:full`, `:link_down` |
+| to the owner | `(:read_failed, why)` | `:trimmed` (below `oldest`; a `:log` follows), `:beyond_tail`, `:busy`, `:corrupt` |
+| to the owner | `(:link_down, why)` | `:closed`; `:in_use` (a second `:open`, or a backing locked by another carrier); `:mismatch` (a backing of another size); `:medium` (the backing could not be opened, read, written or flushed: the carrier stays, not open, until `:close`) |
+
+**What ends a storage carrier.** Only its owner's `:close`: the carrier drains, answers `(:link_down, :closed)` and ends
+with `stop_self(:normal)`, and its reference is dead afterwards. A refused open (`:in_use`, `:mismatch`) and a medium
+failure (`:medium`) give the medium back and leave the carrier, not open; the owner may open it again or close it. This
+differs from the hosted network carriers of §16.4.8, which end on a fault, and exists because a `cast` to an ended actor
+ends its sender (§16.1.4): an owner must always find its store carrier. *Planned change (transport design §6.2, upgrade
+note):* every carrier is to end on a failure with an exit reason, once a `cast` to an ended carrier no longer ends its
+sender; a program should not rely on a failed store carrier staying.
+
+**What a program may rely on.** After a crash, a power loss or a restart the log holds every record below the last
+`(:synced, next)` the owner saw, in order and with no holes, possibly some records after it, and never a reordered or a
+partial record. Records still in the write-behind buffer are lost. A trimmed log delivers at least once: release is by
+whole blocks, so `oldest` may be below the `upto` of a `:trim`.
+
+**Stored frames.** `wireframe@frame(f, mtu, :storage)` heads every record with the segment header of §16.4.7, a frame
+that fits in one record included; index 0 marks the start of a frame, and `wireframe@unframe` in `:storage` mode drops an
+unfinished frame when the next frame-start record arrives and skips a record that continues nothing. A frame spans at
+most 32768 records. `wireframe@record(format, schema, frame)` puts a one-byte format id and a two-byte schema version in
+front of a frame and `wireframe@unrecord` answers `(:ok, format, schema, frame) | (:rejected, :truncated | :bad_format)`.
+The ids are `(:etf)` 1 and `(:cbor)` 2 (`wireframe@format_id`); 0 is never a format. Every stored byte is untrusted on
+every target: only the value `decode` re-creates is used (§16.4.4).
+
+**On the medium.** A region is a run of 4096-byte blocks. A block begins with a 16-byte header, `first_seq` (8 bytes),
+`state` (4 bytes: 1 in use, 0 released) and a CRC-32C of those 12 bytes (4 bytes). Records follow back to back, each
+`length` (4 bytes), `seq` (8 bytes), CRC-32C over length, seq and payload (4 bytes), then the payload; a record never
+spans two blocks and all integers are big-endian. A record is good when its check holds and its `seq` is the one
+expected; the first position that holds no good record ends the block, after one more look at the next write-unit
+boundary (512 bytes), where the record after a sync lies. A sync fills the rest of its write unit with zeros and that
+unit is never written again.
+
+**Diagnostics.** E2414 when a store link is paired with another kind or `(:store)` with another link; E2415 when two
+declarations claim one backing path or one board region; E2417 for a retention that is not `:ring`, `:stop` or `:trim`,
+a capacity that is not a positive multiple of 4096, a parameter that is not a literal of the right class, or a wrong
+parameter count; E2412 for a medium the target does not provide.
+
 
 ## 17. Atomic Operations
 

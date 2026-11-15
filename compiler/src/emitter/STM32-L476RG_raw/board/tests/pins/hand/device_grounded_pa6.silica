@@ -1,0 +1,389 @@
+// Hand-run app, NOT a trial (no suite runs this directory; see README.md here). NUCLEO-L476RG with a
+// jumper from PA6 (flat pin 6, Arduino D12 / MISO) to GND installed before the run.
+//
+// Phase 1, jumper IN: input with pull up, pull down and no pull all read 0; push-pull output driven LOW
+// reads 0; open drain released (HIGH) with the pull-up reads 0 because the pin is grounded. Phase 1 never
+// drives push-pull HIGH: PA6's output latch is written LOW before every mode change.
+// Then LD2 stays solid ON 8 s more (jumper still in). The wait: 20 s, the console asks for the jumper to be pulled once a second, LD2 (PA5) blinks at 4 Hz.
+// Phase 2, jumper OUT: pull up reads 1, pull down reads 0, open drain released with the pull-up reads 1,
+// push-pull HIGH reads 1 and LOW reads 0. Push-pull HIGH is driven only if the phase-2 pull-up read 1
+// (the jumper really is out); otherwise that step is skipped and counted as a failure.
+// LD2: solid ON in phase 1, fast blink during the wait, OFF in phase 2, three slow blinks at the end.
+//
+// Shape: the pin calls are in the device worker (spawn_device_registered, :device_pa6), every pin a literal.
+// The conductor is an ordinary actor: it casts each step to the worker, waits 20 ms (send_after) for the
+// level to settle, asks for the read, prints the result, and runs the waits with send_after to itself.
+use trial_wait_int64;
+
+// ---- the device worker -------------------------------------------------------------------------
+
+// Configures PA6 for a step. The latch is written LOW before any mode change, so no step moves the pin
+// through push-pull HIGH; :pp_high (phase 2 only) is the one place the pin is driven high.
+fn configure(op: atom) -> atom {
+    sequence proc[register_rwr]
+        r: atom <- case op of {
+            :pull_up -> {
+                _: atom <- pin_write(6, false);
+                _: atom <- pin_mode(6, :input);
+                pin_pull(6, :up)
+            };
+            :pull_down -> {
+                _: atom <- pin_write(6, false);
+                _: atom <- pin_mode(6, :input);
+                pin_pull(6, :down)
+            };
+            :pull_none -> {
+                _: atom <- pin_write(6, false);
+                _: atom <- pin_mode(6, :input);
+                pin_pull(6, :none)
+            };
+            :pp_low -> {
+                _: atom <- pin_write(6, false);
+                _: atom <- pin_pull(6, :none);
+                pin_mode(6, :output)
+            };
+            :od_high -> {
+                _: atom <- pin_write(6, false);
+                _: atom <- pin_mode(6, :output_open_drain);
+                _: atom <- pin_pull(6, :up);
+                pin_write(6, true)
+            };
+            :pp_high -> {
+                _: atom <- pin_pull(6, :none);
+                _: atom <- pin_write(6, true);
+                pin_mode(6, :output)
+            };
+            :idle -> {
+                _: atom <- pin_write(6, false);
+                _: atom <- pin_mode(6, :input);
+                pin_pull(6, :none)
+            };
+            :led_on -> {
+                _: atom <- pin_write(5, true);
+                pin_mode(5, :output)
+            };
+            :led_off -> {
+                _: atom <- pin_write(5, false);
+                pin_mode(5, :output)
+            };
+            _: atom -> :ok
+        }
+    produces
+        pure r
+    end
+}
+
+fn measure(step: uint32, reply_to: actor_ref) -> atom {
+    sequence proc[register_rwr, concurrency]
+        level: boolean <- pin_read(6);
+        _: boolean <- cast(reply_to, { step: step, level: level } impl ActorMessage {})
+    produces
+        pure :ok
+    end
+}
+
+fn pa6_worker(msg: { op: atom, step: uint32, reply_to: actor_ref }, state: int64) -> (:no_reply, int64) {
+    sequence proc[register_rwr]
+        _: atom <- case msg.op of {
+            :read -> measure(msg.step, msg.reply_to);
+            _: atom -> configure(msg.op)
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// ---- the conductor ------------------------------------------------------------------------------
+// Messages { step, level }: 0 start; 1..10 a step's reading; 150 the 8 s hold is over; 100 a wait tick (125 ms); 200 an end-blink
+// tick (400 ms); 301..310 a step's settle time is over, ask for the reading.
+
+fn op_of(step: uint32) -> atom {
+    case step of {
+        1 -> :pull_up;
+        2 -> :pull_down;
+        3 -> :pull_none;
+        4 -> :pp_low;
+        5 -> :od_high;
+        6 -> :pull_up;
+        7 -> :pull_down;
+        8 -> :od_high;
+        9 -> :pp_high;
+        10 -> :pp_low;
+        _: uint32 -> :idle
+    }
+}
+
+fn describe(step: uint32) -> string {
+    case step of {
+        1 -> "input + pull up";
+        2 -> "input + pull down";
+        3 -> "input + pull none";
+        4 -> "output push-pull, write LOW";
+        5 -> "open drain, write HIGH (released) + pull up";
+        6 -> "input + pull up";
+        7 -> "input + pull down";
+        8 -> "open drain, write HIGH (released) + pull up";
+        9 -> "output push-pull, write HIGH";
+        10 -> "output push-pull, write LOW";
+        _: uint32 -> "?"
+    }
+}
+
+fn expected(step: uint32) -> boolean {
+    case step of {
+        6 -> true;
+        8 -> true;
+        9 -> true;
+        _: uint32 -> false
+    }
+}
+
+fn level_word(b: boolean) -> uint32 {
+    case b of {
+        true -> 1;
+        false -> 0
+    }
+}
+
+fn worker_do(op: atom, step: uint32) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast_device_registered(:device_pa6, { op: op, step: step, reply_to: self() } impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn tick_in(ms: uint64, code: uint32) -> timer_ref {
+    sequence proc[concurrency]
+        t: timer_ref <- send_after(ms, self(), { step: code, level: false } impl ActorMessage {})
+    produces
+        pure t
+    end
+}
+
+// Configure, then 20 ms for the level to settle before the read.
+fn start_step(step: uint32) -> atom {
+    _: boolean <- worker_do(op_of(step), step);
+    _: timer_ref <- tick_in(20, step + 300);
+    :ok
+}
+
+fn on_start(st: { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) {
+    sequence proc[device_io]
+        _: atom <- print_string("grounded_pa6: pin builtins on PA6 (pin 6, D12)\n");
+        _: boolean <- worker_do(:led_on, 0);
+        _: atom <- print_string("PHASE 1: jumper IN (PA6 to GND), LD2 solid ON\n");
+        _: atom <- start_step(1)
+    produces
+        pure (:no_reply, st)
+    end
+}
+
+// Phase 1 is over: LD2 stays solid ON for 8 s more (the jumper stays in), then the 20 s wait.
+fn begin_hold(pass: uint32) -> atom {
+    sequence proc[device_io]
+        _: atom <- print_string("phase 1: ");
+        _: atom <- print_uint32(pass);
+        _: atom <- print_string(" of 5 passed\n");
+        _: boolean <- worker_do(:idle, 0);
+        _: atom <- print_string("phase 1 done, keep jumper IN, wait 8 s (LD2 solid ON)\n");
+        _: timer_ref <- tick_in(8000, 150)
+    produces
+        pure :ok
+    end
+}
+
+fn begin_wait(st: { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) {
+    sequence proc[device_io]
+        _: boolean <- worker_do(:led_off, 0);
+        _: atom <- print_string("**************************************************\n");
+        _: atom <- print_string("***   REMOVE THE JUMPER FROM PA6 NOW             ***\n");
+        _: atom <- print_string("***   20 seconds; LD2 blinks fast while waiting  ***\n");
+        _: atom <- print_string("**************************************************\n");
+        _: timer_ref <- tick_in(125, 100)
+    produces
+        pure (:no_reply, st)
+    end
+}
+
+fn on_wait_tick(st: { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) {
+    sequence proc[device_io]
+        t: uint32 <- st.ticks + 1;
+        odd: uint32 <- t % 2;
+        led: atom <- case odd == 1 of {
+            true -> :led_on;
+            false -> :led_off
+        };
+        _: boolean <- worker_do(led, 0);
+        sec: uint32 <- t % 8;
+        _: atom <- case sec == 0 of {
+            true -> {
+                _: atom <- print_string(">>> PULL THE JUMPER FROM PA6 NOW: ");
+                _: atom <- print_uint32(20 - t / 8);
+                print_string(" s left <<<\n")
+            };
+            false -> :ok
+        };
+        next: uint32 <- case t < 160 of {
+            true -> {
+                _: timer_ref <- tick_in(125, 100);
+                t
+            };
+            false -> {
+                _: boolean <- worker_do(:led_off, 0);
+                _: atom <- print_string("reading with jumper out\n");
+                _: atom <- print_string("PHASE 2: jumper OUT, LD2 OFF\n");
+                _: atom <- start_step(6);
+                0
+            }
+        }
+    produces
+        pure (:no_reply, { pass: st.pass, fail: st.fail, ticks: next, out: st.out })
+    end
+}
+
+fn begin_end(pass: uint32, fail: uint32) -> atom {
+    sequence proc[device_io]
+        _: boolean <- worker_do(:idle, 0);
+        _: atom <- print_string("SUMMARY: ");
+        _: atom <- print_uint32(pass);
+        _: atom <- print_string(" passed, ");
+        _: atom <- print_uint32(fail);
+        _: atom <- print_string(" failed of 10: ");
+        _: atom <- case fail == 0 of {
+            true -> print_string("ALL PASS\n");
+            false -> print_string("FAILURES\n")
+        };
+        _: timer_ref <- tick_in(400, 200)
+    produces
+        pure :ok
+    end
+}
+
+fn on_end_tick(st: { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) {
+    sequence proc[concurrency, device_io]
+        t: uint32 <- st.ticks + 1;
+        _: boolean <- case t < 7 of {
+            true -> {
+                odd: uint32 <- t % 2;
+                led: atom <- case odd == 1 of {
+                    true -> :led_on;
+                    false -> :led_off
+                };
+                _: boolean <- worker_do(led, 0);
+                _: timer_ref <- tick_in(400, 200);
+                true
+            };
+            false -> {
+                _: atom <- print_string("DONE\n");
+                cast_exit(0)
+            }
+        }
+    produces
+        pure (:no_reply, { pass: st.pass, fail: st.fail, ticks: t, out: st.out })
+    end
+}
+
+fn on_settled(step: uint32, st: { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) {
+    _: boolean <- worker_do(:read, step);
+    (:no_reply, st)
+}
+
+fn skip9_note() -> atom {
+    sequence proc[device_io]
+        _: atom <- print_string("step 9: output push-pull, write HIGH: SKIPPED (step 6 read 0, jumper still in): FAIL\n")
+    produces
+        pure :ok
+    end
+}
+
+// After a reading: the next step, the 8 s hold (after 5), the push-pull HIGH gate (before 9), the end
+// (after 10). The side effects run here, before the new state is built (next_state): a boolean
+// parameter used to build the state record after a call in the same case arm was read as garbage.
+fn advance(step: uint32, pass: uint32, fail: uint32, out: boolean) -> atom {
+    case step of {
+        5 -> begin_hold(pass);
+        10 -> begin_end(pass, fail);
+        8 -> case out of {
+            true -> start_step(9);
+            false -> {
+                _: atom <- skip9_note();
+                start_step(10)
+            }
+        };
+        _: uint32 -> start_step(step + 1)
+    }
+}
+
+// The state after a reading, built with no call in between (see advance).
+fn next_state(step: uint32, pass: uint32, fail: uint32, ticks: uint32, out: boolean) -> { pass: uint32, fail: uint32, ticks: uint32, out: boolean } {
+    skipped: boolean <- step == 8 and out == false;
+    case skipped of {
+        true -> { pass: pass, fail: fail + 1, ticks: ticks, out: out };
+        false -> { pass: pass, fail: fail, ticks: ticks, out: out }
+    }
+}
+
+fn on_result(step: uint32, level: boolean, st: { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) {
+    sequence proc[device_io]
+        ok: boolean <- level == expected(step);
+        _: atom <- print_string("step ");
+        _: atom <- print_uint32(step);
+        _: atom <- print_string(": ");
+        _: atom <- print_string(describe(step));
+        _: atom <- print_string(": read ");
+        _: atom <- print_uint32(level_word(level));
+        _: atom <- print_string(", expect ");
+        _: atom <- print_uint32(level_word(expected(step)));
+        _: atom <- case ok of {
+            true -> print_string(": PASS\n");
+            false -> print_string(": FAIL\n")
+        };
+        pass: uint32 <- case ok of {
+            true -> st.pass + 1;
+            false -> st.pass
+        };
+        fail: uint32 <- case ok of {
+            true -> st.fail;
+            false -> st.fail + 1
+        };
+        out: boolean <- case step == 6 of {
+            true -> level;
+            false -> st.out
+        };
+        _: atom <- advance(step, pass, fail, out)
+    produces
+        pure (:no_reply, next_state(step, pass, fail, st.ticks, out))
+    end
+}
+
+fn conductor(msg: { step: uint32, level: boolean }, st: { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32, out: boolean }) {
+    case msg.step of {
+        0 -> on_start(st);
+        100 -> on_wait_tick(st);
+        150 -> begin_wait(st);
+        200 -> on_end_tick(st);
+        _: uint32 -> case msg.step > 300 of {
+            true -> on_settled(msg.step - 300, st);
+            false -> on_result(msg.step, msg.level, st)
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                _: device_actor_ref <- spawn_device_registered(0, pa6_worker, :device_pa6, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                c: actor_ref <- spawn({ pass: 0, fail: 0, ticks: 0, out: false }, conductor, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(c, { step: 0, level: false } impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

@@ -6,7 +6,7 @@ THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 APP_TRIAL_DIR := $(abspath $(THIS_DIR))
 APP_LABEL := app_transport_tcp_listener
 APP_EXECUTABLES := dangerous_tcp_listener
-APP_LINK_OBJECTS := wire_etf.o wireframe.o carrier.o dangerous_sockets.o dangerous_tcp_carrier.o
+APP_LINK_OBJECTS := wire_etf.o wireframe.o Carrier.o dangerous_sockets.o dangerous_tcp_carrier.o
 
 FFI_TRIAL_DIR := $(abspath $(THIS_DIR)/../../ffi_addition)
 # The platform's view of dangerous_exposure_source, relative to this directory (FFI_PLATFORM comes

@@ -1,0 +1,371 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The on-medium form of a storage carrier's log (transport_serialization_design.md §6.8.3, §6.8.4), as
+// pure functions over byte strings. A medium's carrier (store_memory_carrier, and later the hosted
+// backing and the board media) decides where bytes go; this module says what the bytes are and how a
+// block of them is read back, so every medium keeps the same log.
+//
+// A region is a run of BLOCKS of one size (the pack's number for the medium). A block begins with a
+// 16-byte header and holds records back to back; a record never spans two blocks.
+//
+//   block header   first_seq: 8 bytes | state: 4 bytes (1 in use, 0 released) | crc32c: 4 bytes
+//                  The check covers the first 12 bytes. A header that fails it is not part of the log
+//                  (an all-zero or erased block fails it).
+//   record         length: 4 bytes | seq: 8 bytes | crc32c: 4 bytes | payload: length bytes
+//                  The check covers length, seq and payload. All integers are big-endian.
+//
+// HOW A BLOCK IS READ (scan). The reader knows the sequence number it expects next. A record is good
+// when its length is not zero, it lies inside the block, its check holds AND its seq is the expected
+// one. The sequence test is what ends the log on a medium that is not erased: the records of an
+// earlier lap are still there after the tail with good checks, and only their numbers show they are
+// old. When the bytes at the position are not a good record and the position is not on a WRITE UNIT
+// boundary (the span the medium writes in one piece: 512 bytes for a card sector or a host backing),
+// the reader tries once more at the next boundary. That is where a record written after a sync lies,
+// because a sync fills the rest of its unit with zeros and never rewrites it (§6.8.4). When the bytes
+// at a boundary are not a good record either, the block has no more records.
+module storelog;
+
+export header_bytes/0;
+export envelope_bytes/0;
+export crc32c/1;
+export zeros/1;
+export be32_at/2;
+export be64_at/2;
+export block_header/2;
+export header_first_seq/2;
+export envelope/2;
+export scan/5;
+export round_up/2;
+export put/3;
+export u64be/1;
+export entry/2;
+export apply/2;
+export block_of/3;
+export table_get/2;
+export table_set/3;
+export env_len/1;
+export env_seq/1;
+export env_crc/1;
+export env_check/2;
+export tail_next/4;
+export tail_at/4;
+
+fn header_bytes() -> int64 { 16 }
+fn envelope_bytes() -> int64 { 16 }
+
+fn at(s: string, i: int64) -> int64 {
+    sequence proc[transport]
+        b: int64 <- byte_at(s, i)
+    produces
+        pure b
+    end
+}
+
+fn slice(s: string, start: int64, stop: int64) -> string {
+    sequence proc[mem(normal), transport]
+        out: string <- byte_slice(s, start, stop)
+    produces
+        pure out
+    end
+}
+
+fn join2(a: string, b: string) -> string {
+    sequence proc[mem(normal), transport]
+        parts: List[string, mem(normal)] <- [a, b];
+        out: string <- join_bytes(parts)
+    produces
+        pure out
+    end
+}
+
+fn join3(a: string, b: string, c: string) -> string {
+    sequence proc[mem(normal), transport]
+        parts: List[string, mem(normal)] <- [a, b, c];
+        out: string <- join_bytes(parts)
+    produces
+        pure out
+    end
+}
+
+fn be32_at(s: string, i: int64) -> int64 {
+    ((at(s, i) * 256 + at(s, i + 1)) * 256 + at(s, i + 2)) * 256 + at(s, i + 3)
+}
+
+// A stored 64-bit number. Sequence numbers and offsets stay below 2^63, so the value is an int64.
+fn be64_at(s: string, i: int64) -> int64 {
+    be32_at(s, i) * 4294967296 + be32_at(s, i + 4)
+}
+
+fn u32be(n: int64) -> string {
+    sequence proc[mem(normal), transport]
+        xs: List[int64, mem(normal)] <- [(n / 16777216) % 256, (n / 65536) % 256, (n / 256) % 256, n % 256];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn u64be(n: int64) -> string {
+    join2(u32be(n / 4294967296), u32be(n % 4294967296))
+}
+
+// CRC-32C (Castagnoli, reflected polynomial 0x82F63B78), bit by bit: crc32c("123456789") is 3808858755
+// (0xE3069283). x xor y is spelled (x bor y) - (x band y).
+fn bxor(x: uint64, y: uint64) -> uint64 {
+    (x bor y) - (x band y)
+}
+
+fn crc_bits(c: uint64, k: int64) -> uint64 {
+    one: uint64 <- 1;
+    poly: uint64 <- 2197175160;
+    case k == 0 of {
+        true -> c;
+        false -> case (c band one) == one of {
+            true -> crc_bits(bxor(c shr 1, poly), k - 1);
+            false -> crc_bits(c shr 1, k - 1)
+        }
+    }
+}
+
+fn crc_from(s: string, i: int64, n: int64, c: uint64) -> uint64 {
+    case i >= n of {
+        true -> c;
+        false -> {
+            b: int64 <- at(s, i);
+            crc_from(s, i + 1, n, crc_bits(bxor(c, to_uint64(b)), 8))
+        }
+    }
+}
+
+fn crc32c(s: string) -> int64 {
+    ones: uint64 <- 4294967295;
+    c: uint64 <- bxor(crc_from(s, 0, length_bytes(s), ones), ones);
+    to_int64(c)
+}
+
+fn zeros16() -> string {
+    sequence proc[mem(normal), transport]
+        xs: List[int64, mem(normal)] <- [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        out: string <- bytes_of(xs)
+    produces
+        pure out
+    end
+}
+
+fn zeros_grow(z: string, n: int64) -> string {
+    case length_bytes(z) >= n of {
+        true -> slice(z, 0, n);
+        false -> zeros_grow(join2(z, z), n)
+    }
+}
+
+// n zero bytes.
+fn zeros(n: int64) -> string {
+    case n <= 0 of {
+        true -> "";
+        false -> zeros_grow(zeros16(), n)
+    }
+}
+
+fn round_up(n: int64, wunit: int64) -> int64 {
+    case n % wunit == 0 of {
+        true -> n;
+        false -> n + wunit - (n % wunit)
+    }
+}
+
+// The 16 bytes that begin a block whose first record is first_seq; state 1 in use, 0 released.
+fn block_header(first_seq: int64, state: int64) -> string {
+    body: string <- join2(u64be(first_seq), u32be(state));
+    join2(body, u32be(crc32c(body)))
+}
+
+// The first_seq of the in-use block whose header is at offset in bytes; -1 when the header fails its
+// check, is released, or is not all there.
+fn header_first_seq(bs: string, offset: int64) -> int64 {
+    case offset + 16 > length_bytes(bs) of {
+        true -> 0 - 1;
+        false -> case crc32c(slice(bs, offset, offset + 12)) == be32_at(bs, offset + 12) and be32_at(bs, offset + 8) == 1 of {
+            true -> be64_at(bs, offset);
+            false -> 0 - 1
+        }
+    }
+}
+
+// One record as it lies on the medium.
+fn envelope(seq: int64, payload: string) -> string {
+    head: string <- join2(u32be(length_bytes(payload)), u64be(seq));
+    join3(head, u32be(crc32c(join2(head, payload))), payload)
+}
+
+// The record expected next in a block. block is the block's bytes from its start (a medium that has
+// written less than the whole block gives fewer; what is missing reads as nothing there), pos the
+// position to read at, limit the block size, wunit the medium's write unit, expect the sequence number.
+// (:record, payload, position after it) or (:end, position the next record of this block would be
+// written at: pos, moved up to a unit boundary when what lies at pos is not a good record).
+fn scan(block: string, pos: int64, limit: int64, wunit: int64, expect: int64) -> (:record, string, int64) | (:end, int64) {
+    case good_at(block, pos, limit, expect) of {
+        true -> (:record, slice(block, pos + 16, pos + 16 + be32_at(block, pos)), pos + 16 + be32_at(block, pos));
+        false -> {
+            up: int64 <- round_up(pos, wunit);
+            case up == pos of {
+                true -> (:end, pos);
+                false -> case good_at(block, up, limit, expect) of {
+                    true -> (:record, slice(block, up + 16, up + 16 + be32_at(block, up)), up + 16 + be32_at(block, up));
+                    false -> (:end, up)
+                }
+            }
+        }
+    }
+}
+
+fn good_at(block: string, pos: int64, limit: int64, expect: int64) -> boolean {
+    have: int64 <- length_bytes(block);
+    case pos + 16 > have or pos + 16 > limit of {
+        true -> false;
+        false -> {
+            n: int64 <- be32_at(block, pos);
+            case n == 0 or pos + 16 + n > have or pos + 16 + n > limit of {
+                true -> false;
+                false -> case be64_at(block, pos + 4) == expect of {
+                    false -> false;
+                    true -> crc32c(join2(slice(block, pos, pos + 12), slice(block, pos + 16, pos + 16 + n))) == be32_at(block, pos + 12)
+                }
+            }
+        }
+    }
+}
+
+// The region with bytes written at offset: appended, written over what was there, or appended after a
+// gap of zeros. What lay beyond the written span stays as it was, as on a medium that is not erased.
+fn put(area: string, offset: int64, bs: string) -> string {
+    have: int64 <- length_bytes(area);
+    stop: int64 <- offset + length_bytes(bs);
+    case offset >= have of {
+        true -> join3(area, zeros(offset - have), bs);
+        false -> case stop >= have of {
+            true -> join2(slice(area, 0, offset), bs);
+            false -> join3(slice(area, 0, offset), bs, slice(area, stop, have))
+        }
+    }
+}
+
+// A pending write: bytes for offset, as one entry of a write-behind buffer (offset: 8 bytes, length: 4).
+fn entry(offset: int64, bs: string) -> string {
+    join3(u64be(offset), u32be(length_bytes(bs)), bs)
+}
+
+// The area with every pending write of a buffer applied, in order.
+fn apply(area: string, pending: string) -> string {
+    apply_from(area, pending, 0)
+}
+
+fn apply_from(area: string, pending: string, i: int64) -> string {
+    case i + 12 > length_bytes(pending) of {
+        true -> area;
+        false -> {
+            n: int64 <- be32_at(pending, i + 8);
+            apply_from(put(area, be64_at(pending, i), slice(pending, i + 12, i + 12 + n)), pending, i + 12 + n)
+        }
+    }
+}
+
+// The bytes of block b of an area whose blocks are size bytes: fewer than size when the area ends
+// inside the block, none when it ends before it.
+fn block_of(area: string, b: int64, size: int64) -> string {
+    have: int64 <- length_bytes(area);
+    start: int64 <- b * size;
+    case start >= have of {
+        true -> "";
+        false -> case start + size > have of {
+            true -> slice(area, start, have);
+            false -> slice(area, start, start + size)
+        }
+    }
+}
+
+// A table of 8-byte numbers, one per block (a carrier's first_seq of each block, kept in memory).
+fn table_get(table: string, b: int64) -> int64 {
+    be64_at(table, b * 8)
+}
+
+fn table_set(table: string, b: int64, v: int64) -> string {
+    put(table, b * 8, u64be(v))
+}
+
+// ---- one record read in two parts, and a tail block read whole ----------------------------------
+// A medium whose bytes may not be kept (a hosted backing: what a foreign call reads is
+// external-danger-touched) is read through numbers: the carrier reads the 16 bytes of an envelope,
+// takes its three numbers, reads the payload, and compares the check. Each answer is an int64, which
+// the carrier re-creates before it relies on it.
+
+// The length, the sequence number and the check an envelope's 16 bytes carry; -1 when they are not
+// all there.
+fn env_len(head: string) -> int64 {
+    case length_bytes(head) < 16 of {
+        true -> 0 - 1;
+        false -> be32_at(head, 0)
+    }
+}
+
+fn env_seq(head: string) -> int64 {
+    case length_bytes(head) < 16 of {
+        true -> 0 - 1;
+        false -> be64_at(head, 4)
+    }
+}
+
+fn env_crc(head: string) -> int64 {
+    case length_bytes(head) < 16 of {
+        true -> 0 - 1;
+        false -> be32_at(head, 12)
+    }
+}
+
+// The check an envelope should carry for this payload: CRC-32C over its length, its seq and the
+// payload. -2 when the envelope is not all there, which no stored check equals.
+fn env_check(head: string, payload: string) -> int64 {
+    case length_bytes(head) < 16 of {
+        true -> 0 - 2;
+        false -> crc32c(join2(slice(head, 0, 12), payload))
+    }
+}
+
+// A tail block read whole (its first record is `first`): the number after its last good record, and
+// the position the next record is written at. The block's header is at 0 and its records begin at 16.
+fn tail_next(block: string, limit: int64, wunit: int64, first: int64) -> int64 {
+    walked_next(scan(block, 16, limit, wunit, first), block, limit, wunit, first)
+}
+
+fn walked_next(found: (:record, string, int64) | (:end, int64), block: string, limit: int64, wunit: int64, expect: int64) -> int64 {
+    case found of {
+        (:record, _payload: string, nx: int64) -> walked_next(scan(block, nx, limit, wunit, expect + 1), block, limit, wunit, expect + 1);
+        (:end, _at: int64) -> expect
+    }
+}
+
+fn tail_at(block: string, limit: int64, wunit: int64, first: int64) -> int64 {
+    walked_at(scan(block, 16, limit, wunit, first), block, limit, wunit, first)
+}
+
+fn walked_at(found: (:record, string, int64) | (:end, int64), block: string, limit: int64, wunit: int64, expect: int64) -> int64 {
+    case found of {
+        (:record, _payload: string, nx: int64) -> walked_at(scan(block, nx, limit, wunit, expect + 1), block, limit, wunit, expect + 1);
+        (:end, at: int64) -> at
+    }
+}

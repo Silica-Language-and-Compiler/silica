@@ -65,7 +65,7 @@ altstack_check: dangerous_guarded_null_deref_fault
 	@echo "  ✅ altstack memory symbol present"
 
 integrate-run: fixtures unguarded_probe
-	@ln -sfn "$(FFI_SOURCE_VIEW)" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
+	@ln -sfn "$(patsubst $(abspath $(APP_TRIAL_DIR)/..)/%,../%,$(FFI_SOURCE_VIEW))" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
 	@test -f "$(FFI_LEGACY_ARCHIVE)" || { echo "  ❌ $(APP_LABEL): missing legacy archive"; exit 1; }
 	@cd "$(APP_TRIAL_DIR)" && $(call TRIAL_RM_UNTRACKED,$(APP_EXECUTABLES)); rm -f *.sams *.o *.iface  silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms
 	@cd "$(APP_TRIAL_DIR)" && find "$(APP_TRIAL_DIR)" -maxdepth 1 -name '*.silica' ! -name 'dangerous_unguarded_null_deref_abort.silica' | sed "s|^$(APP_TRIAL_DIR)/||" | sort > silica.config && $(TRIAL_SUPPORT_CONFIG)

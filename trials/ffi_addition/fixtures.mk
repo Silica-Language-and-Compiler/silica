@@ -30,14 +30,17 @@ FFI_ABI_TYPES_OBJ := $(FFI_BUILD_DIR)/silica_abi_types.o
 # hosted carriers' Fifi library, built here so the transport app trials link it like a fixture.
 FFI_STDLIB_NET_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../../compiler/stdlib/net)
 FFI_SOCKETS_OBJ := $(FFI_BUILD_DIR)/silica_sockets.o
+# The hosted (:backing) storage medium's wrappers (design §6.8.6), beside the socket wrappers.
+FFI_STORE_OBJ := $(FFI_BUILD_DIR)/silica_store.o
 
 FFI_LEGACY_ARCHIVE := $(FFI_LIB_DIR)/libsilica_legacy_math.a
 FFI_TEXT_ARCHIVE := $(FFI_LIB_DIR)/libsilica_text.a
 FFI_NET_ARCHIVE := $(FFI_LIB_DIR)/libsilica_net.a
 FFI_ABI_TYPES_ARCHIVE := $(FFI_LIB_DIR)/libsilica_abi_types.a
 FFI_SOCKETS_ARCHIVE := $(FFI_LIB_DIR)/libsilica_sockets.a
+FFI_STORE_ARCHIVE := $(FFI_LIB_DIR)/libsilica_store.a
 
-FFI_WRAPPER_ARCHIVES := $(FFI_LEGACY_ARCHIVE) $(FFI_TEXT_ARCHIVE) $(FFI_NET_ARCHIVE) $(FFI_ABI_TYPES_ARCHIVE) $(FFI_SOCKETS_ARCHIVE)
+FFI_WRAPPER_ARCHIVES := $(FFI_LEGACY_ARCHIVE) $(FFI_TEXT_ARCHIVE) $(FFI_NET_ARCHIVE) $(FFI_ABI_TYPES_ARCHIVE) $(FFI_SOCKETS_ARCHIVE) $(FFI_STORE_ARCHIVE)
 
 .PHONY: ffi-wrapper-archives
 
@@ -46,7 +49,7 @@ FFI_WRAPPER_ARCHIVES := $(FFI_LEGACY_ARCHIVE) $(FFI_TEXT_ARCHIVE) $(FFI_NET_ARCH
 # stands at the end.
 ffi-wrapper-archives: $(FFI_WRAPPER_ARCHIVES)
 	@[ "$$(readlink "$(FFI_SOURCE_VIEW)/sockets")" = "$(FFI_STDLIB_NET_DIR)" ] || ln -sfn "$(FFI_STDLIB_NET_DIR)" "$(FFI_SOURCE_VIEW)/sockets" 2>/dev/null || test -L "$(FFI_SOURCE_VIEW)/sockets"
-	@test -f "$(FFI_LEGACY_ARCHIVE)" && test -f "$(FFI_TEXT_ARCHIVE)" && test -f "$(FFI_NET_ARCHIVE)" && test -f "$(FFI_ABI_TYPES_ARCHIVE)" && test -f "$(FFI_SOCKETS_ARCHIVE)"
+	@test -f "$(FFI_LEGACY_ARCHIVE)" && test -f "$(FFI_TEXT_ARCHIVE)" && test -f "$(FFI_NET_ARCHIVE)" && test -f "$(FFI_ABI_TYPES_ARCHIVE)" && test -f "$(FFI_SOCKETS_ARCHIVE)" && test -f "$(FFI_STORE_ARCHIVE)"
 
 $(FFI_BUILD_DIR):
 	@mkdir -p $(FFI_BUILD_DIR)
@@ -93,4 +96,10 @@ $(FFI_SOCKETS_OBJ): $(FFI_STDLIB_NET_DIR)/silica_sockets.c | $(FFI_BUILD_DIR)
 	$(FFI_CC) $(FFI_CFLAGS) -c $< -o $@
 
 $(FFI_SOCKETS_ARCHIVE): $(FFI_SOCKETS_OBJ) | $(FFI_LIB_DIR)
+	ar rcs $@ $^
+
+$(FFI_STORE_OBJ): $(FFI_STDLIB_NET_DIR)/silica_store.c | $(FFI_BUILD_DIR)
+	$(FFI_CC) $(FFI_CFLAGS) -c $< -o $@
+
+$(FFI_STORE_ARCHIVE): $(FFI_STORE_OBJ) | $(FFI_LIB_DIR)
 	ar rcs $@ $^

@@ -35,6 +35,9 @@
 //    the pack cannot serve is E2410 (the kind is not provided) or E2412 (the link is not provided) here,
 //    where the spawn is; a declaration nothing uses gets the same E2412 from sir_target_verify.
 //
+// 4. A listen address that the declared link refuses at :open, where both literals are visible here, is
+//    E2418 (hosted Ethernet plan E2; scan_listen below).
+//
 // The vocabulary checks that depend only on the language (E2413 unknown link, E2414 kind and link do not
 // pair, E2415 instance conflict, E2417 parameter shape) are the type checker's (type_checker_links); the
 // declaration reaches it as a tag-11 declaration (constraint_extract_decls).
@@ -445,12 +448,228 @@ fn rewrite_spawn(ts: List[{ kind: int64, lexeme: string, location: { file: strin
     }
 }
 
+// ---- E2418: a listen address the declared link refuses ------------------------------------------------
+//
+// Hosted Ethernet plan E2 items 1 and 4 (transport_links_design.md §3.2): a (:tcp) carrier on a declared
+// link refuses "listen:any:<port>", and on (:loopback) a "listen:<ipv4>:<port>" outside 127.0.0.0/8; the
+// carrier ends with (:explicit, :link_unavailable) at :open. Where this pass sees both literals it rejects
+// the program instead: `<x>: <type> <- spawn_dangerous_carrier(<name>, ...)` and, after it in the same
+// function, `cast(<x>, (:open, <owner>, "<address>") ...)`. A carrier name is looked up as its nearest
+// binding above the cast; bindings are forgotten at every `fn`, so a binding in another function is never
+// used. An address this pass cannot see (a variable, a function's result) is left to the carrier's refusal
+// at run time, and so is a named interface's own address, which only the host knows.
+
+fn nil_binds() -> List[{ var: string, decl: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[{ var: string, decl: string }, mem(normal)] <- empty[{ var: string, decl: string }, mem(normal)]()
+    produces
+        pure r
+    end
+}
+
+fn cons_bind(h: { var: string, decl: string }, t: List[{ var: string, decl: string }, mem(normal)]) -> List[{ var: string, decl: string }, mem(normal)] {
+    sequence proc[mem(normal)]
+        r: List[{ var: string, decl: string }, mem(normal)] <- prepend[{ var: string, decl: string }, mem(normal)](h, t)
+    produces
+        pure r
+    end
+}
+
+// The declaration name a carrier binding holds, "" when the nearest binding of var is not a carrier.
+fn bind_decl_of(binds: List[{ var: string, decl: string }, mem(normal)], var: string) -> string {
+    case binds.is_nil of {
+        true -> "";
+        false -> case binds.head.var == var of {
+            true -> binds.head.decl;
+            false -> bind_decl_of(binds.tail, var)
+        }
+    }
+}
+
+fn has_prefix(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+// The index of the first c at or after i, or the length of s.
+fn index_of_char(s: string, c: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> case substring(s, i, i + 1) == c of {
+            true -> i;
+            false -> index_of_char(s, c, i + 1)
+        }
+    }
+}
+
+// Whether s from i on is the rest of a dotted quad: `parts` parts read so far, `digits` digits and value
+// `value` in the current part.
+fn quad_from(s: string, i: int64, parts: int64, digits: int64, value: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> parts == 3 and digits > 0 and value <= 255;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            d: int64 <- digit_value(c);
+            case d >= 0 of {
+                true -> digits < 3 and quad_from(s, i + 1, parts, digits + 1, value * 10 + d);
+                false -> c == "." and digits > 0 and value <= 255 and parts < 3 and quad_from(s, i + 1, parts + 1, 0, 0)
+            }
+        }
+    }
+}
+
+fn is_dotted_quad(s: string) -> boolean {
+    quad_from(s, 0, 0, 0, 0)
+}
+
+// Whether the link is one the carrier reads at :open (every hosted IP link).
+fn link_restricts_listen(link_tag: string) -> boolean {
+    case link_tag of {
+        "loopback" -> true;
+        "interface" -> true;
+        "ethernet" -> true;
+        "wifi" -> true;
+        _: string -> false
+    }
+}
+
+// The E2418 message for a (:tcp) declaration and an address literal (with its quotes), "" when the link
+// allows the address.
+fn listen_conflict(d: { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, literal: string) -> string {
+    address: string <- substring(literal, 1, length_bytes(literal) - 1);
+    rest: string <- substring(address, 7, length_bytes(address));
+    ip: string <- substring(rest, 0, index_of_char(rest, ":", 0));
+    head: string <- concat(concat(concat(concat(concat("carried_on ", d.name), ": link "), d.text), concat(" refuses the address ", literal)), " at :open, where the carrier would end with (:explicit, :link_unavailable)");
+    tail: string <- " (transport_links_design.md §3.2)";
+    // A link this target does not serve is E2412 at the spawn instead (rewrite_spawn).
+    served: boolean <- transport_pack@provides_carrier(d.kind) and transport_pack@provides_link(d.link_tag, d.instance);
+    case served and d.kind == "tcp" and link_restricts_listen(d.link_tag) and has_prefix(address, "listen:") of {
+        false -> "";
+        true -> case has_prefix(address, "listen:any:") of {
+            true -> concat(concat(head, ": \"listen:any:<port>\" listens on every interface, which a declared link does not allow; write \"listen:<port>\" to listen on the link's own address, or spawn the carrier without a link"), tail);
+            false -> case d.link_tag == "loopback" and length_bytes(ip) < length_bytes(rest) and is_dotted_quad(ip) and has_prefix(ip, "127.") == false of {
+                true -> concat(concat(head, ": it is not a loopback address (127.0.0.0/8); write \"listen:<port>\" for 127.0.0.1"), tail);
+                false -> ""
+            }
+        }
+    }
+}
+
+// `<x> : <type> <- ...` with the head at <x>: the binding of x, to a declaration's name when the value is
+// spawn_dangerous_carrier(<name>, ...), else to "" (a later binding of the same name hides a carrier).
+fn binding_update(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], binds: List[{ var: string, decl: string }, mem(normal)]) -> List[{ var: string, decl: string }, mem(normal)] {
+    t1: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(ts));
+    case head_kind(t1) == lexer_token_kind@token_kind_colon() of {
+        false -> binds;
+        true -> {
+            t3: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(skip_space(rest_of(t1))));
+            case head_kind(t3) == lexer_token_kind@token_kind_left_arrow() of {
+                false -> binds;
+                true -> {
+                    t4: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t3));
+                    t5: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t4));
+                    t6: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t5));
+                    is_carrier: boolean <- head_lexeme(t4) == "spawn_dangerous_carrier" and head_kind(t5) == lexer_token_kind@token_kind_left_paren() and head_is_identifier(t6);
+                    case is_carrier of {
+                        true -> cons_bind({ var: ts.head.lexeme, decl: head_lexeme(t6) }, binds);
+                        false -> cons_bind({ var: ts.head.lexeme, decl: "" }, binds)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The last element of the tuple whose elements start at ts, when it is a string literal after a comma:
+// (found, literal, location). The scan stops at the tuple's closing parenthesis.
+fn last_tuple_string(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], depth: int64, prev_kind: int64, last: { kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }) -> (boolean, string, { file: string, line: int64, column: int64, offset: int64 }) {
+    case ts.is_nil of {
+        true -> (false, "", last.location);
+        false -> {
+            k: int64 <- ts.head.kind;
+            case is_space_lexeme(ts.head.lexeme) of {
+                true -> last_tuple_string(ts.tail, depth, prev_kind, last);
+                false -> case k == lexer_token_kind@token_kind_right_paren() and depth == 0 of {
+                    true -> (last.kind == lexer_token_kind@token_kind_string_literal() and prev_kind == lexer_token_kind@token_kind_comma(), last.lexeme, last.location);
+                    false -> {
+                        d2: int64 <- case k == lexer_token_kind@token_kind_left_paren() of {
+                            true -> depth + 1;
+                            false -> case k == lexer_token_kind@token_kind_right_paren() of {
+                                true -> depth - 1;
+                                false -> depth
+                            }
+                        };
+                        last_tuple_string(ts.tail, d2, last.kind, ts.head)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// `cast ( <x> , ( :open , ... , "<address>" )` with the head at `cast`: the E2418 message, or "".
+fn cast_conflict(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], decls: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], binds: List[{ var: string, decl: string }, mem(normal)]) -> (string, { file: string, line: int64, column: int64, offset: int64 }) {
+    t1: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(ts));
+    t2: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t1));
+    t3: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t2));
+    t4: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t3));
+    t5: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- skip_space(rest_of(t4));
+    shape: boolean <- head_kind(t1) == lexer_token_kind@token_kind_left_paren() and head_is_identifier(t2) and head_kind(t3) == lexer_token_kind@token_kind_comma() and head_kind(t4) == lexer_token_kind@token_kind_left_paren() and head_lexeme(t5) == ":open";
+    case shape of {
+        false -> ("", ts.head.location);
+        true -> {
+            d: { name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } } <- find_decl(decls, bind_decl_of(binds, head_lexeme(t2)));
+            case d.name == "" of {
+                true -> ("", ts.head.location);
+                false -> {
+                    (found: boolean, literal: string, lit_loc: { file: string, line: int64, column: int64, offset: int64 }) <- last_tuple_string(rest_of(t5), 0, 0 - 1, t5.head);
+                    case found of {
+                        false -> ("", ts.head.location);
+                        true -> (listen_conflict(d, literal), lit_loc)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The walk over a module's tokens: (ok, message, location) for the first refused address.
+fn scan_listen(ts: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], decls: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], binds: List[{ var: string, decl: string }, mem(normal)]) -> (boolean, string, { file: string, line: int64, column: int64, offset: int64 }) {
+    case ts.is_nil of {
+        true -> (true, "", parser_ast@zero_location());
+        false -> case ts.head.kind == lexer_token_kind@token_kind_fn_keyword() of {
+            true -> scan_listen(ts.tail, decls, nil_binds());
+            false -> case ts.head.lexeme == "cast" of {
+                true -> {
+                    (msg: string, loc: { file: string, line: int64, column: int64, offset: int64 }) <- cast_conflict(ts, decls, binds);
+                    case msg == "" of {
+                        true -> scan_listen(ts.tail, decls, binds);
+                        false -> (false, msg, loc)
+                    }
+                };
+                false -> case lexer_token_kind@is_identifier_lexeme_token(ts.head.kind) of {
+                    true -> scan_listen(ts.tail, decls, binding_update(ts, binds));
+                    false -> scan_listen(ts.tail, decls, binds)
+                }
+            }
+        }
+    }
+}
+
 // Tokens in source order in, tokens in source order out.
 fn expand(tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> { is_ok: boolean, tokens: List[{ kind: int64, lexeme: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], modules: List[string, mem(normal)], error_code: string, error_location: { file: string, line: int64, column: int64, offset: int64 }, error_message: string } {
     (ok: boolean, decls: List[{ name: string, kind: string, link_tag: string, instance: int64, params: string, text: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], msg: string, loc: { file: string, line: int64, column: int64, offset: int64 }) <- collect(tokens, nil_decls());
     case ok of {
         false -> err_result("E1081", loc, msg);
         // the rewrite runs with no declarations too: a spawn_dangerous_carrier of an undeclared name is E1081
-        true -> rewrite(tokens, decls, lexer_runner@empty_token_list(), nil_strings())
+        true -> case decls.is_nil of {
+            true -> rewrite(tokens, decls, lexer_runner@empty_token_list(), nil_strings());
+            false -> {
+                (listen_ok: boolean, listen_msg: string, listen_loc: { file: string, line: int64, column: int64, offset: int64 }) <- scan_listen(tokens, decls, nil_binds());
+                case listen_ok of {
+                    false -> err_result("E2418", listen_loc, listen_msg);
+                    true -> rewrite(tokens, decls, lexer_runner@empty_token_list(), nil_strings())
+                }
+            }
+        }
     }
 }

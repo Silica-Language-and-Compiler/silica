@@ -32,7 +32,8 @@ SUB_TRIALS      := ffi_addition module_duplicate_name_trial module_nonexported_c
 	board_pack_tag_described_trial board_pack_tag_described_bad_body_trial board_pack_wrong_pack_module_trial \
 	$(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,$(DEVICE_APP_TRIALS)) \
 	e2236_supervisor_without_reporter_trial e2236_supervisor_before_registration_trial e2236_helper_starts_supervisor_trial e2236_lib_start_without_reporter_trial e2236_lib_start_through_local_call_trial \
-	cast_check_supervisor_child_trial cast_check_cross_module_trial cast_check_cross_module_param_trial
+	cast_check_supervisor_child_trial cast_check_cross_module_trial cast_check_cross_module_param_trial \
+	link_interface_listen_any_trial link_loopback_listen_any_trial link_loopback_listen_ip_trial
 
 # Single-file trial sources: every *.silica directly in this directory. $(wildcard)
 # rather than $(shell find): the tree holds ~20k files and this file is parsed several times.
@@ -95,7 +96,7 @@ ee-units: $(CUR_FAILS) $(SUB_TARGETS)
 	$(call TRIAL_SUPPORT_IN_TMP,$$tmpdir,$$base.silica); \
 	if grep -q ':etf' "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/wire_etf.silica)" "$$tmpdir/wire_etf.silica" && echo wire_etf.silica >> "$$tmpdir/silica.config"; fi; \
 	for tr in WireFormat Carrier Link; do if grep -q "use $$tr;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/$$tr.silica)" "$$tmpdir/$$tr.silica" && echo $$tr.silica >> "$$tmpdir/silica.config"; fi; done; \
-	if grep -q "use dangerous_sockets;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../ffi_addition/fixtures/build/apple_silicon_mac/dangerous_exposure_source/sockets)" "$$tmpdir/dangerous_exposure_source/sockets"; fi; \
+	if grep -q "use dangerous_sockets;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../ffi_addition/fixtures/build/$(or $(SILICA_HOST_EMIT_TARGET),$(SILICA_EMIT_TARGET),apple_silicon_mac)/dangerous_exposure_source/sockets)" "$$tmpdir/dangerous_exposure_source/sockets"; fi; \
 	for pair in wireframe:wireframe dangerous_sockets:dangerous_sockets dangerous_tcp_carrier:dangerous_tcp_carrier; do m=$${pair%%:*}; f=$${pair##*:}; if grep -q "use $$m;" "$(THIS_DIR)$$base.silica"; then ln -s "$(abspath $(THIS_DIR)../../compiler/stdlib/$$f.silica)" "$$tmpdir/$$m.silica" && echo $$m.silica >> "$$tmpdir/silica.config"; fi; done; \
 	(cd "$$tmpdir" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(SILICA_COMPILER)); }) > "$$base.cur_fail" 2>&1 || true; \
 	rm -rf "$$tmpdir"; \

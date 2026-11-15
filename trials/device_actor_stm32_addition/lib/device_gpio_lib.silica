@@ -1,0 +1,124 @@
+// GPIO workers on the NUCLEO-L476RG, through the board pack's descriptions (device_stm32l4_*_registers):
+// - led_worker owns GPIOA (window 1 at 0x48000000; the runtime already clocks the port for the console):
+//   :init makes PA5, the green user LED LD2, an output (MODER bits 11:10 = 01, a read-modify-write that
+//   keeps PA2/PA3, the console's alternate function); :led_on / :led_off write BSRR (bit 5 sets, bit 21
+//   resets), one store each.
+// - button_worker owns GPIOC (window 3 at 0x48000800): :init first maps RCC (window 4 at 0x40021000) to
+//   switch the port's clock on (AHB2ENR bit 2, GPIOCEN, a read-modify-write that keeps the bits the
+//   runtime set), then maps GPIOC, makes PC13 an input (it leaves reset in analog mode) and keeps the
+//   window; :read_button casts the level of PC13, the blue user
+//   button B1 (pulled high on the board, low while pressed: idle 1), to reply_to as an int64.
+// Every access is inside a sequence proc[register_rwr] in this module.
+// Messages: { op: atom, reply_to: actor_ref }.
+use device_stm32l4_gpioa_registers;
+use device_stm32l4_gpioc_registers;
+use device_stm32l4_rcc_registers;
+
+export led_worker/2;
+export button_worker/2;
+
+fn led_output(w: device_window(L, (:stm32l4_gpioa))) -> device_window(L, (:stm32l4_gpioa)) {
+    sequence proc[register_rwr]
+        mask: uint32 <- 0xC00;
+        mode_out: uint32 <- 0x400;
+        moder: uint32 <- peek(w, :moder) impl Register32 {};
+        _: atom <- poke(w, :moder, ((moder band (bnot mask)) bor mode_out) impl Register32 {})
+    produces
+        pure w
+    end
+}
+
+fn led(w: device_window(L, (:stm32l4_gpioa)), on: boolean) -> device_window(L, (:stm32l4_gpioa)) {
+    sequence proc[register_rwr]
+        _: atom <- case on of {
+            true -> poke(w, :bsrr, 0x20 impl Register32 {});
+            false -> poke(w, :bsrr, 0x200000 impl Register32 {})
+        }
+    produces
+        pure w
+    end
+}
+
+fn led_worker(msg: { op: atom, reply_to: actor_ref }, state: :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa)))) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa)))) {
+    sequence proc[register_rwr]
+        next: :unmapped | (:mapped, device_window(L, (:stm32l4_gpioa))) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    w: device_window(L, (:stm32l4_gpioa)) <- map_device((:stm32l4_gpioa), 0x48000000);
+                    (:mapped, led_output(w))
+                };
+                _: atom -> :unmapped
+            };
+            (:mapped, w: device_window(L, (:stm32l4_gpioa))) -> case msg.op of {
+                :led_on -> (:mapped, led(w, true));
+                :led_off -> (:mapped, led(w, false));
+                _: atom -> (:mapped, w)
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}
+
+// GPIOCEN on; the read back after the write is the delay RM0351 §6.2.18 asks for before the port is used.
+fn clock_port_c() -> atom {
+    sequence proc[register_rwr]
+        rcc: device_window(L, (:stm32l4_rcc)) <- map_device((:stm32l4_rcc), 0x40021000);
+        gpiocen: uint32 <- 4;
+        en: uint32 <- peek(rcc, :ahb2enr) impl Register32 {};
+        _: atom <- poke(rcc, :ahb2enr, (en bor gpiocen) impl Register32 {});
+        _: uint32 <- peek(rcc, :ahb2enr) impl Register32 {}
+    produces
+        pure :ok
+    end
+}
+
+// PC13 leaves reset in analog mode (MODER 11, RM0351 §8.4.1: every pin but the debug pins), where the
+// input Schmitt trigger is off and IDR reads 0 whatever the level; MODER bits 27:26 = 00 makes it an input.
+fn button_input(c: device_window(L, (:stm32l4_gpioc))) -> device_window(L, (:stm32l4_gpioc)) {
+    sequence proc[register_rwr]
+        mask: uint32 <- 0x0C000000;
+        moder: uint32 <- peek(c, :moder) impl Register32 {};
+        _: atom <- poke(c, :moder, (moder band (bnot mask)) impl Register32 {})
+    produces
+        pure c
+    end
+}
+
+fn button_level(c: device_window(L, (:stm32l4_gpioc))) -> (device_window(L, (:stm32l4_gpioc)), int64) {
+    sequence proc[register_rwr]
+        pads: uint32 <- peek(c, :idr) impl Register32 {};
+        bit: uint32 <- (pads shr 13) band 1;
+        level: int64 <- case bit == 1 of {
+            true -> 1;
+            false -> 0
+        }
+    produces
+        pure (c, level)
+    end
+}
+
+fn button_worker(msg: { op: atom, reply_to: actor_ref }, state: :unmapped | (:mapped, device_window(L, (:stm32l4_gpioc)))) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:stm32l4_gpioc)))) {
+    sequence proc[register_rwr, concurrency]
+        next: :unmapped | (:mapped, device_window(L, (:stm32l4_gpioc))) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    _: atom <- clock_port_c();
+                    c: device_window(L, (:stm32l4_gpioc)) <- map_device((:stm32l4_gpioc), 0x48000800);
+                    (:mapped, button_input(c))
+                };
+                _: atom -> :unmapped
+            };
+            (:mapped, c: device_window(L, (:stm32l4_gpioc))) -> case msg.op of {
+                :read_button -> {
+                    (c2: device_window(L, (:stm32l4_gpioc)), level: int64) <- button_level(c);
+                    _: boolean <- cast(msg.reply_to, level impl ActorMessage {});
+                    (:mapped, c2)
+                };
+                _: atom -> (:mapped, c)
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}

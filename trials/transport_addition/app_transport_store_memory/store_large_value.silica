@@ -1,0 +1,375 @@
+// A value larger than the carrier's largest record (design §6.8.3): a 10000-byte string encodes to one
+// (:etf) frame of about 10 KB, which wireframe cuts into three records of at most
+// Carrier@mtu(journal) = 4064 bytes, each headed by the :storage segment header. The replay hands the
+// three records back and wireframe@unframe joins them: two "more", then the frame, which decodes to
+// the stored string. One value is one frame and is held whole in memory; data larger than memory is a
+// stream of values.
+module store_large_value;
+
+use wireframe;
+use Carrier;
+use storelog;
+use wire_etf;
+use trial_wait_int64;
+
+carried_on journal: (:store) (:memory, 65536, :stop);
+
+fn put_blob(car: actor_ref, size: int64) -> boolean {
+    sequence proc[mem(normal), transport]
+        v: (:blob, string) <- (:blob, storelog@zeros(size));
+        body: string <- encode((:etf), v);
+        segs: List[string, mem(normal)] <- wireframe@frame(wireframe@record(:etf, 1, body), Carrier@mtu(journal), Carrier@boundaries(journal))
+    produces
+        pure tx_all(car, segs)
+    end
+}
+
+fn show_frame(f: string) -> atom {
+    unwrapped(wireframe@unrecord(f))
+}
+
+fn unwrapped(r: (:ok, atom, int64, string) | (:rejected, atom)) -> atom {
+    case r of {
+        (:ok, _format: atom, _schema: int64, body: string) -> stored(body);
+        (:rejected, why: atom) -> say_atom("rx unrecord rejected ", why)
+    }
+}
+
+fn stored(body: string) -> atom {
+    sequence proc[mem(normal), transport]
+        decoded: (:ok, (:blob, string)) | (:rejected, atom) <- decode((:etf), body, { max_bytes: 16384 });
+        o: atom <- case decoded of {
+            (:ok, v: (:blob, string)) -> show_blob(v);
+            (:rejected, why: atom) -> say_atom("decode rejected ", why)
+        }
+    produces
+        pure o
+    end
+}
+
+fn show_blob(v: (:blob, string)) -> atom {
+    case v of {
+        (:blob, s: string) -> say_n("rx frame: blob bytes=", length_bytes(s))
+    }
+}
+
+// A replayed record goes through the :storage framing; a whole frame is shown by show_frame.
+fn shown(segment: string, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } } {
+    reframed(wireframe@unframe(st.rx, segment, 65536), st)
+}
+
+fn reframed(r: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom), st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } } {
+    case r of {
+        (:more, rx1: { mode: atom, expected: int64, pending: string }) -> more(rx1, st);
+        (:frame, f: string, rx2: { mode: atom, expected: int64, pending: string }) -> framed(f, rx2, st);
+        (:rejected, why: atom) -> rejected(why, st)
+    }
+}
+
+fn more(rx1: { mode: atom, expected: int64, pending: string }, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } } {
+    _: atom <- say_n("rx more, waiting for record ", rx1.expected);
+    { car: st.car, step: st.step, left: st.left, rx: rx1 }
+}
+
+fn framed(f: string, rx2: { mode: atom, expected: int64, pending: string }, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } } {
+    _: atom <- show_frame(f);
+    { car: st.car, step: st.step, left: st.left, rx: rx2 }
+}
+
+fn rejected(why: atom, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } } {
+    _: atom <- say_atom("rx rejected ", why);
+    { car: st.car, step: st.step, left: st.left, rx: wireframe@fresh(:storage) }
+}
+
+fn expect(step: int64) -> atom {
+    case step of {
+        0 -> :link_up;
+        1 -> :log;
+        2 -> :tx_credit;
+        3 -> :tx_credit;
+        4 -> :synced;
+        5 -> :rx;
+        6 -> :rx_end;
+        7 -> :link_down;
+        8 -> :settled;
+        _: int64 -> :never
+    }
+}
+
+fn need(step: int64) -> int64 {
+    case step of {
+        0 -> 1;
+        1 -> 1;
+        2 -> 1;
+        3 -> 1;
+        4 -> 1;
+        5 -> 3;
+        6 -> 1;
+        7 -> 1;
+        8 -> 1;
+        _: int64 -> 1
+    }
+}
+
+fn act(step: int64, car: actor_ref) -> boolean {
+    case step of {
+        2 -> act2(car);
+        4 -> act4(car);
+        6 -> act6(car);
+        7 -> act7(car);
+        8 -> act8(car);
+        _: int64 -> true
+    }
+}
+
+fn act2(car: actor_ref) -> boolean {
+    _: boolean <- put_blob(car, 10000);
+    ask_sync(car)
+}
+
+fn act4(car: actor_ref) -> boolean {
+    _: boolean <- ask_read(car, 0);
+    give_credit(car, 3)
+}
+
+fn act6(car: actor_ref) -> boolean {
+    ask_close(car)
+}
+
+fn act7(car: actor_ref) -> boolean {
+    settle()
+}
+
+fn act8(car: actor_ref) -> boolean {
+    finished()
+}
+
+fn say_n(label: string, n: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_int64(n);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_atom(label: string, a: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(a);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_text(label: string, s: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        o: atom <- println(s)
+    produces
+        pure o
+    end
+}
+
+fn say_log(oldest: int64, nx: int64, capacity: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("log oldest=");
+        _: atom <- print_int64(oldest);
+        _: atom <- print(" next=");
+        _: atom <- print_int64(nx);
+        _: atom <- print(" capacity=");
+        _: atom <- print_int64(capacity);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn tx(car: actor_ref, s: string) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:tx, s, self()) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// n records of `size` zero bytes each.
+fn tx_zeros(car: actor_ref, n: int64, size: int64) -> boolean {
+    case n <= 0 of {
+        true -> true;
+        false -> {
+            _: boolean <- tx(car, storelog@zeros(size));
+            tx_zeros(car, n - 1, size)
+        }
+    }
+}
+
+fn tx_all(car: actor_ref, segs: List[string, mem(normal)]) -> boolean {
+    case segs of {
+        []: List[string, mem(normal)] -> true;
+        [h: string, t: List[string, mem(normal)]] -> {
+            _: boolean <- tx(car, h);
+            tx_all(car, t)
+        }
+    }
+}
+
+fn nth(xs: List[string, mem(normal)], i: int64) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> case i == 0 of { true -> h; false -> nth(t, i - 1) }
+    }
+}
+
+fn ask_sync(car: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, :sync impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_read(car: actor_ref, from: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:read, from) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_read_stop(car: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, :read_stop impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn give_credit(car: actor_ref, n: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:credit, n) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_trim(car: actor_ref, upto: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:trim, upto) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+fn ask_close(car: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, :close impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+// The carrier ends after :close and, having no supervisor, its normal exit is reported on standard
+// error. The owner waits for that report before it prints the carrier's last message and the line
+// the trial run ends at.
+fn settle() -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(300, self(), :settled impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+fn finished() -> boolean {
+    sequence proc[device_io]
+        _: atom <- println("link_down :closed");
+        _: atom <- println("done")
+    produces
+        pure true
+    end
+}
+
+// The script: at each step the owner waits for need(step) events of the kind expect(step), then
+// act(step) runs and the next step begins. Every event is printed as it arrives, awaited or not.
+fn progress(e: atom, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } } {
+    case e == expect(st.step) of {
+        false -> st;
+        true -> case st.left > 1 of {
+            true -> { car: st.car, step: st.step, left: st.left - 1, rx: st.rx };
+            false -> acted(st)
+        }
+    }
+}
+
+fn acted(st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } } {
+    _: boolean <- act(st.step, st.car);
+    { car: st.car, step: st.step + 1, left: need(st.step + 1), rx: st.rx }
+}
+
+fn on_text(label: string, s: string, e: atom, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> (:no_reply, { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) {
+    _: atom <- say_text(label, s);
+    (:no_reply, progress(e, st))
+}
+
+fn on_n(label: string, n: int64, e: atom, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> (:no_reply, { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) {
+    _: atom <- say_n(label, n);
+    (:no_reply, progress(e, st))
+}
+
+fn on_atom(label: string, a: atom, e: atom, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> (:no_reply, { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) {
+    _: atom <- say_atom(label, a);
+    (:no_reply, progress(e, st))
+}
+
+// The carrier's last message. (:link_down, :closed) is printed by finished(), after the carrier's exit
+// report: the report is written by another thread and would otherwise land before or after this line.
+fn on_link_down(why: atom, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> (:no_reply, { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) {
+    case why == :closed of {
+        true -> (:no_reply, progress(:link_down, st));
+        false -> on_atom("link_down ", why, :link_down, st)
+    }
+}
+
+fn on_log(oldest: int64, nx: int64, capacity: int64, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> (:no_reply, { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) {
+    _: atom <- say_log(oldest, nx, capacity);
+    (:no_reply, progress(:log, st))
+}
+
+fn on_rx(segment: string, st: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> (:no_reply, { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) {
+    (:no_reply, progress(:rx, shown(segment, st)))
+}
+
+fn owner(msg: (:link_up, string) | (:log, int64, int64, int64) | (:tx_credit, int64) | (:synced, int64) | (:rx, string) | (:rx_end, int64) | (:tx_failed, atom) | (:read_failed, atom) | (:link_down, atom) | :settled, state: { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) -> (:no_reply, { car: actor_ref, step: int64, left: int64, rx: { mode: atom, expected: int64, pending: string } }) {
+    case msg of {
+        (:link_up, info: string) -> on_text("link_up ", info, :link_up, state);
+        (:log, a: int64, b: int64, c: int64) -> on_log(a, b, c, state);
+        (:tx_credit, n: int64) -> on_n("tx_credit ", n, :tx_credit, state);
+        (:synced, n: int64) -> on_n("synced ", n, :synced, state);
+        (:rx, s: string) -> on_rx(s, state);
+        (:rx_end, n: int64) -> on_n("rx_end ", n, :rx_end, state);
+        (:tx_failed, why: atom) -> on_atom("tx_failed ", why, :tx_failed, state);
+        (:read_failed, why: atom) -> on_atom("read_failed ", why, :read_failed, state);
+        (:link_down, why: atom) -> on_link_down(why, state);
+        :settled -> (:no_reply, progress(:settled, state))
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                car: actor_ref <- spawn_dangerous_carrier(journal, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                own: actor_ref <- spawn({ car: car, step: 0, left: need(0), rx: wireframe@fresh(:storage) }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(car, (:open, own, "") impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

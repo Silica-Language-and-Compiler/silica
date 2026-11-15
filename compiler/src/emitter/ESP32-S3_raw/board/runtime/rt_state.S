@@ -763,10 +763,12 @@ rt_sm_val:
     s32i    a10, a1, 0
     movi    a10, 24
     call8   rt_sm_add
-    l32i    a8, a4, 8                   // SLOT: the chunk slot bytes; a chunk is 2 slots, next, claim
+    l32i    a8, a4, 8                   // SLOT: the chunk slot bytes; then the chunk's data, next, claim
     s32i    a8, a1, 4
-    slli    a8, a8, 1
-    s32i    a8, a1, 8                   // CDATA
+    movi    a9, 16                      // CDATA = max(SLOT, 16), prims_list chunk_data_bytes (a 4-byte
+    bgeu    a8, a9, 66f                 // slot had 8 here and read the next chunk from inside the data)
+    mov     a8, a9
+66: s32i    a8, a1, 8                   // CDATA
     l32i    a5, a2, 0                   // elements left
     l32i    a6, a2, 8                   // chunk
     l32i    a7, a2, 16                  // cursor
@@ -1075,10 +1077,12 @@ rt_sc_val:
     l32i    a7, a2, 16                  // cursor
     addi    a8, a9, 8
     s32i    a8, a1, 24                  // where the next chunk's final address is stored
-    l32i    a8, a5, 8                   // SLOT; a chunk is 2 slots, then next, then claim
+    l32i    a8, a5, 8                   // SLOT; then the chunk's data, next, claim
     s32i    a8, a1, 32
-    slli    a8, a8, 1
-    s32i    a8, a1, 36                  // CDATA
+    movi    a9, 16                      // CDATA = max(SLOT, 16), prims_list chunk_data_bytes
+    bgeu    a8, a9, 66f
+    mov     a8, a9
+66: s32i    a8, a1, 36                  // CDATA
 71: l32i    a8, a1, 20
     beqz    a8, 79f
     beqz    a6, 79f

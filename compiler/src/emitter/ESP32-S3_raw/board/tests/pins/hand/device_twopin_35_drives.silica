@@ -1,0 +1,341 @@
+// Hand-run app, NOT a trial (see README.md here). ESP32-S3 e-badge (hardware v4.1.0) with ONE jumper
+// between GPIO35 (J3 pin 8, silk U1TX) and GPIO36 (J3 pin 10, silk U1RX), nothing else, installed before the
+// run and left in. Part A of 2: GPIO35 drives, GPIO36 reads (the other part is device_twopin_36_drives).
+//
+// SAFETY: the pins are tied together, so at most one of them is ever an output, and only GPIO35 is ever
+// put in an output mode. Every step starts with release_all (each pin: latch HIGH, input, no pull; at
+// that moment at most GPIO35 was an output, and its latch going HIGH only drives HIGH against an input),
+// then sets the reader's pull, then the driver: its latch first, written while it is an input, then its
+// mode (pin_mode sets the open-drain bit before the output enable). The program ends with both pins
+// inputs, latch HIGH, no pull. No LED, display, button, joystick or buzzer is touched.
+//
+// Shape as device_power_36: a device worker (:device_twopin_35) makes the pin calls, every pin a literal; an
+// ordinary conductor casts each step, waits 20 ms for the level to settle and asks for the read.
+use trial_wait_int64;
+
+// ---- the device worker -------------------------------------------------------------------------
+
+// Both pins: latch HIGH, input, no pull (GPIO35 first, then GPIO36).
+fn release_all() -> atom {
+    sequence proc[register_rwr]
+        _: atom <- pin_write(35, true);
+        _: atom <- pin_mode(35, :input);
+        _: atom <- pin_pull(35, :none);
+        _: atom <- pin_write(36, true);
+        _: atom <- pin_mode(36, :input);
+        pin_pull(36, :none)
+    produces
+        pure :ok
+    end
+}
+
+// One step's setup, always after release_all: the reader's pull, then the driver's latch, then its mode.
+fn configure(step: uint32) -> atom {
+    sequence proc[register_rwr]
+        _: atom <- release_all();
+        r: atom <- case step of {
+            1 -> {
+                _: atom <- pin_write(35, true);
+                pin_mode(35, :output)
+            };
+            2 -> {
+                _: atom <- pin_write(35, false);
+                pin_mode(35, :output)
+            };
+            3 -> {
+                _: atom <- pin_pull(36, :up);
+                _: atom <- pin_write(35, true);
+                pin_mode(35, :output)
+            };
+            4 -> {
+                _: atom <- pin_pull(36, :up);
+                _: atom <- pin_write(35, false);
+                pin_mode(35, :output)
+            };
+            5 -> {
+                _: atom <- pin_pull(36, :down);
+                _: atom <- pin_write(35, true);
+                pin_mode(35, :output)
+            };
+            6 -> {
+                _: atom <- pin_pull(36, :down);
+                _: atom <- pin_write(35, false);
+                pin_mode(35, :output)
+            };
+            7 -> pin_pull(36, :up);
+            8 -> pin_pull(36, :down);
+            9 -> {
+                _: atom <- pin_pull(36, :up);
+                _: atom <- pin_write(35, false);
+                pin_mode(35, :output_open_drain)
+            };
+            10 -> {
+                _: atom <- pin_pull(36, :up);
+                _: atom <- pin_write(35, true);
+                pin_mode(35, :output_open_drain)
+            };
+            11 -> {
+                _: atom <- pin_pull(36, :down);
+                _: atom <- pin_write(35, true);
+                pin_mode(35, :output_open_drain)
+            };
+            12 -> {
+                _: atom <- pin_write(35, true);
+                pin_mode(35, :output)
+            };
+            13 -> {
+                _: atom <- pin_write(35, false);
+                pin_mode(35, :output)
+            };
+            14 -> {
+                _: atom <- pin_write(35, false);
+                pin_mode(35, :output)
+            };
+            _: uint32 -> :ok
+        }
+    produces
+        pure r
+    end
+}
+
+// The toggle burst (step 14, GPIO35 already a push-pull output driving LOW, GPIO36 an input): 8 HIGH/LOW
+// pairs, GPIO36 read after each write; the count of reads that matched (16 expected).
+fn burst(pairs: uint32, acc: uint32) -> uint32 {
+    sequence proc[register_rwr]
+        r: uint32 <- case pairs == 0 of {
+            true -> acc;
+            false -> {
+                _: atom <- pin_write(35, true);
+                hi: boolean <- pin_read(36);
+                _: atom <- pin_write(35, false);
+                lo: boolean <- pin_read(36);
+                a1: uint32 <- case hi of {
+                    true -> acc + 1;
+                    false -> acc
+                };
+                a2: uint32 <- case lo of {
+                    true -> a1;
+                    false -> a1 + 1
+                };
+                burst(pairs - 1, a2)
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+// Steps 12-13 read the driver's own pad (GPIO35), step 14 is the burst, the others read GPIO36.
+fn measure(step: uint32, reply_to: actor_ref) -> atom {
+    sequence proc[register_rwr, concurrency]
+        n: uint32 <- case step == 14 of {
+            true -> burst(8, 0);
+            false -> 0
+        };
+        level: boolean <- case step of {
+            12 -> pin_read(35);
+            13 -> pin_read(35);
+            14 -> n == 16;
+            _: uint32 -> pin_read(36)
+        };
+        _: boolean <- cast(reply_to, { step: step, level: level, n: n } impl ActorMessage {})
+    produces
+        pure :ok
+    end
+}
+
+fn twopin_worker(msg: { op: atom, step: uint32, reply_to: actor_ref }, state: int64) -> (:no_reply, int64) {
+    sequence proc[register_rwr]
+        _: atom <- case msg.op of {
+            :config -> configure(msg.step);
+            :read -> measure(msg.step, msg.reply_to);
+            _: atom -> release_all()
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// ---- the conductor ------------------------------------------------------------------------------
+// Messages { step, level, n }: 0 start; 1..14 a step's reading; 301..314 a step's settle time is over;
+// 150 the readings are done (DONE).
+
+fn describe(step: uint32) -> string {
+    case step of {
+        1 -> "GPIO35 push-pull HIGH, GPIO36 no pull: GPIO36";
+        2 -> "GPIO35 push-pull LOW, GPIO36 no pull: GPIO36";
+        3 -> "GPIO35 push-pull HIGH, GPIO36 pull up: GPIO36";
+        4 -> "GPIO35 push-pull LOW, GPIO36 pull up: GPIO36";
+        5 -> "GPIO35 push-pull HIGH, GPIO36 pull down: GPIO36";
+        6 -> "GPIO35 push-pull LOW, GPIO36 pull down: GPIO36";
+        7 -> "GPIO35 input released, GPIO36 pull up: GPIO36";
+        8 -> "GPIO35 input released, GPIO36 pull down: GPIO36";
+        9 -> "GPIO35 open drain LOW, GPIO36 pull up: GPIO36";
+        10 -> "GPIO35 open drain released, GPIO36 pull up: GPIO36";
+        11 -> "GPIO35 open drain released, GPIO36 pull down: GPIO36";
+        12 -> "GPIO35 push-pull HIGH, reads itself: GPIO35";
+        13 -> "GPIO35 push-pull LOW, reads itself: GPIO35";
+        14 -> "toggle burst: GPIO35 8 x HIGH/LOW, GPIO36 read after each: reads matching (of 16) =";
+        _: uint32 -> "?"
+    }
+}
+
+fn expected(step: uint32) -> boolean {
+    case step of {
+        1 -> true;
+        3 -> true;
+        5 -> true;
+        7 -> true;
+        10 -> true;
+        12 -> true;
+        14 -> true;
+        _: uint32 -> false
+    }
+}
+
+fn level_word(b: boolean) -> uint32 {
+    case b of {
+        true -> 1;
+        false -> 0
+    }
+}
+
+fn worker_do(op: atom, step: uint32) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast_device_registered(:device_twopin_35, { op: op, step: step, reply_to: self() } impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn tick_in(ms: uint64, code: uint32) -> timer_ref {
+    sequence proc[concurrency]
+        t: timer_ref <- send_after(ms, self(), { step: code, level: false, n: 0 } impl ActorMessage {})
+    produces
+        pure t
+    end
+}
+
+// Configure, then 20 ms for the level to settle before the read.
+fn start_step(step: uint32) -> atom {
+    _: boolean <- worker_do(:config, step);
+    _: timer_ref <- tick_in(20, step + 300);
+    :ok
+}
+
+fn on_start(st: { pass: uint32, fail: uint32, ticks: uint32 }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32 }) {
+    sequence proc[device_io]
+        _: atom <- print_string("twopin A: GPIO35 drives, GPIO36 reads; jumper J3 pin 8 (GPIO35, U1TX) to J3 pin 10 (GPIO36, U1RX)\n");
+        _: boolean <- worker_do(:idle, 0);
+        _: atom <- print_string("");
+        _: atom <- start_step(1)
+    produces
+        pure (:no_reply, st)
+    end
+}
+
+fn finish_readings(pass: uint32, fail: uint32) -> atom {
+    sequence proc[device_io]
+        _: boolean <- worker_do(:idle, 0);
+        _: atom <- print_string("SUMMARY: ");
+        _: atom <- print_uint32(pass);
+        _: atom <- print_string(" passed, ");
+        _: atom <- print_uint32(fail);
+        _: atom <- print_string(" failed of 14: ");
+        _: atom <- case fail == 0 of {
+            true -> print_string("ALL PASS\n");
+            false -> print_string("FAILURES\n")
+        };
+        _: atom <- print_string("GPIO35 and GPIO36 back to input, latch HIGH, no pull\n");
+        _: timer_ref <- tick_in(200, 150)
+    produces
+        pure :ok
+    end
+}
+
+fn advance(step: uint32, pass: uint32, fail: uint32) -> atom {
+    case step < 14 of {
+        true -> start_step(step + 1);
+        false -> finish_readings(pass, fail)
+    }
+}
+
+fn on_result(step: uint32, level: boolean, n: uint32, st: { pass: uint32, fail: uint32, ticks: uint32 }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32 }) {
+    sequence proc[device_io]
+        _: atom <- print_string("step ");
+        _: atom <- print_uint32(step);
+        _: atom <- print_string(": ");
+        _: atom <- print_string(describe(step));
+        _: atom <- case step == 14 of {
+            true -> {
+                _: atom <- print_string(" ");
+                print_uint32(n)
+            };
+            false -> {
+                _: atom <- print_string(" reads ");
+                print_uint32(level_word(level))
+            }
+        };
+        _: atom <- print_string(", expect ");
+        _: atom <- print_uint32(level_word(expected(step)));
+        ok: boolean <- level == expected(step);
+        _: atom <- case ok of {
+            true -> print_string(": PASS\n");
+            false -> print_string(": FAIL\n")
+        };
+        pass: uint32 <- case ok of {
+            true -> st.pass + 1;
+            false -> st.pass
+        };
+        fail: uint32 <- case ok of {
+            true -> st.fail;
+            false -> st.fail + 1
+        };
+        _: atom <- advance(step, pass, fail)
+    produces
+        pure (:no_reply, { pass: pass, fail: fail, ticks: st.ticks })
+    end
+}
+
+fn on_settled(step: uint32, st: { pass: uint32, fail: uint32, ticks: uint32 }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32 }) {
+    _: boolean <- worker_do(:read, step);
+    (:no_reply, st)
+}
+
+fn on_hold_done(st: { pass: uint32, fail: uint32, ticks: uint32 }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32 }) {
+    sequence proc[concurrency, device_io]
+        _: atom <- print_string("DONE\n");
+        _: boolean <- cast_exit(0)
+    produces
+        pure (:no_reply, st)
+    end
+}
+
+fn conductor(msg: { step: uint32, level: boolean, n: uint32 }, st: { pass: uint32, fail: uint32, ticks: uint32 }) -> (:no_reply, { pass: uint32, fail: uint32, ticks: uint32 }) {
+    case msg.step of {
+        0 -> on_start(st);
+        150 -> on_hold_done(st);
+        _: uint32 -> case msg.step > 300 of {
+            true -> on_settled(msg.step - 300, st);
+            false -> on_result(msg.step, msg.level, msg.n, st)
+        }
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                _: device_actor_ref <- spawn_device_registered(0, twopin_worker, :device_twopin_35, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                c: actor_ref <- spawn({ pass: 0, fail: 0, ticks: 0 }, conductor, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(c, { step: 0, level: false, n: 0 } impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        _: int64 <- wait_for_exit()
+    produces
+        pure 0
+    end
+}

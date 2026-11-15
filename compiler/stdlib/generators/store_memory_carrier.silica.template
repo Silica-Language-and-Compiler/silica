@@ -1,0 +1,499 @@
+@@FIELDS owner: actor_ref, up: boolean, retention: atom, capacity: int64, area: string, firsts: string, oldest: int64, oldest_block: int64, used: int64, next: int64, tail_block: int64, tail_pos: int64, pend: string, buffered: int64, dirty: boolean, rx_credit: int64, replaying: boolean, r_from: int64, r_end: int64, r_seq: int64, r_block: int64, r_pos: int64@@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The (:memory) storage carrier (transport_serialization_design.md §6.8): a durable-log carrier whose
+// medium is RAM, so nothing survives the actor. It is the test medium, as (:loopback) is for TCP: the
+// whole §6.8.2 vocabulary, the write-behind buffer, the record envelope and block layout of storelog,
+// the three retention modes and credit-paced replay, with no hardware and no host file. A program
+// declares it with `carried_on <name>: (:store) (:memory, <capacity>, <retention>);` and starts it with
+// spawn_dangerous_carrier(<name>, ...); it is an ordinary actor (it touches nothing foreign).
+//
+// THE REGION is `capacity` bytes cut into 4096-byte blocks (capacity is a multiple of 4096), with a
+// 512-byte write unit, the numbers of a card sector, so that padding and the unit-boundary rule are
+// exercised here as on a real medium. The largest record is 4064 bytes (Carrier@mtu(:store)): a block
+// less its header and the record envelope. Blocks are used in ring order. The area string holds what
+// has been written to the "medium"; a reused block keeps its old bytes beyond what is written anew, as
+// a medium that is not erased does.
+//
+// MESSAGES (§6.8.2; every sequence number is exclusive: it names the first record not covered).
+//   to the carrier    (:open, owner, "")   (:tx, record, from)   :sync   (:read, from)   :read_stop
+//                     (:credit, n)   (:trim, upto)   :close
+//   to the owner      (:link_up, "memory")   (:log, oldest, next, capacity)   (:tx_credit, n)
+//                     (:synced, next)   (:rx, record)   (:rx_end, next)   (:tx_failed, why)
+//                     (:read_failed, why)   (:link_down, why)
+// :sync, :read_stop and :close are bare atoms, as :close is in every hosted carrier (a one-atom tuple
+// is not a run-time value). Sequence numbers and counts are int64.
+//
+// WRITE-BEHIND. A :tx is numbered and laid out when it is accepted, and its bytes wait in the buffer
+// (8 slots, one record each; one send credit is one slot). The buffer is written to the area when it
+// is full, 50 ms after its first record when nothing else drains it, and on :sync, :read, :trim and
+// :close; (:tx_credit, n) then gives the n slots back. (:synced, next) answers a :sync only: it drains,
+// fills the rest of the tail's write unit with zeros and never writes that unit again. A refused record
+// takes no number: :too_long (over 4064 bytes), :empty (no bytes), :no_credit (no free slot), :full (a
+// :stop or :trim region with no free block), :link_down (not open).
+//
+// REPLAY. One at a time ((:read_failed, :busy)). (:read, from) drains, then delivers the records from
+// `from` up to the `next` of that moment as (:rx, record), one per receive credit, and ends with
+// (:rx_end, next); records accepted meanwhile are not part of it. :read_stop ends it early with
+// (:rx_end, <first record not delivered>). (:read_failed, :trimmed) when `from` is below `oldest`, at
+// the :read or because a :ring writer reclaimed the block being read (a :log follows);
+// :beyond_tail when `from` is past `next`; :corrupt when a record of the range fails its check.
+//
+// RETENTION. :ring reclaims the oldest block when a new block is needed and none is free. :stop and
+// :trim refuse the record with :full. (:trim, upto) is accepted in every mode: it releases the blocks
+// that lie wholly below upto (never the tail block) and answers (:log, oldest, next, capacity), so
+// `oldest` may stay below upto: a trimmed queue delivers at least once.
+//
+// THE END. :close drains, answers (:link_down, :closed) and ends the carrier (stop_self(:normal)); the
+// reference is dead afterwards. A second (:open, ...) while open is answered (:link_down, :in_use) to
+// its sender and changes nothing.
+module store_memory_carrier;
+
+use storelog;
+
+export initial/2;
+export carrier/2;
+
+fn block_size() -> int64 { 4096 }
+fn write_unit() -> int64 { 512 }
+fn slots() -> int64 { 8 }
+fn largest() -> int64 { 4064 }
+
+// The state a declaration starts the carrier with: `capacity` and `retention` are the link's parameters.
+fn initial(capacity: int64, retention: atom) -> @@ST@@ {
+    @@S(){owner=>actor_ref_of_word(0);;up=>false;;retention=>retention;;capacity=>capacity;;area=>"";;firsts=>"";;oldest=>0;;oldest_block=>0;;used=>0;;next=>0;;tail_block=>0 - 1;;tail_pos=>0;;pend=>"";;buffered=>0;;dirty=>false;;rx_credit=>0;;replaying=>false;;r_from=>0;;r_end=>0;;r_seq=>0;;r_block=>0;;r_pos=>0}@@
+}
+
+fn msg_kind(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | (:read, int64) | (:trim, int64) | :sync | :read_stop | :close | :drain | :step) -> atom {
+    case msg of {
+        (:open, o: actor_ref, a: string) -> :open;
+        (:tx, s: string, f: actor_ref) -> :tx;
+        (:credit, n: int64) -> :credit;
+        (:read, n: int64) -> :read;
+        (:trim, n: int64) -> :trim;
+        :sync -> :sync;
+        :read_stop -> :read_stop;
+        :close -> :close;
+        :drain -> :drain;
+        :step -> :step
+    }
+}
+
+fn msg_owner(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | (:read, int64) | (:trim, int64) | :sync | :read_stop | :close | :drain | :step, fallback: actor_ref) -> actor_ref {
+    case msg of {
+        (:open, o: actor_ref, a: string) -> o;
+        (:tx, s: string, f: actor_ref) -> fallback;
+        (:credit, n: int64) -> fallback;
+        (:read, n: int64) -> fallback;
+        (:trim, n: int64) -> fallback;
+        :sync -> fallback;
+        :read_stop -> fallback;
+        :close -> fallback;
+        :drain -> fallback;
+        :step -> fallback
+    }
+}
+
+fn msg_text(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | (:read, int64) | (:trim, int64) | :sync | :read_stop | :close | :drain | :step) -> string {
+    case msg of {
+        (:open, o: actor_ref, a: string) -> "";
+        (:tx, s: string, f: actor_ref) -> s;
+        (:credit, n: int64) -> "";
+        (:read, n: int64) -> "";
+        (:trim, n: int64) -> "";
+        :sync -> "";
+        :read_stop -> "";
+        :close -> "";
+        :drain -> "";
+        :step -> ""
+    }
+}
+
+fn msg_count(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | (:read, int64) | (:trim, int64) | :sync | :read_stop | :close | :drain | :step) -> int64 {
+    case msg of {
+        (:open, o: actor_ref, a: string) -> 0;
+        (:tx, s: string, f: actor_ref) -> 0;
+        (:credit, n: int64) -> n;
+        (:read, n: int64) -> n;
+        (:trim, n: int64) -> n;
+        :sync -> 0;
+        :read_stop -> 0;
+        :close -> 0;
+        :drain -> 0;
+        :step -> 0
+    }
+}
+
+
+fn blocks(st: @@ST@@) -> int64 {
+    st.capacity / block_size()
+}
+
+fn after(st: @@ST@@, b: int64) -> int64 {
+    (b + 1) % blocks(st)
+}
+
+// ---- :open ----
+fn on_open(o: actor_ref, st: @@ST@@) -> @@ST@@ {
+    case st.up of {
+        true -> refuse_open(o, :in_use, st);
+        false -> case blocks(st) < 1 of {
+            true -> refuse_open(o, :mismatch, st);
+            false -> opened(o, st)
+        }
+    }
+}
+
+fn refuse_open(o: actor_ref, why: atom, st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(o, (:link_down, why) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn opened(o: actor_ref, st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(o, (:link_up, "memory") impl ActorMessage {});
+        _: boolean <- cast(o, (:log, 0, 0, st.capacity) impl ActorMessage {});
+        _: boolean <- cast(o, (:tx_credit, slots()) impl ActorMessage {})
+    produces
+        pure @@S(st){owner=>o;;up=>true;;area=>"";;firsts=>storelog@zeros(blocks(st) * 8);;oldest=>0;;oldest_block=>0;;used=>0;;next=>0;;tail_block=>0 - 1;;tail_pos=>0;;pend=>"";;buffered=>0;;dirty=>false;;rx_credit=>0;;replaying=>false}@@
+    end
+}
+
+// ---- :tx ----
+fn refused(why: atom, st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:tx_failed, why) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn on_tx(segment: string, st: @@ST@@) -> @@ST@@ {
+    n: int64 <- length_bytes(segment);
+    case st.up of {
+        false -> refused(:link_down, st);
+        true -> case n > largest() of {
+            true -> refused(:too_long, st);
+            false -> case n == 0 of {
+                true -> refused(:empty, st);
+                false -> case st.buffered >= slots() of {
+                    true -> refused(:no_credit, st);
+                    false -> case st.tail_block >= 0 and st.tail_pos + 16 + n <= block_size() of {
+                        true -> placed(segment, st);
+                        false -> case st.used == blocks(st) and st.retention != :ring of {
+                            true -> refused(:full, st);
+                            false -> placed(segment, new_block(st))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The next block in ring order becomes the tail. When every block is in use it is the oldest one,
+// which is reclaimed (:ring): `oldest` moves to the block after it.
+fn new_block(st: @@ST@@) -> @@ST@@ {
+    nb: int64 <- case st.tail_block < 0 of { true -> 0; false -> after(st, st.tail_block) };
+    reclaim: boolean <- st.used == blocks(st);
+    used_now: int64 <- case reclaim of { true -> st.used - 1; false -> st.used };
+    ob: int64 <- case reclaim of { true -> after(st, nb); false -> case st.used == 0 of { true -> nb; false -> st.oldest_block } };
+    old: int64 <- case reclaim of {
+        true -> case blocks(st) == 1 of { true -> st.next; false -> storelog@table_get(st.firsts, after(st, nb)) };
+        false -> case st.used == 0 of { true -> st.next; false -> st.oldest }
+    };
+    @@S(st){firsts=>storelog@table_set(st.firsts, nb, st.next);;oldest=>old;;oldest_block=>ob;;used=>used_now + 1;;tail_block=>nb;;tail_pos=>16;;pend=>storelog@put(st.pend, length_bytes(st.pend), storelog@entry(nb * block_size(), storelog@block_header(st.next, 1)))}@@
+}
+
+fn placed(segment: string, st: @@ST@@) -> @@ST@@ {
+    n: int64 <- length_bytes(segment);
+    more: string <- storelog@entry(st.tail_block * block_size() + st.tail_pos, storelog@envelope(st.next, segment));
+    kept: @@ST@@ <- @@S(st){next=>st.next + 1;;tail_pos=>st.tail_pos + 16 + n;;pend=>storelog@put(st.pend, length_bytes(st.pend), more);;buffered=>st.buffered + 1}@@;
+    case kept.buffered == slots() of {
+        true -> drained(kept);
+        false -> case kept.buffered == 1 of {
+            true -> drain_later(kept);
+            false -> kept
+        }
+    }
+}
+
+fn drain_later(st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(50, self(), :drain impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+// ---- the write-behind buffer reaches the area ----
+fn drained(st: @@ST@@) -> @@ST@@ {
+    case st.buffered == 0 of {
+        true -> st;
+        false -> drain_now(st)
+    }
+}
+
+fn drain_now(st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:tx_credit, st.buffered) impl ActorMessage {})
+    produces
+        pure @@S(st){area=>storelog@apply(st.area, st.pend);;pend=>"";;buffered=>0;;dirty=>true}@@
+    end
+}
+
+// ---- :sync ----
+fn on_sync(st0: @@ST@@) -> @@ST@@ {
+    st: @@ST@@ <- drained(st0);
+    case st.up of {
+        false -> st;
+        true -> synced(st)
+    }
+}
+
+fn synced(st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:synced, st.next) impl ActorMessage {})
+    produces
+        pure padded(st)
+    end
+}
+
+fn padded(st: @@ST@@) -> @@ST@@ {
+    up_to: int64 <- storelog@round_up(st.tail_pos, write_unit());
+    case st.dirty and st.tail_block >= 0 and up_to > st.tail_pos of {
+        false -> @@S(st){dirty=>false}@@;
+        true -> @@S(st){area=>storelog@put(st.area, st.tail_block * block_size() + st.tail_pos, storelog@zeros(up_to - st.tail_pos));;tail_pos=>up_to;;dirty=>false}@@
+    }
+}
+
+// ---- :read, :credit, :step, :read_stop ----
+fn read_refused(why: atom, st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:read_failed, why) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn read_trimmed(st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:read_failed, :trimmed) impl ActorMessage {});
+        _: boolean <- cast(st.owner, (:log, st.oldest, st.next, st.capacity) impl ActorMessage {})
+    produces
+        pure @@S(st){replaying=>false}@@
+    end
+}
+
+fn read_ended(nx: int64, st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:rx_end, nx) impl ActorMessage {})
+    produces
+        pure @@S(st){replaying=>false}@@
+    end
+}
+
+fn step_again(st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(self(), :step impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn on_read(from: int64, st0: @@ST@@) -> @@ST@@ {
+    st: @@ST@@ <- drained(st0);
+    case st.up of {
+        false -> read_refused(:link_down, st);
+        true -> case st.replaying of {
+            true -> read_refused(:busy, st);
+            false -> case from < st.oldest of {
+                true -> read_trimmed(st);
+                false -> case from > st.next of {
+                    true -> read_refused(:beyond_tail, st);
+                    false -> case from == st.next of {
+                        true -> read_ended(st.next, st);
+                        false -> started(from, block_holding(st, from, 0, st.oldest_block), st)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The in-use block whose first record is the greatest one not above `from`, walking from the oldest.
+fn block_holding(st: @@ST@@, from: int64, i: int64, best: int64) -> int64 {
+    case i >= st.used of {
+        true -> best;
+        false -> {
+            b: int64 <- (st.oldest_block + i) % blocks(st);
+            case storelog@table_get(st.firsts, b) <= from of {
+                true -> block_holding(st, from, i + 1, b);
+                false -> best
+            }
+        }
+    }
+}
+
+fn started(from: int64, b: int64, st: @@ST@@) -> @@ST@@ {
+    step_again(@@S(st){replaying=>true;;r_from=>from;;r_end=>st.next;;r_seq=>storelog@table_get(st.firsts, b);;r_block=>b;;r_pos=>16}@@)
+}
+
+fn on_credit(n: int64, st0: @@ST@@) -> @@ST@@ {
+    st: @@ST@@ <- @@S(st0){rx_credit=>st0.rx_credit + n}@@;
+    case st.replaying of {
+        true -> step_again(st);
+        false -> st
+    }
+}
+
+// One step of a replay: one record read from the area. Records below `from` (the front of the block
+// the replay started in) are passed over without credit.
+fn on_step(st: @@ST@@) -> @@ST@@ {
+    case st.replaying of {
+        false -> st;
+        true -> case st.r_seq < st.oldest of {
+            true -> read_trimmed(st);
+            false -> case st.r_seq >= st.r_from and st.rx_credit <= 0 of {
+                true -> st;
+                false -> stepped(storelog@scan(storelog@block_of(st.area, st.r_block, block_size()), st.r_pos, block_size(), write_unit(), st.r_seq), st)
+            }
+        }
+    }
+}
+
+fn stepped(found: (:record, string, int64) | (:end, int64), st: @@ST@@) -> @@ST@@ {
+    case found of {
+        (:record, payload: string, nx: int64) -> got_record(payload, nx, st);
+        (:end, _nx: int64) -> next_block(st)
+    }
+}
+
+fn got_record(payload: string, nx: int64, st: @@ST@@) -> @@ST@@ {
+    deliver: boolean <- st.r_seq >= st.r_from;
+    moved: @@ST@@ <- @@S(st){rx_credit=>case deliver of { true -> st.rx_credit - 1; false -> st.rx_credit };;r_seq=>st.r_seq + 1;;r_pos=>nx}@@;
+    told: @@ST@@ <- case deliver of { true -> delivered(payload, moved); false -> moved };
+    case told.r_seq == told.r_end of {
+        true -> read_ended(told.r_end, told);
+        false -> step_again(told)
+    }
+}
+
+fn delivered(payload: string, st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:rx, payload) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+// The block has no more records: the one expected is the first of the next block, or it is missing.
+fn next_block(st: @@ST@@) -> @@ST@@ {
+    nb: int64 <- after(st, st.r_block);
+    case nb != st.r_block and storelog@table_get(st.firsts, nb) == st.r_seq and storelog@header_first_seq(st.area, nb * block_size()) == st.r_seq of {
+        true -> step_again(@@S(st){r_block=>nb;;r_pos=>16}@@);
+        false -> corrupt(st)
+    }
+}
+
+fn corrupt(st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:read_failed, :corrupt) impl ActorMessage {})
+    produces
+        pure @@S(st){replaying=>false}@@
+    end
+}
+
+fn on_read_stop(st: @@ST@@) -> @@ST@@ {
+    case st.replaying of {
+        false -> st;
+        true -> read_ended(case st.r_seq > st.r_from of { true -> st.r_seq; false -> st.r_from }, st)
+    }
+}
+
+// ---- :trim ----
+fn on_trim(upto: int64, st0: @@ST@@) -> @@ST@@ {
+    st: @@ST@@ <- drained(st0);
+    case st.up of {
+        false -> st;
+        true -> trimmed(released(case upto > st.next of { true -> st.next; false -> upto }, st))
+    }
+}
+
+// Releases the oldest block while the block after it begins at or below upto (the oldest then lies
+// wholly below upto) and it is not the tail block. A released block's header says so on the medium.
+fn released(upto: int64, st: @@ST@@) -> @@ST@@ {
+    nb: int64 <- after(st, st.oldest_block);
+    case st.used > 1 and storelog@table_get(st.firsts, nb) <= upto of {
+        false -> st;
+        true -> released(upto, @@S(st){area=>storelog@put(st.area, st.oldest_block * block_size(), storelog@block_header(storelog@table_get(st.firsts, st.oldest_block), 0));;oldest=>storelog@table_get(st.firsts, nb);;oldest_block=>nb;;used=>st.used - 1}@@)
+    }
+}
+
+fn trimmed(st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:log, st.oldest, st.next, st.capacity) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+// ---- :close ----
+fn on_close(st0: @@ST@@) -> @@ST@@ {
+    st: @@ST@@ <- drained(st0);
+    closed(st)
+}
+
+fn closed(st: @@ST@@) -> @@ST@@ {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:link_down, :closed) impl ActorMessage {})
+    produces
+        pure @@S(st){up=>false;;replaying=>false}@@
+    end
+}
+
+fn handled(kind: atom, o: actor_ref, text: string, n: int64, st: @@ST@@) -> @@ST@@ {
+    case kind of {
+        :open -> on_open(o, st);
+        :tx -> on_tx(text, st);
+        :credit -> on_credit(n, st);
+        :read -> on_read(n, st);
+        :trim -> on_trim(n, st);
+        :sync -> on_sync(st);
+        :read_stop -> on_read_stop(st);
+        :close -> on_close(st);
+        :drain -> drained(st);
+        _: atom -> on_step(st)
+    }
+}
+
+fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | (:read, int64) | (:trim, int64) | :sync | :read_stop | :close | :drain | :step, state: @@ST@@) -> (:no_reply, @@ST@@) {
+    sequence proc[concurrency]
+        kind: atom <- msg_kind(msg);
+        after_it: @@ST@@ <- handled(kind, msg_owner(msg, state.owner), msg_text(msg), msg_count(msg), state);
+        _: atom <- case kind == :close of {
+            true -> stop_self(:normal);
+            false -> :ok
+        }
+    produces
+        pure (:no_reply, after_it)
+    end
+}

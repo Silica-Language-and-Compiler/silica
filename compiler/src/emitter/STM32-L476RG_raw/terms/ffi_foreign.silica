@@ -15,31 +15,30 @@
    limitations under the License.
 -}
 
-// Foreign c_wrapper calls on the ESP32-S3 (spec §20.4; FFI wrapper spec §6; porting_for_os_free_targets.md
-// §9.1; chunk15_stack_memory_design.md §7). The C side is compiled by the same Espressif
-// xtensa-esp32s3-elf GCC that assembles and links the image, so emitted code and C share the windowed
-// ABI: a CALL8's arguments are the caller's a10-a15 (the callee's a2-a7), 64-bit values in even-aligned
-// register pairs, results in a2-a5; an aggregate larger than 16 bytes is returned through a hidden
-// pointer passed as the first argument. The emitter's X0-X2 already live in a10-a15 (shared/xt_vr), but a
-// C argument list is laid out by C's rules (a narrow value takes one word, a double an even pair), so
-// every call goes through one shape: the CALL BLOCK.
+// Foreign c_wrapper calls on the STM32-L476RG (spec §20.4; FFI wrapper spec §6; porting_for_os_free_targets.md
+// §9.1; chunk15_stack_memory_design.md §7). The C side is compiled by the same arm-none-eabi GCC that
+// assembles and links the image (-mfloat-abi=softfp), so emitted code and C share AAPCS: r0-r3 carry the
+// first four argument words (a 64-bit value in an even-aligned pair), the rest go on the stack; the result
+// is r0 (r0:r1 for 64 bits); a composite result larger than 4 bytes is returned through a hidden pointer
+// passed in r0 as the first argument. A C argument list is laid out by C's rules (a narrow value takes
+// one word, a double an even pair), so every call goes through one shape: the CALL BLOCK.
 //
 // The call block is 64 bytes of the auxiliary stack (the emitter's SP; reserved by emit_foreign_sret_setup
 // before the arguments are evaluated, as the hosted scratch frame is, and popped after the call):
-//   [SP+0, SP+24)   the six argument words a2-a7 of the C callee, in C order
+//   [SP+0, SP+24)   the six argument words of the C callee in C order (words 0-3 to r0-r3, 4-5 stacked)
 //   [SP+24]         the C function's address
-//   [SP+28]         the result mode: 0 a scalar in a2:a3, 1 a struct of up to 16 bytes in a2-a5 (stored
+//   [SP+28]         the result mode: 0 a scalar in r0:r1, 1 a composite of up to 4 bytes in r0 (stored
 //                   at +32 by the runtime), 2 a struct returned through the hidden pointer at word 0
 //   [SP+32, SP+64)  the returned struct (modes 1 and 2), zeroed before the call
 // Emitted code fills the block, leaves its address in VRG_ARG and calls silica_rt_ffi_call
-// (board/runtime/rt_ffi.S), which loads a10-a15 from it and calls the C function with CALLX8. In an actor
-// the runtime first moves to a machine-stack chunk of the actor's own chain with _silica_ffi_stack_size
-// bytes free below the call (the growth path every emitted prologue uses: rt_actors.S "Growable stacks"),
+// (board/runtime/rt_ffi.S), which loads r0-r3 and the stacked words from it and calls the C function
+// with BLX. In an actor the runtime first moves to a machine-stack chunk of the actor's own chain with
+// _silica_ffi_stack_size bytes free below the call (the growth path every emitted prologue uses: rt_actors.S "Growable stacks"),
 // so the foreign frames never run into the chunk the Silica frames are on and a C stack overflow hits
 // that chunk's guard band like any other; the chunk goes back when the call returns. The runtime marks
 // the core "in foreign code" for the call: a CPU exception raised meanwhile ends the actor with
 // failure_reason :foreign_fault (tag 5, silica_rt_actor_fault_hook), the board's form of the hosted
-// guarded region (no setjmp, porting §9.1 rule 2). The result comes back in a10:a11 = X0, as every call's.
+// guarded region (no setjmp, porting §9.1 rule 2). The result comes back in r0:r1 = X0, as every call's.
 //
 // Marshalling, as the hosted emitters do it: a `string` argument for a `name_ptr: uint8, name_len: uint64`
 // pair is copied with a NUL into a block of the caller's frame (silica_rt_ffi_string_in, a frame
@@ -374,7 +373,7 @@ fn itos(n: int64) -> string {
 }
 
 fn error_line(msg: string) -> string {
-    concat(".error \"ESP32-S3: ", concat(msg, "\"\n"))
+    concat(".error \"STM32-L476RG_raw: ", concat(msg, "\"\n"))
 }
 
 // --- the C layout of an ABI record (FFI wrapper spec §6.8) -----------------------------------------
@@ -684,8 +683,7 @@ fn stage_target_and_call(c_symbol: string) -> string {
 }
 
 // X0 = the string handle: silica_rt_ffi_string_in copies its bytes and a NUL into a block of this frame
-// and answers X0 = the block, X1 = the byte count (a2-a5 of the callee: the windowed ABI's four result
-// words).
+// and answers X0 = the block, X1 = the byte count (r0-r3 are the answer).
 fn emit_string_in_marshal() -> string {
     ins("bl", "silica_rt_ffi_string_in")
 }
@@ -705,7 +703,7 @@ fn emit_string_out_unmarshal(tag_off: int64, ptr_off: int64, len_off: int64) -> 
     concat(base, concat(offs, ins("bl", "silica_rt_ffi_string_out")))
 }
 
-// The C result (a10:a11 = X0) into dest: an integer or boolean through X0/W0, a float's bits into the
+// The C result (r0:r1 = X0) into dest: an integer or boolean through X0/W0, a float's bits into the
 // D/S home (soft-float doubles come back as a pair, floats as one word).
 fn emit_result_mov(dest: string) -> string {
     c: string <- arm_vr@vr_class(dest);
@@ -741,7 +739,7 @@ fn result_mode(return_type: string, expects_string: boolean) -> (int64, string) 
                     true -> (0, concat("the result record ", concat(return_type, " has no C layout this target lowers (flat scalar fields with a name_ptr: uint8 / name_len: uint64 pair)")));
                     false -> case size > 32 of {
                         true -> (0, "a result record larger than 32 bytes is not supported on this target");
-                        false -> case size > 16 of {
+                        false -> case size > 4 of {
                             true -> (2, "");
                             false -> (1, "")
                         }

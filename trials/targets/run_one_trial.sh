@@ -53,7 +53,10 @@ target=$1 suite=$2 stem=$3
 conf="$here/$target.conf"
 [ -f "$conf" ] || die "unknown trial target '$target' (no $conf)"
 [ -d "$trials_root/$suite" ] || die "no suite $suite"
-[ -f "$trials_root/$suite/$stem.silica" ] || die "no trial $suite/$stem.silica"
+# a program of an app directory (ffi_addition's app_*/, board_suite.sh "app directories") is named by its stem
+[ -f "$trials_root/$suite/$stem.silica" ] \
+    || { [ -f "$trials_root/$suite/common_app.mk" ] && ls "$trials_root/$suite"/app_*/"$stem.silica" > /dev/null 2>&1; } \
+    || die "no trial $suite/$stem.silica"
 
 TARGET_DESCRIPTION=""; TARGET_BOARD_DIR=""; TARGET_PYTHON=""; TARGET_ASCOMP_PLATFORM=""
 TARGET_IMAGE_EXT="bin"; TARGET_PORT_DEFAULT=""; TARGET_PY_MODULES="esptool serial"; TARGET_TOOLS=""

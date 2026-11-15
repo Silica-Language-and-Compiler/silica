@@ -20,10 +20,14 @@ carries `:serial`) for the stage S-A carrier. Trials: `trials/error_enforcement_
 `trials/transport_board_addition/device_*_link_tx` and `link_uart0_console_reserved`. Of phase B, the ESP32-S3 UART1
 worker with the §6.2 carrier contract and the §6 failure atoms exists since stage 1 (`device_esp32s3_uart1.silica`),
 and so does the `(:usb_serial_jtag)` carrier of stage S-A (`device_esp32s3_usb_serial_jtag.silica`, both directions, run
-on a real board with the Silica and Erlang peers). **Not done:** the hosted `(:interface, name)`, `(:ethernet, n)` and
+on a real board with the Silica and Erlang peers). Stage S-D (2026-11-10) ran a declared link end to end: in
+`examples/transport_pairs/usb_accel_led_erlang_and_silica` the board (`carried_on usb: (:serial) (:usb_serial_jtag);`)
+sends four ETF readings, each answered by an LED command from a Mac peer that declares its port
+(`(:serial_port, path, 115200)`) or from the Erlang peer behind the serial bridge, and drives the LED each reply names
+(plan §7). **Not done:** the hosted `(:interface, name)`, `(:ethernet, n)` and
 `(:wifi, n)` links are accepted and checked but the TCP and UDP carriers do not bind to the interface yet (no
 `getifaddrs`, no `(:explicit, :link_unavailable)` at open; the `link_interface_absent` and `link_family_absent` trials of
-§10 wait for it); the Linux packs list no link (E2412 there until their rows are written in lock-step); the Nucleo
+§10 wait for it); all three hosted packs list the hosted links (Mac 2026-11-09, Linux x86-64 2026-11-10, Linux AArch64 ported from x86-64 on 2026-11-11; the AArch64 pack not yet built or run on an AArch64 host), so `(:interface, name)` etc. are accepted but binding is E2 (built 2026-11-12, branch `E2-transport-work`; Linux classifier, Wi-Fi and non-loopback binding unverified; see the plan's E2 status); the Nucleo
 (phase C); UART2 on the ESP32-S3 (no window yet); E2416 (phase D: nothing reaches it); the supervised form of the
 board bring-up (a device worker cannot be a supervisor child yet). It extends
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below), §6 (carriers),
@@ -130,9 +134,11 @@ numbers are different series, and the question numbers are kept (§12).
   (`"host:port"`, `"listen:port"`, `"path@baud"`).
 - **The transport pack** (`emitter/<TARGET>/transport_pack.silica`): `provides_format(tag: string)` and
   `provides_carrier(tag: string)`, flat tables read by the shared compiler; a tag the pack does not list is E2410
-  (`NotProvidedOnTarget`) from `sir_target_verify`, wherever it appears. Today the ESP32-S3_raw, STM32-L476RG_raw,
-  Linux and Mac packs all answer `false` for every carrier, and the hosted carriers are provided through
-  `compiler/stdlib/Carrier.silica` rather than the pack (see the comment in `linux_x86_64/transport_pack.silica`).
+  (`NotProvidedOnTarget`) from `sir_target_verify`, wherever it appears. This paragraph described the state before
+  phase A, when every pack answered `false` for every carrier and the hosted carriers were provided through
+  `compiler/stdlib/Carrier.silica` rather than the pack. Since phase A the Mac pack (2026-11-09) and the Linux x86-64
+  pack (2026-11-10) list `tcp`, `udp` and `serial` and the hosted links. The linux_aarch64 pack has the same rows as the x86-64 pack since 2026-11-11
+  (not yet built or run on an AArch64 host).
 - **Board packs.** The ESP32-S3 draft (`ports/board_pack.silica`) is pure indexed functions with no allocation and no
   effects, and already holds `pin_uart0_tx/rx` (43/44), `pin_uart1_tx/rx` (35/36), `uart_txfifo_max` and a
   window-name table (`":esp32s3_uart"`). The Nucleo pack (`emitter/STM32-L476RG_raw/board_pack.silica`) holds
@@ -193,6 +199,23 @@ therefore only says **which interface family the carrier's socket binds to**:
   interface is absent at `:open`, the carrier fails at once with `(:explicit, :link_unavailable)` and the supervisor's
   default restart policy provides the retry; if the interface disappears while running, the socket error becomes the
   failure (the `:link_lost` path, §6.3). No poll-interval constant exists.
+
+**Until this binding exists** (hosted Ethernet plan stage E2), `dangerous_tcp_carrier` offers one explicit wildcard
+form (2026-11-10): the address `"listen:any:<port>"` binds every IPv4 interface (`0.0.0.0`) through
+`dangerous_sockets@tcp_listen_any`, while `"listen:<port>"` stays loopback-only. It is chosen only by writing it,
+and no `carried_on` link maps to it (the hosted links bind nothing yet); `(:interface, name)` and `(:ethernet, n)`
+will replace it with a bind to one interface's address, and once `(:loopback)` refuses non-loopback addresses as
+above, it must refuse this form too. **Built 2026-11-12 (plan stage E2; verified by runs for loopback, refusals and E2418 on the three hosted targets; the Linux classifier, Wi-Fi and a real non-loopback interface are built, not verified; open: UDP binds nothing, no trial for the supervisor-restart retry below the test plan's "a supervisor restart is counted"):** a further form
+`"listen:<ipv4>:<port>"` binding one given IPv4 address (`dangerous_sockets@tcp_listen_addr`), because today a
+multi-homed host cannot restrict an off-host listener to one network and a declared `(:interface, ...)` does not
+restrict it. Refusal rules: `(:loopback)` refuses `"listen:any:"` and non-loopback `"listen:<ip>"`; a named
+interface/ethernet/wifi link refuses `"listen:any:"` and any `listen:<ip>` that is not that interface's address, and
+a bare `"listen:<port>"` under it binds that interface. The guard is the runtime refusal plus the compile diagnostic
+`E2418` (§5.2). Behaviour as built: no link: `listen:<port>` 127.0.0.1, `listen:any:<port>` 0.0.0.0, `listen:<ip>:<port>` that ip; `(:loopback)`: `listen:<port>` 127.0.0.1, `listen:any` refused, `listen:<ip>` only inside 127.0.0.0/8, dials unchanged; `(:interface, n)`/`(:ethernet, n)`/`(:wifi, n)`: `listen:<port>` binds that interface's first IPv4 address, `listen:any` refused, `listen:<ip>` only if one of that interface's addresses, dials leave from the interface's address. A refusal sends the owner `(:link_down, :fault)` and ends the carrier `(:explicit, :link_unavailable)`; a malformed IPv4 ends it `(:explicit, :bad_address)`. `(:ethernet, n)` and `(:wifi, n)` count only interfaces holding an IPv4 address. The UDP carrier still binds nothing. The direct Mac-to-Linux pair
+(`examples/transport_pairs/ethernet_direct`) is its first user, and it is the non-loopback listener Project BEES's
+milestone N1 needs.
+
+**Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated).
 
 ### 3.3 Syntax proposal
 
@@ -347,9 +370,24 @@ The rows by target and phase:
 The existing `provides_carrier(tag)` row for `"serial"` becomes `true` on the targets that provide a link for it, so
 E2410 keeps its meaning (the kind is provided) and the new E2412 says the hardware is not.
 
+**Status (2026-11-10).**
+- **Mac.** Done 2026-11-09, as stage S-C.
+- **Linux x86-64.** Done 2026-11-10. `emitter/linux_x86_64/transport_pack.silica` now has the Mac's rows: the
+  carriers, the hosted links, the baud check and `carrier_spawn`.
+  - **Compiler.** silica-999958-linux-x86_64, built natively on a Linux x86-64 host.
+  - **Trials passed there.** `transport_addition/app_transport_tcp_loopback_link` (`ping 7 / pong 8 / done`),
+    `transport_link_tags`, and the `link_*` error trials. `link_not_provided_hosted` and `link_baud_unsupported` have
+    `.linux_x86_64.golden_fail` goldens that differ from the Mac's only in the target name.
+  - **Interface binding.** A `(:interface, "lo")` copy of the loopback app also ran. Interface binding itself is still
+    not built (§3.2).
+- **Linux AArch64.** Rows written 2026-11-11: `emitter/linux_aarch64/transport_pack.silica` now has the same carriers, links,
+  baud check and `carrier_spawn` as the x86-64 pack (the two files differ only in their header comment). **Pending:** a
+  build of the compiler on an AArch64 host (pix) and the trials there (`app_transport_tcp_loopback_link`,
+  `transport_link_tags`, the `link_*` error trials). Until that runs, "works on AArch64" is not established.
+
 ### 5.2 Diagnostics
 
-Existing numbers in use in the E24xx block: E2401 to E2405, E2408 to E2411 (E2406 and E2407 are provisional in the
+Existing numbers in use in the E24xx block (E2418 is E2's interim guard, below): E2401 to E2405, E2408 to E2411 (E2406 and E2407 are provisional in the
 transport design's §9.3). A grep of `compiler/src`, `compiler/stdlib` and `compiler/design_documents` finds no
 E2412 to E2419. **Decided (Lee, 2026-11-08): E2412 to E2417 are used as the provisional diagnostic numbers** for the
 rows below, in the style of the §9.3 table; the diagnostics table at implementation records them:
@@ -362,6 +400,7 @@ rows below, in the style of the §9.3 table; the diagnostics table at implementa
 | E2415 LinkInstanceConflict | two carrier declarations in one application name the same link tag and instance (decision 6); also a UART instance that another subsystem uses (the console, printing, failure banners, peek/poke apps; decision 17), so no UART instance is ever shared. Message names both users |
 | E2416 LinkConfigMissing | the link needs a configuration function (`board_config.silica`, §4) that is not defined; names the function. Phase D |
 | E2417 LinkParameterInvalid | a link parameter fails the pack's check: baud out of the UART's range, a non-literal instance or baud (the declaration is pure and literal-only, as limits records are), an interface name that is not a literal |
+| E2418 LinkListenAddressRefused | `x: T <- spawn_dangerous_carrier(...)` followed in the same function by `cast(x, (:open, _, "<literal>"))`, where the declared link (served by the target) refuses the literal: `"listen:any:<port>"` under `(:loopback)`, `(:interface, n)`, `(:ethernet, n)` or `(:wifi, n)`, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)` (E2 items 1 and 4; implemented in `parser/carried_on_expand.silica`, token level, reported as a ParseError; a link the target does not serve is E2412 at the spawn instead). Addresses it cannot see are refused at run time (`(:link_down, :fault)`, then `(:explicit, :link_unavailable)`). Built and run in the compile-defect trials (three trials) |
 
 Placement follows E2410: E2413 and E2414 in the shared front end (they depend only on the language's tables), E2415
 in the same pass as E2405 (duplicates), E2412 and E2417 in `sir_target_verify` because they read the pack.

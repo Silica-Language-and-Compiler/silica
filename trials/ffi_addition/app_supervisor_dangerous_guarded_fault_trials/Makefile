@@ -36,7 +36,7 @@ all: integrate
 fixtures: ffi-wrapper-archives
 
 integrate-run: fixtures
-	@ln -sfn "$(FFI_SOURCE_VIEW)" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
+	@ln -sfn "$(patsubst $(abspath $(APP_TRIAL_DIR)/..)/%,../%,$(FFI_SOURCE_VIEW))" "$(APP_TRIAL_DIR)/dangerous_exposure_source"
 	@test -f "$(FFI_LEGACY_ARCHIVE)" || { echo "  ❌ $(APP_LABEL): missing legacy archive"; exit 1; }
 	@cd "$(APP_TRIAL_DIR)" && $(call TRIAL_RM_UNTRACKED,$(APP_EXECUTABLES)); rm -f *.sams *.o *.iface  silica.config silica.link .integrate_counts silica.compile.order silica.needs_runtime silica.atoms
 	@cd "$(APP_TRIAL_DIR)" && { \

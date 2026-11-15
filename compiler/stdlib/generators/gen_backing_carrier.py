@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+"""Writes compiler/stdlib/dangerous_store.silica and dangerous_store_backing_carrier.silica (run it
+from anywhere: it writes beside its own directory). It prints the carrier's initial-state literal, which
+emitter/<target>/transport_pack.silica spells in its spawn text for the (:backing) link: when a field of
+the state changes, change the pack's text with it.
+The carrier's state record is written out in full wherever it is built: the language has no record
+update and no type alias."""
+import re
+
+import os
+STD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..") + os.sep
+lic = open(STD + "dangerous_sockets.silica").read().split("-}")[0] + "-}\n"
+T = "{ tag: int64, value: int64, error_code: int64 }"
+
+bindings = lic + '''
+// The Fifi wrappers of the hosted (:backing) storage medium (compiler/stdlib/net/silica_store.c) as a
+// dangerous module: the raw bindings and their adapters. Every answer is the wrapper's tagged result
+// { tag, value, error_code } with tag 0 ok, 1 error (errno in error_code), 4 the backing is already
+// open (locked), 5 the backing exists at another size; bytes read come back through take/1 as a
+// string. A project that uses a (:backing) store links the archive libsilica_store.a and places
+// silica_store_wrapper.meta under dangerous_exposure_source/sockets, beside the socket wrappers'.
+module dangerous_store;
+
+wrapper_meta "dangerous_exposure_source/sockets/silica_store_wrapper.meta";
+
+export open_backing/2;
+export headers/4;
+export read_at/3;
+export take/1;
+export write_entries/2;
+export flush/1;
+export close_fd/1;
+
+// The FFI carries a pointer-plus-length pair only as a binding's sole parameters, so a wrapper that
+// needs a string and scalars takes the scalars first (set_args; kept per worker thread).
+foreign c_wrapper "silica_store_set_args"
+fn set_args_raw(a: int64, b: int64) -> T;
+foreign c_wrapper "silica_store_open"
+fn open_raw(path_ptr: uint8, path_len: uint64) -> T;
+foreign c_wrapper "silica_store_headers"
+fn headers_raw(fd: int64, count: int64) -> T;
+foreign c_wrapper "silica_store_read"
+fn read_raw(fd: int64, offset: int64, length: int64) -> T;
+foreign c_wrapper "silica_store_take"
+fn take_raw(fd: int64) -> { tag: int64, text_ptr: uint8, text_len: uint64, error_code: int64 };
+foreign c_wrapper "silica_store_write"
+fn write_raw(data_ptr: uint8, data_len: uint64) -> T;
+foreign c_wrapper "silica_store_flush"
+fn flush_raw(fd: int64) -> T;
+foreign c_wrapper "silica_store_close"
+fn close_raw(fd: int64) -> T;
+
+// Opens the backing at path, capacity bytes long, under its exclusive lock; value is the descriptor.
+fn open_backing(path: string, capacity: int64) -> T {
+    _: T <- set_args_raw(capacity, 0);
+    r: T <- open_raw(path);
+    r
+}
+
+// The 16-byte headers of `count` blocks of block_size bytes, from block `first` on, one after another
+// (take/1 answers them).
+fn headers(fd: int64, block_size: int64, first: int64, count: int64) -> T {
+    _: T <- set_args_raw(block_size, first);
+    r: T <- headers_raw(fd, count);
+    r
+}
+
+fn read_at(fd: int64, offset: int64, length: int64) -> T {
+    r: T <- read_raw(fd, offset, length);
+    r
+}
+
+// The bytes of the last headers or read_at on this worker.
+fn take(fd: int64) -> string {
+    out: string <- take_raw(fd);
+    out
+}
+
+// Makes a list of pending writes (storelog@entry, one after another), in order.
+fn write_entries(fd: int64, entries: string) -> T {
+    _: T <- set_args_raw(fd, 0);
+    r: T <- write_raw(entries);
+    r
+}
+
+fn flush(fd: int64) -> T {
+    r: T <- flush_raw(fd);
+    r
+}
+
+fn close_fd(fd: int64) -> T {
+    r: T <- close_raw(fd);
+    r
+}
+'''.replace("-> T", "-> " + T).replace(": T <-", ": " + T + " <-")
+open(STD + "dangerous_store.silica", "w").write(bindings)
+
+F = [("owner", "actor_ref"), ("up", "boolean"), ("retention", "atom"), ("capacity", "int64"), ("path", "string"), ("fd", "int64"),
+     ("firsts", "string"), ("oldest", "int64"), ("oldest_block", "int64"), ("used", "int64"), ("next", "int64"),
+     ("tail_block", "int64"), ("tail_pos", "int64"), ("pend", "string"), ("buffered", "int64"), ("dirty", "boolean"),
+     ("out", "string"), ("want_flush", "boolean"), ("credit_back", "int64"), ("ack", "int64"),
+     ("opening", "boolean"), ("rec_b", "int64"), ("tail_fs", "int64"), ("old_fs", "int64"),
+     ("rx_credit", "int64"), ("replaying", "boolean"), ("want_rec", "boolean"), ("r_from", "int64"), ("r_end", "int64"),
+     ("r_seq", "int64"), ("r_block", "int64"), ("r_pos", "int64")]
+ST = "{ " + ", ".join("%s: %s" % f for f in F) + " }"
+
+def S(base="st", **kw):
+    for k in kw:
+        assert k in dict(F), k
+    return "{ " + ", ".join("%s: %s" % (n, kw.get(n, "%s.%s" % (base, n))) for n, _ in F) + " }"
+
+MSG = "(:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | (:read, int64) | (:trim, int64) | :sync | :read_stop | :close | :drain | :step | :recover"
+
+def proj(name, ret, arms, default):
+    out = "fn %s(msg: MSG%s) -> %s {\n    case msg of {\n" % (name, ", fallback: actor_ref" if name == "msg_owner" else "", ret)
+    pats = {"open": "(:open, o: actor_ref, a: string)", "tx": "(:tx, s: string, f: actor_ref)", "credit": "(:credit, n: int64)",
+            "read": "(:read, n: int64)", "trim": "(:trim, n: int64)"}
+    for k in ["open", "tx", "credit", "read", "trim"]:
+        out += "        %s -> %s;\n" % (pats[k], arms.get(k, default))
+    for k in ["sync", "read_stop", "close", "drain", "step"]:
+        out += "        :%s -> %s;\n" % (k, arms.get(k, default))
+    out += "        :recover -> %s\n    }\n}\n" % arms.get("recover", default)
+    return out
+
+body = '''
+// The (:backing) storage carrier (transport_serialization_design.md §6.8): a durable log in a hosted
+// backing, the first medium that keeps what it is given. A program declares it with
+// `carried_on <name>: (:store) (:backing, "<name>.sildat", <capacity>, <retention>);` and starts it with
+// spawn_dangerous_carrier(<name>, ...). It is a dangerous actor: the backing is reached through the
+// Fifi wrappers of dangerous_store (compiler/stdlib/net/silica_store.c), which open and lock it, read
+// and write byte spans and flush. Everything the bytes mean is here and in storelog, and is the same
+// log the (:memory) carrier keeps: 4096-byte blocks, a 512-byte write unit, records of at most 4064
+// bytes. The vocabulary, the write-behind buffer, the retention modes and the replay are those of
+// store_memory_carrier, message for message; this header says only what a medium that survives adds.
+//
+// NOTHING OF THE LOG IS HELD IN MEMORY but the write-behind buffer (8 records) and one number per block
+// (the first sequence number of each). A log far larger than memory is appended and replayed with
+// that much.
+//
+// WHAT A FOREIGN CALL READS IS NOT KEPT. Bytes read from the backing are external-danger-touched: they
+// may not enter this actor's state, and they are not sent to this actor either. The carrier takes
+// NUMBERS from them, with storelog's functions, inside the root block of the behaviour, and re-creates
+// each number before it relies on it: a block header gives a first sequence number, a record's
+// envelope gives a length, a sequence number and a check, and the check computed over the payload is
+// compared with the one stored. A record's payload leaves the block only one way, as the foreign
+// result (:rx, payload) cast to the owner, whose decode re-creates the value (design §6.8.3): the same
+// path a TCP carrier's received bytes take.
+//
+// OPEN AND RECOVERY (design §6.8.4). (:open, owner, "") opens the backing under an exclusive lock.
+// The 16-byte header of every block is then read, eight blocks to a dispatch (the carrier sends itself
+// :recover until all are read). The blocks in use give `oldest` (the least first sequence number) and
+// the tail block (the greatest). The tail block is read whole and its records counted: the log ends at
+// the first position that holds no good record, where a record is good when its check holds and its
+// number is the one expected (storelog@scan). `next` is the number after the last good record, and the
+// next record will be written at the following write-unit boundary, so a torn tail is never written
+// over and never read again. Then (:link_up, "backing"), (:log, oldest, next, capacity) and
+// (:tx_credit, 8). The open is refused with (:link_down, :in_use) when the backing is locked by another
+// carrier, in this process or another, with (:link_down, :mismatch) when it exists at another size than
+// the declared capacity, and with (:link_down, :medium) when it cannot be opened or read.
+//
+// DURABILITY. A drain writes the buffered records and (:tx_credit, n) follows the write. A :sync
+// writes them, fills the rest of the tail's write unit with zeros, flushes with the platform's full
+// flush (F_FULLFSYNC on macOS, fdatasync on Linux) and only then answers (:synced, next). A (:trim,
+// upto) marks the released blocks' headers, flushes, and then answers (:log, ...). :close drains and
+// flushes before (:link_down, :closed).
+//
+// REPLAY reads one record to a dispatch, in two parts: the 16 bytes of its envelope, then its payload.
+// When what lies at the position is not the record expected and the position is not on a write-unit
+// boundary, the same two reads are made once more at the next boundary (where the record after a sync
+// lies); when that is not the record either, the block has no more records.
+//
+// WHAT ONE DISPATCH DOES. A foreign call may be made only in the root block of a dangerous behaviour,
+// and a block has no loop. So each message is handled in two parts: the pure part decides what the log
+// needs (the bytes to write in `out`, a flush, a record to read), and the root block then makes a
+// fixed run of calls, each only when wanted: the open; one read of eight headers; the tail block; one
+// write of `out`; the flush; the record's reads; the close. Work that needs more than that is carried
+// on by a message the carrier sends itself (:recover, :step).
+//
+// FAILURE. A write, a flush or a read that fails answers (:link_down, :medium) and closes the backing;
+// the carrier stays, not open, until its owner sends :close (or opens it again), so a late message
+// from the owner finds an actor. What the log then holds is what the next open's (:log, ...) reports.
+// :close ends the carrier with stop_self(:normal); its reference is dead afterwards.
+module dangerous_store_backing_carrier;
+
+use storelog;
+use dangerous_store;
+
+export initial/3;
+export carrier/2;
+
+fn block_size() -> int64 { 4096 }
+fn write_unit() -> int64 { 512 }
+fn slots() -> int64 { 8 }
+fn largest() -> int64 { 4064 }
+
+// The state a declaration starts the carrier with: the link's parameters. A program cannot call this
+// (a dangerous module's functions are called only from a dangerous behaviour), so the target's
+// transport pack spells the same record as a literal in the spawn it writes.
+fn initial(path: string, capacity: int64, retention: atom) -> ST {
+    INITIAL
+}
+
+KIND
+OWNER
+TEXT
+COUNT
+
+fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
+    case r of {
+        (:ok, v: int64) -> v;
+        (:rejected, _why: atom) -> 0 - 1
+    }
+}
+
+fn none_res() -> { tag: int64, value: int64, error_code: int64 } {
+    { tag: 2, value: 0 - 1, error_code: 0 }
+}
+
+fn blocks(st: ST) -> int64 {
+    st.capacity / block_size()
+}
+
+fn after(st: ST, b: int64) -> int64 {
+    (b + 1) % blocks(st)
+}
+
+fn more_out(st: ST, bs: string) -> string {
+    storelog@put(st.out, length_bytes(st.out), bs)
+}
+
+// ---- :open: the pure part only marks the open; the root block makes it ----
+fn on_open(o: actor_ref, st: ST) -> ST {
+    case st.up of {
+        true -> refuse_open(o, :in_use, st);
+        false -> case blocks(st) < 1 of {
+            true -> refuse_open(o, :mismatch, st);
+            false -> OPENING
+        }
+    }
+}
+
+fn refuse_open(o: actor_ref, why: atom, st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(o, (:link_down, why) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+// One block's header, as the number it gave (-1: not in use, or not a header): the table of first
+// sequence numbers, the count of blocks in use, and the tail and the oldest so far.
+fn absorb(st: ST, b: int64, fs: int64) -> ST {
+    case fs < 0 or b >= blocks(st) of {
+        true -> st;
+        false -> {
+            is_tail: boolean <- st.tail_fs < 0 or fs > st.tail_fs;
+            is_old: boolean <- st.old_fs < 0 or fs < st.old_fs;
+            ABSORBED
+        }
+    }
+}
+
+// Eight headers were absorbed: the next batch begins eight blocks on.
+fn advanced(st8: ST) -> ST {
+    ADVANCED
+}
+
+fn recover_again(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(self(), :recover impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn announced(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:link_up, "backing") impl ActorMessage {});
+        _: boolean <- cast(st.owner, (:log, st.oldest, st.next, st.capacity) impl ActorMessage {});
+        _: boolean <- cast(st.owner, (:tx_credit, slots()) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+// ---- :tx ----
+fn refused(why: atom, st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:tx_failed, why) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn on_tx(segment: string, st: ST) -> ST {
+    n: int64 <- length_bytes(segment);
+    case st.up of {
+        false -> refused(:link_down, st);
+        true -> case n > largest() of {
+            true -> refused(:too_long, st);
+            false -> case n == 0 of {
+                true -> refused(:empty, st);
+                false -> case st.buffered >= slots() of {
+                    true -> refused(:no_credit, st);
+                    false -> case st.tail_block >= 0 and st.tail_pos + 16 + n <= block_size() of {
+                        true -> placed(segment, st);
+                        false -> case st.used == blocks(st) and st.retention != :ring of {
+                            true -> refused(:full, st);
+                            false -> placed(segment, new_block(st))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The next block in ring order becomes the tail. When every block is in use it is the oldest one,
+// which is reclaimed (:ring): `oldest` moves to the block after it.
+fn new_block(st: ST) -> ST {
+    nb: int64 <- case st.tail_block < 0 of { true -> 0; false -> after(st, st.tail_block) };
+    reclaim: boolean <- st.used == blocks(st);
+    used_now: int64 <- case reclaim of { true -> st.used - 1; false -> st.used };
+    ob: int64 <- case reclaim of { true -> after(st, nb); false -> case st.used == 0 of { true -> nb; false -> st.oldest_block } };
+    old: int64 <- case reclaim of {
+        true -> case blocks(st) == 1 of { true -> st.next; false -> storelog@table_get(st.firsts, after(st, nb)) };
+        false -> case st.used == 0 of { true -> st.next; false -> st.oldest }
+    };
+    NEWBLOCK
+}
+
+fn placed(segment: string, st: ST) -> ST {
+    n: int64 <- length_bytes(segment);
+    more: string <- storelog@entry(st.tail_block * block_size() + st.tail_pos, storelog@envelope(st.next, segment));
+    kept: ST <- PLACED;
+    case kept.buffered == slots() of {
+        true -> drained(kept);
+        false -> case kept.buffered == 1 of {
+            true -> drain_later(kept);
+            false -> kept
+        }
+    }
+}
+
+fn drain_later(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(50, self(), :drain impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+// ---- the write-behind buffer is handed to this dispatch's write; the credit follows the write ----
+fn drained(st: ST) -> ST {
+    case st.buffered == 0 of {
+        true -> st;
+        false -> DRAINED
+    }
+}
+
+// ---- :sync ----
+fn on_sync(st0: ST) -> ST {
+    st: ST <- drained(st0);
+    case st.up of {
+        false -> st;
+        true -> padded(st)
+    }
+}
+
+fn padded(st: ST) -> ST {
+    up_to: int64 <- storelog@round_up(st.tail_pos, write_unit());
+    case st.dirty and st.tail_block >= 0 and up_to > st.tail_pos of {
+        false -> SYNCING;
+        true -> PADDED
+    }
+}
+
+// ---- :read, :credit, :step, :read_stop ----
+fn read_refused(why: atom, st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:read_failed, why) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn read_trimmed(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:read_failed, :trimmed) impl ActorMessage {});
+        _: boolean <- cast(st.owner, (:log, st.oldest, st.next, st.capacity) impl ActorMessage {})
+    produces
+        pure STOPPED
+    end
+}
+
+fn read_ended(nx: int64, st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:rx_end, nx) impl ActorMessage {})
+    produces
+        pure STOPPED
+    end
+}
+
+fn step_again(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(self(), :step impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn on_read(from: int64, st0: ST) -> ST {
+    st: ST <- drained(st0);
+    case st.up of {
+        false -> read_refused(:link_down, st);
+        true -> case st.replaying of {
+            true -> read_refused(:busy, st);
+            false -> case from < st.oldest of {
+                true -> read_trimmed(st);
+                false -> case from > st.next of {
+                    true -> read_refused(:beyond_tail, st);
+                    false -> case from == st.next of {
+                        true -> read_ended(st.next, st);
+                        false -> started(from, block_holding(st, from, 0, st.oldest_block), st)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The in-use block whose first record is the greatest one not above `from`, walking from the oldest.
+fn block_holding(st: ST, from: int64, i: int64, best: int64) -> int64 {
+    case i >= st.used of {
+        true -> best;
+        false -> {
+            b: int64 <- (st.oldest_block + i) % blocks(st);
+            case storelog@table_get(st.firsts, b) <= from of {
+                true -> block_holding(st, from, i + 1, b);
+                false -> best
+            }
+        }
+    }
+}
+
+fn started(from: int64, b: int64, st: ST) -> ST {
+    step_again(STARTED)
+}
+
+fn on_credit(n: int64, st0: ST) -> ST {
+    st: ST <- CREDITED;
+    case st.replaying of {
+        true -> step_again(st);
+        false -> st
+    }
+}
+
+// One step of a replay: one record. The pure part decides whether a record is to be read at all
+// (want_rec); the root block reads it and after_step moves the replay on. Records below `from` (the
+// front of the block the replay started in) are passed over without credit.
+fn on_step(st: ST) -> ST {
+    case st.replaying of {
+        false -> st;
+        true -> case st.r_seq < st.oldest of {
+            true -> read_trimmed(st);
+            false -> case st.r_seq >= st.r_from and st.rx_credit <= 0 of {
+                true -> st;
+                false -> WANTREC
+            }
+        }
+    }
+}
+
+// The record was read (found, and nx the position after it), or the block has no more records.
+fn after_step(st: ST, found: boolean, nx: int64) -> ST {
+    case found of {
+        true -> got_record(nx, st);
+        false -> next_block(st)
+    }
+}
+
+fn got_record(nx: int64, st: ST) -> ST {
+    deliver: boolean <- st.r_seq >= st.r_from;
+    moved: ST <- MOVED;
+    case moved.r_seq == moved.r_end of {
+        true -> read_ended(moved.r_end, moved);
+        false -> step_again(moved)
+    }
+}
+
+// The block has no more records: the one expected is the first of the next block, or it is missing.
+fn next_block(st: ST) -> ST {
+    nb: int64 <- after(st, st.r_block);
+    case nb != st.r_block and storelog@table_get(st.firsts, nb) == st.r_seq of {
+        true -> step_again(HOPPED);
+        false -> corrupt(st)
+    }
+}
+
+fn corrupt(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:read_failed, :corrupt) impl ActorMessage {})
+    produces
+        pure STOPPED
+    end
+}
+
+fn on_read_stop(st: ST) -> ST {
+    case st.replaying of {
+        false -> st;
+        true -> read_ended(case st.r_seq > st.r_from of { true -> st.r_seq; false -> st.r_from }, st)
+    }
+}
+
+// ---- :trim ----
+fn on_trim(upto: int64, st0: ST) -> ST {
+    st: ST <- drained(st0);
+    case st.up of {
+        false -> st;
+        true -> trimming(released(case upto > st.next of { true -> st.next; false -> upto }, st))
+    }
+}
+
+// Releases the oldest block while the block after it begins at or below upto (the oldest then lies
+// wholly below upto) and it is not the tail block. A released block's header says so on the medium.
+fn released(upto: int64, st: ST) -> ST {
+    nb: int64 <- after(st, st.oldest_block);
+    case st.used > 1 and storelog@table_get(st.firsts, nb) <= upto of {
+        false -> st;
+        true -> released(upto, RELEASED)
+    }
+}
+
+fn trimming(st: ST) -> ST {
+    TRIMMING
+}
+
+// ---- :close ----
+fn on_close(st0: ST) -> ST {
+    st: ST <- drained(st0);
+    CLOSING
+}
+
+fn handled(kind: atom, o: actor_ref, text: string, n: int64, st: ST) -> ST {
+    case kind of {
+        :open -> on_open(o, st);
+        :tx -> on_tx(text, st);
+        :credit -> on_credit(n, st);
+        :read -> on_read(n, st);
+        :trim -> on_trim(n, st);
+        :sync -> on_sync(st);
+        :read_stop -> on_read_stop(st);
+        :close -> on_close(st);
+        :drain -> drained(st);
+        :step -> on_step(st);
+        _: atom -> st
+    }
+}
+
+// ---- after the root block's foreign calls ----
+
+// An open that was refused or failed: the owner is told why and the carrier stays, not open.
+fn open_failed(why: atom, st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:link_down, why) impl ActorMessage {})
+    produces
+        pure NOTOPEN
+    end
+}
+
+// A write, a flush or a read failed on an open backing.
+fn medium_failed(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:link_down, :medium) impl ActorMessage {})
+    produces
+        pure NOTOPEN
+    end
+}
+
+// The writes were made (and flushed, if a flush was asked for): the acknowledgements follow.
+fn written(st: ST) -> ST {
+    acked(credited(st))
+}
+
+fn credited(st: ST) -> ST {
+    case st.credit_back > 0 of {
+        false -> st;
+        true -> credit_given(st)
+    }
+}
+
+fn credit_given(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:tx_credit, st.credit_back) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn acked(st: ST) -> ST {
+    case st.ack of {
+        1 -> said_synced(st);
+        2 -> said_log(st);
+        _: int64 -> st
+    }
+}
+
+fn said_synced(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:synced, st.next) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn said_log(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:log, st.oldest, st.next, st.capacity) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn closed(st: ST) -> ST {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.owner, (:link_down, :closed) impl ActorMessage {})
+    produces
+        pure NOTOPEN
+    end
+}
+
+// What the dispatch comes to, given how its foreign calls went.
+//   did_open, open_tag, open_fd   the open, when one was made (0 ok, 4 locked, 5 another size, else an error)
+//   failed                        a later call failed
+//   s2                            the state with this dispatch's headers absorbed (when it read any)
+//   did_tail, nx, at              the tail block was read: the next number and the write position
+//   did_rec, found, rec_nx        a record was read for the replay: found, and the position after it
+fn concluded(kind: atom, st: ST, io: IO) -> ST {
+    case io.did_open and io.open_tag != 0 of {
+        true -> open_failed(case io.open_tag of { 4 -> :in_use; 5 -> :mismatch; _: int64 -> :medium }, st);
+        false -> case io.failed of {
+            true -> case st.opening of { true -> open_failed(:medium, st); false -> medium_failed(st) };
+            false -> case io.did_open of {
+                true -> recover_again(now_open(st, io.open_fd));
+                false -> case io.did_headers of {
+                    true -> headers_done(st, io.did_tail, io.nx, io.at);
+                    false -> settled(kind, written(st), io.did_rec, io.found, io.rec_nx)
+                }
+            }
+        }
+    }
+}
+
+fn now_open(st: ST, open_fd: int64) -> ST {
+    OPENED
+}
+
+// A batch of headers was absorbed: more to read, or the log is known (its tail counted, if it has one).
+fn headers_done(st: ST, did_tail: boolean, nx: int64, at: int64) -> ST {
+    case st.rec_b < blocks(st) of {
+        true -> recover_again(st);
+        false -> case did_tail of {
+            true -> announced(RECOVERED);
+            false -> announced(RECOVERED_EMPTY)
+        }
+    }
+}
+
+fn settled(kind: atom, st: ST, did_rec: boolean, found: boolean, rec_nx: int64) -> ST {
+    clean: ST <- CLEAN;
+    case kind == :close of {
+        true -> closed(clean);
+        false -> case did_rec of {
+            true -> after_step(clean, found, rec_nx);
+            false -> clean
+        }
+    }
+}
+
+fn carrier(msg: MSG, state: ST) -> (:no_reply, ST) {
+    sequence proc[external_danger, concurrency, transport]
+        kind: atom <- msg_kind(msg);
+        s1: ST <- handled(kind, msg_owner(msg, state.owner), msg_text(msg), msg_count(msg), state);
+
+        // ---- the open
+        do_open: boolean <- kind == :open and s1.opening and s1.fd < 0;
+        res_open: R <- case do_open of {
+            true -> dangerous_store@open_backing(s1.path, s1.capacity);
+            false -> none_res()
+        };
+        open_tag_raw: int64 <- res_open.tag;
+        open_fd_raw: int64 <- res_open.value;
+        open_tag: int64 <- pure_int(recreate(open_tag_raw));
+        open_fd: int64 <- pure_int(recreate(open_fd_raw));
+
+        // ---- recovery: eight block headers, each taken as a number and re-created
+        do_headers: boolean <- kind == :recover and s1.opening and s1.fd >= 0 and s1.rec_b < blocks(s1);
+        res_hdr: R <- case do_headers of {
+            true -> dangerous_store@headers(s1.fd, block_size(), s1.rec_b, case blocks(s1) - s1.rec_b < 8 of { true -> blocks(s1) - s1.rec_b; false -> 8 });
+            false -> none_res()
+        };
+        hdr_tag_raw: int64 <- res_hdr.tag;
+        hdr_tag: int64 <- pure_int(recreate(hdr_tag_raw));
+        hdr_ok: boolean <- do_headers and hdr_tag == 0;
+        hs: string <- case hdr_ok of {
+            true -> dangerous_store@take(s1.fd);
+            false -> ""
+        };
+        f0_raw: int64 <- storelog@header_first_seq(hs, 0);
+        f1_raw: int64 <- storelog@header_first_seq(hs, 16);
+        f2_raw: int64 <- storelog@header_first_seq(hs, 32);
+        f3_raw: int64 <- storelog@header_first_seq(hs, 48);
+        f4_raw: int64 <- storelog@header_first_seq(hs, 64);
+        f5_raw: int64 <- storelog@header_first_seq(hs, 80);
+        f6_raw: int64 <- storelog@header_first_seq(hs, 96);
+        f7_raw: int64 <- storelog@header_first_seq(hs, 112);
+        f0: int64 <- pure_int(recreate(f0_raw));
+        f1: int64 <- pure_int(recreate(f1_raw));
+        f2: int64 <- pure_int(recreate(f2_raw));
+        f3: int64 <- pure_int(recreate(f3_raw));
+        f4: int64 <- pure_int(recreate(f4_raw));
+        f5: int64 <- pure_int(recreate(f5_raw));
+        f6: int64 <- pure_int(recreate(f6_raw));
+        f7: int64 <- pure_int(recreate(f7_raw));
+        a0: ST <- absorb(s1, s1.rec_b, f0);
+        a1: ST <- absorb(a0, s1.rec_b + 1, f1);
+        a2: ST <- absorb(a1, s1.rec_b + 2, f2);
+        a3: ST <- absorb(a2, s1.rec_b + 3, f3);
+        a4: ST <- absorb(a3, s1.rec_b + 4, f4);
+        a5: ST <- absorb(a4, s1.rec_b + 5, f5);
+        a6: ST <- absorb(a5, s1.rec_b + 6, f6);
+        a7: ST <- absorb(a6, s1.rec_b + 7, f7);
+        s2: ST <- case hdr_ok of {
+            true -> advanced(a7);
+            false -> s1
+        };
+
+        // ---- recovery: the tail block, read whole once every header is known
+        do_tail: boolean <- hdr_ok and s2.rec_b >= blocks(s2) and s2.tail_block >= 0;
+        res_t: R <- case do_tail of {
+            true -> dangerous_store@read_at(s2.fd, s2.tail_block * block_size(), block_size());
+            false -> none_res()
+        };
+        t_tag_raw: int64 <- res_t.tag;
+        t_tag: int64 <- pure_int(recreate(t_tag_raw));
+        tail_ok: boolean <- do_tail and t_tag == 0;
+        tb: string <- case tail_ok of {
+            true -> dangerous_store@take(s2.fd);
+            false -> ""
+        };
+        nx_raw: int64 <- storelog@tail_next(tb, block_size(), write_unit(), s2.tail_fs);
+        at_raw: int64 <- storelog@tail_at(tb, block_size(), write_unit(), s2.tail_fs);
+        nx: int64 <- pure_int(recreate(nx_raw));
+        at: int64 <- pure_int(recreate(at_raw));
+
+        // ---- this dispatch's writes, then the flush
+        do_write: boolean <- s1.fd >= 0 and length_bytes(s1.out) > 0;
+        res_w: R <- case do_write of {
+            true -> dangerous_store@write_entries(s1.fd, s1.out);
+            false -> none_res()
+        };
+        w_tag_raw: int64 <- res_w.tag;
+        w_tag: int64 <- pure_int(recreate(w_tag_raw));
+        w_bad: boolean <- do_write and w_tag != 0;
+        do_flush: boolean <- s1.fd >= 0 and s1.want_flush and w_bad == false;
+        res_f: R <- case do_flush of {
+            true -> dangerous_store@flush(s1.fd);
+            false -> none_res()
+        };
+        f_tag_raw: int64 <- res_f.tag;
+        f_tag: int64 <- pure_int(recreate(f_tag_raw));
+        f_bad: boolean <- do_flush and f_tag != 0;
+
+        // ---- the replay's record: its envelope, then its payload; once more at the unit boundary
+        do_rec: boolean <- s1.want_rec and s1.fd >= 0 and w_bad == false and f_bad == false;
+        base: int64 <- s1.r_block * block_size();
+        try1: boolean <- do_rec and s1.r_pos + 16 <= block_size();
+        res_h1: R <- case try1 of {
+            true -> dangerous_store@read_at(s1.fd, base + s1.r_pos, 16);
+            false -> none_res()
+        };
+        h1_tag_raw: int64 <- res_h1.tag;
+        h1_tag: int64 <- pure_int(recreate(h1_tag_raw));
+        head1: string <- case try1 and h1_tag == 0 of {
+            true -> dangerous_store@take(s1.fd);
+            false -> ""
+        };
+        len1_raw: int64 <- storelog@env_len(head1);
+        seq1_raw: int64 <- storelog@env_seq(head1);
+        crc1_raw: int64 <- storelog@env_crc(head1);
+        len1: int64 <- pure_int(recreate(len1_raw));
+        seq1: int64 <- pure_int(recreate(seq1_raw));
+        crc1: int64 <- pure_int(recreate(crc1_raw));
+        fits1: boolean <- try1 and len1 > 0 and s1.r_pos + 16 + len1 <= block_size() and seq1 == s1.r_seq;
+        res_p1: R <- case fits1 of {
+            true -> dangerous_store@read_at(s1.fd, base + s1.r_pos + 16, len1);
+            false -> none_res()
+        };
+        p1_tag_raw: int64 <- res_p1.tag;
+        p1_tag: int64 <- pure_int(recreate(p1_tag_raw));
+        pay1: string <- case fits1 and p1_tag == 0 of {
+            true -> dangerous_store@take(s1.fd);
+            false -> ""
+        };
+        chk1_raw: int64 <- storelog@env_check(head1, pay1);
+        chk1: int64 <- pure_int(recreate(chk1_raw));
+        good1: boolean <- fits1 and p1_tag == 0 and chk1 == crc1;
+
+        pos2: int64 <- storelog@round_up(s1.r_pos, write_unit());
+        try2: boolean <- do_rec and good1 == false and pos2 != s1.r_pos and pos2 + 16 <= block_size();
+        res_h2: R <- case try2 of {
+            true -> dangerous_store@read_at(s1.fd, base + pos2, 16);
+            false -> none_res()
+        };
+        h2_tag_raw: int64 <- res_h2.tag;
+        h2_tag: int64 <- pure_int(recreate(h2_tag_raw));
+        head2: string <- case try2 and h2_tag == 0 of {
+            true -> dangerous_store@take(s1.fd);
+            false -> ""
+        };
+        len2_raw: int64 <- storelog@env_len(head2);
+        seq2_raw: int64 <- storelog@env_seq(head2);
+        crc2_raw: int64 <- storelog@env_crc(head2);
+        len2: int64 <- pure_int(recreate(len2_raw));
+        seq2: int64 <- pure_int(recreate(seq2_raw));
+        crc2: int64 <- pure_int(recreate(crc2_raw));
+        fits2: boolean <- try2 and len2 > 0 and pos2 + 16 + len2 <= block_size() and seq2 == s1.r_seq;
+        res_p2: R <- case fits2 of {
+            true -> dangerous_store@read_at(s1.fd, base + pos2 + 16, len2);
+            false -> none_res()
+        };
+        p2_tag_raw: int64 <- res_p2.tag;
+        p2_tag: int64 <- pure_int(recreate(p2_tag_raw));
+        pay2: string <- case fits2 and p2_tag == 0 of {
+            true -> dangerous_store@take(s1.fd);
+            false -> ""
+        };
+        chk2_raw: int64 <- storelog@env_check(head2, pay2);
+        chk2: int64 <- pure_int(recreate(chk2_raw));
+        good2: boolean <- fits2 and p2_tag == 0 and chk2 == crc2;
+
+        found: boolean <- good1 or good2;
+        rec_nx: int64 <- case good1 of { true -> s1.r_pos + 16 + len1; false -> pos2 + 16 + len2 };
+        // the payload leaves as a foreign result to the owner, and only when the record is to be delivered
+        _: boolean <- case found and s1.r_seq >= s1.r_from of {
+            true -> cast(s1.owner, (:rx, case good1 of { true -> pay1; false -> pay2 }) impl ActorMessage {});
+            false -> true
+        };
+        r_bad: boolean <- (try1 and h1_tag != 0) or (fits1 and p1_tag != 0) or (try2 and h2_tag != 0) or (fits2 and p2_tag != 0);
+
+        failed: boolean <- (do_headers and hdr_tag != 0) or (do_tail and t_tag != 0) or w_bad or f_bad or r_bad;
+        // ---- the backing is given back on :close, and when a call on it failed
+        do_close: boolean <- s1.fd >= 0 and (kind == :close or failed);
+        _: R <- case do_close of {
+            true -> dangerous_store@close_fd(s1.fd);
+            false -> none_res()
+        };
+        s3: ST <- concluded(kind, s2, { did_open: do_open, open_tag: open_tag, open_fd: open_fd, failed: failed, did_headers: hdr_ok, did_tail: tail_ok, nx: nx, at: at, did_rec: do_rec, found: found, rec_nx: rec_nx });
+        _: atom <- case kind == :close of {
+            true -> stop_self(:normal);
+            false -> :ok
+        }
+    produces
+        pure (:no_reply, s3)
+    end
+}
+'''
+init = dict(owner="actor_ref_of_word(0)", up="false", retention="retention", capacity="capacity", path="path", fd="0 - 1", firsts='""',
+            oldest="0", oldest_block="0", used="0", next="0", tail_block="0 - 1", tail_pos="0", pend='""', buffered="0", dirty="false",
+            out='""', want_flush="false", credit_back="0", ack="0", opening="false", rec_b="0", tail_fs="0 - 1", old_fs="0 - 1",
+            rx_credit="0", replaying="false", want_rec="false", r_from="0", r_end="0", r_seq="0", r_block="0", r_pos="0")
+INITIAL = "{ " + ", ".join("%s: %s" % (n, init[n]) for n, _ in F) + " }"
+reset = dict(firsts='storelog@zeros(blocks(st) * 8)', oldest="0", oldest_block="0", used="0", next="0", tail_block="0 - 1", tail_pos="0",
+             pend='""', buffered="0", dirty="false", out='""', want_flush="false", credit_back="0", ack="0", rec_b="0",
+             tail_fs="0 - 1", old_fs="0 - 1", rx_credit="0", replaying="false", want_rec="false")
+subs = {
+    "INITIAL": INITIAL,
+    "OPENING": S(owner="o", opening="true", **reset),
+    "OPENED": S(fd="open_fd"),
+    "ABSORBED": S(firsts="storelog@table_set(st.firsts, b, fs)", used="st.used + 1",
+                  tail_block="case is_tail of { true -> b; false -> st.tail_block }", tail_fs="case is_tail of { true -> fs; false -> st.tail_fs }",
+                  oldest_block="case is_old of { true -> b; false -> st.oldest_block }", old_fs="case is_old of { true -> fs; false -> st.old_fs }"),
+    "ADVANCED": S("st8", rec_b="st8.rec_b + 8"),
+    "RECOVERED_EMPTY": S(up="true", opening="false", oldest="0", next="0", tail_pos="0", dirty="false"),
+    "RECOVERED": S(up="true", opening="false", oldest="st.old_fs", next="nx", tail_pos="at", dirty="false"),
+    "NEWBLOCK": S(firsts="storelog@table_set(st.firsts, nb, st.next)", oldest="old", oldest_block="ob", used="used_now + 1", tail_block="nb", tail_pos="16",
+                  pend="storelog@put(st.pend, length_bytes(st.pend), storelog@entry(nb * block_size(), storelog@block_header(st.next, 1)))"),
+    "PLACED": S(next="st.next + 1", tail_pos="st.tail_pos + 16 + n", pend="storelog@put(st.pend, length_bytes(st.pend), more)", buffered="st.buffered + 1"),
+    "DRAINED": S(out="more_out(st, st.pend)", pend='""', buffered="0", dirty="true", credit_back="st.credit_back + st.buffered"),
+    "SYNCING": S(want_flush="true", ack="1", dirty="false"),
+    "PADDED": S(out="more_out(st, storelog@entry(st.tail_block * block_size() + st.tail_pos, storelog@zeros(up_to - st.tail_pos)))", tail_pos="up_to",
+                want_flush="true", ack="1", dirty="false"),
+    "STOPPED": S(replaying="false", want_rec="false"),
+    "STARTED": S(replaying="true", r_from="from", r_end="st.next", r_seq="storelog@table_get(st.firsts, b)", r_block="b", r_pos="16"),
+    "CREDITED": S("st0", rx_credit="st0.rx_credit + n"),
+    "WANTREC": S(want_rec="true"),
+    "MOVED": S(rx_credit="case deliver of { true -> st.rx_credit - 1; false -> st.rx_credit }", r_seq="st.r_seq + 1", r_pos="nx"),
+    "HOPPED": S(r_block="nb", r_pos="16"),
+    "RELEASED": S(out="more_out(st, storelog@entry(st.oldest_block * block_size(), storelog@block_header(storelog@table_get(st.firsts, st.oldest_block), 0)))",
+                  oldest="storelog@table_get(st.firsts, nb)", oldest_block="nb", used="st.used - 1"),
+    "TRIMMING": S(want_flush="true", ack="2"),
+    "CLOSING": S(want_flush="st.fd >= 0"),
+    "NOTOPEN": S(up="false", fd="0 - 1", opening="false", replaying="false", want_rec="false", pend='""', buffered="0", out='""',
+                 want_flush="false", credit_back="0", ack="0"),
+    "CLEAN": S(out='""', want_flush="false", credit_back="0", ack="0", want_rec="false"),
+    "KIND": proj("msg_kind", "atom", {k: ":" + k for k in ["open", "tx", "credit", "read", "trim", "sync", "read_stop", "close", "drain", "step", "recover"]}, ""),
+    "OWNER": proj("msg_owner", "actor_ref", {"open": "o"}, "fallback"),
+    "TEXT": proj("msg_text", "string", {"tx": "s"}, '""'),
+    "COUNT": proj("msg_count", "int64", {"credit": "n", "read": "n", "trim": "n"}, "0"),
+}
+for k, v in subs.items():
+    body = re.sub(r"\b%s\b" % k, lambda m: v, body)
+body = body.replace("MSG", MSG).replace(": R <-", ": " + T + " <-").replace("io: IO", "io: { did_open: boolean, open_tag: int64, open_fd: int64, failed: boolean, did_headers: boolean, did_tail: boolean, nx: int64, at: int64, did_rec: boolean, found: boolean, rec_nx: int64 }")
+body = re.sub(r"\bST\b", lambda m: ST, body)
+open(STD + "dangerous_store_backing_carrier.silica", "w").write(lic + body)
+print("INITIAL literal for the pack:")
+print(INITIAL)

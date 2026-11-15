@@ -36,9 +36,16 @@
 //   silica_rt_adopt        VRG_ARG = the pre-call SP p: [SP, p), the callee's frames and dynamic part,
 //                          becomes the bottom of this frame's dynamic part (design §3.3 (a)); the
 //                          transient part [p, FLOOR) moves below SP. Nothing left (SP == p): SP stays.
-//   silica_rt_ev_frame     NOT PORTED YET: the copier (rt_state.S) is the ESP32-S3 port's next piece on
-//                          this board; a program that reaches it ends with the runtime abort
-//                          "runtime entry not yet ported" (status 71).
+//   silica_rt_ev_frame     X0 = value, X1 = KIND, X2 = AUX of its root descriptor entry, X3 (TP + 0) =
+//                          the pre-call SP p -> X0 = the value with every node of it that lies in the
+//                          callee's frames ([C0 limit, p) of p's chunk C0, or a chunk above C0) copied
+//                          below this frame's floor (design §3.3 (b), §3.5): in an actor into a fresh
+//                          auxiliary chunk appended after the deepest one (the callee's chunks between
+//                          C0 and it go back), in main (one fixed auxiliary chunk) into scratch below the
+//                          callee's SP and then moved up to [p - total, p). The transient part follows
+//                          under the copied nodes; SP and the floor settle under it. Nothing new: SP goes
+//                          back to p and the callee's chunks are released. The measure and the copy are
+//                          rt_state.S silica_rt_frame_measure / silica_rt_frame_copy (the copier).
 // Internal (AAPCS): silica_rt_frame_alloc(r0 = bytes) -> r0 zeroed block in the running frame's dynamic
 // part; silica_rt_in_aux_chain(r0 = ptr) -> r0 0/1; silica_rt_aux_chunk_append(r0 = acb, r1 = after,
 // r2 = bytes, r3 = the SP a restore to pops it) -> r0 chunk, 0 (heap exhausted) or -1 (reservation);
@@ -285,9 +292,158 @@
     b.w     8b
     .size   silica_rt_adopt, . - silica_rt_adopt
 
-// silica_rt_ev_frame: the copier is not ported yet (see the head of the file).
+// silica_rt_ev_frame: see the head of the file. Frame: ENTRY_SAVE (44 bytes: the caller's r0-r8, r12,
+// lr; X0 = [sp + 24], [sp + 28] once the locals are below) + 24 bytes of locals: [0] total, [4] len,
+// [8] dest chunk, [12] final low (main), [16] scratch low (main). r4 = p, r5 = s, r6 = the floor (then
+// the new floor), r7 = C0, r8 = the ACB. The value's new part is measured and copied by rt_state.S
+// (silica_rt_frame_measure / silica_rt_frame_copy, the recursive copier: about 80 bytes of machine
+// stack per descriptor level, at most 13 levels, inside the depth reserve every machine chunk keeps).
     FUNC silica_rt_ev_frame
-    bl      silica_rt_unsupported
+    ENTRY_SAVE
+    sub     sp, #24
+    ldr     r4, [r9, #0]                    // X3 = p, the pre-call SP
+    ldr     r5, [r9, #VRG_VSP]              // s
+    ldr     r6, [r9, #VRG_FLOOR]
+    bl      silica_rt_current
+    mov     r8, r0
+    // C0: the chunk p lies in, at or below the current one
+    ldr     r7, [r9, #VRG_ACHUNK]
+1:  ldr     r0, [r7, #CH_LIMIT]
+    ldr     r1, [r7, #CH_TOP]
+    cmp     r4, r0
+    blo.w   2f
+    cmp     r1, r4
+    bhs.w   3f
+2:  ldr     r7, [r7, #CH_PREV]
+    cmp     r7, #0
+    bne.w   1b
+    b.w     8f                              // p in no chunk of the chain: an invariant violation
+3:  // measure the new part of the value (frame rule: a node is new when it lies in [C0 limit, p) or in
+    // a chunk above C0)
+    ldr     r0, [sp, #24]                   // value lo
+    ldr     r1, [sp, #32]                   // KIND
+    ldr     r2, [sp, #40]                   // AUX
+    mov     r3, r4                          // p
+    push    {r7}                            // C0, the fifth argument
+    bl      silica_rt_frame_measure
+    add     sp, #4
+    str     r0, [sp, #0]                    // total (a multiple of 16), 0: nothing new
+    cmp     r0, #0
+    bne.w   4f
+    // nothing new: the callee's frames are dead, SP goes back to p and its chunks go back
+    str     r4, [r9, #VRG_VSP]
+    bl      silica_rt_aux_release
+    b.w     9f
+4:  mov     r0, r4
+    mov     r1, r6
+    mov     r2, r7
+    bl      rt_transient_len
+    str     r0, [sp, #4]                    // len
+    ldrb    r0, [r8, #ACB_KIND]
+    cmp     r0, #0
+    bne.w   6f                              // main: no chunk to append, the copy is made in place
+    // the destination: a fresh chunk after the current (deepest) one, so no source chunk is reused;
+    // a restore to p or above pops it
+    mov     r0, r8
+    ldr     r1, [r9, #VRG_ACHUNK]
+    ldr     r2, [sp, #0]
+    ldr     r3, [sp, #4]
+    add     r2, r2, r3
+    mov     r3, r4
+    bl      silica_rt_aux_chunk_append
+    cmp     r0, #0
+    beq.w   8f
+    adds    r1, r0, #1
+    beq.w   8f
+    str     r0, [sp, #8]                    // dest chunk
+    // copy the new nodes into [top - total, top) of the destination chunk
+    ldr     r1, [r0, #CH_TOP]
+    ldr     r2, [sp, #0]
+    sub     r1, r1, r2                      // dest low
+    push    {r1}
+    ldr     r0, [sp, #28]                   // value lo (the locals and the pushed word below it)
+    ldr     r1, [sp, #32]                   // value hi
+    ldr     r2, [sp, #36]                   // KIND
+    ldr     r3, [sp, #44]                   // AUX
+    bl      silica_rt_frame_copy
+    add     sp, #4
+    str     r0, [sp, #24]                   // the root, answered in X0
+    str     r1, [sp, #28]
+    // unlink the callee's chunks: C0 -> dest, the chunks between go back
+    ldr     r0, [sp, #8]
+    ldr     r1, [r7, #CH_NEXT]
+    cmp     r1, r0
+    beq.w   5f
+    ldr     r2, [r0, #CH_PREV]
+    movw    r3, #0
+    str     r3, [r2, #CH_NEXT]
+    mov     r0, r1
+    bl      silica_rt_chunks_free_from
+    ldr     r0, [sp, #8]
+5:  str     r0, [r7, #CH_NEXT]
+    str     r7, [r0, #CH_PREV]
+    ldr     r1, [r7, #CH_INDEX]
+    add     r1, r1, #1
+    str     r1, [r0, #CH_INDEX]
+    bl      silica_rt_aux_publish_chunk
+    // the transient part [p, p + len) under the copied nodes; SP and the floor follow
+    ldr     r0, [sp, #8]
+    ldr     r1, [r0, #CH_TOP]
+    ldr     r2, [sp, #0]
+    sub     r6, r1, r2                      // dest low: the new floor
+    b.w     7f
+6:  // main: its auxiliary stack is one fixed chunk (C0; rt_start.S), so the copy's final place is
+    // directly under p, [p - total, p), which overlaps the callee's frames [s, p) the nodes are read
+    // from. The copy pass therefore writes into SCRATCH, [scratch, scratch + total) below both s and
+    // the final place (free: every deeper frame has returned), with every pointer already relocated by
+    // (final - scratch) (silica_rt_frame_copy_delta), and the block then moves up as bytes. The
+    // transient part follows under the final place as on the chunk path.
+    ldr     r1, [sp, #0]                    // total
+    sub     r0, r4, r1                      // final low (p and total are multiples of 16)
+    str     r0, [sp, #12]
+    cmp     r0, r5
+    bhs.w   61f
+    mov     r5, r0
+61: sub     r2, r5, r1                      // scratch low, under min(s, final low)
+    str     r2, [sp, #16]
+    ldr     r3, [r7, #CH_LIMIT]
+    cmp     r2, r3
+    blo.w   8f                              // no room for the scratch
+    ldr     r1, [sp, #4]
+    sub     r1, r0, r1
+    cmp     r1, r3
+    blo.w   8f                              // no room for the transient part under the final place
+    sub     r0, r0, r2                      // delta = final - scratch
+    bl      silica_rt_frame_copy_delta
+    ldr     r0, [sp, #16]
+    push    {r0}
+    ldr     r0, [sp, #28]
+    ldr     r1, [sp, #32]
+    ldr     r2, [sp, #36]
+    ldr     r3, [sp, #44]
+    bl      silica_rt_frame_copy
+    add     sp, #4
+    str     r0, [sp, #24]                   // the root, already at its final address
+    str     r1, [sp, #28]
+    movw    r0, #0
+    bl      silica_rt_frame_copy_delta
+    ldr     r0, [sp, #16]
+    ldr     r1, [sp, #12]
+    ldr     r2, [sp, #0]
+    bl      rt_move_up                      // scratch -> [final low, p)
+    ldr     r6, [sp, #12]                   // final low: the new floor
+7:  ldr     r2, [sp, #4]                    // len
+    mov     r0, r4
+    sub     r1, r6, r2
+    bl      rt_move_down                    // the transient part [p, p + len) -> under the new floor
+    ldr     r2, [sp, #4]
+    sub     r1, r6, r2
+    str     r1, [r9, #VRG_VSP]
+    str     r6, [r9, #VRG_FLOOR]
+9:  add     sp, #24
+    ENTRY_RET
+8:  bl      silica_rt_region_alloc_failed
+    b.w     8b
     .size   silica_rt_ev_frame, . - silica_rt_ev_frame
 
 // silica_rt_frame_alloc(r0 = bytes) -> r0 = a zeroed block in the dynamic part of the running frame

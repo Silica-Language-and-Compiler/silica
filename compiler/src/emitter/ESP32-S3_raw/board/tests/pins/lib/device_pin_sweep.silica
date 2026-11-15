@@ -1,0 +1,155 @@
+// The pin sweep worker of the board pin-builtin tests (board_pin_builtins_design.md §7). Every pin call
+// is inside a sequence proc[register_rwr] in this device_ module, in a device worker (spawn_device); the
+// pin numbers come from the lists below, so every call takes the checked runtime entry.
+// Pins are the module's GPIO numbers (board_pack.silica pin_class). The pin builtins may configure and
+// drive GPIO13-GPIO18 (the minibadge slots) and GPIO35, GPIO36 (the exposed U1TX / U1RX header), so
+// :all, :unloaded and :no_led are those eight and :one is [16]. pin_read may also read the buttons and
+// the joystick (read-only pins; device_pin_read_buttons).
+//
+// MINIBADGE NOTE (Lee, 2026-11-09): a minibadge plugged into slot 1 or 2 can load or drive GPIO13-GPIO18,
+// so a readback may differ from the written level when an add-on is fitted; the pass criteria (the
+// .scout) are for empty slots.
+// Messages: { op: :readback | :pulls | :button | :od, set: atom, reply_to: actor_ref } (see sweep_worker).
+
+export sweep_worker/2;
+
+// The sets are built from the one list literal of :all (a literal costs code per element, and the
+// NUCLEO image has 96 KiB of SRAM1 for code, data and heap).
+fn all_pins() -> List[uint32, mem(normal)] {
+    [13, 14, 15, 16, 17, 18, 35, 36]
+}
+
+fn without(ps: List[uint32, mem(normal)], a: uint32, b: uint32) -> List[uint32, mem(normal)] {
+    sequence proc[mem(normal)]
+        out: List[uint32, mem(normal)] <- case ps.is_nil of {
+            true -> empty[uint32, mem(normal)]();
+            false -> case ps.head == a or ps.head == b of {
+                true -> without(ps.tail, a, b);
+                false -> prepend[uint32, mem(normal)](ps.head, without(ps.tail, a, b))
+            }
+        }
+    produces
+        pure out
+    end
+}
+
+fn pin_set(name: atom) -> List[uint32, mem(normal)] {
+    case name of {
+        :all -> all_pins();
+        :unloaded -> without(all_pins(), 999, 999);
+        :no_led -> without(all_pins(), 999, 999);
+        :button -> [16];
+        _: atom -> [16]
+    }
+}
+
+// Every configuration op is one recursion over the set (one function keeps the image small enough for
+// the NUCLEO's 96 KiB SRAM1); the mode and pull atoms stay literals at each call (E2226).
+fn configure(ps: List[uint32, mem(normal)], op: atom) -> atom {
+    sequence proc[register_rwr]
+        r: atom <- case ps.is_nil of {
+            true -> :ok;
+            false -> {
+                p: uint32 <- ps.head;
+                _: atom <- case op of {
+                    :outputs -> pin_mode(p, :output);
+                    :inputs -> pin_mode(p, :input);
+                    :open_drain -> pin_mode(p, :output_open_drain);
+                    :pull_up -> pin_pull(p, :up);
+                    :pull_down -> pin_pull(p, :down);
+                    :pull_none -> pin_pull(p, :none);
+                    :drive_high -> pin_write(p, true);
+                    :drive_low -> pin_write(p, false);
+                    _: atom -> :ok
+                };
+                configure(ps.tail, op)
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+fn count_level(ps: List[uint32, mem(normal)], expect: boolean, acc: uint32, reply_to: actor_ref) -> uint32 {
+    sequence proc[register_rwr, concurrency]
+        r: uint32 <- case ps.is_nil of {
+            true -> acc;
+            false -> {
+                level: boolean <- pin_read(ps.head);
+                case level == expect of {
+                    true -> count_level(ps.tail, expect, acc + 1, reply_to);
+                    false -> {
+                        _: boolean <- cast(reply_to, { what: :fail, n: ps.head } impl ActorMessage {});
+                        count_level(ps.tail, expect, acc, reply_to)
+                    }
+                }
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+// One check: every pin of the set read, a { what: :fail, n: pin } cast for each that reads the other
+// level, then { what: :high | :low, n: <pins that read as expected> }.
+fn check(ps: List[uint32, mem(normal)], expect: boolean, reply_to: actor_ref) -> atom {
+    sequence proc[register_rwr, concurrency]
+        n: uint32 <- count_level(ps, expect, 0, reply_to);
+        what: atom <- case expect of {
+            true -> :high;
+            false -> :low
+        };
+        _: boolean <- cast(reply_to, { what: what, n: n } impl ActorMessage {})
+    produces
+        pure :ok
+    end
+}
+
+// The tests, one message each (fewer casts keep the NUCLEO image within its 96 KiB SRAM1); every pin of
+// the set ends as an input with no pull.
+//   :readback  output; high, read high; low, read low
+//   :pulls     input; pull-up, read high; pull-down, read low
+//   :button    input; pull-up, read high; pull-down, read high (a pin with the board's own pull-up)
+//   :od        pull-up and open drain; high (floats), read high; low, read low
+fn sweep_worker(msg: { op: atom, set: atom, reply_to: actor_ref }, state: int64) -> (:no_reply, int64) {
+    sequence proc[register_rwr]
+        ps: List[uint32, mem(normal)] <- pin_set(msg.set);
+        r: actor_ref <- msg.reply_to;
+        _: atom <- case msg.op of {
+            :readback -> {
+                _: atom <- configure(ps, :outputs);
+                _: atom <- configure(ps, :drive_high);
+                _: atom <- check(ps, true, r);
+                _: atom <- configure(ps, :drive_low);
+                check(ps, false, r)
+            };
+            :pulls -> {
+                _: atom <- configure(ps, :inputs);
+                _: atom <- configure(ps, :pull_up);
+                _: atom <- check(ps, true, r);
+                _: atom <- configure(ps, :pull_down);
+                check(ps, false, r)
+            };
+            :button -> {
+                _: atom <- configure(ps, :inputs);
+                _: atom <- configure(ps, :pull_up);
+                _: atom <- check(ps, true, r);
+                _: atom <- configure(ps, :pull_down);
+                check(ps, true, r)
+            };
+            :od -> {
+                _: atom <- configure(ps, :pull_up);
+                _: atom <- configure(ps, :open_drain);
+                _: atom <- configure(ps, :drive_high);
+                _: atom <- check(ps, true, r);
+                _: atom <- configure(ps, :drive_low);
+                check(ps, false, r)
+            };
+            _: atom -> :ok
+        };
+        _: atom <- configure(ps, :inputs);
+        _: atom <- configure(ps, :pull_none)
+    produces
+        pure (:no_reply, state)
+    end
+}

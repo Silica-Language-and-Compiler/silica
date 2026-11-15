@@ -1,0 +1,758 @@
+// One Silica program for both ends of the direct Mac <-> Linux pair over MUTUAL TLS
+// (examples/transport_pairs/ethernet_direct_mtls, run_mtls.sh). It is ../ethernet_direct's program with one
+// change: the carrier. There is ONE connection, made by the Mac, TLS 1.3 with a certificate presented and
+// checked by BOTH ends, and requests flow both ways over it:
+//
+//   (:request, id: uint32, body) / (:reply, id: uint32, body), ETF terms behind wireframe's 4-byte length prefix
+//   (Erlang's gen_tcp {packet, 4}). The accel side's ids are odd, the status side's even.
+//
+//   accel side -> peer  (:request, 1 | 3 | 5, (:accel, { x, y, z, at_ms }))   peer -> (:reply, id, (:led, { which: :red, on: z > 256 }))
+//   status side -> peer (:request, 2 | 4 | 6, :status)                          peer -> (:reply, id, (:status, { host, uptime_ms, requests_seen }))
+//
+// THE CARRIER. Every carrier is dangerous_tls_carrier (this directory), started with spawn_dangerous. It speaks the
+// carrier contract of transport_serialization_design.md 6.2 exactly as the standard (:tcp) carrier does, so nothing
+// else in this program differs from the plain-TCP example: the same messages, the same credits, the same framing.
+// TLS is a reliable ordered byte stream with no size limit of its own, so the framing layer is given the (:tcp)
+// kind's row, Carrier@mtu(:tcp) and Carrier@boundaries(:tcp). There is no carried_on declaration: the language's
+// carrier kinds are the compiler's and TLS is not one of them (Silica's secure interchange is Project BEES's
+// TRUST); this is an example of what such a carrier looks like to the program that owns it.
+//
+// IDENTITY AND TRUST are outside this program and outside the language, in the wrapper (net/silica_tls.c) and in
+// files each node's operator puts in place before a run (README.md):
+//   - a node's key is its existing ~/.ssh/id_ed25519, read where it lies;
+//   - a node's certificate is ~/.silica_mtls/own.cert.pem, made once from that key and kept across restarts;
+//   - a node accepts exactly the peers whose certificates are in its ~/.silica_mtls/peers/ directory. There is no
+//     certificate authority and no shared store: each node is given the certificate of each node it talks to.
+// A peer that is not accepted never reaches this program: the dialer sees a link_down (and dials again, as it does
+// when the listener is not up yet), and the listener is never told of the connection.
+//
+// SECURITY: the bytes on the wire are encrypted and each end knows which node it is talking to. What this example
+// does not do: it has no revocation other than deleting a peer's file, it does not bind a certificate to an
+// address or a name (any accepted peer may connect from anywhere the firewall admits), and its ETF frames carry no
+// authorization of their own. The remote firewall's source-address rule still stands in front of the port, and
+// run_mtls.sh keeps the listener up only for the run.
+//
+// Why one connection: the Mac is behind the campus NAT, so the remote cannot dial it. The Linux end (the status
+// side) listens on all of its interfaces ("listen:any:4550") and the Mac end (the accel side) dials it. Once
+// connected, each end sends its own three requests and answers the peer's three on the same connection.
+//
+// The per-host differences are made at compile time by run_mtls.sh with sed: the address to dial, the listen
+// address and the host name a status reply carries (the three settings below; the defaults are the Mac's copy for
+// the real run), and the side. The side is chosen by the two blocks at the end of the file: the accel side block
+// is code and the status side block is a {- -} comment as written (the Mac's copy); the Linux copy swaps them.
+// Only one side is compiled into each end (see ../ethernet_remote/README.md for why). The side block also says
+// whether the end listens (`listens()`).
+//
+// Actors. The coordinator starts the run. On the listening end it owns the listener carrier and gives every
+// accepted connection a session actor; on the dialing end it starts the dialer actor. Both are the behaviour
+// `connection` with one state record (`dials` tells them apart). A connection actor sends its three requests
+// 250 ms apart (several in flight), keeps the outstanding ids as a bit mask (bit id), matches every reply to its
+// request by id, and answers each peer request at once. Frames go out through an outbox: a frame goes out only
+// while a transmit credit is in hand (8 with :link_up, one back per :tx), otherwise it waits in the outbox string.
+// Every :rx is reassembled with wireframe@unframe and drained. An incoming frame is decoded first as a reply to
+// this side's requests and, if that is rejected, as a peer request.
+//
+// The dialer may be refused if the listener is not up yet, or by the handshake: every link_down before completion
+// closes that carrier and dials again after 500 ms with a fresh state, at most 80 times, printing nothing.
+//
+// Complete: 3 replies matched and 3 peer requests answered, with every :tx confirmed. The connection prints
+// "pair complete", the coordinator waits 1.5 s (the peer reads the last reply), closes the listener (listening end)
+// and exits 0. No completion within 45 s prints "timeout: pair not complete" and exits 5; a listener that cannot
+// bind prints "listen failed <why>" and exits 1; a frame that decodes as neither prints "rejected <why>".
+//
+// Two compiler defects are worked around as in ../usb_silica_pair: a nested tagged tuple is bound to an annotated
+// name before encode, and a to_int64(...) result is bound to a name before it is passed as an argument.
+module dangerous_ethernet_mtls_pair;
+
+use wire_etf;
+use wireframe;
+use Carrier;
+use dangerous_tls;
+use dangerous_tls_carrier;
+use trial_wait_int64;
+
+// ---- Per-host settings (run_mtls.sh rewrites these three lines) ----
+fn listen_address() -> string { "listen:any:4550" }
+fn dial_address() -> string { "138.197.209.113:4550" }
+fn host_name() -> string { "mac-arm64" }
+
+fn timeout_ms() -> uint64 {
+    45000
+}
+
+fn request_count() -> int64 {
+    3
+}
+
+// ---- Shared helpers ----
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+fn segment_of(frame: string) -> string {
+    segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(:tcp), Carrier@boundaries(:tcp));
+    first_segment(segs)
+}
+
+fn bit_of(id: int64) -> uint32 {
+    one: uint32 <- 1;
+    one shl id
+}
+
+fn fresh_carrier() -> dangerous_actor_ref {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tls_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area))
+    produces
+        pure car
+    end
+}
+
+// The synthetic reading carried by the k-th accel request (k = 0, 1, 2; id 2k + 1).
+fn reading_x(k: int64) -> int16 {
+    case k == 0 of { true -> 1; false -> case k == 1 of { true -> 3; false -> 0 - 4 } }
+}
+
+fn reading_y(k: int64) -> int16 {
+    case k == 0 of { true -> 0 - 2; false -> case k == 1 of { true -> 1; false -> 0 } }
+}
+
+fn reading_z(k: int64) -> int16 {
+    case k == 0 of { true -> 512; false -> case k == 1 of { true -> 100; false -> 300 } }
+}
+
+fn reading_at(k: int64) -> uint64 {
+    case k == 0 of { true -> 250; false -> case k == 1 of { true -> 500; false -> 750 } }
+}
+
+fn show_reading(x: int16, y: int16, z: int16, at: uint64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(" accel x=");
+        _: atom <- print_int64(to_int64(x));
+        _: atom <- print(" y=");
+        _: atom <- print_int64(to_int64(y));
+        _: atom <- print(" z=");
+        _: atom <- print_int64(to_int64(z));
+        _: atom <- print(" at_ms=");
+        _: atom <- print_int64(to_int64(at))
+    produces
+        pure :ok
+    end
+}
+
+fn show_led(on: boolean) -> atom {
+    sequence proc[device_io]
+        _: atom <- case on of {
+            true -> println(" -> reply led red on");
+            false -> println(" -> reply led red off")
+        }
+    produces
+        pure :ok
+    end
+}
+
+fn say(label: string, why: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(why);
+        _: atom <- println("")
+    produces
+        pure :ok
+    end
+}
+
+// ---- A connection owner: the dialer (dials = true) or a session on an accepted connection (dials = false) ----
+// Both roles send this side's requests and answer the peer's on the one connection.
+fn p_flush(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[concurrency]
+        go: boolean <- length_bytes(st.out) > 0 and st.credit > 0;
+        _: boolean <- case go of {
+            true -> cast(st.car, (:tx, st.out, self()) impl ActorMessage {});
+            false -> false
+        };
+        next: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } <- case go of {
+            true -> { car: st.car, coord: st.coord, rx: st.rx, credit: st.credit - 1, out: "", flight: st.flight + 1, waiting: st.waiting, sent: st.sent, got: st.got, served: st.served, gen: st.gen, tries: st.tries, dials: st.dials, phase: st.phase };
+            false -> st
+        }
+    produces
+        pure next
+    end
+}
+
+fn p_post(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, seg: string) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    p_flush({ car: st.car, coord: st.coord, rx: st.rx, credit: st.credit, out: concat(st.out, seg), flight: st.flight, waiting: st.waiting, sent: st.sent, got: st.got, served: st.served, gen: st.gen, tries: st.tries, dials: st.dials, phase: st.phase })
+}
+
+fn p_said(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, _o: atom) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    st
+}
+
+// The next request of this side: accel ids 1, 3, 5 or status ids 2, 4, 6; the next one follows 250 ms later.
+fn p_send_next(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    k: int64 <- st.sent;
+    id: int64 <- request_id(k);
+    seg: string <- request_segment(id, k);
+    more: boolean <- k + 1 < request_count();
+    _: boolean <- schedule_next(more, st.gen);
+    p_post({ car: st.car, coord: st.coord, rx: st.rx, credit: st.credit, out: st.out, flight: st.flight, waiting: st.waiting bor bit_of(id), sent: k + 1, got: st.got, served: st.served, gen: st.gen, tries: st.tries, dials: st.dials, phase: st.phase }, seg)
+}
+
+fn schedule_next(more: boolean, gen: int64) -> boolean {
+    case more of {
+        true -> {
+            sequence proc[concurrency]
+                _: timer_ref <- send_after(250, self(), (:next, gen) impl ActorMessage {})
+            produces
+                pure true
+            end
+        };
+        false -> false
+    }
+}
+
+// Connected (the dialer) or accepted (a session): grant receive credit, then start this side's requests.
+fn p_link_up(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- case st.dials of {
+            true -> println("connected");
+            false -> println("accepted")
+        };
+        _: boolean <- cast(st.car, (:credit, 4) impl ActorMessage {})
+    produces
+        pure p_send_next(st)
+    end
+}
+
+fn p_next(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, gen: int64) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case gen == st.gen and st.phase == 0 and st.sent < request_count() of {
+        true -> p_send_next(st);
+        false -> st
+    }
+}
+
+// A link_down before completion. The dialer closes that carrier (its own link_down is then ignored in phase 1)
+// and dials again in 500 ms; the generation makes the old connection's :next timers stale. A session reports it.
+fn p_link_down(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, why: atom) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case st.phase == 0 of {
+        true -> case st.dials of {
+            true -> p_retry(st);
+            false -> p_said(st, say("accepted connection down before completion: ", why))
+        };
+        false -> st
+    }
+}
+
+fn p_retry(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.car, :close impl ActorMessage {});
+        _: boolean <- case st.tries < 80 of {
+            true -> {
+                sequence proc[concurrency]
+                    _: timer_ref <- send_after(500, self(), :redial impl ActorMessage {})
+                produces
+                    pure true
+                end
+            };
+            false -> false
+        }
+    produces
+        pure { car: st.car, coord: st.coord, rx: st.rx, credit: st.credit, out: st.out, flight: st.flight, waiting: st.waiting, sent: st.sent, got: st.got, served: st.served, gen: st.gen + 1, tries: st.tries + 1, dials: st.dials, phase: 1 }
+    end
+}
+
+fn p_redial(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- fresh_carrier();
+        _: boolean <- cast(car, (:open, self(), dial_address()) impl ActorMessage {})
+    produces
+        pure { car: car, coord: st.coord, rx: wireframe@fresh(Carrier@boundaries(:tcp)), credit: 0, out: "", flight: 0, waiting: 0, sent: 0, got: 0, served: 0, gen: st.gen, tries: st.tries, dials: st.dials, phase: 0 }
+    end
+}
+
+fn p_tx_credit(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, n: int64) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    confirmed: int64 <- case n == 1 of { true -> 1; false -> 0 };
+    p_maybe_done(p_flush({ car: st.car, coord: st.coord, rx: st.rx, credit: st.credit + n, out: st.out, flight: st.flight - confirmed, waiting: st.waiting, sent: st.sent, got: st.got, served: st.served, gen: st.gen, tries: st.tries, dials: st.dials, phase: st.phase }))
+}
+
+// Done: 3 replies matched, 3 peer requests answered, every :tx confirmed.
+fn p_maybe_done(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    count_ok: boolean <- st.sent == request_count() and st.got == request_count() and st.waiting == 0 and st.served == request_count();
+    done: boolean <- st.phase == 0 and count_ok and st.flight <= 0 and length_bytes(st.out) == 0;
+    case done of {
+        true -> p_done(st);
+        false -> st
+    }
+}
+
+fn p_done(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- println("pair complete: 3 replies matched, 3 peer requests answered");
+        _: boolean <- cast(st.coord, :pair_done impl ActorMessage {})
+    produces
+        pure { car: st.car, coord: st.coord, rx: st.rx, credit: st.credit, out: st.out, flight: st.flight, waiting: st.waiting, sent: st.sent, got: st.got, served: st.served, gen: st.gen, tries: st.tries, dials: st.dials, phase: 2 }
+    end
+}
+
+// ---- A reply, matched to its request by id ----
+fn p_unknown(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[device_io]
+        _: atom <- print("reply to unknown id ");
+        _: atom <- print_int64(id);
+        _: atom <- println("")
+    produces
+        pure st
+    end
+}
+
+fn p_matched(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, bit: uint32) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    { car: st.car, coord: st.coord, rx: st.rx, credit: st.credit, out: st.out, flight: st.flight, waiting: st.waiting band (bnot bit), sent: st.sent, got: st.got + 1, served: st.served, gen: st.gen, tries: st.tries, dials: st.dials, phase: st.phase }
+}
+
+fn is_waiting(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64) -> boolean {
+    (st.waiting band bit_of(id)) != 0
+}
+
+// ---- A peer request, answered at once ----
+fn p_served(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, seg: string) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    p_post({ car: st.car, coord: st.coord, rx: st.rx, credit: st.credit, out: st.out, flight: st.flight, waiting: st.waiting, sent: st.sent, got: st.got, served: st.served + 1, gen: st.gen, tries: st.tries, dials: st.dials, phase: st.phase }, seg)
+}
+
+// ---- Frames in ----
+fn p_with_rx(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, rx: { mode: atom, expected: int64, pending: string }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    { car: st.car, coord: st.coord, rx: rx, credit: st.credit, out: st.out, flight: st.flight, waiting: st.waiting, sent: st.sent, got: st.got, served: st.served, gen: st.gen, tries: st.tries, dials: st.dials, phase: st.phase }
+}
+
+// Every frame is a reply to this side's requests or a peer request (reply_frame tries the first and falls back to
+// request_frame; both are in the side blocks at the end).
+fn p_absorb(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, segment: string) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(st.rx, segment, 4096);
+    case un of {
+        (:more, r1: { mode: atom, expected: int64, pending: string }) -> p_with_rx(st, r1);
+        (:frame, frame0: string, r2: { mode: atom, expected: int64, pending: string }) -> p_absorb(reply_frame(p_with_rx(st, r2), frame0), "");
+        (:rejected, why: atom) -> p_said(st, say("framing rejected ", why))
+    }
+}
+
+fn p_rx(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, segment: string) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.car, (:credit, 1) impl ActorMessage {})
+    produces
+        pure p_maybe_done(p_absorb(st, segment))
+    end
+}
+
+fn connection(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:next, int64) | :redial, state: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) -> (:no_reply, { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, p_link_up(state));
+        (:tx_credit, n: int64) -> (:no_reply, p_tx_credit(state, n));
+        (:rx, segment: string) -> (:no_reply, p_rx(state, segment));
+        (:next, gen: int64) -> (:no_reply, p_next(state, gen));
+        :redial -> (:no_reply, p_redial(state));
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> (:no_reply, p_link_down(state, why2))
+    }
+}
+
+// ---- The coordinator: listens (the listening end) or dials (the dialing end), ends the run ----
+fn c_start(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    case listens() of {
+        true -> c_listen(st);
+        false -> c_dial(st)
+    }
+}
+
+fn c_listen(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.car, (:open, self(), listen_address()) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn c_dial(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[concurrency]
+        d: actor_ref <- spawn({ car: st.car, coord: self(), rx: wireframe@fresh(Carrier@boundaries(:tcp)), credit: 0, out: "", flight: 0, waiting: 0, sent: 0, got: 0, served: 0, gen: 0, tries: 0, dials: true, phase: 0 }, connection, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(st.car, (:open, d, dial_address()) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn c_bound(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[device_io]
+        _: atom <- println("listening")
+    produces
+        pure st
+    end
+}
+
+fn c_accepted(st: { car: dangerous_actor_ref, phase: int64 }, conn: dangerous_actor_ref) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[concurrency]
+        ses: actor_ref <- spawn({ car: conn, coord: self(), rx: wireframe@fresh(Carrier@boundaries(:tcp)), credit: 0, out: "", flight: 0, waiting: 0, sent: 0, got: 0, served: 0, gen: 0, tries: 0, dials: false, phase: 0 }, connection, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(conn, (:open, ses, "") impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn c_complete(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    case st.phase == 0 of {
+        true -> c_finish_later(st);
+        false -> st
+    }
+}
+
+fn c_finish_later(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(1500, self(), :finish impl ActorMessage {})
+    produces
+        pure { car: st.car, phase: 2 }
+    end
+}
+
+fn c_timeout(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    case st.phase == 0 of {
+        true -> c_timed_out(st);
+        false -> st
+    }
+}
+
+fn c_timed_out(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- println("timeout: pair not complete");
+        _: boolean <- cast_exit(5)
+    produces
+        pure { car: st.car, phase: 3 }
+    end
+}
+
+fn c_listener_down(st: { car: dangerous_actor_ref, phase: int64 }, why: atom) -> { car: dangerous_actor_ref, phase: int64 } {
+    case st.phase == 0 of {
+        true -> c_listen_failed(st, why);
+        false -> st
+    }
+}
+
+fn c_listen_failed(st: { car: dangerous_actor_ref, phase: int64 }, why: atom) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- print("listen failed ");
+        _: atom <- print_atom(why);
+        _: atom <- println("");
+        _: boolean <- cast_exit(1)
+    produces
+        pure { car: st.car, phase: 3 }
+    end
+}
+
+// The listening end closes its listener (no listener is left on the port); the dialing end's connection closes
+// when the process exits.
+fn c_finish(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- case listens() of {
+            true -> cast(st.car, :close impl ActorMessage {});
+            false -> false
+        };
+        _: boolean <- cast_exit(0)
+    produces
+        pure st
+    end
+}
+
+fn coordinator(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | :start | :pair_done | :timeout | :finish, state: { car: dangerous_actor_ref, phase: int64 }) -> (:no_reply, { car: dangerous_actor_ref, phase: int64 }) {
+    case msg of {
+        :start -> (:no_reply, c_start(state));
+        (:link_up, _info: string) -> (:no_reply, c_bound(state));
+        (:accepted, conn: dangerous_actor_ref, _info2: string) -> (:no_reply, c_accepted(state, conn));
+        :pair_done -> (:no_reply, c_complete(state));
+        :timeout -> (:no_reply, c_timeout(state));
+        :finish -> (:no_reply, c_finish(state));
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> (:no_reply, c_listener_down(state, why2))
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                car: dangerous_actor_ref <- fresh_carrier();
+                me: actor_ref <- spawn({ car: car, phase: 0 }, coordinator, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: timer_ref <- send_after(timeout_ms(), me, :timeout impl ActorMessage {});
+                _: boolean <- cast(me, :start impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// ==== BEGIN accel side ====
+// The accel side (the Mac): it dials; it requests (:accel, ...) and is answered (:led, ...); it is asked :status
+// and answers (:status, { host, uptime_ms, requests_seen }). run_mtls.sh turns this block into a comment, and the
+// status side block below into code, for the Linux end.
+fn listens() -> boolean {
+    false
+}
+
+fn request_id(k: int64) -> int64 {
+    2 * k + 1
+}
+
+fn request_segment(id: int64, k: int64) -> string {
+    accel_request_segment(id, k)
+}
+
+// Each term is bound to an annotated name before encode (compiler defect 1, see the header).
+fn accel_request_segment(id: int64, k: int64) -> string {
+    sequence proc[mem(normal), transport]
+        body: (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 }) <- (:accel, { x: reading_x(k), y: reading_y(k), z: reading_z(k), at_ms: reading_at(k) });
+        msg: (:request, int64, (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 })) <- (:request, id, body);
+        frame: string <- encode((:etf), msg)
+    produces
+        pure segment_of(frame)
+    end
+}
+
+fn status_reply_segment(id: int64, up: uint64, seen: uint32) -> string {
+    sequence proc[mem(normal), transport]
+        body: (:status, { host: string, uptime_ms: uint64, requests_seen: uint32 }) <- (:status, { host: host_name(), uptime_ms: up, requests_seen: seen });
+        msg: (:reply, int64, (:status, { host: string, uptime_ms: uint64, requests_seen: uint32 })) <- (:reply, id, body);
+        frame: string <- encode((:etf), msg)
+    produces
+        pure segment_of(frame)
+    end
+}
+
+// A reply to an accel request, or else a peer's status request.
+fn reply_frame(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, frame0: string) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[mem(normal), transport]
+        decoded: (:ok, (:reply, uint32, (:led, { which: :single | :red | :green | :blue, on: boolean }))) | (:rejected, atom) <- decode((:etf), frame0);
+        next: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } <- case decoded of {
+            (:ok, m: (:reply, uint32, (:led, { which: :single | :red | :green | :blue, on: boolean }))) -> p_take_led(st, m);
+            (:rejected, _why: atom) -> request_frame(st, frame0)
+        }
+    produces
+        pure next
+    end
+}
+
+fn p_take_led(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, m: (:reply, uint32, (:led, { which: :single | :red | :green | :blue, on: boolean }))) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case m of {
+        (:reply, rid: uint32, body: (:led, { which: :single | :red | :green | :blue, on: boolean })) -> {
+            id: int64 <- to_int64(rid);
+            p_led_body(st, id, body)
+        }
+    }
+}
+
+fn p_led_body(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64, body: (:led, { which: :single | :red | :green | :blue, on: boolean })) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case body of {
+        (:led, cmd: { which: :single | :red | :green | :blue, on: boolean }) -> p_settle_led(st, id, cmd.on)
+    }
+}
+
+fn p_settle_led(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64, on: boolean) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case is_waiting(st, id) of {
+        true -> p_show_led(st, id, on);
+        false -> p_unknown(st, id)
+    }
+}
+
+fn p_show_led(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64, on: boolean) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    k: int64 <- (id - 1) / 2;
+    _: atom <- show_led_line(id, k, on);
+    p_matched(st, bit_of(id))
+}
+
+fn show_led_line(id: int64, k: int64, on: boolean) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("request ");
+        _: atom <- print_int64(id);
+        _: atom <- show_reading(reading_x(k), reading_y(k), reading_z(k), reading_at(k));
+        _: atom <- show_led(on)
+    produces
+        pure :ok
+    end
+}
+
+fn request_frame(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, frame0: string) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[mem(normal), transport]
+        decoded: (:ok, (:request, uint32, :status)) | (:rejected, atom) <- decode((:etf), frame0);
+        next: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } <- case decoded of {
+            (:ok, m: (:request, uint32, :status)) -> p_take_status_request(st, m);
+            (:rejected, why: atom) -> p_said(st, say("rejected ", why))
+        }
+    produces
+        pure next
+    end
+}
+
+fn p_take_status_request(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, m: (:request, uint32, :status)) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case m of {
+        (:request, rid: uint32, :status) -> {
+            id: int64 <- to_int64(rid);
+            p_serve_status(st, id)
+        }
+    }
+}
+
+// A status request: answer (:status, { host, uptime_ms, requests_seen }).
+fn p_serve_status(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[concurrency, device_io]
+        seen: int64 <- st.served + 1;
+        now: int64 <- monotonic_time();
+        up: uint64 <- to_uint64(now / 1000000);
+        seen32: uint32 <- to_uint32(seen);
+        seg: string <- status_reply_segment(id, up, seen32);
+        _: atom <- print("peer request ");
+        _: atom <- print_int64(id);
+        _: atom <- print(" status -> reply status requests_seen=");
+        _: atom <- print_int64(seen);
+        _: atom <- println("")
+    produces
+        pure p_served(st, seg)
+    end
+}
+
+// ==== END accel side ====
+
+{- ==== BEGIN status side ====
+The status side (the Linux end): it listens; it requests :status and is answered (:status, ...); it is asked
+(:accel, ...) and answers (:led, ...) by the rule. -}
+{- ==== status side code ====
+fn listens() -> boolean {
+    true
+}
+
+fn request_id(k: int64) -> int64 {
+    2 * k + 2
+}
+
+fn request_segment(id: int64, _k: int64) -> string {
+    status_request_segment(id)
+}
+
+fn status_request_segment(id: int64) -> string {
+    sequence proc[mem(normal), transport]
+        frame: string <- encode((:etf), (:request, id, :status))
+    produces
+        pure segment_of(frame)
+    end
+}
+
+fn led_reply_segment(id: int64, on: boolean) -> string {
+    sequence proc[mem(normal), transport]
+        body: (:led, { which: :red, on: boolean }) <- (:led, { which: :red, on: on });
+        msg: (:reply, int64, (:led, { which: :red, on: boolean })) <- (:reply, id, body);
+        frame: string <- encode((:etf), msg)
+    produces
+        pure segment_of(frame)
+    end
+}
+
+// A reply to a status request, or else a peer's accel request.
+fn reply_frame(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, frame0: string) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[mem(normal), transport]
+        decoded: (:ok, (:reply, uint32, (:status, { host: string, uptime_ms: uint64, requests_seen: uint32 }))) | (:rejected, atom) <- decode((:etf), frame0, { max_bytes: 256, max_depth: 4, max_length: 64 });
+        next: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } <- case decoded of {
+            (:ok, m: (:reply, uint32, (:status, { host: string, uptime_ms: uint64, requests_seen: uint32 }))) -> p_take_status(st, m);
+            (:rejected, _why: atom) -> request_frame(st, frame0)
+        }
+    produces
+        pure next
+    end
+}
+
+fn p_take_status(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, m: (:reply, uint32, (:status, { host: string, uptime_ms: uint64, requests_seen: uint32 }))) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case m of {
+        (:reply, rid: uint32, body: (:status, { host: string, uptime_ms: uint64, requests_seen: uint32 })) -> {
+            id: int64 <- to_int64(rid);
+            p_status_body(st, id, body)
+        }
+    }
+}
+
+fn p_status_body(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64, body: (:status, { host: string, uptime_ms: uint64, requests_seen: uint32 })) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case body of {
+        (:status, s: { host: string, uptime_ms: uint64, requests_seen: uint32 }) -> p_settle_status(st, id, s)
+    }
+}
+
+fn p_settle_status(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64, s: { host: string, uptime_ms: uint64, requests_seen: uint32 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case is_waiting(st, id) of {
+        true -> p_show_status(st, id, s);
+        false -> p_unknown(st, id)
+    }
+}
+
+fn p_show_status(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64, s: { host: string, uptime_ms: uint64, requests_seen: uint32 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[device_io]
+        _: atom <- print("request ");
+        _: atom <- print_int64(id);
+        _: atom <- print(" status -> reply status host=");
+        _: atom <- print(s.host);
+        _: atom <- print(" uptime_ms=");
+        _: atom <- print_int64(to_int64(s.uptime_ms));
+        _: atom <- print(" requests_seen=");
+        _: atom <- print_int64(to_int64(s.requests_seen));
+        _: atom <- println("")
+    produces
+        pure p_matched(st, bit_of(id))
+    end
+}
+
+fn request_frame(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, frame0: string) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    sequence proc[mem(normal), transport]
+        decoded: (:ok, (:request, uint32, (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 }))) | (:rejected, atom) <- decode((:etf), frame0);
+        next: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } <- case decoded of {
+            (:ok, m: (:request, uint32, (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 }))) -> p_take_accel(st, m);
+            (:rejected, why: atom) -> p_said(st, say("rejected ", why))
+        }
+    produces
+        pure next
+    end
+}
+
+fn p_take_accel(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, m: (:request, uint32, (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 }))) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case m of {
+        (:request, rid: uint32, body: (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 })) -> {
+            id: int64 <- to_int64(rid);
+            p_accel_body(st, id, body)
+        }
+    }
+}
+
+fn p_accel_body(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64, body: (:accel, { x: int16, y: int16, z: int16, at_ms: uint64 })) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    case body of {
+        (:accel, r: { x: int16, y: int16, z: int16, at_ms: uint64 }) -> p_serve_accel(st, id, r)
+    }
+}
+
+// An accel request: print it and answer by the rule (the red LED on when z > 256).
+fn p_serve_accel(st: { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 }, id: int64, r: { x: int16, y: int16, z: int16, at_ms: uint64 }) -> { car: dangerous_actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, waiting: uint32, sent: int64, got: int64, served: int64, gen: int64, tries: int64, dials: boolean, phase: int64 } {
+    on: boolean <- to_int64(r.z) > 256;
+    seg: string <- led_reply_segment(id, on);
+    _: atom <- show_accel_request(id, r, on);
+    p_served(st, seg)
+}
+
+fn show_accel_request(id: int64, r: { x: int16, y: int16, z: int16, at_ms: uint64 }, on: boolean) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("peer request ");
+        _: atom <- print_int64(id);
+        _: atom <- show_reading(r.x, r.y, r.z, r.at_ms);
+        _: atom <- show_led(on)
+    produces
+        pure :ok
+    end
+}
+
+==== END status side ==== -}

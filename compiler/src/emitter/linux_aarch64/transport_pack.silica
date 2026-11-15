@@ -16,12 +16,37 @@
 -}
 
 // The transport pack of this emit target (transport_serialization_design.md §6.0): which wire
-// protocol tags and carrier tags this compiler build provides. The language's vocabulary is the
-// union of every target's pack; a program that names a tag this pack does not list is rejected by
-// sir_target_verify with E2410 before anything is emitted. Every emit target carries its own copy
-// at emitter/<TARGET>/transport_pack.silica, read by the shared compiler like pack_descriptions.
-// This OS-hosted target provides ETF (phase 3, Linux lock-step with the Apple Silicon pack); the
-// carrier tags are provided as on the Mac, through compiler/stdlib/carrier.silica, not this pack.
+// protocol tags, carrier kinds and links this compiler build provides. The language's vocabulary is
+// the union of every target's pack; a program that names a tag this pack does not list is rejected by
+// the shared compiler (E2410 for a protocol or a carrier kind, E2412 for a link) before anything is
+// emitted. Every emit target carries its own copy at emitter/<TARGET>/transport_pack.silica, read by
+// the shared compiler like pack_descriptions.
+//
+// This OS-hosted target answers exactly as the Apple Silicon and Linux x86-64 packs do (links design
+// decision 11; rows ported from emitter/linux_x86_64/transport_pack.silica on 2026-11-11, phase A for
+// Linux AArch64): ETF, the three hosted carriers of §6.3 as dangerous FFI actors over
+// compiler/stdlib/net (tcp, udp, serial; silica_sockets.c is portable POSIX and builds on glibc with
+// -D_GNU_SOURCE, nothing in it depends on the architecture), and the hosted links of the links design
+// §5.1: (:loopback), (:interface, name), (:ethernet, n), (:wifi, n), (:serial_port, path, baud). The
+// instance rows of (:ethernet, n) and (:wifi, n) are resolved at run time through the host (§3.2), so
+// the compile-time check is only that the tag exists. (:uart, n, baud), (:usb_cdc, n) and
+// (:usb_serial_jtag) are board links and are not provided here (E2412). Keep the three hosted packs'
+// rows identical.
+// Storage carriers (transport_serialization_design.md §6.8, phases S0/S1; ported from the Apple Silicon
+// pack on 2026-11-12): the (:store) kind on (:memory, capacity, retention), an ordinary actor
+// (store_memory_carrier), and on (:backing, path, capacity, retention), a dangerous actor over
+// compiler/stdlib/net/silica_store.c (dangerous_store_backing_carrier), same rows as the Apple pack.
+//
+// carrier_spawn spells the spawn that `spawn_dangerous_carrier(<name>, <policies>...)` expands to
+// (parser carried_on_expand): the carrier module's initial state as a literal (a dangerous_* function
+// cannot be called outside an external_danger block, specification §16.4.8) and its behaviour, without
+// the closing parenthesis, so the program's policies follow. The serial carrier takes the link's path
+// and baud in its initial state. The TCP carrier takes the link as `link_spec` in its initial state
+// ("loopback", "interface:<name>", "ethernet:<n>", "wifi:<n>"; link_spec_of): at :open it binds the socket
+// to the interface's address (getifaddrs, §3.2; hosted Ethernet plan E2), refuses the listen addresses the
+// link does not allow and ends with (:explicit, :link_unavailable) when the interface cannot be found
+// (dangerous_tcp_carrier's header). The UDP carrier keeps its address strings and binds nothing yet. The
+// spawn text is lexed by the compiler: keep it one line of plain Silica.
 
 export provides_format/1;
 export provides_carrier/1;
@@ -41,35 +66,181 @@ fn provides_format(tag: string) -> boolean {
 
 fn provides_carrier(tag: string) -> boolean {
     case tag of {
+        "tcp" -> true;
+        "udp" -> true;
+        "serial" -> true;
+        "store" -> true;
         _: string -> false
     }
 }
 
-// Carrier links (transport_links_design.md §5.1, specification §16.4.9): the shared compiler reads
-// these rows for every `carried_on` declaration (E2412 in sir_target_verify and the parser's
-// spawn_dangerous_carrier expansion). This target's rows are not written yet (phase A for the hosted
-// targets is the Mac first, 2026-11-09): no link is provided, so a carried_on declaration compiled for
-// this target is E2412, and spawn_dangerous_carrier has no expansion here.
+// link: the tag name ("uart"); instance: the instance number (0 where the link has none).
 fn provides_link(link_tag: string, instance: int64) -> boolean {
-    false
+    case link_tag of {
+        "loopback" -> true;
+        "interface" -> true;
+        "ethernet" -> true;
+        "wifi" -> true;
+        "serial_port" -> true;
+        "memory" -> true;
+        "backing" -> true;
+        _: string -> false
+    }
 }
 
 fn provided_links() -> string {
-    "(none: the carrier links of this target are not written yet)"
+    "(:loopback), (:interface, name), (:ethernet, n), (:wifi, n), (:serial_port, path, baud), (:memory, capacity, retention), (:backing, path, capacity, retention)"
 }
 
+// No UART instance is the console on a hosted target.
 fn link_console_note(link_tag: string, instance: int64) -> string {
     ""
 }
 
+// The termios wrapper (compiler/stdlib/net/silica_sockets.c) sets these line speeds; any other baud
+// would silently become 115200.
 fn link_baud_ok(link_tag: string, baud: int64) -> boolean {
-    true
+    case link_tag of {
+        "serial_port" -> baud == 9600 or baud == 19200 or baud == 38400 or baud == 57600 or baud == 115200 or baud == 230400;
+        _: string -> true
+    }
 }
 
 fn carrier_module(kind: string, link_tag: string) -> string {
-    ""
+    case kind of {
+        "tcp" -> "dangerous_tcp_carrier";
+        "udp" -> "dangerous_udp_carrier";
+        "serial" -> case link_tag == "serial_port" of {
+            true -> "dangerous_serial_carrier";
+            false -> ""
+        };
+        "store" -> case link_tag of {
+            "memory" -> "store_memory_carrier";
+            "backing" -> "dangerous_store_backing_carrier";
+            _: string -> ""
+        };
+        _: string -> ""
+    }
 }
 
+// params: the link's parameter lexemes joined by ", " (`"/dev/cu.usbmodem101", 115200` for a serial
+// port). "" when this target has no carrier for the kind on the link.
 fn carrier_spawn(kind: string, link_tag: string, instance: int64, params: string) -> string {
-    ""
+    case provides_link(link_tag, instance) of {
+        false -> "";
+        true -> case kind of {
+            "tcp" -> concat(concat("spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: \"", link_spec_of(link_tag, instance, params)), "\" }, dangerous_tcp_carrier@carrier");
+            "udp" -> "spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, peer_host: \"\", peer_port: 0 }, dangerous_udp_carrier@carrier";
+            "serial" -> case link_tag == "serial_port" of {
+                true -> concat(concat("spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, path: ", serial_path_of(params)), concat(concat(", baud: ", serial_baud_of(params)), " }, dangerous_serial_carrier@carrier"));
+                false -> ""
+            };
+            // the (:memory) medium is an ordinary actor: params are `<capacity>, <retention>`
+            "store" -> case link_tag of {
+                "memory" -> concat(concat("spawn(store_memory_carrier@initial(", params), "), store_memory_carrier@carrier");
+                // the (:backing) medium is a dangerous actor, so its initial state is spelled out here (a
+                // program cannot call a dangerous module's function): dangerous_store_backing_carrier@initial's
+                // record with the link's `<path>, <capacity>, <retention>` in place
+                "backing" -> concat(concat(concat("spawn_dangerous({ owner: actor_ref_of_word(0), up: false, ", concat("retention: ", param_at(params, 2))), concat(concat(", capacity: ", param_at(params, 1)), concat(", path: ", param_at(params, 0)))), ", fd: 0 - 1, firsts: \"\", oldest: 0, oldest_block: 0, used: 0, next: 0, tail_block: 0 - 1, tail_pos: 0, pend: \"\", buffered: 0, dirty: false, out: \"\", want_flush: false, credit_back: 0, ack: 0, opening: false, rec_b: 0, tail_fs: 0 - 1, old_fs: 0 - 1, rx_credit: 0, replaying: false, want_rec: false, r_from: 0, r_end: 0, r_seq: 0, r_block: 0, r_pos: 0 }, dangerous_store_backing_carrier@carrier");
+                _: string -> ""
+            };
+            _: string -> ""
+        }
+    }
+}
+
+// The TCP carrier's `link_spec`: the link as the carrier reads it at :open. The interface name is the
+// declaration's literal without its quotes (or the atom's name), so it stays a valid string literal body.
+fn link_spec_of(link_tag: string, instance: int64, params: string) -> string {
+    case link_tag of {
+        "loopback" -> "loopback";
+        "interface" -> concat("interface:", interface_name_of(params));
+        "ethernet" -> concat("ethernet:", int_text(instance));
+        "wifi" -> concat("wifi:", int_text(instance));
+        _: string -> ""
+    }
+}
+
+// `"en0"` or `:en0`, the lexeme of an (:interface, name) parameter, as `en0`.
+fn interface_name_of(params: string) -> string {
+    n: int64 <- length_bytes(params);
+    case n >= 2 and substring(params, 0, 1) == "\"" of {
+        true -> substring(params, 1, n - 1);
+        false -> case n >= 1 and substring(params, 0, 1) == ":" of {
+            true -> substring(params, 1, n);
+            false -> params
+        }
+    }
+}
+
+fn int_text(n: int64) -> string {
+    case n < 10 of {
+        true -> substring("0123456789", n, n + 1);
+        false -> concat(int_text(n / 10), substring("0123456789", n % 10, n % 10 + 1))
+    }
+}
+
+// `"<path>", <baud>`: the two lexemes of a (:serial_port, path, baud) link.
+fn serial_path_of(params: string) -> string {
+    i: int64 <- comma_at(params, 0);
+    case i < 0 of {
+        true -> params;
+        false -> substring(params, 0, i)
+    }
+}
+
+fn serial_baud_of(params: string) -> string {
+    i: int64 <- comma_at(params, 0);
+    case i < 0 of {
+        true -> "0";
+        false -> trim_lead(substring(params, i + 1, length_bytes(params)))
+    }
+}
+
+// Parameter i of a link's parameter lexemes (joined by ", "), 0-based; "" when there is none.
+fn param_at(params: string, i: int64) -> string {
+    c: int64 <- comma_at(params, 0);
+    case i == 0 of {
+        true -> case c < 0 of { true -> params; false -> substring(params, 0, c) };
+        false -> case c < 0 of {
+            true -> "";
+            false -> param_at(trim_lead(substring(params, c + 1, length_bytes(params))), i - 1)
+        }
+    }
+}
+
+// The first comma outside a string literal, or -1.
+fn comma_at(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c of {
+                "\"" -> comma_at(s, after_quote(s, i + 1));
+                "," -> i;
+                _: string -> comma_at(s, i + 1)
+            }
+        }
+    }
+}
+
+fn after_quote(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> i;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c of {
+                "\\" -> after_quote(s, i + 2);
+                "\"" -> i + 1;
+                _: string -> after_quote(s, i + 1)
+            }
+        }
+    }
+}
+
+fn trim_lead(s: string) -> string {
+    case length_bytes(s) > 0 and substring(s, 0, 1) == " " of {
+        true -> trim_lead(substring(s, 1, length_bytes(s)));
+        false -> s
+    }
 }

@@ -19,6 +19,7 @@
                     [--send TEXT [--send-delay S] [--send-marker M [--send-marker-count N]]] image.elf
     run_on_board.py --probe [--port P] [--expect-serial SERIAL]
     run_on_board.py --list-ports
+    run_on_board.py --exec flash --yes-wear-flash [--port P] [--timeout S] [--out FILE] image.elf   (by hand only)
 
 Same interface and output protocol as the ESP32-S3 driver (../../../ESP32-S3_raw/board/tools/run_on_board.py).
 
@@ -43,6 +44,16 @@ named, so this target can never touch it.
 default 066CFF343654393143174720, must match); prints "port chip serial". (st-info resets the target.)
 --expect-mac is accepted and ignored (the trial harness passes it for the ESP32 board only).
 --print-openocd: print the OpenOCD command line for the image and exit (nothing is run; for checking).
+
+--exec flash (BY HAND ONLY; it WEARS THE FLASH): programs a flash image (build_image.sh BOARD_EXEC=flash,
+linked at 0x0800_0000) into the main flash and starts it from a hardware reset:
+    openocd ... -c init -c "reset halt" -c "program <elf> verify" -c "reset halt" -c resume -c shutdown
+Every run erases and reprograms each 2 KiB page the image covers (about 10,000 cycles per page), so it
+is refused unless --yes-wear-flash is given, and it prints a warning first. The trial harness never
+passes either option (flash is never used for trials). The program stays in flash afterwards and runs
+again at every reset or power-up. The wall clock is not written in flash mode (_start's .data copy would
+overwrite it), so current_time counts from the start. The default, --exec ram, refuses a flash image
+(it would never reach RAM) and flash mode refuses a RAM image.
 
 Alternative if OpenOCD misbehaves (not the default): st-util in one shell, then
     arm-none-eabi-gdb -batch -ex "target extended-remote :4242" -ex "load" -ex "set $pc=<_start>" -ex continue image.elf
@@ -70,6 +81,13 @@ EXIT_PREFIX = b"\x02SILICA:EXIT:"
 BAUD = 115200
 DEFAULT_ST_SERIAL = "066CFF343654393143174720"
 OPENOCD_TIMEOUT = 60
+OPENOCD_FLASH_TIMEOUT = 180   # erase + program + verify of a few dozen pages; unmeasured, generous
+
+FLASH_WEAR_WARNING = """\
+run_on_board: *** WARNING: --exec flash ERASES AND REPROGRAMS THE STM32L476RG MAIN FLASH ***
+run_on_board: every run costs one erase cycle on each 2 KiB page the image covers (about 10,000 per page).
+run_on_board: by hand only, never from the trials. The program stays in flash and runs at every reset.
+"""
 
 EXIT_TIMEOUT = 3
 EXIT_BOARD = 4
@@ -158,11 +176,40 @@ def elf_symbols(image, names):
     return out
 
 
+FLASH_BASE = 0x08000000
+FLASH_END = 0x08100000
+
+
+def is_flash_image(syms):
+    """True when the image's code is linked in the main flash (build_image.sh BOARD_EXEC=flash)."""
+    return FLASH_BASE <= syms["_start"] < FLASH_END
+
+
+def openocd_flash_command(image, serial):
+    """The OpenOCD command line that programs a flash image into the main flash (erase, write, verify)
+    and starts it from a hardware reset (the vector table at 0x0800_0000 gives sp and _start)."""
+    syms = elf_symbols(image, ("_start",))
+    if "_start" not in syms:
+        raise BoardUnavailable("%s has no _start symbol" % image)
+    if not is_flash_image(syms):
+        raise BoardUnavailable("%s is not a flash image (_start 0x%08x is outside 0x%08x-0x%08x): build it with BOARD_EXEC=flash"
+                               % (image, syms["_start"], FLASH_BASE, FLASH_END - 1))
+    cmd = [require_tool("openocd"), "-f", "interface/stlink.cfg", "-f", "target/stm32l4x.cfg"]
+    if serial:
+        cmd += ["-c", "adapter serial %s" % serial]
+    cmd += ["-c", "init", "-c", "reset halt", "-c", "program %s verify" % image,
+            "-c", "reset halt", "-c", "resume", "-c", "shutdown"]
+    return cmd
+
+
 def openocd_command(image, serial, wall_ms=None):
     """The OpenOCD command line that loads the ELF into RAM and starts it at _start."""
     syms = elf_symbols(image, ("_start", "silica_rt_wall_clock"))
     if "_start" not in syms:
         raise BoardUnavailable("%s has no _start symbol" % image)
+    if is_flash_image(syms):
+        raise BoardUnavailable("%s is a flash image (_start 0x%08x): RAM loading cannot run it; flash is only "
+                               "programmed by hand with --exec flash --yes-wear-flash" % (image, syms["_start"]))
     # A Thumb function symbol carries bit 0; resume takes the instruction address, and the Thumb state is
     # already set by `reset halt` (EPSR.T), so the bit is cleared.
     start = syms["_start"] & ~1
@@ -234,11 +281,17 @@ def capture(port, timeout, send=None, send_delay=1.0):
     return None, None, bytes(buf)
 
 
-def load_and_start(image, serial):
-    """Run OpenOCD: load the ELF into RAM and resume at _start. Returns when OpenOCD has exited."""
-    cmd = openocd_command(image, serial, int(time.time() * 1000))
+def load_and_start(image, serial, exec_mode="ram"):
+    """Run OpenOCD: load the ELF into RAM and resume at _start (or, exec_mode "flash", program it into
+    flash and start it from reset). Returns when OpenOCD has exited."""
+    if exec_mode == "flash":
+        cmd = openocd_flash_command(image, serial)
+        timeout = OPENOCD_FLASH_TIMEOUT
+    else:
+        cmd = openocd_command(image, serial, int(time.time() * 1000))
+        timeout = OPENOCD_TIMEOUT
     try:
-        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=OPENOCD_TIMEOUT)
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise BoardUnavailable("openocd timed out while loading %s" % image)
     if r.returncode != 0:
@@ -247,7 +300,7 @@ def load_and_start(image, serial):
         raise BoardUnavailable("loading the image through OpenOCD failed: %s" % " | ".join(e.strip() for e in errs[:3]))
 
 
-def run_from_ram(port_name, image, timeout, send=None, send_delay=1.0):
+def run_on_board(port_name, image, timeout, send=None, send_delay=1.0, exec_mode="ram"):
     import serial  # pyserial, from the ESP-IDF Python environment
     st_serial, _, _ = probe(os.environ.get("BOARD_ST_SERIAL", "") or DEFAULT_ST_SERIAL)
     try:
@@ -256,7 +309,7 @@ def run_from_ram(port_name, image, timeout, send=None, send_delay=1.0):
         raise BoardUnavailable("cannot open %s: %s" % (port_name, e))
     try:
         port.reset_input_buffer()
-        load_and_start(image, st_serial)
+        load_and_start(image, st_serial, exec_mode)
         return capture(port, timeout, send, send_delay)
     finally:
         port.close()
@@ -279,7 +332,17 @@ def main():
     ap.add_argument("--send-delay", type=float, default=1.0, help="seconds after the start marker before --send is written")
     ap.add_argument("--send-marker", help="with --send: also wait until the output holds this marker (then quiet), as the host harness does")
     ap.add_argument("--send-marker-count", type=int, default=1, help="occurrences of --send-marker to wait for (default 1)")
+    ap.add_argument("--exec", dest="exec_mode", choices=("ram", "flash"), default="ram",
+                    help="ram (default): load into SRAM1; flash: program the main flash (BY HAND ONLY, wears the flash; needs --yes-wear-flash)")
+    ap.add_argument("--yes-wear-flash", action="store_true",
+                    help="with --exec flash: confirm that this run erases and reprograms flash pages")
     a = ap.parse_args()
+    if a.exec_mode == "flash" and not a.yes_wear_flash:
+        sys.stderr.write(FLASH_WEAR_WARNING)
+        sys.stderr.write("run_on_board: refused: --exec flash needs --yes-wear-flash\n")
+        return 2
+    if a.yes_wear_flash and a.exec_mode != "flash":
+        ap.error("--yes-wear-flash is only meaningful with --exec flash")
     global SEND_MARKER, SEND_MARKER_COUNT
     if a.send_marker:
         SEND_MARKER = a.send_marker.encode("utf-8")
@@ -297,7 +360,9 @@ def main():
         if a.print_openocd:
             if not a.image:
                 ap.error("an image is required")
-            print(" ".join("'%s'" % c if " " in c else c for c in openocd_command(a.image, a.expect_serial, int(time.time() * 1000))))
+            cmd = (openocd_flash_command(a.image, a.expect_serial) if a.exec_mode == "flash"
+                   else openocd_command(a.image, a.expect_serial, int(time.time() * 1000)))
+            print(" ".join("'%s'" % c if " " in c else c for c in cmd))
             return 0
         port = pick_port(a.port)
         if a.probe:
@@ -306,7 +371,9 @@ def main():
             return 0
         if not a.image:
             ap.error("an image is required")
-        out, status, diag = run_from_ram(port, a.image, a.timeout, send, a.send_delay)
+        if a.exec_mode == "flash":
+            sys.stderr.write(FLASH_WEAR_WARNING)
+        out, status, diag = run_on_board(port, a.image, a.timeout, send, a.send_delay, a.exec_mode)
     except BoardUnavailable as e:
         sys.stderr.write("run_on_board: %s\n" % e)
         return EXIT_BOARD
