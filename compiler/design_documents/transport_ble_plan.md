@@ -1559,7 +1559,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
       shim's radio start has none of ESP-IDF's wake-up path.
     - Forced to WPA2's exchange alone (`-DWIFI_NO_SAE`) the join fails with reason 1; not looked into.
       A WPA2-only access point is untried.
-    - Nothing is sent: no network stack is in the image. lwIP is next.
+    - Nothing is sent: no network stack is in the image (step 2 below adds lwIP).
     - Both radios in one image; the Wi-Fi tasks on core 1 beside a Silica program.
     - The shim's random numbers are not fit for keys outside a spike.
     - The DMA paths of the AES and SHA hardware stop the program if reached; none was.
@@ -1567,6 +1567,30 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     processor is and who called, from a level-3 timer interrupt; Espressif's ROM ELF
     (`~/.espressif/tools/esp-rom-elfs`) names an address in the ROM. `-DWIFI_LOG` turns on the Wi-Fi
     library's own log, which prints the access point's name.
+
+- **Stage 12, part 6, step 2, 2026-11-15, done: lwIP above the station on route R1. The board takes an
+  address from the access point by DHCP and exchanges the demo's frame with the Mac over TCP, thirty
+  connections of thirty.**
+  - Built: `spike_r1/wifi_net.c`, the least there can be between the station and lwIP, in place of
+    ESP-IDF's own layer (esp_netif): one interface whose frames go out by `esp_wifi_internal_tx` and
+    come in from the station's receive callback, each copied once; DHCP; lwIP's sockets for one TCP
+    exchange. lwIP is the guest build's `liblwip.a` with ESP-IDF's FreeRTOS port, its task one more of
+    the shim's coroutines. `spike_r1/wifi_peer.py` is the Mac's end: it takes one frame behind a 4-byte
+    length (what Erlang's `gen_tcp` `{packet, 4}` speaks) on each connection and sends it back.
+    `run_wifi.sh --tcp [--links <n>]` builds, starts the peer and runs both.
+  - What lwIP asked beyond the shim: a queue in the caller's record and storage whose handle is that
+    record (`xQueueGenericCreateStatic`, now in `hci_shim.c`; lwIP's mailboxes), the tick count, the C
+    library's error number and its table of character classes.
+  - Run, 160 MHz, power saving off, the Mac and the board on one home network:
+
+    | Connections whole, both ends | Address after the join | Each exchange | Most memory given |
+    | --- | --- | --- | --- |
+    | 30 of 30 | 1.5 s | 74 ms mean, 334 ms the longest | 73 KB of 160 KB |
+
+    The frame is the 48 bytes of ETF the Bluetooth demo sends; the Mac printed the same bytes each time.
+  - The image: 53 KB of code and 11 KB of data in RAM, 463 KB of code and 82 KB of constants in flash.
+  - Not done: a Silica program in the image (this is a C main); the peer a Silica program or an Erlang
+    node; the board listening; IPv6; a frame larger than one segment; main busy between its calls.
 
 ## 7. Facts the design rests on
 

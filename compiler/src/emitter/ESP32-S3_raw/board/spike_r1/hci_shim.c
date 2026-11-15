@@ -681,6 +681,7 @@ struct queue {
     uint8_t *items;
     struct co *owner;   // of a mutex taken through the recursive calls
     uint32_t depth;
+    uint32_t given;     // the record and the items' storage are the caller's (the static calls)
 };
 
 static struct queue *queue_new(uint32_t length, uint32_t item, uint32_t count)
@@ -692,8 +693,37 @@ static struct queue *queue_new(uint32_t length, uint32_t item, uint32_t count)
     q->head = 0;
     q->owner = NULL;
     q->depth = 0;
+    q->given = 0;
     q->items = item ? malloc(length * item) : NULL;
     return q;
+}
+
+// A queue in the caller's record and storage: the handle is the record's address, as FreeRTOS's is
+// (its StaticQueue_t is larger than struct queue).
+void *xQueueGenericCreateStatic(uint32_t length, uint32_t item, uint8_t *storage, void *record, uint8_t type)
+{
+    (void)type;
+    struct queue *q = record;
+    q->length = length;
+    q->item = item;
+    q->count = 0;
+    q->head = 0;
+    q->owner = NULL;
+    q->depth = 0;
+    q->given = 1;
+    q->items = storage;
+    return q;
+}
+
+int xQueueGenericGetStaticBuffers(void *handle, uint8_t **storage, void **record)
+{
+    struct queue *q = handle;
+    if (!q->given) {
+        return 0;
+    }
+    *storage = q->items;
+    *record = q;
+    return 1;
 }
 
 void *xQueueGenericCreate(uint32_t length, uint32_t item, uint8_t type)
@@ -716,8 +746,10 @@ void *xQueueCreateMutex(uint8_t type)
 void vQueueDelete(void *handle)
 {
     struct queue *q = handle;
-    free(q->items);
-    free(q);
+    if (!q->given) {
+        free(q->items);
+        free(q);
+    }
 }
 
 uint32_t uxQueueMessagesWaiting(void *q)

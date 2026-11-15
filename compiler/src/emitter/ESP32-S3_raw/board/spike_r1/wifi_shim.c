@@ -155,23 +155,6 @@ uint32_t xEventGroupWaitBits(void *handle, uint32_t bits, int clear, int all, ui
     }
 }
 
-// ---- queues the caller gives the storage for: made as the others are ----
-
-void *xQueueGenericCreateStatic(uint32_t length, uint32_t item, uint8_t *storage, void *record, uint8_t type)
-{
-    (void)storage;
-    (void)record;
-    return xQueueGenericCreate(length, item, type);
-}
-
-int xQueueGenericGetStaticBuffers(void *queue, uint8_t **storage, void **record)
-{
-    (void)queue;
-    *storage = NULL;
-    *record = NULL;
-    return 1;
-}
-
 // ---- the ROM's timers ----
 
 typedef struct ets_timer {
@@ -378,6 +361,29 @@ void *heap_caps_malloc_prefer(size_t n, size_t count, ...) { (void)count; return
 void *heap_caps_aligned_alloc(size_t align, size_t n, uint32_t caps) { (void)align; (void)n; (void)caps; stop("heap_caps_aligned_alloc"); return NULL; }
 void *heap_caps_aligned_calloc(size_t align, size_t count, size_t n, uint32_t caps) { (void)align; (void)count; (void)n; (void)caps; stop("heap_caps_aligned_calloc"); return NULL; }
 size_t esp_get_free_internal_heap_size(void) { return heap_caps_get_free_size(0); }
+
+// The C library's table of character classes: 128 entries for negative indexes (the end-of-file
+// mark among them), then one for each character; none above 127 has a class.
+const char _ctype_b[128 + 256] = {
+    [128] =
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x28, 0x28, 0x28, 0x28, 0x28, 0x20, 0x20,
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    0x88, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+    0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+    0x10, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x10, 0x10, 0x10, 0x10, 0x10,
+    0x10, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+    0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x10, 0x10, 0x10, 0x10, 0x20,
+};
+
+static int error_number;
+int *__errno(void) { return &error_number; }
+
+// lwIP's sockets are used by its own calls, not through ESP-IDF's file descriptors
+int esp_vfs_register_fd_range(const void *vfs, void *ctx, int min_fd, int max_fd) { (void)vfs; (void)ctx; (void)min_fd; (void)max_fd; return 0; }
+
+// ticks are milliseconds
+uint32_t xTaskGetTickCount(void) { return (uint32_t)(spike_ticks() / 16000); }
 
 int puts(const char *s)
 {
