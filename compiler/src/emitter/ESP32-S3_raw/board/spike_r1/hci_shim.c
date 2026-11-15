@@ -23,10 +23,12 @@
 //               SPIKE_INTERRUPT the line is a level-3 one that is enabled, and the runtime's level-3
 //               path (rt_vectors.S) calls the handler when the interrupt comes; what the handler shares
 //               with the rest (the queues, the switch of control) is then done with the level masked.
-//   the task    xTaskCreatePinnedToCore makes one coroutine (spike_co.S). A call that would block polls
-//               the interrupts and passes control to the other line of control until it can go on.
+//   tasks       xTaskCreatePinnedToCore makes a coroutine (spike_co.S): the controller's task, and
+//               NimBLE's when the host is in the image. A call that would block passes control round
+//               the lines of control, main's among them, until it can go on.
 //   queues, semaphores, mutexes   one structure, a ring of items (none for a semaphore).
-//   memory      a block handed out from the front and never taken back.
+//   timers      ESP-IDF's one-shot timers (NimBLE's timeouts), run when a line of control yields.
+//   memory      one block, first fit, freed blocks joined.
 //   the radio   esp_phy_enable is phy_main.c's start.
 //
 // The types are written as their machine forms so that no FreeRTOS header is needed.
@@ -34,6 +36,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <stdarg.h>
 #include "soc/soc.h"
 #include "soc/rtc.h"
 #include "soc/rtc_cntl_reg.h"
@@ -81,6 +84,12 @@ int64_t esp_timer_get_time(void)
 }
 
 // ---- interrupts, polled ----
+
+#ifndef ARENA_KB
+#define ARENA_KB 56
+#endif
+
+void *malloc(size_t n);
 
 #define MAX_IRQ 8
 static struct irq {
@@ -239,69 +248,118 @@ void _frxt_setup_switch(void)
 
 // ---- the two lines of control ----
 
-static uint32_t co_ctx[2][2];
-static uint32_t co_stack[2048] __attribute__((aligned(16)));
-static void (*co_fn)(void *);
-static void *co_arg;
-static int co_have, co_started, co_cur;
+#define MAX_CO 4
+enum { CO_FREE, CO_NEW, CO_LIVE, CO_DEAD };
+static struct co {
+    uint32_t ctx[2];
+    void (*fn)(void *);
+    void *arg;
+    uint32_t *stack_top;
+    int state;
+} cos[MAX_CO] = { { .state = CO_LIVE } };   // 0 is main's
+static int co_cur;
 uint32_t spike_switches;
 
-// Where the controller's task starts: the level was masked for the switch that started it.
-static void co_entry(void *unused)
+static void timers_run(void);
+void spike_yield(void);
+
+// Where a task starts: the level was masked for the switch that started it.
+static void co_entry(void *arg)
 {
-    (void)unused;
+    struct co *c = arg;
 #ifdef SPIKE_INTERRUPT
     __asm__ volatile("rsil a2, 0" : : : "a2");
 #endif
-    co_fn(co_arg);
+    c->fn(c->arg);
+    c->state = CO_DEAD;
     for (;;) {
+        spike_yield();
     }
 }
 
-// Lets the interrupts and the other line of control run once.
+// Lets the interrupts, the timers and the next line of control run once.
 void spike_yield(void)
 {
     spike_poll();
-    if (!co_have || in_handler) {
+    if (in_handler) {
+        return;
+    }
+    timers_run();
+    int next = co_cur;
+    do {
+        next = (next + 1) % MAX_CO;
+    } while (next != co_cur && cos[next].state != CO_NEW && cos[next].state != CO_LIVE);
+    if (next == co_cur) {
         return;
     }
     spike_switches++;
     // no handler runs while the stacks and the register windows change hands
     uint32_t ps = mask_level3();
     int from = co_cur;
-    co_cur = 1 - co_cur;
-    if (!co_started) {
-        co_started = 1;
-        spike_co_start(co_ctx[from], &co_stack[2048 - 16], co_entry, NULL);
+    co_cur = next;
+    if (cos[next].state == CO_NEW) {
+        cos[next].state = CO_LIVE;
+        spike_co_start(cos[from].ctx, cos[next].stack_top, co_entry, &cos[next]);
     } else {
-        spike_co_switch(co_ctx[from], co_ctx[co_cur]);
+        spike_co_switch(cos[from].ctx, cos[next].ctx);
     }
     unmask(ps);
 }
 
 int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack, void *arg, uint32_t prio, void **handle, int core)
 {
-    (void)stack;
     (void)prio;
     (void)core;
     silica_rt_puts("shim: task ");
     silica_rt_puts(name);
     silica_rt_puts("\n");
-    if (co_have) {
-        return 0;
+    for (int i = 1; i < MAX_CO; i++) {
+        if (cos[i].state == CO_FREE || cos[i].state == CO_DEAD) {
+            // twice what FreeRTOS is asked for and 4 KB more: the controller's handler runs on whichever
+            // stack is current, and a switch spills the register windows onto it
+            uint32_t bytes = (2 * (stack < 4096 ? 4096 : stack) + 4096 + 15) & ~15u;
+            uint32_t *base = malloc(bytes);
+            if (base == NULL) {
+                return 0;
+            }
+            cos[i].fn = fn;
+            cos[i].arg = arg;
+            cos[i].stack_top = base + bytes / 4 - 16;
+            cos[i].state = CO_NEW;
+            if (handle) {
+                *handle = &cos[i];
+            }
+            return 1;
+        }
     }
-    co_fn = fn;
-    co_arg = arg;
-    co_have = 1;
-    if (handle) {
-        *handle = co_stack;
-    }
-    return 1;
+    return 0;
 }
 
 void vTaskDelete(void *handle)
 {
-    (void)handle;
+    struct co *c = handle ? handle : &cos[co_cur];
+    c->state = CO_DEAD;
+    while (c == &cos[co_cur]) {
+        spike_yield();
+    }
+}
+
+void *xTaskGetCurrentTaskHandle(void)
+{
+    return &cos[co_cur];
+}
+
+int xTaskGetSchedulerState(void)
+{
+    return 2;   // running
+}
+
+void vTaskDelay(uint32_t ticks)
+{
+    uint64_t start = spike_ticks();
+    do {
+        spike_yield();
+    } while ((spike_ticks() - start) / 16000 < ticks);
 }
 
 void vPortYield(void)
@@ -311,28 +369,70 @@ void vPortYield(void)
 
 // ---- memory ----
 
-static uint8_t arena[56 * 1024] __attribute__((aligned(16)));
-static size_t arena_used;
+// Blocks of 16-byte multiples, each under a 16-byte header, in address order; a freed block is joined
+// to the free blocks after it.
+struct block {
+    uint32_t size;      // with the header
+    uint32_t used;
+    uint32_t pad[2];
+};
+static uint8_t arena[ARENA_KB * 1024] __attribute__((aligned(16)));
+static uint32_t arena_given, arena_most;
+
+static struct block *next_block(struct block *b)
+{
+    return (struct block *)((uint8_t *)b + b->size);
+}
 
 void *malloc(size_t n)
 {
-    n = (n + 15) & ~(size_t)15;
+    uint32_t need = (uint32_t)((n + 15) & ~(size_t)15) + sizeof(struct block);
+    void *p = NULL;
     uint32_t ps = mask_level3();
-    size_t at = arena_used;
-    if (at + n <= sizeof(arena)) {
-        arena_used = at + n;
+    struct block *b = (struct block *)arena, *end = (struct block *)(arena + sizeof(arena));
+    if (b->size == 0) {
+        b->size = sizeof(arena);
+    }
+    for (; b < end; b = next_block(b)) {
+        if (b->used) {
+            continue;
+        }
+        while (next_block(b) < end && !next_block(b)->used) {
+            b->size += next_block(b)->size;
+        }
+        if (b->size >= need) {
+            if (b->size - need >= 2 * sizeof(struct block)) {
+                struct block *rest = (struct block *)((uint8_t *)b + need);
+                rest->size = b->size - need;
+                rest->used = 0;
+                b->size = need;
+            }
+            b->used = 1;
+            arena_given += b->size;
+            if (arena_given > arena_most) {
+                arena_most = arena_given;
+            }
+            p = b + 1;
+            break;
+        }
     }
     unmask(ps);
-    if (at + n > sizeof(arena)) {
+    if (p == NULL) {
         silica_rt_puts("shim: out of memory\n");
-        return NULL;
     }
-    return &arena[at];
+    return p;
 }
 
 void free(void *p)
 {
-    (void)p;
+    if (p == NULL) {
+        return;
+    }
+    uint32_t ps = mask_level3();
+    struct block *b = (struct block *)p - 1;
+    b->used = 0;
+    arena_given -= b->size;
+    unmask(ps);
 }
 
 void *heap_caps_malloc(size_t n, uint32_t caps)
@@ -351,10 +451,39 @@ void *heap_caps_calloc(size_t count, size_t n, uint32_t caps)
     return p;
 }
 
+void *heap_caps_realloc(void *p, size_t n, uint32_t caps)
+{
+    (void)caps;
+    void *q = malloc(n);
+    if (q && p) {
+        size_t had = ((struct block *)p - 1)->size - sizeof(struct block);
+        memcpy(q, p, had < n ? had : n);
+        free(p);
+    }
+    return q;
+}
+
+void heap_caps_free(void *p)
+{
+    free(p);
+}
+
 size_t heap_caps_get_free_size(uint32_t caps)
 {
     (void)caps;
-    return sizeof(arena) - arena_used;
+    return sizeof(arena) - arena_given;
+}
+
+size_t heap_caps_get_largest_free_block(uint32_t caps)
+{
+    (void)caps;
+    return sizeof(arena) - arena_given;
+}
+
+size_t heap_caps_get_minimum_free_size(uint32_t caps)
+{
+    (void)caps;
+    return sizeof(arena) - arena_most;
 }
 
 int heap_caps_add_region(intptr_t start, intptr_t end)
@@ -366,7 +495,7 @@ int heap_caps_add_region(intptr_t start, intptr_t end)
 
 uint32_t spike_arena_used(void)
 {
-    return (uint32_t)arena_used;
+    return arena_most;
 }
 
 // ---- queues, semaphores and mutexes ----
@@ -374,6 +503,8 @@ uint32_t spike_arena_used(void)
 struct queue {
     uint32_t length, item, count, head;
     uint8_t *items;
+    struct co *owner;   // of a mutex taken through the recursive calls
+    uint32_t depth;
 };
 
 static struct queue *queue_new(uint32_t length, uint32_t item, uint32_t count)
@@ -383,6 +514,8 @@ static struct queue *queue_new(uint32_t length, uint32_t item, uint32_t count)
     q->item = item;
     q->count = count;
     q->head = 0;
+    q->owner = NULL;
+    q->depth = 0;
     q->items = item ? malloc(length * item) : NULL;
     return q;
 }
@@ -404,9 +537,42 @@ void *xQueueCreateMutex(uint8_t type)
     return queue_new(1, 0, 1);
 }
 
-void vQueueDelete(void *q)
+void vQueueDelete(void *handle)
 {
-    (void)q;
+    struct queue *q = handle;
+    free(q->items);
+    free(q);
+}
+
+uint32_t uxQueueMessagesWaiting(void *q)
+{
+    return ((struct queue *)q)->count;
+}
+
+uint32_t uxQueueMessagesWaitingFromISR(void *q)
+{
+    return ((struct queue *)q)->count;
+}
+
+uint32_t uxQueueSpacesAvailable(void *q)
+{
+    return ((struct queue *)q)->length - ((struct queue *)q)->count;
+}
+
+int xQueueIsQueueEmptyFromISR(void *q)
+{
+    return ((struct queue *)q)->count == 0;
+}
+
+int xQueueGenericReset(void *handle, int fresh)
+{
+    (void)fresh;
+    struct queue *q = handle;
+    uint32_t ps = mask_level3();
+    q->count = 0;
+    q->head = 0;
+    unmask(ps);
+    return 1;
 }
 
 static int put(struct queue *q, const void *item)
@@ -474,6 +640,34 @@ int xQueueSemaphoreTake(void *q, uint32_t ticks)
     return xQueueReceive(q, NULL, ticks);
 }
 
+int xQueueTakeMutexRecursive(void *handle, uint32_t ticks)
+{
+    struct queue *q = handle;
+    if (q->owner == &cos[co_cur]) {
+        q->depth++;
+        return 1;
+    }
+    if (!xQueueSemaphoreTake(q, ticks)) {
+        return 0;
+    }
+    q->owner = &cos[co_cur];
+    q->depth = 1;
+    return 1;
+}
+
+int xQueueGiveMutexRecursive(void *handle)
+{
+    struct queue *q = handle;
+    if (q->owner != &cos[co_cur]) {
+        return 0;
+    }
+    if (--q->depth == 0) {
+        q->owner = NULL;
+        xQueueGenericSend(q, NULL, 0, 0);
+    }
+    return 1;
+}
+
 int xQueueGenericSendFromISR(void *q, const void *item, int *woken, int position)
 {
     (void)position;
@@ -499,32 +693,87 @@ int xQueueReceiveFromISR(void *q, void *item, int *woken)
     return get(q, item);
 }
 
-// ---- timers: bt.c's one timer wakes the controller from sleep, which is off ----
+// ---- timers: ESP-IDF's one-shot timers, run when a line of control yields ----
+
+#define MAX_TIMERS 32
+static struct timer {
+    void (*callback)(void *);
+    void *arg;
+    uint64_t due;       // in the system timer's ticks
+    int used, active;
+} timers[MAX_TIMERS];
+static int in_timers;
 
 int esp_timer_create(const void *args, void **handle)
 {
-    (void)args;
-    *handle = (void *)1;
-    return 0;
+    // esp_timer_create_args_t begins with the callback and its argument
+    void *const *a = args;
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (!timers[i].used) {
+            timers[i].used = 1;
+            timers[i].active = 0;
+            timers[i].callback = (void (*)(void *))a[0];
+            timers[i].arg = a[1];
+            *handle = &timers[i];
+            return 0;
+        }
+    }
+    return 0x101;
 }
 
 int esp_timer_start_once(void *handle, uint64_t us)
 {
-    (void)handle;
-    (void)us;
+    struct timer *t = handle;
+    if (t->active) {
+        return 0x103;
+    }
+    t->due = spike_ticks() + us * 16;
+    t->active = 1;
     return 0;
 }
 
 int esp_timer_stop(void *handle)
 {
-    (void)handle;
-    return 0x103;
+    struct timer *t = handle;
+    if (!t->active) {
+        return 0x103;
+    }
+    t->active = 0;
+    return 0;
 }
 
 int esp_timer_delete(void *handle)
 {
-    (void)handle;
+    ((struct timer *)handle)->used = 0;
+    ((struct timer *)handle)->active = 0;
     return 0;
+}
+
+int esp_timer_is_active(void *handle)
+{
+    return ((struct timer *)handle)->active;
+}
+
+int esp_timer_get_expiry_time(void *handle, uint64_t *expiry)
+{
+    *expiry = ((struct timer *)handle)->due / 16;
+    return 0;
+}
+
+static void timers_run(void)
+{
+    if (in_timers) {
+        return;
+    }
+    in_timers = 1;
+    uint64_t now = spike_ticks();
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (timers[i].used && timers[i].active && timers[i].due <= now) {
+            timers[i].active = 0;
+            timers[i].callback(timers[i].arg);
+        }
+    }
+    in_timers = 0;
 }
 
 // ---- the chip ----
@@ -550,6 +799,18 @@ uint32_t esp_random(void)
     x ^= x >> 17;
     x ^= x << 5;
     return x;
+}
+
+// The ROM's rand and srand keep their state through the C library's per-task record, which nothing
+// here sets up (ESP-IDF's own C library replaces them): a store through a null pointer.
+int rand(void)
+{
+    return (int)(esp_random() & 0x7FFFFFFF);
+}
+
+void srand(unsigned seed)
+{
+    (void)seed;
 }
 
 uint32_t esp_clk_xtal_freq(void)
@@ -623,14 +884,133 @@ int phy_printf(const char *format, ...)
     return 0;
 }
 
+void phy_i2c_enter_critical(void)
+{
+}
+
+void phy_i2c_exit_critical(void)
+{
+}
+
+// A small formatter: %s %c %d %i %u %x %X %p %%, a width, a zero fill, and the l, ll, h, z lengths.
+static int format_into(char *out, size_t room, const char *f, va_list ap)
+{
+    size_t n = 0;
+#define PUT(ch) do { if (n + 1 < room) out[n] = (ch); n++; } while (0)
+    for (; *f; f++) {
+        if (*f != '%') {
+            PUT(*f);
+            continue;
+        }
+        f++;
+        int zero = 0, width = 0, wide = 0, left = 0;
+        while (*f == '0' || *f == '-' || *f == '+' || *f == ' ' || *f == '#') {
+            zero |= *f == '0';
+            left |= *f == '-';
+            f++;
+        }
+        if (*f == '*') {
+            width = va_arg(ap, int);
+            f++;
+        }
+        while (*f >= '0' && *f <= '9') {
+            width = width * 10 + (*f++ - '0');
+        }
+        if (*f == '.') {
+            f++;
+            if (*f == '*') {
+                (void)va_arg(ap, int);
+                f++;
+            }
+            while (*f >= '0' && *f <= '9') {
+                f++;
+            }
+        }
+        while (*f == 'l' || *f == 'h' || *f == 'z') {
+            wide += *f == 'l';
+            f++;
+        }
+        char digits[24];
+        int count = 0, negative = 0;
+        if (*f == 's') {
+            const char *t = va_arg(ap, const char *);
+            if (t == NULL) {
+                t = "(null)";
+            }
+            int len = (int)strlen(t);
+            for (int i = len; i < width && !left; i++) {
+                PUT(' ');
+            }
+            while (*t) {
+                PUT(*t++);
+            }
+            for (int i = len; i < width && left; i++) {
+                PUT(' ');
+            }
+            continue;
+        } else if (*f == 'c') {
+            PUT((char)va_arg(ap, int));
+            continue;
+        } else if (*f == '%') {
+            PUT('%');
+            continue;
+        } else if (*f == 'd' || *f == 'i') {
+            long long v = wide >= 2 ? va_arg(ap, long long) : va_arg(ap, int);
+            negative = v < 0;
+            unsigned long long u = negative ? 0ull - (unsigned long long)v : (unsigned long long)v;
+            do {
+                digits[count++] = (char)('0' + u % 10);
+                u /= 10;
+            } while (u);
+        } else if (*f == 'u' || *f == 'x' || *f == 'X' || *f == 'p') {
+            unsigned long long u = wide >= 2 ? va_arg(ap, unsigned long long) : va_arg(ap, unsigned);
+            unsigned base = *f == 'u' ? 10 : 16;
+            const char *set = *f == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
+            do {
+                digits[count++] = set[u % base];
+                u /= base;
+            } while (u);
+        } else {
+            if (*f == 0) {
+                break;
+            }
+            continue;
+        }
+        if (negative && zero) {
+            PUT('-');
+        }
+        for (int i = count + negative; i < width; i++) {
+            PUT(zero ? '0' : ' ');
+        }
+        if (negative && !zero) {
+            PUT('-');
+        }
+        while (count) {
+            PUT(digits[--count]);
+        }
+    }
+#undef PUT
+    if (room) {
+        out[n < room ? n : room - 1] = 0;
+    }
+    return (int)n;
+}
+
+int snprintf(char *out, size_t room, const char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    int n = format_into(out, room, format, ap);
+    va_end(ap);
+    return n;
+}
+
 int sprintf(char *out, const char *format, ...)
 {
-    int n = 0;
-    while (format[n] != 0) {
-        out[n] = format[n];
-        n++;
-    }
-    out[n] = 0;
+    va_list ap;
+    va_start(ap, format);
+    int n = format_into(out, 256, format, ap);
+    va_end(ap);
     return n;
 }
 
@@ -685,9 +1065,32 @@ void coex_update_lpclk_interval(void) { }
 void esp_log(uint32_t config, const char *tag, const char *format, ...)
 {
     (void)config;
+    char line[160];
+    va_list ap;
+    va_start(ap, format);
+    format_into(line, sizeof(line), format, ap);
+    va_end(ap);
     silica_rt_puts("log ");
     silica_rt_puts(tag ? tag : "?");
     silica_rt_puts(": ");
-    silica_rt_puts(format);
+    silica_rt_puts(line);
     silica_rt_puts("\n");
+}
+
+void esp_log_level_set(const char *tag, int level)
+{
+    (void)tag;
+    (void)level;
+}
+
+// ---- storage: nothing is kept ----
+
+int nvs_flash_init(void)
+{
+    return 0;
+}
+
+int nvs_flash_erase(void)
+{
+    return 0;
 }

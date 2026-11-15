@@ -1259,6 +1259,50 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Next: NimBLE on the shim (the 21 functions, a second task, timers that fire), then the wrapper under
     a C main: the frame exchanged with the Mac, pairing included.
 
+- **Stage 12, part 4, step 2, 2026-11-14, working but not sound: NimBLE runs on the chip Silica owns and
+  the stage 7 exchange, pairing included, has passed against the Mac. One run in three ended in a fault
+  that is not yet found.**
+  - Built, in `board/spike_r1`:
+    - `hci_shim.c` grown for the host: up to three tasks as coroutines beside main, passed control in
+      turn; ESP-IDF's one-shot timers, run when a line of control yields; a memory block that takes
+      memory back; the further queue calls and the mutex its holder takes twice; `snprintf`; `rand`
+      (the ROM's keeps its state through a record of the C library that nothing here sets up).
+    - `nimble_main.c`: drives the board's own wrapper (`silica_ble_nimble.c`, unchanged) as the radio
+      actor does: the peripheral role of the stage 7 demo. `HCI_TRACE=1` prints every packet between
+      the host and the controller.
+    - `run_nimble.sh`: the image. NimBLE and ESP-IDF's glue come from the guest's cached `libbt.a`.
+      196 KB of code and 23 KB of constants in flash, 73 KB of code in RAM, 146 KB of RAM left with the
+      shim's 112 KB block taken out; the host and the controller used 88 KB of the block.
+  - What ran (the Mac's `run_peer.sh central`; the controller's handler by interrupt):
+    - The host and the controller agreed 6 ms after the start; advertising; the Mac connected and read
+      the service and both characteristics.
+    - Pairing: the Mac's request, the board's answer (no code, Secure Connections, no keys kept), the
+      public keys each way, and the link encrypted about 4 s after the connection. The board's key pair
+      took about 0.8 s to compute at 80 MHz.
+    - The exchange: three segments each way, each confirmed. Board: `frame out 48 bytes, frame in 48
+      bytes: the same`, the Mac ending the link (reason 0x213), status 0. Mac: `frame in 48 bytes`,
+      `accel x=1 y=-2 z=512 at_ms=1000`, `link down :closed`, status 0.
+  - Of three runs with the handler by interrupt: one whole as above; one whole on both ends' evidence,
+    the board then faulting in NimBLE as the link closed; one faulting while advertising, before a
+    central came.
+  - Found and fixed on the way:
+    - A task's stack was sized as FreeRTOS is asked for it. The controller's handler runs on whichever
+      stack is current and a switch spills the register windows there: the stack guard of the runtime
+      reported the overflow. Stacks are now twice the request and 4 KB.
+    - A new line of control's first frame had no caller's record under it. The window overflow path
+      reads "the caller's stack pointer" from 12 bytes under a frame and stores four registers 32 bytes
+      under that; on a fresh stack that was a store to wherever the block's old contents pointed.
+      `spike_co_start` now writes the record.
+    - With the handler polled, the link was lost during the 0.8 s of the key pair: nothing serves the
+      controller while a task computes. This is step 4's rule seen from the host's side, and why the
+      handler is an interrupt.
+  - Not found: what corrupts a return address now and then with the handler by interrupt (an illegal
+    instruction in the ROM with a meaningless caller, once; a null read in NimBLE's event queue, once).
+    The polled runs did not show it. The suspects are the level-3 path's assumptions about the code it
+    interrupts and the fairness of the turn-taking between the tasks.
+  - `stdlib/ble/silica_ble.m`, `silica_ble_nimble.c` and the demo's Mac program are unchanged: the same
+    wrapper and the same peer as on the guest.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

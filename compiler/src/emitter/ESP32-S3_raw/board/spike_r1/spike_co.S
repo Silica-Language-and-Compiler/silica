@@ -38,6 +38,7 @@ spike_co_switch:
     .size   spike_co_switch, . - spike_co_switch
 
 // void spike_co_start(uint32_t save[2], uint32_t *stack_top, void (*fn)(void *), void *arg): fn never returns
+// stack_top has 16 bytes under it and 48 above it that belong to the new stack's block
     .align  4
     .global spike_co_start
     .type   spike_co_start, @function
@@ -46,6 +47,13 @@ spike_co_start:
     call8   xthal_window_spill
     s32i    a0, a2, 0
     s32i    a1, a2, 4
+    // When this frame's window is spilled, the overflow path stores a4 to a7 at 32 to 20 bytes under
+    // "the caller's stack pointer", which it reads from 12 bytes under this frame's. This frame has no
+    // caller on the new stack: name a place 32 bytes above the top, inside the block, so the store
+    // lands at the top's first 16 bytes. Left as found in the block it is a store to anywhere.
+    addi    a8, a3, 32
+    addi    a9, a3, -12
+    s32i    a8, a9, 0
     mov     a1, a3
     mov     a10, a5
     callx8  a4
