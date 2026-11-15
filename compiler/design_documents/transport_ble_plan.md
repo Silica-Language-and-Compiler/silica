@@ -1641,6 +1641,30 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Not done: the board listening; the peer a Silica program or an Erlang node; a link lost in the
     middle (the access point gone, the peer gone); a frame over 1024 bytes; both radios in one image.
 
+- **Stage 12, part 7, 2026-11-15, done: `main` merged into the branch; the board's `(:tcp)` carrier
+  declared as a hosted one is, `carried_on lan: (:tcp) (:wifi, 0);`.**
+  - The merge (`main` at `82d1bb0d99`: transport stage E2, the storage carriers, the Nucleo port, the
+    pin tests). Conflicts where both sides had added rows to one table, both kept: `Carrier.silica`,
+    `Link.silica`, the type checker's link table, the Apple transport pack, the transport design's
+    phase table, the board's skip list and `board_suite.sh`. Twenty-nine Apple goldens that conflicted
+    were taken from `main`; they are stale until the merged Apple compiler records them again (not
+    done: the Apple trial tree has not been run on the merged tree).
+  - Both compilers rebuilt from the merged source, neither published: the Apple one by `main`'s
+    binary, then again from clean by itself; the ESP32-S3 one by that.
+  - On the merged tree, the board: timers, scheduler policy, supervisors, board transport and foreign
+    calls, 396 of 401, the five all assembly goldens gone stale (four by the atoms' numbers, which
+    the two sides' new atoms moved; one by `main`'s behaviour-frame fix under a golden this branch
+    had recorded). Recorded again (`gen_board_ascomp.sh`, which writes a golden only for a trial whose
+    board output matched); board transport and foreign calls then 77 of 77. Both radio demos on route
+    R1, three links of three each.
+  - The pack rows (`emitter/ESP32-S3_raw/transport_pack.silica`): the kind `(:tcp)` and the link
+    `(:wifi, 0)`, the carrier `dangerous_tcp_board_carrier`, spawned as the `(:ble_gatt)` one is. The
+    demo program declares `carried_on lan: (:tcp) (:wifi, 0);` and reads `Carrier@mtu(lan)`; three
+    links of three. A trial for the row: `transport_board_addition/link_wifi_instance_not_provided`
+    (`(:wifi, 1)` is E2412); the two goldens that quote the board's links name the new one.
+  - Not carried over from the hosted carrier yet: the link handed to the carrier as text (the board
+    has one station), `listen:` addresses, and a carrier that ends itself after `(:link_down, :fault)`.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

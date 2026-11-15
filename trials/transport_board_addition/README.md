@@ -17,6 +17,7 @@ bring-up checks that SOFs arrive); nothing needs to read that port.
 | `device_usb_serial_jtag_link_tx` | the same USB-Serial-JTAG program through `carried_on usb: (:serial) (:usb_serial_jtag);` and `spawn_dangerous_carrier(usb, ...)`; same output as `device_usb_serial_jtag_carrier_tx` |
 | `link_uart0_console_reserved` | compile-failure trial (`link_uart0_console_reserved.ESP32-S3_raw.golden_fail`, the board driver's `--fail-one` mode): `carried_on console_line: (:serial) (:uart, 0, 115200);` is E2412 with the console note of links design decision 17 (UART0 is the console) and the list of links this board provides |
 | `link_bluetooth_instance_not_provided` | compile-failure trial: `carried_on phone: (:ble_gatt) (:bluetooth, 1);` is E2412 with the list of links this board provides; the chip has one radio, `(:bluetooth, 0)` (transport_ble_plan.md stage 7) |
+| `link_wifi_instance_not_provided` | compile-failure trial: `carried_on lan: (:tcp) (:wifi, 1);` is E2412 with the list of links this board provides; the chip has one Wi-Fi radio, `(:wifi, 0)` |
 
 ## Goldens and targets
 
