@@ -481,7 +481,9 @@ silica_rt_atom_names:
 
 // Cores the runtime runs on (1 or NCORES_MAX). With 1, core 1 is never started and every actor is
 // pinned to core 0, as before core 1 ran.
+#ifndef NCORES_RUN        // the image builder may set it (BOARD_ASFLAGS=-DNCORES_RUN=1)
 #define NCORES_RUN       2
+#endif
 
 // The emitted code's per-core register block (rt_start.S silica_rt_core_regs, the same offsets):
 // the auxiliary stack pointer (shared/xt_vr.silica vr_vsp_off), the limits emitted code compares
@@ -1401,17 +1403,14 @@ silica_rt_wake:
 silica_rt_ctx_switch:
     entry   a1, 32
     call8   silica_rt_console_release_if_mine   // a context leaving mid-line gives the console up
-#ifdef SILICA_GUEST
-    // Guest of ESP-IDF: interrupts are on. While the spill has the window rotated, a1 is some other
-    // frame's register, and an interrupt would put its frame wherever that points: none is let in
-    // until the window is back (the overflow exceptions the spill relies on are not interrupts).
+    // Interrupts may be on: ESP-IDF's in a guest image, a level-3 handler of foreign code on bare
+    // metal (rt_vectors.S). While the spill has the window rotated, a1 is some other frame's
+    // register, and an interrupt would put its frame wherever that points: none is let in until the
+    // window is back (the overflow exceptions the spill relies on are not interrupts).
     rsil    a4, 3
     SPILL_ALL_WINDOWS
     wsr     a4, ps
     rsync
-#else
-    SPILL_ALL_WINDOWS
-#endif
     s32i    a0, a2, ACB_CTX_A0
     s32i    a1, a2, ACB_CTX_A1
     rur     a4, threadptr               // this core's register block: the emitter's SP lives there
@@ -3366,12 +3365,22 @@ silica_rt_spawn_common:
     addi    a5, a3, -4
     l32i    a5, a5, 0
 #else
-    movi    a8, 0x40378000
+    // Bare metal: the code is in RAM, read through the data-bus alias, or in flash when the image
+    // was built with code there (tools/flash_layout.py), read where it is, as in a guest.
+    movi    a8, 0x42000000
+    bltu    a3, a8, 60f
+    movi    a8, 0x44000000
+    bgeu    a3, a8, 63f
+    addi    a5, a3, -4
+    l32i    a5, a5, 0
+    j       61f
+60: movi    a8, 0x40378000
     bltu    a3, a8, 63f
     movi    a8, _silica_iram_dram_offset
     sub     a5, a3, a8
     addi    a5, a5, -4
     l32i    a5, a5, 0
+61:
 #endif
     srli    a6, a5, 4
     movi    a8, 0x5C1AC0F

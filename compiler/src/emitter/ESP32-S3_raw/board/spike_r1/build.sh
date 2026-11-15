@@ -90,7 +90,7 @@ done
 ld="$ld -Wl,-T,$IDF_PATH/components/esp_hal_regi2c/esp32s3/rom.regi2c.ld"
 # the addresses of the chip's peripheral register blocks
 ld="$ld -Wl,-T,$IDF_PATH/components/soc/esp32s3/ld/esp32s3.peripherals.ld"
-# the runtime's number for a record no unit of this image declares
-ld="$ld -Wl,--defsym,silica_registry_shape_exit_report=0"
+# the runtime's number for a record no unit of this image declares, when no compiled Silica code is in it
+case " $sources " in *.sams\ *) ;; *) ld="$ld -Wl,--defsym,silica_registry_shape_exit_report=0" ;; esac
 # shellcheck disable=SC2086
 BOARD_LDFLAGS="$ld ${SPIKE_LDFLAGS:-}" sh "$BOARD/tools/build_image.sh" -o "$out" $sources "$HERE/spike_support.c"

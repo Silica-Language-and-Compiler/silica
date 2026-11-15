@@ -16,6 +16,7 @@
 """Code and constants that run from flash, for a bare-metal image (transport_ble_plan.md stage 12).
 
     flash_layout.py script <silica_esp32s3.ld> <out.ld> <file pattern>...
+    flash_layout.py ram <linked.elf> <ram.elf>
     flash_layout.py merge <ram.bin> <rodata.bin> <text.bin> <out.bin>
 
 script: writes a copy of the runtime's linker script in which the code (.literal, .text) and the
@@ -24,10 +25,15 @@ placed at the addresses the flash is mapped to, with every section named .flash.
 .flash.rodata*. Everything else stays in RAM as before: data, .bss, and code a file marks for RAM
 (.iram1). The script defines _silica_flash_{text,rodata}_{start,end} and _silica_flash_{text,rodata}_offset.
 
+ram: writes a copy of the linked ELF in which the two flash sections are marked as holding no bytes
+(as .bss is), so the image tool builds the part the ROM loads into RAM from the rest. The sections
+stay: the function-name records in RAM are linked to the code they name.
+
 merge: writes the flash image: the RAM part the ROM loads at offset 0, then the constants and the
 code at the offsets below, each on a 64 KB page boundary, where the program maps them at its start.
 """
 
+import struct
 import sys
 
 RODATA_OFFSET = 0x80000     # 512 KB for the RAM part before it
@@ -88,6 +94,26 @@ def script(src, out, patterns):
     open(out, 'w').write(text)
 
 
+def ram(src, out):
+    elf = bytearray(open(src, 'rb').read())
+    if elf[:6] != b'\x7fELF\x01\x01':
+        sys.exit('flash_layout: %s is not a 32-bit little-endian ELF' % src)
+    shoff, = struct.unpack_from('<I', elf, 32)
+    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', elf, 46)
+    names_at, = struct.unpack_from('<I', elf, shoff + shstrndx * shentsize + 16)
+    found = 0
+    for i in range(shnum):
+        at = shoff + i * shentsize
+        name_off, = struct.unpack_from('<I', elf, at)
+        name = bytes(elf[names_at + name_off:elf.index(b'\0', names_at + name_off)]).decode()
+        if name in ('.flash.text', '.flash.rodata'):
+            struct.pack_into('<I', elf, at + 4, 8)      # SHT_NOBITS
+            found += 1
+    if found != 2:
+        sys.exit('flash_layout: %s has %d of the two flash sections' % (src, found))
+    open(out, 'wb').write(elf)
+
+
 def merge(ram, rodata, code, out):
     parts = [(0, open(ram, 'rb').read()), (RODATA_OFFSET, open(rodata, 'rb').read()), (TEXT_OFFSET, open(code, 'rb').read())]
     if len(parts[0][1]) > RODATA_OFFSET:
@@ -104,6 +130,8 @@ def merge(ram, rodata, code, out):
 if __name__ == '__main__':
     if len(sys.argv) >= 5 and sys.argv[1] == 'script':
         script(sys.argv[2], sys.argv[3], sys.argv[4:])
+    elif len(sys.argv) == 4 and sys.argv[1] == 'ram':
+        ram(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 6 and sys.argv[1] == 'merge':
         merge(*sys.argv[2:])
     else:

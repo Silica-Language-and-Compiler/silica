@@ -242,7 +242,14 @@ silica_rt_start_windowed:
     call8   silica_rt_actors_start_cores
     call8   silica_rt_console_rx_drain   // standard input starts empty: nothing the loader left counts
     call8   silica_rt_wall_clock_start   // the timer reading the loader's Unix time stands for (rt_actors.S)
-    movi    a10, silica_rt_start_marker
+    // An image with code in flash (tools/flash_layout.py) links a function that maps it, and main
+    // may be such code: it is called here, before anything of the program runs. No such function,
+    // no call.
+    .weak   silica_rt_board_prepare
+    movi    a8, silica_rt_board_prepare
+    beqz    a8, 4f
+    callx8  a8
+4:  movi    a10, silica_rt_start_marker
     call8   silica_rt_puts
     call8   silica_rt_console_release_if_mine   // the marker has no newline: drop the line hold
     movi    a2, silica_rt_console_last  // and the marker is framing, not program output: main

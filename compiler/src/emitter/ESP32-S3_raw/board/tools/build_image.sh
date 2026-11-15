@@ -26,6 +26,9 @@
 # Sources are .S/.s hand-written assembly, .sams emitted by an ESP32-S3_raw silica-compiler, .c files
 # (foreign-call wrappers, spec §20.4: compiled freestanding by the same toolchain's GCC, no C library
 # in the image beyond the memory functions of board/runtime/rt_ffi.S; BOARD_CFLAGS adds flags,
+# BOARD_ASFLAGS adds flags for the runtime's and the sources' assembly (-DNCORES_RUN=1: one core);
+# BOARD_STACK_ALLOWANCE=N keeps N more bytes above every stack's guard band, for an interrupt handler
+# of foreign code (rt_vectors.S);
 # BOARD_LDFLAGS adds link options, such as further linker scripts; BOARD_FLASH_FILES names files
 # whose code and constants run from flash: tools/flash_layout.py, and the program maps them), and
 # prebuilt .o objects and .a archives for this triple (an archive built with xtensa-esp32s3-elf-ar
@@ -82,7 +85,7 @@ fi
 # --longcalls: CALL8 reaches +-512 KB, relaxed to L32R+CALLX8 when a target is further away.
 # --auto-litpools is NOT used: literals go to .literal sections, which the link script puts in
 # front of .text (L32R only reaches backwards, 256 KB).
-ASFLAGS="-c -mlongcalls"
+ASFLAGS="-c -mlongcalls ${BOARD_ASFLAGS:-}"
 # C wrappers: freestanding (no C library is linked; rt_ffi.S provides memcpy/memmove/memset/memcmp/
 # strlen), one section per function so --gc-sections keeps only what the program calls, literals in
 # .literal sections as for the runtime. A wrapper's own directory is on the include path.
@@ -164,6 +167,8 @@ machine=$(printf '%s\n' "$bound" | sed -n 's/^machine //p')
 aux=$(printf '%s\n' "$bound" | sed -n 's/^aux //p')
 rt_depth=$(printf '%s\n' "$bound" | sed -n 's/^rt_depth //p')
 [ "$rt_depth" -lt 64 ] && rt_depth=64        # the overflow handlers' own two frames
+# room on every stack for an interrupt handler of foreign code, which runs on the stack it interrupts
+rt_depth=$(( rt_depth + ${BOARD_STACK_ALLOWANCE:-0} ))
 size_with_margin() {                         # bound -> bound + max(bound/4, 128) + guard 64, up to 64
     m=$(( $1 / 4 )); [ "$m" -lt 128 ] && m=128
     echo $(( ( $1 + m + 64 + 63 ) / 64 * 64 ))
@@ -199,7 +204,7 @@ if [ -n "${BOARD_FLASH_FILES:-}" ]; then
     OBJCOPY="$XTENSA_BIN/xtensa-esp32s3-elf-objcopy"
     "$OBJCOPY" -O binary -j .flash.text "$out.elf" "$out.flash_text.bin"
     "$OBJCOPY" -O binary -j .flash.rodata "$out.elf" "$out.flash_rodata.bin"
-    "$OBJCOPY" --remove-section .flash.text --remove-section .flash.rodata "$out.elf" "$out.ram.elf"
+    "${BOARD_PYTHON:-python3}" "$HERE/flash_layout.py" ram "$out.elf" "$out.ram.elf"
     "$ESPTOOL" --chip esp32s3 elf2image --flash-mode dio --flash-freq 80m --flash-size 2MB \
         -o "$out.ram.bin" "$out.ram.elf" >/dev/null
     "${BOARD_PYTHON:-python3}" "$HERE/flash_layout.py" merge "$out.ram.bin" "$out.flash_rodata.bin" "$out.flash_text.bin" "$out.bin"

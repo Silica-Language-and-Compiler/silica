@@ -1333,6 +1333,46 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     controller (stack room for the handler, the level masked where the runtime switches stacks, Silica's
     code in flash).
 
+- **Stage 12, part 5, step 1, 2026-11-14, done: a Silica program with its actors runs on route R1. The
+  stage 8 demo's board program, compiled as for the guest, exchanged the frame and the LED command with
+  the Mac over an encrypted link, three runs of three. A program whose actors take long turns starves the
+  Bluetooth tasks: the next step is theirs.**
+  - Changed in the bare-metal runtime (`board/runtime`):
+    - `rt_start.S`: before main, the start calls `silica_rt_board_prepare` when an image links one. It
+      maps the flash, where main itself may now be.
+    - `rt_actors.S`: the switch between actors masks level 3 while it spills the register windows, as
+      it did in a guest only; the word before a behaviour is read from flash when the code is there;
+      `NCORES_RUN` may be set by the builder.
+    - `tools/build_image.sh`: `BOARD_ASFLAGS` (here `-DNCORES_RUN=1`) and `BOARD_STACK_ALLOWANCE` (here
+      2,048 bytes kept above every stack's guard band for the handler); `tools/flash_layout.py ram`,
+      since the function-name records in RAM are linked to code that is now in flash.
+  - Built, in `board/spike_r1`:
+    - `r1_port.c`: `silica_rt_board_prepare` (the flash mapped, the clocks up), and the radio actor's
+      poll of the wrapper (`silica_nimble_event`, linked through here) gives the controller's and
+      NimBLE's tasks and the timers their turns, on the stack of the actor's foreign call.
+    - `run_r1_peer.sh [--accel]`: the image. The program's own compiled code runs from flash with the
+      Bluetooth libraries': 383 KB of code and 55 KB of constants in flash, 74 KB of code in RAM, and
+      84 KB in all loaded by the ROM. One core.
+  - Run, `--accel` (the stage 8 program; the Mac's `dangerous_ble_mac_led`), three of three:
+    - Board: `link up mtu:253`, `tx credit 8`, `sent 48 bytes`, `led red on`, `link down :closed`, 0.
+    - Mac: `link up mtu:253`, `frame 48 bytes`, `accel x=1 y=-2 z=512 at_ms=1000`, `sent 35 bytes`,
+      `link down :closed`, 0.
+    - The same lines as stage 8's on the guest.
+  - The stage 7 program (`dangerous_ble_board_peer`, two actors kept busy without pause) does not make a
+    link on this image. The host and the controller agree and advertising starts, but the radio actor's
+    polls come 1.35 s apart, not 20 ms: the two busy actors share the one core, and an actor's turn is
+    not cut short. The Bluetooth tasks run only at those polls, and step 4 gave them 100 ms.
+  - What it means: with the tasks' turns given by an actor, their service is as slow as the slowest
+    actor's turn. A guest does not have this: FreeRTOS takes the core from an actor for them. The ways
+    out, to choose between:
+    - The second core for the Bluetooth tasks alone: the controller's handler and both tasks on core 1,
+      served without pause; actors on core 0, the wrapper's calls crossing cores (the shim's queues and
+      mutexes made safe for two cores). No actor is ever interrupted by a task. A program that uses the
+      radio has one core for its actors.
+    - A timer's interrupt that runs the tasks on their own stacks from the handler's level: the tasks
+      take the core from an actor, as in a guest. Both cores stay for actors. It is pre-emption by
+      foreign tasks, the thing R1 set out to avoid.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
