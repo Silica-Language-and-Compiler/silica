@@ -25,7 +25,8 @@
 #
 # Sources are .S/.s hand-written assembly, .sams emitted by an ESP32-S3_raw silica-compiler, .c files
 # (foreign-call wrappers, spec §20.4: compiled freestanding by the same toolchain's GCC, no C library
-# in the image beyond the memory functions of board/runtime/rt_ffi.S; BOARD_CFLAGS adds flags), and
+# in the image beyond the memory functions of board/runtime/rt_ffi.S; BOARD_CFLAGS adds flags,
+# BOARD_LDFLAGS adds link options, such as further linker scripts), and
 # prebuilt .o objects and .a archives for this triple (an archive built with xtensa-esp32s3-elf-ar
 # rcs; archives are placed after every object on the link line). BOARD_FFI_STACK=N sets the machine
 # stack a foreign call runs on (the link's _silica_ffi_stack_size; 4 KB when unset).
@@ -135,8 +136,8 @@ for src in "$@"; do
 done
 
 link() {   # the --defsym options must precede -T: the script tests DEFINED() on them
-    "$CC" -nostdlib -nostartfiles -Wl,--gc-sections $ffi_defsym "$@" -Wl,-T,"$RT/silica_esp32s3.ld" \
-        -Wl,-Map,"$out.map" -o "$out.elf" $objs $libs -lgcc
+    "$CC" -nostdlib -nostartfiles -Wl,--gc-sections $ffi_defsym "$@" ${BOARD_LDFLAGS:-} -Wl,-T,"$RT/silica_esp32s3.ld" \
+        -Wl,-Map,"$out.map" -o "$out.elf" $objs -Wl,--start-group $libs -lgcc -Wl,--end-group
 }
 
 # Pass 1: small main stacks, only to measure. Pass 2: main's stacks and the runtime reserve from

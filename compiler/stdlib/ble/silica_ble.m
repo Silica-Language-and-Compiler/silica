@@ -94,6 +94,7 @@ static silica_ble_tagged down(void) { silica_ble_tagged r = {3, 0, 0}; return r;
 @property NSInteger writesPending;
 @property BOOL writeFailed;
 @property BOOL canUpdate;
+@property int subscribeTries;
 @property(strong) NSMutableArray<NSData *> *inbox;
 @property(strong) CBUUID *serviceUUID;
 @property(strong) CBUUID *rxUUID;
@@ -186,11 +187,30 @@ static void trace(NSString *what) {
     if (rx == nil || tx == nil) { [self setPhaseAndSignal:PHASE_FAULT]; return; }
     self.peerRx = rx;
     self.peerWriteType = (rx.properties & CBCharacteristicPropertyWrite) ? CBCharacteristicWriteWithResponse : CBCharacteristicWriteWithoutResponse;
+    self.subscribeTries = 0;
     [peripheral setNotifyValue:YES forCharacteristic:tx];
 }
 
 - (void)peripheral:(CBPeripheral *)peripheral didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic error:(NSError *)error {
-    if (error != nil) { trace([NSString stringWithFormat:@"subscribe failed, error %@", error]); [self setPhaseAndSignal:PHASE_FAULT]; return; }
+    if (error != nil) {
+        trace([NSString stringWithFormat:@"subscribe failed, error %@", error]);
+        /* A peripheral that requires an encrypted link refuses the subscription until the pairing it
+           asked for at the connection is done. The subscription can arrive first: it is tried again,
+           up to ten times at half a second. */
+        BOOL wantsSecurity = [error.domain isEqualToString:CBATTErrorDomain]
+            && (error.code == CBATTErrorInsufficientEncryption || error.code == CBATTErrorInsufficientAuthentication);
+        if (wantsSecurity && self.subscribeTries < 10 && self.phase != PHASE_FAULT) {
+            self.subscribeTries += 1;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_SEC / 2)), self.queue, ^{
+                if (self.peer == peripheral && peripheral.state == CBPeripheralStateConnected) {
+                    [peripheral setNotifyValue:YES forCharacteristic:characteristic];
+                }
+            });
+            return;
+        }
+        [self setPhaseAndSignal:PHASE_FAULT];
+        return;
+    }
     if (!characteristic.isNotifying || self.peerRx == nil) return;
     [self.cond lock];
     self.mtu = (NSInteger)[peripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse];

@@ -1002,6 +1002,119 @@ Each stage's result is recorded here when it closes: date, what was built, trial
       on a chip Silica owns (the closed `register_chipv7_phy` returning), then the timing measurement on the
       guest.
 
+- **Stage 12, part 2, 2026-11-14, decided: the spike goes ahead, as an experiment on the branch
+  `ble-r1-spike` (Matt Manley).**
+
+- **Stage 12, part 3, step 1, 2026-11-14, done: on a chip the bare-metal runtime owns, the clocks reach what
+  the radio needs and Espressif's closed radio start returns, four runs of four. Nothing was on the air.**
+  - Built, in `board/spike_r1`:
+    - `build.sh`: a bare-metal image from one C file, compiled by ESP-IDF's own command for its bootloader
+      (no FreeRTOS), linked with the runtime, the archives named, and ESP-IDF's linker scripts for the ROM's
+      symbols and the peripherals' addresses. It reads the guest's cached ESP-IDF build.
+    - `clocks_main.c` (step 1a): ESP-IDF's `rtc_clk_init`, from its bootloader's library.
+    - `phy_main.c` (step 1b): the clocks, the modem's power domain and clocks by their registers, then
+      `register_chipv7_phy` from `libphy.a` with the default init data and a full calibration.
+    - `spike_support.c`: `abort`, the assertion and the log's time, answered on the bare-metal runtime.
+  - Results:
+    - Step 1a: `before: cpu 40 MHz, source 0` (the crystal), `after: cpu 80 MHz, source 1` (the PLL), bus
+      80 MHz, and the runtime ran on to its normal end.
+    - Step 1b: `register_chipv7_phy: answered 1 after 32 ms` (29 to 35 ms over four runs; 1 is the library's
+      "calibration data made anew"), the calibration table filled, status 0. The same with ESP-IDF's
+      `rtc_init` (the chip's analog settings) run first.
+    - The image: 60 KB of code with the radio library in it, 30 KB without.
+  - Learned:
+    - The console is untouched by the clock change: the ROM clocks UART0 from the crystal, not the bus. The
+      system timer is the crystal's too.
+    - The radio library's needs of its host were four functions: two for a critical section (interrupts
+      are masked already), a print, and `sprintf`.
+    - ESP-IDF's code names sections of its own for RAM (`.iram1`, `.dram1`). The bare-metal linker script
+      did not place them, and they landed on the instruction bus at the addresses the data takes on the
+      data bus: text read as garbage and the program stopped. The script now places them.
+  - Changed outside the spike's directory: `runtime/silica_esp32s3.ld` (those sections) and
+    `tools/build_image.sh` (`BOARD_LDFLAGS`, further link options; archives linked as one group).
+    `silica_09_lists` builds and matches with both.
+  - Found, not from this work: the assembly apps (`asm_00_hello`) no longer link. The runtime names
+    `silica_registry_shape_exit_report`, which only compiled Silica code defines.
+  - Not shown: that the radio works. The call returned and filled its table; no packet was sent or heard.
+
+- **Stage 12, part 3, step 2, 2026-11-14, done: the controller may be kept waiting 100 ms at a time, its
+  interrupt handlers included, and the link holds. R1 need not interrupt an actor.**
+  - Built: `board/spike_r1/guest_hold.c`, added to the guest image of the stage 7 demo
+    (`run_board_peer.sh`, `BOARD_EXTRA_SOURCES`). A task on the controller's core, above the controller's
+    own, keeps the core for a set time at a set period: by running (the controller's task and the host's
+    wait; the handlers run), or with interrupts masked up to level 3 (the handlers wait too).
+  - Each run: Mac central, board peripheral, four exchanges each on a link of its own, pairing included.
+
+    | Held | For | Every | Links | Mac's time |
+    | --- | --- | --- | --- | --- |
+    | nothing | | | 8 of 8 | |
+    | the task | 20 ms | 200 ms | 4 of 4 | 42 s |
+    | the task | 100 ms | 200 ms | 4 of 4 | 48 s |
+    | the task | 500 ms | 1 s | 4 of 4 | 46 s |
+    | the handlers too | 1 ms | 200 ms | 4 of 4 | 40 s |
+    | the handlers too | 5 ms | 200 ms | 4 of 4 | 39 s |
+    | the handlers too | 20 ms | 200 ms | 4 of 4, at the second run | 39 s |
+    | the handlers too | 100 ms | 200 ms | 4 of 4 | 101 s |
+
+  - The hold was in every held image: ESP-IDF's heap at the start was 2,156 bytes less, its task's stack.
+  - The 20 ms run failed once at its first link, as a run with nothing held also did: the Mac's subscription
+    was refused for want of encryption (below). It is not counted against the hold.
+  - What it means: the radio's timing is kept by the hardware, which the controller programs ahead; its
+    handlers and its task tidy up after. So on a chip Silica owns the controller's interrupts can be polled
+    between actors' turns, and its task run as one more turn, while turns stay under some tens of
+    milliseconds. Slower service costs speed (the 101 s), not the link.
+  - Limits of the measurement: one peer (a Mac, at the connection timing it chooses), four links a run, a
+    48-byte frame. A link held up for long, heavy traffic, and the board as central were not run.
+  - Found on the way, in stage 10's work: with a Mac as central and a board as peripheral, the Mac's
+    subscription can reach the board before the pairing the board asked for is done. The board refuses it
+    ("encryption is insufficient") and the Mac's wrapper took that for a fault: one link of the first
+    two-link run. `silica_ble.m` now asks again, up to ten times at half a second. The refusal has not come
+    since in a run that could show the retry working; one later run had the board end the link after the
+    refusal, which the retry does not cover.
+
+- **Stage 12, part 3, step 3, 2026-11-14, done, and the spike's aim met: on a chip the bare-metal runtime
+  owns, with every interrupt disabled, Espressif's controller answers HCI commands and advertises, and the
+  Mac hears it.**
+  - Built, in `board/spike_r1`:
+    - `hci_shim.c`: the 66 functions ESP-IDF's glue (`bt.c`) asks of FreeRTOS and of ESP-IDF, on the
+      bare-metal runtime. The glue itself is linked as the guest's cached build compiled it, unchanged.
+      - Interrupts: `esp_intr_alloc` routes the source to a CPU interrupt line that stays disabled; a poll
+        reads the line's pending bit and calls the handler in ordinary context.
+      - The controller's task: one coroutine. A call that would block polls the interrupts and passes
+        control to the other line of control until it can go on.
+      - Queues, semaphores and mutexes: one structure. Memory: a block handed out from the front.
+      - Sleep's timer never fires; coexistence answers 0; the radio's start is step 1's.
+    - `spike_co.S`: the switch between the two lines of control, 20 instructions: spill the register
+      windows (Cadence's `xthal_window_spill`), exchange the return address and the stack pointer, return.
+    - `hci_main.c` and `run_hci.sh`: the test and its build.
+  - Run (`run_hci.sh`, loaded into RAM, status 0):
+    - `controller init: 0`, `controller enable: 0`; the controller made one task (`btController`) and took
+      one interrupt (source 8, the Bluetooth link layer's).
+    - HCI Reset answered `04 0E 04 05 03 0C 00`, command complete with status 0. Read Address answered the
+      board's address.
+    - Advertising parameters, data and enable each answered with status 0. For 30 s the chip advertised
+      the Nordic UART Service as "R1" every 100 ms; the Mac's `find_service.sh` heard it in 7 of 7
+      five-second windows (7 to 13 advertisements in each, signal -45 to -55). The poll called the
+      controller's handler 572 times in the 30 s.
+  - The image: 154 KB of code and 15 KB of constants in RAM (the guest keeps code in flash; a bare-metal
+    image is loaded whole into RAM), and the controller took 27 KB of memory. With main's stacks at 36 KB
+    the heap had 107 KB.
+  - Learned:
+    - Bluetooth's clock bits are off after the ROM. ESP-IDF's start-up sets every modem clock bit once
+      (`esp_perip_clk_init`), and its own mask for Bluetooth is empty. Without them the controller stops
+      at an assertion in its exchange-memory check (`emi.c 164`).
+    - `build_image.sh` could not bound main's stacks through ESP-IDF's code and gave it 192 KB; the image
+      sets them.
+  - Not shown:
+    - A connection. Advertising is the least of the radio's timing; a link's events come every few tens of
+      milliseconds for as long as it is up.
+    - The controller beside Silica's actors. Main alone ran here, polling without pause (6.8 million
+      passes in the run). Step 2 says a poll every few tens of milliseconds is enough.
+    - Both cores, a host above the controller (NimBLE, or the carrier), and the image's code in flash.
+  - What stands between this and a build: the poll made a turn of the scheduler; the coroutine made the
+    runtime's (a task that is run when its semaphore is given); NimBLE on the same shim or a host in Silica
+    (§2.4); and room for the code, 154 KB of the 399 KB a RAM-loaded image has.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

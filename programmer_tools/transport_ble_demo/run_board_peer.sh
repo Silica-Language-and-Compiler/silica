@@ -12,6 +12,7 @@
 # long after the exchange.
 # --central: the board scans for a peripheral offering the service and connects to it (the plan's stage
 # 9); the peripheral is then the Mac (./run_peer.sh peripheral [uuid], started first).
+# BOARD_EXTRA_SOURCES=<files> adds C sources to the image, compiled with BOARD_CFLAGS.
 # uuid is the service's UUID (4, 8 or 36 characters); without it the service is the Nordic UART
 # Service. --timeout (default 300) bounds the wait for the central. GUEST_RAM=<bytes> sets Silica's
 # block (the guest's README).
@@ -65,6 +66,6 @@ sed -n 's/^ *symbol: "\(.*\)"$/long long \1(void) { return 0; }/p' "$ROOT/compil
 for i in $(seq 1 12); do "$CC" > ../compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
 [ "$ec" -eq 0 ] || { echo "run_board_peer: compile failed; see $WORK/compile.log"; grep -A8 "Compilation error" ../compile.log | head -14; exit 1; }
 
-BOARD_PYTHON="$PY" sh "$GUEST/tools/build_image.sh" -o "$WORK/image/board_peer" ./*.sams "$ROOT/compiler/stdlib/ble/silica_ble_nimble.c" || exit 1
+BOARD_PYTHON="$PY" sh "$GUEST/tools/build_image.sh" -o "$WORK/image/board_peer" ./*.sams "$ROOT/compiler/stdlib/ble/silica_ble_nimble.c" ${BOARD_EXTRA_SOURCES:-} || exit 1
 [ "$BUILD_ONLY" = 1 ] && exit 0
 "$PY" "$GUEST/tools/run_on_board.py" --timeout "$TIMEOUT" "$WORK/image/board_peer.bin"

@@ -86,6 +86,10 @@ SECTIONS
     . = 0x400;
     *(.*Vector.literal)
     *(.literal .literal.* .text .text.*)
+    /* ESP-IDF's names for code and data it wants in RAM (IRAM_ATTR, DRAM_ATTR), for foreign code built
+       from its sources. Left unplaced they would follow this section on the instruction bus, at the
+       addresses the data sections take on the data bus. */
+    *(.iram1 .iram1.*)
     . = ALIGN(16);
     _silica_iram_end = ABSOLUTE(.);
   } > iram
@@ -110,6 +114,7 @@ SECTIONS
   {
     _silica_data_start = ABSOLUTE(.);
     *(.data .data.* .sdata .sdata.*)
+    *(.dram1 .dram1.*)
     . = ALIGN(8);
     _silica_data_end = ABSOLUTE(.);
   } > dram
