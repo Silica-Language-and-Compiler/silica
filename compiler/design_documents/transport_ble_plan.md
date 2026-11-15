@@ -1424,6 +1424,27 @@ Each stage's result is recorded here when it closes: date, what was built, trial
       closed by one end the moment it has what it wants can cost the other end its last confirmation;
       not looked into further.
 
+- **Stage 12, part 5, step 3, 2026-11-14: a trace of the packets is in the two-core image, and the
+  pairing fault did not come in eight runs with it on. What a good link's pairing looks like is now on
+  record; the fault is still not explained.**
+  - Built: `hci_shim.c` with `R1_HCI_TRACE` (`HCI_TRACE=1 ./run_r1_peer.sh`): every packet between NimBLE
+    and the controller while a link is up, printed by the Bluetooth core.
+  - Run: the stage 7 program, one link a run, eight runs, each from a fresh start of the board: eight of
+    eight whole on both ends.
+  - A good link, from the trace (times from the connection):
+    - The board's security request at once. The Mac reads the services meanwhile.
+    - About 0.8 s: the Mac's pairing request and the board's answer (Secure Connections, no bonding).
+    - About 1 s: the Mac's subscription. The board refuses it with "authentication is insufficient".
+    - About 3 s: the Mac's public key; the board's a second later (its key pair takes that long at
+      80 MHz); the confirm, random and check values within 0.2 s.
+    - About 4.2 s: the Mac starts encryption, the board gives the key, the link is encrypted.
+    - The Mac then makes the subscription again by itself, it is accepted, and the segments follow.
+  - So the refusal a good link gets is the other one, "authentication is insufficient", and macOS
+    answers it by waiting for the pairing and asking again. The fault's refusal, "encryption is
+    insufficient", was not seen on the wire here. Whether the board ever sends it is the open point.
+  - When the fault has come (five times in all, on both routes): after another link to the same Mac,
+    in the same start of the board or a start before. A run that follows a failed one has always passed.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

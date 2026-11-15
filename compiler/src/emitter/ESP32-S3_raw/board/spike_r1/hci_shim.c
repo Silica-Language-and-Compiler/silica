@@ -1217,6 +1217,105 @@ int nvs_flash_erase(void)
     return 0;
 }
 
+// ---- a trace of the packets between the host and the controller ----
+
+#ifdef R1_HCI_TRACE
+// Built with R1_HCI_TRACE, and the image's calls to ESP-IDF's two functions linked through here (the
+// linker's --wrap): every packet is kept as it passes and printed by the Bluetooth core's loop while a
+// link is up, > to the controller and < from it, with the time and the first bytes.
+typedef struct {
+    void (*notify_host_send_available)(void);
+    int (*notify_host_recv)(uint8_t *data, uint16_t len);
+} vhci_callbacks;
+void __real_esp_vhci_host_send_packet(uint8_t *data, uint16_t len);
+int __real_esp_vhci_host_register_callback(const vhci_callbacks *callbacks);
+
+#define TRACED 128
+static struct traced {
+    uint32_t ms;
+    uint16_t len;
+    uint8_t up, head[28];
+} trace[TRACED];
+static volatile uint32_t trace_in, trace_out;
+static volatile int trace_link;
+static const vhci_callbacks *host_callbacks;
+
+static void keep(int up, const uint8_t *data, uint16_t len)
+{
+    // a link begins with an LE meta event "connection complete" (plain or enhanced) and ends with a
+    // disconnection complete, which is still printed
+    if (up && len > 3 && data[0] == 0x04 && data[1] == 0x3E && (data[3] == 0x01 || data[3] == 0x0A)) {
+        trace_link = 1;
+    }
+    if (!trace_link) {
+        return;
+    }
+    uint32_t ps = mask_level3();
+    if (trace_in - trace_out < TRACED) {
+        struct traced *t = &trace[trace_in % TRACED];
+        t->ms = (uint32_t)(spike_ticks() / 16000);
+        t->len = len;
+        t->up = (uint8_t)up;
+        for (int i = 0; i < 28 && i < len; i++) {
+            t->head[i] = data[i];
+        }
+        trace_in = trace_in + 1;
+    }
+    unmask(ps);
+    if (up && len > 1 && data[0] == 0x04 && data[1] == 0x05) {
+        trace_link = 0;
+    }
+}
+
+void __wrap_esp_vhci_host_send_packet(uint8_t *data, uint16_t len)
+{
+    keep(0, data, len);
+    __real_esp_vhci_host_send_packet(data, len);
+}
+
+static void traced_send_available(void)
+{
+    host_callbacks->notify_host_send_available();
+}
+
+static int traced_recv(uint8_t *data, uint16_t len)
+{
+    keep(1, data, len);
+    return host_callbacks->notify_host_recv(data, len);
+}
+
+int __wrap_esp_vhci_host_register_callback(const vhci_callbacks *callbacks)
+{
+    static const vhci_callbacks mine = { traced_send_available, traced_recv };
+    host_callbacks = callbacks;
+    return __real_esp_vhci_host_register_callback(&mine);
+}
+
+static void trace_print(void)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    while (trace_out != trace_in) {
+        struct traced *t = &trace[trace_out % TRACED];
+        // the number of completed packets says only that the radio sent something
+        if (!(t->up && t->head[0] == 0x04 && t->head[1] == 0x13)) {
+            char line[80];
+            int n = 0;
+            for (int i = 0; i < 28 && i < t->len; i++) {
+                line[n++] = digits[t->head[i] >> 4];
+                line[n++] = digits[t->head[i] & 15];
+            }
+            line[n] = 0;
+            silica_rt_puts("    ");
+            spike_put_dec(t->ms);
+            silica_rt_puts(t->up ? " < " : " > ");
+            silica_rt_puts(line);
+            silica_rt_puts("\n");
+        }
+        trace_out = trace_out + 1;
+    }
+}
+#endif
+
 // ---- the Bluetooth core ----
 
 // The core the tasks, the timers and the controller's handler belong to, when a Silica program's actors
@@ -1229,6 +1328,9 @@ void spike_bt_core_loop(void)
 #endif
     for (;;) {
         spike_yield();
+#ifdef R1_HCI_TRACE
+        trace_print();
+#endif
 #ifdef R1_DEBUG
         if ((spike_ticks() - said) / 16000000 >= 2) {
             said = spike_ticks();

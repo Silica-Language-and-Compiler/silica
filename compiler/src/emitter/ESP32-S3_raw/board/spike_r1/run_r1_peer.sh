@@ -62,6 +62,11 @@ done
 # main's stacks: the builder cannot bound a start that calls into ESP-IDF's code (the flash mapping) and
 # would give main 192 KB; the guest's builder bounds this program's main at 4.5 KB and 320 bytes
 syms="$syms -Wl,--defsym,_silica_main_stack_req=0x4000 -Wl,--defsym,_silica_main_aux_req=0x400"
+# HCI_TRACE=1: every packet between the host and the controller is printed while a link is up
+if [ "${HCI_TRACE:-0}" = 1 ]; then
+    SPIKE_CFLAGS="${SPIKE_CFLAGS:-} -DR1_HCI_TRACE"
+    syms="$syms -Wl,--wrap=esp_vhci_host_send_packet -Wl,--wrap=esp_vhci_host_register_callback"
+fi
 C="$IDF_PATH/components"
 # in flash: the Bluetooth libraries and the program's own compiled code (each .sams becomes <n>.<name>.o)
 BOARD_FLASH_FILES="*libbt.a *libbtdm_app.a *libphy.a *libbtbb.a"
