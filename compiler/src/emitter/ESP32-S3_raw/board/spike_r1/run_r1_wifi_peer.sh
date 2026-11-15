@@ -17,7 +17,7 @@
 # exchanges a frame with the Mac over TCP, on the chip the bare-metal runtime owns: no ESP-IDF
 # start-up, no FreeRTOS.
 #
-#   BOARD_PORT=<port> ./run_r1_wifi_peer.sh [--build-only] [--links <n>] [<out_dir>]
+#   BOARD_PORT=<port> ./run_r1_wifi_peer.sh [--build-only] [--links <n>] [--listen] [<out_dir>]
 #
 # The program is programmer_tools/transport_wifi_demo/dangerous_wifi_board_peer.silica above the
 # hosted (:tcp) carrier (compiler/stdlib/dangerous_tcp_carrier.silica) and dangerous_sockets, whose
@@ -29,6 +29,9 @@
 # The access point's name and passphrase come from SILICA_WIFI_FILE as for run_wifi.sh. The peer is
 # wifi_peer.py on this Mac, which the script starts: it sends each frame back. --links <n> exchanges,
 # each on a TCP connection of its own. The Mac must be on the same network.
+# --listen: the board listens (the program opens "listen:<port>" on the station's address) and the
+# Mac connects for each exchange, finding the board by trying the port across its /24 network.
+# The libraries' memory comes from the runtime's heap (-DSPIKE_ONE_HEAP, hci_shim.c).
 # R1_CPU_MHZ=80|160|240 (160 unless given).
 #
 # Needs: the ESP32-S3_raw Silica compiler (SILICA_COMPILER, default the local build), the guest's
@@ -45,11 +48,12 @@ PY=${BOARD_PYTHON:-$HOME/.espressif/python_env/idf6.2_py3.14_env/bin/python}
 CC=${SILICA_COMPILER:-$ROOT/compiler/build/ESP32-S3_raw/silica-compiler}
 XT=${XTENSA_BIN:-$HOME/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin}
 PORT=${WIFI_PORT:-4370}
-build_only=0 links=1
+build_only=0 links=1 listen=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-only) build_only=1; shift ;;
         --links) links=$2; shift 2 ;;
+        --listen) listen=1; shift ;;
         *) break ;;
     esac
 done
@@ -80,7 +84,10 @@ modules="Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_c
 for m in $modules; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$SRC/$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$SRC/trial_wait_int64.silica"
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" "$SRC/trial_support_hex.silica"
-sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$peer:$PORT\" }|" \
+address="$peer:$PORT" listening=false connect_to=""
+[ "$listen" = 1 ] && address="listen:$PORT" listening=true connect_to=$peer
+sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$address\" }|" \
+    -e "s|^fn listening() -> boolean { false }|fn listening() -> boolean { $listening }|" \
     -e "s|^fn links() -> int64 { 1 }|fn links() -> int64 { $links }|" "$DEMO/dangerous_wifi_board_peer.silica" > "$SRC/dangerous_wifi_board_peer.silica"
 for m in $modules trial_support_hex trial_wait_int64 dangerous_wifi_board_peer; do echo "$m.silica"; done > "$SRC/silica.config"
 # The compiler wants the archive the .meta names; the wrapper itself is compiled into the image, so
@@ -108,10 +115,10 @@ done
 export BOARD_FLASH_FILES
 inc="-I$out -I$C/esp_wifi/include -I$C/esp_wifi/include/local -I$C/esp_event/include -I$C/esp_netif/include -I$C/esp_phy/include"
 inc="$inc -I$L/include -I$L/include/apps -I$L/include/apps/sntp -I$L/lwip/src/include -I$L/port/include -I$L/port/freertos/include -I$L/port/esp32xx/include -I$L/port/esp32xx/include/arch"
-export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DARENA_KB=${ARENA_KB:-112} -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
+export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
 # the runtime on one core, core 0, for the program's actors; core 1 is the radio's tasks' (r1_port.c)
 export BOARD_ASFLAGS="-DNCORES_RUN=1"
-export BOARD_FFI_STACK=${BOARD_FFI_STACK:-16384}
+export BOARD_FFI_STACK=${BOARD_FFI_STACK:-6144}
 boot=$(ls "$IDF_BUILD"/bootloader/esp-idf/*/lib*.a | tr '\n' ' ')
 mbed=$(find "$IDF_BUILD/esp-idf/mbedtls" -name "*.a" | tr '\n' ' ')
 # shellcheck disable=SC2086
@@ -121,7 +128,7 @@ SPIKE_LDFLAGS="$syms" "$HERE/build.sh" --app "$out/r1_wifi_peer" "$SRC"/*.sams \
     "$IDF_BUILD/esp-idf/esp_coex/libesp_coex.a" "$C/esp_coex/lib/esp32s3/libcoexist.a" "$IDF_BUILD/esp-idf/esp_hal_security/libesp_hal_security.a" \
     "$C/esp_phy/lib/esp32s3/libphy.a" "$IDF_BUILD/esp-idf/esp_phy/libesp_phy.a" $boot "$C/xtensa/esp32s3/libxt_hal.a"
 [ "$build_only" = 1 ] && exit 0
-python3 "$HERE/wifi_peer.py" "$PORT" "$links" "${SPIKE_TIMEOUT:-120}" > "$out/wifi_peer.log" 2>&1 &
+python3 "$HERE/wifi_peer.py" "$PORT" "$links" "${SPIKE_TIMEOUT:-120}" $connect_to > "$out/wifi_peer.log" 2>&1 &
 peer_pid=$!
 status=0
 "$PY" "$BOARD/tools/run_on_board.py" --flash --timeout "${SPIKE_TIMEOUT:-120}" "$out/r1_wifi_peer.bin" || status=$?

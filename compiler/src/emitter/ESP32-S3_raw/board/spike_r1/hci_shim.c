@@ -545,6 +545,70 @@ void vPortYield(void)
 
 // ---- memory ----
 
+#ifdef SPIKE_ONE_HEAP
+// One heap for the whole chip: the libraries' blocks come from the runtime's heap (rt_heap.S), beside
+// the actors' stacks, states and messages, so neither side keeps memory the other could use. The
+// runtime's blocks are 8-byte aligned under an 8-byte header ([-8] the size, [-4] HEAP_USED); the
+// libraries are given 16-byte alignment, as from the arena below: a block whose payload is not on a
+// 16-byte boundary is handed out 8 bytes further in, with ONE_HEAP_MOVED in the word under it where
+// an unmoved block has the runtime's tag. The runtime's heap lock is a spin lock both cores take;
+// the radio's interrupt is masked around a call so that it never finds this core holding it.
+#define HEAP_USED 0x5A11CA1D
+#define ONE_HEAP_MOVED 0x16A116ED
+void *silica_rt_alloc_or_null(uint32_t size);
+void silica_rt_free(void *p);
+extern uint8_t _silica_heap_start[], _silica_heap_end[];
+static uint32_t arena_given, arena_most;
+
+static uint32_t *block_base(void *p)       // the runtime's payload address of a block handed out
+{
+    uint32_t *w = p;
+    return w[-1] == ONE_HEAP_MOVED ? w - 2 : w;
+}
+
+static size_t block_room(void *p)          // the bytes the holder of p may use
+{
+    uint32_t *base = block_base(p);
+    return base[-2] - 8 - (size_t)((uint8_t *)p - (uint8_t *)base);
+}
+
+void *malloc(size_t n)
+{
+    uint32_t ps = mask_level3();
+    uint32_t *base = silica_rt_alloc_or_null((uint32_t)n + 8);
+    void *p = NULL;
+    if (base) {
+        arena_given += base[-2];
+        if (arena_given > arena_most) {
+            arena_most = arena_given;
+        }
+        p = base;
+        if ((uintptr_t)base & 8) {
+            base[1] = ONE_HEAP_MOVED;
+            p = base + 2;
+        }
+    }
+    unmask(ps);
+    if (p == NULL) {
+        silica_rt_puts("shim: out of memory\n");
+    }
+    return p;
+}
+
+void free(void *p)
+{
+    if (p == NULL) {
+        return;
+    }
+    uint32_t ps = mask_level3();
+    uint32_t *base = block_base(p);
+    arena_given -= base[-2];
+    silica_rt_free(base);
+    unmask(ps);
+}
+
+#define ARENA_BYTES ((uint32_t)(_silica_heap_end - _silica_heap_start))
+#else
 // Blocks of 16-byte multiples, each under a 16-byte header, in address order; a freed block is joined
 // to the free blocks after it.
 struct block {
@@ -611,6 +675,14 @@ void free(void *p)
     unmask(ps);
 }
 
+static size_t block_room(void *p)
+{
+    return ((struct block *)p - 1)->size - sizeof(struct block);
+}
+
+#define ARENA_BYTES ((uint32_t)sizeof(arena))
+#endif
+
 void *heap_caps_malloc(size_t n, uint32_t caps)
 {
     (void)caps;
@@ -632,7 +704,7 @@ void *heap_caps_realloc(void *p, size_t n, uint32_t caps)
     (void)caps;
     void *q = malloc(n);
     if (q && p) {
-        size_t had = ((struct block *)p - 1)->size - sizeof(struct block);
+        size_t had = block_room(p);
         memcpy(q, p, had < n ? had : n);
         free(p);
     }
@@ -647,19 +719,19 @@ void heap_caps_free(void *p)
 size_t heap_caps_get_free_size(uint32_t caps)
 {
     (void)caps;
-    return sizeof(arena) - arena_given;
+    return ARENA_BYTES - arena_given;
 }
 
 size_t heap_caps_get_largest_free_block(uint32_t caps)
 {
     (void)caps;
-    return sizeof(arena) - arena_given;
+    return ARENA_BYTES - arena_given;
 }
 
 size_t heap_caps_get_minimum_free_size(uint32_t caps)
 {
     (void)caps;
-    return sizeof(arena) - arena_most;
+    return ARENA_BYTES - arena_most;
 }
 
 int heap_caps_add_region(intptr_t start, intptr_t end)

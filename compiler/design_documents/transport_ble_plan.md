@@ -1712,6 +1712,36 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Not done: the board listening (`listen:<port>` binds the station's address by the same code; no
     program here takes `:accepted` yet); a trial for the eight-word call; the hosted trials of the
     `(:tcp)` carrier run on the board; a link lost in the middle.
+- **Stage 12, part 9, 2026-11-15, done: the board listens, and the libraries share the runtime's
+  heap.**
+  - **Listening.** The Wi-Fi demo's board program, run with `run_r1_wifi_peer.sh --listen`, opens its
+    carrier at `listen:<port>` under `(:wifi, 0)`: the hosted carrier binds the station's address,
+    answers `(:link_up, "port:<n>")`, and for each peer sends the owner
+    `(:accepted, conn, "peer:<ipv4>:<port>")`; the owner opens `conn` and exchanges the frame on it as
+    on a connection it made. While the station has not joined, the listener ends with
+    `(:explicit, :link_unavailable)` as a connecting carrier does, and the owner opens another. The
+    Mac's end (`wifi_peer.py` with this Mac's address as its fourth argument) finds the board by
+    trying the port on every address of its /24 network.
+  - **One heap.** The first listening runs ended each accepted connection's carrier with
+    `(:explicit, :out_of_memory)`: the runtime's heap was 144 KB, in use to within 4 KB (an actor that
+    makes foreign calls holds about 15 to 20 KB of it), beside 112 KB set aside for the libraries'
+    `malloc`. With `-DSPIKE_ONE_HEAP`, `hci_shim.c` takes the libraries' blocks from the runtime's
+    heap (`silica_rt_alloc_or_null`, `silica_rt_free`; 16-byte alignment kept; the radio's interrupt
+    masked around each call, the heap's lock being a spin lock): one heap of 259 KB, and neither side
+    keeps memory the other could use. `run_r1_wifi_peer.sh` builds so. The Bluetooth image still has
+    its arena.
+  - **The foreign calls' stack** in the Wi-Fi image is 6 KB for each actor that makes them (was
+    16 KB); the station starts within it.
+  - Runs, 160 MHz, power saving off:
+
+    | Run | Result |
+    | --- | --- |
+    | The board listening, three peers | 3 accepted, 3 exchanges whole on both ends, status 0 |
+    | The board connecting, thirty links | 30 of 30, status 0, no allocation refused |
+    | Bluetooth on route R1 (arena), three links | 3 of 3 on both ends |
+
+  - Not done: a trial for the eight-word call; the hosted trials of the `(:tcp)` carrier run on the
+    board; a link lost in the middle; the Bluetooth image on the one heap.
 
 ## 7. Facts the design rests on
 
