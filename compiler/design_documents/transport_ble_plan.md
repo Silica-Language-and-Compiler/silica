@@ -1037,8 +1037,9 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     `silica_registry_shape_exit_report`, which only compiled Silica code defines.
   - Not shown: that the radio works. The call returned and filled its table; no packet was sent or heard.
 
-- **Stage 12, part 3, step 2, 2026-11-14, done: the controller may be kept waiting 100 ms at a time, its
-  interrupt handlers included, and the link holds. R1 need not interrupt an actor.**
+- **Stage 12, part 3, step 2, 2026-11-14, done: the controller may be kept waiting 100 ms now and then, its
+  interrupt handlers included, and the link holds. Step 4 shows this is not leave to serve the handlers
+  late every time.**
   - Built: `board/spike_r1/guest_hold.c`, added to the guest image of the stage 7 demo
     (`run_board_peer.sh`, `BOARD_EXTRA_SOURCES`). A task on the controller's core, above the controller's
     own, keeps the core for a set time at a set period: by running (the controller's task and the host's
@@ -1059,10 +1060,9 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - The hold was in every held image: ESP-IDF's heap at the start was 2,156 bytes less, its task's stack.
   - The 20 ms run failed once at its first link, as a run with nothing held also did: the Mac's subscription
     was refused for want of encryption (below). It is not counted against the hold.
-  - What it means: the radio's timing is kept by the hardware, which the controller programs ahead; its
-    handlers and its task tidy up after. So on a chip Silica owns the controller's interrupts can be polled
-    between actors' turns, and its task run as one more turn, while turns stay under some tens of
-    milliseconds. Slower service costs speed (the 101 s), not the link.
+  - What it means: a stall now and then costs the radio events it was in the middle of, and the link
+    outlives them; slower service costs speed (the 101 s). Between the stalls the controller was served at
+    once, so this run does not say how late its handlers may be served as a rule (step 4 does).
   - Limits of the measurement: one peer (a Mac, at the connection timing it chooses), four links a run, a
     48-byte frame. A link held up for long, heavy traffic, and the board as central were not run.
   - Found on the way, in stage 10's work: with a Mac as central and a board as peripheral, the Mac's
@@ -1111,9 +1111,44 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     - The controller beside Silica's actors. Main alone ran here, polling without pause (6.8 million
       passes in the run). Step 2 says a poll every few tens of milliseconds is enough.
     - Both cores, a host above the controller (NimBLE, or the carrier), and the image's code in flash.
-  - What stands between this and a build: the poll made a turn of the scheduler; the coroutine made the
-    runtime's (a task that is run when its semaphore is given); NimBLE on the same shim or a host in Silica
-    (§2.4); and room for the code, 154 KB of the 399 KB a RAM-loaded image has.
+
+- **Stage 12, part 3, step 4, 2026-11-14, done: a connection. The Mac connected to the controller on the
+  chip Silica owns and the link held 30 s, until the Mac ended it. The controller's handlers must be served
+  within about a millisecond; its task may wait 100 ms.**
+  - Built: `hci_main.c` asks for a link's events, advertises as connectable and prints each packet the
+    controller sends up with its time. `POLL_GAP_MS` sets how often the controller is visited (each visit
+    serves it until no interrupt waits); `HANDLERS_PROMPT` serves the handlers without pause and leaves
+    only the task to the visits.
+  - The link, visited without pause (the Mac's `run_peer.sh central`):
+    - 1,346 ms after advertising began: connection complete, status 0, the board the peripheral. Then the
+      channel selection, the change to the 2M PHY and the data length change, each an event with status 0.
+    - 2,149 ms: the Mac's first request as data (its ATT MTU request). No host is on the board to answer.
+    - 32,120 ms: disconnection, reason 0x13, the Mac ending the link when its request went unanswered for
+      30 s. The link was up 30.8 s; the poll called the handler 2,989 times, about 97 a second.
+  - How often the controller must be visited:
+
+    | Handlers | Task | Result |
+    | --- | --- | --- |
+    | every visit, without pause | the same | link up 30.8 s |
+    | every 1 ms | the same | link up 30.9 s |
+    | every 2, 3, 5, 10 or 30 ms | the same | the Mac never heard an advertisement; the interrupt was waiting at every visit |
+    | at once | every 30 ms | link up 30.6 s |
+    | at once | every 100 ms | link up 30.7 s |
+
+  - What it means for the design:
+    - The handler cannot be polled between actors' turns: a turn is not bounded to a millisecond. It has
+      to be a real interrupt, at level 3 on one core. It is short, runs on the stack that is running and
+      returns to the same actor; it switches no actor out. Stage 5 worked out what such an interrupt costs
+      a Silica stack on the guest, where ESP-IDF's interrupts already land on Silica's stacks.
+    - The controller's task can be a turn of the scheduler, run when the handler has given its semaphore.
+      No task pre-empts an actor.
+    - So R1 adds one interrupt path to the bare-metal runtime (the board plan's item K, for one source) and
+      keeps the rule that an actor is never switched out by another.
+  - Not shown: data in both directions (no host), the controller beside actors, both cores, the board as
+    central, the handler as an interrupt.
+  - What stands between this and a build: the level 3 interrupt path in the bare-metal runtime; the
+    coroutine made the runtime's (a task run when its semaphore is given); NimBLE on the same shim or a
+    host in Silica (§2.4); and room for the code, 155 KB of the 399 KB a RAM-loaded image has.
 
 ## 7. Facts the design rests on
 

@@ -19,7 +19,8 @@
 // The controller is the closed libbtdm_app.a under ESP-IDF's own glue (bt.c, as compiled for the guest
 // image); hci_shim.c answers what the glue asks of an operating system. Sends HCI Reset and prints the
 // event the controller answers with: 04 0E 04 05 03 0C 00 is "command complete, reset, status 0". It then
-// advertises, for a scanner to hear.
+// advertises, and when a central connects it reports the link: when it came up, what the central sent, how
+// long it held and why it ended.
 
 #include <stdint.h>
 #include "soc/rtc.h"
@@ -30,6 +31,7 @@ void silica_rt_puts(const char *s);
 void spike_put_dec(uint32_t n);
 uint64_t spike_ticks(void);
 void spike_yield(void);
+void spike_poll(void);
 uint32_t spike_arena_used(void);
 extern uint32_t spike_handler_calls, spike_switches;
 
@@ -47,11 +49,27 @@ static void put_hex(const uint8_t *p, int n)
 }
 
 #ifndef ADVERTISE_SECONDS
-#define ADVERTISE_SECONDS 30
+#define ADVERTISE_SECONDS 60
+#endif
+
+#ifndef POLL_GAP_MS
+#define POLL_GAP_MS 0
 #endif
 
 static uint8_t event[64];
 static volatile int event_len;
+
+// What the controller sent while advertising and connected: the time, the length and the first bytes of
+// each packet, kept by the controller's line of control and printed by main's.
+#define KEPT 48
+static struct packet {
+    uint32_t ms, len;
+    uint8_t head[16];
+} packets[KEPT];
+static volatile uint32_t packets_in, acl_in;
+static uint32_t packets_out;
+static uint64_t watch_start;
+static volatile int watching;
 
 static void host_send_available(void)
 {
@@ -59,6 +77,21 @@ static void host_send_available(void)
 
 static int host_recv(uint8_t *data, uint16_t len)
 {
+    if (watching) {
+        if (data[0] == 0x02) {
+            acl_in++;
+        }
+        if (packets_in < KEPT) {
+            struct packet *p = &packets[packets_in];
+            p->ms = (uint32_t)((spike_ticks() - watch_start) / 16000);
+            p->len = len;
+            for (int i = 0; i < 16 && i < len; i++) {
+                p->head[i] = data[i];
+            }
+            packets_in = packets_in + 1;
+        }
+        return 0;
+    }
     if (event_len == 0) {
         int n = len > sizeof(event) ? (int)sizeof(event) : len;
         for (int i = 0; i < n; i++) {
@@ -135,28 +168,95 @@ long long main(void)
     int failed = ask("reset", reset, sizeof(reset));
     failed += ask("read address", read_address, sizeof(read_address));
 
-    // Advertise the Nordic UART Service as "R1" every 100 ms for ADVERTISE_SECONDS, for a scanner to
-    // hear: the radio in use, its interrupts served by polling.
+    // Advertise the Nordic UART Service as "R1" every 100 ms, for at most ADVERTISE_SECONDS.
     static uint8_t parameters[] = { 0x01, 0x06, 0x20, 0x0F, 0xA0, 0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0x07, 0x00 };
     static uint8_t data[4 + 32] = { 0x01, 0x08, 0x20, 0x20, 25,
         0x02, 0x01, 0x06,
         0x11, 0x07, 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, 0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, 0x01, 0x00, 0x40, 0x6E,
         0x03, 0x09, 'R', '1' };
     static uint8_t enable[] = { 0x01, 0x0A, 0x20, 0x01, 0x01 };
+    // the events of a link are masked until the host asks for them
+    static uint8_t mask[] = { 0x01, 0x01, 0x0C, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x3F };
+    static uint8_t le_mask[] = { 0x01, 0x01, 0x20, 0x08, 0xFF, 0xFF, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    failed += ask("event mask", mask, sizeof(mask));
+    failed += ask("LE event mask", le_mask, sizeof(le_mask));
     failed += ask("advertising parameters", parameters, sizeof(parameters));
     failed += ask("advertising data", data, sizeof(data));
     failed += ask("advertise", enable, sizeof(enable));
+    // Advertising, then whatever a central does: each packet the controller sends up is printed with
+    // its time. The interrupts are polled once every POLL_GAP_MS milliseconds (0: without pause), as a
+    // scheduler would between actors' turns. No host answers the central, so it ends the link itself.
     uint32_t before = spike_handler_calls;
-    uint64_t start = spike_ticks();
-    while ((spike_ticks() - start) / 16000000 < ADVERTISE_SECONDS) {
-        spike_yield();
+    uint32_t connected_ms = 0, ended_ms = 0, reason = 0;
+    int most_passes = 0;
+    watch_start = spike_ticks();
+    watching = 1;
+    while ((spike_ticks() - watch_start) / 16000000 < ADVERTISE_SECONDS && ended_ms == 0) {
+        // one visit to the controller: until a pass finds no interrupt waiting, 16 passes at most
+        uint32_t calls;
+        int passes = 0;
+        do {
+            calls = spike_handler_calls;
+            spike_yield();
+            passes++;
+        } while (spike_handler_calls != calls && passes < 16);
+        if (passes > most_passes) {
+            most_passes = passes;
+        }
+        while (packets_out < packets_in) {
+            struct packet *p = &packets[packets_out++];
+            silica_rt_puts("  ");
+            spike_put_dec(p->ms);
+            silica_rt_puts(" ms < ");
+            put_hex(p->head, p->len < 16 ? (int)p->len : 16);
+            silica_rt_puts("\n");
+            if (p->head[0] == 0x04 && p->head[1] == 0x3E && (p->head[3] == 0x01 || p->head[3] == 0x0A) && p->head[4] == 0) {
+                connected_ms = p->ms;
+            }
+            if (p->head[0] == 0x04 && p->head[1] == 0x05) {
+                ended_ms = p->ms;
+                reason = p->head[6];
+            }
+        }
+        if (POLL_GAP_MS != 0) {
+            uint64_t gap = spike_ticks();
+            while ((spike_ticks() - gap) / 16000 < POLL_GAP_MS) {
+#ifdef HANDLERS_PROMPT
+                // the handlers alone served at once, as an interrupt would; the controller's task waits
+                spike_poll();
+#endif
+            }
+        }
     }
-    silica_rt_puts("advertised for ");
-    spike_put_dec(ADVERTISE_SECONDS);
-    silica_rt_puts(" s, handlers called in that time ");
+    watching = 0;
+#ifdef HANDLERS_PROMPT
+    silica_rt_puts("handlers served at once; the task's ");
+#endif
+    silica_rt_puts("poll gap ");
+    spike_put_dec(POLL_GAP_MS);
+    silica_rt_puts(" ms, handlers called ");
     spike_put_dec(spike_handler_calls - before);
-    silica_rt_puts("\n");
-
+    silica_rt_puts(", most passes in a visit ");
+    spike_put_dec((uint32_t)most_passes);
+    silica_rt_puts(", packets up ");
+    spike_put_dec(packets_in);
+    silica_rt_puts(" (data ");
+    spike_put_dec(acl_in);
+    silica_rt_puts(")\n");
+    if (connected_ms == 0) {
+        silica_rt_puts("no central connected\n");
+        failed++;
+    } else if (ended_ms == 0) {
+        silica_rt_puts("link up from ");
+        spike_put_dec(connected_ms);
+        silica_rt_puts(" ms to the end of the watch\n");
+    } else {
+        silica_rt_puts("link up for ");
+        spike_put_dec(ended_ms - connected_ms);
+        silica_rt_puts(" ms, ended with reason ");
+        spike_put_dec(reason);
+        silica_rt_puts("\n");
+    }
     silica_rt_puts("handlers called ");
     spike_put_dec(spike_handler_calls);
     silica_rt_puts(", switches ");
