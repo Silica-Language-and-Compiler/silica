@@ -37,6 +37,8 @@ Phases 1, 3, 4 (frames, fuel, source-mapped traces) and 6 (trampoline) are there
 
 ### Phase 1 — Core representation
 
+*Superseded (2026-11-14): the specification rules out preemption inside a dispatch (sections 16.2.6.5 and 23.1.1), and this document's own Implementation status (2026-10-16) records that the explicit frame stack is not implemented and recursion runs on the native stack with per-actor growable stacks.*
+
 1. Define a **process-local frame** type: callee identity, return PC or resume point, locals slot region or pointers, optional **defunctionalized continuation** tag + payload for pending work.
 2. Define a **frame stack** abstraction: push, pop, depth, `max_depth` enforcement with a clear, source-mapped error on overflow.
 3. Back the stack with a **growable buffer** or **arena slab**; **reuse** freed slots where possible to limit allocator traffic.
@@ -44,11 +46,15 @@ Phases 1, 3, 4 (frames, fuel, source-mapped traces) and 6 (trampoline) are there
 
 ### Phase 2 — Lowering and execution
 
+*Superseded (2026-11-14): see the Implementation status (2026-10-16) above; SIR-level recursion is specified in `sir_recursion_strategy.md`, and the code that exists is native stack plus tail-call jumps (phase 5).*
+
 5. Lower direct and mutually recursive calls into **explicit push** of a frame and **dispatch** to the target code (bytecode, threaded code, or a tight switch).
 6. Lower returns into **pop**, **merge result** into the caller’s continuation (per your IR), and **branch** to the resume PC.
 7. Introduce **defunctionalized** continuation states for non-tail patterns (e.g. “after recursive call, combine with `n`”) so pending work is first-order and debug-printable.
 
 ### Phase 3 — Preemption and fairness
+
+*Superseded (2026-11-14): the specification rules out preemption inside a dispatch (an actor is switched out only at a dispatch boundary or a wait on `call`); the `_silica_fuel` pieces are comments and stubs only (Implementation status 2026-10-16).*
 
 8. Attach a **reduction or fuel counter** to the runnable unit (process/actor); decrement on each **logical step** or every **N** steps as policy dictates.
 9. On **back-edges** (tail call, loop head, recursive jump), ensure fuel is checked; **yield** when exhausted, persisting the full saved state from step 4.

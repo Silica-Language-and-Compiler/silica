@@ -155,6 +155,8 @@ today's image size. The levers are a smaller image (emitted code size, shared pr
 `.text`/`.rodata` from flash (the part has 1 MiB; the image runs from RAM only because the probe loads nothing
 into flash). Whichever is chosen, re-measure the budget above.
 
+**Partly done (2026-11-14):** the flash lever is implemented and link-verified (`83ff3cd7dc`, 2026-11-12: `BOARD_EXEC=flash`, `runtime/silica_stm32l476rg_flash.ld`, example `nucleo_flash_max_actors`; see `stm32_flash_execution_design.md`). It is used by hand only, the trials still run from RAM, RAM images stay capped by the 16 KiB heap assert, and the budget has not been re-measured.
+
 ## Runtime: what is here (stage 1) and what is not
 
 | File | Here | Not yet |
@@ -174,7 +176,7 @@ into flash). Whichever is chosen, re-measure the budget above.
 | `rt_support.S` | checked int64 add/add1/mul, `h2f`/`f2h`, `trunc_f32/f64`, `map_device_check`, memcpy/memmove/memset/memcmp/strlen (the memory functions a foreign C wrapper links against), LED + delay helpers | |
 | `rt_ffi.S` | (2026-11-10, group 7) **foreign calls** (spec §20.4; the ESP32-S3's rt_ffi.S for the AAPCS): `silica_rt_ffi_call` takes the emitter's 64-byte call block (terms/ffi_foreign.silica: six argument words, words 0-3 in r0-r3 and 4-5 on the outgoing stack, the function at +24, the result mode at +28, the struct area at +32; a composite result of more than 4 bytes comes back through the hidden pointer in r0, mode 2), in an actor on a machine chunk of the actor's own chain with `_silica_ffi_stack_size` (2 KiB, `BOARD_FFI_STACK`) free above its limit (taken through `silica_rt_stack_grow`, left through `silica_rt_chunk_return`; the SRAM2 chunk arena first, then SRAM1), with MPU region 1 making 32 bytes of that chunk's band no-access for the call (a C stack that runs through the limit, the depth reserve and the headroom faults instead of writing the heap block below); in main on main's fixed stacks, unguarded; `VRG_FFI` (register block +148) is 1 for the call, so a CPU fault in an actor's foreign code ends it with `:foreign_fault` (tag 5; the fault hook also switches the band guard off and clears `CCR.DIV_0_TRP`, which the sigfpe probe sets), a foreign fault in main is the fatal report (70); `ffi_string_in` (a frame block holding the bytes and a NUL, X0 = pointer, X1 = count), `ffi_string_out` (a fresh frame string from a tagged `_ptr`/`_len` result; the empty string for a nonzero tag or a null pointer) | a hosted-style guarded region for a fault outside any actor (main's is process-fatal, as the ESP32-S3's) |
 | `rt_float.S` | `print_f64` (soft float, the host's 15-digit algorithm with an exact FCVTZS-style double -> int64), `print_f32` (FPU, 7 digits), `print_f16` (widened; `nan`/`inf`/`-inf` as words), `f16_to_i32` (a float16 `main`'s exit code) | |
-| `rt_stubs.S` | one aborting stub per unported entry, so every program links (`tools/list_runtime_stubs.sh` regenerates the list) | |
+| `rt_stubs.S` | one aborting stub per unported entry, so every program links (`tools/list_runtime_stubs.sh` regenerates the list; most entries were ported 2026-11-09/10, about 11 STUB lines remain as of 2026-11-14, not yet enumerated against use) | |
 
 A stub aborts with `[silica] abort: runtime entry not yet ported to STM32-L476RG_raw at 0x<pc>`
 (status 71) at the first use.

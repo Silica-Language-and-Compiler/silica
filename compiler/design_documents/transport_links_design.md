@@ -25,7 +25,7 @@ on a real board with the Silica and Erlang peers). Stage S-D (2026-11-10) ran a 
 sends four ETF readings, each answered by an LED command from a Mac peer that declares its port
 (`(:serial_port, path, 115200)`) or from the Erlang peer behind the serial bridge, and drives the LED each reply names
 (plan §7). **Not done:** the hosted `(:interface, name)`, `(:ethernet, n)` and
-`(:wifi, n)` links are accepted and checked but see E2 below for the binding, which is built and verified by real runs 2026-11-13/14 (TCP and UDP; see the plan's E2 status); all three hosted packs list the hosted links (Mac 2026-11-09, Linux x86-64 2026-11-10, Linux AArch64 ported from x86-64 on 2026-11-11; the AArch64 pack not yet built or run on an AArch64 host), so `(:interface, name)` etc. are accepted but binding is E2 (built 2026-11-12, branch `E2-transport-work`; classifier, LAN binding and real Wi-Fi on pix verified 2026-11-13/14; wireless on nix and the Mac and two addresses on one interface not verified; see the plan's E2 status); the Nucleo
+`(:wifi, n)` links are accepted and checked but see E2 below for the binding, which is built and verified by real runs 2026-11-13/14 (TCP and UDP; see the plan's E2 status); all three hosted packs list the hosted links (Mac 2026-11-09, Linux x86-64 2026-11-10, Linux AArch64 ported from x86-64 on 2026-11-11; the AArch64 pack built and verified on pix 2026-11-13/14), so `(:interface, name)` etc. are accepted but binding is E2 (built 2026-11-12, branch `E2-transport-work`; classifier, LAN binding and real Wi-Fi on pix verified 2026-11-13/14; wireless on nix and the Mac and two addresses on one interface not verified; see the plan's E2 status); the Nucleo
 (phase C); UART2 on the ESP32-S3 (no window yet); E2416 (phase D: nothing reaches it); the supervised form of the
 board bring-up (a device worker cannot be a supervisor child yet). It extends
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below), §6 (carriers),
@@ -136,7 +136,7 @@ numbers are different series, and the question numbers are kept (§12).
   phase A, when every pack answered `false` for every carrier and the hosted carriers were provided through
   `compiler/stdlib/Carrier.silica` rather than the pack. Since phase A the Mac pack (2026-11-09) and the Linux x86-64
   pack (2026-11-10) list `tcp`, `udp` and `serial` and the hosted links. The linux_aarch64 pack has the same rows as the x86-64 pack since 2026-11-11
-  (not yet built or run on an AArch64 host).
+  (built and verified on pix, 2026-11-13/14).
 - **Board packs.** The ESP32-S3 draft (`ports/board_pack.silica`) is pure indexed functions with no allocation and no
   effects, and already holds `pin_uart0_tx/rx` (43/44), `pin_uart1_tx/rx` (35/36), `uart_txfifo_max` and a
   window-name table (`":esp32s3_uart"`). The Nucleo pack (`emitter/STM32-L476RG_raw/board_pack.silica`) holds

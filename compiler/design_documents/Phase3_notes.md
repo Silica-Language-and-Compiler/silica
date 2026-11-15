@@ -17,8 +17,8 @@ under the build-slot lock; builder `/Volumes/2T/silica/binaries/silica-compiler`
 | 3a | `state_policy(...)` accepted (optional) after `stack_policy(...)` in every hosted spawning form; `compact_state()` builtin; ACB #576 stored at spawn, #584 set by `compact_state()` under `:compact_on_request`; no behaviour change | code done (Mac + the shared front end; ESP32 accepts the prim as a pass-through); Haiku build + gate: see §5 |
 | 3b | per-slot copier tables, free lists (§2.3, §5.4, P5) | Mac source written 2026-10-29 (§10), not built; Linux twins listed, not applied |
 | 3c | dispatch end (§4.1-§4.7), W2300/E2321, `strict state_release;` | Mac source written 2026-10-30 (§10.8), not built; `strict state_release;` / E2321 and the `\|_upd=` update-call rules deferred (§10.8.4) |
-| 3d | `state_policy` required (E2005), the bootstrap rewrite script | not started |
-| 3e | linux_aarch64 / linux_x86_64 ports | not started; removed from the phase-3 completion gate by Lee (2026-10-30); Linux and ESP32 ports move to after phase 7, and no Linux builds run until phase 7 (Lee, 2026-10-30) |
+| 3d | `state_policy` required (E2005), the bootstrap rewrite script | **done** (verified 2026-11-14): `type_checker_supervisor.silica:150-185` requires the `state_policy` field (E2092, "required since phase 3d"); phase 3 closed 2026-10-31, compiler published as 999937 from the 3d sources |
+| 3e | linux_aarch64 / linux_x86_64 ports | **done in chunk 15 phase 8** (verified 2026-11-14): x86-64 2026-11-04 (`04bb9d4c53`, `a2dd0caa42`, `5614f4bb09`), aarch64 green via `81c1144bb6` 2026-11-11; ESP32-S3 ported `029447ad31` 2026-11-07, green `978f663e08` 2026-11-12. (Was: removed from the phase-3 completion gate by Lee 2026-10-30; Linux and ESP32 ports moved to after phase 7) |
 
 ## 2. Stage 3a: what was done
 
@@ -118,7 +118,7 @@ child table included.
   already names the bound variant's cost) and all three trees.
 * **Q3 (3d, the code for a missing child-spec field).** The coordinator's brief says "E2005 when a child spec
   omits it". The existing child-spec field rules (a missing `flavor`, `restart`, ...) are E2092 (the init
-  return-type shape check). 3d will use E2092 for a missing `state_policy` field unless Lee wants E2005 there.
+  return-type shape check). 3d will use E2092 for a missing `state_policy` field unless Lee wants E2005 there. **Resolved (2026-11-14 check):** 3d uses E2092.
 
 ## 4. Trial requests (for Sonnet; names from design §11.3, phase 3 rows)
 
@@ -702,7 +702,7 @@ proof rejects), so nothing in the new state reaches the old root. **Lee: confirm
   (`declarations_from_slots`: `decl.tag < 0 -> declarations_from_slots(slots.tail)`), so the line is
   silently ignored today; a real statement needs a new declaration tag (0-9 are taken; 72 `tag == 0`
   tests and 9 `tag of` switches would need an audit) read by `main_compile_pipeline` to turn W2300
-  into E2321. Deferred to a 3c-2 pass with that audit.
+  into E2321. Deferred to a 3c-2 pass with that audit. **Partly done (2026-11-14 check):** `strict <what>;` is now parsed (decl tag 10, `parser/constraint_extract_decls.silica:575+`). **Still open:** E2321 is not emitted anywhere (only a stale comment at `main_compile_pipeline.silica:174`) and is not in `error_codes.md`.
 * The `|_upd=` marker and the update-chain rules of §4.1 (P1, P4, the version argument): no logging
   updater exists before the stdlib's phase 5, so every update is unproven now (the conservative side).
   The `.iface` carriage of the marker goes with it.
@@ -747,6 +747,7 @@ proof rejects), so nothing in the new state reaches the old root. **Lee: confirm
    (W2300), `actor_stacks_addition/state_policy_shrink_after_compaction` / `_compact_on_request` /
    `_keep_state_area_holds`, `memory_region_addition/retire_outside_actor_is_noop`, and a
    `retire` type-error pair (E2010 non-ref argument, E2003 bound to int64).
+   **Partly done (2026-11-14 check):** none of `proven_release_flat_memory`, `fallback_copy_compacts_holes` or the `state_policy_*` trials exists by name; related trials exist (`actor_stacks_addition/stack_keep_high_water_{proven,unproven}_state_survives`, `actors_addition/state_keeps_message_part_unproven`). The rest remain to be written or marked covered.
 
 **Checks for Haiku** (one builder at a time, build-slot lock at `scratchpad/build_slot/lock`; no
 board, no board lock, no change to any `.scout`, golden or trial):

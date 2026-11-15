@@ -153,7 +153,7 @@ that OS adaptation, which conflicts with the port being ESP-IDF-free and with th
 (the radio's internals are not reachable). This is a separate decision, together with
 [ROADMAP.md](../../ROADMAP.md) chunk 9, "Networking through Fifi": networking is not part of the language
 (spec §20.4) and is reached through the Foreign Function Interface, so a radio stack would arrive as foreign
-code under that model rather than as device workers. The radio decision is independent of the Silica
+code under that model rather than as device workers. **Decided 2026-11-09:** Lee chose route R2 (ESP-IDF's Wi-Fi component as foreign code; `transport_esp32s3_wifi_plan.md` §3); the radio work is deferred, not cancelled (§8 there), and no radio code exists yet. The radio decision is independent of the Silica
 network stack of §4.6, which can sit on a wired link (UART1, USB, SPI Ethernet) and, if Wi-Fi is ever
 adopted, on top of the radio's link layer.
 
@@ -274,7 +274,7 @@ Items A to D are the agreed steps 1 to 4, in that order. Prerequisites sit where
 | J | Filesystem layer chosen per §4.3 and its `file_io` backend for this target | I; choice settled (§6) | none beyond I |
 | K | Interrupt runtime per spec §9 (handler acks and enqueues to the owning worker; pack names IRQ to worker) | design decision (§6) | interrupt matrix, SYSTEM |
 | L | USB OTG device/host stack | B, H, K | USB OTG, GDMA |
-| M | Radio: a decision, not scheduled work | networking chunk | n/a |
+| M | Radio: decided 2026-11-09 (Lee chose R2, ESP-IDF Wi-Fi as foreign code, `transport_esp32s3_wifi_plan.md` §3); the radio work (stages 3 to 9) is deferred, not cancelled (that plan's §8); no radio code exists | networking chunk | n/a |
 | N | UART1 device worker and SLIP (or PPP) link worker | B | UART1, GPIO, IO_MUX, SYSTEM (clock gate) |
 | O | Silica network stack core: owned packet buffers, checksum and byte-order helpers, IPv4, ARP (Ethernet links), ICMP, DHCP, DNS as supervised actors; UDP endpoint actors (one per bound port, a datagram per message) | N; bounds checking (chunk 4) | none beyond N |
 | P | TCP demultiplexer, connection actors (own state machine, retransmission and delayed-ACK timers) and listener actors; the actor surface for programs (connect message returning the connection ref, owner delivery, owned-buffer cast to send, credit-based flow control in both directions) | O; timer source settled (§6) | SYSTIMER or TIMG0/1 if a board-local timer worker is used |
@@ -308,7 +308,9 @@ Items A to D are the agreed steps 1 to 4, in that order. Prerequisites sit where
   that allows.
 - SLIP or PPP for the first link (PPP adds negotiation and authentication; SLIP is smaller).
 
-### Known issue: board emitter heap (recorded 2026-10-28)
+### Known issue: board emitter heap (recorded 2026-10-28; fixed 2026-11-07)
+
+**Fixed (2026-11-07):** chunk 15 phase 9 landed in `029447ad31` ("ESP32-S3_raw: port to the chunk 15 stack memory model (state chains, no actor heap use)"; `make integrate ESP32-S3_raw` 22,694 pass, 0 fail). The two reproducers below were not re-run against the fixed compiler. The text below is the record as written before the fix.
 
 On the board emitter, before chunk 15 phase 9 (`chunk15_stack_memory_design.md` §9.1, §11.1; phase 2 changed only the hosted emitters):
 

@@ -33,7 +33,7 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
 | --- | --- | --- | --- | --- |
 | apple_silicon_mac | tcp, udp, serial | loopback, interface, ethernet n, wifi n, serial_port | yes: verified (Mac dialed Linux x86-64, 2026-11-10/11) | E2 verified (loopback, refusals, classifier `en0` ethernet / `en1` wifi, LAN binds; Wi-Fi port inactive, refusal only) |
 | linux_x86_64 | tcp, udp, serial | same rows as the Mac | yes: verified as the listening end on `manager@aalang.org` | E2 verified (loopback, refusals, classifier, LAN binds on nix; no wireless hardware, refusal only) |
-| linux_aarch64 | same rows in the tree since 2026-11-11 (pack is identical to x86-64's apart from the header comment) | same | UNKNOWN: pack not built or run on an AArch64 host (pix) | built E2, verified on pix (full hosted integrate on the merged tree, then the transport_addition and ffi_addition suites with the rewritten TCP programs, all outputs matching .scout; assembly goldens regenerated afterward); classifier, LAN binds and real Wi-Fi (`wlan0`) verified 2026-11-13/14 |
+| linux_aarch64 | same rows in the tree since 2026-11-11 (pack is identical to x86-64's apart from the header comment) | same | pack built and verified on pix 2026-11-13/14 (see Interface binding) | built E2, verified on pix (full hosted integrate on the merged tree, then the transport_addition and ffi_addition suites with the rewritten TCP programs, all outputs matching .scout; assembly goldens regenerated afterward); classifier, LAN binds and real Wi-Fi (`wlan0`) verified 2026-11-13/14 |
 | ESP32-S3_raw | serial, uart1, usb_serial_jtag (no tcp/udp) | `(:uart, 1, baud)`, `(:usb_serial_jtag)` | no (no Ethernet or Wi-Fi link; out of scope, links design §8) | n/a |
 | STM32-L476RG_raw | none (`provides_carrier` is false for every tag) | none | no | n/a |
 
@@ -45,8 +45,7 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
   `transport_addition/app_transport_tcp_listen_any` (loopback, Apple goldens only), `app_transport_tcp_loopback_link`
   (also run on linux_x86_64 incl. an `(:interface, "lo")` copy; links design §5.1 status). These example runs are
   outside `make integrate`; I did not re-run them for this note.
-- **Not verified:** linux_aarch64 anything (pack rows only); the fixed point of the Linux x86-64 compiler (plan line
-  180); Linux goldens of the transport trials are known stale in places (plan §5b D0).
+- **Not verified:** the fixed point of the current Linux x86-64 compiler (not run, by rule: no fixed point until asked; AArch64 pack verified on pix 2026-11-13/14, see the matrix); Linux goldens of the transport trials are known stale in places (plan §5b D0).
 - **Planned, not built:** connect timeout (E8); TLS/auth (Project BEES, not built as of 2026-11-10).
 
 ## Wording to use
@@ -55,5 +54,5 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
   other dials `<ip>:4550`. Verified Mac to Linux x86-64."
 - "`(:interface, ...)`, `(:ethernet, n)`, `(:wifi, n)` bind the carrier to that interface's IPv4 address and refuse
   `listen:any` (E2, verified 2026-11-13/14: loopback, refusals, classifier, real LAN binds on all three hosted targets, real Wi-Fi on pix; not verified: wireless on nix and the Mac, two addresses on one interface)."
-- "The linux_aarch64 pack has the same rows as linux_x86_64 (written 2026-11-11); not yet built or run on pix."
-- Do not write "Linux AArch64 is not done" (stale) or "AArch64 works" (unproven).
+- "The linux_aarch64 pack has the same rows as linux_x86_64 (written 2026-11-11); built and verified on pix 2026-11-13/14 (full hosted integrate, transport suites, classifier, LAN binds, real Wi-Fi wlan0)."
+- Do not write "Linux AArch64 is not done" (stale) (AArch64 is now verified on pix, 2026-11-13/14; say what was run).

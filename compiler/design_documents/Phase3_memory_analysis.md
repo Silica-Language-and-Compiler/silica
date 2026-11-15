@@ -100,8 +100,10 @@ Mechanisms that would have to change, each compatible with stack allocation (the
   (a compaction every k levels, or when the adopted dynamic part exceeds a threshold). Restores freeing of callee garbage; trades a bounded copy for a bounded retention.
 * **Popping and returning pages inside a dispatch.** After an evacuation at the outermost consumer, decommit (MAP_FIXED remap, already the only Darwin call that works) the committed
   run below SP plus a margin when `committed - (top - SP)` exceeds a threshold. Cheap per event; turns RSS from the deepest point into a decaying high-water.
+  *Partly done (2026-11-14 check):* SD-41 (`6e3f85e229`, 2026-11-13) added `silica_rt_stack_trim_scratch` after the state copy or evacuate on Mac and Linux, decommitting the scratch mid-dispatch. The proven (evacuate) path is unmeasured and has no trial; a general in-dispatch trim after any evacuation is not done.
 * **Scratch placement and size.** Keep the scratch strictly below SP (as for returns) instead of the bottom of the committed run at dispatch end, and size it to the value; or
   evacuate in place by sliding when the source is dead, avoiding the two-pass doubling.
+  *Partly done (2026-11-14 check):* the same SD-41 fix (`6e3f85e229`) fixed the scratch ratchet for the unproven path, with four `stack_*_unproven_state_survives` trials; the keep-below-SP / evacuate-in-place design is not adopted as such.
 * **Boundary structure.** Split a unit across dispatches, or phases across actors (lexing, parsing, checking, SIR, emit) with `:release_on_return`, so the release algorithm and the state
   evacuation return pages between phases. One dispatch per unit forfeits every release policy.
 * **Reservation policy.** Lower the default reserve for compiler actors (explicit `stack_policy(reserve, ...)`) so VSZ and overcommit behave on a Pi; this changes no RSS and is the least important for size.
@@ -140,6 +142,8 @@ Today one pipeline actor holds the whole unit (lex, parse, check, SIR, emit) in 
 **What would be measured (after review):** per-phase footprint over time inside the largest units (which phase is the peak), the size of each boundary value (tokens, AST, checked AST, SIR) against the phase's own peak, and whether the sender's copy is released at actor exit. These decide whether a split lowers the maximum.
 
 ## 8. Haiku request list: first measurement (run only when the build-slot lock is free)
+
+*Partly done (2026-11-14 check):* per-unit self-build profiling is now automatic (`programmer_tools/ram_profile_unit.sh`); `benchmarking/memory_use_reports/data` holds 70 tsv files (2026-11-03 to 2026-11-14) with `peak_footprint_MB` and seconds per unit for seed, gen1, gen2, 999936 and 999922. Still open: the 999939-versus-stage-1 over-time comparison below is not written up.
 
 Goal: peak physical footprint over time for the self-build, one process per unit, with the published 999939 and with stage 1. Footprint, not just resident. No change to compiler source. Run the builds one at a time, 999939 first, in clean copies of the compiler tree so every unit recompiles.
 

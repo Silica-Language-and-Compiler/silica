@@ -179,12 +179,13 @@ Missing:
   the request/reply exchange from both sides (dial and listen in the same program, two connections), plus a failure
   trial for a request with no reply (peer closes) that must end with `(:link_down, ...)` rather than hang. Apple
   goldens regenerated; Linux goldens stay stale until a Linux host (known, see the serial plan).
-- **E4. Remote demo, Mac dials.** `run_demo.sh --remote`: starts the Erlang listener on the remote over ssh (loopback
+  **Partly done (2026-11-14):** the loopback trials exist (`trials/transport_addition/app_transport_tcp_loopback_link`, `_tcp_listener`, `_tcp_listen_any`, `_tcp_link_rules`: one-direction ping/pong plus link-refusal trials). **Still open:** a both-sides exchange trial and the peer-closes-mid-request failure trial.
+- **E4. Remote demo, Mac dials.** **Superseded (2026-11-14): direct TCP replaced the tunnels (§5b, D2/D3 ran direct to manager@aalang.org, `--runs 2` PASS, re-verified 2026-11-11; §7 Q1).** Original text: `run_demo.sh --remote`: starts the Erlang listener on the remote over ssh (loopback
   port), opens `ssh -N -L`, runs the Silica dialer, compares the output, tears down tunnel and remote process
   (trap; no orphan `erl` left on the web host).
-- **E5. Remote demo, remote dials.** Silica listener on the Mac loopback; `ssh -N -R` reverse forward; the remote
+- **E5. Remote demo, remote dials.** **Superseded (2026-11-14): §5b drops the reverse tunnel; the Mac is behind the campus NAT, so one Mac-dialed connection carries both directions (D1, D2).** Original text: Silica listener on the Mac loopback; `ssh -N -R` reverse forward; the remote
   Erlang dials its own loopback and sends `(:request, 1, (:status))`; the Silica listener answers.
-- **E6. Both at once.** One run, two connections, requests from both sides interleaved, ids matched; timeouts and
+- **E6. Both at once.** **Done in the one-connection form (2026-11-14, §5b D1/D2): requests both ways interleaved, ids matched, `--runs 2` PASS, teardown checked; the two-connection variant was dropped.** Original text: One run, two connections, requests from both sides interleaved, ids matched; timeouts and
   cleanup; run twice in a row to prove no stale state. Expected output compared byte for byte.
 - **E7 (optional). Linux x86-64 Silica peer on aalang.org.** (Done in another form by L0 to L2, §5a: the Silica
   peer is built on the remote with the copied hosted compiler and talks to the Mac's Silica end.) The compiler
@@ -193,6 +194,7 @@ Missing:
   Mac and the binary copied.
 - **E8. Hardening and docs.** Reconnect after a drop, connect timeout, large frames (the 4-byte prefix is the limit),
   status lines in the transport and links designs, memory note.
+  **Partly done (2026-11-14):** status lines and docs are done (plan, links design, hosted status) and a link-down ends the carrier (teardown-on-drop, `71009f96f8`). **Still open:** a connect timeout (`silica_sockets_tcp_connect` is still a plain blocking `connect()`) and large frames beyond the 4-byte prefix.
 
 ## 5a. Silica on both ends, Mac and Linux x86-64 (replaces E1; done 2026-11-10)
 
@@ -378,5 +380,5 @@ from 157.201.64.9) was made by the user beforehand.
 
 1. ~~Is a tunnel acceptable, or do you want a real public port?~~ **Answered 2026-11-10:** a real port. TCP 4550 is
    open in `ufw` from the Mac's address only, and the tunnels are dropped (§5b).
-2. Should E7 (Silica on the remote) be in scope, and may I probe it for a C toolchain (`clang`/`ar`)?
-3. Which demo content: the accel/LED terms (same as the serial demo) plus the `:status` request, or something else?
+2. **Moot (2026-11-14):** E7 was done in another form (§5a, L0 to L2: Silica peer built on the remote). Original question: Should E7 (Silica on the remote) be in scope, and may I probe it for a C toolchain (`clang`/`ar`)?
+3. **Answered (2026-11-14, §5a/D1):** odd ids carry accel from the Mac, even ids carry `:status` from Linux. Original question: Which demo content: the accel/LED terms (same as the serial demo) plus the `:status` request, or something else?
