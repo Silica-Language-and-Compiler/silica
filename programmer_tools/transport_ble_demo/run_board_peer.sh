@@ -13,6 +13,8 @@
 # --central: the board scans for a peripheral offering the service and connects to it (the plan's stage
 # 9); the peripheral is then the Mac (./run_peer.sh peripheral [uuid], started first).
 # BOARD_EXTRA_SOURCES=<files> adds C sources to the image, compiled with BOARD_CFLAGS.
+# --open: the board as peripheral asks its central for no pairing (the wrapper's SILICA_BLE_OPEN_LINK),
+# for runs with nobody at the Mac: macOS asks its user to approve every pairing, and every link is one.
 # uuid is the service's UUID (4, 8 or 36 characters); without it the service is the Nordic UART
 # Service. --timeout (default 300) bounds the wait for the central. GUEST_RAM=<bytes> sets Silica's
 # block (the guest's README).
@@ -40,6 +42,7 @@ while [ $# -gt 0 ]; do
         --cut) CUT=$2; shift 2 ;;
         --hold) HOLD=$2; shift 2 ;;
         --central) ROLE=central; shift ;;
+        --open) BOARD_CFLAGS="${BOARD_CFLAGS:-} -DSILICA_BLE_OPEN_LINK"; export BOARD_CFLAGS; shift ;;
         --timeout) TIMEOUT=$2; shift 2 ;;
         -*) echo "run_board_peer: unknown argument $1" >&2; exit 2 ;;
         *) UUID=$1; shift ;;

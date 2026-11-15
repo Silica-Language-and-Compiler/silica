@@ -16,7 +16,10 @@
 # Route R1 (transport_ble_plan.md stage 12, part 5): the stage 7 demo's board program, a Silica program
 # with its actors, on the chip the bare-metal runtime owns: no ESP-IDF start-up, no FreeRTOS.
 #
-#   BOARD_PORT=<port> ./run_r1_peer.sh [--build-only] [--links <n>] [--accel] [<out_dir>]
+#   BOARD_PORT=<port> ./run_r1_peer.sh [--build-only] [--links <n>] [--accel] [--open] [<out_dir>]
+#
+# --open: the board asks its central for no pairing (the wrapper's SILICA_BLE_OPEN_LINK), for runs with
+# nobody at the Mac to approve one at every link.
 #
 # --accel: the stage 8 demo's board program instead (dangerous_ble_board_accel_led: one reading sent, one
 # LED command taken, no busy actors), compiled by run_accel_led.sh --build-only; its peer is the Mac
@@ -43,6 +46,7 @@ while [ $# -gt 0 ]; do
         --build-only) build_only=1; shift ;;
         --links) links=$2; shift 2 ;;
         --accel) accel=1; shift ;;
+        --open) SPIKE_CFLAGS="${SPIKE_CFLAGS:-} -DSILICA_BLE_OPEN_LINK"; shift ;;
         *) break ;;
     esac
 done

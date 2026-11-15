@@ -82,6 +82,8 @@
    macOS lets only an application with a window pair as peripheral). The pairing is LE Secure
    Connections with no code ("Just Works"): it keeps a listener out, and does not prove who the peer
    is. No keys are kept, so every link pairs afresh and neither end can hold keys the other has lost.
+   A Mac asks its user to approve each pairing. For tests with nobody at the central,
+   SILICA_BLE_OPEN_LINK (below) builds a peripheral that asks for no pairing.
 
    The central role (silica_nimble_seek, once the host is ready). This end scans for a peripheral that
    advertises the service, connects, exchanges the MTU, finds the service's characteristic to write
@@ -161,6 +163,17 @@ static uint16_t tx_handle;           /* the indicated characteristic's value han
 static volatile uint16_t link = BLE_HS_CONN_HANDLE_NONE;
 static volatile int subscribed;
 static volatile int encrypted;       /* the link is encrypted; as peripheral nothing passes on it before */
+
+/* A switch for tests that run with nobody at the central: compiled with SILICA_BLE_OPEN_LINK (BOARD_CFLAGS
+   of the image builders) a peripheral asks for no pairing and its characteristics for no encryption. A
+   Mac asks its user to approve every pairing in a dialog, and with no keys kept every link is one. */
+#ifdef SILICA_BLE_OPEN_LINK
+#define ENC_WRITE 0
+#define ENC_INDICATE 0
+#else
+#define ENC_WRITE BLE_GATT_CHR_F_WRITE_ENC
+#define ENC_INDICATE BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC
+#endif
 static int subscribe_again;          /* as central: the subscription was refused for want of encryption */
 static QueueHandle_t rx_queue;       /* segments the central wrote, until silica_nimble_recv */
 static QueueHandle_t tx_queue;       /* segments waiting for the indication before them */
@@ -380,8 +393,12 @@ static int on_gap_event(struct ble_gap_event *event, void *arg) {
                 int rc = ble_gattc_exchange_mtu(link, on_mtu, NULL);
                 if (rc != 0) give_up(link, 1000 + rc);
             } else {
+#ifdef SILICA_BLE_OPEN_LINK
+                encrypted = 1;   /* the test switch: the open link passes as an encrypted one does */
+#else
                 /* a peripheral asks its central to pair; its attributes refuse it until then */
                 ble_gap_security_initiate(link);
+#endif
             }
         }
         post(EV_CONNECTED, event->connect.conn_handle, event->connect.status);
@@ -609,10 +626,10 @@ silica_nimble_tagged silica_nimble_serve(const uint8_t *uuid_ptr, uint64_t uuid_
     memset(characteristics, 0, sizeof characteristics);
     characteristics[0].uuid = &rx_uuid.u;
     characteristics[0].access_cb = on_write;
-    characteristics[0].flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC;
+    characteristics[0].flags = BLE_GATT_CHR_F_WRITE | ENC_WRITE;
     characteristics[1].uuid = &tx_uuid.u;
     characteristics[1].access_cb = on_tx_access;
-    characteristics[1].flags = BLE_GATT_CHR_F_INDICATE | BLE_GATT_CHR_F_NOTIFY_INDICATE_ENC;
+    characteristics[1].flags = BLE_GATT_CHR_F_INDICATE | ENC_INDICATE;
     characteristics[1].val_handle = &tx_handle;
     memset(services, 0, sizeof services);
     services[0].type = BLE_GATT_SVC_TYPE_PRIMARY;

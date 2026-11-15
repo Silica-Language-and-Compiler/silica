@@ -1445,6 +1445,26 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - When the fault has come (five times in all, on both routes): after another link to the same Mac,
     in the same start of the board or a start before. A run that follows a failed one has always passed.
 
+- **Stage 12, part 5, step 4, 2026-11-14: macOS asks its user to approve every pairing, in a dialog, and
+  with no keys kept every link is a pairing. A test switch builds a board that asks for none. The dialog
+  left unanswered is a likely cause of stage 10's pairing fault, not confirmed.**
+  - Learned from Matt Manley, who has been pressing "Connect" at each link: the plan said macOS pairs by
+    itself. It does not. Every run here that paired had a person at the Mac.
+  - What follows for the fault ("encryption is insufficient", the link lost before it is up): a pairing
+    nobody approves does not finish, the Mac's subscription stays refused, and the link fails. That is
+    the fault's shape, and it would come and go as the dialogs were answered or not. Not confirmed: no
+    record was kept of which dialogs were left.
+  - Built: `stdlib/ble/silica_ble_nimble.c` compiled with `SILICA_BLE_OPEN_LINK`: as peripheral it asks
+    its central for no pairing and its characteristics for no encryption. `--open` on
+    `run_board_peer.sh` (the guest) and on `spike_r1/run_r1_peer.sh` sets it. The default is unchanged:
+    an encrypted link is required.
+  - Run, `run_r1_peer.sh --open --links 4`: four frames each way, both ends status 0.
+  - The overnight hunt for the fault (step 3) was stopped at its first run: each of its links raised the
+    dialog.
+  - For later: keys kept on both ends (bonding), so that a Mac asks once for a board. It needs somewhere
+    on the board to keep them that outlives a flash, or a way back from a key only one end still has
+    (§8, decision 4).
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
