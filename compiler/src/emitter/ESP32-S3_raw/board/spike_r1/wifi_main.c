@@ -159,7 +159,12 @@ long long main(void)
 #endif
 #ifdef WIFI_NO_SLEEP
     // the radio stays on between the access point's beacons
+#ifdef WIFI_PS_ON
+    // modem sleep: the station sleeps between the access point's beacons
+    STEP(esp_wifi_set_ps(WIFI_PS_MIN_MODEM), "power save on (modem sleep)");
+#else
     STEP(esp_wifi_set_ps(WIFI_PS_NONE), "power save off");
+#endif
 #endif
     STEP(esp_wifi_start(), "wifi start");
 

@@ -389,6 +389,9 @@ static struct co {
     void (*fn)(void *);
     void *arg;
     uint32_t *stack_top;
+    uint32_t *stack_base;       // the lowest word of its stack, and the stack's size: spike_stack_report
+    uint32_t stack_bytes;
+    const char *name;
     int state;
 } cos[MAX_CO] = { { .state = CO_LIVE } };   // 0 is main's
 static int co_cur;
@@ -495,7 +498,13 @@ int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack
         if (free_slot) {
             // twice what FreeRTOS is asked for and 4 KB more: the controller's handler runs on whichever
             // stack is current, and a switch spills the register windows onto it
+            // (SPIKE_STACK_TIGHT: what is asked for and no more, where memory is short: measured with both
+            // radios at work, a task had used at most half of it; spike_stack_report prints what each has used)
+#ifdef SPIKE_STACK_TIGHT
+            uint32_t bytes = ((stack < 4096 ? 4096 : stack) + 15) & ~15u;
+#else
             uint32_t bytes = (2 * (stack < 4096 ? 4096 : stack) + 4096 + 15) & ~15u;
+#endif
             uint32_t *base = stack_take(bytes);
             if (base == NULL) {
                 cos[i].state = CO_FREE;
@@ -504,6 +513,9 @@ int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack
             cos[i].fn = fn;
             cos[i].arg = arg;
             cos[i].stack_top = base + bytes / 4 - 16;
+            cos[i].stack_base = base;
+            cos[i].stack_bytes = bytes;
+            cos[i].name = name;
             cos[i].state = CO_NEW;
             if (handle) {
                 *handle = &cos[i];
@@ -512,6 +524,27 @@ int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack
         }
     }
     return 0;
+}
+
+// Each task's stack: how much of it has ever been written (a stack starts as zeros).
+void spike_stack_report(void)
+{
+    for (int i = 1; i < MAX_CO; i++) {
+        if (cos[i].state != CO_LIVE || cos[i].stack_base == NULL) {
+            continue;
+        }
+        uint32_t words = cos[i].stack_bytes / 4, low = 0;
+        while (low < words && cos[i].stack_base[low] == 0) {
+            low++;
+        }
+        silica_rt_puts("shim: stack of ");
+        silica_rt_puts(cos[i].name);
+        silica_rt_puts(": used ");
+        spike_put_dec(cos[i].stack_bytes - 4 * low);
+        silica_rt_puts(" of ");
+        spike_put_dec(cos[i].stack_bytes);
+        silica_rt_puts("\n");
+    }
 }
 
 void vTaskDelete(void *handle)
@@ -760,6 +793,18 @@ uint32_t spike_arena_now(void)
 {
     return arena_given;
 }
+
+#ifdef SPIKE_ONE_HEAP
+// The runtime's own summary of the heap (in use, free, the sizes of its blocks), for a debug report.
+void silica_rt_heap_summary(void);
+void spike_heap_report(void)
+{
+    uint32_t ps = mask_level3();
+    silica_rt_heap_summary();
+    unmask(ps);
+    silica_rt_puts("\n");
+}
+#endif
 
 uint32_t spike_arena_used(void)
 {
@@ -1181,12 +1226,23 @@ uint32_t esp_clk_slowclk_cal_get(void)
     static uint32_t cal;
     if (cal == 0) {
         cal = rtc_clk_cal(CLK_CAL_RTC_SLOW, 1024);
+        silica_rt_puts("shim: the slow clock's period, in 2^-19 us: ");
+        spike_put_dec(cal);
+        silica_rt_puts("\n");
     }
     return cal;
 }
 
+// The modem's power domain, for both radios: powered and reset by its first user only, as ESP-IDF
+// counts them (phy_init.c). A reset at the second radio's start would take the first one's MAC and the
+// radio's calibration away.
+static int modem_power_users;
+
 void esp_wifi_bt_power_domain_on(void)
 {
+    if (modem_power_users++ != 0) {
+        return;
+    }
     CLEAR_PERI_REG_MASK(RTC_CNTL_DIG_PWC_REG, RTC_CNTL_WIFI_FORCE_PD);
     esp_rom_delay_us(10);
     SET_PERI_REG_MASK(SYSTEM_WIFI_CLK_EN_REG, SYSTEM_WIFI_CLK_WIFI_BT_COMMON_M);
@@ -1197,6 +1253,10 @@ void esp_wifi_bt_power_domain_on(void)
 
 void esp_wifi_bt_power_domain_off(void)
 {
+    // the domain stays powered
+    if (modem_power_users > 0) {
+        modem_power_users--;
+    }
 }
 
 // The one module bt.c names is Bluetooth's: its clock, and its blocks' resets.
@@ -1378,9 +1438,30 @@ int sprintf(char *out, const char *format, ...)
     return n;
 }
 
+#ifdef SPIKE_WIFI
+// What ESP-IDF's start-up does once before either radio (esp_coex's coexist.c): Espressif's
+// coexistence library is given its adapter and prepared. Called by whichever radio starts first.
+extern void *g_coex_adapter_funcs;
+int esp_coex_adapter_register(void *funcs);
+int coex_pre_init(void);
+void spike_coex_start(void)
+{
+    static int done;
+    if (!done) {
+        done = 1;
+        esp_coex_adapter_register(&g_coex_adapter_funcs);
+        coex_pre_init();
+    }
+}
+#endif
+
+// The Bluetooth controller's first call into the platform (esp_bt_controller_init).
 void esp_phy_modem_init(uint8_t modem)
 {
     (void)modem;
+#ifdef SPIKE_WIFI
+    spike_coex_start();
+#endif
 }
 
 void esp_phy_modem_deinit(uint8_t modem)

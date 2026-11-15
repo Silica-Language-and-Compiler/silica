@@ -18,7 +18,7 @@
 # demos' frame with the Mac on both, on the chip the bare-metal runtime owns: no ESP-IDF start-up, no
 # FreeRTOS.
 #
-#   BOARD_PORT=<port> ./run_r1_both.sh [--build-only] [--links <n>] [<out_dir>]
+#   BOARD_PORT=<port> ./run_r1_both.sh [--build-only] [--links <n>] [--only wifi|ble] [<out_dir>]
 #
 # The program is programmer_tools/transport_both_demo/dangerous_both_board_peer.silica: the hosted
 # (:tcp) carrier above lwIP (run_r1_wifi_peer.sh) and the board's (:ble_gatt) carrier above NimBLE
@@ -42,11 +42,12 @@ PY=${BOARD_PYTHON:-$HOME/.espressif/python_env/idf6.2_py3.14_env/bin/python}
 CC=${SILICA_COMPILER:-$ROOT/compiler/build/ESP32-S3_raw/silica-compiler}
 XT=${XTENSA_BIN:-$HOME/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin}
 PORT=${WIFI_PORT:-4370}
-build_only=0 links=1
+build_only=0 links=1 only=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-only) build_only=1; shift ;;
         --links) links=$2; shift 2 ;;
+        --only) only=$2; shift 2 ;;
         *) break ;;
     esac
 done
@@ -81,6 +82,15 @@ ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" "$SRC/trial_sup
 sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$peer:$PORT\" }|" \
     -e "s|^fn ble_links() -> int64 { 1 }|fn ble_links() -> int64 { $links }|" \
     -e "s|^fn links() -> int64 { 1 }|fn links() -> int64 { $links }|" "$DEMO/dangerous_both_board_peer.silica" > "$SRC/dangerous_both_board_peer.silica"
+# --only wifi|ble: the other radio's carrier is never opened (its libraries are still in the image), and
+# the program ends when the one's links are done
+# BOTH_NO_BUSY=1: the busy actor is never started, so the actors' core goes idle between messages
+[ "${BOTH_NO_BUSY:-0}" = 1 ] && sed -i '' -e '/cast(b0, me impl ActorMessage {});/d' "$SRC/dangerous_both_board_peer.silica"
+case "$only" in
+    wifi) sed -i '' -e '/cast(bcar, (:open, bme, ble_address())/d' -e 's/spawn({ left: 2, code: 0 }, both,/spawn({ left: 1, code: 0 }, both,/' \
+              -e 's/cast(car, (:open, me, address()) impl ActorMessage {});/cast(car, (:open, me, address()) impl ActorMessage {})/' "$SRC/dangerous_both_board_peer.silica" ;;
+    ble) sed -i '' -e '/cast(car, (:open, me, address())/d' -e 's/spawn({ left: 2, code: 0 }, both,/spawn({ left: 1, code: 0 }, both,/' "$SRC/dangerous_both_board_peer.silica" ;;
+esac
 for m in $modules trial_support_hex trial_wait_int64 dangerous_both_board_peer; do echo "$m.silica"; done > "$SRC/silica.config"
 # The compiler wants the archive the .meta names; the wrapper itself is compiled into the image, so
 # the archive here holds only the symbols.
@@ -98,7 +108,8 @@ done
 [ "$ec" -eq 0 ] || { echo "run_r1_both: the program did not compile; see $DEMO/build/board_peer/compile.log" >&2; grep -A8 "Compilation error" "$SRC/../compile.log" | head -14 >&2; exit 1; }
 
 # main's stacks: the builder cannot bound a start that calls into ESP-IDF's code (run_r1_peer.sh)
-syms="-Wl,--defsym,_silica_main_stack_req=0x4000 -Wl,--defsym,_silica_main_aux_req=0x400"
+# (8 KB here, where memory is short: the guest's builder bounds a demo's main at 4.5 KB)
+syms="-Wl,--defsym,_silica_main_stack_req=0x2000 -Wl,--defsym,_silica_main_aux_req=0x400"
 for s in _bt_bss_start _bt_bss_end _bt_controller_bss_start _bt_controller_bss_end _bt_data_start _bt_data_end _bt_controller_data_start _bt_controller_data_end; do
     syms="$syms -Wl,--defsym,$s=0"
 done
@@ -118,10 +129,10 @@ export BOARD_FLASH_FILES
 export BOARD_FLASH_IRAM=1
 inc="-I$out -I$C/esp_wifi/include -I$C/esp_wifi/include/local -I$C/esp_event/include -I$C/esp_netif/include -I$C/esp_phy/include"
 inc="$inc -I$L/include -I$L/include/apps -I$L/include/apps/sntp -I$L/lwip/src/include -I$L/port/include -I$L/port/freertos/include -I$L/port/esp32xx/include -I$L/port/esp32xx/include/arch"
-export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSILICA_BLE_OPEN_LINK -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
+export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSOCKETS_WIFI_PS -DSOCKETS_WIFI_RX_BUFFERS=6 -DSPIKE_STACK_TIGHT -DSILICA_BLE_OPEN_LINK -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
 # the runtime on one core, core 0, for the program's actors; core 1 is the radio's tasks' (r1_port.c)
 export BOARD_ASFLAGS="-DNCORES_RUN=1"
-export BOARD_FFI_STACK=${BOARD_FFI_STACK:-6144}
+export BOARD_FFI_STACK=${BOARD_FFI_STACK:-4096}
 boot=$(ls "$IDF_BUILD"/bootloader/esp-idf/*/lib*.a | tr '\n' ' ')
 mbed=$(find "$IDF_BUILD/esp-idf/mbedtls" -name "*.a" | tr '\n' ' ')
 # shellcheck disable=SC2086

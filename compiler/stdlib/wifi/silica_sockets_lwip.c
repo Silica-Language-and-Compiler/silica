@@ -44,7 +44,8 @@
 
    Outside this file: spike_wifi_event (the station's events, kept by wifi_shim.c where ESP-IDF's
    event loop would deliver them) and spike_net_start, spike_net_address (wifi_net.c, in place of
-   ESP-IDF's esp_netif). Both are route R1's; on a guest of ESP-IDF they would be ESP-IDF's own. */
+   ESP-IDF's esp_netif), and spike_coex_start (hci_shim.c: the coexistence library prepared once,
+   before either radio). All are route R1's; on a guest of ESP-IDF they would be ESP-IDF's own. */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -73,10 +74,8 @@ typedef struct silica_sockets_bytes {
 int spike_wifi_event(int32_t *id, uint8_t data[48]);
 int spike_net_start(void);
 uint32_t spike_net_address(void);
-int esp_coex_adapter_register(void *funcs);
-int coex_pre_init(void);
+void spike_coex_start(void);
 int psa_crypto_init(void);
-extern void *g_coex_adapter_funcs;
 
 #define RX_MAX 4096
 #define CONNECT_MS 5000
@@ -159,7 +158,8 @@ static void station_task(void *unused) {
             }
         }
 #ifdef SOCKETS_HEAP_REPORT
-        // every five seconds: how much of the heap the libraries hold (route R1's one heap)
+        // every five seconds: how much of the heap the libraries hold (route R1's one heap); every thirty,
+        // how much of its stack each task has used
         static uint32_t passes;
         if (++passes % 250 == 0) {
             extern uint32_t spike_arena_now(void);
@@ -168,6 +168,14 @@ static void station_task(void *unused) {
             silica_rt_puts("station: the libraries hold ");
             spike_put_dec(spike_arena_now());
             silica_rt_puts("\n");
+#ifdef SOCKETS_HEAP_SUMMARY
+            extern void spike_heap_report(void);
+            spike_heap_report();
+#endif
+            if (passes % 1500 == 0) {
+                extern void spike_stack_report(void);
+                spike_stack_report();
+            }
         }
 #endif
         vTaskDelay(20);
@@ -176,12 +184,17 @@ static void station_task(void *unused) {
 
 static int station_start(void) {
     if (station_started) return 0;
-    /* what ESP-IDF's start-up does before any radio (esp_coex's coexist.c, mbedtls's esp_psa_crypto_init.c) */
-    esp_coex_adapter_register(&g_coex_adapter_funcs);
-    coex_pre_init();
+    /* what ESP-IDF's start-up does before any radio (esp_coex's coexist.c through spike_coex_start, mbedtls's esp_psa_crypto_init.c) */
+    spike_coex_start();
     if (psa_crypto_init() != 0) return -1;
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     cfg.nvs_enable = 0;
+#ifdef SOCKETS_WIFI_RX_BUFFERS
+    /* fewer of the 1.6 KB receive buffers the station keeps for its whole life (ESP-IDF's default is
+       10), where memory is short; the receive window for aggregated frames must not exceed them */
+    cfg.static_rx_buf_num = SOCKETS_WIFI_RX_BUFFERS;
+    if (cfg.rx_ba_win > SOCKETS_WIFI_RX_BUFFERS) cfg.rx_ba_win = SOCKETS_WIFI_RX_BUFFERS;
+#endif
     static wifi_config_t sta;
     strncpy((char *)sta.sta.ssid, SILICA_WIFI_SSID, sizeof sta.sta.ssid);
     strncpy((char *)sta.sta.password, SILICA_WIFI_PASSPHRASE, sizeof sta.sta.password);
@@ -189,7 +202,13 @@ static int station_start(void) {
     if (e == ESP_OK) e = esp_wifi_set_mode(WIFI_MODE_STA);
     if (e == ESP_OK) e = esp_wifi_set_config(WIFI_IF_STA, &sta);
     /* the radio stays on between beacons: its power saving is not right on this route yet */
+#ifdef SOCKETS_WIFI_PS
+    // modem sleep: the station sleeps between the access point's beacons. Espressif's coexistence
+    // needs it when the Bluetooth controller shares the radio.
+    if (e == ESP_OK) e = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+#else
     if (e == ESP_OK) e = esp_wifi_set_ps(WIFI_PS_NONE);
+#endif
     if (e == ESP_OK && xTaskCreatePinnedToCore(station_task, "station", 4096, NULL, 5, NULL, 1) != pdPASS) e = ESP_FAIL;
     if (e == ESP_OK) e = esp_wifi_start();
     if (e != ESP_OK) return -1;
