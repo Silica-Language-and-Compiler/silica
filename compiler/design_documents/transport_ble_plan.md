@@ -1185,6 +1185,80 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Not shown: data in both directions (no host), actors beside the controller, both cores, the board as
     central.
 
+- **Stage 12, part 4, 2026-11-14, begun: a host on the chip Silica owns. NimBLE first, on the shim; its
+  reading pass is done. It asks for 21 functions more than the controller did, and its code does not fit
+  in RAM beside a Silica program.**
+  - Why NimBLE first (Matt Manley agreed): the wrapper, the radio actor and the carrier stand on its API,
+    so the stage 7 demo would run unchanged on either runtime, and pairing comes with it. A host in Silica
+    (§2.4) stays the later work; it speaks HCI and can be built on either base.
+  - Read from the guest's build of the stage 7 demo: the wrapper's object followed through ESP-IDF's
+    libraries by symbol, stopping at the edge of the Bluetooth and radio code.
+    - Inside the edge: the wrapper, 58 objects of `libbt.a` (NimBLE's host, its port to FreeRTOS, its
+      own cryptography, and `bt.c`), 87 of the controller, 19 of the radio libraries.
+    - Asked of the outside: 87 functions. The shim answers 66 already. The 21 more:
+      - FreeRTOS, 10: how full a queue is (four forms), a queue emptied, a mutex taken twice by its holder
+        (two), a delay, "which task am I", "is the scheduler running".
+      - Timers, 2 more, and they must fire now: NimBLE's timeouts are ESP-IDF timers.
+      - Memory, 4 more (free, resize, two measures), so the block must take memory back.
+      - `snprintf`, a log level, NVS's start and erase (nothing is kept, so they answer "done").
+    - A second task: NimBLE's host runs in a task of its own beside the controller's.
+  - Size, from the guest image's map:
+
+    | Library | Code | Constants and data |
+    | --- | --- | --- |
+    | NimBLE and the glue (`libbt.a`) | 105 KB | 6 KB |
+    | the controller | 81 KB | 6 KB |
+    | the radio libraries | 36 KB | 8 KB |
+
+    A bare-metal image is loaded whole into RAM, 399 KB for code, data, stacks and heap together. Step
+    4's image, without NimBLE, left 104 KB. NimBLE's code and the memory it takes when it starts come to
+    more than that.
+  - What follows: a test of NimBLE on the shim can be made to fit only with nothing else in the image,
+    and a Silica program beside it cannot. Route R1 needs the bare-metal runtime to run code from flash,
+    as the guest image does through ESP-IDF's bootloader. That is its own piece of work and comes before
+    a whole demo on R1.
+
+- **Stage 12, part 4, step 1, 2026-11-14, done: code and constants run from flash on the chip the
+  bare-metal runtime owns. With the controller and the radio libraries in flash the image's RAM for the
+  heap doubles, and step 5's connection holds as before.**
+  - Built:
+    - `tools/flash_layout.py` and `BOARD_FLASH_FILES` in `tools/build_image.sh`: the code and constants
+      of the files named are linked at the addresses flash is mapped to, with any section named
+      `.flash.text*` or `.flash.rodata*`. Data, `.bss` and code a file marks for RAM stay in RAM. The
+      image is then three parts in one file: the part the ROM loads into RAM at offset 0, the constants
+      at 512 KB, the code at 768 KB.
+    - `spike_r1/spike_flash.c`: the mapping, at main's start, by ESP-IDF's own code from its bootloader's
+      libraries: the cache and the flash chip set up, the two parts mapped, the cache on.
+    - `spike_r1/flash_main.c`: a function linked into flash that prints a text linked into flash.
+    - `run_hci.sh --flash`: step 5's image with the controller, the radio libraries and ESP-IDF's glue
+      in flash.
+  - Results:
+    - `flash_main`: `hello from flash, text and all`, `the function answered 40`, status 0.
+    - The HCI image (handler by interrupt, main busy 30 ms between visits): the Mac's link up 30.9 s,
+      2,936 handler calls, status 0.
+
+      | | All in RAM | Bluetooth code in flash |
+      | --- | --- | --- |
+      | Code in RAM | 155 KB | 64 KB |
+      | Code in flash | | 95 KB |
+      | Constants in flash | | 11 KB |
+      | Left for the heap | 104 KB | 206 KB |
+
+  - Learned:
+    - The chip has one table of flash pages, seen through both buses: page n is at `0x3C000000` + n × 64 KB
+      for data and at `0x42000000` + n × 64 KB for code. Constants and code cannot both start at page 0.
+    - The instruction cache must be given its size, ways and line length before it is used
+      (`rom_config_instruction_cache_mode`). ESP-IDF does it at the application's start, not in the
+      bootloader. Without it the instruction bus reads zeros where the data bus reads the page.
+    - An image with parts in flash cannot be loaded into RAM for a run; it is written to flash each time,
+      as a guest image is.
+  - `silica_08_stack_guard` and `silica_09_lists` match with the changed builder.
+  - Not done: Silica's own code in flash. The runtime and a compiled program are still loaded into RAM;
+    the guest runtime already runs both from flash, so what it changed for that is the guide. The mapping
+    belongs in the runtime's start, before main, when that is done.
+  - Next: NimBLE on the shim (the 21 functions, a second task, timers that fire), then the wrapper under
+    a C main: the frame exchanged with the Mac, pairing included.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

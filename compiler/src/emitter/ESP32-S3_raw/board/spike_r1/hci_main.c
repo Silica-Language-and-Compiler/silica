@@ -32,6 +32,7 @@ void spike_put_dec(uint32_t n);
 uint64_t spike_ticks(void);
 void spike_yield(void);
 void spike_poll(void);
+int spike_flash_map(void);
 uint32_t spike_arena_used(void);
 extern uint32_t spike_handler_calls, spike_switches;
 
@@ -140,6 +141,13 @@ static int ask(const char *what, uint8_t *command, uint16_t len)
 
 long long main(void)
 {
+#ifdef SPIKE_FLASH
+    if (spike_flash_map() != 0) {
+        silica_rt_puts("flash not mapped\n");
+        return 1;
+    }
+    silica_rt_puts("flash mapped\n");
+#endif
     esp_rom_output_tx_wait_idle(0);
     rtc_clk_config_t clk = RTC_CLK_CONFIG_DEFAULT();
     clk.cpu_freq_mhz = 80;

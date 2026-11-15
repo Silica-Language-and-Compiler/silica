@@ -21,7 +21,8 @@
 #
 # A .c source is compiled by ESP-IDF's own command: that of its bootloader build, which has no
 # FreeRTOS, or with --app that of the application (the guest image), whose include paths reach the
-# Bluetooth headers. SPIKE_CFLAGS adds flags. Every other source (.S, .o, .a) goes to the bare-metal
+# Bluetooth headers; a source written boot:<file>.c is compiled by the bootloader's command even then.
+# SPIKE_CFLAGS adds flags. Every other source (.S, .o, .a) goes to the bare-metal
 # builder as it is; spike_support.c is always added. The chip's ROM symbols and the peripherals'
 # addresses come from ESP-IDF's linker scripts.
 #
@@ -48,7 +49,8 @@ case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
 mkdir -p "$(dirname "$out")"
 
 # ESP-IDF's compile command for one of its files, less that file and its output
-cmd=$(python3 - "$db" "$like" <<'PY'
+command_like() {
+    python3 - "$1" "$2" <<'PY'
 import json, shlex, sys
 for e in json.load(open(sys.argv[1])):
     if e['file'].endswith(sys.argv[2]):
@@ -57,12 +59,20 @@ for e in json.load(open(sys.argv[1])):
         print(' '.join(shlex.quote(x) for x in a if x != '-Werror'))
         break
 PY
-)
+}
+cmd=$(command_like "$db" "$like")
+bootcmd=$(command_like "$IDF_BUILD/bootloader/compile_commands.json" "port/esp32s3/rtc_clk.c")
 inc="-I$IDF_PATH/components/esp_phy/include -I$IDF_PATH/components/esp_phy/esp32s3/include"
 sources=""
 n=0
 for src in "$@"; do
     case "$src" in
+        boot:*.c) n=$((n + 1))
+             obj="$out.$n.o"
+             src=${src#boot:}
+             abs="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+             ( cd "$IDF_BUILD/bootloader" && eval "$bootcmd $inc ${SPIKE_CFLAGS:-} -Wno-unused-parameter -o '$obj' -c '$abs'" )
+             sources="$sources $obj" ;;
         *.c) n=$((n + 1))
              obj="$out.$n.o"
              abs="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
