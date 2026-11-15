@@ -1766,6 +1766,44 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - `flash_layout.py script --iram` (`BOARD_FLASH_IRAM=1`): the listed libraries' code marked for RAM
     (`.iram1`) goes to flash as well, for an image that never takes its flash away. Not used by the
     single-radio scripts.
+- **Stage 12, part 11, 2026-11-15, begun: both radios in one image.** Not working yet: the image
+  builds, both radios' libraries start beside each other, no link has come up on either.
+  - **The program and the script.** `programmer_tools/transport_both_demo/dangerous_both_board_peer.silica`
+    declares `carried_on lan: (:tcp) (:wifi, 0);` and `carried_on phone: (:ble_gatt) (:bluetooth, 0);`
+    and has an owner for each (the Wi-Fi demo's owner written twice, for the two carriers' reference
+    types and rules) and a coordinator that ends the program when both owners' links are done.
+    `spike_r1/run_r1_both.sh` builds it with the hosted `(:tcp)` carrier above lwIP, the board's
+    `(:ble_gatt)` carrier above NimBLE, both wrappers, the shims and every library of the two
+    single-radio images: 45 KB of code in RAM, 956 KB in flash. The Mac's ends are `wifi_peer.py` and
+    `run_peer.sh central`.
+  - **Memory is the first limit.** Measured in this image, 160 MHz:
+
+    | What | Bytes |
+    | --- | --- |
+    | The heap (the RAM left after code, constants, data and main's stack) | 265,152 |
+    | The libraries hold once both have started (Wi-Fi not joined, no Bluetooth link) | 127,760 |
+    | The runtime and the demo's eleven actors hold at the first refused allocation | about 130,000 |
+
+    An actor holds 7 to 11 KB (a 4 KB stack chunk, a 2 KB state chunk, its record and mailbox) and
+    one that makes foreign calls about 16 KB more. What was done for it:
+    - the Bluetooth libraries' `.iram1` code and the wrappers' code moved to flash
+      (`BOARD_FLASH_IRAM=1`): the code in RAM went from 85 KB to 45 KB;
+    - tasks' stacks are taken first from 32 KB of RAM the heap does not reach, 0x3FCF0000 to
+      0x3FCF8000 (ESP-IDF's memory layout gives it to its heap when the data cache is 32 KB or less;
+      `spike_flash.c` now sets the data cache's size as ESP-IDF's start does); two of the five fit;
+    - `hci_shim.c` prints what the libraries hold when a task is made and when an allocation is
+      refused; `-DSOCKETS_HEAP_REPORT` prints it every five seconds.
+    Not yet tried: 16 KB of instruction RAM at 0x40374000 for runtime code; the tasks' stacks at the
+    size ESP-IDF asks for plus 4 KB in place of twice it plus 4 KB; fewer Wi-Fi receive buffers and
+    Bluetooth activities than the guest's configuration; main's stack at 8 KB.
+  - **Wi-Fi power saving is the second.** With the Bluetooth controller running, the station did
+    not join in 50 s. Espressif's coexistence shares the one radio by time, and needs the station in
+    modem sleep so that the access point holds its frames while Bluetooth has the radio; ESP-IDF
+    refuses `WIFI_PS_NONE` when both are on. The station here runs with `WIFI_PS_NONE` because power
+    saving loses beacons on route R1 (part 6). So this part waits on that one.
+  - When the libraries take all of the heap the runtime's own allocation aborts the program
+    (`heap exhausted`): on one heap the libraries need a limit of their own.
+  - After these changes the single-radio images: Wi-Fi five links of five, Bluetooth three of three.
 
 ## 7. Facts the design rests on
 

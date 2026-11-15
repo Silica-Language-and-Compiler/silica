@@ -95,6 +95,8 @@ int64_t esp_timer_get_time(void)
 #endif
 
 void *malloc(size_t n);
+static void *stack_take(uint32_t bytes);
+uint32_t spike_arena_now(void);
 
 #define MAX_IRQ 8
 static struct irq {
@@ -480,6 +482,8 @@ int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack
     silica_rt_puts(name);
     silica_rt_puts(", stack asked ");
     spike_put_dec(stack);
+    silica_rt_puts(", the libraries hold ");
+    spike_put_dec(spike_arena_now());
     silica_rt_puts("\n");
     for (int i = 1; i < MAX_CO; i++) {
         uint32_t ps = mask_level3();
@@ -492,7 +496,7 @@ int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack
             // twice what FreeRTOS is asked for and 4 KB more: the controller's handler runs on whichever
             // stack is current, and a switch spills the register windows onto it
             uint32_t bytes = (2 * (stack < 4096 ? 4096 : stack) + 4096 + 15) & ~15u;
-            uint32_t *base = malloc(bytes);
+            uint32_t *base = stack_take(bytes);
             if (base == NULL) {
                 cos[i].state = CO_FREE;
                 return 0;
@@ -546,6 +550,9 @@ void vPortYield(void)
 }
 
 // ---- memory ----
+
+#define STACK_POOL_START 0x3FCF0000u
+#define STACK_POOL_END   0x3FCF8000u
 
 #ifdef SPIKE_ONE_HEAP
 // One heap for the whole chip: the libraries' blocks come from the runtime's heap (rt_heap.S), beside
@@ -606,7 +613,7 @@ void *malloc(size_t n)
 
 void free(void *p)
 {
-    if (p == NULL) {
+    if (p == NULL || ((uintptr_t)p >= STACK_POOL_START && (uintptr_t)p < STACK_POOL_END)) {
         return;
     }
     uint32_t ps = mask_level3();
@@ -749,9 +756,38 @@ int heap_caps_add_region(intptr_t start, intptr_t end)
     return 0;
 }
 
+uint32_t spike_arena_now(void)
+{
+    return arena_given;
+}
+
 uint32_t spike_arena_used(void)
 {
     return arena_most;
+}
+
+// Tasks' stacks first come from the 32 KB of RAM above the ROM's own, which the runtime's heap does
+// not reach (0x3FCF0000: free while the data cache is 32 KB or less, spike_flash.c), one after another
+// and never given back; when that is full, from the heap. Only in an image on the one heap (those map
+// their flash with spike_flash.c, which sets the data cache's size).
+static uint32_t stack_pool_next = STACK_POOL_START;
+
+static void *stack_take(uint32_t bytes)
+{
+#ifdef SPIKE_ONE_HEAP
+    uint32_t ps = mask_level3();
+    void *p = NULL;
+    if (STACK_POOL_END - stack_pool_next >= bytes) {
+        p = (void *)stack_pool_next;
+        stack_pool_next += bytes;
+    }
+    unmask(ps);
+    if (p) {
+        memset(p, 0, bytes);
+        return p;
+    }
+#endif
+    return malloc(bytes);
 }
 
 // ---- queues, semaphores and mutexes ----

@@ -158,6 +158,18 @@ static void station_task(void *unused) {
                 esp_wifi_connect();
             }
         }
+#ifdef SOCKETS_HEAP_REPORT
+        // every five seconds: how much of the heap the libraries hold (route R1's one heap)
+        static uint32_t passes;
+        if (++passes % 250 == 0) {
+            extern uint32_t spike_arena_now(void);
+            extern void spike_put_dec(uint32_t n);
+            extern void silica_rt_puts(const char *s);
+            silica_rt_puts("station: the libraries hold ");
+            spike_put_dec(spike_arena_now());
+            silica_rt_puts("\n");
+        }
+#endif
         vTaskDelay(20);
     }
 }
