@@ -1592,6 +1592,55 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Not done: a Silica program in the image (this is a C main); the peer a Silica program or an Erlang
     node; the board listening; IPv6; a frame larger than one segment; main busy between its calls.
 
+- **Stage 12, part 6, step 3, 2026-11-15, done: a Silica program with its actors exchanges the demo's
+  frame with the Mac over Wi-Fi and TCP on route R1, thirty links of thirty.**
+  - Built, each the Bluetooth piece of the same place with the names changed and little else:
+
+    | Piece | File | Made from |
+    | --- | --- | --- |
+    | The wrapper | `compiler/stdlib/wifi/silica_wifi_lwip.c` and its `.meta` | new, in the shape of `silica_ble_nimble.c`: the same calls, the same event numbers |
+    | Its Silica module | `compiler/stdlib/dangerous_wifi.silica` | `dangerous_nimble` |
+    | The radio actor | `compiler/stdlib/dangerous_wifi_radio.silica` | `dangerous_ble_radio`, the wrapper's module changed and nothing else |
+    | The carrier | `compiler/stdlib/dangerous_tcp_board_carrier.silica` | `dangerous_ble_gatt_board_carrier`, the address's forms changed |
+    | The program | `programmer_tools/transport_wifi_demo/dangerous_wifi_board_peer.silica` | the stage 7 board program, framing by wireframe's `:stream` mode |
+    | The script | `spike_r1/run_r1_wifi_peer.sh [--links <n>]` | `run_r1_peer.sh` |
+
+    The image is step 2's with the program in place of the C main, built as part 5's: the runtime and
+    the program's actors on core 0, the Wi-Fi libraries' tasks, lwIP's task and the Wi-Fi interrupt on
+    core 1. No file of the shim changed for the second core.
+  - The wrapper never waits: it makes the connection on a socket that does not block and reads it
+    with `MSG_DONTWAIT`, and `silica_wifi_event` does one step of each thing that goes on by itself.
+    A TCP connection has no second step after it is made, so the wrapper reports NimBLE's
+    `:subscribed` at once and the radio actor is unchanged.
+  - **No compiler change.** The pack for this target has no `(:tcp)` carrier and no `(:wifi, n)` link,
+    so the program has no `carried_on`: it spawns the carrier as an ordinary actor, with the state
+    written out (a call into a `dangerous_` module is allowed only in an FFI worker, E4042), and reads
+    the carrier's row by its tag, `Carrier@mtu(:tcp)`. The pack rows are the Wi-Fi plan's stage 7.
+  - Run, 160 MHz, power saving off, the Mac's end `wifi_peer.py` (it sends each frame back):
+
+    | Links whole, both ends | Reasons for the links' ends | Each link | The radio's memory, a link up |
+    | --- | --- | --- | --- |
+    | 30 of 30, status 0 | 30 `:closed` | about 8.5 s | 49 KB free of 112 KB, the least 42 KB, steady |
+
+    The program's two busy actors share core 0 with the radio actor as in part 5, which is most of a
+    link's time; the Bluetooth program takes 11.5 s a link at this clock.
+  - The image: 56 KB of code and 16 KB of data in RAM, 646 KB of code and 112 KB of constants in flash.
+  - **Beside the hosted work on `main`** (fetched 2026-11-15; this branch was cut from 2026-11-09's):
+    - Lee's stage E2 gave the hosted `(:tcp)` carrier link binding (`carried_on` with `(:ethernet, n)`,
+      `(:wifi, n)`, `(:loopback)`, an interface by name), the addresses `listen:<ipv4>:<port>` and
+      `listen:any:<port>`, and a carrier that ends itself after `(:link_down, :fault)` when its link is
+      unavailable. It is the Mac's and Linux's carrier; nothing there is the board's. The board carrier
+      here takes that carrier's address forms (a peer is `a.b.c.d:port`, a listener `listen:...`) and
+      none of its link binding or its endings yet.
+    - Project BEES (secure interchange above the `(:tcp)` carrier: mutual TLS 1.3, a BEAM mode with a
+      cookie) names Mbed TLS as its TLS engine on the ESP32-S3. This image has Mbed TLS linked, for
+      WPA3's key exchange.
+    - `main` does not merge cleanly into this branch: four files conflict (`Carrier.silica`, the Apple
+      transport pack, `type_checker_links.silica`, the transport design), each where both sides added
+      rows, and the goldens under them. `ble-transport-support` has the same merge ahead of it.
+  - Not done: the board listening; the peer a Silica program or an Erlang node; a link lost in the
+    middle (the access point gone, the peer gone); a frame over 1024 bytes; both radios in one image.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
