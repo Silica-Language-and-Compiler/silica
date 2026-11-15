@@ -21,6 +21,8 @@
 # --open: the board asks its central for no pairing (the wrapper's SILICA_BLE_OPEN_LINK), for runs with
 # nobody at the Mac to approve one at every link.
 #
+# R1_CPU_MHZ=80|160|240: the processor's clock (80 unless given).
+#
 # --accel: the stage 8 demo's board program instead (dangerous_ble_board_accel_led: one reading sent, one
 # LED command taken, no busy actors), compiled by run_accel_led.sh --build-only; its peer is the Mac
 # program that script builds, build/accel_led/mac/dangerous_ble_mac_led.
@@ -78,7 +80,7 @@ for f in "$SRC"/*.sams; do
     BOARD_FLASH_FILES="$BOARD_FLASH_FILES *.$(basename "$f" .sams).o"
 done
 export BOARD_FLASH_FILES
-export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DARENA_KB=${ARENA_KB:-96}"
+export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DARENA_KB=${ARENA_KB:-96} -DR1_CPU_MHZ=${R1_CPU_MHZ:-80}"
 # the runtime on one core, core 0, for the program's actors; core 1 is the Bluetooth tasks' (r1_port.c)
 export BOARD_ASFLAGS="-DNCORES_RUN=1"
 # The controller's handler interrupts core 1 only, so no actor's stack needs room for it.

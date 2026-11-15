@@ -1,6 +1,6 @@
 # Bluetooth Low Energy transport, `(:ble_gatt)`: development plan
 
-Status: **2026-11-14. Stages 1 to 9 are closed, stage 10 is open (§6), stage 11, Linux, is deferred, and stage 12 studies the route on which Silica owns the chip. The goal, the design and the
+Status: **2026-11-15. Stages 1 to 9 are closed, stage 10 is open (§6), stage 11, Linux, is deferred, and stage 12 studies the route on which Silica owns the chip, for Bluetooth and, from part 6, for Wi-Fi. The goal, the design and the
 vocabulary are decided (§8: Matt Manley).** It refines §6.5 and phase 5 of
 [transport_serialization_design.md](transport_serialization_design.md) (the "transport design" below). Link naming is
 from [transport_links_design.md](transport_links_design.md) (the "links design"). The board's radio is hosted as
@@ -270,9 +270,10 @@ FreeRTOS. Nothing above the controller changes: the wrapper's calls, the radio a
 guest of ESP-IDF (§2.1) stays the built route and the reference an R1 build is compared against. Lee's
 decisions on the radio routes are in the Wi-Fi plan.
 
-The spike is an experiment on a branch of its own, `ble-r1-spike`, cut from `ble-transport-support` (Matt
-Manley, 2026-11-14). If it succeeds it is merged into `ble-transport-support`; Wi-Fi development is taken up
-after that, on the merged base.
+The spike is an experiment on a branch of its own, `r1-radio-spike` (named `ble-r1-spike` until 2026-11-15),
+cut from `ble-transport-support` (Matt Manley, 2026-11-14). Wi-Fi on this route is worked out on the same
+branch (Matt Manley, 2026-11-15), and what the route changes in the runtime stays on it until the route is
+put to Lee. If it succeeds it is merged into `ble-transport-support`.
 
 1. **A reading pass**, with no board: every call the closed libraries make outside themselves, sorted into
    what the bare-metal runtime answers today, what needs new runtime work, and what is unclear.
@@ -1003,7 +1004,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
       guest.
 
 - **Stage 12, part 2, 2026-11-14, decided: the spike goes ahead, as an experiment on the branch
-  `ble-r1-spike` (Matt Manley).**
+  `ble-r1-spike` (Matt Manley), renamed `r1-radio-spike` on 2026-11-15.**
 
 - **Stage 12, part 3, step 1, 2026-11-14, done: on a chip the bare-metal runtime owns, the clocks reach what
   the radio needs and Espressif's closed radio start returns, four runs of four. Nothing was on the air.**
@@ -1485,6 +1486,87 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     10,448 bytes free with a link up; ESP-IDF's heap on the guest had 35,420.
   - Not compared: a program without busy actors, where R1's one core for actors costs less; the board as
     central; links held up for long.
+
+- **Stage 12, part 5, step 6, 2026-11-15, done: the processor's clock on route R1 raised from 80 MHz. Thirty
+  links of thirty at 160 and at 240 MHz; at the guest's clock R1 takes 1.7 times the guest's time.**
+  - `R1_CPU_MHZ=80|160|240` on `run_r1_peer.sh` (`r1_port.c`; 80 unless given). All three come from the
+    480 MHz PLL and the bus the radio is on stays at 80 MHz. The guest runs at 160 MHz
+    (`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`), so step 5 compared R1 at half the guest's clock.
+  - Run as step 5 (the stage 7 program, `--open`, `--links 30`, the Mac central):
+
+    | Route and clock | Links whole, both ends | The Mac's time | Each link |
+    | --- | --- | --- | --- |
+    | R1, 80 MHz (step 5) | 30 of 30 | 631 s | 21 s |
+    | R1, 160 MHz | 30 of 30 | 344 s | 11.5 s |
+    | R1, 240 MHz | 30 of 30 | 249 s | 8.3 s |
+    | Guest, 160 MHz (step 5) | 30 of 30 | 201 s | 6.7 s |
+
+    Every link ended `:closed`, both ends status 0.
+  - What is left of the gap at 160 MHz is the one core R1's actors have (step 5).
+  - The images' sizes in flash, this program: R1 522 KB (85 KB loaded to RAM, 383 KB of code and 55 KB
+    of constants run in place); the guest's application 733 KB, beside ESP-IDF's bootloader.
+  - Not measured: the time from reset to the first advertisement on each route; RAM, like for like.
+
+- **Stage 12, part 6, 2026-11-15: Wi-Fi on route R1. A reading pass, then a first image: on the chip the
+  bare-metal runtime owns, Espressif's Wi-Fi libraries join a WPA2/WPA3 access point and stay joined.**
+  The Wi-Fi plan chose the guest route (its R2) and names this one, its R1, as the long-term path; its
+  stages are deferred and it is not changed here.
+  - **Reading pass** (the guest's cached ESP-IDF build, a station that sends and takes raw frames, no
+    network stack):
+
+    | | Bluetooth (built) | Wi-Fi station |
+    | --- | --- | --- |
+    | Functions needed from outside the radio's libraries, cryptography apart | 87 | 111, of which the R1 image had 39 |
+    | Code | 383 KB | 382 KB as linked (below), Mbed TLS's part in it |
+    | Above it | NimBLE, in the figure | lwIP: 137 KB and 28 outside functions, nearly all in the shim already (not linked yet) |
+
+    The closed libraries (`libnet80211.a`, `libpp.a`, `libcore.a`) reach the OS through a table of 128
+    functions that ESP-IDF's open `esp_wifi/esp32s3/esp_adapter.c` fills. The mesh library (219 KB),
+    which the reading counted, is not pulled into the link.
+  - **Built** (`spike_r1/wifi_main.c`, `wifi_shim.c`, `run_wifi.sh`): a C main on the bare-metal runtime,
+    one core, the Wi-Fi interrupt at level 3. `wifi_shim.c` answers what Wi-Fi asks beyond `hci_shim.c`:
+    event groups, the ROM's timers, events kept for main, per-task values, the C library's locks, a
+    store that keeps nothing, the Wi-Fi MAC's clock and reset. Linked from the guest's build: ESP-IDF's
+    glue, its WPA supplicant, Mbed TLS, the register code of the chip's AES, SHA and big-number
+    hardware, and Espressif's own coexistence library. `flash_layout.py` places the sections these
+    libraries name for RAM (`.wifi0iram` and the like) in flash. The access point's name and passphrase
+    come from a file outside git (`run_wifi.sh`'s header).
+  - **What ESP-IDF's start-up does that a bare-metal image must do itself**, each found by a hang or a
+    fault:
+    - every modem clock bit set (`SYSTEM_WIFI_CLK_EN`) and the MAC's low-power clock chosen: without
+      them the MAC never answers its start and `libpp.a`'s `hal_init` waits for ever;
+    - the Wi-Fi MAC's own reset when the glue asks for it (the shim reset Bluetooth's blocks);
+    - `esp_coex_adapter_register` and `coex_pre_init`: the chip's ROM holds coexistence code that the
+      Wi-Fi library calls, and its tables are empty until then (a load from address 0x28 in the ROM's
+      `coex_schm_interval_set`). Stand-ins for the coexistence calls cannot be used with Wi-Fi;
+    - `psa_crypto_init`: without it every key operation fails, and a WPA3 join is refused at once
+      (reason 202);
+    - a C-library mutex declared ready is all ones, not zero.
+  - **Result**, the access point offering WPA2 and WPA3 (the station takes WPA3's exchange), 160 MHz:
+
+    | Main busy between visits to the tasks | Joined after asking | Stayed joined | Frames taken |
+    | --- | --- | --- | --- |
+    | 0 ms | 1.0 s | 57 s, the run's end | 283 (86 KB) |
+    | 20 ms | 3.1 s | 24 s, the run's end | 67 |
+    | 100 ms | 5.3 s | 21 s, the run's end | 44 |
+
+    So the Wi-Fi tasks, like Bluetooth's, bear 100 ms between turns once the interrupt is taken. Most
+    memory given by the shim's block: 61 KB of 160 KB. The image: 52 KB of code and 10 KB of data in
+    RAM, 382 KB of code and 65 KB of constants in flash.
+  - **Open.**
+    - With the radio's power saving on (the default) the station joins but takes 2 frames in 21 s and
+      reports beacons missed twice; the runs above have it off (`esp_wifi_set_ps(WIFI_PS_NONE)`). The
+      shim's radio start has none of ESP-IDF's wake-up path.
+    - Forced to WPA2's exchange alone (`-DWIFI_NO_SAE`) the join fails with reason 1; not looked into.
+      A WPA2-only access point is untried.
+    - Nothing is sent: no network stack is in the image. lwIP is next.
+    - Both radios in one image; the Wi-Fi tasks on core 1 beside a Silica program.
+    - The shim's random numbers are not fit for keys outside a spike.
+    - The DMA paths of the AES and SHA hardware stop the program if reached; none was.
+  - **Tools for a hang** (`-DSPIKE_DEBUG`): `spike_debug_watch` reports every two seconds where the
+    processor is and who called, from a level-3 timer interrupt; Espressif's ROM ELF
+    (`~/.espressif/tools/esp-rom-elfs`) names an address in the ROM. `-DWIFI_LOG` turns on the Wi-Fi
+    library's own log, which prints the access point's name.
 
 ## 7. Facts the design rests on
 

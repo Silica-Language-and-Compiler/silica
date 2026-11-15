@@ -47,6 +47,7 @@
 #include "soc/syscon_reg.h"
 #include "soc/system_reg.h"
 #include "soc/efuse_reg.h"
+#include "soc/periph_defs.h"
 #include "soc/systimer_reg.h"
 #include "esp_rom_sys.h"
 #include "esp_phy_init.h"
@@ -280,12 +281,49 @@ void spike_poll(void)
 {
 }
 
+#ifdef SPIKE_DEBUG
+// Starts the watch: the processor's second cycle timer, a level-3 interrupt, reports every two
+// seconds where the program is (the timer counts the processor's cycles: a longer gap at a slower clock).
+void spike_debug_watch(void)
+{
+    uint32_t count, enabled;
+    silica_rt_level3_handler = dispatch;
+    __asm__ volatile("rsr.ccount %0" : "=r"(count));
+    count += 480000000u;
+    __asm__ volatile("wsr.ccompare1 %0\n rsync" : : "r"(count));
+    __asm__ volatile("rsr.intenable %0" : "=r"(enabled));
+    enabled |= 1u << 15;
+    __asm__ volatile("wsr.intenable %0\n rsync" : : "r"(enabled));
+}
+#endif
+
 // called by the runtime's level-3 path
 static void dispatch(void)
 #else
 void spike_poll(void)
 #endif
 {
+#if defined(SPIKE_DEBUG) && defined(SPIKE_INTERRUPT)
+    {
+        // the watch (spike_debug_watch): every two seconds, where the processor was and who called it
+        uint32_t fired, pc, ra, count;
+        __asm__ volatile("rsr.interrupt %0" : "=r"(fired));
+        if (fired & (1u << 15)) {
+            __asm__ volatile("rsr.epc3 %0" : "=r"(pc));
+            __asm__ volatile("rsr.excsave3 %0" : "=r"(ra));
+            __asm__ volatile("rsr.ccount %0" : "=r"(count));
+            count += 480000000u;
+            __asm__ volatile("wsr.ccompare1 %0\n rsync" : : "r"(count));
+            static const char digits[] = "0123456789abcdef";
+            char text[40] = "shim: at ........ from ........\n";
+            for (int i = 0; i < 8; i++) {
+                text[9 + i] = digits[(pc >> (28 - 4 * i)) & 15];
+                text[23 + i] = digits[(ra >> (28 - 4 * i)) & 15];
+            }
+            silica_rt_puts(text);
+        }
+    }
+#endif
     if (in_handler) {
         return;
     }
@@ -297,6 +335,13 @@ void spike_poll(void)
             irqs[i].handler(irqs[i].arg);
             in_handler = 0;
             spike_handler_calls++;
+#ifdef SPIKE_DEBUG
+            if (spike_handler_calls == 1 || spike_handler_calls % 50000 == 0) {
+                silica_rt_puts("shim: handler calls ");
+                spike_put_dec(spike_handler_calls);
+                silica_rt_puts("\n");
+            }
+#endif
         }
     }
 }
@@ -386,6 +431,25 @@ void spike_yield(void)
     if (in_handler) {
         return;
     }
+#ifdef SPIKE_DEBUG
+    // every two seconds: which line of control yields, the handlers called, the lines pending and enabled
+    static uint64_t said;
+    if ((spike_ticks() - said) / 16000000 >= 2) {
+        uint32_t pending, enabled;
+        __asm__ volatile("rsr.interrupt %0" : "=r"(pending));
+        __asm__ volatile("rsr.intenable %0" : "=r"(enabled));
+        said = spike_ticks();
+        silica_rt_puts("shim: yield from ");
+        spike_put_dec((uint32_t)co_cur);
+        silica_rt_puts(", handlers ");
+        spike_put_dec(spike_handler_calls);
+        silica_rt_puts(", pending ");
+        spike_put_dec(pending);
+        silica_rt_puts(", enabled ");
+        spike_put_dec(enabled);
+        silica_rt_puts("\n");
+    }
+#endif
     timers_run();
     int next = co_cur;
     do {
@@ -767,6 +831,12 @@ int xQueueTakeMutexRecursive(void *handle, uint32_t ticks)
     return 1;
 }
 
+// the task that holds a mutex taken through the recursive calls, as its handle
+void *xQueueGetMutexHolder(void *handle)
+{
+    return ((struct queue *)handle)->owner;
+}
+
 int xQueueGiveMutexRecursive(void *handle)
 {
     struct queue *q = handle;
@@ -812,6 +882,7 @@ static struct timer {
     void (*callback)(void *);
     void *arg;
     uint64_t due;       // in the system timer's ticks
+    uint64_t period;    // in ticks; 0 when the timer runs once
     int used, active;
 } timers[MAX_TIMERS];
 static int in_timers;
@@ -843,6 +914,21 @@ int esp_timer_start_once(void *handle, uint64_t us)
     int was = t->active;
     if (!was) {
         t->due = spike_ticks() + us * 16;
+        t->period = 0;
+        t->active = 1;
+    }
+    unmask(ps);
+    return was ? 0x103 : 0;
+}
+
+int esp_timer_start_periodic(void *handle, uint64_t us)
+{
+    struct timer *t = handle;
+    uint32_t ps = mask_level3();
+    int was = t->active;
+    if (!was) {
+        t->due = spike_ticks() + us * 16;
+        t->period = us * 16;
         t->active = 1;
     }
     unmask(ps);
@@ -887,7 +973,9 @@ static void timers_run(void)
     for (int i = 0; i < MAX_TIMERS; i++) {
         uint32_t ps = mask_level3();
         int due = timers[i].used && timers[i].active && timers[i].due <= now;
-        if (due) {
+        if (due && timers[i].period != 0) {
+            timers[i].due = now + timers[i].period;
+        } else if (due) {
             timers[i].active = 0;
         }
         unmask(ps);
@@ -982,9 +1070,10 @@ void periph_module_disable(int module)
 
 void periph_module_reset(int module)
 {
-    (void)module;
-    SET_PERI_REG_MASK(SYSTEM_CORE_RST_EN_REG, BT_RESETS);
-    CLEAR_PERI_REG_MASK(SYSTEM_CORE_RST_EN_REG, BT_RESETS);
+    // the Wi-Fi MAC's reset when its glue asks (soc/periph_defs.h PERIPH_WIFI_MODULE), else Bluetooth's
+    uint32_t resets = module == PERIPH_WIFI_MODULE ? SYSTEM_WIFIMAC_RST : BT_RESETS;
+    SET_PERI_REG_MASK(SYSTEM_CORE_RST_EN_REG, resets);
+    CLEAR_PERI_REG_MASK(SYSTEM_CORE_RST_EN_REG, resets);
 }
 
 // ---- the radio ----
@@ -1127,6 +1216,11 @@ int snprintf(char *out, size_t room, const char *format, ...)
     return n;
 }
 
+int vsnprintf(char *out, size_t room, const char *format, va_list ap)
+{
+    return format_into(out, room, format, ap);
+}
+
 int sprintf(char *out, const char *format, ...)
 {
     va_list ap;
@@ -1171,6 +1265,8 @@ void esp_phy_disable(esp_phy_modem_t modem)
 
 // ---- coexistence with Wi-Fi: there is none ----
 
+// with Wi-Fi in the image Espressif's own coexistence library is linked (run_wifi.sh)
+#ifndef SPIKE_WIFI
 int coex_init(void) { return 0; }
 int coex_enable(void) { return 0; }
 void coex_disable(void) { }
@@ -1181,6 +1277,7 @@ uint32_t coex_schm_interval_get(void) { return 0; }
 uint8_t coex_schm_curr_period_get(void) { return 1; }
 void *coex_schm_curr_phase_get(void) { return NULL; }
 void coex_update_lpclk_interval(void) { }
+#endif
 
 // ---- the log ----
 

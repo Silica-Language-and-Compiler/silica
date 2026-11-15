@@ -40,6 +40,12 @@ void spike_bt_core_loop(void);
 void spike_co_start(uint32_t save[2], uint32_t *stack_top, void (*fn)(void *), void *arg);
 void silica_rt_start_app_cpu(void);
 
+// The processor's clock in MHz: 80, 160 or 240, all from the 480 MHz PLL; the bus the radio is on stays
+// at 80 MHz. run_r1_peer.sh sets it from R1_CPU_MHZ.
+#ifndef R1_CPU_MHZ
+#define R1_CPU_MHZ 80
+#endif
+
 void silica_rt_board_prepare(void)
 {
     if (spike_flash_map() != 0) {
@@ -47,7 +53,7 @@ void silica_rt_board_prepare(void)
     }
     esp_rom_output_tx_wait_idle(0);
     rtc_clk_config_t clk = RTC_CLK_CONFIG_DEFAULT();
-    clk.cpu_freq_mhz = 80;
+    clk.cpu_freq_mhz = R1_CPU_MHZ;
     rtc_clk_init(clk);
     silica_rt_start_app_cpu();
 }

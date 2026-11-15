@@ -77,6 +77,10 @@ def script(src, out, patterns):
     _silica_flash_text_start = ABSOLUTE(.);
     *(.flash.text .flash.text.*)
     *(.literal .literal.* .text .text.*)
+    /* the names Espressif's Wi-Fi and radio libraries give code that ESP-IDF may keep in RAM: no flash
+       operation here ever takes the flash away from under it */
+    *(.wifi0iram .wifi0iram.* .wifirxiram .wifirxiram.* .wifislpiram .wifislpiram.* .wifislprxiram .wifislprxiram.*)
+    *(.wifiextrairam .wifiextrairam.* .wifiorslpiram .wifiorslpiram.* .phyiram .phyiram.* .coexiram .coexiram.* .coexsleepiram .coexsleepiram.*)
     . = ALIGN(4);
     _silica_flash_text_end = ABSOLUTE(.);
   } > irom
@@ -86,6 +90,7 @@ def script(src, out, patterns):
     _silica_flash_rodata_start = ABSOLUTE(.);
     *(.flash.rodata .flash.rodata.*)
     *(.rodata .rodata.* .srodata .srodata.*)
+    *(.rodata_wlog .rodata_wlog_*)
     . = ALIGN(4);
     _silica_flash_rodata_end = ABSOLUTE(.);
   } > drom
