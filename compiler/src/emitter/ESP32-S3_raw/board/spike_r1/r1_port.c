@@ -15,17 +15,18 @@
 */
 
 // Route R1 (transport_ble_plan.md stage 12, part 5): a Silica program's radio actor calls the NimBLE
-// wrapper (compiler/stdlib/ble/silica_ble_nimble.c) on the chip the bare-metal runtime owns.
+// wrapper (compiler/stdlib/ble/silica_ble_nimble.c) on the chip the bare-metal runtime owns. The
+// runtime is built for one core, core 0, where the program's actors run; core 1 is the Bluetooth
+// tasks' alone, so an actor's long turn keeps nothing of Bluetooth waiting and no task ever takes a
+// core from an actor.
 //
 //   silica_rt_board_prepare   called by the runtime's start before main (rt_start.S): maps the flash,
 //                             where the program's own code and the Bluetooth libraries' are
-//                             (spike_flash.c), and brings the clocks up (ESP-IDF's rtc_clk_init).
-//   silica_nimble_event       the image links the program's calls to it through here (the linker's
-//                             --wrap). It is the radio actor's poll, every 20 ms or less: the
-//                             controller's and NimBLE's tasks and the timers get their turns here
-//                             (hci_shim.c spike_yield), on the stack of the actor's foreign call.
-//
-// The controller's handler comes by the runtime's level-3 interrupt and needs none of this.
+//                             (spike_flash.c), brings the clocks up (ESP-IDF's rtc_clk_init) and
+//                             starts core 1.
+//   silica_rt_board_core1     core 1's entry (rt_start.S): on a stack of its own it passes control
+//                             round the controller's and NimBLE's tasks and runs the timers for ever
+//                             (hci_shim.c spike_bt_core_loop); the controller's handler interrupts it.
 
 #include <stdint.h>
 #include "soc/rtc.h"
@@ -34,11 +35,10 @@
 typedef struct {
     int64_t tag, value, error_code;
 } tagged;
-tagged __real_silica_nimble_event(int64_t timeout_ms);
 int spike_flash_map(void);
-void spike_yield(void);
-
-static int ready;
+void spike_bt_core_loop(void);
+void spike_co_start(uint32_t save[2], uint32_t *stack_top, void (*fn)(void *), void *arg);
+void silica_rt_start_app_cpu(void);
 
 void silica_rt_board_prepare(void)
 {
@@ -49,52 +49,20 @@ void silica_rt_board_prepare(void)
     rtc_clk_config_t clk = RTC_CLK_CONFIG_DEFAULT();
     clk.cpu_freq_mhz = 80;
     rtc_clk_init(clk);
-    ready = 1;
+    silica_rt_start_app_cpu();
 }
 
-tagged __wrap_silica_nimble_event(int64_t timeout_ms)
+static uint32_t core1_stack[2048] __attribute__((aligned(16)));
+
+static void core1_loop(void *unused)
 {
-    if (ready) {
-        for (int pass = 0; pass < 8; pass++) {
-            spike_yield();
-        }
-    }
-#ifdef R1_DEBUG
-    static uint32_t polls;
-    extern uint32_t spike_handler_calls, spike_switches;
-    void silica_rt_puts(const char *s);
-    void spike_put_dec(uint32_t n);
-    uint64_t spike_ticks(void);
-    tagged r = __real_silica_nimble_event(timeout_ms);
-    if ((++polls & 63) == 0 || polls <= 4 || r.tag == 0) {
-        silica_rt_puts("r1: ");
-        spike_put_dec((uint32_t)(spike_ticks() / 16000));
-        silica_rt_puts(" ms, poll ");
-        spike_put_dec(polls);
-        silica_rt_puts(" handlers ");
-        spike_put_dec(spike_handler_calls);
-        silica_rt_puts(" switches ");
-        spike_put_dec(spike_switches);
-        if (r.tag == 0) {
-            silica_rt_puts(" event ");
-            spike_put_dec((uint32_t)r.value);
-        }
-        silica_rt_puts("\n");
-    }
-    return r;
-#endif
-    return __real_silica_nimble_event(timeout_ms);
+    (void)unused;
+    spike_bt_core_loop();
 }
 
-#ifdef R1_DEBUG
-// the start, said on the console as it goes in and comes out (the image wraps it too when debugging)
-tagged __real_silica_nimble_start(int64_t reserved);
-tagged __wrap_silica_nimble_start(int64_t reserved)
+// Core 1 arrives on the runtime's 2 KB boot stack: it moves to its own and does not come back.
+void silica_rt_board_core1(void)
 {
-    void silica_rt_puts(const char *s);
-    silica_rt_puts("r1: start in\n");
-    tagged r = __real_silica_nimble_start(reserved);
-    silica_rt_puts(r.tag == 0 ? "r1: start out, ok\n" : "r1: start out, failed\n");
-    return r;
+    static uint32_t left[2];
+    spike_co_start(left, &core1_stack[2048 - 16], core1_loop, NULL);
 }
-#endif

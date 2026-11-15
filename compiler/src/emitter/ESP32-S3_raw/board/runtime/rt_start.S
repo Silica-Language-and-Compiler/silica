@@ -243,13 +243,11 @@ silica_rt_start_windowed:
     call8   silica_rt_console_rx_drain   // standard input starts empty: nothing the loader left counts
     call8   silica_rt_wall_clock_start   // the timer reading the loader's Unix time stands for (rt_actors.S)
     // An image with code in flash (tools/flash_layout.py) links a function that maps it, and main
-    // may be such code: it is called here, before anything of the program runs. No such function,
-    // no call.
-    .weak   silica_rt_board_prepare
-    movi    a8, silica_rt_board_prepare
-    beqz    a8, 4f
-    callx8  a8
-4:  movi    a10, silica_rt_start_marker
+    // may be such code: it is called here, before anything of the program runs. An image without
+    // one gets the empty function below. The call is direct, so that the builder can still bound
+    // main's stacks from the linked code (tools/main_stack_bound.py).
+    call8   silica_rt_board_prepare
+    movi    a10, silica_rt_start_marker
     call8   silica_rt_puts
     call8   silica_rt_console_release_if_mine   // the marker has no newline: drop the line hold
     movi    a2, silica_rt_console_last  // and the marker is framing, not program output: main
@@ -263,6 +261,15 @@ silica_rt_start_windowed:
     call8   silica_rt_exit         // a10 = low word = status
 1:  j       1b
     .size   silica_rt_start_windowed, . - silica_rt_start_windowed
+
+// silica_rt_board_prepare(): nothing, unless the image links its own (see the call above).
+    .align  4
+    .weak   silica_rt_board_prepare
+    .type   silica_rt_board_prepare, @function
+silica_rt_board_prepare:
+    entry   a1, 32
+    retw
+    .size   silica_rt_board_prepare, . - silica_rt_board_prepare
 
 // ---------------------------------------------------------------------------------------------
 // The APP cpu (core 1)
@@ -404,7 +411,14 @@ silica_rt_start_core1:
     s32i    a3, a2, VRG_ALIMIT
     movi    a0, 0
     movi    a1, silica_rt_core1_stack_top
-    call8   silica_rt_core1_main
+    // An image may give core 1 to foreign code (transport_ble_plan.md stage 12: the Bluetooth
+    // controller's and host's tasks): it links silica_rt_board_core1, which does not return, and
+    // starts the core itself (silica_rt_start_app_cpu) with the runtime built for one core.
+    .weak   silica_rt_board_core1
+    movi    a8, silica_rt_board_core1
+    beqz    a8, 2f
+    callx8  a8
+2:  call8   silica_rt_core1_main
 1:  j       1b
     .size   silica_rt_start_core1, . - silica_rt_start_core1
 

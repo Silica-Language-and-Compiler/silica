@@ -29,6 +29,10 @@
 //   queues, semaphores, mutexes   one structure, a ring of items (none for a semaphore).
 //   timers      ESP-IDF's one-shot timers (NimBLE's timeouts), run when a line of control yields.
 //   memory      one block, first fit, freed blocks joined.
+//   two cores   built with SPIKE_BT_CORE=1 the tasks, the timers and the controller's handler are core
+//               1's alone (spike_bt_core_loop), and a Silica program's actors call the wrapper from core
+//               0. What both touch is under one lock, taken with the level masked; a call from core 0
+//               that would block waits without passing control, since the tasks run beside it.
 //   the radio   esp_phy_enable is phy_main.c's start.
 //
 // The types are written as their machine forms so that no FreeRTOS header is needed.
@@ -99,8 +103,66 @@ static struct irq {
     int enabled;
 } irqs[MAX_IRQ];
 static int irq_count;
-static int in_handler;
 uint32_t spike_handler_calls;
+// Which core this is: the processor's identity register reads 0xCDCD on core 0 and 0xABAB on core 1.
+static inline int core_id(void)
+{
+    uint32_t prid;
+    __asm__ volatile("rsr.prid %0" : "=r"(prid));
+    return prid == 0xCDCD ? 0 : 1;
+}
+
+#ifdef SPIKE_BT_CORE
+static inline int on_bt_core(void)
+{
+    return core_id() == SPIKE_BT_CORE;
+}
+
+// One lock for what the two cores share, held with level 3 masked on the holder's core; the holder may
+// take it again.
+static volatile uint32_t lock_owner;    // 0, or the core's number plus 1
+static uint32_t lock_depth;
+
+static inline void lock_take(void)
+{
+    uint32_t me = (uint32_t)core_id() + 1;
+    if (lock_owner != me) {
+        while (!__sync_bool_compare_and_swap(&lock_owner, 0, me)) {
+        }
+    }
+    lock_depth++;
+}
+
+static inline void lock_give(void)
+{
+    if (--lock_depth == 0) {
+        lock_owner = 0;
+    }
+}
+#else
+static inline int on_bt_core(void)
+{
+    return 1;
+}
+
+static inline void lock_take(void)
+{
+}
+
+static inline void lock_give(void)
+{
+}
+#endif
+
+static int in_handler;
+static volatile uint32_t lines_to_enable;   // asked for from the other core, enabled by the Bluetooth core
+
+// In the controller's handler: only the Bluetooth core takes it.
+static inline int in_isr(void)
+{
+    return on_bt_core() && in_handler;
+}
+
 #ifdef SPIKE_INTERRUPT
 // the CPU's level-3 lines that take a level from a peripheral
 static const uint8_t lines[MAX_IRQ] = { 23, 27, 23, 27, 23, 27, 23, 27 };
@@ -110,15 +172,30 @@ static inline uint32_t mask_level3(void)
 {
     uint32_t ps;
     __asm__ volatile("rsil %0, 3" : "=r"(ps));
+    lock_take();
     return ps;
 }
 
 static inline void unmask(uint32_t ps)
 {
+    lock_give();
     __asm__ volatile("wsr.ps %0\n rsync" : : "r"(ps));
 }
 
 static void dispatch(void);
+
+// A core enables its own interrupt lines.
+static void enable_lines(void)
+{
+    uint32_t want = lines_to_enable, enabled;
+    if (want == 0) {
+        return;
+    }
+    __asm__ volatile("rsr.intenable %0" : "=r"(enabled));
+    enabled |= want;
+    __asm__ volatile("wsr.intenable %0\n rsync" : : "r"(enabled));
+    lines_to_enable = 0;
+}
 #else
 // CPU interrupt lines that take a level from a peripheral (level 1; they stay disabled)
 static const uint8_t lines[MAX_IRQ] = { 0, 1, 2, 3, 4, 5, 8, 9 };
@@ -146,7 +223,11 @@ int esp_intr_alloc(int source, int flags, void (*handler)(void *), void *arg, vo
     q->line = lines[irq_count];
     q->enabled = 1;
     irq_count++;
+#ifdef SPIKE_BT_CORE
+    intr_matrix_set(SPIKE_BT_CORE, (uint32_t)source, (uint32_t)q->line);
+#else
     intr_matrix_set(0, (uint32_t)source, (uint32_t)q->line);
+#endif
     silica_rt_puts("shim: interrupt source ");
     spike_put_dec((uint32_t)source);
     silica_rt_puts(" on line ");
@@ -157,10 +238,14 @@ int esp_intr_alloc(int source, int flags, void (*handler)(void *), void *arg, vo
     }
 #ifdef SPIKE_INTERRUPT
     silica_rt_level3_handler = dispatch;
-    uint32_t enabled;
-    __asm__ volatile("rsr.intenable %0" : "=r"(enabled));
-    enabled |= 1u << q->line;
-    __asm__ volatile("wsr.intenable %0\n rsync" : : "r"(enabled));
+    // the Bluetooth core enables the line at its next pass when this is the other core
+    lines_to_enable |= 1u << q->line;
+    if (on_bt_core()) {
+        enable_lines();
+    } else {
+        while (lines_to_enable != 0) {
+        }
+    }
 #endif
     return 0;
 }
@@ -218,7 +303,7 @@ void spike_poll(void)
 
 int xPortInIsrContext(void)
 {
-    return in_handler;
+    return in_isr();
 }
 
 static uint32_t critical_depth, critical_ps;
@@ -239,6 +324,8 @@ void vPortExitCritical(void *mux)
     (void)mux;
     if (--critical_depth == 0) {
         unmask(critical_ps);
+    } else {
+        lock_give();    // each entry took the lock; only the outermost exit puts the level back
     }
 }
 
@@ -249,7 +336,7 @@ void _frxt_setup_switch(void)
 // ---- the two lines of control ----
 
 #define MAX_CO 4
-enum { CO_FREE, CO_NEW, CO_LIVE, CO_DEAD };
+enum { CO_FREE, CO_NEW, CO_LIVE, CO_DEAD, CO_TAKEN };
 static struct co {
     uint32_t ctx[2];
     void (*fn)(void *);
@@ -258,7 +345,13 @@ static struct co {
     int state;
 } cos[MAX_CO] = { { .state = CO_LIVE } };   // 0 is main's
 static int co_cur;
+static struct co other_core;    // stands for whoever calls from the core that is not the tasks'
 uint32_t spike_switches;
+
+static struct co *current(void)
+{
+    return on_bt_core() ? &cos[co_cur] : &other_core;
+}
 
 static void timers_run(void);
 void spike_yield(void);
@@ -268,7 +361,10 @@ static void co_entry(void *arg)
 {
     struct co *c = arg;
 #ifdef SPIKE_INTERRUPT
-    __asm__ volatile("rsil a2, 0" : : : "a2");
+    // the switch that started this left the level masked and the lock held, for this side to undo
+    uint32_t ps;
+    __asm__ volatile("rsr.ps %0" : "=r"(ps));
+    unmask(ps & ~0xFu);
 #endif
     c->fn(c->arg);
     c->state = CO_DEAD;
@@ -280,7 +376,13 @@ static void co_entry(void *arg)
 // Lets the interrupts, the timers and the next line of control run once.
 void spike_yield(void)
 {
+    if (!on_bt_core()) {
+        return;
+    }
     spike_poll();
+#ifdef SPIKE_INTERRUPT
+    enable_lines();
+#endif
     if (in_handler) {
         return;
     }
@@ -314,12 +416,19 @@ int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack
     silica_rt_puts(name);
     silica_rt_puts("\n");
     for (int i = 1; i < MAX_CO; i++) {
-        if (cos[i].state == CO_FREE || cos[i].state == CO_DEAD) {
+        uint32_t ps = mask_level3();
+        int free_slot = cos[i].state == CO_FREE || cos[i].state == CO_DEAD;
+        if (free_slot) {
+            cos[i].state = CO_TAKEN;
+        }
+        unmask(ps);
+        if (free_slot) {
             // twice what FreeRTOS is asked for and 4 KB more: the controller's handler runs on whichever
             // stack is current, and a switch spills the register windows onto it
             uint32_t bytes = (2 * (stack < 4096 ? 4096 : stack) + 4096 + 15) & ~15u;
             uint32_t *base = malloc(bytes);
             if (base == NULL) {
+                cos[i].state = CO_FREE;
                 return 0;
             }
             cos[i].fn = fn;
@@ -337,16 +446,19 @@ int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack
 
 void vTaskDelete(void *handle)
 {
-    struct co *c = handle ? handle : &cos[co_cur];
+    struct co *c = handle ? handle : current();
+    if (c == &other_core) {
+        return;
+    }
     c->state = CO_DEAD;
-    while (c == &cos[co_cur]) {
+    while (c == current()) {
         spike_yield();
     }
 }
 
 void *xTaskGetCurrentTaskHandle(void)
 {
-    return &cos[co_cur];
+    return current();
 }
 
 int xTaskGetSchedulerState(void)
@@ -615,7 +727,7 @@ int xQueueGenericSend(void *q, const void *item, uint32_t ticks, int position)
     (void)position;
     uint64_t start = spike_ticks();
     while (!put(q, item)) {
-        if (in_handler || expired(start, ticks)) {
+        if (in_isr() || expired(start, ticks)) {
             return 0;
         }
         spike_yield();
@@ -627,7 +739,7 @@ int xQueueReceive(void *q, void *item, uint32_t ticks)
 {
     uint64_t start = spike_ticks();
     while (!get(q, item)) {
-        if (in_handler || expired(start, ticks)) {
+        if (in_isr() || expired(start, ticks)) {
             return 0;
         }
         spike_yield();
@@ -643,14 +755,14 @@ int xQueueSemaphoreTake(void *q, uint32_t ticks)
 int xQueueTakeMutexRecursive(void *handle, uint32_t ticks)
 {
     struct queue *q = handle;
-    if (q->owner == &cos[co_cur]) {
+    if (q->owner == current()) {
         q->depth++;
         return 1;
     }
     if (!xQueueSemaphoreTake(q, ticks)) {
         return 0;
     }
-    q->owner = &cos[co_cur];
+    q->owner = current();
     q->depth = 1;
     return 1;
 }
@@ -658,7 +770,7 @@ int xQueueTakeMutexRecursive(void *handle, uint32_t ticks)
 int xQueueGiveMutexRecursive(void *handle)
 {
     struct queue *q = handle;
-    if (q->owner != &cos[co_cur]) {
+    if (q->owner != current()) {
         return 0;
     }
     if (--q->depth == 0) {
@@ -708,6 +820,7 @@ int esp_timer_create(const void *args, void **handle)
 {
     // esp_timer_create_args_t begins with the callback and its argument
     void *const *a = args;
+    uint32_t ps = mask_level3();
     for (int i = 0; i < MAX_TIMERS; i++) {
         if (!timers[i].used) {
             timers[i].used = 1;
@@ -715,31 +828,35 @@ int esp_timer_create(const void *args, void **handle)
             timers[i].callback = (void (*)(void *))a[0];
             timers[i].arg = a[1];
             *handle = &timers[i];
+            unmask(ps);
             return 0;
         }
     }
+    unmask(ps);
     return 0x101;
 }
 
 int esp_timer_start_once(void *handle, uint64_t us)
 {
     struct timer *t = handle;
-    if (t->active) {
-        return 0x103;
+    uint32_t ps = mask_level3();
+    int was = t->active;
+    if (!was) {
+        t->due = spike_ticks() + us * 16;
+        t->active = 1;
     }
-    t->due = spike_ticks() + us * 16;
-    t->active = 1;
-    return 0;
+    unmask(ps);
+    return was ? 0x103 : 0;
 }
 
 int esp_timer_stop(void *handle)
 {
     struct timer *t = handle;
-    if (!t->active) {
-        return 0x103;
-    }
+    uint32_t ps = mask_level3();
+    int was = t->active;
     t->active = 0;
-    return 0;
+    unmask(ps);
+    return was ? 0 : 0x103;
 }
 
 int esp_timer_delete(void *handle)
@@ -768,8 +885,13 @@ static void timers_run(void)
     in_timers = 1;
     uint64_t now = spike_ticks();
     for (int i = 0; i < MAX_TIMERS; i++) {
-        if (timers[i].used && timers[i].active && timers[i].due <= now) {
+        uint32_t ps = mask_level3();
+        int due = timers[i].used && timers[i].active && timers[i].due <= now;
+        if (due) {
             timers[i].active = 0;
+        }
+        unmask(ps);
+        if (due) {
             timers[i].callback(timers[i].arg);
         }
     }
@@ -869,12 +991,12 @@ void periph_module_reset(int module)
 
 uint32_t phy_enter_critical(void)
 {
-    return 0;
+    return mask_level3();
 }
 
 void phy_exit_critical(uint32_t level)
 {
-    (void)level;
+    unmask(level);
 }
 
 int phy_printf(const char *format, ...)
@@ -1093,4 +1215,36 @@ int nvs_flash_init(void)
 int nvs_flash_erase(void)
 {
     return 0;
+}
+
+// ---- the Bluetooth core ----
+
+// The core the tasks, the timers and the controller's handler belong to, when a Silica program's actors
+// have the other: passes control round the tasks for ever. Called once on that core, on a stack with
+// room for the handler.
+void spike_bt_core_loop(void)
+{
+#ifdef R1_DEBUG
+    uint64_t said = spike_ticks();
+#endif
+    for (;;) {
+        spike_yield();
+#ifdef R1_DEBUG
+        if ((spike_ticks() - said) / 16000000 >= 2) {
+            said = spike_ticks();
+            silica_rt_puts("bt: handlers ");
+            spike_put_dec(spike_handler_calls);
+            silica_rt_puts(" switches ");
+            spike_put_dec(spike_switches);
+            silica_rt_puts(" lock ");
+            spike_put_dec(lock_owner);
+            silica_rt_puts(" tasks");
+            for (int i = 1; i < MAX_CO; i++) {
+                silica_rt_puts(" ");
+                spike_put_dec((uint32_t)cos[i].state);
+            }
+            silica_rt_puts("\n");
+        }
+#endif
+    }
 }

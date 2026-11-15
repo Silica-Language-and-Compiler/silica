@@ -23,8 +23,8 @@
 # program that script builds, build/accel_led/mac/dangerous_ble_mac_led.
 #
 # The program is compiled as programmer_tools/transport_ble_demo/run_board_peer.sh compiles it (that
-# script is run with --build-only and its .sams are taken). The image is the bare-metal runtime on one
-# core, the program, the NimBLE wrapper, r1_port.c and hci_shim.c, NimBLE and ESP-IDF's glue from the
+# script is run with --build-only and its .sams are taken). The image is the bare-metal runtime on
+# core 0, the Bluetooth tasks on core 1, the program, the NimBLE wrapper, r1_port.c and hci_shim.c, NimBLE and ESP-IDF's glue from the
 # guest's cached build, the closed controller and radio libraries, and ESP-IDF's clock and flash code
 # from its bootloader build. The program's own code and the Bluetooth libraries' run from flash.
 # The peer is the Mac: programmer_tools/transport_ble_demo/run_peer.sh central.
@@ -59,8 +59,6 @@ syms=""
 for s in _bt_bss_start _bt_bss_end _bt_controller_bss_start _bt_controller_bss_end _bt_data_start _bt_data_end _bt_controller_data_start _bt_controller_data_end; do
     syms="$syms -Wl,--defsym,$s=0"
 done
-syms="$syms -Wl,--wrap=silica_nimble_event"
-case "${SPIKE_CFLAGS:-}" in *R1_DEBUG*) syms="$syms -Wl,--wrap=silica_nimble_start" ;; esac
 # main's stacks: the builder cannot bound a start that calls into ESP-IDF's code (the flash mapping) and
 # would give main 192 KB; the guest's builder bounds this program's main at 4.5 KB and 320 bytes
 syms="$syms -Wl,--defsym,_silica_main_stack_req=0x4000 -Wl,--defsym,_silica_main_aux_req=0x400"
@@ -71,11 +69,10 @@ for f in "$SRC"/*.sams; do
     BOARD_FLASH_FILES="$BOARD_FLASH_FILES *.$(basename "$f" .sams).o"
 done
 export BOARD_FLASH_FILES
-export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} -DSPIKE_INTERRUPT -DARENA_KB=${ARENA_KB:-112}"
-# one core: the shim's tasks and the controller's handler are core 0's
+export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DARENA_KB=${ARENA_KB:-96}"
+# the runtime on one core, core 0, for the program's actors; core 1 is the Bluetooth tasks' (r1_port.c)
 export BOARD_ASFLAGS="-DNCORES_RUN=1"
-# the controller's handler runs on the stack it interrupts, an actor's among them
-export BOARD_STACK_ALLOWANCE=${BOARD_STACK_ALLOWANCE:-2048}
+# The controller's handler interrupts core 1 only, so no actor's stack needs room for it.
 export BOARD_FFI_STACK=${BOARD_FFI_STACK:-16384}
 boot=$(ls "$IDF_BUILD"/bootloader/esp-idf/*/lib*.a | tr '\n' ' ')
 # shellcheck disable=SC2086

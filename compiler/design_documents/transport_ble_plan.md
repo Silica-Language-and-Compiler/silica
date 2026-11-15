@@ -1373,6 +1373,57 @@ Each stage's result is recorded here when it closes: date, what was built, trial
       take the core from an actor, as in a guest. Both cores stay for actors. It is pre-emption by
       foreign tasks, the thing R1 set out to avoid.
 
+- **Stage 12, part 5, step 2, 2026-11-14, done: the second core given to the Bluetooth tasks (Matt Manley's
+  choice of the two ways out). The stage 7 program, its two actors busy without pause, exchanges the frame
+  with the Mac on route R1, ten links in a row. The pairing fault of stage 10 shows on this image too and
+  its cause is not established.**
+  - The arrangement: the runtime is built for one core, core 0, where the program's actors run. Core 1
+    passes control round the controller's and NimBLE's tasks and runs their timers without pause, and the
+    controller's handler interrupts core 1 only. No task or handler ever takes core 0 from an actor, and no
+    actor's stack needs room for the handler. A program that uses the radio has one core for its actors.
+  - Built:
+    - `runtime/rt_start.S`: core 1's entry calls `silica_rt_board_core1` when an image links one; the
+      prepare hook before main is a direct call to a function that is empty unless the image links its
+      own. (Step 1's hook was a call through a register: the builder could no longer bound main's stacks
+      for any image, gave each 192 KB, and `timers_addition/cancelled_timers_release_messages` ran out of
+      memory. With the direct call `timers_addition` is 28 of 28 on bare metal; `scheduler_policy_addition`
+      and `ffi_addition` passed with it, 106 trials in the three suites.)
+    - `spike_r1/hci_shim.c`, built with `SPIKE_BT_CORE=1`: one lock for what the two cores share (the
+      queues, the memory block, the timers, the task table), taken with level 3 masked and taken again
+      freely by its holder; a call from core 0 that would block waits without passing control, since
+      the tasks run beside it; the controller's interrupt line routed to core 1 and enabled there.
+    - `spike_r1/r1_port.c`: starts core 1 from the prepare hook; core 1 moves to an 8 KB stack and loops.
+      The radio actor's poll no longer gives the tasks their turns.
+  - Found and fixed:
+    - The shim's lock was taken at each entry to a nested critical section and given back once, so core
+      1 kept it and core 0 waited for ever at the controller's enable.
+    - Silica's heap: with the handler off the actors' stacks the allowance of step 1 went, and the shim's
+      block came down to 96 KB (88 KB used at most); the program's owner had run out of memory.
+  - The pairing fault of stage 10 ("encryption is insufficient" at the Mac's subscription, then the link
+    lost before it is up), not explained:
+    - It ends a run now and then at a first link: here two runs of five on this image before the soak
+      below, and one run of one on the guest image afterwards.
+    - A cause was named and a fix tried, and both are withdrawn. The claim was that NimBLE holds a
+      pairing's key in memory and so answers "encryption is insufficient" where it would say
+      "authentication is insufficient"; the fix cleared NimBLE's store at each connection. NimBLE's
+      source says otherwise: it stores a pairing's keys only when both ends ask for bonding
+      (`ble_sm.c`), and the board does not. The guest run that failed had the fix in it. The fix is
+      taken out of `silica_ble_nimble.c`; the runs below that passed with it prove nothing about it.
+    - What is known: NimBLE gives that answer only when its store holds a key for the peer
+      (`ble_att_svr.c`), and nothing here should put one there. Not checked: whether the answer the
+      Mac reports is the board's at all, or macOS's own after an encryption it started with a key it
+      kept from an earlier pairing. A trace of the packets on a run that fails would settle it
+      (`HCI_TRACE` in `nimble_main.c` is the means on this route).
+  - Run, the Mac as central (`run_peer.sh central`), the program's two busy actors running throughout:
+    - One link, twice: board `frame out 48 bytes`, `frame in 48 bytes`, `accel x=1 y=-2 z=512
+      at_ms=1000`, `link down :closed`, status 0; the Mac the same, status 0.
+    - Four links in a row, then ten: every frame whole each way, no refusal, both ends status 0.
+    - The stage 8 program (`--accel`), three runs: the board's lines whole and status 0 each time. The
+      Mac's ended in `tx failed :link_down`, `link down :timeout`, status 1, in one of the three: the
+      board had the LED command and closed the link before the Mac had the answer to its write. A link
+      closed by one end the moment it has what it wants can cost the other end its last confirmation;
+      not looked into further.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
