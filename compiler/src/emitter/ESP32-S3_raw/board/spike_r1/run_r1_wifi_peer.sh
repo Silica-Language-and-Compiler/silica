@@ -20,8 +20,8 @@
 #   BOARD_PORT=<port> ./run_r1_wifi_peer.sh [--build-only] [--links <n>] [<out_dir>]
 #
 # The program is programmer_tools/transport_wifi_demo/dangerous_wifi_board_peer.silica above the
-# board's (:tcp) carrier (compiler/stdlib/dangerous_tcp_board_carrier.silica), the radio actor
-# (dangerous_wifi_radio) and the wrapper (compiler/stdlib/wifi/silica_wifi_lwip.c). The image is the
+# hosted (:tcp) carrier (compiler/stdlib/dangerous_tcp_carrier.silica) and dangerous_sockets, whose
+# wrappers on the board are lwIP's (compiler/stdlib/wifi/silica_sockets_lwip.c). The image is the
 # bare-metal runtime on core 0 for the program's actors; on core 1 the tasks of Espressif's Wi-Fi
 # libraries and of lwIP, and the Wi-Fi interrupt (r1_port.c, hci_shim.c, wifi_shim.c, wifi_net.c). The
 # program's own code and the libraries' run from flash.
@@ -75,8 +75,8 @@ PY
 # The program and the modules it uses, compiled in a copy, with the peer's address in place of the placeholder.
 SRC="$DEMO/build/board_peer/src"
 rm -rf "$DEMO/build/board_peer"; mkdir -p "$SRC/dangerous_exposure_source/lib"
-ln -sfn "$ROOT/compiler/stdlib/wifi" "$SRC/dangerous_exposure_source/wifi"
-modules="Supervisor wire_etf wireframe Carrier dangerous_wifi dangerous_wifi_radio dangerous_tcp_board_carrier"
+ln -sfn "$ROOT/compiler/stdlib/net" "$SRC/dangerous_exposure_source/sockets"
+modules="Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_carrier"
 for m in $modules; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$SRC/$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$SRC/trial_wait_int64.silica"
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" "$SRC/trial_support_hex.silica"
@@ -85,9 +85,9 @@ sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$
 for m in $modules trial_support_hex trial_wait_int64 dangerous_wifi_board_peer; do echo "$m.silica"; done > "$SRC/silica.config"
 # The compiler wants the archive the .meta names; the wrapper itself is compiled into the image, so
 # the archive here holds only the symbols.
-sed -n 's/^ *symbol: "\(.*\)"$/long long \1(void) { return 0; }/p' "$ROOT/compiler/stdlib/wifi/silica_wifi_lwip_wrapper.meta" > "$SRC/stub.c"
+sed -n 's/^ *symbol: "\(.*\)"$/long long \1(void) { return 0; }/p' "$ROOT/compiler/stdlib/net/silica_sockets_wrapper.meta" > "$SRC/stub.c"
 "$XT/xtensa-esp32s3-elf-gcc" -c -mlongcalls -Os -ffreestanding "$SRC/stub.c" -o "$SRC/stub.o"
-"$XT/xtensa-esp32s3-elf-ar" rcs "$SRC/dangerous_exposure_source/lib/libsilica_wifi_lwip.a" "$SRC/stub.o"
+"$XT/xtensa-esp32s3-elf-ar" rcs "$SRC/dangerous_exposure_source/lib/libsilica_sockets.a" "$SRC/stub.o"
 ec=1
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     ec=0; ( cd "$SRC" && "$CC" > ../compile.log 2>&1 ) || ec=$?
@@ -116,7 +116,7 @@ boot=$(ls "$IDF_BUILD"/bootloader/esp-idf/*/lib*.a | tr '\n' ' ')
 mbed=$(find "$IDF_BUILD/esp-idf/mbedtls" -name "*.a" | tr '\n' ' ')
 # shellcheck disable=SC2086
 SPIKE_LDFLAGS="$syms" "$HERE/build.sh" --app "$out/r1_wifi_peer" "$SRC"/*.sams \
-    "$ROOT/compiler/stdlib/wifi/silica_wifi_lwip.c" "$HERE/r1_port.c" "$HERE/hci_shim.c" "$HERE/wifi_shim.c" "$HERE/wifi_net.c" "$HERE/spike_co.S" "boot:$HERE/spike_flash.c" \
+    "$ROOT/compiler/stdlib/wifi/silica_sockets_lwip.c" "$HERE/r1_port.c" "$HERE/hci_shim.c" "$HERE/wifi_shim.c" "$HERE/wifi_net.c" "$HERE/spike_co.S" "boot:$HERE/spike_flash.c" \
     "$IDF_BUILD/esp-idf/lwip/liblwip.a" "$IDF_BUILD/esp-idf/esp_wifi/libesp_wifi.a" "$W/libnet80211.a" "$W/libpp.a" "$W/libcore.a" "$IDF_BUILD/esp-idf/wpa_supplicant/libwpa_supplicant.a" $mbed \
     "$IDF_BUILD/esp-idf/esp_coex/libesp_coex.a" "$C/esp_coex/lib/esp32s3/libcoexist.a" "$IDF_BUILD/esp-idf/esp_hal_security/libesp_hal_security.a" \
     "$C/esp_phy/lib/esp32s3/libphy.a" "$IDF_BUILD/esp-idf/esp_phy/libesp_phy.a" $boot "$C/xtensa/esp32s3/libxt_hal.a"

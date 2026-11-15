@@ -1665,6 +1665,54 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - Not carried over from the hosted carrier yet: the link handed to the carrier as text (the board
     has one station), `listen:` addresses, and a carrier that ends itself after `(:link_down, :fault)`.
 
+- **Stage 12, part 8, 2026-11-15, done: the board's `(:tcp)` carrier is the hosted one. The hosted
+  carrier and its sockets module run on the board as they are, above socket wrappers written over
+  lwIP; thirty links of thirty.** This replaces the carrier of part 6, step 3, and its radio actor,
+  module and wrapper, which are removed.
+  - Why: the hosted carrier (`dangerous_tcp_carrier.silica`, as stage E2 left it) is a dangerous actor
+    over `dangerous_sockets`, whose wrappers (`compiler/stdlib/net/silica_sockets.c`) are BSD socket
+    calls. lwIP has the same calls. A board carrier made to behave as the hosted one would follow it
+    for ever; the hosted one itself needs only its wrappers answered.
+  - Built:
+    - `compiler/stdlib/wifi/silica_sockets_lwip.c`: every symbol of the hosted wrapper, with the same
+      answers, over lwIP. `silica_sockets_link_select` answers for `(:wifi, 0)`: the station's address,
+      or ENXIO while it has none. Its first call starts the station; a task of the wrapper's on the
+      radio's core joins the access point, starts lwIP, and joins again when the access point is
+      lost. UDP and the serial port answer ENOSYS. A connection is given 5 s to be made.
+    - The pack: `(:tcp)` on `(:wifi, 0)` spawns `dangerous_tcp_carrier` with `link_spec: "wifi:0"`, as
+      the hosted packs do.
+    - The demo program speaks the hosted contract: the carrier is a `dangerous_actor_ref`, it ends
+      with its link, so each link has a carrier of its own, spawned by the owner.
+  - **The hosted rules, seen on the board.** While the station is joining, an `:open` answers
+    `(:link_down, :fault)` and the carrier ends with `(:explicit, :link_unavailable)`, three times in
+    each run before the link is there; the program opens again half a second later. A link that
+    closes ends its carrier `:normal`.
+  - **The compiler and the runtime: a foreign call of eight argument words.** The board refused more
+    than six (the registers), and `dangerous_sockets`' receive takes eight: a result returned through
+    a hidden pointer and three `int64`. C takes the seventh and eighth from the caller's stack.
+    `terms/ffi_foreign.silica` stages them at the end of the call block's struct area (allowed when
+    the returned struct is at most 24 bytes) and adds 4 to the block's mode word; `rt_ffi.S` puts
+    them at the bottom of its own frame before the call. A call of six words or fewer is emitted as
+    before: no golden changed. No trial yet calls with seven or eight.
+  - Run, 160 MHz, power saving off, the Mac's end `wifi_peer.py`:
+
+    | Links whole, both ends | Reasons for the links' ends | Each link | Board suites after the change |
+    | --- | --- | --- | --- |
+    | 30 of 30, status 0 | 30 `:closed`; 3 `:fault` while joining | about 5.5 s | foreign calls and board transport, 78 of 78 |
+
+    The image: 56 KB of code in RAM, 651 KB in flash.
+  - **Found.**
+    - A cast to a carrier that has ended ends the sender with `(:explicit, :actor_not_found)`. A
+      carrier ends itself when its peer closes, so an owner still answering the last `:rx` (a
+      `:credit`, a `:close`) is ended by its own cast: seen here when the Mac's end closed first, and
+      the busy actors that cast to the owner went the same way. `wifi_peer.py` now waits for the
+      board to close. Whether a hosted owner meets the same is not tried.
+    - Each carrier's end is printed as an actor failure report, the normal ones too, because the
+      demo's carriers have no supervisor.
+  - Not done: the board listening (`listen:<port>` binds the station's address by the same code; no
+    program here takes `:accepted` yet); a trial for the eight-word call; the hosted trials of the
+    `(:tcp)` carrier run on the board; a link lost in the middle.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

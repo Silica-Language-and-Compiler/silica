@@ -15,24 +15,26 @@
    limitations under the License.
 -}
 
-// The board end of the Wi-Fi demo (transport_ble_plan.md stage 12, part 6, step 3): the Bluetooth
-// demo's board program (transport_ble_demo/dangerous_ble_board_peer) over the board's (:tcp) carrier
-// (dangerous_tcp_board_carrier above the radio actor, Espressif's Wi-Fi station and lwIP) in place of
-// the (:ble_gatt) one, on the ESP32-S3 the bare-metal runtime owns. The carrier is declared on the
-// chip's Wi-Fi radio, `carried_on lan: (:tcp) (:wifi, 0);`.
+// The board end of the Wi-Fi demo (transport_ble_plan.md stage 12, parts 6 to 8): the Bluetooth demo's
+// board program (transport_ble_demo/dangerous_ble_board_peer) over a (:tcp) carrier in place of the
+// (:ble_gatt) one, on the ESP32-S3 the bare-metal runtime owns. The carrier is declared on the chip's
+// Wi-Fi radio, `carried_on lan: (:tcp) (:wifi, 0);`, and is the hosted (:tcp) carrier
+// (dangerous_tcp_carrier) above lwIP's sockets and Espressif's Wi-Fi station.
 // On :link_up it encodes (:accel, { x: 1, y: -2, z: 512, at_ms: 1000 }) with ETF (48 bytes), frames it
 // with wireframe@frame (a 4-byte length before it, what Erlang's gen_tcp {packet, 4} speaks) and sends
 // it, printing the segment in hexadecimal. It then reassembles what the peer sends with
 // wireframe@unframe, decodes the frame, prints the reading and closes the link: a peer that sends the
-// same frame back proves both directions. Two busy actors keep the cores occupied from the start; the
-// program prints how far they got, and what memory the radio has left, when the link comes up. Run it
-// through spike_r1/run_r1_wifi_peer.sh, which puts the peer's address in place of the one below.
+// same frame back proves both directions. A carrier ends with its link, so each link has a carrier of
+// its own; while the station has not joined its access point the link is not there
+// ((:link_down, :fault)), and the program opens again half a second later, up to forty times. Two
+// busy actors keep the cores occupied from the start; the program prints how far they got when a
+// link comes up. Run it through spike_r1/run_r1_wifi_peer.sh, which puts the peer's address in place
+// of the one below.
 module dangerous_wifi_board_peer;
 
 use wire_etf;
 use wireframe;
 use Carrier;
-use dangerous_wifi;
 use trial_support_hex;
 use trial_wait_int64;
 
@@ -62,42 +64,6 @@ fn busy(msg: actor_ref, rounds: int64) -> (:no_reply, int64) {
         _: boolean <- cast(self(), msg impl ActorMessage {})
     produces
         pure (:no_reply, rounds + 1)
-    end
-}
-
-fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
-    case r of {
-        (:ok, v: int64) -> v;
-        (:rejected, _why: atom) -> 0 - 1
-    }
-}
-
-fn report_to(msg: (:report, actor_ref, atom)) -> actor_ref {
-    case msg of {
-        (:report, to: actor_ref, _what: atom) -> to
-    }
-}
-
-fn report_of(msg: (:report, actor_ref, atom)) -> atom {
-    case msg of {
-        (:report, _to: actor_ref, what: atom) -> what
-    }
-}
-
-// Reads the memory the Wi-Fi libraries and lwIP take theirs from, free now and the least it has been,
-// and sends the two figures back. What a foreign call answered cannot
-// be printed where it was read, so the owner prints it.
-fn meter(msg: (:report, actor_ref, atom), state: int64) -> (:no_reply, int64) {
-    sequence proc[external_danger, concurrency, transport]
-        res_free: { tag: int64, value: int64, error_code: int64 } <- dangerous_wifi@memory(0);
-        res_least: { tag: int64, value: int64, error_code: int64 } <- dangerous_wifi@memory(1);
-        free_raw: int64 <- res_free.value;
-        least_raw: int64 <- res_least.value;
-        free: int64 <- pure_int(recreate(free_raw));
-        least: int64 <- pure_int(recreate(least_raw));
-        _: boolean <- cast(report_to(msg), (:heap, report_of(msg), free, least) impl ActorMessage {})
-    produces
-        pure (:no_reply, state)
     end
 }
 
@@ -138,7 +104,7 @@ fn show_reading(r: { x: int16, y: int16, z: int16, at_ms: uint64 }) -> atom {
 }
 
 // Every segment to the carrier, in order; the count sent.
-fn send_all(car: actor_ref, segs: List[string, mem(normal)], sent: int64) -> int64 {
+fn send_all(car: dangerous_actor_ref, segs: List[string, mem(normal)], sent: int64) -> int64 {
     case segs of {
         []: List[string, mem(normal)] -> sent;
         [h: string, t: List[string, mem(normal)]] -> {
@@ -164,7 +130,7 @@ fn only_first(segs: List[string, mem(normal)]) -> List[string, mem(normal)] {
 }
 
 // cutting: only the frame's first segment goes out.
-fn send_reading(car: actor_ref, cutting: boolean) -> int64 {
+fn send_reading(car: dangerous_actor_ref, cutting: boolean) -> int64 {
     sequence proc[mem(normal), device_io, transport]
         frame: string <- encode((:etf), (:accel, { x: 1, y: 0 - 2, z: 512, at_ms: 1000 }));
         _: atom <- print("frame out ");
@@ -178,7 +144,7 @@ fn send_reading(car: actor_ref, cutting: boolean) -> int64 {
 }
 
 // The exchange is over: close now, or after hold_ms() when the link is to be kept (never when cutting).
-fn finish(car: actor_ref, cutting: boolean) -> boolean {
+fn finish(car: dangerous_actor_ref, cutting: boolean) -> boolean {
     sequence proc[concurrency]
         done: boolean <- case hold_ms() == 0 or cutting of {
             true -> cast(car, :close impl ActorMessage {});
@@ -203,41 +169,25 @@ fn finish(car: actor_ref, cutting: boolean) -> boolean {
 // opens the carrier again. It ends with status 0 after links() whole exchanges, 5 after four that were
 // cut short. cut_link() names one link, by its place in the run, on which this end sends only its first
 // segment and closes: the other end's test of a frame cut short.
-fn owner(msg: (:rounds, int64) | (:heap, atom, int64, int64) | (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | :reopen | :finish,
-         state: { car: actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, up: boolean, sent: int64, acked: int64, got: boolean, cut: boolean, done: int64, lost: int64, meter: dangerous_actor_ref, rounds: int64 })
-    -> (:no_reply, { car: actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, up: boolean, sent: int64, acked: int64, got: boolean, cut: boolean, done: int64, lost: int64, meter: dangerous_actor_ref, rounds: int64 }) {
+fn owner(msg: (:rounds, int64) | (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | :reopen | :finish,
+         state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, up: boolean, sent: int64, acked: int64, got: boolean, cut: boolean, done: int64, lost: int64, rounds: int64 })
+    -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, up: boolean, sent: int64, acked: int64, got: boolean, cut: boolean, done: int64, lost: int64, rounds: int64 }) {
     case msg of {
-        (:rounds, n: int64) -> (:no_reply, { car: state.car, rx: state.rx, code: state.code, up: state.up, sent: state.sent, acked: state.acked, got: state.got, cut: state.cut, done: state.done, lost: state.lost, meter: state.meter, rounds: state.rounds + n });
-        (:heap, what: atom, free: int64, least: int64) -> {
-            sequence proc[device_io]
-                _: atom <- print("radio memory at ");
-                _: atom <- print_atom(what);
-                _: atom <- print(": free ");
-                _: atom <- print_int64(free);
-                _: atom <- print(" least ");
-                _: atom <- print_int64(least);
-                _: atom <- println("")
-            produces
-                pure (:no_reply, state)
-            end
-        };
+        (:rounds, n: int64) -> (:no_reply, { car: state.car, rx: state.rx, code: state.code, up: state.up, sent: state.sent, acked: state.acked, got: state.got, cut: state.cut, done: state.done, lost: state.lost, rounds: state.rounds + n });
         (:link_up, info: string) -> {
             sequence proc[concurrency, device_io]
                 _: atom <- print("link up ");
                 _: atom <- println(info);
                 _: atom <- show_rounds(state.rounds);
-                _: boolean <- cast(state.meter, (:report, self(), :link_up) impl ActorMessage {});
-                _: boolean <- case state.done + state.lost == 0 of {
-                    true -> cast(state.car, (:credit, 8) impl ActorMessage {});
-                    false -> true
-                };
+                // each link has a carrier of its own, which starts with no credit
+                _: boolean <- cast(state.car, (:credit, 8) impl ActorMessage {});
                 cutting: boolean <- state.done + state.lost == cut_link();
                 n: int64 <- send_reading(state.car, cutting);
                 _: atom <- print("sent ");
                 _: atom <- print_int64(n);
                 _: atom <- println(" segments; waiting for a frame from the peer")
             produces
-                pure (:no_reply, { car: state.car, rx: state.rx, code: 4, up: true, sent: n, acked: 0, got: false, cut: cutting, done: state.done, lost: state.lost, meter: state.meter, rounds: state.rounds })
+                pure (:no_reply, { car: state.car, rx: state.rx, code: 4, up: true, sent: n, acked: 0, got: false, cut: cutting, done: state.done, lost: state.lost, rounds: state.rounds })
             end
         };
         (:tx_credit, n: int64) -> {
@@ -246,7 +196,7 @@ fn owner(msg: (:rounds, int64) | (:heap, atom, int64, int64) | (:link_up, string
                 true -> finish(state.car, state.cut);
                 false -> true
             };
-            (:no_reply, { car: state.car, rx: state.rx, code: state.code, up: state.up, sent: state.sent, acked: acked, got: state.got, cut: state.cut, done: state.done, lost: state.lost, meter: state.meter, rounds: state.rounds })
+            (:no_reply, { car: state.car, rx: state.rx, code: state.code, up: state.up, sent: state.sent, acked: acked, got: state.got, cut: state.cut, done: state.done, lost: state.lost, rounds: state.rounds })
         };
         (:rx, segment: string) -> {
             sequence proc[concurrency, device_io]
@@ -299,7 +249,7 @@ fn owner(msg: (:rounds, int64) | (:heap, atom, int64, int64) | (:link_up, string
                     false -> true
                 }
             produces
-                pure (:no_reply, { car: state.car, rx: rx2, code: code2, up: state.up, sent: state.sent, acked: state.acked, got: got2, cut: state.cut, done: state.done, lost: state.lost, meter: state.meter, rounds: state.rounds })
+                pure (:no_reply, { car: state.car, rx: rx2, code: code2, up: state.up, sent: state.sent, acked: state.acked, got: got2, cut: state.cut, done: state.done, lost: state.lost, rounds: state.rounds })
             end
         };
         (:tx_failed, why3: atom) -> {
@@ -320,9 +270,9 @@ fn owner(msg: (:rounds, int64) | (:heap, atom, int64, int64) | (:link_up, string
                     lost: int64 <- case whole of { true -> state.lost; false -> state.lost + 1 };
                     _: atom <- print("link down ");
                     _: atom <- print_atom(why4);
-                    _: atom <- println(case whole of { true -> ""; false -> case state.cut of { true -> " (cut short by this end)"; false -> " (before the exchange was whole)" } });
+                    _: atom <- println(case whole of { true -> ""; false -> case state.cut of { true -> " (cut short by this end)"; false -> case state.sent == 0 of { true -> " (the link is not there yet, or the peer is not)"; false -> " (before the exchange was whole)" } } });
                 _: atom <- show_rounds(state.rounds);
-                    again: boolean <- why4 != :fault and done < links() and lost < 4;
+                        again: boolean <- done < links() and lost < 40;
                     _: boolean <- case again of {
                         true -> {
                             sequence proc[concurrency]
@@ -334,7 +284,7 @@ fn owner(msg: (:rounds, int64) | (:heap, atom, int64, int64) | (:link_up, string
                         false -> cast_exit(case done == links() of { true -> 0; false -> case why4 == :fault of { true -> 1; false -> 5 } })
                     }
                 produces
-                    pure (:no_reply, { car: state.car, rx: wireframe@fresh(Carrier@boundaries(lan)), code: state.code, up: false, sent: state.sent, acked: state.acked, got: state.got, cut: state.cut, done: done, lost: lost, meter: state.meter, rounds: state.rounds })
+                    pure (:no_reply, { car: state.car, rx: wireframe@fresh(Carrier@boundaries(lan)), code: state.code, up: false, sent: 0, acked: state.acked, got: state.got, cut: state.cut, done: done, lost: lost, rounds: state.rounds })
                 end
             }
         };
@@ -345,14 +295,16 @@ fn owner(msg: (:rounds, int64) | (:heap, atom, int64, int64) | (:link_up, string
                 pure (:no_reply, state)
             end
         };
+        // the carrier ended with its link, so each link has a carrier of its own
         :reopen -> {
             sequence proc[concurrency, device_io]
                 _: atom <- print("link ");
                 _: atom <- print_int64(state.done + state.lost);
                 _: atom <- println(": opening again");
-                _: boolean <- cast(state.car, (:open, self(), address()) impl ActorMessage {})
+                car: dangerous_actor_ref <- spawn_dangerous_carrier(lan, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(car, (:open, self(), address()) impl ActorMessage {})
             produces
-                pure (:no_reply, { car: state.car, rx: state.rx, code: state.code, up: true, sent: 0, acked: 0, got: false, cut: false, done: state.done, lost: state.lost, meter: state.meter, rounds: state.rounds })
+                pure (:no_reply, { car: car, rx: state.rx, code: state.code, up: true, sent: 0, acked: 0, got: false, cut: false, done: state.done, lost: state.lost, rounds: state.rounds })
             end
         }
     }
@@ -363,16 +315,14 @@ fn main() -> int64 {
         _: supervisor_ref <- trial_wait_int64@start();
         _: boolean <- trial_wait_int64@run(fn() -> int64 {
             sequence proc[concurrency]
-                car: actor_ref <- spawn_dangerous_carrier(lan, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-                m: dangerous_actor_ref <- spawn_dangerous(0, meter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-                me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries(lan)), code: 4, up: true, sent: 0, acked: 0, got: false, cut: false, done: 0, lost: 0, meter: m, rounds: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                car: dangerous_actor_ref <- spawn_dangerous_carrier(lan, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries(lan)), code: 4, up: true, sent: 0, acked: 0, got: false, cut: false, done: 0, lost: 0, rounds: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                 b0: actor_ref <- spawn(0, busy, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                 b1: actor_ref <- spawn(0, busy, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
                 _: atom <- migrate_actor(b0, 0);
                 _: atom <- migrate_actor(b1, 1);
                 _: boolean <- cast(b0, me impl ActorMessage {});
                 _: boolean <- cast(b1, me impl ActorMessage {});
-                _: boolean <- cast(m, (:report, me, :start) impl ActorMessage {});
                 _: boolean <- cast(car, (:open, me, address()) impl ActorMessage {})
             produces
                 pure 0

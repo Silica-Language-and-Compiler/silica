@@ -25,7 +25,8 @@
 //
 //   silica_rt_ffi_call()         VRG_ARG = the call block: [+0, +24) the six argument words, [+24] the C
 //                                function, [+28] the result mode (1: the a2-a5 of a struct result are
-//                                stored at [+32, +48)). Calls the C function; a2:a3 = its a2:a3.
+//                                stored at [+32, +48)), plus 4 when a seventh and an eighth argument
+//                                word wait at [+56, +64) for the callee's stack. Calls the C function; a2:a3 = its a2:a3.
 //                                In an actor the call runs on a machine-stack chunk of the actor's own
 //                                chain with _silica_ffi_stack_size bytes free under it: this routine
 //                                takes the chunk exactly as an emitted prologue grows (rt_actors.S
@@ -101,7 +102,13 @@ silica_rt_ffi_call:
 5:  rur     a8, threadptr
     movi    a9, 1
     s32i    a9, a8, VRG_FFI             // in foreign code: a fault now is :foreign_fault
-    l32i    a10, a2, 0
+    l32i    a9, a2, 28
+    bbci    a9, 2, 7f                   // mode bit 2: argument words 6 and 7, which C takes from the
+    l32i    a8, a2, 56                  // caller's stack at a1 + 0 and a1 + 4: this frame's own bottom
+    s32i    a8, a1, 0
+    l32i    a8, a2, 60
+    s32i    a8, a1, 4
+7:  l32i    a10, a2, 0
     l32i    a11, a2, 4
     l32i    a12, a2, 8
     l32i    a13, a2, 12
@@ -113,6 +120,7 @@ silica_rt_ffi_call:
     movi    a9, 0
     s32i    a9, a8, VRG_FFI
     l32i    a9, a2, 28
+    extui   a9, a9, 0, 2                // the result mode, less the stack-words bit
     beqz    a9, 6f
     addi    a9, a9, -1
     bnez    a9, 6f                      // mode 1: a struct of up to 16 bytes came back in a2-a5

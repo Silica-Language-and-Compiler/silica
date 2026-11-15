@@ -26,10 +26,13 @@
 //
 // The call block is 64 bytes of the auxiliary stack (the emitter's SP; reserved by emit_foreign_sret_setup
 // before the arguments are evaluated, as the hosted scratch frame is, and popped after the call):
-//   [SP+0, SP+24)   the six argument words a2-a7 of the C callee, in C order
+//   [SP+0, SP+24)   the six argument words a2-a7 of the C callee, in C order; a seventh and an eighth,
+//                   which C takes from the stack, wait at [SP+56, SP+64) (allowed when the returned
+//                   struct is at most 24 bytes, so does not reach there)
 //   [SP+24]         the C function's address
 //   [SP+28]         the result mode: 0 a scalar in a2:a3, 1 a struct of up to 16 bytes in a2-a5 (stored
-//                   at +32 by the runtime), 2 a struct returned through the hidden pointer at word 0
+//                   at +32 by the runtime), 2 a struct returned through the hidden pointer at word 0;
+//                   plus 4 when argument words 6 and 7 wait at +56 and +60
 //   [SP+32, SP+64)  the returned struct (modes 1 and 2), zeroed before the call
 // Emitted code fills the block, leaves its address in VRG_ARG and calls silica_rt_ffi_call
 // (board/runtime/rt_ffi.S), which loads a10-a15 from it and calls the C function with CALLX8. In an actor
@@ -47,7 +50,7 @@
 // `buf(L, S, uint8, N)` crosses as its data pointer and its count word (§6.2); a struct result holding
 // a `_ptr`/`_len` pair expected as a string is copied into a fresh frame string
 // (silica_rt_ffi_string_out). Nothing is allocated on the heap. What the target does not lower is refused
-// with an `.error` line, the tree's convention for unsupported constructs: more than six argument words,
+// with an `.error` line, the tree's convention for unsupported constructs: more than eight argument words,
 // a record or tuple argument, a float16.
 //
 // A struct result that is not consumed as a string becomes a Silica record when it is a flat record of
@@ -567,13 +570,22 @@ fn block_word_store(reg: string, w: int64) -> string {
     ins("s32i", concat(reg, concat(", a9, ", itos(w * 4))))
 }
 
-// The low word of VR `src` into block word w (a2 is the temp; a global home is read through threadptr).
+// Argument word w of the C callee: words 0 to 5 are the block's first six; words 6 and 7, which C
+// passes on the stack, wait at +56 and +60, the end of the struct area.
+fn arg_word_store(reg: string, w: int64) -> string {
+    case w < 6 of {
+        true -> block_word_store(reg, w);
+        false -> ins("s32i", concat(reg, concat(", a9, ", itos(56 + (w - 6) * 4))))
+    }
+}
+
+// The low word of VR `src` into argument word w (a2 is the temp; a global home is read through threadptr).
 fn stage_lo(src: string, w: int64) -> string {
-    concat(xt_vr@vr_lo_load(src, "a2"), block_word_store(xt_vr@vr_lo_reg(src, "a2"), w))
+    concat(xt_vr@vr_lo_load(src, "a2"), arg_word_store(xt_vr@vr_lo_reg(src, "a2"), w))
 }
 
 fn stage_hi(src: string, w: int64) -> string {
-    concat(xt_vr@vr_hi_load(src, "a3"), block_word_store(xt_vr@vr_hi_reg(src, "a3"), w))
+    concat(xt_vr@vr_hi_load(src, "a3"), arg_word_store(xt_vr@vr_hi_reg(src, "a3"), w))
 }
 
 fn even_up(w: int64) -> int64 {
@@ -665,14 +677,14 @@ fn zero_words_from(w: int64, n: int64) -> string {
     }
 }
 
-// The struct area zeroed, the result mode at +28 and, for a hidden-pointer result, the area's address in
-// word 0.
-fn stage_result_area(mode: int64) -> string {
+// The struct area zeroed, the result mode at +28 (plus 4 when argument words 6 and 7 wait at +56 and
+// +60) and, for a hidden-pointer result, the area's address in word 0.
+fn stage_result_area(mode: int64, stack_flag: int64) -> string {
     case mode == 0 of {
-        true -> concat(ins("movi", "a8, 0"), block_word_store("a8", 7));
+        true -> concat(ins("movi", concat("a8, ", itos(stack_flag))), block_word_store("a8", 7));
         false -> {
             zero: string <- concat(ins("movi", "a8, 0"), zero_words_from(8, 8));
-            mode_line: string <- concat(ins("movi", concat("a8, ", itos(mode))), block_word_store("a8", 7));
+            mode_line: string <- concat(ins("movi", concat("a8, ", itos(mode + stack_flag))), block_word_store("a8", 7));
             ptr: string <- case mode == 2 of {
                 true -> concat(ins("addi", "a8, a9, 32"), block_word_store("a8", 0));
                 false -> ""
@@ -877,6 +889,24 @@ fn result_mode(return_type: string, expects_string: boolean) -> (int64, string) 
     }
 }
 
+// The C size of a result that comes back in the block's struct area, 0 for a scalar: argument words 6
+// and 7 wait in that area's last 8 bytes, which a struct of up to 24 bytes leaves alone.
+fn result_c_bytes(return_type: string, expects_string: boolean, mode: int64) -> int64 {
+    case mode == 0 of {
+        true -> 0;
+        false -> case expects_string of {
+            true -> {
+                (size: int64, _: int64, _: int64, _: int64) <- string_result_layout(return_type);
+                size
+            };
+            false -> {
+                (rsize: int64, _: string) <- record_result_layout(return_type);
+                rsize
+            }
+        }
+    }
+}
+
 fn foreign_call_body(
     term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 },
     dest: string,
@@ -890,9 +920,10 @@ fn foreign_call_body(
         true -> error_line(mode_err);
         false -> case length_bytes(args_err) > 0 of {
             true -> error_line(args_err);
-            false -> case words > 6 of {
-                true -> error_line(concat("a foreign call with more than six argument words is not supported on this target (", concat(ctx.c_symbol, ")")));
+            false -> case words > 8 or (words > 6 and result_c_bytes(ctx.return_type, expects_string, mode) > 24) of {
+                true -> error_line(concat("a foreign call with more than eight argument words, or more than six and a result record larger than 24 bytes, is not supported on this target (", concat(ctx.c_symbol, ")")));
                 false -> {
+                    stack_flag: int64 <- case words > 6 of { true -> 4; false -> 0 };
                     marshal: string <- case needs_string_in_marshal(ctx.param_types, ctx.arg1_type) of {
                         true -> emit_string_in_marshal();
                         false -> case needs_buf_in_marshal(ctx.param_types, ctx.arg1_type) of {
@@ -900,7 +931,7 @@ fn foreign_call_body(
                             false -> ""
                         }
                     };
-                    stage: string <- concat(block_base_load(), concat(stage_result_area(mode), concat(args_asm, stage_target_and_call(ctx.c_symbol))));
+                    stage: string <- concat(block_base_load(), concat(stage_result_area(mode, stack_flag), concat(args_asm, stage_target_and_call(ctx.c_symbol))));
                     string_out: string <- case expects_string and mode > 0 of {
                         true -> {
                             (_: int64, tag_off: int64, ptr_off: int64, len_off: int64) <- string_result_layout(ctx.return_type);

@@ -14,7 +14,8 @@
 # limitations under the License.
 
 """The Mac's end of run_wifi.sh --tcp: listens on a TCP port, and for each of <links> connections reads
-one frame behind a 4-byte length (Erlang's {packet, 4}), prints it and sends it back.
+one frame behind a 4-byte length (Erlang's {packet, 4}), prints it, sends it back and waits for the
+other end to close.
 
     wifi_peer.py <port> [<links>] [<seconds>]
 
@@ -48,6 +49,13 @@ try:
             head = read(conn, 4)
             frame = read(conn, struct.unpack('>I', head)[0])
             conn.sendall(head + frame)
+            # the other end closes when it has the frame: a carrier that sees its peer close first ends
+            # at once, and its owner may still be answering the frame
+            try:
+                while conn.recv(4096):
+                    pass
+            except socket.timeout:
+                pass
         print('link %d: frame in %d bytes %s, sent back' % (link, len(frame), frame.hex().upper()), flush=True)
 except (socket.timeout, EOFError) as e:
     print('no whole frame: %s' % type(e).__name__, flush=True)
