@@ -1465,6 +1465,27 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     on the board to keep them that outlives a flash, or a way back from a key only one end still has
     (§8, decision 4).
 
+- **Stage 12, part 5, step 5, 2026-11-14, done: thirty links in a row with nobody at the Mac, on each
+  route. Both are whole; route R1 takes three times as long with this program, whose two busy actors now
+  share the one core its actors have.**
+  - Run: the stage 7 program built with `--open`, `--links 30`; the Mac's `run_peer.sh central --links 30`.
+
+    | Route | Links whole, both ends | Reasons for the links' ends | The Mac's time | Each link |
+    | --- | --- | --- | --- | --- |
+    | R1 (Silica owns the chip; Bluetooth on core 1) | 30 of 30 | 30 `:closed` | 631 s | 21 s |
+    | Guest of ESP-IDF | 30 of 30 | 30 `:closed` | 201 s | 6.7 s |
+
+    Both ends status 0 on both routes.
+  - The time: on R1 the program's actors have core 0 alone. Its two busy actors take turns of some
+    0.65 s each, so the radio actor is run every 1.35 s (step 1), and each step of the exchange that the
+    program takes itself waits for that. On the guest the actors have both cores and FreeRTOS takes a
+    core from them for the Bluetooth tasks. The Bluetooth tasks themselves are served at once on R1: no
+    link was lost or timed out in the thirty.
+  - Memory of the Bluetooth side, steady from the first link to the last on both: R1's block of 96 KB had
+    10,448 bytes free with a link up; ESP-IDF's heap on the guest had 35,420.
+  - Not compared: a program without busy actors, where R1's one core for actors costs less; the board as
+    central; links held up for long.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
