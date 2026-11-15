@@ -380,7 +380,7 @@ void _frxt_setup_switch(void)
 
 // ---- the two lines of control ----
 
-#define MAX_CO 4
+#define MAX_CO 8     // main, and both radios' tasks at once: the controller's, NimBLE's, Wi-Fi's, lwIP's, the station's
 enum { CO_FREE, CO_NEW, CO_LIVE, CO_DEAD, CO_TAKEN };
 static struct co {
     uint32_t ctx[2];
@@ -478,6 +478,8 @@ int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, uint32_t stack
     (void)core;
     silica_rt_puts("shim: task ");
     silica_rt_puts(name);
+    silica_rt_puts(", stack asked ");
+    spike_put_dec(stack);
     silica_rt_puts("\n");
     for (int i = 1; i < MAX_CO; i++) {
         uint32_t ps = mask_level3();
@@ -559,6 +561,7 @@ void *silica_rt_alloc_or_null(uint32_t size);
 void silica_rt_free(void *p);
 extern uint8_t _silica_heap_start[], _silica_heap_end[];
 static uint32_t arena_given, arena_most;
+#define ARENA_BYTES ((uint32_t)(_silica_heap_end - _silica_heap_start))
 
 static uint32_t *block_base(void *p)       // the runtime's payload address of a block handed out
 {
@@ -590,7 +593,13 @@ void *malloc(size_t n)
     }
     unmask(ps);
     if (p == NULL) {
-        silica_rt_puts("shim: out of memory\n");
+        silica_rt_puts("shim: out of memory: ");
+        spike_put_dec((uint32_t)n);
+        silica_rt_puts(" bytes asked, the libraries hold ");
+        spike_put_dec(arena_given);
+        silica_rt_puts(" of the heap's ");
+        spike_put_dec(ARENA_BYTES);
+        silica_rt_puts("\n");
     }
     return p;
 }
@@ -607,7 +616,6 @@ void free(void *p)
     unmask(ps);
 }
 
-#define ARENA_BYTES ((uint32_t)(_silica_heap_end - _silica_heap_start))
 #else
 // Blocks of 16-byte multiples, each under a 16-byte header, in address order; a freed block is joined
 // to the free blocks after it.

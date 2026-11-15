@@ -140,11 +140,12 @@ for src in "$@"; do
 done
 
 # BOARD_FLASH_FILES: the files whose code and constants run from flash (flash_layout.py)
+# BOARD_FLASH_IRAM=1: their code marked for RAM (.iram1) as well
 ldscript="$RT/silica_esp32s3.ld"
 if [ -n "${BOARD_FLASH_FILES:-}" ]; then
     ldscript="$objdir/silica_esp32s3_flash.ld"
     # shellcheck disable=SC2086
-    "${BOARD_PYTHON:-python3}" "$HERE/flash_layout.py" script "$RT/silica_esp32s3.ld" "$ldscript" $BOARD_FLASH_FILES
+    "${BOARD_PYTHON:-python3}" "$HERE/flash_layout.py" script ${BOARD_FLASH_IRAM:+--iram} "$RT/silica_esp32s3.ld" "$ldscript" $BOARD_FLASH_FILES
 fi
 
 link() {   # the --defsym options must precede -T: the script tests DEFINED() on them

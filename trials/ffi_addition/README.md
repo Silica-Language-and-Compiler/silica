@@ -19,6 +19,7 @@ ffi_addition/
   app_ffi_result_cast_add/              # runnable app: FFI result cast with tainted int64
   app_foreign_abi_valid/                # runnable apps: legacy Silica-side ABI smoke tests
   app_foreign_abi_types_e2e/            # runtime link + guarded worker for libsilica_abi_types.a
+  app_foreign_three_int64_result_e2e/   # three int64 arguments and a struct result: eight argument words on the ESP32-S3
   abi_addition/                         # compile-only ABI success trials (spec §5–§9 data shapes)
   app_e2e_scalar_string_echo/           # runnable apps: scalar add + string echo e2e
   module_addition/                      # compile-only module naming trial (phase 3)
@@ -45,6 +46,7 @@ Each `app_*` directory is a self-contained runnable program (or small set of pro
 | `app_ffi_result_cast_add` | Tainted int64 delivered by FFI result cast inside worker |
 | `app_foreign_abi_valid` | Scalar and net-port ABI declarations compile and run |
 | `app_foreign_abi_types_e2e` | Runtime link + cast/worker for `libsilica_abi_types.a` (int64/boolean/record/tagged_result decls; guarded `:foreign_fault` golden) |
+| `app_foreign_three_int64_result_e2e` | Three `int64` arguments and a tagged result: on the ESP32-S3 a hidden result pointer and three aligned pairs, eight argument words, the last two on the C stack (`10203` / `done` golden; left out on the STM32, whose emitter takes six) |
 | `abi_addition/` | Compile-success matrix for documented C ABI data shapes (§5.4–§9): integers, floats, boolean, inline records, tagged results, string ptr+len and two-layer adapters |
 | `app_e2e_scalar_string_echo` | Full cast/worker e2e: int64 add and string echo through C wrappers |
 | `app_legacy_math_add_guarded` | Phase 11: single `silica_legacy_math_add_int64` call through guarded runtime boundary |

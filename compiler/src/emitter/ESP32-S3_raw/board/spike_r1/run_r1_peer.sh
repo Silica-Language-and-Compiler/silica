@@ -80,7 +80,7 @@ for f in "$SRC"/*.sams; do
     BOARD_FLASH_FILES="$BOARD_FLASH_FILES *.$(basename "$f" .sams).o"
 done
 export BOARD_FLASH_FILES
-export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DARENA_KB=${ARENA_KB:-96} -DR1_CPU_MHZ=${R1_CPU_MHZ:-80}"
+export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DR1_CPU_MHZ=${R1_CPU_MHZ:-80}"
 # the runtime on one core, core 0, for the program's actors; core 1 is the Bluetooth tasks' (r1_port.c)
 export BOARD_ASFLAGS="-DNCORES_RUN=1"
 # The controller's handler interrupts core 1 only, so no actor's stack needs room for it.

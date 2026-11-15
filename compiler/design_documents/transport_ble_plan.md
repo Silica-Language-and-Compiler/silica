@@ -1742,6 +1742,30 @@ Each stage's result is recorded here when it closes: date, what was built, trial
 
   - Not done: a trial for the eight-word call; the hosted trials of the `(:tcp)` carrier run on the
     board; a link lost in the middle; the Bluetooth image on the one heap.
+- **Stage 12, part 10, 2026-11-15, done: the merged tree verified on the Mac, and a trial for the
+  eight-word call.**
+  - **The Mac's whole tree on the merged source**: 35,190 trials passed and 75 differed, every one a
+    golden the merge left stale and no program's behaviour: 66 assembly goldens of the transport
+    suites main added (the atom table two atoms longer, `:ble_gatt` and `:characteristic`, and the
+    numbers after them moved) and 9 diagnostics whose lists of carriers and links now hold both
+    branches' entries (`(:ble_gatt)`, `(:bluetooth, n)` beside the `(:store)` links). The 66 were
+    recorded again with `programmer_tools/update_goldens.sh --apply` for `transport_addition` and
+    `ffi_addition/app_transport_tcp_loopback`, the 9 from the compiler's output after reading each
+    difference. Run again: `transport_addition` 109 of 109, `ffi_addition` 94 of 94,
+    `error_enforcement_addition` 11,114 of 11,114.
+  - **Trial `ffi_addition/app_foreign_three_int64_result_e2e`**: a C function of three `int64`
+    returning the tagged result (`silica_abi_i64_result_of3` in the fixtures' `silica_abi_types.c`),
+    the shape of `dangerous_sockets`' receive: eight argument words on the ESP32-S3, the last two on
+    the C stack. It answers `a * 10000 + b * 100 + c`; the trial prints `10203`. Passes on the Mac and
+    on the board, assembly goldens recorded for both (the board's shows the stores at the call
+    block's +56 and +60); the board's `ffi_addition` 69 of 69. Left out on the STM32-L476RG
+    (`trials/targets/STM32-L476RG_raw.skip`): its emitter takes six words, so the hosted `(:tcp)`
+    carrier's receive would not compile there either.
+  - **The Bluetooth image on the one heap**: `run_r1_peer.sh` builds with `-DSPIKE_ONE_HEAP` (a heap
+    of 264 KB); three links of three on both ends.
+  - `flash_layout.py script --iram` (`BOARD_FLASH_IRAM=1`): the listed libraries' code marked for RAM
+    (`.iram1`) goes to flash as well, for an image that never takes its flash away. Not used by the
+    single-radio scripts.
 
 ## 7. Facts the design rests on
 

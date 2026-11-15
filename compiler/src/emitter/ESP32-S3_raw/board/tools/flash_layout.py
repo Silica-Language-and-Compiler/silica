@@ -15,7 +15,7 @@
 
 """Code and constants that run from flash, for a bare-metal image (transport_ble_plan.md stage 12).
 
-    flash_layout.py script <silica_esp32s3.ld> <out.ld> <file pattern>...
+    flash_layout.py script [--iram] <silica_esp32s3.ld> <out.ld> <file pattern>...
     flash_layout.py ram <linked.elf> <ram.elf>
     flash_layout.py merge <ram.bin> <rodata.bin> <text.bin> <out.bin>
 
@@ -23,7 +23,8 @@ script: writes a copy of the runtime's linker script in which the code (.literal
 constants (.rodata) of the files matching the patterns (as the linker matches them: *libphy.a) are
 placed at the addresses the flash is mapped to, with every section named .flash.text* or
 .flash.rodata*. Everything else stays in RAM as before: data, .bss, and code a file marks for RAM
-(.iram1). The script defines _silica_flash_{text,rodata}_{start,end} and _silica_flash_{text,rodata}_offset.
+(.iram1). With --iram the matching files' .iram1 code goes to flash as well: ESP-IDF keeps it in RAM for
+the times it takes the flash away, which an image that never writes its flash does not have. The script defines _silica_flash_{text,rodata}_{start,end} and _silica_flash_{text,rodata}_offset.
 
 ram: writes a copy of the linked ELF in which the two flash sections are marked as holding no bytes
 (as .bss is), so the image tool builds the part the ROM loads into RAM from the rest. The sections
@@ -45,7 +46,7 @@ RODATA_ADDRESS = 0x3C000000
 TEXT_ADDRESS = 0x42040000
 
 
-def script(src, out, patterns):
+def script(src, out, patterns, iram=False):
     text = open(src).read()
     files = ' '.join(patterns)
 
@@ -60,6 +61,8 @@ def script(src, out, patterns):
 
     swap('*(.literal .literal.* .text .text.*)')
     swap('*(.rodata .rodata.* .srodata .srodata.*)')
+    if iram:
+        swap('*(.iram1 .iram1.*)')
     memory = '  dram (RW) : org = 0x3FC88000, len = 0x61700\n'
     if text.count(memory) != 1:
         sys.exit('flash_layout: the linker script has no dram region as expected')
@@ -77,6 +80,7 @@ def script(src, out, patterns):
     _silica_flash_text_start = ABSOLUTE(.);
     *(.flash.text .flash.text.*)
     *(.literal .literal.* .text .text.*)
+    *(.iram1 .iram1.*)
     /* the names Espressif's Wi-Fi and radio libraries give code that ESP-IDF may keep in RAM: no flash
        operation here ever takes the flash away from under it */
     *(.wifi0iram .wifi0iram.* .wifirxiram .wifirxiram.* .wifislpiram .wifislpiram.* .wifislprxiram .wifislprxiram.*)
@@ -133,7 +137,9 @@ def merge(ram, rodata, code, out):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) >= 5 and sys.argv[1] == 'script':
+    if len(sys.argv) >= 6 and sys.argv[1:3] == ['script', '--iram']:
+        script(sys.argv[3], sys.argv[4], sys.argv[5:], True)
+    elif len(sys.argv) >= 5 and sys.argv[1] == 'script':
         script(sys.argv[2], sys.argv[3], sys.argv[4:])
     elif len(sys.argv) == 4 and sys.argv[1] == 'ram':
         ram(sys.argv[2], sys.argv[3])
