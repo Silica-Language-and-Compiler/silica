@@ -541,22 +541,25 @@ supervisor decides what happens next. Making that safe is a change to the langua
    `cast_device` to an actor that has ended, or never existed, now returns `false` and the sender goes on. It holds for
    every actor reference, not only a carrier's. It is stated in specification §16.1.2, §16.1.4 and §15.1.2.3 and made in
    the runtime of every target. Built and run on Apple Silicon; changed but not run on Linux AArch64, Linux x86-64,
-   ESP32-S3_raw and STM32-L476RG_raw. `call`, `call_with_timeout` and the registered casts are unchanged and still
-   raise `actor_not_found`; whether they change is not decided.
-2. **The store carriers.** `store_memory_carrier` and `dangerous_store_backing_carrier` then end on a medium failure and
-   on a refused open, with `stop_self((:explicit, :link_lost))` and `(:explicit, :link_unavailable)`, as the network
-   carriers do, and §6.8.2 and §6.8.10 lose their exception.
-3. **Owners.** An owner written against today's store carriers sends `:close` after `(:link_down, :medium)`. After the
-   upgrade that `:close` reaches an ended carrier and is harmless, so such an owner needs no change; an owner that relies
-   on the carrier staying to be opened again must start a new carrier, or leave that to its supervisor.
+   STM32-L476RG_raw; run on the ESP32-S3 board on 2026-11-16 (the trial `cast_to_ended_actor_returns_false` as a board
+   app: its output matched). `call`, `call_with_timeout` and the registered casts are unchanged and still raise
+   `actor_not_found`: **decided (Lee, 2026-11-16), they keep raising.** The legacy builtin `send` also still raises;
+   what becomes of it is not decided.
+2. **The store carriers: not to be changed (decided, Lee, 2026-11-16).** `store_memory_carrier` and
+   `dangerous_store_backing_carrier` keep ending only on their owner's `:close`, and stay, not open, after a medium
+   failure or a refused open. The exception of §6.8.2 and §6.8.10 stands as the design, not as an interim state. (The
+   note first said they would end on failure as the network carriers do.)
+3. **Owners.** With item 2 decided as it is, an owner of a store carrier is unchanged: it sends `:close` after
+   `(:link_down, :medium)` to be rid of the carrier, or opens it again. An owner of a hosted network carrier that sends
+   after the carrier has ended gets `false` and goes on.
 4. **Trials.** A trial in which an owner sends to a carrier that has already ended, for each carrier kind; the
    `ethernet_direct` example's dial retry, which closes a carrier that a refused dial has already ended, is the case
    that exists today. The `(:tcp)` carrier has its trial (2026-11-16,
    `transport_addition/app_transport_tcp_close_after_end`, run on Apple Silicon);
    the other carrier kinds have none yet.
 
-What remains is items 2 and 3, and the trials of item 4 for the other carrier kinds. Until item 2 is built a program
-that owns a store carrier must send `:close` to be rid of it. A program that owns a hosted network carrier should still
+What remains is the trials of item 4 for the other carrier kinds. A program that owns a store carrier must send
+`:close` to be rid of it. A program that owns a hosted network carrier should still
 treat `:link_down` as the last use of that reference: a message sent after it is dropped.
 
 **Listeners.** A carrier whose `addressing` is `:endpoint` and whose `boundaries` are `:stream` may be opened to
@@ -946,6 +949,12 @@ at a time, ending at the `next` of its `:read`, with `:read_stop` and `:busy` (�
 `:sync` and `:read_stop` are bare atoms, as `:close` is (§6.8.2). (19) The `(:memory)` carrier is an ordinary actor and
 its reference an `actor_ref`; a hosted `(:backing)` carrier is a dangerous actor (§6.8.1). (20) Receive credit outlives
 a replay (§6.8.2).
+
+**Decided (Lee, 2026-11-16).** Three points that were written into this section during the review without a ruling are
+accepted as written: (21) `:trim` is answered by `:log` and a trimmed queue delivers at least once (§6.8.5, decision 14);
+(22) a record never spans two blocks, and the block size gives the `mtu` (§6.8.4, decision 16); (23) the recovery
+trials run on `(:backing)` and not on `(:memory)` (§6.8.7). (24) The store carriers end only on their owner's `:close`
+and stay, not open, after a failure (§6.2, upgrade note item 2).
 
 **Open.**
 1. (Closed 2026-11-12: there is no default retention.)
