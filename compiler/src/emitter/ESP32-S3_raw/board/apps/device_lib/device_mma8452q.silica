@@ -1,0 +1,284 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The port test board's accelerometer, an NXP MMA8452Q (3 axes, 12 bits, device_window(L, (:esp32s3_i2c0)) address 0x1C:
+// board_pack accelerometer_i2c_address) on the board's I2C bus, as a device worker over the I2C0
+// controller (device_esp32s3_i2c0). Written in Silica from the part's register map; nothing foreign
+// is called.
+//
+// THE PART. Registers used (MMA8452Q data sheet, register map):
+//     0x01..0x06  OUT_X_MSB, OUT_X_LSB, OUT_Y_MSB, OUT_Y_LSB, OUT_Z_MSB, OUT_Z_LSB
+//     0x0D        WHO_AM_I, which reads 0x2A on this part
+//     0x0E        XYZ_DATA_CFG: bits 1:0 the full-scale range (0 = +-2 g, 1 = +-4 g, 2 = +-8 g)
+//     0x2A        CTRL_REG1: bit 0 ACTIVE, bits 5:3 the output data rate (3 = 100 Hz)
+// The configuration registers may be written only in standby (ACTIVE 0), so :init puts the part in
+// standby, sets the range to +-2 g, and then sets 100 Hz and ACTIVE in one write (0x19).
+// A sample is 12 bits, two's complement, left-justified in two bytes: the MSB byte holds bits 11:4 and
+// the top four bits of the LSB byte hold bits 3:0. At +-2 g one count is 1/1024 g, so an axis that
+// points straight up reads about +1024 and one that points straight down about -1024. The six output
+// bytes are read in ONE transfer, which is what keeps the three axes of a reading from the same
+// sample: the part latches the set when the first of them is read.
+//
+// This worker owns four windows: device_window(L, (:esp32s3_gpio)) and IO_MUX for the two bus pads, SYSTEM for the controller's
+// clock gate, and I2C0. Two workers must not share a controller (spec 5.1), so an app that reads the
+// accelerometer does its other I2C work through this worker or not at all until a bus worker serves
+// several devices.
+//
+// State: `:unmapped` until :init; then (:mapped, gpio, mux, system, i2c0), one flat tuple of the four
+// windows.
+//
+// Messages: { op: :init | :read | :hold | :probe | :init_unclocked | :reclock, count: int64,
+// reply_to: actor_ref }.
+//   :init   maps the windows, brings the controller and the pads up, asks the part who it is and
+//           configures it. Answer to reply_to: (:accel_ready, who) with who the WHO_AM_I byte (42, hex
+//           2A), or (:accel_error, why, who) with why the I2C outcome of the step that failed (:nack
+//           when nothing answers at 0x1C, :timeout, :arbitration_lost, :stuck) or :unknown_part when
+//           something answered with another WHO_AM_I.
+//   :read   one reading. Answer: (:accel, x, y, z), each axis in counts of 1/1024 g, -2048 to 2047,
+//           or (:accel_error, why, 0).
+//   :hold   busy-waits `count` ticks of about a millisecond in message order (no delay builtin), so
+//           an app can space its readings.
+// Three more messages serve the error-path apps (silica_36, silica_37):
+//   :probe           reads WHO_AM_I at the 7-bit address `count`, whatever it is. Answer:
+//                    (:accel_probed, how, byte) with how the I2C outcome (:ok, or :nack when nothing
+//                    answers there) and byte what was read.
+//   :init_unclocked  as :init, but with the controller's clock gate turned OFF, so every transfer ends
+//                    :stuck. Answer: (:accel_error, :stuck, 0).
+//   :reclock         after :init_unclocked: turns the clock on, sets the controller up again and brings
+//                    the part up. Answer as for :init.
+// Before :init (or :init_unclocked) every other message is ignored. The answers are ordinary casts; an int64 per axis is
+// used where the transport design 6.6 names int16 fields, and there is no timestamp yet: the board
+// has no clock builtin to take one from.
+
+use device_esp32s3_i2c0;
+use device_esp32s3_gpio_registers;
+use device_esp32s3_io_mux_registers;
+use device_esp32s3_system_registers;
+use device_esp32s3_i2c0_registers;
+use board_pack;
+
+export accelerometer_worker/2;
+
+fn reg_out_x_msb() -> uint32 {
+    0x01
+}
+
+fn reg_who_am_i() -> uint32 {
+    0x0D
+}
+
+fn reg_xyz_data_cfg() -> uint32 {
+    0x0E
+}
+
+fn reg_ctrl_reg1() -> uint32 {
+    0x2A
+}
+
+// What WHO_AM_I reads on an MMA8452Q.
+fn who_mma8452q() -> uint32 {
+    0x2A
+}
+
+// CTRL_REG1: output data rate 100 Hz (bits 5:3 = 3) and ACTIVE (bit 0).
+fn ctrl_100hz_active() -> uint32 {
+    0x19
+}
+
+fn spin(n: int64) -> int64 {
+    case n == 0 of { true -> 0; false -> spin(n - 1) }
+}
+
+// About a millisecond per tick at the 40 MHz hand-off clock (device_esp32s3_gpio's count).
+fn hold_ticks(n: int64) -> int64 {
+    case n <= 0 of {
+        true -> 0;
+        false -> {
+            _: int64 <- spin(400);
+            hold_ticks(n - 1)
+        }
+    }
+}
+
+// One axis from its two bytes: 12 bits, two's complement, left-justified.
+fn axis(msb: uint32, lsb: uint32) -> int64 {
+    raw: uint32 <- (msb shl 4) bor (lsb shr 4);
+    case raw >= 2048 of {
+        true -> to_int64(raw) - 4096;
+        false -> to_int64(raw)
+    }
+}
+
+// WHO_AM_I at an address: (the window, how the transfer ended, the byte read).
+fn who_at(i: device_window(L, (:esp32s3_i2c0)), addr: uint32) -> (device_window(L, (:esp32s3_i2c0)), atom, uint32) {
+    sequence proc[register_rwr]
+        (i1, how) <- device_esp32s3_i2c0@i2c0_read_start(i, addr, reg_who_am_i(), 1);
+        (i2, who) <- device_esp32s3_i2c0@i2c0_rx_byte(i1)
+    produces
+        pure (i2, how, who)
+    end
+}
+
+// Standby, +-2 g, then 100 Hz and active. The first write that fails is the answer.
+fn configure(i: device_window(L, (:esp32s3_i2c0))) -> (device_window(L, (:esp32s3_i2c0)), atom) {
+    sequence proc[register_rwr]
+        addr: uint32 <- board_pack@accelerometer_i2c_address();
+        (i1, a) <- device_esp32s3_i2c0@i2c0_write_reg(i, addr, reg_ctrl_reg1(), 0);
+        (i2, b) <- device_esp32s3_i2c0@i2c0_write_reg(i1, addr, reg_xyz_data_cfg(), 0);
+        (i3, c) <- device_esp32s3_i2c0@i2c0_write_reg(i2, addr, reg_ctrl_reg1(), ctrl_100hz_active())
+    produces
+        pure (i3, case a == :ok of { false -> a; true -> case b == :ok of { false -> b; true -> c } })
+    end
+}
+
+// Bring-up: (the window, :ok or why not, the WHO_AM_I byte).
+fn bring_up(i: device_window(L, (:esp32s3_i2c0))) -> (device_window(L, (:esp32s3_i2c0)), atom, uint32) {
+    sequence proc[register_rwr]
+        (i1, how, who) <- who_at(i, board_pack@accelerometer_i2c_address());
+        known: boolean <- how == :ok and who == who_mma8452q();
+        (i2, cfg) <- case known of {
+            true -> configure(i1);
+            false -> (i1, case how == :ok of { true -> :unknown_part; false -> how })
+        }
+    produces
+        pure (i2, cfg, who)
+    end
+}
+
+// One reading: the six output bytes in one transfer.
+fn reading(i: device_window(L, (:esp32s3_i2c0))) -> (device_window(L, (:esp32s3_i2c0)), atom, int64, int64, int64) {
+    sequence proc[register_rwr]
+        (i1, how) <- device_esp32s3_i2c0@i2c0_read_start(i, board_pack@accelerometer_i2c_address(), reg_out_x_msb(), 6);
+        (i2, xm) <- device_esp32s3_i2c0@i2c0_rx_byte(i1);
+        (i3, xl) <- device_esp32s3_i2c0@i2c0_rx_byte(i2);
+        (i4, ym) <- device_esp32s3_i2c0@i2c0_rx_byte(i3);
+        (i5, yl) <- device_esp32s3_i2c0@i2c0_rx_byte(i4);
+        (i6, zm) <- device_esp32s3_i2c0@i2c0_rx_byte(i5);
+        (i7, zl) <- device_esp32s3_i2c0@i2c0_rx_byte(i6)
+    produces
+        pure (i7, how, axis(xm, xl), axis(ym, yl), axis(zm, zl))
+    end
+}
+
+// After a transfer that did not end with :ok the controller is reset and set up again, so the next
+// message finds it working (device_esp32s3_i2c0@i2c0_recover).
+fn healed(s: device_window(L, (:esp32s3_system)), i: device_window(L, (:esp32s3_i2c0)), how: atom) -> (device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_i2c0))) {
+    sequence proc[register_rwr]
+        (s1, i1) <- case how == :ok of {
+            true -> (s, i);
+            false -> device_esp32s3_i2c0@i2c0_recover(s, i)
+        }
+    produces
+        pure (s1, i1)
+    end
+}
+
+fn tell_ready(to: actor_ref, how: atom, who: uint32) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- case how == :ok of {
+            true -> cast(to, (:accel_ready, who) impl ActorMessage {});
+            false -> cast(to, (:accel_error, how, who) impl ActorMessage {})
+        }
+    produces
+        pure sent
+    end
+}
+
+fn tell_probed(to: actor_ref, how: atom, byte: uint32) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast(to, (:accel_probed, how, byte) impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn tell_reading(to: actor_ref, how: atom, x: int64, y: int64, z: int64) -> boolean {
+    sequence proc[concurrency]
+        none: uint32 <- 0;
+        sent: boolean <- case how == :ok of {
+            true -> cast(to, (:accel, x, y, z) impl ActorMessage {});
+            false -> cast(to, (:accel_error, how, none) impl ActorMessage {})
+        }
+    produces
+        pure sent
+    end
+}
+
+fn accelerometer_worker(msg: { op: atom, count: int64, reply_to: actor_ref }, state: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_i2c0)))) -> (:no_reply, :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_i2c0)))) {
+    sequence proc[register_rwr]
+        next: :unmapped | (:mapped, device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux)), device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_i2c0))) <- case state of {
+            :unmapped -> case msg.op of {
+                :init -> {
+                    g: device_window(L, (:esp32s3_gpio)) <- map_device((:esp32s3_gpio), 0x60004000); // board_pack window 1
+                    m: device_window(L, (:esp32s3_io_mux)) <- map_device((:esp32s3_io_mux), 0x60009000); // board_pack window 3
+                    s: device_window(L, (:esp32s3_system)) <- map_device((:esp32s3_system), 0x600C0000); // board_pack window 8
+                    i: device_window(L, (:esp32s3_i2c0)) <- map_device((:esp32s3_i2c0), 0x60013000); // board_pack window 13
+                    s1: device_window(L, (:esp32s3_system)) <- device_esp32s3_i2c0@i2c0_enable(s);
+                    (g1, m1) <- device_esp32s3_i2c0@i2c0_pins(g, m);
+                    i1: device_window(L, (:esp32s3_i2c0)) <- device_esp32s3_i2c0@i2c0_init(i);
+                    (i2, how, who) <- bring_up(i1);
+                    _: boolean <- tell_ready(msg.reply_to, how, who);
+                    (s2, i3) <- healed(s1, i2, how);
+                    (:mapped, g1, m1, s2, i3)
+                };
+                :init_unclocked -> {
+                    g: device_window(L, (:esp32s3_gpio)) <- map_device((:esp32s3_gpio), 0x60004000); // board_pack window 1
+                    m: device_window(L, (:esp32s3_io_mux)) <- map_device((:esp32s3_io_mux), 0x60009000); // board_pack window 3
+                    s: device_window(L, (:esp32s3_system)) <- map_device((:esp32s3_system), 0x600C0000); // board_pack window 8
+                    i: device_window(L, (:esp32s3_i2c0)) <- map_device((:esp32s3_i2c0), 0x60013000); // board_pack window 13
+                    s1: device_window(L, (:esp32s3_system)) <- device_esp32s3_i2c0@i2c0_disable(s);
+                    (g1, m1) <- device_esp32s3_i2c0@i2c0_pins(g, m);
+                    i1: device_window(L, (:esp32s3_i2c0)) <- device_esp32s3_i2c0@i2c0_init(i);
+                    (i2, how, who) <- bring_up(i1);
+                    _: boolean <- tell_ready(msg.reply_to, how, who);
+                    (s2, i3) <- healed(s1, i2, how);
+                    (:mapped, g1, m1, s2, i3)
+                };
+                _: atom -> :unmapped
+            };
+            (:mapped, g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux)), s: device_window(L, (:esp32s3_system)), i: device_window(L, (:esp32s3_i2c0))) -> case msg.op of {
+                :read -> {
+                    (i1, how, x, y, z) <- reading(i);
+                    _: boolean <- tell_reading(msg.reply_to, how, x, y, z);
+                    (s1, i2) <- healed(s, i1, how);
+                    (:mapped, g, m, s1, i2)
+                };
+                :hold -> {
+                    _: int64 <- hold_ticks(msg.count);
+                    state
+                };
+                :probe -> {
+                    (i1, how, byte) <- who_at(i, to_uint32(msg.count));
+                    _: boolean <- tell_probed(msg.reply_to, how, byte);
+                    (s1, i2) <- healed(s, i1, how);
+                    (:mapped, g, m, s1, i2)
+                };
+                :reclock -> {
+                    s1: device_window(L, (:esp32s3_system)) <- device_esp32s3_i2c0@i2c0_enable(s);
+                    i1: device_window(L, (:esp32s3_i2c0)) <- device_esp32s3_i2c0@i2c0_init(i);
+                    (i2, how, who) <- bring_up(i1);
+                    _: boolean <- tell_ready(msg.reply_to, how, who);
+                    (s2, i3) <- healed(s1, i2, how);
+                    (:mapped, g, m, s2, i3)
+                };
+                _: atom -> state
+            }
+        }
+    produces
+        pure (:no_reply, next)
+    end
+}

@@ -269,6 +269,29 @@ Items A to D are the agreed steps 1 to 4, in that order. Prerequisites sit where
 | E | `poke_n` spec addition and implementation, only if C or a later driver needs it. Closed 2026-10-29, not needed (see §2) | spec decision first (§2) | none |
 | F | USB-Serial-JTAG second-console worker | B | USB-Serial-JTAG (full register set) |
 | G | I2C0 controller worker; accelerometer readings; minibadge I2C; GPIO worker for minibadge lines | B; minibadge pin question (§6) settled | I2C0, GPIO, IO_MUX |
+
+**Item G, status 2026-11-16.** Done on the board: the I2C0 controller as a master (`device_lib/device_esp32s3_i2c0`, board-pack
+window 13 at 0x60013000, 100 kHz from the 40 MHz crystal, polled) and the accelerometer worker over it
+(`device_lib/device_mma8452q`); apps `silica_34_device_accelerometer` (matches its expected output) and
+`silica_35_device_accelerometer_tilt`. The base address is confirmed by the part answering WHO_AM_I, and the gate
+"readings change when the board tilts" was met with the tilt app on 2026-11-16 (Lee turned the board while it ran).
+Two of the four failure outcomes are provoked without hands and recovered from: `:nack` (`silica_36`, a device address
+with nothing at it) and `:stuck` (`silica_37`, the controller's clock gate off). The first of them found a fault in the
+driver: after a refused transfer the controller took no further transfer until the whole peripheral was reset
+(`i2c0_recover`); neither the state-machine reset in CTR nor a STOP-only program brought it back. Not done: the
+minibadge I2C and its GPIO lines; a bus worker that serves several devices; `:timeout` and `:arbitration_lost` (below).
+
+**Item G, not completed (logged 2026-11-16).** The plan's gate "I2C ACK and timeout paths exercised" is met for the ACK
+path only.
+
+| Outcome | State | What it needs |
+| --- | --- | --- |
+| `:timeout` | not provoked, not completed | SCL (GPIO42) held to ground at a minibadge header during a transfer; an app that prints each read's outcome while a person holds and releases the line; a check that `i2c0_recover` brings the controller back afterwards |
+| `:arbitration_lost` | not provoked, not completed | the same with SDA (GPIO41); the outcome may depend on when the line goes low (held before the start, the controller may see a busy bus and report `:stuck`), so the app should record what each timing gives |
+
+Until both are provoked on the board, the driver's handling of them is written from the register description and
+unverified.
+
 | H | DMA per spec §5.3 (GDMA window, buffer move-and-return) | B; optional for G | GDMA |
 | I | SD block access on SPI3 | B; H recommended | SPI3, GDMA, GPIO, IO_MUX |
 | J | Filesystem layer chosen per §4.3 and its `file_io` backend for this target | I; choice settled (§6) | none beyond I |

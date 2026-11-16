@@ -25,13 +25,16 @@ REG_DIR = "components/soc/esp32s3/register/soc"
 # families: (regex on the register name, family key with '#' for the index) rows that override the
 #   digit-run family of the matching registers, when one digit pattern covers registers of different
 #   layouts (RMT's TX and RX channels share CH<n>CONF0 and CH<n>STATUS names).
+# reg_base: the base macro the header itself writes its registers against, when that is not `base`
+#   (i2c_reg.h uses DR_REG_I2C_BASE, which soc.h defines as REG_I2C_BASE(0) = DR_REG_I2C_EXT_BASE).
 # values_of: the name of another entry with the same header and layout (a second instance of one
 #   controller, UART1 beside UART0): only the description module is written for this entry, and
 #   drivers read the field constants from that entry's _values module, since the same header gives
 #   the same offsets, shifts and masks for every instance.
 class P:
-    def __init__(s, name, header, base, instance, prefix, macro_fields=False, field_register=None, word_ram=None, families=(), values_of=None):
+    def __init__(s, name, header, base, instance, prefix, macro_fields=False, field_register=None, word_ram=None, families=(), values_of=None, reg_base=None):
         s.name, s.header, s.base, s.instance, s.prefix = name, header, base, instance, prefix
+        s.reg_base = reg_base
         s.macro_fields, s.field_register, s.word_ram, s.families, s.values_of = macro_fields, field_register, word_ram, families, values_of
 
 PERIPHERALS = [
@@ -51,11 +54,15 @@ PERIPHERALS = [
                 (r"^:ch[0-3]status$", ":ch#status_tx"), (r"^:ch[4-7]status$", ":ch#status_rx"))),
     P("ledc", "ledc_reg.h", "DR_REG_LEDC_BASE", None, "LEDC_"),
     P("usb_serial_jtag", "usb_serial_jtag_reg.h", "DR_REG_USB_SERIAL_JTAG_BASE", None, "USB_SERIAL_JTAG_"),
+    # I2C0 (DR_REG_I2C_EXT_BASE 0x60013000, board_pack window 13): the controller of the board's I2C bus
+    # (SCL GPIO42, SDA GPIO41; the MMA8452Q accelerometer at 0x1C and the minibadge headers). i2c_reg.h
+    # writes its registers against DR_REG_I2C_BASE, which soc.h maps to REG_I2C_BASE(0) = this base.
+    P("i2c0", "i2c_reg.h", "DR_REG_I2C_EXT_BASE", 0, "I2C_", reg_base="DR_REG_I2C_BASE"),
 ]
 
 # GPIO-matrix signal indices (gpio_sig_map.h; not registers) emitted as constant functions into
 # board_pack_gpio_signals.silica: every macro whose name starts with one of these prefixes.
-SIGNAL_PREFIXES = ("RMT_SIG_", "LEDC_LS_SIG_", "SIG_GPIO_OUT_IDX")
+SIGNAL_PREFIXES = ("RMT_SIG_", "LEDC_LS_SIG_", "SIG_GPIO_OUT_IDX", "I2CEXT0_")
 LD_PERIPHERALS = "components/soc/esp32s3/ld/esp32s3.peripherals.ld"
 SOC_CAPS = "components/soc/esp32s3/include/soc/soc_caps.h"
 SIG_MAP = "components/soc/esp32s3/include/soc/gpio_sig_map.h"
@@ -137,7 +144,7 @@ def parse(idf, p, warn):
     seen_reg = set()
     for li, ln in enumerate(lines):
         m = REG_RE.match(ln)
-        if m and m.group(1).startswith(p.prefix) and (m.group(3) == p.base or m.group(3).startswith("REG_")):
+        if m and m.group(1).startswith(p.prefix) and (m.group(3) == p.base or m.group(3) == p.reg_base or m.group(3).startswith("REG_")):
             cur = len(regs); regs.append((m.group(1), int(m.group(4), 16))); continue
         m = ALIAS_RE.match(ln)
         if m and m.group(1).startswith(p.prefix) and m.group(2) in periphs:
@@ -188,6 +195,9 @@ ACCESS_OVERRIDES = {
     # RMT CH<n>DATA: the header marks the one field RO, but the register is the APB FIFO write path too
     # ("read and write data ... via APB FIFO"; the TRM lists it R/W).
     **{("rmt", ":ch%ddata" % c): "read_write" for c in range(8)},
+    # I2C DATA: the header marks the one field (FIFO_RDATA) RO, but in FIFO mode a write to the same
+    # register pushes a byte into the TX FIFO (ESP-IDF i2c_ll_write_txfifo writes hw->data.val).
+    ("i2c0", ":data"): "read_write",
 }
 
 def lname(macro, prefix, suffix=""):
@@ -379,7 +389,7 @@ def gen_values(p, commit, regrows, vrows):
 # Device tag of each peripheral's description module (silica_device_actor_specification.md §4.9). The module
 # name must start with device_ (E2210), so the file is device_esp32s3_<tag>_registers.silica.
 DEVICE_TAGS = {"gpio": "gpio", "io_mux": "io_mux", "uart0": "uart", "uart1": "uart1", "spi2": "spi2", "system": "system", "rmt": "rmt", "ledc": "ledc",
-               "usb_serial_jtag": "usb_serial_jtag"}
+               "usb_serial_jtag": "usb_serial_jtag", "i2c0": "i2c0"}
 
 def desc_file(p): return "device_esp32s3_%s_registers.silica" % DEVICE_TAGS[p.name]
 
