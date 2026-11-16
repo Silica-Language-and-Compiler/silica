@@ -23,7 +23,7 @@
 #                no "handshake" text on stderr.
 #   owner_close  the dialler's owner sends :close on an up link: (:link_down,:closed), a :normal end (the runtime reports it,
 #                printed "carrier ended normal"), the carrier
-#                reference is dead afterwards (a throw-away probe actor's cast raises actor_not_found), no later message.
+#                reference is dead afterwards (a throw-away probe actor's cast to it returns false), no later message.
 #   peer_close   the other end of that link sees (:link_down,:closed) and a :normal end the same way; the listener
 #                then closes and the server exits 0.
 #   lost_link    the server is SIGKILLed while the client sends :tx pings: (:link_down,:fault)+(:explicit,:link_lost)
@@ -338,7 +338,7 @@ linenr() { grep -Fxn "$2" "$1" | head -1 | cut -d: -f1; }
 dump() {   # TAG: the outputs of a scenario, indented
     for f in "$SCR/$1".*.out "$SCR/$1".*.err; do [ -f "$f" ] && { echo "    -- $(basename "$f"):"; sed 's/^/    /' "$f" | head -30; }; done
 }
-DEAD="carrier ref dead (cast raised actor_not_found)"
+DEAD="carrier ref dead (cast returned false)"
 NOMSG="message after the end"
 
 # ---- 4. the timeout program: bad_address, connect_timeout, handshake_timeout, refused ----

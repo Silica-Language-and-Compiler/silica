@@ -11,16 +11,19 @@
 // also receives the runtime's failure reports, and prints, labelled with the role:
 //   <role>: carrier ended <reason>                 the carrier ended: "normal" (the runtime reports a :normal end of an
 //                                                  unsupervised actor too), (:explicit, :link_lost) and so on, or "other"
-//   <role>: carrier ref dead (cast raised actor_not_found)
-//                                                  a throw-away probe actor cast to the ended carrier and ended with
-//                                                  actor_not_found: the reference is dead (the :normal end itself is reported too)
+//   <role>: carrier ref dead (cast returned false) a throw-away probe actor cast to the ended carrier and the cast answered
+//                                                  false: the reference is dead (specification 16.1.2: a cast to an ended
+//                                                  actor returns false and its sender goes on). "carrier ref ALIVE (cast
+//                                                  returned true)" must never appear
+//   <role>: an actor ended with actor_not_found    must never appear: it would mean a call, or a registered cast, to an
+//                                                  ended actor
 // Owner lines: "<role>: link_up <peer>", "<role>: link_down <why>", "<role>: tx_failed <why>", "server: listening",
 // "server: accepted", "server: session link_down <why>", "<role>: message after the end: <kind>" (must never
 // appear: :link_down is the last message the owner receives) and "<role>: <gave up ...>".
 //
-// The owner never casts to a carrier it knows has ended. The one exception is the client_tx tick, which races the
-// carrier's end by at most the time one message takes to be handled: a tick that wins that race raises
-// actor_not_found in the owner and the run is reported as such by the script.
+// The owner does not cast to a carrier it knows has ended. The client_tx tick can race the carrier's end by at most
+// the time one message takes to be handled: a tick that wins that race casts to an ended carrier, the cast returns
+// false and the owner goes on (before the 2026-11-16 language change it ended the owner with actor_not_found).
 module dangerous_tls_link_check;
 
 use dangerous_tls;
@@ -108,7 +111,7 @@ fn show(text: string) -> atom {
 fn reporter_shown(m: string) -> atom {
     case message_kind(m) of {
         :line -> show(substring(m, 2, length_bytes(m)));
-        :dead -> show("carrier ref dead (cast raised actor_not_found)");
+        :dead -> show("an actor ended with actor_not_found");
         :report -> show(concat("carrier ended ", end_reason(m)));
         _: atom -> show("unexpected message")
     }
@@ -163,19 +166,20 @@ fn finish_later(ms: uint64) -> boolean {
     end
 }
 
-// A throw-away actor that casts to a carrier that has ended. The cast raises actor_not_found, which ends the probe
-// and reaches the reporter; the owner is not involved.
-fn probe(msg: int64, state: { target: dangerous_actor_ref }) -> (:no_reply, { target: dangerous_actor_ref }) {
+// A throw-away actor that casts to a carrier that has ended and tells the reporter what the cast answered: false
+// for an ended carrier (specification 16.1.2). The owner is not involved.
+fn probe(msg: int64, state: { target: dangerous_actor_ref, rep: actor_ref }) -> (:no_reply, { target: dangerous_actor_ref, rep: actor_ref }) {
     sequence proc[concurrency]
-        _: boolean <- cast(state.target, :poll impl ActorMessage {})
+        enqueued: boolean <- cast(state.target, :poll impl ActorMessage {});
+        _: boolean <- cast(state.rep, case enqueued of { true -> "P carrier ref ALIVE (cast returned true)"; false -> "P carrier ref dead (cast returned false)" } impl ActorMessage {})
     produces
         pure (:no_reply, state)
     end
 }
 
-fn probe_dead(target: dangerous_actor_ref) -> boolean {
+fn probe_dead(target: dangerous_actor_ref, rep: actor_ref) -> boolean {
     sequence proc[concurrency]
-        p: actor_ref <- spawn({ target: target }, probe, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        p: actor_ref <- spawn({ target: target, rep: rep }, probe, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
         sent: boolean <- cast(p, 0 impl ActorMessage {})
     produces
         pure sent
@@ -259,7 +263,7 @@ fn on_accepted(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_a
 
 fn server_session_down(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
     sequence proc[concurrency]
-        _: boolean <- probe_dead(st.sess);
+        _: boolean <- probe_dead(st.sess, st.rep);
         _: boolean <- cast(st.car, :close impl ActorMessage {})
     produces
         pure say({ car: st.car, rep: st.rep, sess: st.sess, phase: 2, ended: st.ended }, concat("session link_down ", why_text(why)))
@@ -271,7 +275,7 @@ fn server_listener_down(st: { car: dangerous_actor_ref, rep: actor_ref, sess: da
 }
 
 fn client_down(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
-    kept(probe_dead(st.car), kept(finish_later(800), say({ car: st.car, rep: st.rep, sess: st.sess, phase: 2, ended: true }, concat("link_down ", why_text(why)))))
+    kept(probe_dead(st.car, st.rep), kept(finish_later(800), say({ car: st.car, rep: st.rep, sess: st.sess, phase: 2, ended: true }, concat("link_down ", why_text(why)))))
 }
 
 fn on_down(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
