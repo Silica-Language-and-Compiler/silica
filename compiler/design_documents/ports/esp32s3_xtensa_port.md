@@ -21,7 +21,7 @@ disagrees with [silica-specification.md](../silica-specification.md), the specif
 | --- | --- |
 | [esp32s3_port_status.md](esp32s3_port_status.md) | Status: behaviours verified on the board, differences from Apple Silicon, and the gaps ordered for the next addition |
 | [porting_for_os_free_targets.md](../porting_for_os_free_targets.md) | What a complete OS-free port needs; this port covers the compiler target and a first runtime |
-| [linux_aarch64_port_checklist.md](linux_aarch64_port_checklist.md) | The sibling hosted port; same "Darwin-isms" inventory, different ISA problem |
+| [linux_aarch64_port_checklist.md](../completed_plans/linux_aarch64_port_checklist.md) | The sibling hosted port; same "Darwin-isms" inventory, different ISA problem |
 | [memory-effects-aarch64-implementation-plan.md](../memory-effects-aarch64-implementation-plan.md) | `Space` on ESP32-S3 (pools, not MAIR) — later phases |
 | `emitter/ESP32-S3_raw/board/README.md` | Runtime, memory map, console protocol, tools, bring-up apps |
 | [docs/required-software.md](../../../docs/required-software.md) | The toolchain, esptool and board the port needs |

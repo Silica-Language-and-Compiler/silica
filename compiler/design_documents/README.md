@@ -75,9 +75,21 @@ Use the entries below for **quick navigation**. Each item links to a file in thi
 
 ---
 
-## [ports/linux_aarch64_port_checklist.md](./ports/linux_aarch64_port_checklist.md)
+## [completed_plans/linux_aarch64_port_checklist.md](./completed_plans/linux_aarch64_port_checklist.md)
 
 **Hosted port checklist** (now the record of how the port was made; it self-hosts and has fixed points) for **64-bit Raspberry Pi OS / Debian AArch64**: emit-target naming, the Darwin-ism inventory (syscall convention, `X8` hazard, symbol decoration, relocation syntax, sections, entry point and stack), the per-target golden-file split, Pi bootstrap steps, and verification gates through self-host.
+
+---
+
+## [completed_plans/](./completed_plans/)
+
+Plans whose steps are all done, completed or superseded, kept as the record. Currently: [Phase4_prep.md](./completed_plans/Phase4_prep.md) (chunk 15 phase 4 preparation, superseded by Phase4_notes.md; phase 4 closed on the Mac tree 2026-10-31) and [linux_aarch64_port_checklist.md](./completed_plans/linux_aarch64_port_checklist.md) (done through G7).
+
+---
+
+## Plan parts split from design files (2026-11-15)
+
+Each design file keeps its design; the work sequencing moved to a `_plan.md` file beside it (open work, so none is in completed_plans yet): [actor_growable_stack_plan.md](./actor_growable_stack_plan.md) (design section 11), [chunk15_stack_memory_plan.md](./chunk15_stack_memory_plan.md) (section 11), [direct_machine_object_emitter_plan.md](./direct_machine_object_emitter_plan.md) (section 13) and [region_memory_safety_plan.md](./region_memory_safety_plan.md) (sections 13 and 16).
 
 ---
 

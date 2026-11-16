@@ -1,6 +1,6 @@
 # Chunk 15 phase 4: preparation (messages, replies, spawn)
 
-Design: [chunk15_stack_memory_design.md](chunk15_stack_memory_design.md) section 0, section 5 (5.1-5.5), 9.1, 11.1 row 4, 11.2, 11.3, 12, 13.
+Design: [chunk15_stack_memory_design.md](../chunk15_stack_memory_design.md) section 0, section 5 (5.1-5.5), 9.1, 11.1 row 4, 11.2, 11.3, 12, 13.
 Written 2026-10-29 by reading and grep only. No source, trial or golden was touched; nothing was built or run.
 Line numbers are from the working tree at this date (apple_silicon_mac unless stated) and WILL move; re-grep before editing.
 

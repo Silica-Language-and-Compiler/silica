@@ -28,7 +28,7 @@ full duplex. Every reply is matched to its request by id.
   `"listen:any:4550"`, and `(:interface, "en0")` with `listen:any` was exactly what this example declared before E2,
   so the source and `run_direct.sh` now write `"listen:4550"`. **Choice made: the declaration is kept** (it now
   means something), and the listener binds the declared interface instead of every interface. Nothing changes on
-  the wire: the status side still listens on 4550 and the Mac still dials `138.197.209.113:4550`; only the
+  the wire: the status side still listens on 4550 and the Mac still dials `138.197.209.113:4550` (dial address `138.197.209.113:4550:3000`, the last part is the connect timeout in ms, required since stage E8); only the
   listening address narrows from 0.0.0.0 to eth0's address. `--local` declares `lo0`, so its listener binds 127.0.0.1.
 
 ```

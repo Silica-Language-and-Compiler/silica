@@ -187,7 +187,7 @@ if [ "$MODE" = local ]; then
         exit 0
     fi
     echo "== local: the Silica status side listens on listen:$LOCAL_PORT, the Erlang peer dials 127.0.0.1:$LOCAL_PORT"
-    build_mac_silica "$WORK/local/status" linux "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64 '(:interface, "lo0")'
+    build_mac_silica "$WORK/local/status" linux "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT:3000" linux-x86_64 '(:interface, "lo0")'
     all=1
     for r in $(seq 1 "$RUNS"); do
         echo "== local run $r"
@@ -212,7 +212,7 @@ fi
 echo "== 2. Linux end (Silica, status side) on $REMOTE: listen:$PORT"
 rsh 'echo "remote: $(hostname) ($(uname -sm))"' || { echo "run: ssh failed"; exit 1; }
 remote_port_free || { echo "run: remote port $PORT in use (or ssh failed):"; remote_listener; exit 1; }
-side_copy "$DIRECT/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:$PORT" "$REMOTE_IP:$PORT" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
+side_copy "$DIRECT/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:$PORT" "$REMOTE_IP:$PORT:3000" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
 want=$(shasum -a 256 "$WORK/$NAME.linux.silica" | cut -c1-64)
 rsh "mkdir -p $RDIR/build" || exit 1
 if [ $REBUILD = 0 ]; then

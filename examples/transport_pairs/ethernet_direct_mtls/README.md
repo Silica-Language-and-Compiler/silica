@@ -74,6 +74,46 @@ To stop accepting a peer, delete its file from `peers/`. To replace a node's cer
 A system with more nodes works the same way: a node holds the certificates of the nodes it talks to, not of
 every node.
 
+## The dial address and its timeout
+
+A dial address is `"<ipv4>:<port>:<timeout_ms>"`, for example `138.197.209.113:4550:5000`. The third part is the
+connect timeout in whole milliseconds (1 to 9 decimal digits, greater than 0). The program must state it: there
+is no default, as for the standard `(:tcp)` carrier since stage E8 of the hosted Ethernet plan.
+
+- The timeout bounds the TCP connect **and** the client's TLS handshake together, against one deadline. Neither
+  blocks: the socket is non-blocking for both and the carrier's worker waits in polls that end at the deadline.
+- A peer that does not answer the connect, or does not finish the handshake, in that time gives the owner
+  `(:link_down, :timeout)` and the carrier ends with `(:explicit, :link_timeout)`.
+- An address without the timeout, or with a malformed or zero one, dials nothing: `(:link_down, :fault)`, and the
+  carrier ends with `(:explicit, :bad_address)`.
+- A refused connection and a failed handshake (a certificate not accepted) are `(:link_down, :fault)`, and the
+  carrier ends with `(:explicit, :link_unavailable)`.
+- `(:link_up, "<ipv4>:<port>")` carries the peer without the timeout.
+
+## How the carrier ends
+
+The carrier ends with its link, exactly as the standard `(:tcp)` carrier does: `:link_down` is the last message
+the owner receives, the descriptor and its TLS state are released (a TLS `close_notify` goes to the peer on
+`:close` and on a failed write), and a supervisor restarts a faulted link and leaves a closed one alone.
+
+| Event | Owner receives | Carrier exit reason |
+|---|---|---|
+| `:close` from the owner | `(:link_down, :closed)` | `:normal` |
+| The peer closed (`close_notify`, or the connection dropped) | `(:link_down, :closed)` | `:normal` |
+| A read failed (fatal TLS alert, reset) | `(:link_down, :fault)` | `(:explicit, :link_lost)` |
+| A write failed or timed out | `(:tx_failed, :link_down)`, then `(:link_down, :fault)` | `(:explicit, :link_lost)` |
+| Dial refused (nothing listens) | `(:link_down, :fault)` | `(:explicit, :link_unavailable)` |
+| Dial handshake failed (certificate not accepted) | `(:link_down, :fault)` | `(:explicit, :link_unavailable)` |
+| Dial connect or handshake timed out | `(:link_down, :timeout)` | `(:explicit, :link_timeout)` |
+| Dial address malformed (no stated timeout) | `(:link_down, :fault)` | `(:explicit, :bad_address)` |
+| Listener cannot bind | `(:link_down, :fault)` | `(:explicit, :link_unavailable)` |
+
+In TLS 1.3 a server that refuses the client's certificate says so only after the client's handshake has finished,
+so that client sees `(:link_up, ...)` and then the read-failed row, not the failed-handshake row. A `:tx` on a
+carrier that is not up answers `(:tx_failed, :link_down)` and the carrier goes on.
+
+The source and `run_mtls.sh` state 5000 ms.
+
 ## Running
 
 ```
@@ -126,7 +166,13 @@ on `aalang-web` with OpenSSL 3.5.3:
 - A certificate is not bound to an address or a name: an accepted peer may connect from anywhere the firewall
   admits.
 - The frames carry no authorization of their own; an accepted peer may send any request.
-- A handshake runs on the listener's thread and is bounded at five seconds, so a silent peer delays the next
-  accept by that long.
+- A listener's handshake with an accepted peer runs on the listener's thread and is bounded at five seconds for
+  each read and write, so a silent peer delays the next accept by at least that long. Only the dialing side's
+  handshake is under the stated connect timeout.
 - The key is the node's ssh identity. A real deployment would give TLS a key of its own.
-- The carrier is a copy of the standard `(:tcp)` carrier as of 2026-11-12 and does not follow later changes to it.
+- The carrier is a copy of the standard `(:tcp)` carrier as of 2026-11-12 and does not follow later changes to it,
+  except the required connect timeout and the carrier teardown (both 2026-11-16): it ends as the standard carrier
+  does (see "How the carrier ends").
+- The connect timeout and teardown changes of 2026-11-16 were checked with `run_timeout_checks.sh` (11 checks pass
+  on the Mac, pix and nix; `happy_path` runs on the Mac only) and `run_mtls.sh` on the Mac. `run_mtls.sh` has no
+  Linux mode. The older "Checked" runs above predate the change and dialled `<ip>:4550`.
