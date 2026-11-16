@@ -1,0 +1,470 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// I2C0 on the ESP32-S3 port test board as a master: the controller of the board's one I2C bus (SCL
+// GPIO42, SDA GPIO41, board_pack pin_i2c_scl / pin_i2c_sda), which carries the MMA8452Q accelerometer
+// at 0x1C and the minibadge headers (peripherals plan item G). Written in Silica against the
+// controller's registers; nothing foreign is called. The window is board_pack.silica window 13
+// (0x60013000, 4 KB, base from ESP-IDF's reg_base.h and TRM-unconfirmed); the SYSTEM window (8) holds
+// its clock gate and reset, and the GPIO and IO_MUX windows its two pads. Register names, offsets and
+// field values are the generated board pack's (device_esp32s3_i2c0_registers, board_pack_i2c0_values,
+// from ESP-IDF v6.1 i2c_reg.h); the order of operations and the timing arithmetic follow ESP-IDF's
+// i2c_ll.h for the ESP32-S3 (i2c_ll_master_init, i2c_ll_master_cal_bus_clk, i2c_ll_master_set_bus_timing).
+//
+// HOW THE CONTROLLER WORKS. It runs a short program of up to eight COMMANDS (COMD0..COMD7), each one
+// phase of a transfer: RSTART (a start or repeated start), WRITE n bytes taken from the transmit FIFO,
+// READ n bytes into the receive FIFO, STOP. A WRITE can check that the slave acknowledged each byte;
+// a READ says whether the master acknowledges (more bytes follow) or not (the last byte). The bytes to
+// send, the address byte included, are pushed into the transmit FIFO through the DATA register before
+// the program starts; bytes read are popped from the same register afterwards. TRANS_START in CTR
+// runs the program, and the raw interrupt bits say how it ended. This driver polls them: the board
+// runtime runs with interrupts off.
+//
+// A command word: opcode in bits 13:11 (RSTART 6, WRITE 1, READ 3, STOP 2, END 4), bit 10 the
+// acknowledge value the master sends after a READ byte (1 = not acknowledged), bit 9 the acknowledge
+// value expected from the slave (0), bit 8 "check the slave's acknowledge", bits 7:0 the byte count.
+//
+// CLOCK. The function clock is the 40 MHz crystal (CLK_CONF sclk_sel 0), undivided, as for LEDC and
+// the RMT: the ROM hands off without the PLL, so the crystal is the one fixed rate. For a 100 kHz bus
+// a half cycle is 40,000,000 / 100,000 / 2 = 200 clock ticks, and ESP-IDF's split of it is used:
+// SCL low 200, SCL high 102 with 98 more waited for the line to rise (the pull-ups are what raise it),
+// SDA changes 50 ticks after SCL falls and is sampled 100 ticks after it rises, start and stop setup
+// and hold 200 each. The timeout is 2^12 ticks. Both lines pass the controller's glitch filter
+// (threshold 7 ticks).
+//
+// PADS. Both pads are open drain with the input buffer and the weak pull-up on (the board has its own
+// pull-ups on the bus; the pad's are in parallel), driven by the controller's SDA and SCL output
+// signals through the GPIO matrix and read back into its input signals: an I2C line is driven low or
+// released, never driven high, and the controller watches the line it drives to see a slave stretch
+// the clock or lose arbitration.
+//
+// WHAT A TRANSFER ANSWERS. One of
+//     :ok                 the program ran to its STOP
+//     :nack               the slave did not acknowledge a byte: nothing at that address, or it refused
+//     :timeout            SCL was held low longer than the timeout
+//     :arbitration_lost   SDA did not follow the controller: another master, or a stuck line
+//     :stuck              no end reported within the polling budget (the controller is not clocked,
+//                         or the pads are not routed)
+// After anything but :ok the controller takes no further transfer until i2c0_recover has reset it; the
+// worker that owns the windows calls it (it needs the SYSTEM window, which a transfer does not have).
+//
+// VERIFIED ON THE BOARD (2026-11-16): :ok, :nack (app silica_36) and :stuck (app silica_37), each with
+// its recovery. NOT COMPLETED: :timeout and :arbitration_lost have not been provoked (they need SCL or
+// SDA held low by hand); their handling is written from the register description and is unverified
+// (peripherals plan, item G).
+//
+// The functions take and hand back the windows, as every register helper does; a worker (device_mma8452q)
+// owns them. A transfer allocates nothing.
+
+use device_esp32s3_i2c0_registers;
+use device_esp32s3_gpio_registers;
+use device_esp32s3_io_mux_registers;
+use device_esp32s3_system_registers;
+use board_pack;
+use board_pack_i2c0_values;
+use board_pack_gpio_values;
+use board_pack_io_mux_values;
+use board_pack_system_values;
+use board_pack_gpio_signals;
+
+export i2c0_enable/1;
+export i2c0_disable/1;
+export i2c0_pins/2;
+export i2c0_init/1;
+export i2c0_recover/2;
+export i2c0_write_reg/4;
+export i2c0_read_start/4;
+export i2c0_rx_byte/1;
+export i2c0_int_raw/1;
+export i2c0_sr/1;
+
+// Half an SCL cycle in function-clock ticks: 40 MHz crystal, 100 kHz bus.
+fn half_cycle() -> uint32 {
+    200
+}
+
+// How long SCL high waits for the line to rise before the high period is counted (ESP-IDF: half the
+// half cycle less 2, for a bus of 80 kHz or more).
+fn wait_high() -> uint32 {
+    half_cycle() / 2 - 2
+}
+
+// log2 of the timeout in ticks: ESP-IDF's bit length of 5 half cycles (1000: 10 bits), plus 2.
+fn timeout_log2() -> uint32 {
+    12
+}
+
+fn filter_ticks() -> uint32 {
+    7
+}
+
+// Command opcodes of the ESP32-S3 controller (i2c_ll.h I2C_LL_CMD_*), already in bits 13:11.
+fn cmd_rstart() -> uint32 {
+    0x3000
+}
+
+fn cmd_write() -> uint32 {
+    0x0800
+}
+
+fn cmd_read() -> uint32 {
+    0x1800
+}
+
+fn cmd_stop() -> uint32 {
+    0x1000
+}
+
+// Bit 8: check the slave's acknowledge after each written byte.
+fn cmd_check_ack() -> uint32 {
+    0x100
+}
+
+// Bit 10: the master does not acknowledge the byte read (the last one).
+fn cmd_send_nack() -> uint32 {
+    0x400
+}
+
+// How many times a transfer's end is polled for, with a short wait between polls (pause). A six-byte
+// read at 100 kHz lasts about a millisecond, a few tens of polls; the budget is some fifty times that.
+// The polls are a recursion, so the budget is also the deepest the worker's stack goes for a transfer
+// that never ends.
+fn poll_budget() -> uint32 {
+    1000
+}
+
+fn spin(n: int64) -> int64 {
+    case n == 0 of { true -> 0; false -> spin(n - 1) }
+}
+
+// A few tens of microseconds at the 40 MHz hand-off clock.
+fn pause() -> int64 {
+    spin(100)
+}
+
+// CTR for a master: master mode, both lines as direct (open-drain) outputs, the register clock on,
+// most significant bit first both ways.
+fn ctr_word() -> uint32 {
+    board_pack_i2c0_values@i2c0_ms_mode_mask() bor board_pack_i2c0_values@i2c0_sda_force_out_mask() bor board_pack_i2c0_values@i2c0_scl_force_out_mask() bor board_pack_i2c0_values@i2c0_clk_en_mask()
+}
+
+// Clock on, then a reset pulse, so the controller starts from its defaults whatever ran before.
+fn i2c0_enable(s: device_window(L, (:esp32s3_system))) -> device_window(L, (:esp32s3_system)) {
+    sequence proc[register_rwr]
+        clk: uint32 <- board_pack_system_values@system_i2c_ext0_clk_en_mask();
+        rst_bit: uint32 <- board_pack_system_values@system_i2c_ext0_rst_mask();
+        keep: uint32 <- bnot rst_bit;
+        en: uint32 <- peek(s, :perip_clk_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_clk_en0, (en bor clk) impl Register32 {});
+        rst: uint32 <- peek(s, :perip_rst_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_rst_en0, (rst bor rst_bit) impl Register32 {});
+        _: atom <- poke(s, :perip_rst_en0, (rst band keep) impl Register32 {})
+    produces
+        pure s
+    end
+}
+
+// The controller's clock gate off. Its registers then keep nothing that is written to them and a
+// transfer never ends: the way a test provokes :stuck (app silica_37).
+fn i2c0_disable(s: device_window(L, (:esp32s3_system))) -> device_window(L, (:esp32s3_system)) {
+    sequence proc[register_rwr]
+        clk: uint32 <- board_pack_system_values@system_i2c_ext0_clk_en_mask();
+        en: uint32 <- peek(s, :perip_clk_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_clk_en0, (en band (bnot clk)) impl Register32 {})
+    produces
+        pure s
+    end
+}
+
+// GPIO41 (SDA) and GPIO42 (SCL): pad function GPIO with the input buffer and the pull-up, open drain,
+// released (output latch high, output enabled), the controller's output signals routed to the pads
+// and the pads routed back to its input signals. Both pins are in the second GPIO bank (bits 9 and
+// 10 of the OUT1 / ENABLE1 registers).
+fn i2c0_pins(g: device_window(L, (:esp32s3_gpio)), m: device_window(L, (:esp32s3_io_mux))) -> (device_window(L, (:esp32s3_gpio)), device_window(L, (:esp32s3_io_mux))) {
+    sequence proc[register_rwr]
+        mcu_sel_mask: uint32 <- board_pack_io_mux_values@io_mux_mcu_sel_mask();
+        pu_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_pu_mask();
+        pd_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_pd_mask();
+        ie_mask: uint32 <- board_pack_io_mux_values@io_mux_fun_ie_mask();
+        clear: uint32 <- bnot (mcu_sel_mask bor pu_mask bor pd_mask);
+        pad: uint32 <- board_pack@io_mux_mcu_sel_gpio() bor ie_mask bor pu_mask;
+        sda_pad: uint32 <- peek(m, :gpio41) impl Register32 {};
+        _: atom <- poke(m, :gpio41, ((sda_pad band clear) bor pad) impl Register32 {});
+        scl_pad: uint32 <- peek(m, :gpio42) impl Register32 {};
+        _: atom <- poke(m, :gpio42, ((scl_pad band clear) bor pad) impl Register32 {});
+        open_drain: uint32 <- board_pack@gpio_pin_open_drain_bit();
+        sda_pin: uint32 <- peek(g, :pin41) impl Register32 {};
+        _: atom <- poke(g, :pin41, (sda_pin bor open_drain) impl Register32 {});
+        scl_pin: uint32 <- peek(g, :pin42) impl Register32 {};
+        _: atom <- poke(g, :pin42, (scl_pin bor open_drain) impl Register32 {});
+        both: uint32 <- 0x600;
+        _: atom <- poke(g, :out1_w1ts, both impl Register32 {});
+        _: atom <- poke(g, :enable1_w1ts, both impl Register32 {});
+        oen_from_enable: uint32 <- board_pack_gpio_values@gpio_func_oen_sel_mask();
+        _: atom <- poke(g, :func41_out_sel_cfg, (oen_from_enable bor board_pack_gpio_signals@gpio_signal_i2cext0_sda_out()) impl Register32 {});
+        _: atom <- poke(g, :func42_out_sel_cfg, (oen_from_enable bor board_pack_gpio_signals@gpio_signal_i2cext0_scl_out()) impl Register32 {});
+        from_pad: uint32 <- board_pack_gpio_values@gpio_sig_in_sel_mask();
+        in_shift: uint32 <- board_pack_gpio_values@gpio_func_in_sel_shift();
+        _: atom <- poke(g, :func90_in_sel_cfg, (from_pad bor (board_pack@pin_i2c_sda() shl in_shift)) impl Register32 {});
+        _: atom <- poke(g, :func89_in_sel_cfg, (from_pad bor (board_pack@pin_i2c_scl() shl in_shift)) impl Register32 {})
+    produces
+        pure (g, m)
+    end
+}
+
+// Master mode at 100 kHz from the crystal, the glitch filter on, FIFO mode with both FIFOs emptied,
+// no interrupt enabled (the driver polls), every raw interrupt bit cleared, and the configuration
+// latched (conf_upgate: the timing registers take effect only then).
+fn i2c0_init(i: device_window(L, (:esp32s3_i2c0))) -> device_window(L, (:esp32s3_i2c0)) {
+    sequence proc[register_rwr]
+        ctr: uint32 <- ctr_word();
+        one: uint32 <- 1;
+        all: uint32 <- 0x7FFFF;
+        zero: uint32 <- 0;
+        setup_hold: uint32 <- half_cycle() - one;
+        _: atom <- poke(i, :ctr, ctr impl Register32 {});
+        _: atom <- poke(i, :clk_conf, board_pack_i2c0_values@i2c0_sclk_active_mask() impl Register32 {});
+        _: atom <- poke(i, :scl_low_period, (half_cycle() - one) impl Register32 {});
+        _: atom <- poke(i, :scl_high_period, ((half_cycle() - wait_high()) bor (wait_high() shl board_pack_i2c0_values@i2c0_scl_wait_high_period_shift())) impl Register32 {});
+        _: atom <- poke(i, :sda_hold, (half_cycle() / 4 - one) impl Register32 {});
+        _: atom <- poke(i, :sda_sample, (half_cycle() / 2 - one) impl Register32 {});
+        _: atom <- poke(i, :scl_rstart_setup, setup_hold impl Register32 {});
+        _: atom <- poke(i, :scl_stop_setup, setup_hold impl Register32 {});
+        _: atom <- poke(i, :scl_start_hold, setup_hold impl Register32 {});
+        _: atom <- poke(i, :scl_stop_hold, setup_hold impl Register32 {});
+        _: atom <- poke(i, :to, ((timeout_log2() shl board_pack_i2c0_values@i2c0_time_out_value_shift()) bor board_pack_i2c0_values@i2c0_time_out_en_mask()) impl Register32 {});
+        _: atom <- poke(i, :filter_cfg, ((filter_ticks() shl board_pack_i2c0_values@i2c0_scl_filter_thres_shift()) bor (filter_ticks() shl board_pack_i2c0_values@i2c0_sda_filter_thres_shift()) bor board_pack_i2c0_values@i2c0_scl_filter_en_mask() bor board_pack_i2c0_values@i2c0_sda_filter_en_mask()) impl Register32 {});
+        fifo: uint32 <- peek(i, :fifo_conf) impl Register32 {};
+        fifo_mode: uint32 <- fifo band (bnot board_pack_i2c0_values@i2c0_nonfifo_en_mask());
+        _: atom <- poke(i, :fifo_conf, (fifo_mode bor board_pack_i2c0_values@i2c0_tx_fifo_rst_mask() bor board_pack_i2c0_values@i2c0_rx_fifo_rst_mask()) impl Register32 {});
+        _: atom <- poke(i, :fifo_conf, fifo_mode impl Register32 {});
+        _: atom <- poke(i, :int_ena, zero impl Register32 {});
+        _: atom <- poke(i, :int_clr, all impl Register32 {});
+        _: atom <- poke(i, :ctr, (ctr bor board_pack_i2c0_values@i2c0_conf_upgate_mask()) impl Register32 {})
+    produces
+        pure i
+    end
+}
+
+// Both FIFOs emptied before a transfer's bytes are pushed.
+fn fifo_reset(i: device_window(L, (:esp32s3_i2c0))) -> device_window(L, (:esp32s3_i2c0)) {
+    sequence proc[register_rwr]
+        fifo: uint32 <- peek(i, :fifo_conf) impl Register32 {};
+        resets: uint32 <- board_pack_i2c0_values@i2c0_tx_fifo_rst_mask() bor board_pack_i2c0_values@i2c0_rx_fifo_rst_mask();
+        _: atom <- poke(i, :fifo_conf, (fifo bor resets) impl Register32 {});
+        _: atom <- poke(i, :fifo_conf, (fifo band (bnot resets)) impl Register32 {})
+    produces
+        pure i
+    end
+}
+
+// The command program is latched and started: old raw interrupt bits cleared first, so the bits read
+// afterwards are this transfer's.
+fn go(i: device_window(L, (:esp32s3_i2c0))) -> device_window(L, (:esp32s3_i2c0)) {
+    sequence proc[register_rwr]
+        ctr: uint32 <- ctr_word();
+        all: uint32 <- 0x7FFFF;
+        _: atom <- poke(i, :int_clr, all impl Register32 {});
+        _: atom <- poke(i, :ctr, (ctr bor board_pack_i2c0_values@i2c0_conf_upgate_mask()) impl Register32 {});
+        _: atom <- poke(i, :ctr, (ctr bor board_pack_i2c0_values@i2c0_trans_start_mask()) impl Register32 {})
+    produces
+        pure i
+    end
+}
+
+// How a transfer ended, from the raw interrupt bits; :running while none of them is set. A failure is
+// looked for before the completion bit: a refused byte also ends the program.
+fn outcome(raw: uint32) -> atom {
+    case (raw band board_pack_i2c0_values@i2c0_nack_int_raw_mask()) != 0 of {
+        true -> :nack;
+        false -> case (raw band board_pack_i2c0_values@i2c0_arbitration_lost_int_raw_mask()) != 0 of {
+            true -> :arbitration_lost;
+            false -> case (raw band board_pack_i2c0_values@i2c0_time_out_int_raw_mask()) != 0 of {
+                true -> :timeout;
+                false -> case (raw band board_pack_i2c0_values@i2c0_trans_complete_int_raw_mask()) != 0 of {
+                    true -> :ok;
+                    false -> :running
+                }
+            }
+        }
+    }
+}
+
+// Polls for the transfer's end, at most `left` times.
+fn wait_end(i: device_window(L, (:esp32s3_i2c0)), left: uint32) -> (device_window(L, (:esp32s3_i2c0)), atom) {
+    sequence proc[register_rwr]
+        raw: uint32 <- peek(i, :int_raw) impl Register32 {};
+        how: atom <- outcome(raw);
+        (i2, ended) <- case how == :running of {
+            false -> (i, how);
+            true -> case left == 0 of {
+                true -> (i, :stuck);
+                false -> {
+                    _: int64 <- pause();
+                    wait_end(i, left - 1)
+                }
+            }
+        }
+    produces
+        pure (i2, ended)
+    end
+}
+
+// After a transfer that did not end with :ok. On a refusal (:nack) the controller raises the
+// interrupt bit and GOES ON with the rest of its program, to the STOP, so the end of the program is
+// waited for and nothing is written meanwhile: a new program or a reset started at once cuts into the
+// one still running. The other failures have no end to wait for. In every case the controller is then
+// left as it is: it does not take another transfer until i2c0_recover has reset it (found on the board
+// with app silica_36: neither the state-machine reset of CTR nor a STOP-only program brought it back,
+// and every later transfer was refused; ESP-IDF resets the whole peripheral on this chip for the same
+// reason).
+fn settle(i: device_window(L, (:esp32s3_i2c0)), how: atom) -> device_window(L, (:esp32s3_i2c0)) {
+    sequence proc[register_rwr]
+        (after, _came) <- case how of {
+            :ok -> (i, true);
+            :nack -> wait_complete(i, poll_budget());
+            _: atom -> (i, false)
+        }
+    produces
+        pure after
+    end
+}
+
+// Polls for the end of the program alone (trans_complete), at most `left` times: true when it came.
+fn wait_complete(i: device_window(L, (:esp32s3_i2c0)), left: uint32) -> (device_window(L, (:esp32s3_i2c0)), boolean) {
+    sequence proc[register_rwr]
+        raw: uint32 <- peek(i, :int_raw) impl Register32 {};
+        complete: boolean <- (raw band board_pack_i2c0_values@i2c0_trans_complete_int_raw_mask()) != 0;
+        (i2, came) <- case complete of {
+            true -> (i, true);
+            false -> case left == 0 of {
+                true -> (i, false);
+                false -> {
+                    _: int64 <- pause();
+                    wait_complete(i, left - 1)
+                }
+            }
+        }
+    produces
+        pure (i2, came)
+    end
+}
+
+// The controller put back in working order after a transfer that failed: a reset pulse to the whole
+// peripheral (device_window(L, (:esp32s3_system))TEM's reset register; the clock gate is left as it is), then the set-up of i2c0_init
+// again, since the reset clears it. The pads keep their routing: that is the GPIO matrix's, not the
+// controller's. A worker calls this after any outcome but :ok, before its next transfer.
+fn i2c0_recover(s: device_window(L, (:esp32s3_system)), i: device_window(L, (:esp32s3_i2c0))) -> (device_window(L, (:esp32s3_system)), device_window(L, (:esp32s3_i2c0))) {
+    sequence proc[register_rwr]
+        rst_bit: uint32 <- board_pack_system_values@system_i2c_ext0_rst_mask();
+        keep: uint32 <- bnot rst_bit;
+        rst: uint32 <- peek(s, :perip_rst_en0) impl Register32 {};
+        _: atom <- poke(s, :perip_rst_en0, (rst bor rst_bit) impl Register32 {});
+        _: atom <- poke(s, :perip_rst_en0, (rst band keep) impl Register32 {});
+        i1: device_window(L, (:esp32s3_i2c0)) <- i2c0_init(i)
+    produces
+        pure (s, i1)
+    end
+}
+
+fn finish(i: device_window(L, (:esp32s3_i2c0))) -> (device_window(L, (:esp32s3_i2c0)), atom) {
+    sequence proc[register_rwr]
+        (i1, how) <- wait_end(go(i), poll_budget());
+        i2: device_window(L, (:esp32s3_i2c0)) <- settle(i1, how)
+    produces
+        pure (i2, how)
+    end
+}
+
+// One register of a slave written: START, the address with the write bit, the register number and the
+// value, each acknowledged by the slave, STOP. `addr` is the 7-bit address.
+fn i2c0_write_reg(i: device_window(L, (:esp32s3_i2c0)), addr: uint32, reg: uint32, value: uint32) -> (device_window(L, (:esp32s3_i2c0)), atom) {
+    sequence proc[register_rwr]
+        i1: device_window(L, (:esp32s3_i2c0)) <- fifo_reset(i);
+        byte_mask: uint32 <- 0xFF;
+        three: uint32 <- 3;
+        _: atom <- poke(i1, :data, (addr shl 1) impl Register32 {});
+        _: atom <- poke(i1, :data, (reg band byte_mask) impl Register32 {});
+        _: atom <- poke(i1, :data, (value band byte_mask) impl Register32 {});
+        _: atom <- poke(i1, :comd0, cmd_rstart() impl Register32 {});
+        _: atom <- poke(i1, :comd1, (cmd_write() bor cmd_check_ack() bor three) impl Register32 {});
+        _: atom <- poke(i1, :comd2, cmd_stop() impl Register32 {});
+        (i2, how) <- finish(i1)
+    produces
+        pure (i2, how)
+    end
+}
+
+// `count` (1 to 32) registers of a slave read, starting at `reg`: START, the address with the write
+// bit and the register number, a REPEATED START (no STOP between: the MMA8452Q, like many parts, needs
+// it), the address with the read bit, then the bytes, every one acknowledged by the master but the
+// last, STOP. On :ok the bytes wait in the receive FIFO, in order, for i2c0_rx_byte.
+fn i2c0_read_start(i: device_window(L, (:esp32s3_i2c0)), addr: uint32, reg: uint32, count: uint32) -> (device_window(L, (:esp32s3_i2c0)), atom) {
+    sequence proc[register_rwr]
+        i1: device_window(L, (:esp32s3_i2c0)) <- fifo_reset(i);
+        byte_mask: uint32 <- 0xFF;
+        one: uint32 <- 1;
+        two: uint32 <- 2;
+        _: atom <- poke(i1, :data, (addr shl 1) impl Register32 {});
+        _: atom <- poke(i1, :data, (reg band byte_mask) impl Register32 {});
+        _: atom <- poke(i1, :data, ((addr shl 1) bor one) impl Register32 {});
+        _: atom <- poke(i1, :comd0, cmd_rstart() impl Register32 {});
+        _: atom <- poke(i1, :comd1, (cmd_write() bor cmd_check_ack() bor two) impl Register32 {});
+        _: atom <- poke(i1, :comd2, cmd_rstart() impl Register32 {});
+        _: atom <- poke(i1, :comd3, (cmd_write() bor cmd_check_ack() bor one) impl Register32 {});
+        _: atom <- case count > 1 of {
+            true -> poke(i1, :comd4, (cmd_read() bor (count - one)) impl Register32 {});
+            false -> poke(i1, :comd4, (cmd_read() bor cmd_send_nack() bor one) impl Register32 {})
+        };
+        _: atom <- case count > 1 of {
+            true -> poke(i1, :comd5, (cmd_read() bor cmd_send_nack() bor one) impl Register32 {});
+            false -> poke(i1, :comd5, cmd_stop() impl Register32 {})
+        };
+        _: atom <- poke(i1, :comd6, cmd_stop() impl Register32 {});
+        (i2, how) <- finish(i1)
+    produces
+        pure (i2, how)
+    end
+}
+
+// The next byte of the receive FIFO.
+fn i2c0_rx_byte(i: device_window(L, (:esp32s3_i2c0))) -> (device_window(L, (:esp32s3_i2c0)), uint32) {
+    sequence proc[register_rwr]
+        byte_mask: uint32 <- 0xFF;
+        word: uint32 <- peek(i, :data) impl Register32 {}
+    produces
+        pure (i, word band byte_mask)
+    end
+}
+
+// Read-backs for probes. Each is a read, so the window is not handed back.
+fn i2c0_int_raw(i: device_window(L, (:esp32s3_i2c0))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(i, :int_raw) impl Register32 {}
+    produces
+        pure v
+    end
+}
+
+// SR: bus_busy, the FIFO counts and the state machines' states.
+fn i2c0_sr(i: device_window(L, (:esp32s3_i2c0))) -> uint32 {
+    sequence proc[register_rwr]
+        v: uint32 <- peek(i, :sr) impl Register32 {}
+    produces
+        pure v
+    end
+}

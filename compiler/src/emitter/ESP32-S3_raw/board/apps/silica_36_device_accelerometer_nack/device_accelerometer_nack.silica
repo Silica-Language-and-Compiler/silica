@@ -1,0 +1,162 @@
+// ESP32-S3 port app 36: the I2C "nobody answered" path, without hands. The accelerometer worker
+// (device_lib/device_mma8452q over device_lib/device_esp32s3_i2c0) is brought up as in app 34. It is
+// then asked for WHO_AM_I at address 0x1D, where nothing is (the MMA8452Q's other possible address;
+// this board's part is strapped to 0x1C): no device pulls SDA low in the acknowledge slot, and the
+// controller reports :nack. The same question at 0x1C is then answered, and a reading is taken, which
+// shows the controller recovers after a refused transfer (its state machine is reset after one).
+// Expected console: "accelerometer: MMA8452Q", "probe 0x1D: nack", "probe 0x1C: ok, who_am_i 42",
+// "reading: about 1 g", "done", status 0.
+use device_mma8452q;
+use Supervisor;
+
+fn how_text(how: atom) -> string {
+    case how of {
+        :ok -> "ok";
+        :nack -> "nack";
+        :timeout -> "timeout";
+        :arbitration_lost -> "arbitration_lost";
+        :stuck -> "stuck";
+        :unknown_part -> "unknown_part";
+        _: atom -> "?"
+    }
+}
+
+// 0.7 g and 1.3 g in counts (717 and 1331), squared.
+fn about_one_g(x: int64, y: int64, z: int64) -> boolean {
+    m2: int64 <- x * x + y * y + z * z;
+    m2 >= 514089 and m2 <= 1771561
+}
+
+fn said(line: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        println(line)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// state counts the probes answered: the first is the address with no device, the second the part's.
+fn on_probed(how: atom, byte: uint32, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        print(case state == 0 of { true -> "probe 0x1D: "; false -> "probe 0x1C: " });
+        print(how_text(how));
+        _: atom <- case how == :ok of {
+            true -> {
+                print(", who_am_i ");
+                print_int64(to_int64(byte))
+            };
+            false -> :ok
+        };
+        println("")
+    produces
+        pure (:no_reply, state + 1)
+    end
+}
+
+fn on_error(why: atom, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        print("accelerometer error: ");
+        println(how_text(why));
+        _: boolean <- cast_exit(1)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn on_reading(x: int64, y: int64, z: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        println(case about_one_g(x, y, z) of { true -> "reading: about 1 g"; false -> "reading: NOT about 1 g" });
+        println("done");
+        _: boolean <- cast_exit(0)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn announcer(msg: (:accel_ready, uint32) | (:accel_error, atom, uint32) | (:accel_probed, atom, uint32) | (:accel, int64, int64, int64), state: int64) -> (:no_reply, int64) {
+    case msg of {
+        (:accel_ready, _who: uint32) -> said("accelerometer: MMA8452Q", state);
+        (:accel_error, why: atom, _who: uint32) -> on_error(why, state);
+        (:accel_probed, how: atom, byte: uint32) -> on_probed(how, byte, state);
+        (:accel, x: int64, y: int64, z: int64) -> on_reading(x, y, z, state)
+    }
+}
+
+impl AppSupervisor for Supervisor;
+
+// The app's work, run by the supervisor's one worker (main only starts the supervisor and casts).
+fn app_worker(msg: atom, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        a: actor_ref <- spawn(0, announcer, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        w: device_actor_ref <- spawn_device(:unmapped, device_mma8452q@accelerometer_worker, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_device(w, { op: :init, count: 0, reply_to: a } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :probe, count: 29, reply_to: a } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :probe, count: 28, reply_to: a } impl ActorMessage {});
+        _: boolean <- cast_device(w, { op: :read, count: 0, reply_to: a } impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn init(initial_state: int64) -> (
+    { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 },
+    List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)]
+) {
+    sequence proc[mem(normal)]
+        flags: { strategy: :one_for_one | :one_for_all | :rest_for_one, allowed_restart_count: int64, restarts_time_frame: int64 } <- { strategy: :one_for_one, allowed_restart_count: 0, restarts_time_frame: 1 };
+        children: List[{ id: atom, agent_type: :worker | :supervisor, initial_state: int64, behavior: fn(msg: atom, state: int64) -> (:no_reply, int64), restart: :permanent | :temporary | :transient, shutdown: int64, flavor: :plain | :dangerous, state_policy: state_policy }, mem(normal)] <- [
+            { id: :app_worker, agent_type: :worker, initial_state: initial_state, behavior: app_worker, restart: :transient, shutdown: 0, flavor: :plain, state_policy: state_policy(:keep_state_area) }
+        ]
+    produces
+        pure (flags, children)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: atom <- start_reporter();
+        _: supervisor_ref <- spawn_registered_supervisor(AppSupervisor, 0, :app_supervisor, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast_registered(:app_worker, (:start) impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// FailureReporter (spec §15.4.13.4): registered before anything is started (E2236).
+// region_dump_limit is called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// True for the root supervisor's own report: no supervisor (a null pointer prints as 0x0 on
+// Darwin, (nil) on glibc, 0x00000000 on the ESP32-S3 board) and frame #0 `<unknown behavior>`,
+// the runtime-owned supervisor behaviour. A worker's report always names its behaviour.
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+// A registered reporter receives every report the runtime would otherwise write to stderr, so it
+// writes the report there itself. The root supervisor's report ends the program with status 70.
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Spawns the FailureReporter and registers it.
+fn start_reporter() -> atom {
+    sequence proc[concurrency]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        registered: atom <- register_failure_reporter(reporter_ref)
+    produces
+        pure registered
+    end
+}
