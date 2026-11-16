@@ -1834,6 +1834,48 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     between beacons; while Bluetooth has a link the station at times loses the access point and
     joins again (`:link_unavailable` between links).
 
+- **Stage 12, part 12, 2026-11-15, done: the two-radio image's memory.** Fifteen links on each
+  radio, the two overlapping, now pass: three runs of three, status 0, where part 11 lost a Wi-Fi
+  carrier in each.
+  - **What part 11 had wrong.** The heap was not only broken up; it was full. A walk of every block
+    (`-DSPIKE_HEAP_WALK`, with `-DSOCKETS_HEAP_SUMMARY`) showed 223 KB of 271 KB in use with both
+    radios idle, 244 KB with one `(:tcp)` carrier live, and the runtime's `heap exhausted` when a
+    Bluetooth link came on top.
+  - **RAM the image did not use.** The runtime's image ends at 0x3FCE9700, the bound the ROM needs
+    while it loads the image. Above it, 0x3FCE9800 to 0x3FCEF000 (22 KB) is the ROM's only during
+    the load; the ROM's own variables, which the libraries' code in ROM uses, start at 0x3FCEF81C.
+    With part 11's 32 KB at 0x3FCF0000 that is 54 KB the heap does not reach. (A first attempt took
+    the region from 0x3FCE9700 and the Wi-Fi start faulted: the frame above main's stack top is
+    written to.)
+  - **The libraries' regions** (`hci_shim.c`). The libraries' blocks, tasks' stacks among them,
+    first fill regions of their own, with the shim's own allocator in each: the two pieces above,
+    then one block of `SPIKE_LIB_REGION_KB` taken from the runtime's heap at the first allocation
+    (64 KB in the two-radio image, 32 KB in the Wi-Fi image, 16 KB otherwise). What fits in none
+    comes block by block from the heap, as in part 9. So the libraries' many small blocks no longer
+    lie among the actors' stack chunks. `SPIKE_LIB_LIMIT_KB` (160) bounds all they hold: beyond it
+    they are refused, which they report, where an exhausted heap ends the runtime. A region's
+    blocks are zeroed when handed out, as the runtime's are.
+  - **Measured**, 160 MHz:
+
+    | Image | The libraries hold (most) | In the regions | The heap in use, of |
+    | --- | --- | --- | --- |
+    | Both radios, fifteen links on each | 118 KB (134 KB) | 119 KB of 120 KB | 206 to 235 KB of 271 KB |
+    | Wi-Fi, eight links | 80 KB (84 KB) | 68 KB of 71 KB (before the region was 32 KB) | 149 KB of 258 KB |
+
+  - **The demos' owners watch their links.** A carrier refused its memory ends without a word to
+    its owner, which waited for ever. The Wi-Fi demo's owner now sends itself `(:watch, n)` when it
+    opens link n and ends the run with status 6 if that link is still in hand `watch_ms()` (60 s)
+    later; the two-radio demo's Wi-Fi owner the same, telling the coordinator 6. Checked with
+    `watch_ms()` at 1.5 s: status 6.
+  - Runs after these changes: the two-radio image 15 and 15 three times; the Wi-Fi image eight links
+    of eight; the Bluetooth image five of five.
+  - **Open.** As part 11, less the heap: 16 KB of instruction RAM at 0x40374000 (ESP-IDF loads
+    applications' code there with its default 16 KB instruction cache, so the ROM leaves it free;
+    it holds code only); the 230 bytes a Wi-Fi link leaves behind; the radio closed between
+    beacons; the station at times loses the access point while Bluetooth has a link. The runtime's
+    linker script could give the 22 KB above the image to every ESP32-S3 program's heap; here only
+    the radio images use it.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

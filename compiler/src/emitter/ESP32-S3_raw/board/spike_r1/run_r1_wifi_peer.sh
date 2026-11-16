@@ -31,7 +31,8 @@
 # each on a TCP connection of its own. The Mac must be on the same network.
 # --listen: the board listens (the program opens "listen:<port>" on the station's address) and the
 # Mac connects for each exchange, finding the board by trying the port across its /24 network.
-# The libraries' memory comes from the runtime's heap (-DSPIKE_ONE_HEAP, hci_shim.c).
+# The libraries' memory: the RAM above the image, then a region of the runtime's heap, then the heap
+# (-DSPIKE_ONE_HEAP, -DSPIKE_LIB_REGION_KB, hci_shim.c).
 # R1_CPU_MHZ=80|160|240 (160 unless given).
 #
 # Needs: the ESP32-S3_raw Silica compiler (SILICA_COMPILER, default the local build), the guest's
@@ -115,7 +116,7 @@ done
 export BOARD_FLASH_FILES
 inc="-I$out -I$C/esp_wifi/include -I$C/esp_wifi/include/local -I$C/esp_event/include -I$C/esp_netif/include -I$C/esp_phy/include"
 inc="$inc -I$L/include -I$L/include/apps -I$L/include/apps/sntp -I$L/lwip/src/include -I$L/port/include -I$L/port/freertos/include -I$L/port/esp32xx/include -I$L/port/esp32xx/include/arch"
-export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
+export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DSPIKE_LIB_REGION_KB=32 -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
 # the runtime on one core, core 0, for the program's actors; core 1 is the radio's tasks' (r1_port.c)
 export BOARD_ASFLAGS="-DNCORES_RUN=1"
 export BOARD_FFI_STACK=${BOARD_FFI_STACK:-6144}

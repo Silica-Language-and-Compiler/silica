@@ -584,24 +584,137 @@ void vPortYield(void)
 
 // ---- memory ----
 
-#define STACK_POOL_START 0x3FCF0000u
-#define STACK_POOL_END   0x3FCF8000u
+// RAM the runtime's image leaves alone, in two pieces. Above its main stack, 0x3FCE9800 to 0x3FCEF000:
+// the ROM has its stack and its loader's data there only while it loads the image (the ROM's own
+// variables, which the libraries' code in ROM uses, start at 0x3FCEF81C; the frame above the main
+// stack's top is the ROM's too). And 0x3FCF0000 to 0x3FCF8000, free while the data cache is 32 KB or
+// less (spike_flash.c sets it; ESP-IDF heap/port/esp32s3/memory_layout.c).
+#define LOW_RAM_START  0x3FCE9800u
+#define LOW_RAM_END    0x3FCEF000u
+#define HIGH_RAM_START 0x3FCF0000u
+#define HIGH_RAM_END   0x3FCF8000u
+
+// The libraries' blocks: 16-byte multiples, each under a 16-byte header, in address order in one
+// region; a freed block is joined to the free blocks after it when a search passes it.
+struct block {
+    uint32_t size;      // with the header
+    uint32_t used;
+    uint32_t pad[2];
+};
+static struct region {
+    uint8_t *base;
+    uint32_t bytes, given, most;
+} regions[3];
+static uint32_t region_count;
+static uint32_t arena_given, arena_most;    // all the libraries hold, in the regions and beyond them
+
+static struct block *next_block(struct block *b)
+{
+    return (struct block *)((uint8_t *)b + b->size);
+}
+
+static void region_add(uint8_t *base, uint32_t bytes)
+{
+    struct region *r = &regions[region_count++];
+    r->base = base;
+    r->bytes = bytes;
+    ((struct block *)base)->size = bytes;
+    ((struct block *)base)->used = 0;
+}
+
+static struct region *region_of(void *p)
+{
+    for (uint32_t i = 0; i < region_count; i++) {
+        if ((uint8_t *)p >= regions[i].base && (uint8_t *)p < regions[i].base + regions[i].bytes) {
+            return &regions[i];
+        }
+    }
+    return NULL;
+}
+
+static void given(uint32_t bytes)
+{
+    arena_given += bytes;
+    if (arena_given > arena_most) {
+        arena_most = arena_given;
+    }
+}
+
+// With the radio's interrupt masked. The first region with room.
+static void *region_take(size_t n)
+{
+    uint32_t need = (uint32_t)((n + 15) & ~(size_t)15) + sizeof(struct block);
+    for (uint32_t i = 0; i < region_count; i++) {
+        struct region *r = &regions[i];
+        struct block *b = (struct block *)r->base, *end = (struct block *)(r->base + r->bytes);
+        if (r->bytes - r->given < need) {
+            continue;
+        }
+        for (; b < end; b = next_block(b)) {
+            if (b->used) {
+                continue;
+            }
+            while (next_block(b) < end && !next_block(b)->used) {
+                b->size += next_block(b)->size;
+            }
+            if (b->size >= need) {
+                if (b->size - need >= 2 * sizeof(struct block)) {
+                    struct block *rest = (struct block *)((uint8_t *)b + need);
+                    rest->size = b->size - need;
+                    rest->used = 0;
+                    b->size = need;
+                }
+                b->used = 1;
+                r->given += b->size;
+                if (r->given > r->most) {
+                    r->most = r->given;
+                }
+                given(b->size);
+                return b + 1;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void region_give(struct region *r, void *p)
+{
+    struct block *b = (struct block *)p - 1;
+    b->used = 0;
+    r->given -= b->size;
+    arena_given -= b->size;
+}
 
 #ifdef SPIKE_ONE_HEAP
-// One heap for the whole chip: the libraries' blocks come from the runtime's heap (rt_heap.S), beside
-// the actors' stacks, states and messages, so neither side keeps memory the other could use. The
-// runtime's blocks are 8-byte aligned under an 8-byte header ([-8] the size, [-4] HEAP_USED); the
-// libraries are given 16-byte alignment, as from the arena below: a block whose payload is not on a
-// 16-byte boundary is handed out 8 bytes further in, with ONE_HEAP_MOVED in the word under it where
-// an unmoved block has the runtime's tag. The runtime's heap lock is a spin lock both cores take;
-// the radio's interrupt is masked around a call so that it never finds this core holding it.
+// One heap for the whole chip: the libraries' memory comes from the runtime's heap (rt_heap.S), beside
+// the actors' stacks, states and messages, so neither side keeps memory the other could use.
+//
+// The libraries' blocks are many, small and long held; left among the actors' they cut the heap into
+// pieces too small for a stack chunk. So the libraries first fill regions of their own: the RAM
+// above the runtime's image (the two pieces above, 54 KB the heap does not reach), then one block of
+// SPIKE_LIB_REGION_KB taken from the heap at the first allocation. Only what fits in neither comes
+// block by block from the heap, up to SPIKE_LIB_LIMIT_KB in all: beyond that the libraries are
+// refused, which they report, where an exhausted heap would end the runtime.
+//
+// A block from the heap: the runtime's blocks are 8-byte aligned under an 8-byte header ([-8] the
+// size, [-4] HEAP_USED); the libraries are given 16-byte alignment, as in the region: a block whose
+// payload is not on a 16-byte boundary is handed out 8 bytes further in, with ONE_HEAP_MOVED in the
+// word under it where an unmoved block has the runtime's tag. The runtime's heap lock is a spin lock
+// both cores take; the radio's interrupt is masked around a call so that it never finds this core
+// holding it.
+#ifndef SPIKE_LIB_REGION_KB
+#define SPIKE_LIB_REGION_KB 16
+#endif
+#ifndef SPIKE_LIB_LIMIT_KB
+#define SPIKE_LIB_LIMIT_KB 160
+#endif
 #define HEAP_USED 0x5A11CA1D
 #define ONE_HEAP_MOVED 0x16A116ED
 void *silica_rt_alloc_or_null(uint32_t size);
 void silica_rt_free(void *p);
 extern uint8_t _silica_heap_start[], _silica_heap_end[];
-static uint32_t arena_given, arena_most;
 #define ARENA_BYTES ((uint32_t)(_silica_heap_end - _silica_heap_start))
+static uint32_t region_asked;
 
 static uint32_t *block_base(void *p)       // the runtime's payload address of a block handed out
 {
@@ -611,6 +724,9 @@ static uint32_t *block_base(void *p)       // the runtime's payload address of a
 
 static size_t block_room(void *p)          // the bytes the holder of p may use
 {
+    if (region_of(p)) {
+        return ((struct block *)p - 1)->size - sizeof(struct block);
+    }
     uint32_t *base = block_base(p);
     return base[-2] - 8 - (size_t)((uint8_t *)p - (uint8_t *)base);
 }
@@ -618,26 +734,44 @@ static size_t block_room(void *p)          // the bytes the holder of p may use
 void *malloc(size_t n)
 {
     uint32_t ps = mask_level3();
-    uint32_t *base = silica_rt_alloc_or_null((uint32_t)n + 8);
-    void *p = NULL;
-    if (base) {
-        arena_given += base[-2];
-        if (arena_given > arena_most) {
-            arena_most = arena_given;
+    if (!region_asked) {
+        region_asked = 1;
+        region_add((uint8_t *)HIGH_RAM_START, HIGH_RAM_END - HIGH_RAM_START);
+        region_add((uint8_t *)LOW_RAM_START, LOW_RAM_END - LOW_RAM_START);
+        uint8_t *r = silica_rt_alloc_or_null(SPIKE_LIB_REGION_KB * 1024 + 8);
+        if (r) {
+            region_add((uint8_t *)(((uintptr_t)r + 15) & ~(uintptr_t)15), SPIKE_LIB_REGION_KB * 1024);
         }
-        p = base;
-        if ((uintptr_t)base & 8) {
-            base[1] = ONE_HEAP_MOVED;
-            p = base + 2;
+    }
+    void *p = region_take(n);
+    int zeroed = p == NULL;                 // the runtime's blocks come zeroed; a region's must be made so
+    if (p == NULL && arena_given + n + 16 <= SPIKE_LIB_LIMIT_KB * 1024u) {
+        uint32_t *base = silica_rt_alloc_or_null((uint32_t)n + 8);
+        if (base) {
+            given(base[-2]);
+            p = base;
+            if ((uintptr_t)base & 8) {
+                base[1] = ONE_HEAP_MOVED;
+                p = base + 2;
+            }
         }
     }
     unmask(ps);
+    if (p && !zeroed) {
+        memset(p, 0, n);
+    }
     if (p == NULL) {
         silica_rt_puts("shim: out of memory: ");
         spike_put_dec((uint32_t)n);
         silica_rt_puts(" bytes asked, the libraries hold ");
         spike_put_dec(arena_given);
-        silica_rt_puts(" of the heap's ");
+        silica_rt_puts(" (");
+        spike_put_dec(regions[0].given + regions[1].given + regions[2].given);
+        silica_rt_puts(" in their regions of ");
+        spike_put_dec(regions[0].bytes + regions[1].bytes + regions[2].bytes);
+        silica_rt_puts("), their limit ");
+        spike_put_dec(SPIKE_LIB_LIMIT_KB * 1024u);
+        silica_rt_puts(", the heap ");
         spike_put_dec(ARENA_BYTES);
         silica_rt_puts("\n");
     }
@@ -646,64 +780,31 @@ void *malloc(size_t n)
 
 void free(void *p)
 {
-    if (p == NULL || ((uintptr_t)p >= STACK_POOL_START && (uintptr_t)p < STACK_POOL_END)) {
+    if (p == NULL) {
         return;
     }
     uint32_t ps = mask_level3();
-    uint32_t *base = block_base(p);
-    arena_given -= base[-2];
-    silica_rt_free(base);
+    struct region *r = region_of(p);
+    if (r) {
+        region_give(r, p);
+    } else {
+        uint32_t *base = block_base(p);
+        arena_given -= base[-2];
+        silica_rt_free(base);
+    }
     unmask(ps);
 }
 
 #else
-// Blocks of 16-byte multiples, each under a 16-byte header, in address order; a freed block is joined
-// to the free blocks after it.
-struct block {
-    uint32_t size;      // with the header
-    uint32_t used;
-    uint32_t pad[2];
-};
 static uint8_t arena[ARENA_KB * 1024] __attribute__((aligned(16)));
-static uint32_t arena_given, arena_most;
-
-static struct block *next_block(struct block *b)
-{
-    return (struct block *)((uint8_t *)b + b->size);
-}
 
 void *malloc(size_t n)
 {
-    uint32_t need = (uint32_t)((n + 15) & ~(size_t)15) + sizeof(struct block);
-    void *p = NULL;
     uint32_t ps = mask_level3();
-    struct block *b = (struct block *)arena, *end = (struct block *)(arena + sizeof(arena));
-    if (b->size == 0) {
-        b->size = sizeof(arena);
+    if (region_count == 0) {
+        region_add(arena, sizeof(arena));
     }
-    for (; b < end; b = next_block(b)) {
-        if (b->used) {
-            continue;
-        }
-        while (next_block(b) < end && !next_block(b)->used) {
-            b->size += next_block(b)->size;
-        }
-        if (b->size >= need) {
-            if (b->size - need >= 2 * sizeof(struct block)) {
-                struct block *rest = (struct block *)((uint8_t *)b + need);
-                rest->size = b->size - need;
-                rest->used = 0;
-                b->size = need;
-            }
-            b->used = 1;
-            arena_given += b->size;
-            if (arena_given > arena_most) {
-                arena_most = arena_given;
-            }
-            p = b + 1;
-            break;
-        }
-    }
+    void *p = region_take(n);
     unmask(ps);
     if (p == NULL) {
         silica_rt_puts("shim: out of memory\n");
@@ -717,9 +818,7 @@ void free(void *p)
         return;
     }
     uint32_t ps = mask_level3();
-    struct block *b = (struct block *)p - 1;
-    b->used = 0;
-    arena_given -= b->size;
+    region_give(&regions[0], p);
     unmask(ps);
 }
 
@@ -794,6 +893,24 @@ uint32_t spike_arena_now(void)
     return arena_given;
 }
 
+// The most the libraries held in their region and in all, for a report of what the region should be.
+void spike_arena_report(void)
+{
+    silica_rt_puts("shim: the libraries hold ");
+    spike_put_dec(arena_given);
+    silica_rt_puts(", most ");
+    spike_put_dec(arena_most);
+    for (uint32_t i = 0; i < region_count; i++) {
+        silica_rt_puts("; in a region of ");
+        spike_put_dec(regions[i].bytes);
+        silica_rt_puts(": ");
+        spike_put_dec(regions[i].given);
+        silica_rt_puts(", most ");
+        spike_put_dec(regions[i].most);
+    }
+    silica_rt_puts("\n");
+}
+
 #ifdef SPIKE_ONE_HEAP
 // The runtime's own summary of the heap (in use, free, the sizes of its blocks), for a debug report.
 void silica_rt_heap_summary(void);
@@ -803,6 +920,45 @@ void spike_heap_report(void)
     silica_rt_heap_summary();
     unmask(ps);
     silica_rt_puts("\n");
+    spike_arena_report();
+#ifdef SPIKE_HEAP_WALK
+    // every size of block in use that takes 1 KB or more in all: size x count, in the order met
+    static uint32_t sizes[96], counts[96];
+    uint32_t kinds = 0, other = 0;
+    ps = mask_level3();
+    for (uint32_t *b = (uint32_t *)_silica_heap_start; (uint8_t *)b < _silica_heap_end && b[0] >= 16 && (b[0] & 7) == 0;
+         b = (uint32_t *)((uint8_t *)b + b[0])) {
+        if (b[1] != HEAP_USED) {
+            continue;
+        }
+        uint32_t k = 0;
+        while (k < kinds && sizes[k] != b[0]) {
+            k++;
+        }
+        if (k == kinds) {
+            if (kinds == 96) {
+                other += b[0];
+                continue;
+            }
+            sizes[kinds] = b[0];
+            counts[kinds++] = 0;
+        }
+        counts[k]++;
+    }
+    unmask(ps);
+    silica_rt_puts("walk:");
+    for (uint32_t k = 0; k < kinds; k++) {
+        if (sizes[k] * counts[k] >= 1024) {
+            silica_rt_puts(" ");
+            spike_put_dec(sizes[k]);
+            silica_rt_puts("x");
+            spike_put_dec(counts[k]);
+        }
+    }
+    silica_rt_puts(" other ");
+    spike_put_dec(other);
+    silica_rt_puts("\n");
+#endif
 }
 #endif
 
@@ -811,28 +967,14 @@ uint32_t spike_arena_used(void)
     return arena_most;
 }
 
-// Tasks' stacks first come from the 32 KB of RAM above the ROM's own, which the runtime's heap does
-// not reach (0x3FCF0000: free while the data cache is 32 KB or less, spike_flash.c), one after another
-// and never given back; when that is full, from the heap. Only in an image on the one heap (those map
-// their flash with spike_flash.c, which sets the data cache's size).
-static uint32_t stack_pool_next = STACK_POOL_START;
-
+// A task's stack is a block like any other of the libraries'.
 static void *stack_take(uint32_t bytes)
 {
-#ifdef SPIKE_ONE_HEAP
-    uint32_t ps = mask_level3();
-    void *p = NULL;
-    if (STACK_POOL_END - stack_pool_next >= bytes) {
-        p = (void *)stack_pool_next;
-        stack_pool_next += bytes;
-    }
-    unmask(ps);
+    void *p = malloc(bytes);
     if (p) {
         memset(p, 0, bytes);
-        return p;
     }
-#endif
-    return malloc(bytes);
+    return p;
 }
 
 // ---- queues, semaphores and mutexes ----

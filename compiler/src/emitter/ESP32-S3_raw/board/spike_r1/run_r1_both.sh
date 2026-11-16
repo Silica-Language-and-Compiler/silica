@@ -24,7 +24,8 @@
 # (:tcp) carrier above lwIP (run_r1_wifi_peer.sh) and the board's (:ble_gatt) carrier above NimBLE
 # (run_r1_peer.sh), in one image. The actors run on core 0; core 1 has the tasks of the Wi-Fi
 # libraries, lwIP, the Bluetooth controller and NimBLE, and both radios' interrupts. The libraries'
-# memory comes from the runtime's heap. --links <n> whole exchanges on each radio.
+# memory: the RAM above the image, then a region of the runtime's heap (BOTH_LIB_REGION_KB, 64 unless
+# given), then the heap (hci_shim.c). --links <n> whole exchanges on each radio.
 #
 # The Mac's ends are not started here: wifi_peer.py <port> <n> for Wi-Fi (the port is WIFI_PORT, 4370
 # unless given) and transport_ble_demo/run_peer.sh central --links <n> for Bluetooth. The access
@@ -89,7 +90,7 @@ sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$
 case "$only" in
     wifi) sed -i '' -e '/cast(bcar, (:open, bme, ble_address())/d' -e 's/spawn({ left: 2, code: 0 }, both,/spawn({ left: 1, code: 0 }, both,/' \
               -e 's/cast(car, (:open, me, address()) impl ActorMessage {});/cast(car, (:open, me, address()) impl ActorMessage {})/' "$SRC/dangerous_both_board_peer.silica" ;;
-    ble) sed -i '' -e '/cast(car, (:open, me, address())/d' -e 's/spawn({ left: 2, code: 0 }, both,/spawn({ left: 1, code: 0 }, both,/' "$SRC/dangerous_both_board_peer.silica" ;;
+    ble) sed -i '' -e '/cast(car, (:open, me, address())/d' -e '/send_after(watch_ms(), me, (:watch, 0)/d' -e 's/spawn({ left: 2, code: 0 }, both,/spawn({ left: 1, code: 0 }, both,/' "$SRC/dangerous_both_board_peer.silica" ;;
 esac
 for m in $modules trial_support_hex trial_wait_int64 dangerous_both_board_peer; do echo "$m.silica"; done > "$SRC/silica.config"
 # The compiler wants the archive the .meta names; the wrapper itself is compiled into the image, so
@@ -129,7 +130,7 @@ export BOARD_FLASH_FILES
 export BOARD_FLASH_IRAM=1
 inc="-I$out -I$C/esp_wifi/include -I$C/esp_wifi/include/local -I$C/esp_event/include -I$C/esp_netif/include -I$C/esp_phy/include"
 inc="$inc -I$L/include -I$L/include/apps -I$L/include/apps/sntp -I$L/lwip/src/include -I$L/port/include -I$L/port/freertos/include -I$L/port/esp32xx/include -I$L/port/esp32xx/include/arch"
-export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSOCKETS_WIFI_PS -DSOCKETS_WIFI_RX_BUFFERS=6 -DSPIKE_STACK_TIGHT -DSILICA_BLE_OPEN_LINK -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
+export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSOCKETS_WIFI_PS -DSOCKETS_WIFI_RX_BUFFERS=6 -DSPIKE_STACK_TIGHT -DSILICA_BLE_OPEN_LINK -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DSPIKE_LIB_REGION_KB=${BOTH_LIB_REGION_KB:-64} -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
 # the runtime on one core, core 0, for the program's actors; core 1 is the radio's tasks' (r1_port.c)
 export BOARD_ASFLAGS="-DNCORES_RUN=1"
 export BOARD_FFI_STACK=${BOARD_FFI_STACK:-4096}
