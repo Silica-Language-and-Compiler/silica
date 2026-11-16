@@ -488,6 +488,7 @@ one definition (chunk 10), three uses (`L_region_grow`). Left for phases 8/9 (`.
 `emitter/linux_aarch64` 36 / 5, `emitter/linux_x86_64` 33 / 6, `emitter/ESP32-S3_raw` 30 / 5 (plus the board's
 `rt_ordering.S` and `rt_heap.S` twins, which are not `.silica`). There is no `compiler/src_selfhost` directory in this
 tree (the tree-layout move made `src` the selfhost source). Nothing was built or run.
+2026-11-14 (verification pass): partly done. Linux done in phase 8: `canonical_arena` is removed from linux_aarch64 and linux_x86_64 (only a comment remains). Still open: `ESP32-S3_raw` still has `terms/canonical_arena_runtime_asm.*` and `canonical_arena` entries in `board/runtime/rt_ordering.S`.
 
 ## 9. Phase 5 close (2026-10-31)
 

@@ -2,7 +2,7 @@
 
 **Status:** Design plan. The ESP32-S3_raw path implements the device MMIO surface (§5) and its board pack (§10); see the implementation status below. Not a substitute for [silica-specification.md](silica-specification.md). Use this document when adding a **board** or **OS-free** compiler/runtime target. Hosted ports (macOS, Linux, Windows) are out of scope except where this text contrasts them.
 
-**Implementation status (2026-10-16), ESP32-S3_raw.** Delivered: the `register_rwr` effect; device descriptions as compile-time data (`impl fn registers(device: (:tag))` of the built-in `DeviceDescription` trait, checked by E2201-E2210; stdlib `DeviceDescription.silica`, `Register8.silica`..`Register64.silica`); `map_device`, `peek` and `poke` through the shared stages (`type_checker/device/`, `type_checker/expressions/type_checker_expressions_device.silica`, `module_checker/module_checker_device.silica`, `sir_generator/terms/sir_device_calls.silica`); `spawn_device`, `spawn_device_registered`, `cast_device`, `cast_device_registered` with a third registry; the `device_*` module rules (E2216-E2233); the pre-emit rejection `sir_generator/sir_target_verify.silica` (E2220 for a prim the target cannot compile, through `emitter_core@unsupported_prim_reason`), which stops all three hosted emitters before they emit; the ESP32-S3 lowering in `emitter/ESP32-S3_raw/terms/prims/prims_device.silica` (one `memw`, one `l32i` / `s32i`, and for a `poke` a trailing `memw`; **only 32-bit accesses** are accepted, any other width is refused with an `.error` line naming it); the board pack `emitter/ESP32-S3_raw/board_pack.silica` (window table, `window_containing`, `window_allows_width`, pins, register facts) with its runtime twin `board/runtime/rt_device.S` (`silica_rt_map_device_check`, the abort `illegal device map` for a computed base outside every window); generated per-peripheral descriptions with access modes under `board/pack/` (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT; `board/tools/gen_board_pack.py`); device drivers in Silica under `board/apps/device_lib/` and the board apps `silica_16_device_uart` to `silica_22_device_buzzer`; fatal fault (status 70) and runtime abort (status 71) reports as console output before the exit marker; a first-fit heap with release; per-core cooperative schedulers on both LX7 cores; growable actor stacks. Not delivered: any bare-metal AArch64 / QEMU board pack (§11, §12 Phases B, D, E remain a plan), per-`Space` pools (the ESP32-S3 `alloc_region` still ignores its space operand), a timer-IRQ clock (the board reads the 16 MHz system timer by polling), Fifi on OS-free targets (§9.1 is planned, not implemented), the wide emitter diagnostic channel (the narrow channel is `sir_target_verify`; the ESP32-S3 refusals for foreign calls, file io, frame size and an unsupported width are still `.error` lines). The rows of §4 below describe the starting inventory; the status paragraph and the port status document win where they differ.
+**Implementation status (2026-10-16), ESP32-S3_raw.** Delivered: the `register_rwr` effect; device descriptions as compile-time data (`impl fn registers(device: (:tag))` of the built-in `DeviceDescription` trait, checked by E2201-E2210; stdlib `DeviceDescription.silica`, `Register8.silica`..`Register64.silica`); `map_device`, `peek` and `poke` through the shared stages (`type_checker/device/`, `type_checker/expressions/type_checker_expressions_device.silica`, `module_checker/module_checker_device.silica`, `sir_generator/terms/sir_device_calls.silica`); `spawn_device`, `spawn_device_registered`, `cast_device`, `cast_device_registered` with a third registry; the `device_*` module rules (E2216-E2233); the pre-emit rejection `sir_generator/sir_target_verify.silica` (E2220 for a prim the target cannot compile, through `emitter_core@unsupported_prim_reason`), which stops all three hosted emitters before they emit; the ESP32-S3 lowering in `emitter/ESP32-S3_raw/terms/prims/prims_device.silica` (one `memw`, one `l32i` / `s32i`, and for a `poke` a trailing `memw`; **only 32-bit accesses** are accepted, any other width is refused with an `.error` line naming it); the board pack `emitter/ESP32-S3_raw/board_pack.silica` (window table, `window_containing`, `window_allows_width`, pins, register facts) with its runtime twin `board/runtime/rt_device.S` (`silica_rt_map_device_check`, the abort `illegal device map` for a computed base outside every window); generated per-peripheral descriptions with access modes under `board/pack/` (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT; `board/tools/gen_board_pack.py`); device drivers in Silica under `board/apps/device_lib/` and the board apps `silica_16_device_uart` to `silica_22_device_buzzer`; fatal fault (status 70) and runtime abort (status 71) reports as console output before the exit marker; a first-fit heap with release; per-core cooperative schedulers on both LX7 cores; growable actor stacks. Not delivered: any bare-metal AArch64 / QEMU board pack (§11, §12 Phases B, D, E remain a plan), per-`Space` pools (the ESP32-S3 `alloc_region` still ignores its space operand), a timer-IRQ clock (the board reads the 16 MHz system timer by polling), Fifi on OS-free targets (done 2026-11-07 on ESP32-S3, commit d036d03b43: FFI on the board in the actor's stack chain, `rt_ffi.S` call block, a C fault mapped to `:foreign_fault`, 30 FFI trials pass on the board; STM32 has `rt_ffi.S` too; updated 2026-11-14), the wide emitter diagnostic channel (the narrow channel is `sir_target_verify`; the ESP32-S3 refusals for foreign calls, file io, frame size and an unsupported width are still `.error` lines). The rows of §4 below describe the starting inventory; the status paragraph and the port status document win where they differ.
 
 **Audience:** someone who already knows Silica’s region/`Space`/`sequence` model and needs a single list of what a raw-metal image must provide, what the current compiler already does, and what still has to be added.
 
@@ -88,7 +88,7 @@ Raw-metal *applications* need device MMIO. Raw-metal *runtimes* also need privil
 | Privileged CPU regs | — | Runtime-only access at EL1 (or ESP32 equivalent); not app MMIO |
 | Actors | Hosted runtime | ESP32-S3_raw: done (`rt_actors.S`, per-core cooperative schedulers on both cores, [esp32s3_xtensa_port.md](ports/esp32s3_xtensa_port.md) §8). Other targets: [IPC_Bare](IPC_Bare.md) scheduling, no Darwin threads |
 | Fault notes | macOS FFI crash note | Per-board fault/IRQ document |
-| Fatal fault / runtime abort reports (spec §15.4.5.5) | `sigaction` + `sigaltstack` handler, `silica_rt_print_fault_site` (status 70), `silica_rt_abort_with` (status 71), on stderr | Exception vectors and stack-guard data breakpoints into the same report line, written as console output before the exit marker with status 70 / 71; see [runtime_failure_reporting.md](runtime_failure_reporting.md) |
+| Fatal fault / runtime abort reports (spec §15.4.5.5) | `sigaction` + `sigaltstack` handler, `silica_rt_print_fault_site` (status 70), `silica_rt_abort_with` (status 71), on stderr | (Status 2026-11-14: ESP32-S3 and STM32 `rt_vectors.S` deliver fatal fault 70 and abort 71 reports as console output; no per-board fault/IRQ document and no AArch64 vectors yet; stack-guard breakpoints not verified.) Exception vectors and stack-guard data breakpoints into the same report line, written as console output before the exit marker with status 70 / 71; see [runtime_failure_reporting.md](runtime_failure_reporting.md) |
 
 A port is **not complete** if only the MMIO prims land, or only the object format lands.
 
@@ -209,6 +209,8 @@ Normative rules, registries, `device_*` vs `dangerous_*`, and the boot/panic/IRQ
 
 ### 9.1 Fifi on OS-free targets (normative)
 
+*Status (2026-11-14): implemented on ESP32-S3 (commit d036d03b43, 2026-11-07, 30 FFI trials pass on the board) and carried by `rt_ffi.S` on STM32; no bare-metal AArch64 path exists yet.*
+
 Fifi is optional for a port. A port that provides it follows these rules.
 
 1. **Archives are built against the board pack, not an OS C library.** A wrapper's `lib<name>.a` is compiled for the
@@ -285,17 +287,25 @@ Wire `alloc_region(Space)` to a real allocator on one QEMU image. `device` pool 
 
 Device descriptions, `map_device`, and 32-bit `peek` / `poke`, with the hosted emitters' rejection (§5.5). First QEMU trial may use the **reset-stub** UART exception. Application poke waits for Phase F.
 
+*Status (2026-11-14), partly done: ESP32-S3_raw has `map_device` and 32-bit `peek`/`poke` (`prims_device.silica`). Still open: the bare-metal AArch64/QEMU pack.*
+
 ### Phase D — Console and panic
 
 Early panic UART stays in the stub. After Phase F, hosted `device_io` print on that target is replaced by casts to a UART device worker.
+
+*Status (2026-11-14), partly done: ESP32-S3 fault/abort reports (status 70/71) exist as console output. Still open: AArch64 early-panic UART stub; the UART worker needs Phase F.*
 
 ### Phase E — Image
 
 `aarch64-none-elf` (or direct ELF writer). Reset stub. CI: QEMU boot + UART output golden.
 
+*Status (2026-11-14), partly done: the ESP32-S3 image path exists (`board/tools/build_image.sh`, esptool elf2image). Still open: `aarch64-none-elf`/direct ELF and QEMU UART golden CI.*
+
 ### Phase F — Time and device workers
 
 Tick + `spawn_device` UART (or timer) worker. Clients `cast_device`. Privilege/sysreg stays in the stub. Checker markers from [silica_device_actor_specification.md](silica_device_actor_specification.md) §11 land with this phase or immediately after.
+
+*Status (2026-11-14), partly done: `spawn_device`/`cast_device` delivered with E2216-E2233 rules and ESP32-S3 board apps silica_16..22. Still open: timer-IRQ clock (polling today) and any AArch64 device worker.*
 
 ### Phase G — Second chip
 

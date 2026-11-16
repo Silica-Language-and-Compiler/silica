@@ -393,7 +393,7 @@ Alternatively land skeletons in both trees in the same change set if churn contr
 
 ### Phase 5 — Trials and docs
 
-- Add trials: iface written; dependent type-checks with dep AST omitted; stale iface rejected; conflict `E4001` still fires from iface keys.  
+- *(Partly done, 2026-11-14: `trials/compiler_addition/iface_after_emit_lib/use` and `trials/modules_addition/generic_modules_addition` leave `.iface` for every unit. Still open: a trial named for stale iface rejected, dependent type-checked with dependency AST omitted, and `E4001` from iface keys.)* Add trials: iface written; dependent type-checks with dep AST omitted; stale iface rejected; conflict `E4001` still fires from iface keys.  
 - Update design_documents README index if the tree maintains one.  
 - Cross-link from §28.1.2 notes if appropriate (informative, not a language change).
 

@@ -4,7 +4,7 @@ Design: `chunk15_stack_memory_design.md` §6 (§6.1 the pass and what it compute
 §11.1 row 6; `region_memory_safety_design.md` §4, §6, §10, §11 (decision 16: lifetimes and isolation
 only, no ownership state); `Phase3_notes.md` §10.8.4 (the parser skips an unknown top-level token, so
 `strict …;` needs a declaration tag). Stage 6a is the pass skeleton and the analysis in report mode;
-6b onwards add the diagnostics (E2301, E2302, E2300 narrowed, E2242). Nothing here was built or run
+6b onwards add the diagnostics (E2301, E2302, E2300 narrowed, E2242). **Status (2026-11-14 check):** E2301 done (6b gate: phase 6 landed `bf2f8c4630` 2026-11-01, E2301 emitted at `region_checker_core.silica:301`, trial `error_enforcement_addition/region_use_after_move_trial`); E2302 and E2300 narrowed done (`55040488fc` 2026-11-01; `error_codes.md` lines 147-149); E2242 still open (named only in a comment at `region_checker_core.silica:27`, not in `error_codes.md`). Nothing here was built or run
 (Haiku builds). The Linux twins, the ESP32-S3 tree and src_selfhost are untouched.
 
 ## 1. Stage 6a: the pass, the analysis, `strict region_check;` (written 2026-10-31, not built)
@@ -362,7 +362,7 @@ allocation.
   allocating frame; once that frame pops the cell is gone. With the malloc block the cell outlived
   the frame. §3.8's own text (line 314) accepts this for the witness case and leaves the escape to
   the lifetime checker (E2300/E2302, §6.3-§6.4, phase 6); the checker does not yet distinguish
-  spaces. A returned `region(L, atomic)` handle is not a frame-free scalar
+  spaces (still open, 2026-11-14 check). A returned `region(L, atomic)` handle is not a frame-free scalar
   (`reg_conventions@is_frame_free_scalar_type`), so the call site adopts the callee's frame and the
   block survives a return in the dynamic part, as any other frame node does.
 * `L_region_grow` still mallocs its extension blocks (`ADD X0, X20, #32; BL _silica_rt_raw_alloc`)
@@ -370,10 +370,12 @@ allocation.
   caller). That was already so before this change (a region block was never freed since the
   region-destroy machinery went in phase 2 S7); a region that overflows 4096 bytes of cells still
   leaks its extensions. The design (§3.2, line 224) deletes `L_region_grow` with the mailbox copier's
-  last use; not done here.
+  last use; not done here. **Update (2026-11-14 check):** partly done: on the hosted emitters `L_region_grow` is no longer emitted (`prims_memory.silica:150`, "gone, Lee 2026-11-01"; only comments remain); `ESP32-S3_raw` `prims_memory.silica:135,544` still refer to it.
 * `alloc_region_on_numa_node` has no Mac emitter arm (front end only); not touched.
 
 ### 4.6 Not verified (Haiku: one builder at a time, build-slot lock; no trial, golden or `.scout` edits)
+
+*Done (2026-11-14 check): the 6b gate result is recorded by the landing of phase 6 (`bf2f8c4630`, 2026-11-01), design §11.1 row 6 "done", and the E2301 error trial `region_use_after_move_trial`; the frame-area move of `alloc_region` is in the design as §3.8.*
 
 Nothing was built or run. To check, in this order:
 

@@ -1,7 +1,7 @@
 # Makefile for the transport trials (transport_serialization_design.md): wire protocols, the
 # transport builtins, the carrier properties and framing. The built-in modules the trials use
 # (STDLIB_MODS) are linked into .trial_stdlib/ as Supervisor is. The TCP listener trial, which
-# links the socket wrappers, is the sub-trial app_transport_tcp_listener (SUB_TRIALS); app_transport_tcp_listen_any app_transport_tcp_link_rules
+# links the socket wrappers, is the sub-trial app_transport_tcp_listener (SUB_TRIALS); app_transport_tcp_listen_any app_transport_tcp_link_rules app_transport_udp_link_rules
 # is the same with the "listen:any:<port>" wildcard listener.
 # Uses silica-compiler (Phase 2) to generate assembly, then assembles and links
 # No Rust code - only silica-compiler + assembler + linker
@@ -35,7 +35,7 @@ MSG_PREFIX := $(TRIAL_DIR)/
 # The language's built-in modules (compiler/stdlib) the flat trials here link.
 STDLIB_MODS := wire_etf wireframe Carrier Link storelog
 # Sub-trials with a Makefile of their own, run after the flat trials and counted with them.
-SUB_TRIALS := app_transport_tcp_listener app_transport_tcp_loopback_link app_transport_tcp_listen_any app_transport_store_memory app_transport_store_backing app_transport_tcp_link_rules
+SUB_TRIALS := app_transport_tcp_listener app_transport_tcp_loopback_link app_transport_tcp_listen_any app_transport_store_memory app_transport_store_backing app_transport_tcp_link_rules app_transport_udp_link_rules
 
 
 .DEFAULT_GOAL := all

@@ -84,6 +84,40 @@ static int copy_host(const uint8_t *ptr, uint64_t len, char *out, size_t cap) {
     return 1;
 }
 
+/* The one IPv4 text parser of this file (Lee, 2026-11-12): exactly four decimal parts separated by dots, each 0 to
+   255, digits only, no leading zero except a bare "0". Everything else is refused: "010.0.0.1", "1.02.3.4",
+   "1.2.3.", "1.2.3.4.5", empty parts, signs, spaces, hex and octal forms, and a text with a NUL inside. It is the
+   same on every host, where inet_aton and inet_pton are not (macOS and glibc differ on leading zeros), so no
+   libc parser is used. The address is answered in host order. */
+static int ipv4_strict(const uint8_t *s, uint64_t n, uint32_t *out) {
+    uint32_t a = 0;
+    uint64_t i = 0;
+    for (int part = 0; part < 4; part++) {
+        uint32_t v = 0;
+        uint64_t start = i;
+        if (part > 0) {
+            if (i >= n || s[i] != '.') return 0;
+            i++;
+            start = i;
+        }
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            if (i - start == 3) return 0;
+            v = v * 10 + (uint32_t)(s[i] - '0');
+            i++;
+        }
+        if (i == start || v > 255) return 0;
+        if (s[start] == '0' && i - start > 1) return 0;
+        a = (a << 8) | v;
+    }
+    if (i != n) return 0;
+    *out = a;
+    return 1;
+}
+
+static int ipv4_strict_text(const char *s, uint32_t *out) {
+    return ipv4_strict((const uint8_t *)s, (uint64_t)strlen(s), out);
+}
+
 /* A write to a connection whose peer has gone must fail with EPIPE, which the carrier reports to its
    owner, and must never raise SIGPIPE, which would end the whole program. Each platform's own
    per-socket mechanism is used, so the program's signal dispositions are left alone: macOS marks the
@@ -136,14 +170,14 @@ silica_sockets_tagged silica_sockets_set_host(const uint8_t *host_ptr, uint64_t 
 
 /* port: set_args a */
 silica_sockets_tagged silica_sockets_tcp_connect(const uint8_t *host_ptr, uint64_t host_len) {
-    char host[256];
     struct sockaddr_in addr;
+    uint32_t to;
     int64_t port = silica_sockets_arg_a;
-    if (!copy_host(host_ptr, host_len, host, sizeof host)) { errno = EINVAL; return err(); }
+    if (!ipv4_strict(host_ptr, host_len, &to)) { errno = EINVAL; return err(); }
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { errno = EINVAL; return err(); }
+    addr.sin_addr.s_addr = htonl(to);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return err();
     int one = 1;
@@ -183,31 +217,30 @@ silica_sockets_tagged silica_sockets_tcp_listen_any(int64_t port) {
 
 /* Binds one given IPv4 address (dotted quad, "10.0.0.5"): the carrier address "listen:<ipv4>:<port>", and the
    address of the interface a named link selected (silica_sockets_link_select). A text that is not a dotted quad is
-   EINVAL; the carrier checks it first with silica_sockets_parse_ipv4 and refuses it with its own reason.
+   EINVAL (the strict parser, ipv4_strict); the carrier checks it first with silica_sockets_parse_ipv4 and refuses it
+   with its own reason.
    port: set_args a */
 silica_sockets_tagged silica_sockets_tcp_listen_addr(const uint8_t *host_ptr, uint64_t host_len) {
-    char host[64];
-    struct in_addr a;
+    uint32_t a;
     int64_t port = silica_sockets_arg_a;
-    if (!copy_host(host_ptr, host_len, host, sizeof host)) { errno = EINVAL; return err(); }
-    if (inet_pton(AF_INET, host, &a) != 1) { errno = EINVAL; return err(); }
-    return tcp_listen_on(port, ntohl(a.s_addr));
+    if (!ipv4_strict(host_ptr, host_len, &a)) { errno = EINVAL; return err(); }
+    return tcp_listen_on(port, a);
 }
 
 /* Connects from the given local IPv4 address (host order): the source bind of a carrier on a named link, so
    the connection leaves by that interface's address (links design §3.2, decision 10).
    port: set_args a, local address: set_args b */
 silica_sockets_tagged silica_sockets_tcp_connect_from(const uint8_t *host_ptr, uint64_t host_len) {
-    char host[256];
     struct sockaddr_in addr;
     struct sockaddr_in local;
+    uint32_t to;
     int64_t port = silica_sockets_arg_a;
     uint32_t from = (uint32_t)silica_sockets_arg_b;
-    if (!copy_host(host_ptr, host_len, host, sizeof host)) { errno = EINVAL; return err(); }
+    if (!ipv4_strict(host_ptr, host_len, &to)) { errno = EINVAL; return err(); }
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) { errno = EINVAL; return err(); }
+    addr.sin_addr.s_addr = htonl(to);
     memset(&local, 0, sizeof local);
     local.sin_family = AF_INET;
     local.sin_port = 0;
@@ -222,14 +255,13 @@ silica_sockets_tagged silica_sockets_tcp_connect_from(const uint8_t *host_ptr, u
     return ok(fd);
 }
 
-/* A dotted-quad IPv4 text as its address in host order (value), or EINVAL: the check of "listen:<ipv4>:<port>"
-   before anything is bound. */
+/* A dotted-quad IPv4 text as its address in host order (value), or EINVAL (ipv4_strict): the check a carrier makes
+   of every address text before anything is bound or dialled ("listen:<ipv4>:<port>", a dial host, a UDP peer and
+   a UDP local address), so a malformed one ends the carrier (:explicit, :bad_address). */
 silica_sockets_tagged silica_sockets_parse_ipv4(const uint8_t *host_ptr, uint64_t host_len) {
-    char host[64];
-    struct in_addr a;
-    if (!copy_host(host_ptr, host_len, host, sizeof host)) { errno = EINVAL; return err(); }
-    if (inet_pton(AF_INET, host, &a) != 1) { errno = EINVAL; return err(); }
-    return ok((int64_t)ntohl(a.s_addr));
+    uint32_t a;
+    if (!ipv4_strict(host_ptr, host_len, &a)) { errno = EINVAL; return err(); }
+    return ok((int64_t)a);
 }
 
 /* ---- links: the interface a carrier binds to (transport_links_design.md §3.2) ------------------- */
@@ -385,16 +417,25 @@ silica_sockets_tagged silica_sockets_tcp_accept(int64_t fd, int64_t timeout_ms) 
 
 /* ---- UDP ----------------------------------------------------------------------------------- */
 
-silica_sockets_tagged silica_sockets_udp_bind(int64_t port) {
+/* Binds a datagram socket to one local IPv4 address (host order) and port: 0x7f000001 (127.0.0.1) for the
+   default endpoint, 0 (INADDR_ANY) for "any:<port>", a literal address, or the address of the interface a named
+   link selected (silica_sockets_link_select). Every datagram the socket sends then leaves from that address, so
+   a carrier on a named link needs no separate source bind (links design §3.2, hosted Ethernet plan E2). */
+silica_sockets_tagged silica_sockets_udp_bind_on(int64_t port, int64_t host_order_addr) {
     struct sockaddr_in addr;
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return err();
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_addr.s_addr = htonl((uint32_t)host_order_addr);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { int e = errno; close(fd); errno = e; return err(); }
     return ok(fd);
+}
+
+/* Binds 127.0.0.1:port only. */
+silica_sockets_tagged silica_sockets_udp_bind(int64_t port) {
+    return silica_sockets_udp_bind_on(port, (int64_t)INADDR_LOOPBACK);
 }
 
 /* fd: set_args a, port: set_args b, host: set_host */
@@ -405,7 +446,9 @@ silica_sockets_tagged silica_sockets_udp_send(const uint8_t *data_ptr, uint64_t 
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, silica_sockets_host, &addr.sin_addr) != 1) { errno = EINVAL; return err(); }
+    uint32_t to;
+    if (!ipv4_strict_text(silica_sockets_host, &to)) { errno = EINVAL; return err(); }
+    addr.sin_addr.s_addr = htonl(to);
     ssize_t n = sendto((int)fd, data_ptr, (size_t)data_len, 0, (struct sockaddr *)&addr, sizeof addr);
     if (n < 0) return err();
     return ok((int64_t)n);

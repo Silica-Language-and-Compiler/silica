@@ -349,7 +349,7 @@ Where it is applied:
   `(:explicit, :shutdown)` (reason tag 4). A child whose supervisor is already dead does not print the root-actor note.
   The `shutdown` time limit is not enforced on any target, because nothing preempts a running message.
 - `remove_actor(self())` and `kill_abnormal(self())` fail the caller with `:language_error` at run time (spec §15.1.2.3);
-  the compile-time rejection is not implemented.
+  the compile-time rejection is now implemented (2026-11-14 check): E2241 `TerminateSelfByRemoveOrKill` (`error_codes.md:146`, checked in `type_checker_expressions_actor_spawn.silica`, commit `146f34bf19` 2026-10-17), with trials `actors_addition/remove_actor_self_language_error` and `kill_abnormal_self_language_error`.
 - A `call` or `cast` whose target's calling convention does not match (a cast to a call-only actor, a call to a
   cast-only one) is rejected at compile time wherever the compiler can follow the reference (E2237, E2238; spec
   §16.2.6.4). Where it cannot, the runtime records the convention in the control block at spawn (hosted ACB

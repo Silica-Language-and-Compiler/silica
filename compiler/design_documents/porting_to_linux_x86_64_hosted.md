@@ -377,14 +377,15 @@ the same fault in `os_unfair_lock_lock`.
 Two Linux-only harness defects the run exposed (fixed in the Mac tree by the session coordinator, not part of this
 backend): the `compare_scout_*.sh` scripts need bash (`set -o pipefail`) but the makefiles start them with
 `$(SHELL)`, which is dash on Debian-family hosts; and `error_enforcement_addition`'s `silica.config` recipe
-expanded ~11k file names into one shell argument, over Linux's 128 KB `MAX_ARG_STRLEN`. A third, still open:
-`src/Makefile`'s `fixpoint` target prints the binary sizes with BSD `stat -f %z` and no GNU fallback, so
-that one line reads as a filesystem dump on Linux (the verdict itself is a `cmp` and is unaffected).
+expanded ~11k file names into one shell argument, over Linux's 128 KB `MAX_ARG_STRLEN`. A third, fixed (verified 2026-11-14):
+`src/Makefile`'s `fixpoint` target printed the binary sizes with BSD `stat -f %z` and no GNU fallback, so
+that one line read as a filesystem dump on Linux (the verdict itself is a `cmp` and was unaffected). The target now uses
+`stat -c %s ... || stat -f %z` (`compiler/src/Makefile` line ~629).
 
 ### Phase 6 — Droplets and project builds
 
 - `deploy/linux/install_silica.sh`: `apt install build-essential clang make`, clone or pull, run the symlink updater, compile a hello project with `project_makefiles/Makefile`. Idempotent; `sudo` only for apt.
-- `project_makefiles/Makefile`: include `project_makefiles/platform/<host emit target>.mk` (assembler, linker, `LDFLAGS_STACK` empty on Linux) instead of its inline macOS values; `silica_link.sh` returns ELF archives.
+- *(Partly done, 2026-11-14: `project_makefiles/platform/platforms.mk` exists (commit b575c4f6fa); not verified: per-host emit-target `.mk` fragments complete, `silica_link.sh` returning ELF archives.)* `project_makefiles/Makefile`: include `project_makefiles/platform/<host emit target>.mk` (assembler, linker, `LDFLAGS_STACK` empty on Linux) instead of its inline macOS values; `silica_link.sh` returns ELF archives.
 - Stdlib outputs per target: emit to `stdlib/**/build/<target>/`, `trials/stdlib_prereq.mk` reads from there, and the committed Darwin files at the stdlib root stop being overwritten.
 - Docs: `design_documents/README.md`, `tutorials_and_howtos/ffi_wrappers_and_makefiles.md` (SysV notes), the top-level `README.md` platform list; mark this document Implemented.
 

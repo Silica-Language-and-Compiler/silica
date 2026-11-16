@@ -129,19 +129,19 @@ Apple Silicon (`emitter/apple_silicon_mac/`), mirrored in `emitter/linux_aarch64
 ## 3. Open items (what remains of phase 2)
 
 1. **linux_aarch64**: the full integrate on pix (the gate suites ran on the pre-removal build; the
-   final build passed recursive_function and records).
+   final build passed recursive_function and records). **Done (2026-11-14 check):** superseded by chunk 15 phase 8; pix green, fixed point `df3357ce38` 2026-11-04, goldens refreshed `81c1144bb6` 2026-11-11.
 2. **linux_x86_64**: the full integrate on nix (only the gate suites ran), and the memory_region
-   suite once its three `ref_in_region` trials are rewritten.
+   suite once its three `ref_in_region` trials are rewritten. **Done (2026-11-14 check):** phase 8 on nix 2026-11-04, full integrate 35,073 pass / 0 fail; hosted green `81c1144bb6` 2026-11-11; the memory_region trials were rewritten (no `ref_in_region`).
 3. **S7 removals still open.**
    * The promote sites are done (S8, §6). `prims_actors` `heap_promote_stack_aggregate_x0` /
      `heap_promote_reply_x0` / `spawn_promote_init_x11` (actor state, reply and spawn shells) stay on
      the heap: phases 3/4.
    * `emitter_core@record_make_link_promotes_field` still gives the parameters of a body with a nested
      aggregate record field callee-saved shadows, for a promote BL that no longer exists. It is now
-     conservative only (extra shadows); remove it when a trial shows it can go.
+     conservative only (extra shadows); remove it when a trial shows it can go. **Still open (2026-11-14 check):** the function is still at `emitter_core` line ~766.
    * The scope-release code (`arena_scope` / `region_scope`, `L_sc_arena_mark`, region mark/release)
-     is unreachable and still emitted text: remove it with the arena_ok / region_ok parameters.
-   * `L_region_grow` stays for atomic/device regions and the message copier.
+     is unreachable and still emitted text: remove it with the arena_ok / region_ok parameters. **Done (2026-11-14 check):** `arena_scope` and `L_sc_arena_mark` are gone from `emitter_core`.
+   * `L_region_grow` stays for atomic/device regions and the message copier. **Update (2026-11-14 check):** on the hosted emitters it is no longer emitted (`prims_memory.silica:150`, "gone, Lee 2026-11-01"); the ESP32-S3_raw tree still refers to it.
    * The implicit heap routines stay (runtime lists/strings, state, messages) as the brief says.
 4. **Known hazards, not covered by trials yet.**
    * `write_ref` of a frame-young value into an older cell
@@ -151,7 +151,7 @@ Apple Silicon (`emitter/apple_silicon_mac/`), mirrored in `emitter/linux_aarch64
      expectation (7, 0) contradicts that rule; under the design it becomes an error trial (expect
      E2302) once phase 6's checker lands. Making the evacuator scan every older cell would mean a
      remembered set (a write barrier on every pointer store into a ref cell), which is not in the
-     design.
+     design. **Update (2026-11-14 check):** E2302 is implemented (`region_checker_core.silica:298`, `55040488fc` 2026-11-01), but the trial is still a positive hazard trial (`.scout` 7,0) and no E2302 error trial exists yet; still open: add it.
    * Heap-mode evacuation of a send/call payload rewrites, in place, the words of an *old* aggregate
      that reaches young nodes (S6c): the sender's old shell then names the heap copies. Equal for
      immutable values, but a mutable ref cell reached that way is copied, so the sender's later writes
@@ -938,6 +938,8 @@ Lw_copy_done:
 ```
 
 ## Trial agent requests (written by the trial-sources agent, 2026-10-26; for a Haiku agent)
+
+**Done (2026-11-14 check):** R1 to R3 trials all exist with `.scout` (`alloc_ref_regionless_*`, `frame_adopt_chain_*`, `behaviour_reply_frame_built_string`, `wbt_set_insert_three_validate`); R4 became `region_hazards_open_errors_addition/e2313_*.golden_fail`; R5 trials exist; R6 is marked superseded below. Later phase gates ran them.
 
 Nothing below has been run: the sources were written by hand and are unverified. `$P2` is the phase 2 Mac
 compiler the main session names (not the phase 1 `binaries/silica-compiler`, which still accepts

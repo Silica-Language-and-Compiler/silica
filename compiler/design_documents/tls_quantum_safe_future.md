@@ -1,5 +1,7 @@
 # First-Class Quantum-Safe TLS
 
+> **Out of scope for the Silica language (2026-11-14, Lee).** Cryptography is not part of the Silica language; it is planned as part of Project BEES (a separate repository). Nothing in this document is scheduled in this repository. It is kept for the record.
+
 **Status:** Future development. Not implemented (checked 2026-10-16: no `tls_*` types, intrinsics or runtime support exist in the compiler or runtimes). Specification §20.4 now states that networking is not part of the language and is reached through Fifi; the `net.tcp`, `tcp_connection` and `network_io` spellings below name a foreign socket wrapper's operations and effect, not language built-ins. Not normative for the current compiler. When this work starts, [silica-specification.md](silica-specification.md) §20.4, [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md), and the supervisor plan gain a TLS section; this document stays the design authority until then.
 
 **TLS is not planned as a built-in at first.** Until the intrinsics in this document exist, programs that need TLS
