@@ -46,6 +46,14 @@ void silica_rt_start_app_cpu(void);
 #define R1_CPU_MHZ 80
 #endif
 
+// -DR1_BOTH_CORES: the runtime is built for both cores and starts core 1 itself; actors run on both.
+// The libraries' tasks have their turn on core 1 at every pass of that core's scheduler, idle or
+// between two dispatches (silica_rt_board_pass, rt_actors.S), and whenever an actor on core 1 waits
+// inside a foreign call; the radios' handlers interrupt core 1 on a stack of their own (hci_shim.c).
+// A dispatch on core 1 that runs long does not keep the tasks waiting: a radio's handler, or a 2 ms
+// tick, gives them a turn under it (hci_shim.c preempt, spike_tick_start).
+void spike_yield(void);
+
 void silica_rt_board_prepare(void)
 {
     if (spike_flash_map() != 0) {
@@ -55,8 +63,31 @@ void silica_rt_board_prepare(void)
     rtc_clk_config_t clk = RTC_CLK_CONFIG_DEFAULT();
     clk.cpu_freq_mhz = R1_CPU_MHZ;
     rtc_clk_init(clk);
+#ifndef R1_BOTH_CORES
     silica_rt_start_app_cpu();
+#endif
 }
+
+#ifdef R1_BOTH_CORES
+void spike_tick_start(void);
+extern volatile int spike_in_pass;
+
+void silica_rt_board_pass(int core)
+{
+    static int ticking;
+    if (core == 1) {
+        if (!ticking) {
+            ticking = 1;
+#ifndef R1_NO_PREEMPT
+            spike_tick_start();
+#endif
+        }
+        spike_in_pass = 1;
+        spike_yield();
+        spike_in_pass = 0;
+    }
+}
+#else
 
 static uint32_t core1_stack[2048] __attribute__((aligned(16)));
 
@@ -72,3 +103,4 @@ void silica_rt_board_core1(void)
     static uint32_t left[2];
     spike_co_start(left, &core1_stack[2048 - 16], core1_loop, NULL);
 }
+#endif

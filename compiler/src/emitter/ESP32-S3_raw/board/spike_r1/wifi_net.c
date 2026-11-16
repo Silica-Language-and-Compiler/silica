@@ -105,6 +105,13 @@ int spike_net_start(void)
     return netifapi_dhcp_start(&station) == ERR_OK ? 0 : 3;
 }
 
+// DHCP's state for the station (lwIP prot/dhcp.h dhcp_state_enum_t: 8 checking, 10 bound), for a report
+int spike_net_dhcp_state(void)
+{
+    struct dhcp *d = netif_dhcp_data(&station);
+    return d ? d->state : -1;
+}
+
 // in network byte order
 uint32_t spike_net_address(void)
 {

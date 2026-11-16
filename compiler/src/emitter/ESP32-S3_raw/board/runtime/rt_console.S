@@ -100,6 +100,7 @@
 // lock while wanting the console, so the two locks cannot form a cycle.
     .section .bss.silica_rt_console_lock, "aw", @nobits
     .align  4
+    .global silica_rt_console_lock            // read by foreign code that preempts an actor (hci_shim.c)
 silica_rt_console_lock:
     .space  4
 silica_rt_console_depth:

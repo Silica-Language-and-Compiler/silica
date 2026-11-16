@@ -91,6 +91,19 @@ static silica_sockets_tagged err(void) { silica_sockets_tagged r = {1, 0, (int64
 static silica_sockets_tagged timeout(void) { silica_sockets_tagged r = {2, 0, 0}; return r; }
 static silica_sockets_tagged closed(void) { silica_sockets_tagged r = {3, 0, 0}; return r; }
 static silica_sockets_tagged fail(int code) { errno = code; return err(); }
+#ifdef SOCKETS_STATION_REPORT
+static void say_errno(const char *where, int e) {
+    extern void spike_put_dec(uint32_t n);
+    extern void silica_rt_puts(const char *s);
+    silica_rt_puts("sockets: ");
+    silica_rt_puts(where);
+    silica_rt_puts(" errno ");
+    spike_put_dec((uint32_t)e);
+    silica_rt_puts("\n");
+}
+#else
+#define say_errno(where, e) ((void)0)
+#endif
 
 static int copy_host(const uint8_t *ptr, uint64_t len, char *out, size_t cap) {
     if (len == 0 || len >= cap) return 0;
@@ -155,6 +168,16 @@ static void station_task(void *unused) {
                 station_joined = 1;
             } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
                 station_joined = 0;
+#ifdef SOCKETS_STATION_REPORT
+                {
+                    /* why the access point was lost: wifi_event_sta_disconnected_t's reason (esp_wifi_types.h wifi_err_reason_t) */
+                    extern void spike_put_dec(uint32_t n);
+                    extern void silica_rt_puts(const char *s);
+                    silica_rt_puts("station: lost the access point, reason ");
+                    spike_put_dec(((wifi_event_sta_disconnected_t *)data)->reason);
+                    silica_rt_puts("\n");
+                }
+#endif
                 esp_wifi_connect();
             }
         }
@@ -172,6 +195,10 @@ static void station_task(void *unused) {
 #ifdef SOCKETS_HEAP_SUMMARY
             extern void spike_heap_report(void);
             spike_heap_report();
+#endif
+#ifdef SOCKETS_PREEMPT_REPORT
+            extern void spike_preempt_report(void);
+            spike_preempt_report();
 #endif
             if (passes % 1500 == 0) {
                 extern void spike_stack_report(void);
@@ -228,6 +255,26 @@ static uint32_t station_address(void) {
 silica_sockets_tagged silica_sockets_link_select(const uint8_t *name_ptr, uint64_t name_len) {
     (void)name_ptr;
     (void)name_len;
+#ifdef SOCKETS_STATION_REPORT
+    {
+        extern void spike_put_dec(uint32_t n);
+        extern void silica_rt_puts(const char *s);
+        if (arg_a != LINK_WIFI || arg_b != 0 || station_address() == 0) {
+            silica_rt_puts("station: link_select refused: args ");
+            spike_put_dec((uint32_t)arg_a);
+            silica_rt_puts(" ");
+            spike_put_dec((uint32_t)arg_b);
+            silica_rt_puts(", joined ");
+            spike_put_dec((uint32_t)station_joined);
+            silica_rt_puts(", address ");
+            spike_put_dec(spike_net_address() != 0);
+            silica_rt_puts(", dhcp state ");
+            extern int spike_net_dhcp_state(void);
+            spike_put_dec((uint32_t)spike_net_dhcp_state());
+            silica_rt_puts("\n");
+        }
+    }
+#endif
     if (arg_a != LINK_WIFI || arg_b != 0) return fail(ENXIO);
     if (station_start() != 0) return fail(ENXIO);
     uint32_t a = station_address();
@@ -284,13 +331,13 @@ static silica_sockets_tagged connect_to(const uint8_t *host_ptr, uint64_t host_l
     addr.sin_addr.s_addr = lwip_htonl(to);
     spike_net_core();   /* a peer on 127.0.0.1 needs no station */
     int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return err();
+    if (fd < 0) { say_errno("socket", errno); return err(); }
     no_delay(fd);
     if (from != 0) {
         memset(&local, 0, sizeof local);
         local.sin_family = AF_INET;
         local.sin_addr.s_addr = lwip_htonl(from);
-        if (lwip_bind(fd, (struct sockaddr *)&local, sizeof local) < 0) { int e = errno; lwip_close(fd); return fail(e); }
+        if (lwip_bind(fd, (struct sockaddr *)&local, sizeof local) < 0) { int e = errno; say_errno("bind", e); lwip_close(fd); return fail(e); }
     }
     /* made without blocking, so that a peer that does not answer costs CONNECT_MS and no more */
     lwip_fcntl(fd, F_SETFL, lwip_fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
@@ -303,7 +350,7 @@ static silica_sockets_tagged connect_to(const uint8_t *host_ptr, uint64_t host_l
                 lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &size);
             }
         }
-        if (e != 0) { lwip_close(fd); return fail(e); }
+        if (e != 0) { say_errno("connect", e); lwip_close(fd); return fail(e); }
     }
     return ok(fd);
 }

@@ -1903,6 +1903,52 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     two trials above would then run); the trials are not in the board's trial harness, which builds
     images without the radio libraries.
 
+- **Stage 12, part 14, 2026-11-16, tried, not adopted: actors on both cores beside the radios.**
+  `run_r1_both.sh --both-cores` builds the runtime for two cores (`-DNCORES_RUN=2`,
+  `-DR1_BOTH_CORES`) and puts the demo's busy actor on core 1. Bluetooth is whole in every run;
+  Wi-Fi is not: TCP connections time out while a Bluetooth link is up. Route R1 stays as it was:
+  actors on core 0, core 1 the radios' alone, which this part's changes leave untouched.
+  - **What was built.**
+    - The radios' handlers on a stack of their own. A level-3 handler ran on whichever stack it
+      interrupted; an actor's is a small chunk. `rt_vectors.S`: when foreign code stores a stack's
+      top in `silica_rt_level3_stack`, the path spills every live window but the interrupted one to
+      its own stack and calls the handler on that stack. With the word 0 the path is as before.
+    - The tasks' turn at every pass of core 1's scheduler: `rt_actors.S` calls a weak
+      `silica_rt_board_pass(core)` at each pass, idle or between two dispatches; `r1_port.c` gives
+      the libraries' tasks one round there. An actor of core 1 that waits inside a foreign call
+      passes control to the tasks as a task would.
+    - The tasks' turn under a handler (`hci_shim.c preempt`). A dispatch may run long (the busy
+      actor's is 200 ms). When a handler has interrupted the program's or the runtime's code on
+      core 1, the tasks have a round before that code goes on, the handler's frame standing for it
+      among the lines of control; the runtime's save area and the interrupt's registers are kept
+      meanwhile. Not inside a foreign call or the scheduler's own pass (library code the tasks are
+      not written to run under), nor while the heap's or the console's lock is held.
+    - A tick for the timers: the processor's second cycle timer, level 3, at the earliest timer's
+      time and every 2 ms at the latest. Without it the station took 18 s to join, with a fixed
+      2 ms tick 6 s, with the timers' times 2 to 3 s, as on one core.
+    - In a handler the shim's allocator keeps to the regions and frees a heap block later: the
+      handler may have interrupted an actor that holds the heap's lock.
+  - **Measured**, 160 MHz, fifteen links on each radio, the busy actor on core 1:
+
+    | Image | Wi-Fi | Bluetooth | Carriers ended `:link_unavailable` |
+    | --- | --- | --- | --- |
+    | Actors on core 0 (as part 12; this part's code in the image) | 15 of 15 | 15 of 15 | 3, before the station has its address |
+    | Actors on both cores | 8 of 15 in 480 s | 15 of 15 | 35 |
+
+    On both cores the station joins and keeps its access point, and DHCP is bound; the carriers
+    that fail are refused by `connect`, errno 116, after its five seconds, each beside a Bluetooth
+    link coming up. One carrier in that run ended `:out_of_memory` (the second core's scheduler and
+    the handlers' 8 KB stack come out of the same RAM).
+  - **What it is taken to mean.** Espressif's libraries are written for a scheduler that runs
+    their tasks and timers at once, above everything else. Beside cooperative actors on the same
+    core they get their turn only where the actor's code allows: not during a foreign call, nor a
+    console line (9 to 14 ms measured). Which of these costs Wi-Fi its share of the radio under
+    coexistence was not found: a count of refused turns (`-DSOCKETS_PREEMPT_REPORT`) cannot tell a
+    foreign call that waits, and so gives the tasks their turns, from one that does not.
+  - Switches left in for the next attempt: `-DR1_NO_PREEMPT`, `-DR1_TICK_US=<n>`,
+    `-DSOCKETS_STATION_REPORT` (why the station lost its access point, why `link_select` or
+    `connect` refused), `-DSOCKETS_PREEMPT_REPORT`.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

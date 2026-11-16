@@ -261,6 +261,15 @@ silica_rt_double_vector:
 // One save area: one core takes these interrupts. The interrupted code must have a valid stack
 // pointer and window state, so runtime code that has neither for a moment (a switch of stacks) is
 // to mask the level around it before an image runs actors beside such a handler.
+//
+// A stack for the handler. Where the interrupted code may be an actor, its stack is a small chunk
+// with no room promised for a foreign handler. The foreign code then stores the top of a stack of
+// its own in silica_rt_level3_stack (16-byte aligned, 0 for none): the handler is called on it. The
+// stack pointer of a windowed frame cannot simply be moved: a caller's registers are spilled to the
+// 16 bytes under its callee's stack pointer, read when the spill happens. So every live window but
+// the interrupted one is spilled first, to the stacks they belong to, where the underflow path
+// finds them afterwards; the interrupted window's own registers, if the handler's calls spill it,
+// go under the handler's frame on the handler's stack and are back before the handler returns.
     .section .text.silica_rt_level3, "ax"
     .literal_position
     .align  4
@@ -299,10 +308,28 @@ silica_rt_level3_interrupt:
     movi    a4, 0x40023           // PS: WOE=1, EXCM=0, UM=1, INTLEVEL=3
     wsr     a4, ps
     rsync
-    movi    a0, silica_rt_level3_handler
+    s32i    a1, a0, 68
+    movi    a4, silica_rt_level3_stack
+    l32i    a4, a4, 0
+    beqz    a4, 2f
+    // every live window above this one to its own stack (rt_actors.S SPILL_ALL_WINDOWS)
+    and     a12, a12, a12
+    rotw    3
+    and     a12, a12, a12
+    rotw    3
+    and     a12, a12, a12
+    rotw    3
+    and     a12, a12, a12
+    rotw    3
+    and     a12, a12, a12
+    rotw    4
+    movi    a4, silica_rt_level3_stack
+    l32i    a1, a4, 0
+2:  movi    a0, silica_rt_level3_handler
     l32i    a0, a0, 0
     callx4  a0
     movi    a0, silica_rt_level3_save
+    l32i    a1, a0, 68
     l32i    a4, a0, 48
     wsr     a4, sar
     l32i    a4, a0, 52
@@ -333,8 +360,12 @@ silica_rt_level3_interrupt:
     .global silica_rt_level3_handler
 silica_rt_level3_handler:
     .space  4
+    .global silica_rt_level3_save            // kept by foreign code that lets its tasks run under a handler
 silica_rt_level3_save:
-    .space  68
+    .space  72
+    .global silica_rt_level3_stack
+silica_rt_level3_stack:
+    .space  4
 
 // a0 = cause code (EXCCAUSE for user exceptions, 1001+ for the other vectors). The faulting
 // context is abandoned: a fresh stack and a single live window are set up, the diagnostic is

@@ -170,6 +170,26 @@ static inline int in_isr(void)
 // the CPU's level-3 lines that take a level from a peripheral
 static const uint8_t lines[MAX_IRQ] = { 23, 27, 23, 27, 23, 27, 23, 27 };
 extern void (*silica_rt_level3_handler)(void);
+#ifdef R1_BOTH_CORES
+extern uint32_t silica_rt_level3_stack;
+extern uint32_t silica_rt_level3_save[18];
+extern volatile uint32_t silica_rt_heap_lock, silica_rt_console_lock;
+static uint32_t handler_stack[2048] __attribute__((aligned(16)));
+static int preempting, no_timers;
+volatile int spike_in_pass;         // the scheduler of the tasks' core is in its pass of the tasks (r1_port.c)
+#define VRG_FFI 148                 // rt_actors.S: 1 while a foreign call runs on this core
+#ifndef R1_CPU_MHZ
+#define R1_CPU_MHZ 80
+#endif
+#ifndef R1_TICK_US
+#define R1_TICK_US 2000
+#endif
+static int ticking;
+uint32_t spike_preempts;
+static int preempt(void);
+static int over_task(void);
+void spike_tick_arm(int soon);
+#endif
 
 static inline uint32_t mask_level3(void)
 {
@@ -241,6 +261,10 @@ int esp_intr_alloc(int source, int flags, void (*handler)(void *), void *arg, vo
     }
 #ifdef SPIKE_INTERRUPT
     silica_rt_level3_handler = dispatch;
+#ifdef R1_BOTH_CORES
+    // actors run on the handlers' core: the handlers have a stack of their own (rt_vectors.S)
+    silica_rt_level3_stack = (uint32_t)&handler_stack[sizeof handler_stack / 4 - 8];
+#endif
     // the Bluetooth core enables the line at its next pass when this is the other core
     lines_to_enable |= 1u << q->line;
     if (on_bt_core()) {
@@ -331,6 +355,13 @@ void spike_poll(void)
     }
     uint32_t pending;
     __asm__ volatile("rsr.interrupt %0" : "=r"(pending));
+#if defined(R1_BOTH_CORES) && !defined(SPIKE_DEBUG)
+    if (pending & (1u << 15)) {
+        // the tick (spike_tick_start): nothing to do here but ask for the next; the tasks' turn is below.
+        // Over a task the timers are not looked at: the tasks run them as they pass control on.
+        spike_tick_arm(over_task() ? 2 : 0);
+    }
+#endif
     for (int i = 0; i < irq_count; i++) {
         if (irqs[i].enabled && (pending & (1u << irqs[i].line))) {
             in_handler = 1;
@@ -346,7 +377,13 @@ void spike_poll(void)
 #endif
         }
     }
+#ifdef R1_BOTH_CORES
+    if (preempt()) {
+        spike_tick_arm(1);      // the tasks could not have their turn here: soon again
+    }
+#endif
 }
+
 
 int xPortInIsrContext(void)
 {
@@ -406,6 +443,101 @@ static struct co *current(void)
 static void timers_run(void);
 void spike_yield(void);
 
+#ifdef R1_BOTH_CORES
+// Actors run on the tasks' core, and a dispatch may run long. A handler has usually made work for a
+// task, so when it interrupted the core's own line of control (the scheduler or an actor, not a task)
+// the tasks have a turn before the interrupted code goes on: this frame, on the handlers' stack,
+// stands for the interrupted code among the lines of control, and control comes back to it when each
+// task has run until it waited.
+//
+// While the tasks run, the handlers interrupt them as ever: the runtime's one save area of the
+// interrupted code's registers, and the three registers of the interrupt itself, are kept here
+// meanwhile, and the handlers' stack is given a top under this frame.
+//
+// Only when the interrupted code is the program's own or the runtime's. Inside a foreign call (this
+// core's VRG_FFI word, rt_ffi.S) or the scheduler's own pass of the tasks (spike_in_pass, r1_port.c)
+// it is in the libraries or this shim, at a place the tasks are not written to run under: a timer's
+// callback half done, a list half changed. Such code gives the tasks their turn itself when it waits.
+//
+// Not when the interrupted code holds the runtime's heap or console lock: a task that then asked for
+// memory or printed would wait for a lock only the interrupted code can give back, or print into the
+// middle of its line. (With both free the interrupted code holds neither; the other core holds one
+// only for a moment.) The timers are
+// left to the tasks' own passes: their callbacks are not to run at the handlers' level.
+static uint32_t refused[4];     // the tasks' turn refused: in the scheduler's pass, a foreign call, the heap's lock, the console's
+static uint64_t refused_since, refused_longest;
+static int refused_longest_why;
+
+void spike_preempt_report(void)
+{
+    silica_rt_puts("shim: turns under a handler ");
+    spike_put_dec(spike_preempts);
+    silica_rt_puts("; refused in the pass ");
+    spike_put_dec(refused[0]);
+    silica_rt_puts(", a foreign call ");
+    spike_put_dec(refused[1]);
+    silica_rt_puts(", the heap's lock ");
+    spike_put_dec(refused[2]);
+    silica_rt_puts(", the console's ");
+    spike_put_dec(refused[3]);
+    silica_rt_puts("; the longest wait ");
+    spike_put_dec((uint32_t)(refused_longest / 16));
+    silica_rt_puts(" us, kind ");
+    spike_put_dec((uint32_t)refused_longest_why);
+    silica_rt_puts("\n");
+    refused_longest = 0;
+}
+
+static int over_task(void)
+{
+    return co_cur != 0 || preempting;
+}
+
+// 1 when the tasks should have had a turn and the interrupted code's place forbade it.
+static int preempt(void)
+{
+#ifdef R1_NO_PREEMPT
+    return 0;
+#endif
+    uint32_t *core_block;
+    __asm__ volatile("rur.threadptr %0" : "=r"(core_block));
+    if (co_cur != 0 || preempting) {
+        return 0;       // a task was interrupted: the tasks are having their turns
+    }
+    int why = spike_in_pass ? 0 : core_block[VRG_FFI / 4] != 0 ? 1 : silica_rt_heap_lock != 0 ? 2 : silica_rt_console_lock != 0 ? 3 : -1;
+    if (why >= 0) {
+        // counted, with the longest time the tasks were kept waiting this way, for spike_preempt_report
+        uint64_t now = spike_ticks();
+        refused[why]++;
+        if (refused_since == 0) {
+            refused_since = now;
+        } else if (now - refused_since > refused_longest) {
+            refused_longest = now - refused_since;
+            refused_longest_why = why;
+        }
+        return 1;
+    }
+    refused_since = 0;
+    uint32_t save[18], epc, eps, exc, top = silica_rt_level3_stack;
+    memcpy(save, silica_rt_level3_save, sizeof save);
+    __asm__ volatile("rsr.epc3 %0" : "=r"(epc));
+    __asm__ volatile("rsr.eps3 %0" : "=r"(eps));
+    __asm__ volatile("rsr.excsave3 %0" : "=r"(exc));
+    silica_rt_level3_stack = ((uint32_t)__builtin_frame_address(0) - 1024) & ~15u;
+    preempting = 1;
+    no_timers = 1;
+    spike_preempts++;
+    spike_yield();
+    preempting = 0;
+    silica_rt_level3_stack = top;
+    __asm__ volatile("wsr.epc3 %0" : : "r"(epc));
+    __asm__ volatile("wsr.eps3 %0" : : "r"(eps));
+    __asm__ volatile("wsr.excsave3 %0\n rsync" : : "r"(exc));
+    memcpy(silica_rt_level3_save, save, sizeof save);
+    return 0;
+}
+#endif
+
 // Where a task starts: the level was masked for the switch that started it.
 static void co_entry(void *arg)
 {
@@ -455,7 +587,14 @@ void spike_yield(void)
         silica_rt_puts("\n");
     }
 #endif
-    timers_run();
+#ifdef R1_BOTH_CORES
+    if (no_timers) {
+        no_timers = 0;      // under a handler (preempt): the tasks' own passes run the timers
+    } else
+#endif
+    {
+        timers_run();
+    }
     int next = co_cur;
     do {
         next = (next + 1) % MAX_CO;
@@ -715,6 +854,7 @@ void silica_rt_free(void *p);
 extern uint8_t _silica_heap_start[], _silica_heap_end[];
 #define ARENA_BYTES ((uint32_t)(_silica_heap_end - _silica_heap_start))
 static uint32_t region_asked;
+static void *late_free;     // heap blocks a handler freed, linked through their first word
 
 static uint32_t *block_base(void *p)       // the runtime's payload address of a block handed out
 {
@@ -745,7 +885,9 @@ void *malloc(size_t n)
     }
     void *p = region_take(n);
     int zeroed = p == NULL;                 // the runtime's blocks come zeroed; a region's must be made so
-    if (p == NULL && arena_given + n + 16 <= SPIKE_LIB_LIMIT_KB * 1024u) {
+    // Not from a handler: it may have interrupted an actor of its own core inside the runtime's heap,
+    // which holds the heap's lock (R1_BOTH_CORES); a handler has the regions only.
+    if (p == NULL && !in_isr() && arena_given + n + 16 <= SPIKE_LIB_LIMIT_KB * 1024u) {
         uint32_t *base = silica_rt_alloc_or_null((uint32_t)n + 8);
         if (base) {
             given(base[-2]);
@@ -787,10 +929,21 @@ void free(void *p)
     struct region *r = region_of(p);
     if (r) {
         region_give(r, p);
+    } else if (in_isr()) {
+        // the heap's lock may be held under this handler: the block waits for a task's next free
+        *(void **)p = late_free;
+        late_free = p;
     } else {
-        uint32_t *base = block_base(p);
-        arena_given -= base[-2];
-        silica_rt_free(base);
+        for (;;) {
+            uint32_t *base = block_base(p);
+            arena_given -= base[-2];
+            silica_rt_free(base);
+            p = late_free;
+            if (p == NULL) {
+                break;
+            }
+            late_free = *(void **)p;
+        }
     }
     unmask(ps);
 }
@@ -1251,6 +1404,9 @@ int esp_timer_start_once(void *handle, uint64_t us)
         t->due = spike_ticks() + us * 16;
         t->period = 0;
         t->active = 1;
+#if defined(R1_BOTH_CORES) && !defined(SPIKE_DEBUG)
+        spike_tick_arm(0);      // an earlier timer than the tick was asked for
+#endif
     }
     unmask(ps);
     return was ? 0x103 : 0;
@@ -1265,6 +1421,9 @@ int esp_timer_start_periodic(void *handle, uint64_t us)
         t->due = spike_ticks() + us * 16;
         t->period = us * 16;
         t->active = 1;
+#if defined(R1_BOTH_CORES) && !defined(SPIKE_DEBUG)
+        spike_tick_arm(0);      // an earlier timer than the tick was asked for
+#endif
     }
     unmask(ps);
     return was ? 0x103 : 0;
@@ -1320,6 +1479,47 @@ static void timers_run(void)
     }
     in_timers = 0;
 }
+
+#if defined(R1_BOTH_CORES) && !defined(SPIKE_DEBUG)
+// The tick of the tasks' core: the processor's second cycle timer, a level-3 interrupt, under which the
+// tasks and the timers have a turn (preempt). The tasks wait on timers as well as on the handlers (a
+// delay, the libraries' timers, lwIP's, the coexistence of the two radios, which is timed to a fraction
+// of a millisecond), and an actor's dispatch on this core may run long. The next tick is asked for at
+// the earliest timer's time, R1_TICK_US at the latest (soon 1: in 100 us; soon 2: R1_TICK_US whatever
+// the timers), 50 us at the earliest. On the
+// tasks' core only: a timer started from the other core is seen at the next tick.
+void spike_tick_arm(int soon)
+{
+    if (!ticking || !on_bt_core()) {
+        return;
+    }
+    uint32_t ps = mask_level3();
+    uint64_t now = spike_ticks(), next = now + (soon ? 100u : (uint32_t)R1_TICK_US) * 16u;
+    for (int i = 0; soon != 2 && i < MAX_TIMERS; i++) {
+        if (timers[i].used && timers[i].active && timers[i].due < next) {
+            next = timers[i].due;
+        }
+    }
+    uint32_t gap = next > now + 50u * 16u ? (uint32_t)(next - now) : 50u * 16u, count;
+    __asm__ volatile("rsr.ccount %0" : "=r"(count));
+    count += gap * (R1_CPU_MHZ / 16u);
+    __asm__ volatile("wsr.ccompare1 %0\n rsync" : : "r"(count));
+    unmask(ps);
+}
+
+// Called once on the tasks' core.
+void spike_tick_start(void)
+{
+    uint32_t enabled;
+    silica_rt_level3_handler = dispatch;
+    silica_rt_level3_stack = (uint32_t)&handler_stack[sizeof handler_stack / 4 - 8];
+    ticking = 1;
+    spike_tick_arm(0);
+    __asm__ volatile("rsr.intenable %0" : "=r"(enabled));
+    enabled |= 1u << 15;
+    __asm__ volatile("wsr.intenable %0\n rsync" : : "r"(enabled));
+}
+#endif
 
 // ---- the chip ----
 

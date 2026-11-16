@@ -2392,7 +2392,15 @@ silica_rt_sched_loop:
     movi    a10, 0
     movi    a11, 0
     call8   silica_rt_exit_request_record
-12: // timers whose deadline has passed (spec §22.14.2; silica_rt_timers_fire below): a dispatch
+12: // An image may have foreign code that needs a turn on a core beside the actors
+    // (transport_ble_plan.md stage 12: the radio libraries' tasks): it links silica_rt_board_pass,
+    // called with the core's number at every pass, idle or between dispatches.
+    .weak   silica_rt_board_pass
+    movi    a8, silica_rt_board_pass
+    beqz    a8, 14f
+    l32i    a10, a3, CORE_ID
+    callx8  a8
+14: // timers whose deadline has passed (spec §22.14.2; silica_rt_timers_fire below): a dispatch
     // boundary or an idle pass, never inside a dispatch; a lock-free peek keeps the idle loop cheap
     call8   silica_rt_timers_fire
     // :release_when_idle actors of this core, a second after their last message (at most every

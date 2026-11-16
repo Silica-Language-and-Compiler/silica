@@ -18,7 +18,7 @@
 # demos' frame with the Mac on both, on the chip the bare-metal runtime owns: no ESP-IDF start-up, no
 # FreeRTOS.
 #
-#   BOARD_PORT=<port> ./run_r1_both.sh [--build-only] [--links <n>] [--only wifi|ble] [<out_dir>]
+#   BOARD_PORT=<port> ./run_r1_both.sh [--build-only] [--links <n>] [--only wifi|ble] [--both-cores] [<out_dir>]
 #
 # The program is programmer_tools/transport_both_demo/dangerous_both_board_peer.silica: the hosted
 # (:tcp) carrier above lwIP (run_r1_wifi_peer.sh) and the board's (:ble_gatt) carrier above NimBLE
@@ -43,12 +43,13 @@ PY=${BOARD_PYTHON:-$HOME/.espressif/python_env/idf6.2_py3.14_env/bin/python}
 CC=${SILICA_COMPILER:-$ROOT/compiler/build/ESP32-S3_raw/silica-compiler}
 XT=${XTENSA_BIN:-$HOME/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin}
 PORT=${WIFI_PORT:-4370}
-build_only=0 links=1 only=""
+build_only=0 links=1 only="" both_cores=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --build-only) build_only=1; shift ;;
         --links) links=$2; shift 2 ;;
         --only) only=$2; shift 2 ;;
+        --both-cores) both_cores=1; shift ;;
         *) break ;;
     esac
 done
@@ -87,6 +88,13 @@ sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$
 # the program ends when the one's links are done
 # BOTH_NO_BUSY=1: the busy actor is never started, so the actors' core goes idle between messages
 [ "${BOTH_NO_BUSY:-0}" = 1 ] && sed -i '' -e '/cast(b0, me impl ActorMessage {});/d' "$SRC/dangerous_both_board_peer.silica"
+# --both-cores: actors run on both cores (r1_port.c -DR1_BOTH_CORES); the busy actor is put on core 1,
+# where the libraries' tasks have their turns between its dispatches
+[ "$both_cores" = 1 ] && grep -q 'cast(b0, me impl ActorMessage {});' "$SRC/dangerous_both_board_peer.silica" && sed -i '' -e '/trial_wait_int64@run(fn() -> int64 {/{n;s/proc\[concurrency\]/proc[concurrency, device_io]/;}' -e 's/^\( *\)_: boolean <- cast(b0, me impl ActorMessage {});/\1moved: atom <- migrate_actor(b0, 1);\
+\1_: atom <- print("busy actor to core 1 ");\
+\1_: atom <- print_atom(moved);\
+\1_: atom <- println("");\
+&/' "$SRC/dangerous_both_board_peer.silica"
 case "$only" in
     wifi) sed -i '' -e '/cast(bcar, (:open, bme, ble_address())/d' -e 's/spawn({ left: 2, code: 0 }, both,/spawn({ left: 1, code: 0 }, both,/' \
               -e 's/cast(car, (:open, me, address()) impl ActorMessage {});/cast(car, (:open, me, address()) impl ActorMessage {})/' "$SRC/dangerous_both_board_peer.silica" ;;
@@ -132,7 +140,12 @@ inc="-I$out -I$C/esp_wifi/include -I$C/esp_wifi/include/local -I$C/esp_event/inc
 inc="$inc -I$L/include -I$L/include/apps -I$L/include/apps/sntp -I$L/lwip/src/include -I$L/port/include -I$L/port/freertos/include -I$L/port/esp32xx/include -I$L/port/esp32xx/include/arch"
 export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSOCKETS_WIFI_PS -DSOCKETS_WIFI_RX_BUFFERS=6 -DSPIKE_STACK_TIGHT -DSILICA_BLE_OPEN_LINK -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DSPIKE_LIB_REGION_KB=${BOTH_LIB_REGION_KB:-64} -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
 # the runtime on one core, core 0, for the program's actors; core 1 is the radio's tasks' (r1_port.c)
-export BOARD_ASFLAGS="-DNCORES_RUN=1"
+if [ "$both_cores" = 1 ]; then
+    export BOARD_ASFLAGS="-DNCORES_RUN=2"
+    SPIKE_CFLAGS="$SPIKE_CFLAGS -DR1_BOTH_CORES"
+else
+    export BOARD_ASFLAGS="-DNCORES_RUN=1"
+fi
 export BOARD_FFI_STACK=${BOARD_FFI_STACK:-4096}
 boot=$(ls "$IDF_BUILD"/bootloader/esp-idf/*/lib*.a | tr '\n' ' ')
 mbed=$(find "$IDF_BUILD/esp-idf/mbedtls" -name "*.a" | tr '\n' ' ')
