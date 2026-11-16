@@ -8,6 +8,9 @@
 #   REMOTE=manager@aalang.org ./run_mtls.sh --timeout-check  no Linux end: the Mac end must time out (exit 5)
 #   ./run_mtls.sh --local                                    both ends on this Mac (listen:any, dial 127.0.0.1)
 #
+# Every dial address this script writes is "<ip>:<port>:5000": the third part is the connect timeout in
+# milliseconds, which the carrier requires (no default). It bounds the TCP connect and the TLS handshake together.
+#
 # BEFORE the first run, by hand and not by this script (README.md, "Certificates"): each node makes its
 # certificate once with make_cert.sh, and each node is given the other's certificate in ~/.silica_mtls/peers/.
 # This script creates, copies and reads NO key and NO certificate. It only checks that the files are in place
@@ -40,6 +43,7 @@ ROOT="$(cd "$HERE/../../.." && pwd)"
 REMOTE="${REMOTE:-manager@aalang.org}"
 REMOTE_IP="${REMOTE_IP:-138.197.209.113}"
 PORT=4550 MODE=pair RUNS=1 LOCAL_PORT=45550
+CONNECT_TIMEOUT_MS=5000   # the stated connect timeout of every dial address (connect plus handshake)
 while [ $# -gt 0 ]; do
     case "$1" in
         --timeout-check) MODE=timeout; shift ;;
@@ -129,8 +133,13 @@ build_mac() {   # DIR SIDE LISTEN DIAL HOST
     echo "built $D/$NAME"
 }
 
-run_with_watchdog() {   # EXE OUT SECONDS: runs EXE, appends "exit <code>" to OUT
-    "$1" > "$2" 2>&1 &
+# Standard output is what the program says and is what expected/ records. Standard error (the runtime's failure
+# banners, "[silica] root actor exited (no supervisor)" and the wrapper's "tls: ..." diagnostics) goes to OUT's
+# sibling .err file, is shown, and is checked by check_err: the carrier that ends :normal on :close or on the
+# peer's close is an unsupervised actor ending, and the runtime reports that end (spec 8584, 15.4.13); any report
+# with another reason is a mismatch.
+run_with_watchdog() {   # EXE OUT SECONDS: runs EXE, appends "exit <code>" to OUT; standard error goes to ${OUT%.out}.err
+    "$1" > "$2" 2> "${2%.out}.err" &
     local pid=$!
     MAC_PIDS="$MAC_PIDS $pid"
     ( sleep "$3"; kill "$pid" 2>/dev/null ) & local watch=$!; disown $watch 2>/dev/null
@@ -140,8 +149,18 @@ run_with_watchdog() {   # EXE OUT SECONDS: runs EXE, appends "exit <code>" to OU
     return $rc
 }
 
-compare_both() {   # MAC_OUT LINUX_OUT
+check_err() {   # NAME ERR_FILE: the failure reports on standard error must all be :normal carrier ends
+    local bad
+    echo "--- $1 standard error:"; cat "$2"
+    bad=$(grep -E '^reason:' "$2" | grep -v -E '^reason: +:normal$')
+    if [ -n "$bad" ]; then echo "MISMATCH: $1 standard error holds a failure report that is not a normal end:"; echo "$bad"; return 1; fi
+    echo "MATCH: $1 standard error holds only normal-end reports"
+}
+
+compare_both() {   # MAC_OUT LINUX_OUT (the .err files sit beside them)
     local ok=1
+    check_err "mac end" "${1%.out}.err" || ok=0
+    check_err "linux end" "${2%.out}.err" || ok=0
     echo "--- Mac end (accel side, dials):"; cat "$1"
     echo "--- Linux end (status side, listens):"; cat "$2"
     if diff <(normalize "$1") <(normalize "$HERE/expected/mac_end.txt") > "$WORK/mac_end.diff"; then echo "MATCH: mac end"
@@ -175,8 +194,8 @@ if [ "$MODE" = local ]; then
     echo "== local: the status side listens on listen:any:$LOCAL_PORT, the accel side dials 127.0.0.1:$LOCAL_PORT"
     busy=$(lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN 2>/dev/null)
     [ -z "$busy" ] || { echo "run_mtls: Mac port $LOCAL_PORT in use"; exit 1; }
-    build_mac "$WORK/local/accel" mac "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" mac-arm64
-    build_mac "$WORK/local/status" linux "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64
+    build_mac "$WORK/local/accel" mac "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT:$CONNECT_TIMEOUT_MS" mac-arm64
+    build_mac "$WORK/local/status" linux "listen:any:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT:$CONNECT_TIMEOUT_MS" linux-x86_64
     all=1
     for r in $(seq 1 "$RUNS"); do
         echo "== local run $r"
@@ -191,7 +210,7 @@ if [ "$MODE" = local ]; then
 fi
 
 echo "== 1. Mac end (accel side): dials $REMOTE_IP:$PORT"
-build_mac "$WORK/mac" mac "listen:any:$PORT" "$REMOTE_IP:$PORT" mac-arm64
+build_mac "$WORK/mac" mac "listen:any:$PORT" "$REMOTE_IP:$PORT:$CONNECT_TIMEOUT_MS" mac-arm64
 
 if [ "$MODE" = pair ]; then
     echo "== 2. Linux end (status side) on $REMOTE: listen:any:$PORT"
@@ -212,7 +231,7 @@ if [ "$MODE" = pair ]; then
     scp -q "${SSH_OPTS[@]}" "$ROOT"/compiler/stdlib/{Supervisor,wire_etf,wireframe,Carrier}.silica "$HERE"/{dangerous_tls,dangerous_tls_carrier}.silica \
         "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$REMOTE:silica_demo/ethernet_direct_mtls/stdlib/" || exit 1
     scp -q "${SSH_OPTS[@]}" "$HERE"/net/{silica_tls.c,silica_tls_wrapper.meta} "$REMOTE:silica_demo/ethernet_direct_mtls/net/" || exit 1
-    side_copy "$HERE/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:any:$PORT" "$REMOTE_IP:$PORT" linux-x86_64
+    side_copy "$HERE/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:any:$PORT" "$REMOTE_IP:$PORT:$CONNECT_TIMEOUT_MS" linux-x86_64
     scp -q "${SSH_OPTS[@]}" "$WORK/$NAME.linux.silica" "$REMOTE:silica_demo/ethernet_direct_mtls/build/$NAME.silica" || exit 1
     rsh "chmod +x $RDIR/build_linux.sh && $RDIR/build_linux.sh $RDIR/build $NAME $LINUX_COMPILER" || exit 1
 fi
@@ -221,7 +240,7 @@ all=1
 for r in $(seq 1 "$RUNS"); do
     if [ "$MODE" = pair ]; then
         echo "== 3. run $r: start the Linux end (timeout 90), listening on 0.0.0.0:$PORT"
-        rsh "cd $RDIR/build && rm -f peer.out && (setsid nohup bash -c 'timeout 90 ./$NAME > peer.out 2>&1; echo \"exit \$?\" >> peer.out' > /dev/null 2>&1 &)" || exit 1
+        rsh "cd $RDIR/build && rm -f peer.out peer.err && (setsid nohup bash -c 'timeout 90 ./$NAME > peer.out 2> peer.err; echo \"exit \$?\" >> peer.out' > /dev/null 2>&1 &)" || exit 1
         up=0
         for i in $(seq 1 20); do remote_listener >/dev/null && { up=1; break; }; sleep 0.5; done
         [ $up = 1 ] || { echo "run_mtls: the Linux end is not listening on $PORT"; rsh "cat $RDIR/build/peer.out"; exit 1; }
@@ -230,6 +249,7 @@ for r in $(seq 1 "$RUNS"); do
         run_with_watchdog "$WORK/mac/$NAME" "$WORK/mac_end.out" 70
         for i in $(seq 1 30); do rsh "grep -q '^exit ' $RDIR/build/peer.out" && break; sleep 1; done
         rsh "cat $RDIR/build/peer.out" > "$WORK/linux_end.out"
+        rsh "cat $RDIR/build/peer.err" > "$WORK/linux_end.err"
         compare_both "$WORK/mac_end.out" "$WORK/linux_end.out" || all=0
         echo "== after run $r"; teardown_check || all=0
     else

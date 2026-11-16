@@ -4,7 +4,7 @@ Ported from `emitter/apple_silicon_mac/` (same ISA, different OS). Build with
 `make TARGET=linux_aarch64` in `src/`; the resulting `silica-compiler` emits GNU/ELF
 AArch64 assembly text (`.sams`) for `as`/`gcc` on a Debian-family AArch64 host. Instruction
 selection is unchanged; everything Darwin-shaped was replaced. Design notes and the gate plan:
-`design_documents/ports/linux_aarch64_port_checklist.md`.
+`design_documents/completed_plans/linux_aarch64_port_checklist.md`.
 
 ## What changed relative to `apple_silicon_mac`
 

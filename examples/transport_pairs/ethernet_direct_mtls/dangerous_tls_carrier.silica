@@ -17,10 +17,49 @@
 
 // The carrier of the mutual-TLS example: the standard (:tcp) carrier, compiler/stdlib/dangerous_tcp_carrier.silica,
 // with the socket wrappers replaced by the TLS wrappers of dangerous_tls. Everything below the module line is that
-// carrier's text with dangerous_sockets@ read as dangerous_tls@, and nothing else is changed: the carrier
-// contract of transport_serialization_design.md 6.2 is the same, message for message, so the program that owns
-// this carrier is written exactly as it would be over plain TCP. That is the point of the example: mutual TLS
-// sits BELOW the carrier contract, in the wrapper, and a program gains it by naming another carrier.
+// carrier's text (as of 2026-11-12, plus the connect timeout of 2026-11-16, below) with dangerous_sockets@ read
+// as dangerous_tls@: the carrier contract of transport_serialization_design.md 6.2 is the same, message for
+// message, so the program that owns this carrier is written exactly as it would be over plain TCP. That is the
+// point of the example: mutual TLS sits BELOW the carrier contract, in the wrapper, and a program gains it by
+// naming another carrier.
+//
+// It is opened with (:open, owner, address):
+//   address "host:port:timeout_ms"  dials the peer and waits at most timeout_ms milliseconds for the TCP connect
+//                                   and the TLS handshake together: a connection carrier (the connect timeout, below);
+//   address "listen:port"           binds 127.0.0.1:port and becomes a listener;
+//   address "listen:any:port"       binds 0.0.0.0:port, every IPv4 interface of the host, and becomes a listener.
+//
+// The connect timeout (hosted Ethernet plan stage E8, as the standard carrier's). A dial states how long the
+// carrier may wait for the peer: the third part of "host:port:timeout_ms", whole milliseconds written as 1 to 9
+// decimal digits, greater than 0. There is no default. An address without the third part ("host:port"), with an
+// empty one, with anything but digits in it, with more than 9 digits or with the value 0 is malformed: nothing is
+// dialled, the owner is told (:link_down, :fault) and the carrier ends with (:explicit, :bad_address). The dial
+// never blocks: the socket is non-blocking while it connects and while the client's handshake runs, and the
+// carrier's worker waits in polls that end at one deadline, timeout_ms after the dial began
+// (dangerous_tls@tcp_connect). A peer that does not answer the connect in that time (a firewall that drops the
+// packets, a host that is down), or that accepts the connection and does not finish the handshake in it, is a
+// timed-out open: the owner is told (:link_down, :timeout) and the carrier ends with (:explicit, :link_timeout).
+// A refused connection (nothing listens on the port) and a failed handshake are a failed open:
+// (:link_down, :fault), and the carrier ends with (:explicit, :link_unavailable). The carrier handles no other
+// message while it waits, so the timeout is also the longest time a :close sent during the dial stays unread.
+// The :link_up of a dialled connection carries the peer, "host:port", without the timeout.
+//
+// The carrier ends with its link, exactly as the standard carrier does (transport_serialization_design.md 6.2,
+// transport_links_design.md 6.3): :link_down is the last message its owner receives, the descriptor and its TLS
+// state are released (a TLS close_notify is sent to the peer on :close and on a failed write), and a supervisor
+// restarts a faulted link and leaves a closed one alone. Event -> owner message -> exit reason:
+//   :close from the owner                        (:link_down, :closed)    :normal
+//   peer closed (close_notify or dropped link)   (:link_down, :closed)    :normal
+//   read failed (fatal alert, reset)             (:link_down, :fault)     (:explicit, :link_lost)
+//   write failed or timed out                    (:tx_failed, :link_down), (:link_down, :fault)  (:explicit, :link_lost)
+//   :tx on a carrier that is not up              (:tx_failed, :link_down) only: the carrier goes on
+//   dial refused (nothing listens)               (:link_down, :fault)     (:explicit, :link_unavailable)
+//   dial handshake failed (certificate refused)  (:link_down, :fault)     (:explicit, :link_unavailable)
+//   dial connect or handshake timed out          (:link_down, :timeout)   (:explicit, :link_timeout)
+//   dial address malformed (no stated timeout)   (:link_down, :fault)     (:explicit, :bad_address)
+//   listener cannot bind                         (:link_down, :fault)     (:explicit, :link_unavailable)
+// (In TLS 1.3 a server that refuses the client's certificate says so only after the client's handshake has
+// finished: the client then ends as a read that failed, (:link_down, :fault) and :link_lost, not as a failed dial.)
 //
 // What the owner sees that it would not see over plain TCP:
 //   - a dial to a peer that does not accept this node, or that this node does not accept, ends with
@@ -40,7 +79,9 @@
 // peer that passes the handshake, spawns one connection carrier and tells its owner
 // (:accepted, conn: dangerous_actor_ref, "peer:accepted"); whoever sends that carrier (:open, owner, _)
 // becomes the connection's owner. A carrier polls its descriptor between mailbox messages with a 20 ms
-// timeout; a handshake is bounded at 5 seconds and runs on the listener's thread.
+// timeout. A dial (connect and handshake) waits for at most the timeout its address states; a listener's
+// handshake with an accepted peer is bounded at 5 seconds for each read and write and runs on the listener's
+// thread.
 module dangerous_tls_carrier;
 
 use dangerous_tls;
@@ -86,6 +127,55 @@ fn host_of(address: string) -> string {
 fn port_of(address: string) -> int64 {
     h: string <- host_of(address);
     digits_from(address, length_bytes(h) + 1, 0)
+}
+
+// Where the timeout text of a dial address "host:port:timeout_ms" starts, or -1 when the address has no third
+// part (no second ':' or nothing after it).
+fn connect_timeout_start(address: string) -> int64 {
+    port_start: int64 <- length_bytes(host_of(address)) + 1;
+    case port_start >= length_bytes(address) of {
+        true -> 0 - 1;
+        false -> {
+            port_text: string <- substring_until_char(address, port_start, ':');
+            start: int64 <- port_start + length_bytes(port_text) + 1;
+            case start >= length_bytes(address) of {
+                true -> 0 - 1;
+                false -> start
+            }
+        }
+    }
+}
+
+fn all_digits_from(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> true;
+        false -> {
+            d: int64 <- at(s, i) - 48;
+            case d < 0 or d > 9 of {
+                true -> false;
+                false -> all_digits_from(s, i + 1)
+            }
+        }
+    }
+}
+
+// The connect timeout a dial address states, in milliseconds, or 0 when it states none: the third part must be
+// 1 to 9 decimal digits and nothing else (header). 0 is never a timeout, so "host:port:0" is refused with the
+// malformed ones.
+fn connect_timeout_of(address: string) -> int64 {
+    start: int64 <- connect_timeout_start(address);
+    case start < 0 of {
+        true -> 0;
+        false -> case length_bytes(address) - start > 9 or all_digits_from(address, start) == false of {
+            true -> 0;
+            false -> digits_from(address, start, 0)
+        }
+    }
+}
+
+// The peer of a dial address whose timeout is stated: "host:port", what a dialled connection's :link_up carries.
+fn dial_peer_text(address: string) -> string {
+    substring(address, 0, connect_timeout_start(address) - 1)
 }
 
 // The port of a listener address: "listen:any:<port>" or "listen:<port>".
@@ -178,8 +268,12 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         listen_any: boolean <- starts(text, "listen:any:");
         do_connect: boolean <- kind == :open and adoptable == false and listen_mode == false;
         do_listen: boolean <- kind == :open and adoptable == false and listen_mode;
-        res_open: { tag: int64, value: int64, error_code: int64 } <- case do_connect of {
-            true -> dangerous_tls@tcp_connect(host_of(text), port_of(text));
+        // The connect timeout a dial states (header): none, or a malformed one, is a malformed address, and
+        // then nothing is dialled (none_res: open_tag is not 0, so the open fails below).
+        timeout_ms: int64 <- case do_connect of { true -> connect_timeout_of(text); false -> 0 };
+        bad_address: boolean <- do_connect and timeout_ms <= 0;
+        res_open: { tag: int64, value: int64, error_code: int64 } <- case do_connect and bad_address == false of {
+            true -> dangerous_tls@tcp_connect(host_of(text), port_of(text), timeout_ms);
             false -> case do_listen and listen_any of {
                 true -> dangerous_tls@tcp_listen_any(listen_port_of(text));
                 false -> case do_listen of {
@@ -228,7 +322,13 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
             true -> dangerous_tls@take(state.fd);
             false -> ""
         };
-        do_close: boolean <- kind == :close and state.fd >= 0;
+        // The descriptor (and its TLS state: a TLS close_notify to the peer) is given back whenever the link
+        // ends, not only on :close: the peer closed or the read failed (a fatal alert, a reset), or a write
+        // failed (a peer that went away, or a write that timed out part way and left a torn record).
+        open_failed: boolean <- kind == :open and adoptable == false and open_tag != 0;
+        rx_ended: boolean <- do_rx and (rx_tag == 1 or rx_tag == 3);
+        tx_broke: boolean <- do_tx and tx_tag != 0;
+        do_close: boolean <- (kind == :close or rx_ended or tx_broke) and state.fd >= 0;
         _: { tag: int64, value: int64, error_code: int64 } <- case do_close of {
             true -> dangerous_tls@close_fd(state.fd);
             false -> none_res()
@@ -250,16 +350,23 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         // system chose when asked for 0), and once when an accepted connection is opened.
         connected: boolean <- do_connect and open_tag == 0;
         link_up_now: boolean <- connected or bound or do_adopt;
-        link_down_now: boolean <- (kind == :open and adoptable == false and open_tag != 0) or (do_rx and (rx_tag == 1 or rx_tag == 3)) or (kind == :close);
+        link_down_now: boolean <- open_failed or rx_ended or tx_broke or (kind == :close);
+        ended_normally: boolean <- kind == :close or (do_rx and rx_tag == 3);
+        // A dial that was made and whose peer did not answer the connect, or did not finish the handshake,
+        // within the stated timeout (tag 2 of the connect; a malformed address makes no call and is not one).
+        connect_timed_out: boolean <- do_connect and bad_address == false and open_tag == 2;
         down_reason: atom <- case kind == :close of {
             true -> :closed;
             false -> case do_rx and rx_tag == 3 of {
                 true -> :closed;
-                false -> :fault
+                false -> case connect_timed_out of {
+                    true -> :timeout;
+                    false -> :fault
+                }
             }
         };
         _: boolean <- case link_up_now of {
-            true -> cast(owner, (:link_up, case bound of { true -> concat("port:", int_text(port)); false -> case do_adopt of { true -> "peer:accepted"; false -> text } }) impl ActorMessage {});
+            true -> cast(owner, (:link_up, case bound of { true -> concat("port:", int_text(port)); false -> case do_adopt of { true -> "peer:accepted"; false -> dial_peer_text(text) } }) impl ActorMessage {});
             false -> true
         };
         _: boolean <- case connected or do_adopt of {
@@ -284,6 +391,31 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
             true -> cast(owner, (:link_down, down_reason) impl ActorMessage {});
             false -> true
         };
+        // The carrier ends with its link, as the standard carrier does (transport design 6.2): :link_down is
+        // the last message its owner receives and the carrier's reference is dead afterwards. A :close, and a
+        // peer that closed (TLS close_notify, or the connection dropped), are a normal end; a failed open, a
+        // failed read (a fatal TLS alert, a reset) and a failed write end it with the link exit reasons of the
+        // links design 6.3, so a supervisor restarts a faulted link and leaves a closed one alone. A failed
+        // open is a refused connection or a failed handshake (the wrapper's tag 1; (:link_down, :fault)):
+        // (:explicit, :link_unavailable); a dial address without a stated timeout is (:explicit, :bad_address);
+        // a dial that timed out, in the connect or in the handshake, is (:explicit, :link_timeout) after
+        // (:link_down, :timeout). stop_self takes effect when this dispatch returns.
+        _: atom <- case link_down_now of {
+            true -> case ended_normally of {
+                true -> stop_self(:normal);
+                false -> case open_failed of {
+                    true -> case bad_address of {
+                        true -> stop_self((:explicit, :bad_address));
+                        false -> case connect_timed_out of {
+                            true -> stop_self((:explicit, :link_timeout));
+                            false -> stop_self((:explicit, :link_unavailable))
+                        }
+                    };
+                    false -> stop_self((:explicit, :link_lost))
+                }
+            };
+            false -> :ok
+        };
         up_next: boolean <- case link_down_now of {
             true -> false;
             false -> state.up or connected or do_adopt
@@ -294,7 +426,7 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         };
         fd_next: int64 <- case kind == :open and adoptable == false of {
             true -> open_fd;
-            false -> case kind == :close of { true -> 0 - 1; false -> state.fd }
+            false -> case link_down_now of { true -> 0 - 1; false -> state.fd }
         };
         credit_next: int64 <- case kind == :credit of {
             true -> state.rx_credit + msg_count(msg);

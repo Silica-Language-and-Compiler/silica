@@ -1,7 +1,7 @@
 # Chunk 15 phase 4: running notes (Fable)
 
 Design: [chunk15_stack_memory_design.md](chunk15_stack_memory_design.md) §5 (5.1 the copier and the mailbox buffer),
-§11.1 row 4; preparation: [Phase4_prep.md](Phase4_prep.md) §2 rows 4, 5, 12, 13; phase 3's copier:
+§11.1 row 4; preparation: [Phase4_prep.md](completed_plans/Phase4_prep.md) §2 rows 4, 5, 12, 13; phase 3's copier:
 [Phase3_notes.md](Phase3_notes.md) §10.8. Mac tree (`compiler/src/emitter/apple_silicon_mac/terms/`) only; the Linux
 twins and the board are untouched. Nothing here was built or run by the implementing agent (Haiku builds, Sonnet reads).
 

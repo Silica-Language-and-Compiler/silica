@@ -129,7 +129,8 @@ numbers are different series, and the question numbers are kept (§12).
   `(:credit, n)`, `(:close)` toward the carrier; `(:link_up, info)`, `(:rx, segment)`, `(:tx_credit, n)`,
   `(:tx_failed, reason)`, `(:link_down, reason)` toward the owner. The three hosted carriers spawn with
   `spawn_dangerous(initial(), carrier, stack_policy(...), state_policy(...))` and open with an address string
-  (`"host:port"`, `"listen:port"`, `"path@baud"`).
+  (`"host:port:timeout_ms"`, `"listen:port"`, `"path@baud"`; a TCP dial states its connect timeout, there is no
+  default).
 - **The transport pack** (`emitter/<TARGET>/transport_pack.silica`): `provides_format(tag: string)` and
   `provides_carrier(tag: string)`, flat tables read by the shared compiler; a tag the pack does not list is E2410
   (`NotProvidedOnTarget`) from `sir_target_verify`, wherever it appears. This paragraph described the state before

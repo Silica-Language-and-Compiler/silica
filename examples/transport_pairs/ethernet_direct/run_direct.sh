@@ -151,8 +151,8 @@ if [ "$MODE" = local ]; then
     echo "== local: the status side listens on listen:$LOCAL_PORT, the accel side dials 127.0.0.1:$LOCAL_PORT"
     busy=$(lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN 2>/dev/null)
     [ -z "$busy" ] || { echo "run_direct: Mac port $LOCAL_PORT in use"; exit 1; }
-    build_mac "$WORK/local/accel" mac "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" mac-arm64 '(:interface, "lo0")'
-    build_mac "$WORK/local/status" linux "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT" linux-x86_64 '(:interface, "lo0")'
+    build_mac "$WORK/local/accel" mac "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT:3000" mac-arm64 '(:interface, "lo0")'
+    build_mac "$WORK/local/status" linux "listen:$LOCAL_PORT" "127.0.0.1:$LOCAL_PORT:3000" linux-x86_64 '(:interface, "lo0")'
     all=1
     for r in $(seq 1 "$RUNS"); do
         echo "== local run $r"
@@ -167,7 +167,7 @@ if [ "$MODE" = local ]; then
 fi
 
 echo "== 1. Mac end (accel side): dials $REMOTE_IP:$PORT"
-build_mac "$WORK/mac" mac "listen:$PORT" "$REMOTE_IP:$PORT" mac-arm64 "(:interface, \"$MAC_IFACE\")"
+build_mac "$WORK/mac" mac "listen:$PORT" "$REMOTE_IP:$PORT:3000" mac-arm64 "(:interface, \"$MAC_IFACE\")"
 
 if [ "$MODE" = pair ]; then
     echo "== 2. Linux end (status side) on $REMOTE: listen:$PORT"
@@ -188,7 +188,7 @@ if [ "$MODE" = pair ]; then
     scp -q "${SSH_OPTS[@]}" "$ROOT"/compiler/stdlib/{Supervisor,wire_etf,wireframe,Carrier,dangerous_sockets,dangerous_tcp_carrier}.silica \
         "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$REMOTE:silica_demo/ethernet_direct/stdlib/" || exit 1
     scp -q "${SSH_OPTS[@]}" "$ROOT"/compiler/stdlib/net/{silica_sockets.c,silica_sockets_wrapper.meta} "$REMOTE:silica_demo/ethernet_direct/stdlib/net/" || exit 1
-    side_copy "$HERE/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:$PORT" "$REMOTE_IP:$PORT" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
+    side_copy "$HERE/$NAME.silica" "$WORK/$NAME.linux.silica" linux "listen:$PORT" "$REMOTE_IP:$PORT:3000" linux-x86_64 "(:interface, \"$LINUX_IFACE\")"
     scp -q "${SSH_OPTS[@]}" "$WORK/$NAME.linux.silica" "$REMOTE:silica_demo/ethernet_direct/build/$NAME.silica" || exit 1
     rsh "chmod +x $RDIR/build_linux.sh && $RDIR/build_linux.sh $RDIR/build $NAME $LINUX_COMPILER" || exit 1
 fi

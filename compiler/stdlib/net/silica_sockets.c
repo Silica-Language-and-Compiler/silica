@@ -18,7 +18,9 @@
    (ROADMAP chunk 9, the part phase 2 needs): TCP connect / listen / accept, UDP bind / send / receive,
    a serial port through termios, and the read / write / close every descriptor shares. Every call is
    bounded by a timeout in milliseconds, so a carrier actor polls between its mailbox messages and
-   never blocks its thread for long.
+   never blocks its thread for long. A TCP connect is bounded too: the socket is non-blocking while it
+   connects and the wait ends at the timeout the caller stated (silica_sockets_set_connect_timeout).
+   There is no default: a connect whose timeout was not stated is refused with EINVAL.
 
    Result conventions (FFI wrapper specification §9): a tagged result { tag, value, error_code } with
    tag 0 = ok, 1 = error (errno in error_code), 2 = timeout, 3 = closed by the peer. Received bytes
@@ -33,6 +35,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <time.h>
+#include <limits.h>
 #include <termios.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -71,6 +75,11 @@ static __thread uint64_t silica_sockets_rx_len = 0;
 static __thread int64_t silica_sockets_arg_a = 0;
 static __thread int64_t silica_sockets_arg_b = 0;
 static __thread char silica_sockets_host[256] = "127.0.0.1";
+
+/* The connect timeout the caller stated for the next TCP connect of this thread, in milliseconds
+   (silica_sockets_set_connect_timeout). 0 means "not stated": there is no default, so a connect then
+   answers EINVAL. Each connect consumes the value, so one statement bounds exactly one connect. */
+static __thread int64_t silica_sockets_connect_timeout_ms = 0;
 
 static silica_sockets_tagged ok(int64_t v) { silica_sockets_tagged r = {0, v, 0}; return r; }
 static silica_sockets_tagged err(void) { silica_sockets_tagged r = {1, 0, (int64_t)errno}; return r; }
@@ -161,6 +170,15 @@ silica_sockets_tagged silica_sockets_set_args(int64_t a, int64_t b) {
     return ok(0);
 }
 
+/* States the timeout of the next TCP connect of this thread, in milliseconds. Only 1 to INT_MAX is a
+   timeout; anything else is EINVAL and leaves none stated. */
+silica_sockets_tagged silica_sockets_set_connect_timeout(int64_t timeout_ms) {
+    silica_sockets_connect_timeout_ms = 0;
+    if (timeout_ms <= 0 || timeout_ms > (int64_t)INT_MAX) { errno = EINVAL; return err(); }
+    silica_sockets_connect_timeout_ms = timeout_ms;
+    return ok(0);
+}
+
 silica_sockets_tagged silica_sockets_set_host(const uint8_t *host_ptr, uint64_t host_len) {
     if (!copy_host(host_ptr, host_len, silica_sockets_host, sizeof silica_sockets_host)) { errno = EINVAL; return err(); }
     return ok(0);
@@ -168,11 +186,66 @@ silica_sockets_tagged silica_sockets_set_host(const uint8_t *host_ptr, uint64_t 
 
 /* ---- TCP ----------------------------------------------------------------------------------- */
 
-/* port: set_args a */
+static int64_t monotonic_ms(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) < 0) return -1;
+    return (int64_t)t.tv_sec * 1000 + (int64_t)(t.tv_nsec / 1000000);
+}
+
+/* The stated connect timeout of this thread, taken: the next connect has none until one is stated again. */
+static int64_t take_connect_timeout(void) {
+    int64_t t = silica_sockets_connect_timeout_ms;
+    silica_sockets_connect_timeout_ms = 0;
+    return t;
+}
+
+/* Connects fd to addr without ever blocking in connect(): the socket is made non-blocking, the connect is
+   started, and the wait for its end is a poll bounded by timeout_ms (1 to INT_MAX, checked by the callers)
+   against a monotonic deadline, so signals (EINTR) cannot lengthen it. The answer is ok(fd) with the socket
+   back in blocking mode (every later call on it is bounded by its own poll), timeout() when the peer did not
+   answer in time, or err() with the connect's errno (ECONNREFUSED, EHOSTUNREACH, ...). fd is closed on every
+   answer but ok. */
+static silica_sockets_tagged connect_bounded(int fd, const struct sockaddr_in *addr, int64_t timeout_ms) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { int e = errno; close(fd); errno = e; return err(); }
+    int64_t start = monotonic_ms();
+    if (start < 0) { int e = errno; close(fd); errno = e; return err(); }
+    if (connect(fd, (const struct sockaddr *)addr, sizeof *addr) < 0) {
+        /* EINPROGRESS: the connect is under way. EINTR: a signal interrupted the call, and the connect goes
+           on in the background all the same (POSIX); calling connect again would answer EALREADY. Both are
+           waited for below. Any other errno is the connect's answer. */
+        if (errno != EINPROGRESS && errno != EINTR) { int e = errno; close(fd); errno = e; return err(); }
+        for (;;) {
+            int64_t now = monotonic_ms();
+            if (now < 0) { int e = errno; close(fd); errno = e; return err(); }
+            int64_t left = timeout_ms - (now - start);
+            if (left <= 0) { close(fd); return timeout(); }
+            struct pollfd p;
+            p.fd = fd;
+            p.events = POLLOUT;
+            p.revents = 0;
+            int n = poll(&p, 1, (int)left);
+            if (n > 0) break;
+            if (n == 0) { close(fd); return timeout(); }
+            if (errno != EINTR) { int e = errno; close(fd); errno = e; return err(); }
+        }
+        /* Writable, or an error or hang-up reported by poll: SO_ERROR says which. */
+        int so_error = 0;
+        socklen_t so_len = sizeof so_error;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) < 0) { int e = errno; close(fd); errno = e; return err(); }
+        if (so_error != 0) { close(fd); errno = so_error; return err(); }
+    }
+    if (fcntl(fd, F_SETFL, flags) < 0) { int e = errno; close(fd); errno = e; return err(); }
+    return ok(fd);
+}
+
+/* port: set_args a, timeout in milliseconds: set_connect_timeout (EINVAL when none was stated) */
 silica_sockets_tagged silica_sockets_tcp_connect(const uint8_t *host_ptr, uint64_t host_len) {
     struct sockaddr_in addr;
     uint32_t to;
     int64_t port = silica_sockets_arg_a;
+    int64_t timeout_ms = take_connect_timeout();
+    if (timeout_ms <= 0) { errno = EINVAL; return err(); }
     if (!ipv4_strict(host_ptr, host_len, &to)) { errno = EINVAL; return err(); }
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -183,8 +256,7 @@ silica_sockets_tagged silica_sockets_tcp_connect(const uint8_t *host_ptr, uint64
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     no_sigpipe(fd);
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { int e = errno; close(fd); errno = e; return err(); }
-    return ok(fd);
+    return connect_bounded(fd, &addr, timeout_ms);
 }
 
 static silica_sockets_tagged tcp_listen_on(int64_t port, uint32_t host_order_addr) {
@@ -229,13 +301,16 @@ silica_sockets_tagged silica_sockets_tcp_listen_addr(const uint8_t *host_ptr, ui
 
 /* Connects from the given local IPv4 address (host order): the source bind of a carrier on a named link, so
    the connection leaves by that interface's address (links design §3.2, decision 10).
-   port: set_args a, local address: set_args b */
+   port: set_args a, local address: set_args b, timeout in milliseconds: set_connect_timeout (EINVAL when none
+   was stated) */
 silica_sockets_tagged silica_sockets_tcp_connect_from(const uint8_t *host_ptr, uint64_t host_len) {
     struct sockaddr_in addr;
     struct sockaddr_in local;
     uint32_t to;
     int64_t port = silica_sockets_arg_a;
     uint32_t from = (uint32_t)silica_sockets_arg_b;
+    int64_t timeout_ms = take_connect_timeout();
+    if (timeout_ms <= 0) { errno = EINVAL; return err(); }
     if (!ipv4_strict(host_ptr, host_len, &to)) { errno = EINVAL; return err(); }
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -251,8 +326,7 @@ silica_sockets_tagged silica_sockets_tcp_connect_from(const uint8_t *host_ptr, u
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     no_sigpipe(fd);
     if (bind(fd, (struct sockaddr *)&local, sizeof local) < 0) { int e = errno; close(fd); errno = e; return err(); }
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { int e = errno; close(fd); errno = e; return err(); }
-    return ok(fd);
+    return connect_bounded(fd, &addr, timeout_ms);
 }
 
 /* A dotted-quad IPv4 text as its address in host order (value), or EINVAL (ipv4_strict): the check a carrier makes

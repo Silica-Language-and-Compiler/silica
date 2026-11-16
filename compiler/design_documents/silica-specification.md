@@ -10659,7 +10659,7 @@ socket only; the connections it spawned live on.
 
 | Tag | Module and behaviour | `address` | `mtu` | `boundaries` | `delivery` |
 | --- | --- | --- | --- | --- | --- |
-| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"` the same on every IPv4 interface (0.0.0.0), and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
+| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port:timeout_ms"` connects and waits at most `timeout_ms` milliseconds for the peer to answer (the connect timeout is stated in the address, 1 to 9 decimal digits, greater than 0; there is no default, and `"host:port"` without it is a malformed address; `:link_up` carries `"host:port"`); `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"` the same on every IPv4 interface (0.0.0.0), and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
 | `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx` (the link does not restrict it), and the local address to bind (`:link_up` carries `"port:<n>"`); `local` is `<port>`, `<ipv4>:<port>` or `any:<port>`: with no link `<port>` binds 127.0.0.1, `any` 0.0.0.0, an ip that ip; under `(:loopback)` `any` is refused and an ip must lie in 127.0.0.0/8; under a named link `<port>` binds the interface's first IPv4 address, `any` is refused and an ip must be that interface's address; a refusal tells the owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)`; a malformed peer host or local ip ends `(:explicit, :bad_address)` (strict dotted quad) | 65507 | `:datagram` | `:unreliable` |
 | `:serial` | `dangerous_serial_carrier@carrier` | `""` when the port is declared (`carried_on ... (:serial_port, path, baud)`, §16.4.9), else `"path@baud"`; raw 8N1; `:link_up` carries `"path@baud"` | 0 | `:stream` | `:reliable_ordered` |
 
@@ -10676,6 +10676,12 @@ socket wrappers behind the hosted carriers are the dangerous module `dangerous_s
 link. After `:close`, and after a peer closes, it answers `(:link_down, :closed)` and ends with `stop_self(:normal)`.
 After a failed open it answers `(:link_down, :fault)` and ends with `stop_self((:explicit, :link_unavailable))`; after
 a failed read or write, with `(:explicit, :link_lost)`, so a supervisor restarts a faulted link and leaves a closed one.
+A `(:tcp)` dial never blocks in the connect: the socket is non-blocking while it connects and the carrier waits at most
+the timeout its address states (`"host:port:timeout_ms"`). A peer that does not answer in that time is a timed-out
+open: the carrier answers `(:link_down, :timeout)` and ends with `stop_self((:explicit, :link_timeout))`. A dial address
+that states no timeout, or a malformed or zero one, is refused before anything is dialled: `(:link_down, :fault)`, then
+`stop_self((:explicit, :bad_address))`, as for a host that is not a dotted quad (built 2026-11-15; not yet compiled or
+run).
 `:link_down` is the last message the owner receives, and the carrier's reference is dead afterwards. A write that fails
 is a link failure: the owner receives `(:tx_failed, :link_down)` and then `:link_down`. A write to a peer that has gone
 fails with an error and never raises `SIGPIPE`.
@@ -10736,7 +10742,7 @@ business, spelled by the target's transport pack:
 - on a hosted target, `spawn_dangerous(<initial state>, dangerous_<kind>_carrier@carrier, <policies>...)`: a
   `dangerous_actor_ref`. The `(:serial)` carrier's initial state carries the declared path and baud, so its `:open`
   address is `""` (an address `"path@baud"` still names a port directly); `:link_up` carries `"path@baud"`. The
-  `(:tcp)` and `(:udp)` carriers keep their address strings at `:open` (`"listen:0"`, `"host:port"`, ...), and
+  `(:tcp)` and `(:udp)` carriers keep their address strings at `:open` (`"listen:0"`, `"host:port:timeout_ms"`, ...), and
   `(:loopback)` is where they already bind. The module the spawn names is an implicit `use`, as `wire_etf` is for
   `(:etf)`;
 - on the ESP32-S3, `spawn_device(:idle, <device worker>@<carrier behaviour>, <policies>...)`: a `device_actor_ref`,

@@ -51,7 +51,7 @@ for the trial harness. GNU `as` and `ld` serve where clang's integrated assemble
 | Host | Verified with |
 | ---- | ------------- |
 | Linux on x86-64 (`linux-x86_64`) | Ubuntu 24.04.3, clang 18.1.3, GNU as/ld 2.42, GNU Make 4.3 ([trials/platform/linux_x86_64.mk](https://github.com/yenrab/silica/blob/main/trials/platform/linux_x86_64.mk)) |
-| Linux on AArch64 (`linux-aarch64`) | 64-bit Raspberry Pi OS / Debian-family AArch64; `uname -m` must print `aarch64` ([linux_aarch64_port_checklist.md](https://github.com/yenrab/silica/blob/main/compiler/design_documents/ports/linux_aarch64_port_checklist.md)) |
+| Linux on AArch64 (`linux-aarch64`) | 64-bit Raspberry Pi OS / Debian-family AArch64; `uname -m` must print `aarch64` ([linux_aarch64_port_checklist.md](https://github.com/yenrab/silica/blob/main/compiler/design_documents/completed_plans/linux_aarch64_port_checklist.md)) |
 
 On a Debian-family host:
 
