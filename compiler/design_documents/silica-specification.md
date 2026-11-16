@@ -10694,8 +10694,8 @@ A carrier can end before its owner has read its `:link_down`. A `cast` to an end
 owner goes on (§16.1.2, changed 2026-11-16; before that date such a `cast` ended the owner with `actor_not_found`). A
 message sent after the carrier has ended is dropped, so **an owner should treat `:link_down` as the last use of that
 reference**. `call`, `call_with_timeout` and the registered casts still raise `actor_not_found` for an ended actor.
-*Planned change (transport design §6.2, upgrade note):* every carrier, the storage carriers included (§16.4.11), is to
-end on a failure.
+The storage carriers do not end on a failure (§16.4.11): that is decided (transport design §6.2, 2026-11-16) and
+no change is planned.
 
 #### 16.4.9 Carrier links
 
@@ -10870,8 +10870,8 @@ with `stop_self(:normal)`, and its reference is dead afterwards. A refused open 
 failure (`:medium`) give the medium back and leave the carrier, not open; the owner may open it again or close it. This
 differs from the hosted network carriers of §16.4.8, which end on a fault. It was built this way because a `cast` to an
 ended actor then ended its sender, so an owner had always to find its store carrier. Since 2026-11-16 such a `cast`
-returns `false` (§16.1.2) and that reason is gone. *Planned change (transport design §6.2, upgrade note):* every carrier
-is to end on a failure with an exit reason; a program should not rely on a failed store carrier staying.
+returns `false` (§16.1.2) and that reason is gone. This is the decided behaviour (transport design §6.2, 2026-11-16): a store carrier that has failed stays until it is
+closed, and a program may rely on that.
 
 **What a program may rely on.** After a crash, a power loss or a restart the log holds every record below the last
 `(:synced, next)` the owner saw, in order and with no holes, possibly some records after it, and never a reordered or a
