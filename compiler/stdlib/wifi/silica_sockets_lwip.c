@@ -72,6 +72,7 @@ typedef struct silica_sockets_bytes {
 } silica_sockets_bytes;
 
 int spike_wifi_event(int32_t *id, uint8_t data[48]);
+void spike_net_core(void);
 int spike_net_start(void);
 uint32_t spike_net_address(void);
 void spike_coex_start(void);
@@ -184,6 +185,7 @@ static void station_task(void *unused) {
 
 static int station_start(void) {
     if (station_started) return 0;
+    spike_net_core();
     /* what ESP-IDF's start-up does before any radio (esp_coex's coexist.c through spike_coex_start, mbedtls's esp_psa_crypto_init.c) */
     spike_coex_start();
     if (psa_crypto_init() != 0) return -1;
@@ -280,6 +282,7 @@ static silica_sockets_tagged connect_to(const uint8_t *host_ptr, uint64_t host_l
     addr.sin_family = AF_INET;
     addr.sin_port = lwip_htons((uint16_t)port);
     addr.sin_addr.s_addr = lwip_htonl(to);
+    spike_net_core();   /* a peer on 127.0.0.1 needs no station */
     int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return err();
     no_delay(fd);
@@ -317,6 +320,7 @@ silica_sockets_tagged silica_sockets_tcp_connect_from(const uint8_t *host_ptr, u
 
 static silica_sockets_tagged tcp_listen_on(int64_t port, uint32_t host_order_addr) {
     struct sockaddr_in addr;
+    spike_net_core();
     int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return err();
     int one = 1;

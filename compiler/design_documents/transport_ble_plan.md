@@ -1876,6 +1876,33 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     linker script could give the 22 KB above the image to every ESP32-S3 program's heap; here only
     the radio images use it.
 
+- **Stage 12, part 13, 2026-11-16, done: the hosts' `(:tcp)` trials on the board.** The trial
+  programs of `transport_addition` and `ffi_addition` that use the hosted `(:tcp)` carrier are built
+  unchanged as R1 images and run on the board; the console output is compared with each trial's
+  `.scout`, the output the hosts must give (`spike_r1/run_r1_tcp_trials.sh`, the comparison by
+  `tools/compare_sout.sh`).
+  - Both ends of these trials are in the one program, on 127.0.0.1. lwIP has a loopback interface
+    of its own; it had been started only when the station joined. `spike_net_core` (`wifi_net.c`)
+    starts lwIP's task alone, and the wrapper calls it before it makes a socket, so a program that
+    never opens `(:wifi, 0)` has TCP on 127.0.0.1 with no access point and no peer.
+  - Of the ten programs:
+
+    | Program | On the board |
+    | --- | --- |
+    | `app_transport_tcp_listener/dangerous_tcp_listener` (a listener, two peers accepted, a session each) | as the `.scout` |
+    | `app_transport_tcp_listen_any/dangerous_tcp_listen_any` (`listen:any:0`) | as the `.scout` |
+    | `ffi_addition/app_transport_tcp_loopback/dangerous_tcp_loopback` | as the `.scout` |
+    | `app_transport_tcp_link_rules/dangerous_link_listen_ip` | as the `.scout` |
+    | `dangerous_tcp_loopback_link`, `dangerous_link_listen_ip_refused_loopback` (`(:loopback)`) | refused by the compiler, E2412 |
+    | `dangerous_link_ethernet_absent`, `dangerous_link_interface_absent`, `dangerous_link_listen_any_refused_interface`, `dangerous_link_wifi_absent` | refused by the compiler, E2412 |
+
+    The six refused name a link the board's pack does not provide; four of them are the hosts' trials
+    of a link that is absent at run time, which the board refuses when it compiles.
+  - The Wi-Fi image three links of three and the two-radio image three and three after the change.
+  - **Open.** Whether the board's pack should provide `(:loopback)` where lwIP is in the image (the
+    two trials above would then run); the trials are not in the board's trial harness, which builds
+    images without the radio libraries.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

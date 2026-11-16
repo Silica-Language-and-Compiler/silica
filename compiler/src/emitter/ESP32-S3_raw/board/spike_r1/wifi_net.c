@@ -17,6 +17,9 @@
 // Route R1 spike, Wi-Fi (transport_ble_plan.md stage 12, part 6): lwIP above the station. ESP-IDF's
 // own layer between the two (esp_netif) is not in the image; this is the least of it:
 //
+//   spike_net_core     starts lwIP's task, once: enough for 127.0.0.1 (lwIP's own loopback interface).
+//                      Not safe against a second caller at the same moment: the first call is made
+//                      where only one runs (the wrapper calls it from the actors' core).
 //   spike_net_start    starts lwIP's task and adds one interface whose frames go out by
 //                      esp_wifi_internal_tx and come in from the station's receive callback (each
 //                      copied once, either way), then asks for an address by DHCP.
@@ -79,9 +82,18 @@ static err_t station_init(struct netif *netif)
     return ERR_OK;
 }
 
+void spike_net_core(void)
+{
+    static int started;
+    if (!started) {
+        started = 1;
+        tcpip_init(NULL, NULL);
+    }
+}
+
 int spike_net_start(void)
 {
-    tcpip_init(NULL, NULL);
+    spike_net_core();
     if (netifapi_netif_add(&station, NULL, NULL, NULL, NULL, station_init, tcpip_input) != ERR_OK) {
         return 1;
     }
