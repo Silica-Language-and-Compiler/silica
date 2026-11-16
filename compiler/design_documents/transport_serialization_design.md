@@ -523,21 +523,26 @@ upgrade below.
 | hosted `(:tcp)`, `(:udp)`, `(:serial)` | `(:link_down, :closed)`, then the carrier ends, `stop_self(:normal)` | `(:link_down, :fault)`, then the carrier ends with `stop_self((:explicit, :link_unavailable))` for a failed open and `(:explicit, :link_lost)` for a failed read or write; a `(:tcp)` dial whose peer does not answer within the connect timeout its address states answers `(:link_down, :timeout)` and ends with `(:explicit, :link_timeout)` (built 2026-11-15; not yet compiled or run); in each case its supervisor restarts it | `(:link_down, :closed)`, then the carrier ends, `stop_self(:normal)` |
 | `(:store)` on `(:memory)` and `(:backing)` (§6.8) | the same | `(:link_down, :medium)` (or `:in_use`, `:mismatch` for a refused open); the backing is closed and **the carrier stays**, not open, until its owner sends `:close` | does not apply |
 
-**The hazard.** A `cast` to an actor that has ended ends the sender with `actor_not_found` (specification §16.1.4). A
-carrier that ends on its own can end before its owner has read `:link_down`, and an owner that then sends a `:tx`, a
-`:credit` or a `:close` it had already decided on is ended too. Nothing the owner does closes that window. The hosted
-network carriers have it on every fault and on a peer's close; the store carriers do not, because only their owner's
-`:close` ends them. For a store the owner is usually the actor that holds the application's unsaved data, which is why
-the store carriers were built the safe way first.
+**The hazard (removed for `cast`, 2026-11-16).** Until 2026-11-16 a `cast` to an actor that had ended ended the sender
+with `actor_not_found`. A carrier that ends on its own can end before its owner has read `:link_down`, and an owner that
+then sent a `:tx`, a `:credit` or a `:close` it had already decided on was ended too. Nothing the owner did closed that
+window. The hosted network carriers had it on every fault and on a peer's close; the store carriers did not, because only
+their owner's `:close` ends them. For a store the owner is usually the actor that holds the application's unsaved data,
+which is why the store carriers were built the safe way first. A `cast` to an ended actor now returns `false` and the
+sender goes on (specification §16.1.2 and §16.1.4), so such a `:tx`, `:credit` or `:close` is dropped and the owner is
+not ended. `call`, `call_with_timeout` and the registered casts still raise `actor_not_found`.
 
-**Upgrade note: end on failure everywhere, and change the language (decided in direction, Lee, 2026-11-12; not built).**
+**Upgrade note: end on failure everywhere, and change the language (decided in direction, Lee, 2026-11-12; item 1
+built for `cast` 2026-11-16, items 2 to 4 not built).**
 The intended rule is the one this section states: every carrier ends when its link fails, with an exit reason, and its
 supervisor decides what happens next. Making that safe is a change to the language, not to the carriers:
 
-1. **The language.** A `cast` to an ended carrier must not end its sender. The change is to what a `cast` to an ended
-   actor does (for instance: it answers `false` and the sender goes on), in specification §16.1.4, §15.1.2.3 and
-   §15.4.11, and in the runtime of every target (Apple Silicon, Linux AArch64, Linux x86-64, ESP32-S3_raw,
-   STM32-L476RG_raw). Whether it holds for every actor reference or only for a carrier's is part of that design.
+1. **The language (done for `cast`, 2026-11-16).** A `cast` to an ended carrier must not end its sender. A `cast` or a
+   `cast_device` to an actor that has ended, or never existed, now returns `false` and the sender goes on. It holds for
+   every actor reference, not only a carrier's. It is stated in specification §16.1.2, §16.1.4 and §15.1.2.3 and made in
+   the runtime of every target. Built and run on Apple Silicon; changed but not run on Linux AArch64, Linux x86-64,
+   ESP32-S3_raw and STM32-L476RG_raw. `call`, `call_with_timeout` and the registered casts are unchanged and still
+   raise `actor_not_found`; whether they change is not decided.
 2. **The store carriers.** `store_memory_carrier` and `dangerous_store_backing_carrier` then end on a medium failure and
    on a refused open, with `stop_self((:explicit, :link_lost))` and `(:explicit, :link_unavailable)`, as the network
    carriers do, and §6.8.2 and §6.8.10 lose their exception.
@@ -546,11 +551,13 @@ supervisor decides what happens next. Making that safe is a change to the langua
    on the carrier staying to be opened again must start a new carrier, or leave that to its supervisor.
 4. **Trials.** A trial in which an owner sends to a carrier that has already ended, for each carrier kind; the
    `ethernet_direct` example's dial retry, which closes a carrier that a refused dial has already ended, is the case
-   that exists today.
+   that exists today. The `(:tcp)` carrier has its trial (2026-11-16,
+   `transport_addition/app_transport_tcp_close_after_end`, run on Apple Silicon);
+   the other carrier kinds have none yet.
 
-Until then a program that owns a hosted network carrier should treat `:link_down` as the last use of that reference
-and should not send to a carrier it has not heard from, and a program that owns a store carrier must send `:close` to
-be rid of it.
+What remains is items 2 and 3, and the trials of item 4 for the other carrier kinds. Until item 2 is built a program
+that owns a store carrier must send `:close` to be rid of it. A program that owns a hosted network carrier should still
+treat `:link_down` as the last use of that reference: a message sent after it is dropped.
 
 **Listeners.** A carrier whose `addressing` is `:endpoint` and whose `boundaries` are `:stream` may be opened to
 listen instead of connect (`(:tcp)`: `"listen:<port>"` binds 127.0.0.1 only; `"listen:any:<port>"` binds every IPv4
@@ -1057,7 +1064,8 @@ actor either. Composite `recreate` is not built. So the backing carrier keeps no
 - **A medium failure does not end the carrier (now the documented behaviour, §6.2 and §6.8.2; to change with the upgrade
   note of §6.2).** A write, a flush or a read that fails answers `(:link_down, :medium)`
   and closes the backing; the carrier stays, not open, until its owner sends `:close`. An owner that sends a late message
-  then finds an actor: a cast to an ended actor ends its sender with `actor_not_found`. Only `:close` ends the carrier.
+  then finds an actor: until 2026-11-16 a cast to an ended actor ended its sender with `actor_not_found` (it now returns
+  `false`, §6.2). Only `:close` ends the carrier.
 - **A refused open leaves the carrier too:** `(:link_down, :in_use)`, `(:link_down, :mismatch)` or `(:link_down, :medium)`,
   and the owner may open again or close.
 - **`(:tx_credit, n)` and `(:synced, next)` follow the write and the flush** they report, in the same dispatch.

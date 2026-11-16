@@ -1,0 +1,84 @@
+// An owner sends to a (:tcp) carrier that has already ended, and goes on (specification §16.1.2, §16.1.4 and §16.4.8; transport design §6.2, upgrade note item 4).
+// Dialing "127.0.0.1:1:3000", a loopback port nothing listens on, is refused at once: (:link_down, :fault) to the owner, and the carrier ends (:explicit, :link_unavailable). Port 1 (tcpmux) is assumed closed on the host.
+// No link; the carrier is spawned directly.
+//
+// The owner keeps the reason of (:link_down, why). The carrier's end reaches the failure reporter as its failure report, and the reporter then tells the owner (:carrier_ended, 1), so the owner sends only once the carrier has ended. The reporter must be registered before any actor is spawned (E2236), so it reaches the owner by its registered name, :link_owner.
+// The owner casts :close and (:credit, 1) to the ended carrier: each cast returns false and the owner is not ended. It casts (:carrier_ended, 2) to itself, handles that message too, and ends the program with exit code 0.
+// Before 2026-11-16 the first of these casts ended the owner with (:explicit, :actor_not_found) and the program never ended.
+module dangerous_tcp_close_after_end;
+
+use dangerous_sockets;
+use dangerous_tcp_carrier;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(msg: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: boolean <- case contains(msg, "(:explicit, :link_unavailable)") of {
+            true -> cast_registered(:link_owner, (:carrier_ended, 1) impl ActorMessage {});
+            false -> cast_exit(3)
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:carrier_ended, int64),
+         state: { car: dangerous_actor_ref, down: atom })
+    -> (:no_reply, { car: dangerous_actor_ref, down: atom }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, state);
+        (:accepted, _conn: dangerous_actor_ref, _peer: string) -> (:no_reply, state);
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n2: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> (:no_reply, { car: state.car, down: why2 });
+        (:carrier_ended, step: int64) -> {
+            sequence proc[concurrency, device_io]
+                _: boolean <- case step of {
+                    1 -> {
+                        _: atom <- println(down_text(state.down));
+                        closed: boolean <- cast(state.car, :close impl ActorMessage {});
+                        print("close to the ended carrier: ");
+                        print_boolean(closed);
+                        println("");
+                        credited: boolean <- cast(state.car, (:credit, 1) impl ActorMessage {});
+                        print("credit to the ended carrier: ");
+                        print_boolean(credited);
+                        println("");
+                        cast(self(), (:carrier_ended, 2) impl ActorMessage {})
+                    };
+                    _: int64 -> {
+                        _: atom <- println("the owner handled its next message");
+                        cast_exit(0)
+                    }
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+fn down_text(why: atom) -> string {
+    case why of {
+        :fault -> "link_down :fault";
+        :none -> "no link_down before the carrier ended";
+        _: atom -> "link_down, another reason"
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        own: actor_ref <- spawn_registered({ car: car, down: :none }, owner, :link_owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, own, "127.0.0.1:1:3000") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
