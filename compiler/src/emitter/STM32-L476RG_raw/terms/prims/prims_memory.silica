@@ -36,6 +36,7 @@ use atom_table;
 use arm_isa;
 use arm_mem;
 use arm_frame;
+use prims_memory_spaces;
 
 export is_memory_prim/1;
 export emit_prim_op/2;
@@ -110,7 +111,9 @@ fn emit_ref_eq(dest: string) -> string {
 // it is released with that frame; nothing is taken from the heap. The block is the 4128 bytes the heap
 // form used: a 32-byte header and 4096 bytes of cells.
 // Region layout, unchanged: [base+0]=bump (starts at base+32), [base+8]=end, [base+16]=extensions,
-// [base+24]=span end. Operands: X1 = space (unused). X4 and X5 are the scratch the heap form used.
+// [base+24]=span end. The space operand is not loaded: emit_prim_op reads its name and refuses a
+// space this board does not provide (memory_prim_space_refusal). X4 and X5 are the scratch the heap
+// form used.
 fn emit_alloc_region(dest: string) -> string {
     alloc: string <- arm_frame@dyn_alloc_asm("#4128", "X4");
     add_bump: string <- arm_isa@xt_add("X5", "X4", "#32");
@@ -241,10 +244,26 @@ fn emit_alloc_ref(term: { nodes: List[{ kind: int64, type_name: string, value: s
     }
 }
 
+// True when the ref operand of read_ref / write_ref (the prim's first operand) is typed in the
+// atomic space: ref(L, atomic, T). The operand's SIR node carries its type text.
+fn ref_operand_is_atomic(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    memory_type_contains(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name, "atomic")
+}
+
+// An access to an atomic cell is ordered against every other memory access: DMB SY before it and
+// DMB SY after it (spec §9.1.1; the function-entry and function-exit barriers of control.silica stay).
+// Any other ref is accessed as before.
+fn atomic_ordered(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, access: string) -> string {
+    case ref_operand_is_atomic(term) of {
+        true -> concat("    dmb sy\n", concat(access, "    dmb sy\n"));
+        false -> access
+    }
+}
+
 // read_ref(ref): load value from ref
 // Operands: X1 = ref (pointer)
-fn emit_read_ref(dest: string) -> string {
-    arm_mem@xt_ldr(dest, "[X1]")
+fn emit_read_ref(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    atomic_ordered(term, arm_mem@xt_ldr(dest, "[X1]"))
 }
 
 fn emit_write_ref_tuple_copy_words(word_index: int64, word_count: int64) -> string {
@@ -269,10 +288,11 @@ fn emit_write_ref_tuple(term: { nodes: List[{ kind: int64, type_name: string, va
 }
 
 fn emit_write_ref(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
-    case memory_value_is_tuple_like(sir_term_at(term, sir_term_root_node(term).right_expr)) of {
+    access: string <- case memory_value_is_tuple_like(sir_term_at(term, sir_term_root_node(term).right_expr)) of {
         true -> emit_write_ref_tuple(term, dest);
         false -> emit_write_ref_scalar(dest)
-    }
+    };
+    atomic_ordered(term, access)
 }
 
 // alloc_buf(region, N): bump-allocate buffer of N elements within region.
@@ -619,7 +639,33 @@ fn emit_evacuation_helper() -> string {
     ""
 }
 
+// The `.error` line for a memory prim that uses a space this board does not provide
+// (prims_memory_spaces), "" otherwise. alloc_region names its space in its operand, a variable node
+// `%<space>`; every memory prim carries its `[mem(<space>)]` effect in `value` and its result type in
+// `type_name`, and its operands (a region, a ref, a buffer) carry their own types.
+fn memory_prim_space_refusal(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> string {
+    node: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(term);
+    first: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, node.inner));
+    second: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- sir_term_root_node(sir_term_at(term, node.right_expr));
+    operand: string <- case node.name == "alloc_region" and first.kind == 1 of {
+        true -> prims_memory_spaces@space_operand_refusal(first.name);
+        false -> ""
+    };
+    case operand == "" of {
+        false -> operand;
+        true -> prims_memory_spaces@space_text_refusal(concat(node.value, concat(" ; ", concat(node.type_name, concat(" ; ", concat(first.type_name, concat(" ; ", second.type_name)))))))
+    }
+}
+
 fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
+    refusal: string <- memory_prim_space_refusal(term);
+    case refusal == "" of {
+        false -> refusal;
+        true -> emit_provided_prim_op(term, dest)
+    }
+}
+
+fn emit_provided_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     case sir_term_root_node(term).name of {
         "alloc_region" -> case alloc_in_frame(term) of {
             // The lifetime witness (design §3.2): the allocating frame's X29, never dereferenced.
@@ -628,7 +674,7 @@ fn emit_prim_op(term: { nodes: List[{ kind: int64, type_name: string, value: str
         };
         "alloc_ref" -> emit_alloc_ref(term, dest);
         "alloc_rec" -> emit_alloc_rec(term, dest);
-        "read_ref" -> emit_read_ref(dest);
+        "read_ref" -> emit_read_ref(term, dest);
         "write_ref" -> emit_write_ref(term, dest);
         "alloc_buf" -> emit_alloc_buf(term, dest);
         "alloc_buf_retained" -> emit_alloc_buf_retained(dest);

@@ -148,6 +148,31 @@ Actors run on both LX7 cores (`get_cpu_topology()` reports two `:performance` co
 to core 1 runs on the APP cpu, which the runtime starts at its first actor entry point --
 [design §8.9](../../../../design_documents/ports/esp32s3_xtensa_port.md)).
 
+## Memory spaces: exact, equivalent or emulated
+
+What the chip provides for each `Space` of the specification (§4.4.2), read from the ESP32-S3 Technical Reference
+Manual v1.8 on 2026-11-16. **This describes the hardware. The runtime does not yet implement per-`Space` behaviour**
+(`Space` is not passed to the allocator and there are no per-`Space` pools; see
+[porting_for_os_free_targets.md](../../../../design_documents/porting_for_os_free_targets.md) §7 and §7.1, which also
+has the STM32L476 columns). Nothing here was run on the board.
+
+**Exact** means the hardware provides the behaviour. **Equivalent** means the memory has no cache, so the behaviour
+holds trivially at no cost, but the chip has no such setting. **Emulated** means the runtime would have to supply it.
+**Not found** means the manual says nothing and nothing is assumed.
+
+| `Space` | Internal SRAM | External RAM (PSRAM, through the DCache) |
+| --- | --- | --- |
+| `normal` (write-back) | equivalent: no data cache is described for internal SRAM (TRM 4.3.2) | **exact**: the DCache is write-back, with dirty bits and write-back, clean and invalidate operations, on the DCache only (TRM 4.3.3.3) |
+| `normal_writethrough` | equivalent: every write reaches memory | **emulated**: the TRM describes no write-through mode and no per-region cache-policy register; the runtime would run the DCache write-back operation after each write |
+| `normal_noncacheable` | **exact**: internal SRAM is not cached | **not found**: no uncached path or bypass is described; emulate with write-back plus invalidate around each use, or keep the data in internal SRAM |
+| `atomic` | **exact**: `S32C1I`, already used for the runtime's spin locks (`rt_heap.S`, `rt_actors.S`, `rt_supervisors.S`, `rt_console.S`). The TRM does not describe `S32C1I` or `ATOMCTL` (that is the Xtensa ISA manual, not read) | **not confirmed**: a forum answer (not Espressif documentation) says hardware compare-and-swap does not work on PSRAM addresses; treat as not available until checked |
+| `device` | no cache attribute exists; peripherals have their own address ranges, and Permission Control (TRM chapter 15) gives read, write and execute rights per Secure and Non-secure world, not memory attributes | n/a |
+
+Unconfirmed: `S32C1I` and `ATOMCTL` behaviour, and whether any uncached path to PSRAM exists. Today the whole
+program (code, data, heap and stack) lives in about 390 KB of internal SRAM with no flash cache mapping (see "Image
+model"), so the external RAM column applies only once PSRAM support is added: the badge carries 2 MB of quad PSRAM
+(`PORT_TEST_BOARD_byu_idaho_v4.0_feb26.md`), which the runtime does not use yet.
+
 ## Stack budget
 
 `main`'s stacks are fixed and sized per image; every actor's and supervisor's two stacks are chains
