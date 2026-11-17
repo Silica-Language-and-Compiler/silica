@@ -184,6 +184,25 @@ Follow [memory-effects-aarch64-implementation-plan.md](memory-effects-aarch64-im
 
 `device` RAM-like arenas (if any) stay distinct from **mapped peripheral windows**.
 
+### 7.1 What the chips provide: exact, equivalent or emulated (read 2026-11-16)
+
+For each `Space` of the specification (§4.4.2: `normal`/`normal_writeback`, `normal_writethrough`, `normal_noncacheable`, `atomic`, `device`) this table says what the hardware gives, so that the capability flag of item 4 above can be set from facts. **Exact** means the hardware provides the behaviour. **Equivalent** means the chip has no cache on that memory, so the behaviour holds trivially and costs nothing, but the hardware has no such setting. **Emulated** means the runtime has to supply it. **Not found** means the manual says nothing and nothing is assumed. Sources: ESP32-S3 Technical Reference Manual v1.8 (the whole manual, read locally); STM32L4 reference manual RM0351 chapter 2 (a mirror, one chapter); ST application note AN4838 and the Cortex-M4 documentation (PM0214 and the Arm Cortex-M4 TRM) through search excerpts only. Nothing here was run on a board.
+
+| `Space` | ESP32-S3 internal SRAM | ESP32-S3 external RAM (PSRAM, through the DCache) | STM32L476 SRAM1 / SRAM2 | STM32L476 peripherals |
+| --- | --- | --- | --- | --- |
+| `normal` (write-back) | equivalent: no data cache is described for internal SRAM (TRM 4.3.2) | **exact**: the DCache is write-back, with dirty bits and write-back, clean and invalidate operations on the DCache only (TRM 4.3.3.3) | equivalent: RM0351 chapter 2 describes no cache for SRAM; SRAM runs at full clock with no wait state | n/a |
+| `normal_writethrough` | equivalent (every write reaches memory) | **emulated**: the TRM describes no write-through mode and no per-region cache-policy register; the runtime would run the DCache write-back operation after each write | equivalent | n/a |
+| `normal_noncacheable` | **exact**: internal SRAM is not cached | **not found**: no uncached path or bypass is described (a search of the TRM for uncached, non-cacheable and bypass found none); emulate with write-back plus invalidate around each use, or place the data in internal SRAM | equivalent: the Cortex-M4 has no data cache, and the MPU's cacheable bit has no effect on SRAM | n/a |
+| `atomic` | **exact**: `S32C1I`, which the runtime already uses for its spin locks (`rt_heap.S`, `rt_actors.S`, `rt_supervisors.S`, `rt_console.S`). The TRM does not describe `S32C1I` or `ATOMCTL` (Xtensa ISA manual, not read) | **not confirmed**: a forum answer, not Espressif documentation, says hardware compare-and-swap does not work on PSRAM addresses and the IDF falls back to a critical section; treat as not available until checked | **exact** with `LDREX`/`STREX` on ordinary SRAM addresses: a load-exclusive tag is cleared by any `STREX`, by `CLREX` and by an exception, so every sequence needs a retry loop; exclusive access to the bit-band alias (`0x22000000`) is **not** supported; DMA takes no part in the monitor | n/a |
+| `device` | no cache attribute exists; peripherals are at their own address ranges; Permission Control (TRM chapter 15) gives read, write and execute rights per Secure and Non-secure world, not memory attributes | n/a | n/a | **exact through the MPU**: TEX, S, C and B bits select Device or Strongly-ordered (AN4838); the runtime programs the MPU for guard regions only (`rt_start.S`, `rt_failure.S`), not for attributes |
+
+**What follows for the port** (proposals; Lee to confirm):
+
+1. The capability flag reports **exact** only for rows marked exact. Rows marked equivalent are a decision for Lee: true by construction, but not a hardware setting a program could rely on if a later chip adds a cache.
+2. On the ESP32-S3 the real choices are three: internal SRAM (uncached, atomic by `S32C1I`), external RAM through the write-back DCache, and peripherals. A program that needs write-through or uncached external RAM today needs explicit write-back and invalidate calls; those two operations are the whole emulation.
+3. On the STM32L476 the only space that needs hardware set-up is `device` (an MPU region); `atomic` needs a lowering to `LDREX`/`STREX` retry loops, written so that it never targets the bit-band alias.
+4. Unconfirmed, to check before relying on the row: `S32C1I`/`ATOMCTL` behaviour on the ESP32-S3 (the Xtensa ISA manual), whether any uncached path to PSRAM exists, the Cortex-M4 exclusive monitor on Device and Strongly-ordered regions, and what the L4 flash accelerator caches (RM0351 chapter 3, not read).
+
 ---
 
 ## 8. Boot, image, and I/O without Darwin
