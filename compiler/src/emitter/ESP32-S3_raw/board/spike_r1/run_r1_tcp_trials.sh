@@ -25,7 +25,7 @@
 #
 # Without programs named: every program of TRIALS below. Lines the shim prints ("shim: ...") are
 # left out of the comparison. A program whose carried_on names a link the board's pack does not provide
-# ((:loopback), (:interface, name), (:ethernet, n), (:wifi, n) but 0) is refused by the compiler
+# ((:interface, name), (:ethernet, n), (:wifi, n) but 0) is refused by the compiler
 # (E2412), which is reported and not counted. Exit status: the number of programs that failed.
 #
 # Needs: the ESP32-S3_raw Silica compiler (SILICA_COMPILER, default the local build), the guest's
@@ -135,7 +135,11 @@ for t in $TRIALS; do
     [ "$build_only" = 1 ] && { echo "$t: built"; continue; }
     "$PY" "$BOARD/tools/run_on_board.py" --flash --timeout "${SPIKE_TIMEOUT:-60}" "$out/$name.bin" > "$out/$name.raw" 2> "$out/$name.log" || true
     grep -a -v '^shim: ' "$out/$name.raw" > "$out/$name.sout" || true
-    if "$BOARD/tools/compare_sout.sh" "$out/$name.sout" "$dir/$name.scout" > "$out/$name.diff" 2>&1; then
+    # a .scout with an actor failure report in it holds <PTR> for the fields that differ from run to
+    # run, and its suite compares with the pointer lines folded (tests/pins/compare_scout_normalized.sh)
+    compare="$BOARD/tools/compare_sout.sh"
+    grep -q '<PTR>' "$dir/$name.scout" && compare="$BOARD/tests/pins/compare_scout_normalized.sh"
+    if "$compare" "$out/$name.sout" "$dir/$name.scout" > "$out/$name.diff" 2>&1; then
         echo "$t: pass"
     else
         echo "$t: FAIL; see $out/$name.diff"; failed=$((failed + 1))

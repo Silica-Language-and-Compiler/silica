@@ -1899,9 +1899,9 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     The six refused name a link the board's pack does not provide; four of them are the hosts' trials
     of a link that is absent at run time, which the board refuses when it compiles.
   - The Wi-Fi image three links of three and the two-radio image three and three after the change.
-  - **Open.** Whether the board's pack should provide `(:loopback)` where lwIP is in the image (the
-    two trials above would then run); the trials are not in the board's trial harness, which builds
-    images without the radio libraries.
+  - The board's pack provides `(:loopback)` since part 15, and the two trials that declare it run.
+    The trials are not in the board's trial harness, which builds images without the radio
+    libraries.
 
 - **Stage 12, part 14, 2026-11-16, tried, not adopted: actors on both cores beside the radios.**
   `run_r1_both.sh --both-cores` builds the runtime for two cores (`-DNCORES_RUN=2`,
@@ -1949,6 +1949,20 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     `-DSOCKETS_STATION_REPORT` (why the station lost its access point, why `link_select` or
     `connect` refused), `-DSOCKETS_PREEMPT_REPORT`.
 
+- **Stage 12, part 15, 2026-11-16, done: `(:loopback)` on the board** (decision 9). The board's
+  pack provides the link `(:loopback)` for the kind `(:tcp)`: the hosted carrier with the link
+  "loopback" in its state, as the hosted packs spawn it, over lwIP's own loopback interface. The
+  station is not started for it. Like `(:wifi, 0)`, a program that declares it links only where
+  lwIP and the wrappers are in the image.
+  - The hosts' trials on the board (`run_r1_tcp_trials.sh`): six of the ten give the `.scout`'s
+    output, now with `dangerous_tcp_loopback_link` and `dangerous_link_listen_ip_refused_loopback`
+    (a listen on an address that is not the loopback's is refused, the carrier ending
+    `:link_unavailable`); the four left are refused by the compiler, E2412, for `(:interface, name)`,
+    `(:ethernet, n)` and `(:wifi, 7)`. A `.scout` with an actor failure report is compared as its
+    suite compares it, the pointer lines folded (`tests/pins/compare_scout_normalized.sh`).
+  - The three error goldens of `transport_board_addition` that quote the board's links name
+    `(:loopback)` too, and pass.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
@@ -1992,3 +2006,9 @@ Each stage's result is recorded here when it closes: date, what was built, trial
 
 8. **Linux comes after the board** (stage 11), together with the Linux goldens that already wait to be regenerated.
    Deferred on 2026-11-14 until a Linux machine with Bluetooth is at hand.
+
+9. **Route R1 is the route for the board's radios** (2026-11-16), in place of decisions 2 and 3: the bare-metal
+   runtime owns the chip, the actors run on core 0, and Espressif's libraries, NimBLE and lwIP are its guests on
+   core 1 (stage 12). With it: the board provides `(:loopback)` where lwIP is in the image; the carriers' common
+   helpers go in one module; the RAM above the image goes to every ESP32-S3 program's heap. The branch is merged
+   into main later, and what becomes of the guest target (stages 4 to 9) is decided then.
