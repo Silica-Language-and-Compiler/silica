@@ -37,6 +37,7 @@ silica.config:
 		echo "../../compiler/stdlib/wireframe.silica"; \
 		echo "../../compiler/stdlib/Carrier.silica"; \
 		echo "../../compiler/stdlib/dangerous_nimble.silica"; \
+		echo "../../compiler/stdlib/carrier_support.silica"; \
 		echo "../../compiler/stdlib/dangerous_ble_radio.silica"; \
 		echo "../../compiler/stdlib/dangerous_ble_gatt_board_carrier.silica"; \
 		find "$$PWD" -maxdepth 1 -type f -name '*.silica' | sed "s|^$$PWD/||" | LC_ALL=C sort; \

@@ -24,7 +24,7 @@
 # (:tcp) carrier above lwIP (run_r1_wifi_peer.sh) and the board's (:ble_gatt) carrier above NimBLE
 # (run_r1_peer.sh), in one image. The actors run on core 0; core 1 has the tasks of the Wi-Fi
 # libraries, lwIP, the Bluetooth controller and NimBLE, and both radios' interrupts. The libraries'
-# memory: the RAM above the image, then a region of the runtime's heap (BOTH_LIB_REGION_KB, 64 unless
+# memory: the RAM above the heap, then a region of the runtime's heap (BOTH_LIB_REGION_KB, 86 unless
 # given), then the heap (hci_shim.c). --links <n> whole exchanges on each radio.
 #
 # The Mac's ends are not started here: wifi_peer.py <port> <n> for Wi-Fi (the port is WIFI_PORT, 4370
@@ -77,7 +77,7 @@ SRC="$DEMO/build/board_peer/src"
 rm -rf "$DEMO/build/board_peer"; mkdir -p "$SRC/dangerous_exposure_source/lib"
 ln -sfn "$ROOT/compiler/stdlib/net" "$SRC/dangerous_exposure_source/sockets"
 ln -sfn "$ROOT/compiler/stdlib/ble" "$SRC/dangerous_exposure_source/ble"
-modules="Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_carrier dangerous_nimble dangerous_ble_radio dangerous_ble_gatt_board_carrier"
+modules="Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_carrier carrier_support dangerous_nimble dangerous_ble_radio dangerous_ble_gatt_board_carrier"
 for m in $modules; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$SRC/$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$SRC/trial_wait_int64.silica"
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" "$SRC/trial_support_hex.silica"
@@ -138,7 +138,7 @@ export BOARD_FLASH_FILES
 export BOARD_FLASH_IRAM=1
 inc="-I$out -I$C/esp_wifi/include -I$C/esp_wifi/include/local -I$C/esp_event/include -I$C/esp_netif/include -I$C/esp_phy/include"
 inc="$inc -I$L/include -I$L/include/apps -I$L/include/apps/sntp -I$L/lwip/src/include -I$L/port/include -I$L/port/freertos/include -I$L/port/esp32xx/include -I$L/port/esp32xx/include/arch"
-export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSOCKETS_WIFI_PS -DSOCKETS_WIFI_RX_BUFFERS=6 -DSPIKE_STACK_TIGHT -DSILICA_BLE_OPEN_LINK -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DSPIKE_LIB_REGION_KB=${BOTH_LIB_REGION_KB:-64} -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
+export SPIKE_CFLAGS="${SPIKE_CFLAGS:-} $inc -DSPIKE_WIFI -DSOCKETS_WIFI_PS -DSOCKETS_WIFI_RX_BUFFERS=6 -DSPIKE_STACK_TIGHT -DSILICA_BLE_OPEN_LINK -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DSPIKE_LIB_REGION_KB=${BOTH_LIB_REGION_KB:-86} -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
 # the runtime on one core, core 0, for the program's actors; core 1 is the radio's tasks' (r1_port.c)
 if [ "$both_cores" = 1 ]; then
     export BOARD_ASFLAGS="-DNCORES_RUN=2"

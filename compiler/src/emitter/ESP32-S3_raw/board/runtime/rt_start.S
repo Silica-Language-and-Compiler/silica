@@ -163,22 +163,19 @@ _start:
     s32i    a5, a2, 0
     memw
 
-    // 4. Zero .bss through the fault and auxiliary stacks (up to the heap), the heap (allocations
-    //    are returned zeroed) and main's machine stack: nothing lives below a1 yet, and _start's own
-    //    frame is above _silica_stack_top (the ROM's area, never spilled to: _start never returns).
+    // 4. Zero .bss through the fault stacks, main's auxiliary stack and its machine stack (up to the
+    //    heap) and the heap: nothing lives below a1 yet, and _start has no frame (it never returns).
+    //    The heap's upper end is where the ROM had its stack (silica_esp32s3.ld): a1 has left it.
     movi    a2, _silica_bss_start
     movi    a3, _silica_heap_start
     call0   silica_rt_zero_words_c0
     movi    a2, _silica_heap_start
     movi    a3, _silica_heap_end
     call0   silica_rt_zero_words_c0
-    movi    a2, _silica_heap_end
-    movi    a3, _silica_stack_top
-    call0   silica_rt_zero_words_c0
 
     // 5. Stack guards (Xtensa data breakpoints: DBREAKC bit 31 = break on store, mask 0 = 64-byte
     //    range; both addresses are 64-byte aligned). Armed after the zeroing above, which stores there.
-    movi    a2, _silica_heap_end          // machine stack bottom
+    movi    a2, _silica_main_stack_bottom // machine stack bottom
     wsr     a2, dbreaka0
     movi    a3, 0x80000000
     wsr     a3, dbreakc0
@@ -211,7 +208,7 @@ silica_rt_start_windowed:
     rur     a2, threadptr
     movi    a3, silica_rt_aux_stack_top
     s32i    a3, a2, VRG_VSP
-    movi    a3, _silica_heap_end          // main's machine-stack limit: guard top + runtime reserve
+    movi    a3, _silica_main_stack_bottom // main's machine-stack limit: guard top + runtime reserve
     movi    a4, _silica_rt_depth_reserve
     add     a3, a3, a4
     addi    a3, a3, 64
@@ -310,10 +307,24 @@ silica_rt_start_app_cpu:
     s32i    a3, a2, 0
     memw
     // the ROM's APP cpu loop jumps to this address once it is set
+    movi    a2, silica_rt_core1_arrived
+    movi    a3, 0
+    s32i    a3, a2, 0
+    memw
     movi    a10, silica_rt_start_core1
     movi    a8, ETS_SET_APPCPU_BOOT_ADDR
     callx8  a8
-    retw
+    // Until core 1 is in silica_rt_start_core1 it runs the ROM's code on the ROM's stack, which is
+    // RAM the heap has (silica_esp32s3.ld): wait for it here, before anything more is allocated.
+    // Bounded (a second or so at any clock), so that a core that never starts is not a silent hang.
+    movi    a2, silica_rt_core1_arrived
+    movi    a4, 0x2000000
+1:  memw
+    l32i    a3, a2, 0
+    bnez    a3, 2f
+    addi    a4, a4, -1
+    bnez    a4, 1b
+2:  retw
     .size   silica_rt_start_app_cpu, . - silica_rt_start_app_cpu
 
 // silica_rt_stall_app_cpu(): freeze core 1 where it stands (RunStall). The program's end
@@ -411,6 +422,10 @@ silica_rt_start_core1:
     s32i    a3, a2, VRG_ALIMIT
     movi    a0, 0
     movi    a1, silica_rt_core1_stack_top
+    movi    a2, silica_rt_core1_arrived             // off the ROM's stack: core 0 goes on
+    movi    a3, 1                                   // (silica_rt_start_app_cpu)
+    s32i    a3, a2, 0
+    memw
     // An image may give core 1 to foreign code (transport_ble_plan.md stage 12: the Bluetooth
     // controller's and host's tasks): it links silica_rt_board_core1, which does not return, and
     // starts the core itself (silica_rt_start_app_cpu) with the runtime built for one core.
@@ -449,6 +464,11 @@ silica_rt_core_regs:
 silica_rt_core1_stack_bottom:              // core 1's boot stack: silica_rt_core1_main and the first switch
     .space  CORE1_STACK_SIZE
 silica_rt_core1_stack_top:
+
+    .section .bss.silica_rt_core1_arrived, "aw", @nobits
+    .balign 4
+silica_rt_core1_arrived:                   // 1 once core 1 is on its boot stack (silica_rt_start_core1)
+    .space  4
 
     .section .rodata.silica_rt_start, "a"
 silica_rt_start_marker:

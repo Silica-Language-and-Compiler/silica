@@ -43,6 +43,7 @@
     .global _silica_heap_start
     .global _silica_heap_end
     .global _silica_stack_top
+    .global _silica_main_stack_bottom
 silica_rt_aux_stack_bottom:
     .space  GUEST_AUX_SIZE
 silica_rt_aux_stack_top:
@@ -51,6 +52,7 @@ _silica_heap_start:
     .space  GUEST_HEAP_SIZE
     .balign 64
 _silica_heap_end:
+_silica_main_stack_bottom:               // main's machine stack is above the heap here
     .space  GUEST_MAIN_STACK_SIZE
     .balign 16
 _silica_stack_top:

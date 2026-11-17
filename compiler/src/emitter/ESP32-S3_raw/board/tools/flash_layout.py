@@ -63,7 +63,7 @@ def script(src, out, patterns, iram=False):
     swap('*(.rodata .rodata.* .srodata .srodata.*)')
     if iram:
         swap('*(.iram1 .iram1.*)')
-    memory = '  dram (RW) : org = 0x3FC88000, len = 0x61700\n'
+    memory = '  dram (RW) : org = 0x3FC88000, len = 0x66E00\n'
     if text.count(memory) != 1:
         sys.exit('flash_layout: the linker script has no dram region as expected')
     text = text.replace(memory, memory +

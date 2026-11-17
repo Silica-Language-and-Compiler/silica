@@ -1963,6 +1963,55 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - The three error goldens of `transport_board_addition` that quote the board's links name
     `(:loopback)` too, and pass.
 
+- **Stage 12, part 16, 2026-11-16, done: the RAM above the image is the heap's, in every ESP32-S3
+  program** (decision 9). The heap of the bare-metal runtime ended below `main`'s machine stack at
+  0x3FCE9700, the bound the ROM loads an image under; the R1 shim used 22 KB above it for the
+  libraries. Now `main`'s machine stack is below the heap, and the heap goes on to 0x3FCEEE00
+  (`runtime/silica_esp32s3.ld`): 22,272 bytes more for every program, radio or not.
+  - What is up there (ESP-IDF's `bootloader.memory.ld.in`): the ROM's stack for core 0, 0x3FCE9710
+    to 0x3FCEB710, which nothing uses once `_start` has its own; the ROM's stack for core 1, to
+    0x3FCED710, in use from the moment core 1 is released until it reaches `silica_rt_start_core1`;
+    data the ROM uses only while it starts, to 0x3FCEEE34. `silica_rt_start_app_cpu` now waits
+    (bounded) for core 1 to be on its boot stack before it returns, so nothing is allocated while
+    the ROM still writes there. The heap zeroes each block as it is taken, so what the ROM left
+    does not show.
+  - All that is loaded, and both of `main`'s stacks, must still end under 0x3FCE9700; the linker
+    refuses an image where they do not. `rt_start.S`, `rt_actors.S` and `rt_console.S` name the
+    machine stack's bottom `_silica_main_stack_bottom` where they used the heap's end. The guest of
+    ESP-IDF shares `rt_actors.S` and `rt_console.S` and keeps its own layout, the stack above the
+    heap, so its `rt_guest_mem.S` defines the same name at the heap's end; the guest's Bluetooth
+    image builds, and was not run.
+  - The shim keeps one region outside the heap (0x3FCF0000 to 0x3FCF8000) and takes the 22 KB as
+    part of its region in the heap: `SPIKE_LIB_REGION_KB` 38 by default, 54 for the Wi-Fi image, 86
+    for the two-radio image.
+  - On the board: the core suites 1,164 of 1,164; the two-radio image fifteen links of fifteen on
+    each radio, status 0, its heap 294,528 bytes (272 KB before), 248 KB of it in use at the end;
+    the Wi-Fi image five links of five; `dangerous_tcp_listener`, `dangerous_tcp_loopback_link`,
+    `dangerous_tcp_listen_any` and `dangerous_tcp_loopback` as their `.scout`. Not run on this
+    layout: `dangerous_link_listen_ip` and `dangerous_link_listen_ip_refused_loopback` (the board
+    was taken off its cable during the run; both passed before the change), the single-radio
+    Bluetooth image, and the board's trial suites beyond the core ones.
+
+- **Stage 12, part 17, 2026-11-16, done for the Bluetooth carriers: the carriers' common helpers in
+  one module** (decision 9). `compiler/stdlib/carrier_support.silica` holds `starts`, `int_text`
+  and `none_res`; `dangerous_ble_gatt_carrier` and `dangerous_ble_gatt_board_carrier` use it in
+  place of their own copies.
+  - `pure_int` stays in each carrier: the compiler does not infer the type of a `recreate()` that
+    is the argument of a call into another module (E2005). The readers of a carrier's own message
+    (`msg_kind` and the rest) stay too: they follow the carrier's message type. The radio actor
+    used only `pure_int` and is unchanged.
+  - The hosted `(:tcp)`, `(:udp)`, `(:serial)` and store carriers keep their copies for now: each
+    has assembly goldens for three hosts, the Linux ones recorded on Linux, and two branches in
+    progress change them (`E2-transport-work`, `local-data-storage-as-transport`). They can take
+    the module when those land.
+  - A program that uses either Bluetooth carrier lists `carrier_support.silica` (the demos'
+    scripts, `run_r1_both.sh`, the suite's Makefile). A module more moves the atoms' numbers in the
+    programs of `transport_ble_board_addition`, so its four assembly goldens are recorded again
+    (`trials/targets/gen_board_ascomp.sh`, which compiles only); the suite itself was not run on
+    the board after the change.
+  - On the board: the two-radio image, the Mac's end on the hosted carrier and the board's on the
+    board carrier, fifteen links of fifteen on each radio, status 0.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

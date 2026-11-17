@@ -67,14 +67,14 @@ PLIST
 ln -sfn "$ROOT/compiler/stdlib/ble" dangerous_exposure_source/ble
 $CLANG -fobjc-arc -O2 -arch arm64 -mmacosx-version-min=26.0 -Wall -c "$ROOT/compiler/stdlib/ble/silica_ble.m" -o silica_ble.o || exit 1
 ar rcs dangerous_exposure_source/lib/libsilica_ble.a silica_ble.o
-for m in Supervisor wire_etf wireframe Carrier dangerous_ble dangerous_ble_gatt_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
+for m in Supervisor wire_etf wireframe Carrier carrier_support dangerous_ble dangerous_ble_gatt_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" trial_wait_int64.silica
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" trial_support_hex.silica
 sed -e "s|^fn address() -> string { \"peripheral:\" }|fn address() -> string { \"$ROLE:$UUID\" }|" \
     -e "s|^fn links() -> int64 { 1 }|fn links() -> int64 { $LINKS }|" -e "s|^fn cut_link() -> int64 { 0 - 1 }|fn cut_link() -> int64 { 0 - 1 + 1 + $CUT }|" \
     -e "s|^fn hold_ms() -> uint64 { 0 }|fn hold_ms() -> uint64 { ${HOLD}000 }|" \
     -e "s|^fn second_address() -> string { \"\" }|fn second_address() -> string { \"$SECOND\" }|" "$HERE/dangerous_ble_peer.silica" > dangerous_ble_peer.silica
-printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_ble.silica\ndangerous_ble_gatt_carrier.silica\ntrial_support_hex.silica\ntrial_wait_int64.silica\ndangerous_ble_peer.silica\n' > silica.config
+printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ncarrier_support.silica\ndangerous_ble.silica\ndangerous_ble_gatt_carrier.silica\ntrial_support_hex.silica\ntrial_wait_int64.silica\ndangerous_ble_peer.silica\n' > silica.config
 for i in $(seq 1 12); do "$CC" > compile.log 2>&1; ec=$?; [ $ec -eq 0 ] && break; [ $ec -ne 75 ] && [ $ec -ne 76 ] && break; done
 if [ ! -f dangerous_ble_peer.sams ]; then echo "compile failed (exit $ec); see $WORK/compile.log"; grep -A8 "Compilation error" compile.log | head -12; exit 1; fi
 objs=""

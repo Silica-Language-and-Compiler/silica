@@ -495,7 +495,7 @@ silica_rt_exit:
     call8   silica_rt_exit_marker
     movi    a10, silica_rt_stacks_pre
     call8   silica_rt_puts
-    movi    a10, _silica_heap_end
+    movi    a10, _silica_main_stack_bottom
     movi    a11, _silica_stack_top
     call8   silica_rt_stack_high_water
     movi    a10, _silica_main_stack_size

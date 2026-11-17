@@ -192,7 +192,7 @@ it uses, which is exactly the shape a device description spells out.
 | USB_SERIAL_JTAG `(:esp32s3_usb_serial_jtag)` | `0x60038000` | `0x1000` | 32 | `CONF0 +0x18` | `rt_board.S:60` |
 | SYSTEM `(:esp32s3_system)` | `0x600C0000` | `0x1000` | 32 | `CORE_1_CONTROL_0 +0x00` | `rt_start.S:67` |
 
-Never windows, whatever the base: internal SRAM (`0x3FC88000`–`0x3FCE9700` on the data bus, `0x40378000` on the
+Never windows, whatever the base: internal SRAM (`0x3FC88000`–`0x3FCEEE00` on the data bus, `0x40378000` on the
 instruction bus, `board/runtime/silica_esp32s3.ld:18-31,38-41`), the ROM (`0x40000600` `ets_delay_us`,
 `0x40000720` `ets_set_appcpu_boot_addr`, `rt_board.S:55`, `rt_start.S:74`), and anything outside the peripheral
 region. A constant `map_device((:esp32s3_uart), 0x3FC88000)` is therefore a compile error in the emitter (§4.1).

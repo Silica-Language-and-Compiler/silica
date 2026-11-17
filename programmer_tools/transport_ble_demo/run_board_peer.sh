@@ -54,13 +54,13 @@ cd "$WORK/src" || exit 1
 
 # The program and the modules it uses, compiled in a copy, with the service in place of the placeholder.
 ln -sfn "$ROOT/compiler/stdlib/ble" dangerous_exposure_source/ble
-for m in Supervisor wire_etf wireframe Carrier dangerous_nimble dangerous_ble_radio dangerous_ble_gatt_board_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
+for m in Supervisor wire_etf wireframe Carrier carrier_support dangerous_nimble dangerous_ble_radio dangerous_ble_gatt_board_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" trial_wait_int64.silica
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" trial_support_hex.silica
 sed -e "s|^fn address() -> string { \"peripheral:\" }|fn address() -> string { \"$ROLE:$UUID\" }|" \
     -e "s|^fn links() -> int64 { 1 }|fn links() -> int64 { $LINKS }|" -e "s|^fn cut_link() -> int64 { 0 - 1 }|fn cut_link() -> int64 { 0 - 1 + 1 + $CUT }|" \
     -e "s|^fn hold_ms() -> uint64 { 0 }|fn hold_ms() -> uint64 { ${HOLD}000 }|" "$HERE/dangerous_ble_board_peer.silica" > dangerous_ble_board_peer.silica
-printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_nimble.silica\ndangerous_ble_radio.silica\ndangerous_ble_gatt_board_carrier.silica\ntrial_support_hex.silica\ntrial_wait_int64.silica\ndangerous_ble_board_peer.silica\n' > silica.config
+printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ncarrier_support.silica\ndangerous_nimble.silica\ndangerous_ble_radio.silica\ndangerous_ble_gatt_board_carrier.silica\ntrial_support_hex.silica\ntrial_wait_int64.silica\ndangerous_ble_board_peer.silica\n' > silica.config
 # The compiler wants the archive the .meta names; the wrapper itself is compiled into the image as
 # ESP-IDF code, so the archive here holds only the symbols.
 sed -n 's/^ *symbol: "\(.*\)"$/long long \1(void) { return 0; }/p' "$ROOT/compiler/stdlib/ble/silica_ble_nimble_wrapper.meta" > stub.c

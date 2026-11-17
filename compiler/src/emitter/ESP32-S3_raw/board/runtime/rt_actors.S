@@ -805,7 +805,7 @@ silica_rt_actors_init:
     s32i    a5, a6, CH_RET
     movi    a5, _silica_main_stack_size
     s32i    a5, a6, CH_SIZE
-    movi    a5, _silica_heap_end          // machine stack bottom (the guard _start armed)
+    movi    a5, _silica_main_stack_bottom // machine stack bottom (the guard _start armed)
     s32i    a5, a6, CH_BAND
     movi    a7, _silica_rt_depth_reserve + 64
     add     a7, a5, a7

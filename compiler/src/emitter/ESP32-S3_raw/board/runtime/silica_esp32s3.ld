@@ -21,9 +21,17 @@
    and the data bus at 0x3FC8_8000 (offset 0x6F_0000). Code is placed first from the bottom on the
    instruction bus; data starts where the code ends, on the data bus, so the two never overlap.
 
-   Upper limit 0x3FCE_9700: the ROM keeps its own stack and data above that while it loads the
-   image (ESP-IDF's bootloader.memory.ld.in uses the same bound). SRAM0 (0x4037_0000-0x4037_7FFF)
-   is left alone because the ROM can configure it as instruction cache.
+   Upper limit of the image, 0x3FCE_9700: the ROM keeps its own stacks and data above that while it
+   loads the image (ESP-IDF's bootloader.memory.ld.in uses the same bound). Everything the ROM loads
+   or _start uses before it is on its own stack ends below it: code, data, .bss and main's stacks.
+   The heap alone goes on above it, to 0x3FCE_EE00: the ROM's stack for core 0 (0x3FCE_9710 to
+   0x3FCE_B710), which nothing uses once _start has set a1; its stack for core 1 (to 0x3FCE_D710),
+   which core 1 leaves when it reaches silica_rt_start_core1 (silica_rt_start_app_cpu waits for
+   that); and data the ROM uses only while it starts (to 0x3FCE_EE34, where ESP-IDF's
+   _dram0_rtos_reserved_start begins: the ROM's own variables, in use for as long as its code is
+   called). The heap's allocations grow from its low end, and each is zeroed when it is taken.
+   SRAM0 (0x4037_0000-0x4037_7FFF) is left alone because the ROM can configure it as instruction
+   cache.
 
    Byte and halfword loads from the instruction bus fault on this chip, so every byte of data --
    strings, tables, .rodata of any kind -- must be in a data-bus section. Only code and L32R
@@ -33,6 +41,7 @@ ENTRY(_start)
 
 _silica_iram_dram_offset = 0x6F0000;
 _silica_sram_dram_end    = 0x3FCE9700;
+_silica_sram_heap_end    = 0x3FCEEE00;
 _silica_fault_stack_size = 0x800;
 
 /* main's two stacks are sized per image: tools/build_image.sh links once with the defaults below,
@@ -56,7 +65,7 @@ _silica_ffi_stack_size   = DEFINED(_silica_ffi_stack_req)  ? _silica_ffi_stack_r
 MEMORY
 {
   iram (RX) : org = 0x40378000, len = 0x61700
-  dram (RW) : org = 0x3FC88000, len = 0x61700
+  dram (RW) : org = 0x3FC88000, len = 0x66E00
 }
 
 SECTIONS
@@ -136,12 +145,18 @@ SECTIONS
     silica_rt_aux_stack_bottom = ABSOLUTE(.);
     . += _silica_main_aux_size;
     silica_rt_aux_stack_top = ABSOLUTE(.);
+    /* main's machine stack, below the heap; its bottom 64-byte aligned for the guard watchpoint */
+    . = ALIGN(64);
+    _silica_main_stack_bottom = ABSOLUTE(.);
+    . += _silica_main_stack_size;
+    . = ALIGN(16);
+    _silica_stack_top = ABSOLUTE(.);
   } > dram
 
-  _silica_heap_start = ALIGN(silica_rt_aux_stack_top, 16);
-  _silica_stack_top  = _silica_sram_dram_end & ~15;
-  _silica_heap_end   = (_silica_stack_top - _silica_main_stack_size) & ~63;
+  _silica_heap_start = ALIGN(_silica_stack_top, 16);
+  _silica_heap_end   = _silica_sram_heap_end & ~63;
 
+  ASSERT(_silica_heap_start <= _silica_sram_dram_end, "program too large: the image and main's stacks do not fit below the ROM's area")
   ASSERT(_silica_heap_start < _silica_heap_end, "program too large: no room left for the heap")
   ASSERT((_silica_main_aux_size & 63) == 0, "_silica_main_aux_size must be a multiple of 64")
   ASSERT((_silica_vecbase & 0x3FF) == 0, "VECBASE must be 1 KB aligned")

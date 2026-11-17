@@ -723,13 +723,9 @@ void vPortYield(void)
 
 // ---- memory ----
 
-// RAM the runtime's image leaves alone, in two pieces. Above its main stack, 0x3FCE9800 to 0x3FCEF000:
-// the ROM has its stack and its loader's data there only while it loads the image (the ROM's own
-// variables, which the libraries' code in ROM uses, start at 0x3FCEF81C; the frame above the main
-// stack's top is the ROM's too). And 0x3FCF0000 to 0x3FCF8000, free while the data cache is 32 KB or
-// less (spike_flash.c sets it; ESP-IDF heap/port/esp32s3/memory_layout.c).
-#define LOW_RAM_START  0x3FCE9800u
-#define LOW_RAM_END    0x3FCEF000u
+// RAM the runtime's image and heap leave alone: 0x3FCF0000 to 0x3FCF8000, free while the data cache
+// is 32 KB or less (spike_flash.c sets it; ESP-IDF heap/port/esp32s3/memory_layout.c). The RAM above
+// the image, where the ROM has its stacks while it starts, is the heap's (runtime/silica_esp32s3.ld).
 #define HIGH_RAM_START 0x3FCF0000u
 #define HIGH_RAM_END   0x3FCF8000u
 
@@ -830,7 +826,7 @@ static void region_give(struct region *r, void *p)
 //
 // The libraries' blocks are many, small and long held; left among the actors' they cut the heap into
 // pieces too small for a stack chunk. So the libraries first fill regions of their own: the RAM
-// above the runtime's image (the two pieces above, 54 KB the heap does not reach), then one block of
+// above the heap (32 KB, above), then one block of
 // SPIKE_LIB_REGION_KB taken from the heap at the first allocation. Only what fits in neither comes
 // block by block from the heap, up to SPIKE_LIB_LIMIT_KB in all: beyond that the libraries are
 // refused, which they report, where an exhausted heap would end the runtime.
@@ -842,7 +838,7 @@ static void region_give(struct region *r, void *p)
 // both cores take; the radio's interrupt is masked around a call so that it never finds this core
 // holding it.
 #ifndef SPIKE_LIB_REGION_KB
-#define SPIKE_LIB_REGION_KB 16
+#define SPIKE_LIB_REGION_KB 38
 #endif
 #ifndef SPIKE_LIB_LIMIT_KB
 #define SPIKE_LIB_LIMIT_KB 160
@@ -877,7 +873,6 @@ void *malloc(size_t n)
     if (!region_asked) {
         region_asked = 1;
         region_add((uint8_t *)HIGH_RAM_START, HIGH_RAM_END - HIGH_RAM_START);
-        region_add((uint8_t *)LOW_RAM_START, LOW_RAM_END - LOW_RAM_START);
         uint8_t *r = silica_rt_alloc_or_null(SPIKE_LIB_REGION_KB * 1024 + 8);
         if (r) {
             region_add((uint8_t *)(((uintptr_t)r + 15) & ~(uintptr_t)15), SPIKE_LIB_REGION_KB * 1024);

@@ -118,7 +118,7 @@ for t in $TRIALS; do
     export BOARD_FLASH_FILES SPIKE_CFLAGS
     inc="-I$out -I$C/esp_wifi/include -I$C/esp_wifi/include/local -I$C/esp_event/include -I$C/esp_netif/include -I$C/esp_phy/include"
     inc="$inc -I$L/include -I$L/include/apps -I$L/include/apps/sntp -I$L/lwip/src/include -I$L/port/include -I$L/port/freertos/include -I$L/port/esp32xx/include -I$L/port/esp32xx/include/arch"
-    SPIKE_CFLAGS="$base_cflags $inc -DSPIKE_WIFI -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DSPIKE_LIB_REGION_KB=16 -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
+    SPIKE_CFLAGS="$base_cflags $inc -DSPIKE_WIFI -DSPIKE_INTERRUPT -DSPIKE_BT_CORE=1 -DSPIKE_ONE_HEAP -DSPIKE_LIB_REGION_KB=38 -DR1_CPU_MHZ=${R1_CPU_MHZ:-160}"
     # the runtime on one core, core 0, for the program's actors; core 1 is the radio's tasks' (r1_port.c)
     export BOARD_ASFLAGS="-DNCORES_RUN=1"
     export BOARD_FFI_STACK=${BOARD_FFI_STACK:-6144}

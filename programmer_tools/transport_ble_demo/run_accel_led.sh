@@ -59,10 +59,10 @@ PLIST
 ln -sfn "$ROOT/compiler/stdlib/ble" dangerous_exposure_source/ble
 $CLANG -fobjc-arc -O2 -arch arm64 -mmacosx-version-min=26.0 -Wall -c "$ROOT/compiler/stdlib/ble/silica_ble.m" -o silica_ble.o || exit 1
 ar rcs dangerous_exposure_source/lib/libsilica_ble.a silica_ble.o
-for m in Supervisor wire_etf wireframe Carrier dangerous_ble dangerous_ble_gatt_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
+for m in Supervisor wire_etf wireframe Carrier carrier_support dangerous_ble dangerous_ble_gatt_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" trial_wait_int64.silica
 sed "s|(:open, me, \"central:\")|(:open, me, \"central:$UUID\")|" "$HERE/dangerous_ble_mac_led.silica" > dangerous_ble_mac_led.silica
-printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_ble.silica\ndangerous_ble_gatt_carrier.silica\ntrial_wait_int64.silica\ndangerous_ble_mac_led.silica\n' > silica.config
+printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ncarrier_support.silica\ndangerous_ble.silica\ndangerous_ble_gatt_carrier.silica\ntrial_wait_int64.silica\ndangerous_ble_mac_led.silica\n' > silica.config
 compile "$MCC" compile.log || exit 1
 objs=""
 for s in *.sams; do clang -mmacosx-version-min=26.0 -c -x assembler "$s" -o "${s%.sams}.o" || exit 1; objs="$objs ${s%.sams}.o"; done
@@ -72,9 +72,9 @@ $CLANG $objs dangerous_exposure_source/lib/libsilica_ble.a -framework CoreBlueto
 # the archive the compiler wants holds only its symbols
 cd "$WORK/board/src" || exit 1
 ln -sfn "$ROOT/compiler/stdlib/ble" dangerous_exposure_source/ble
-for m in Supervisor wire_etf wireframe Carrier dangerous_nimble dangerous_ble_radio dangerous_ble_gatt_board_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
+for m in Supervisor wire_etf wireframe Carrier carrier_support dangerous_nimble dangerous_ble_radio dangerous_ble_gatt_board_carrier; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$m.silica"; done
 sed "s|(:open, me, \"peripheral:\")|(:open, me, \"peripheral:$UUID\")|" "$HERE/dangerous_ble_board_accel_led.silica" > dangerous_ble_board_accel_led.silica
-printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ndangerous_nimble.silica\ndangerous_ble_radio.silica\ndangerous_ble_gatt_board_carrier.silica\ndangerous_ble_board_accel_led.silica\n' > silica.config
+printf 'Supervisor.silica\nwire_etf.silica\nwireframe.silica\nCarrier.silica\ncarrier_support.silica\ndangerous_nimble.silica\ndangerous_ble_radio.silica\ndangerous_ble_gatt_board_carrier.silica\ndangerous_ble_board_accel_led.silica\n' > silica.config
 sed -n 's/^ *symbol: "\(.*\)"$/long long \1(void) { return 0; }/p' "$ROOT/compiler/stdlib/ble/silica_ble_nimble_wrapper.meta" > stub.c
 "$XT/xtensa-esp32s3-elf-gcc" -c -mlongcalls -Os -ffreestanding stub.c -o stub.o || exit 1
 "$XT/xtensa-esp32s3-elf-ar" rcs dangerous_exposure_source/lib/libsilica_ble_nimble.a stub.o
