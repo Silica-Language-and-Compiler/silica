@@ -45,5 +45,5 @@ expected text for each program:
   status line prints it, as the `alloc_region_*` trials print `0`. If the run prints anything else, the golden is wrong, not the board.
 - `<stem>.st_nucleo.ascomp` goldens are generated afterwards by `trials/targets/gen_board_ascomp.sh` from the board compiler's
   real output once the run matched; for `mem_space_atomic_load_store` they show `dmb sy` before and after the load and the store.
-- Directory is `INTEGRATE_PENDING`: the host run skips it. The ESP32-S3 run skips it.
+- Directory has a `BOARD_ONLY` marker: host runs skip it (no host goldens). The Nucleo board run includes it; the ESP32-S3 run skips it.
 - Board run: `make integrate TRIAL_TARGET=STM32-L476RG_raw TRIAL_SUITES=memory_space_nucleo_addition` from `trials/` (announce the run; one board at a time).
