@@ -53,7 +53,7 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E1055 UnusedVariable — a binding is never used in its scope (use it, pass it on, return it, or bind it as `_`)
 - E1056 EmptyProcOnPureSequence — empty `proc[]` on a pure sequence block
 - E1057 SequenceAsArrowRhs — sequence...produces pure...end cannot be the right-hand side of `->`; use a `{ ... }` block
-- E1058 ReservedKeywordAsBindingName — a reserved keyword used as a variable binding name
+- E1058 ReservedKeywordAsBindingName — a reserved keyword (`meta`, `wrapper_meta`, `region`) used as a variable binding name
 - E1059 ReservedKeywordAsFieldName — a reserved keyword used as a record field name
 - E1060 UnbalancedDelimiters — unbalanced brackets, braces or parentheses
 - E1061 NamedStructConstruction — named struct construction is not allowed; use an anonymous record `{ field: ... }`
