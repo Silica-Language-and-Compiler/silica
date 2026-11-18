@@ -467,6 +467,20 @@ EOF
     exit 1
 fi
 
+# The other hosted platforms build on their own machines, so they start first, in the background, and
+# run while this machine builds its own compiler and the raw targets. Each one's output goes to its own
+# file (printed below, in order) and its result to <log>/remote-<target>.rc.
+declare -a remote_pids=() remote_targets=()
+for t in $OTHER_HOSTED; do
+    conn_spec="$(conn_of "$t")" || continue
+    conn="${conn_spec%%:*}"; rpath="${conn_spec#*:}"
+    (
+        if remote_build_and_fixpoint "$t" "$conn" "$rpath"; then echo 0; else echo 1; fi > "$LOG_DIR/remote-$t.rc"
+    ) > "$LOG_DIR/remote-$t.out" 2>&1 &
+    remote_pids+=($!); remote_targets+=("$t")
+    echo "== $t on $conn started in the background (output: $LOG_DIR/remote-$t.out)"
+done
+
 if [ "$BUILD_NATIVE" = 1 ]; then
     if [ "$DO_FIXPOINT" = 1 ]; then
         if local_fixpoint; then ok+=("$HOST_TARGET(native,fixed point)"); else bad+=("$HOST_TARGET"); fi
@@ -481,11 +495,12 @@ for t in $RAW_TARGETS; do
     if local_build "$t"; then ok+=("$t(cross)"); else bad+=("$t"); fi
 done
 
-# Only the platforms chosen for this run, even when the file remembers more machines.
-for t in $OTHER_HOSTED; do
-    conn_spec="$(conn_of "$t")" || continue
-    conn="${conn_spec%%:*}"; rpath="${conn_spec#*:}"
-    if remote_build_and_fixpoint "$t" "$conn" "$rpath"; then ok+=("$t@$conn"); else bad+=("$t@$conn"); fi
+# Wait for the remote builds started above and print what each one said.
+for i in "${!remote_pids[@]}"; do
+    wait "${remote_pids[$i]}"
+    t="${remote_targets[$i]}"; conn_spec="$(conn_of "$t")"; conn="${conn_spec%%:*}"
+    cat "$LOG_DIR/remote-$t.out"
+    if [ "$(tail -n 1 "$LOG_DIR/remote-$t.rc" 2>/dev/null)" = 0 ]; then ok+=("$t@$conn"); else bad+=("$t@$conn"); fi
 done
 
 # No `make clean` here any more: each target builds in its own compiler/build/<target>/, so the

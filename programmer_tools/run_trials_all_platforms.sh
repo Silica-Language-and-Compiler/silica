@@ -29,8 +29,9 @@
 # Remote machines are reached with public/private key ssh in batch mode; no password is ever typed.
 # Set the key up with ssh-keygen and ssh-copy-id, and check it with `ssh -o BatchMode=yes host true`.
 #
-# This machine runs its own trials, and the board runs after it: both take their own per-target lock (trials/.integrate.lock.<target>),
-# one trial run per target. Remote machines run at the same time as each other.
+# This machine runs its own trials; when that run finishes, every board selected with --board starts at
+# once, in parallel with each other and with the remote machines, which started at the very beginning.
+# Each target takes its own per-target lock (trials/.integrate.lock.<target>), one trial run per target.
 #
 # Logs and each platform's .integrate_report land in the log directory, and one summary table is
 # printed at the end. The exit status is 0 only when every platform passed.
@@ -49,6 +50,12 @@ JOBS_linux_aarch64="${PI_JOBS:-2}"            # 4 GB board
 SDS_linux_aarch64="${PI_SDS_JOBS:-1}"
 JOBS_linux_x86_64="${NIX_JOBS:-3}"            # 13 GB, 8 cores
 SDS_linux_x86_64="${NIX_SDS_JOBS:-1}"
+# The two boards run together on this machine once its own run is over, so each gets a share of the
+# cores and the memory (16 GB Mac): 5 jobs each, 10 compiles at once, instead of one per core apiece.
+JOBS_ESP32_S3_raw="${ESP32_JOBS:-5}"
+SDS_ESP32_S3_raw="${ESP32_SDS_JOBS:-1}"
+JOBS_STM32_L476RG_raw="${NUCLEO_JOBS:-5}"
+SDS_STM32_L476RG_raw="${NUCLEO_SDS_JOBS:-1}"
 
 STAMP="$(date '+%Y%m%d-%H%M%S')"
 LOG_DIR="${LOG_DIR:-$REPO/../silica_trial_runs/$STAMP}"
@@ -265,9 +272,12 @@ run_here() {  # $1 = target, $2 = TRIAL_TARGET value
 pids=(); tags=()
 for t in $RUN_REMOTE; do run_remote "$t" & pids+=($!); tags+=("$t"); done
 
-# This machine, then the board: each takes its own per-target lock.
+# The remote machines are already running. This machine's own run goes first; the moment it finishes
+# the boards start, all of them at once and while the remote runs are still going (each has its own
+# per-target lock, work directory under trials/.target/<target>/, serial port and report). With no
+# native run the boards start immediately.
 [ "$RUN_NATIVE" = 1 ] && run_here "$HOST_TARGET" host
-for t in $RUN_RAW; do run_here "$t" "$t"; done
+for t in $RUN_RAW; do run_here "$t" "$t" & pids+=($!); tags+=("$t"); done
 
 if [ ${#pids[@]} -gt 0 ]; then
     for i in "${!pids[@]}"; do wait "${pids[$i]}"; echo "  done ${tags[$i]}"; done

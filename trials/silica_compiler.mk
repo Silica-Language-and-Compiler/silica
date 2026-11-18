@@ -644,8 +644,8 @@ define INTEGRATE_CHILD
 cd "$(INTEGRATE_DIR)" || exit 1; \
 dir="$(1)"; \
 rm -f "$$dir/.integrate_counts" "$$dir/.integrate_report" "$$dir/.integrate_status" "$$dir/.integrate_skipped"; \
-if [ -f "$$dir/INTEGRATE_PENDING" ] && [ -z "$(INTEGRATE_NAMED_SUITES)" ]; then \
-	echo "SKIP: $$dir (INTEGRATE_PENDING -- see $$dir/README.md)"; \
+if { [ -f "$$dir/INTEGRATE_PENDING" ] || [ -f "$$dir/BOARD_ONLY" ]; } && [ -z "$(INTEGRATE_NAMED_SUITES)" ]; then \
+	echo "SKIP: $$dir ($$( [ -f "$$dir/INTEGRATE_PENDING" ] && echo INTEGRATE_PENDING || echo BOARD_ONLY ) -- see $$dir/README.md)"; \
 	: > "$$dir/.integrate_skipped"; \
 	find "$$dir" -name .target -prune -o \( -name .integrate_log -o -name .integrate_report -o -name .integrate_status \) -type f -exec rm -f {} + 2>/dev/null || true; \
 else \
@@ -665,7 +665,7 @@ ok=0; ko=0; failed=0; \
 printf '──── %s: per-directory results ────\n' "$(INTEGRATE_LABEL)"; \
 for dir in $(1); do \
 	if [ -f "$$dir/.integrate_skipped" ]; then \
-		printf '  %-48s SKIPPED (INTEGRATE_PENDING)\n' "$$dir"; \
+		printf '  %-48s SKIPPED (%s)\n' "$$dir" "$$( [ -f "$$dir/BOARD_ONLY" ] && echo BOARD_ONLY || echo INTEGRATE_PENDING )"; \
 		continue; \
 	fi; \
 	n1=0; n2=0; \

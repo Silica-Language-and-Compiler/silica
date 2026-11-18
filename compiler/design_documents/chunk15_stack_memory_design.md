@@ -176,6 +176,52 @@ Decision 2 removes the implicit heap and decision 1 the family arenas. The follo
 | the runtime's own tables (registry, identity table, timers, carriers) | the process | as today |
 
 None of these is reachable from user code as "memory" except through the typed values the runtime hands out, and none grows without a matching release path.
+### 2.8 Scrubbing: no stale program data in freed memory (requirement, Lee 2026-11-16)
+
+**Status: requirement and measurement plan; not implemented, not measured.** The statements marked **today:** were read from the runtime assembly on 2026-11-16 (hosted: `compiler/build/apple_silicon_mac/__silica_runtime.sams` of 2026-11-15 and `compiler/build/linux_aarch64/__silica_runtime.sams` of 2026-11-04, which may predate later changes; ESP32-S3 and STM32: the sources under `compiler/src/emitter/<target>/board/runtime/`).
+
+**Threat.** An attacker reading stale RAM: values left in memory that a finished actor (or a finished message, or a finished call) owned and that the runtime has since freed or reused. The routes are a core dump, swap, a debugger or JTAG/SWD on a board, a cold-boot read, an out-of-bounds or uninitialised read by other code, and, on a board, any other actor. Code in the same address space with arbitrary reads (a `dangerous_*` module on a hosted target) is not stopped by this requirement and is out of scope here; the FFI security model covers it.
+
+**Requirement.** Every runtime-owned block that can hold program data is **zeroed immediately before it is returned** to a free list or to the operating system (**scrub on free**) and **zeroed immediately after it is allocated** when it did not come from a source that guarantees zero (**zero on alloc**). Both are required: scrub on free closes the window while the block is free; zero on alloc is the backstop for any free path that is missed and for blocks that were never scrubbed. The stores must not be removable (hand-written assembly in the runtime, or the platform's non-elidable fill). The scrub runs on **every** release path, including the failure, kill and end-of-actor paths (`fail_current`, `stop_self`, the supervisor's forced end, the end-of-actor drain), and it runs before the block is visible to another actor or thread.
+
+**Which memory.** The set is the runtime-owned memory of §2.7 and the actor's own stack and state:
+
+| Memory | Scrub on free | Zero on alloc | **Today** (2026-11-16) |
+| --- | --- | --- | --- |
+| stack chunks: ESP32-S3 `silica_rt_free_stack` / `silica_rt_alloc_stack` | add before the block is linked on `silica_rt_stack_free` | add on the reuse path (a fresh block is zero from the heap) | free only links the block; a reused block is not zeroed (`rt_actors.S`, comment at `silica_rt_alloc_stack`). `silica_rt_zero_block` exists |
+| stack chunks: STM32-L476RG | add where a chunk is freed (not located in `rt_actors.S` or `rt_heap.S` on 2026-11-16: find it first) | the heap zeroes every allocation (`rt_heap.S`) | allocation covered; free unverified |
+| stack chunks: hosted (Mac, Linux) | write zeros over the committed run before `_silica_rt_stack_release_to` and the trim path give pages back | a fresh commit and the `MAP_FIXED` anonymous remap read as zero from the kernel; a run kept committed by a `stack_policy` that keeps high water is **not** re-zeroed | the remap discards the contents but the bytes stay in physical memory until the kernel reuses the page; nothing writes zeros first |
+| dead frames inside a live chunk (values below SP after a return) | scrub the released portion when the stack shrinks or the actor ends | n/a | not scrubbed while the actor lives; scrubbed by nothing at the end on hosted |
+| state-area nodes (§2.3) | in `_silica_rt_state_free` over the whole node | in `_silica_rt_state_alloc` on the free-list pop (the extend path is fresh pages) | free writes only word 0 (and word 1 above 1,024 B); alloc returns a popped node untouched; no zero store in either routine on Mac or Linux |
+| mailbox buffers and nodes (§5.1) | before the block is freed (dispatch end, failed send, end-of-actor drain) | the copy overwrites the buffer in full; confirm it also covers padding | hosted buffers are `malloc`ed and freed unscrubbed |
+| ACBs, call records, release log, child-table rows, row spec buffers | before they return to a free list or are freed | hosted ACBs are `calloc`ed (zero); board ACBs and the others: add | not scrubbed |
+| other board heap blocks (`silica_rt_free`) | in `silica_rt_free` | already zero on alloc (`rt_heap.S`, ESP32-S3 and STM32) | not scrubbed on free |
+
+**Design notes.**
+
+1. **Where the zeroing goes.** A free scrubs the block while the caller still owns it, before the free-list lock is taken, so the lock is held for the link only. On the boards the scrub calls `silica_rt_zero_block` (word granularity). On the hosted targets it is a store loop over the committed bytes (`DC ZVA` where the target has it; `rep stosq` on x86-64), followed by the existing release.
+2. **Hosted pages that are given back.** After the scrub the existing remap or `madvise` returns the pages. The scrub touches only pages that are committed, so an actor that never grew its stack pays for its first chunk only.
+3. **Cost shape.** Every scrub is linear in the bytes released, proportional to a quantity the program controls (decision 4 holds: no threshold, no sweep). The cost is paid at release time on the actor that releases.
+4. **What this does not scrub.** Copies held in registers, caches and the store buffer; the same values in another actor's mailbox buffer; values a program wrote to a `device_window` or a file; and the FFI arena of a dangerous actor beyond its own `_silica_rt_ffi_arena_teardown`, which this requirement also covers by zeroing the arena there.
+
+**Measurement: before and after (required).** Scrubbing is not free, so each target records its speed cost. **Before** means the unchanged runtime; **after** means the same benchmark with every row of the table above implemented. **No number has been measured yet; the table below is to be filled in, and a row with no number is not done.**
+
+| Benchmark | What it exercises | Metric |
+| --- | --- | --- |
+| `stack_churn` | spawn N actors that each grow the stack to S KB, then exit (S = 2, 16, 256) | microseconds per spawn+exit; bytes scrubbed per actor |
+| `message_pingpong` | two actors exchange M messages of B bytes (B = 16, 1 K, 64 K) | nanoseconds per round trip |
+| `state_churn` | one actor allocates and frees state-area nodes of 16 B, 256 B and 4 KB | nanoseconds per alloc+free pair |
+| `idle_actors` | spawn 1,000 idle actors, then end them all | total milliseconds; resident memory |
+| `scrub_floor` | the scrub loop alone over 4 KB, 64 KB, 1 MB | bytes per nanosecond (the platform's limit) |
+
+Rules: one target at a time on an idle machine (the build documentation's machine limits), the median of 20 runs after 2 warm-up runs, the same binary inputs before and after, compiler built with `--no-fixpoint` for both. Targets: Apple Silicon (this Mac), Linux AArch64 (`pix`), Linux x86-64 (`nix`), ESP32-S3 (CCOUNT cycles, both cores idle but the runtime), STM32-L476RG (DWT CYCCNT cycles). Report for each cell: before, after, and the percentage difference; a slowdown above 10% on `stack_churn` or `message_pingpong` is reported to Lee before the change merges (a number, not a verdict). **Order (Lee 2026-11-16):** the **before** run is the first step of the change, not done ahead of it; it is captured first, on the commit that precedes the first scrub change, and recorded here with the commit hash and date; the **after** run follows the last scrub change.
+
+| Target | Benchmark | Before | After | Difference |
+| --- | --- | --- | --- | --- |
+| (all rows) | (all benchmarks) | not measured | not measured | |
+
+**Trials.** One trial per memory row: an actor writes a recognisable pattern (`0xA5` words) into its stack, state and a message, ends, and a second actor, or a dump of the freed block through a runtime test hook, must find only zeros; the failure, kill and supervisor-stop paths each get their own trial. The assembly goldens change with the scrub calls and are refreshed from the current output once the trial outputs match.
+
 ## 3. Code generation: frames, allocation, returns
 
 This section replaces the implicit heap in the emitted code. It covers §7.5 items 3, 4 and 8.
@@ -775,6 +821,7 @@ Plain statements of where the decisions, taken as written, cannot be implemented
 
 ## Revision history
 
+- 1.5 (2026-11-16): §2.8 added (Lee 2026-11-16): scrub on free and zero on alloc for every runtime-owned block that can hold program data, against an attacker reading stale RAM; the state of each block kind as read from the runtime on 2026-11-16; a before-and-after speed measurement plan with an empty results table. Requirement only: nothing implemented, nothing measured.
 - 1.4 (2026-11-04): §11.1 status table brought up to date (phases 6 and 7 done; phase 8 done on Linux x86-64, in progress on Linux AArch64) and "Phase 8 notes" added: the 616-byte Linux ACB, the FFI arena out of compiled code on every hosted emitter, the heap-parity method, the all-goldens effect of 4e, the Linux task-limit scope, and the cross-build procedure.
 - 1.3 (2026-11-01): §7 rewritten to the pin rule (Lee 2026-11-01): a retained buffer is a state-area node of a pinned actor (E4036 spawn policy, E4037 fallback behaviour, E4039 `compact_state()`); buffers never cross an actor boundary (E4038 for a spawn's initial state); `retains:` validation joins E4033; the FFI arena leaves compiled code on Apple Silicon (per-call scratch in the caller's frame). §4.2 gains the rule for buffers in state; §4.3 and §6.4 follow.
 - 1.2a (2026-10-28): amendment, not yet implemented and not yet measured: the copy-or-keep rule at a return (keep the callee frame while its garbage is small relative to the result, copy the live result out once it is large; threshold to be measured) added under §3.3 and §3.4, with committed stack pages returned after an evacuation. Existing text unchanged.

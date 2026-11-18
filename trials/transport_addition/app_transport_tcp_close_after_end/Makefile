@@ -5,7 +5,7 @@
 THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 APP_TRIAL_DIR := $(abspath $(THIS_DIR))
 APP_LABEL := app_transport_tcp_close_after_end
-APP_EXECUTABLES := dangerous_tcp_close_after_end
+APP_EXECUTABLES := dangerous_tcp_close_after_end dangerous_tcp_carrier_end_memory dangerous_state_holds_carrier_ref
 APP_LINK_OBJECTS := wire_etf.o wireframe.o Carrier.o dangerous_sockets.o dangerous_tcp_carrier.o
 
 FFI_TRIAL_DIR := $(abspath $(THIS_DIR)/../../ffi_addition)
