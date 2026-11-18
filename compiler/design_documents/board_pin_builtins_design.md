@@ -272,7 +272,7 @@ pix and nix).
 **Results (2026-11-10).** ESP32-S3 e-badge (empty minibadge slots): 22 of 22 (7 programs, 15 compile
 failures). NUCLEO-L476RG: 18 of 18 (6 programs, 12 compile failures); B1 (PC13) reads high with the chip's
 pull-down, as §5 expected. Hosted: the four E2220 trials pass on the Mac with a compiler built from this
-tree (pix and nix goldens are derived, not yet run).
+tree (pix and nix goldens are derived, not yet run). **Status 2026-11-18:** the hosted runs of 2026-11-11 (commit `81c1144bb6`, "Hosted (Mac, pix, nix) green") included these trials; the four trials are still in `trials/error_enforcement_addition`. **Status 2026-11-18:** the later hosted runs (commit `81c1144bb6`, "Hosted (Mac, pix, nix) green") included these trials; the four trials are still in `trials/error_enforcement_addition`.
 
 **Found while testing, fixed with a trial each** (outside the pin code): a guarded case arm whose guard
 calls a function lost its scrutinee (every emitter; `case_addition/case_guard_call_keeps_scrutinee`); a

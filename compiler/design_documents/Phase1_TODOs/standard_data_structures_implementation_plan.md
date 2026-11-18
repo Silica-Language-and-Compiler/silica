@@ -1492,7 +1492,7 @@ This is the **first** self-host source change after the parallel tree exists. Ke
 
 **Scope:**
 
-- **Phase 6:** self-host integrate suite (`trials/self_host_addition/`), fixed-point (`host_n` compiles `host_{n+1}` from `src/`).
+- **Phase 6:** self-host integrate suite (`trials/self_host_addition/`; **Status 2026-11-18 (Lee): obsolete**, the suite is no longer wanted), fixed-point (`host_n` compiles `host_{n+1}` from `src/`).
 - **Cutover (only after fixed-point green):** promote `src/` over production `src/` (or swap trees per authority plan), make self-host the default build, then retire `silica-bootstrap-compiler` from the default path. Until that moment the freeze in §11 still holds.
 
 **§13 exit gate:** Phase 6.1 fixed-point integrate passes on the parallel tree; `make integrate` includes the self-host trial; after cutover, production compiler source has zero `type` aliases, no `bst` dependency, and builds/maintains itself without `silica-bootstrap-compiler` on the default path. Blocks §14 onward until this gate passes.

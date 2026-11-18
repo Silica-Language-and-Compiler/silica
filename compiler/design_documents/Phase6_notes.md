@@ -9,6 +9,8 @@ only, no ownership state); `Phase3_notes.md` §10.8.4 (the parser skips an unkno
 
 ## 1. Stage 6a: the pass, the analysis, `strict region_check;` (written 2026-10-31, not built)
 
+**Status 2026-11-18: done**: built and landed as phase 6 (`bf2f8c4630`, 2026-11-01), E2301 and E2302 in `region_checker_core.silica`, design §11.1 row 6 done.
+
 ### 1.1 Files
 
 | File | Change |
@@ -153,6 +155,8 @@ program declares `strict region_check;` yet). Stage 6a passes; 6b (E2301) next.
 
 ## 3. Stage 6b: E2301 UseAfterMove (written 2026-11-01, not built)
 
+**Status 2026-11-18: done**: built and landed as phase 6 (`bf2f8c4630`, 2026-11-01), E2301 and E2302 in `region_checker_core.silica`, design §11.1 row 6 done.
+
 ### 3.1 Files
 
 | File | Change |
@@ -228,6 +232,8 @@ acc.errors)`), so the errors of arm 2 extend arm 1's, and `rc_merge` takes the l
   unchanged.
 
 ### 3.5 Not verified (Haiku: one builder at a time, build-slot lock; no trial, golden or `.scout` edits)
+
+**Status 2026-11-18: done**: built and landed as phase 6 (`bf2f8c4630`, 2026-11-01), E2301 and E2302 in `region_checker_core.silica`, design §11.1 row 6 done.
 
 Nothing was built or run. To check, in this order:
 

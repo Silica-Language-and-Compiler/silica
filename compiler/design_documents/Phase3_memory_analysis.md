@@ -37,7 +37,7 @@ actor) plus machine-stack depth of the recursion. Grows with input size n as the
   nodes the function allocated. Dynamic parts of adopted callees (return position) stay below the caller until the outermost consumer evacuates
   (option-1 rule, §3.3-3.4). Evacuation (§3.5) is two pass: copy to scratch below SP, then copy to the destination; transient cost = size of the evacuated value.
 * `H_interim` = what phase 2 still puts in the old heap: behaviour result and state shell evacuated to the actor heap each dispatch (`bmv_state_asm`, `L_ev_heap`),
-  messages and replies copied into arenas. Never freed until the actor ends. Phase 3 (state area, stages 3b/3c) is not built; until then this term is the old model's, unchanged.
+  messages and replies copied into arenas. Never freed until the actor ends. Phase 3 (state area, stages 3b/3c) is not built; until then this term is the old model's, unchanged. **[Status 2026-11-18: superseded: phase 3 (state at the stack base, `a528a2ef0d`, closed 2026-10-31) and phase 4e (implicit heap removed, 2026-10-31) are built, so this term no longer exists on the hosted targets or the ESP32-S3.]**
 * The state area (phase 3 onward): nodes of the live state, exact-size free lists, nodes never move (decision 21), holes reusable only by the same size, never decommitted
   while the actor lives under `:keep_state_area`. The fallback (§4.4) copies the whole state through scratch: transient 2x the state size.
 * Reservation: virtual only. Each actor reserves hw.memsize + swap (`PROT_NONE`, NORESERVE), nothing committed at spawn. RSS is zero for it; only the committed run counts.
@@ -127,7 +127,7 @@ Mechanisms that would have to change, each compatible with stack allocation (the
 
 Direction list note (2026-10-28): the first item of the direction list is the copy-or-keep rule at a return (keep the callee frame while its garbage is small relative to the result, copy the live result out once it is large; committed stack pages returned after an evacuation). It is decided as direction, not implemented and not measured; see the amendments under sections 3.3 and 3.4 of chunk15_stack_memory_design.md. The actor split below follows it.
 
-Today one pipeline actor holds the whole unit (lex, parse, check, SIR, emit) in one stack for one dispatch. The progress lines already name the phases, and `parse_in_actor.silica` exists but is not wired in.
+Today one pipeline actor holds the whole unit (lex, parse, check, SIR, emit) in one stack for one dispatch. The progress lines already name the phases, and `parse_in_actor.silica` exists but is not wired in. **[Status 2026-11-18: `parse_in_actor.silica` is no longer in `compiler/src`, and the compiler still runs a unit in one pipeline actor (`main.silica`); the split is not done.]**
 
 **Why it can help (theory).** An actor's stack is unmapped when the actor ends (`_silica_rt_actor_stack_free`), which is the only mechanism that truly returns committed pages mid-unit without a runtime change. A phase actor that finishes and exits returns its entire high-water, its adopted garbage and its scratch. So peak becomes `max over phases (phase working set + input copy + output copy)` instead of the deepest point over the whole unit. Mechanism 1 (adopted garbage) and 2 (high-water never returned) of section 3 are then bounded per phase. Release algorithms also get dispatch boundaries to act on, with phases as messages to a long-lived actor.
 

@@ -39,7 +39,7 @@ How the build works now (details in `compiler/src/README.md`, `compiler/src/Make
 | Phase 4, Phase 7 (compiler adoption of standard structures) | Withdrawn 2026-09-29, removed |
 | Phase 5.1 (no `type` aliases) | Done: zero `type` aliases and zero named `struct` declarations in `compiler/src` (verified with `git grep`) |
 | Phase 5.2 (no legacy stdlib `use`) | Done; compiler-internal stdlib is `wbt_map` and `OrderedMap` only |
-| Step 6.1 (gen 2, differential, fixpoint) | Done: `make gen2`, `make fixpoint` (the fixpoint check also reports units emitted differently by gen2 than by gen1); logs under `/Volumes/2T/silica_builds/`. `trials/self_host_addition/` was not created; `make trials-gen1`, `trials-gen2`, `trials-both` run the whole tree against a generation instead |
+| Step 6.1 (gen 2, differential, fixpoint) | Done: `make gen2`, `make fixpoint` (the fixpoint check also reports units emitted differently by gen2 than by gen1); logs under `/Volumes/2T/silica_builds/`. `trials/self_host_addition/` was not created; `make trials-gen1`, `trials-gen2`, `trials-both` run the whole tree against a generation instead. **Status 2026-11-18 (Lee): obsolete.** Lee ruled that a `trials/self_host_addition` suite is no longer wanted. |
 | Step 6.3 (cutover) and 6.4 (bootstrap retirement) | Done: single tree `compiler/src`, no `silica-boot`, no Rust crate |
 
 Open items that remain from this plan:
@@ -403,7 +403,7 @@ Work items map to W-ids from Step 0.2. Prefer fixing and simplifying **inside `s
 2. Differential: compile the same trial sources with gen 1 and gen 2 and diff every `.sams` (label counters `o[0-9]+` are the only expected noise; see `trials/` notes).
 3. Fixpoint: gen 2 builds gen 3; compare binaries byte-for-byte modulo embedded metadata. Self-compiling once is *not* fixpoint.
 4. (Done: `src/fix_seed_emission.py` was removed 2026-10-16.) Retire it before claiming fixpoint if it is still applied to any `.sams`.
-5. Optionally add `trials/self_host_addition/` wrapping steps 1–3 so `make integrate` runs them.
+5. Optionally add `trials/self_host_addition/` wrapping steps 1–3 so `make integrate` runs them. **Status 2026-11-18 (Lee): obsolete.** Lee ruled that a `trials/self_host_addition` suite is no longer wanted.
 
 **Exit criteria:**
 

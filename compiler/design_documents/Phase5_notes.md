@@ -209,6 +209,8 @@ prim dispatch: 5d) and one `(region(L, normal), ref` in a `type_checker_recursiv
 
 ## 6. Not verified (Haiku builds, Sonnet reads)
 
+**Status 2026-11-18: done**: built and gated in section 9 (12-suite gate, compiler sha1 d6438413, 2026-10-31).
+
 Nothing built or run. Expected: every stdlib unit and every compiler unit that spelled the field recompiles with
 the 4e compiler as builder (the inline types match the stdlib records again); `ordered_data_structures` and the
 five other suites of §4 fail to compile until 5b. Risks judged highest: (a) a `sequence` that lost its
@@ -468,6 +470,7 @@ Other trees, left for phases 8/9 (`grep -rn canonical_arena compiler/src | grep 
   takes that lock three times, so the word could not be deleted with the module. It moved, as one `.bss` word, into
   `prims_actors_runtime_asm@actor_rt_asm_chunk_10` (beside the other process-wide lock words; the runtime object is
   linked once per executable, as the canonical module was). It goes when `L_region_grow` goes.
+**Status 2026-11-18: partly done**: `L_region_grow` is no longer emitted on the Mac (`prims_memory.silica:150`, Lee 2026-11-01), but the lock word is still defined in `actor_rt_asm_chunk_10` with no remaining user, so it can be deleted.
 * The ESP32-S3 twins of the abort entries and the lock are the board's (`rt_ordering.S`, phase 9); untouched.
 * `compiler/src/__silica_runtime.sams` and `compiler/build/apple_silicon_mac/{silica.config,.silica.config.units}`
   name the module; both are gitignored build outputs the topo script and the build regenerate.
@@ -489,6 +492,7 @@ one definition (chunk 10), three uses (`L_region_grow`). Left for phases 8/9 (`.
 `rt_ordering.S` and `rt_heap.S` twins, which are not `.silica`). There is no `compiler/src_selfhost` directory in this
 tree (the tree-layout move made `src` the selfhost source). Nothing was built or run.
 2026-11-14 (verification pass): partly done. Linux done in phase 8: `canonical_arena` is removed from linux_aarch64 and linux_x86_64 (only a comment remains). Still open: `ESP32-S3_raw` still has `terms/canonical_arena_runtime_asm.*` and `canonical_arena` entries in `board/runtime/rt_ordering.S`.
+**Status 2026-11-18: done**: `ESP32-S3_raw/terms/canonical_arena_runtime_asm.*` is gone and `rt_ordering.S` keeps only header comments that name the routines, no definitions.
 
 ## 9. Phase 5 close (2026-10-31)
 
