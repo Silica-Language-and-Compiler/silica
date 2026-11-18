@@ -27,6 +27,45 @@
 //   address "listen:any:port"  binds 0.0.0.0:port, every IPv4 interface of the host, and becomes a listener
 //                              that behaves exactly as the loopback one. It is the explicit wildcard form for a
 //                              carrier spawned without a link; nothing chooses it by default.
+//   address "[ipv6]:port:timeout_ms"
+//                              connects to an IPv6 peer; the address is written between brackets;
+//   address "listen:[ipv6]:port"
+//                              binds the one given IPv6 address and becomes a listener;
+//   address "listen:name:name:port:timeout_ms"
+//                              resolves the host name, waiting at most timeout_ms milliseconds for the resolver,
+//                              binds the address it names and becomes a listener.
+//
+// IPv6 (requests SR-1 and SR-2). An IPv6 address is always written between brackets, in a dial and in a listen
+// address alike: every form ends with ":port", and an address made of colons has no other unambiguous end. An
+// unbracketed one is never accepted ("::1:80:3000" is malformed). Between the brackets stands the address alone,
+// in its one canonical text (RFC 5952, dangerous_sockets@parse_ipv6): lowercase hexadecimal, no leading zeros in
+// a group, "::" for the longest run of two or more zero groups; no dotted-quad tail, no zone ("%en0"). Anything
+// else ("[2001:DB8::1]", "[2001:0db8::1]", "[0:0:0:0:0:0:0:1]", "[::1", "[::1]x") ends the carrier with
+// (:explicit, :bad_address), as a malformed dotted quad does. So does a link-local address ("[fe80::1]"): it means
+// something only with its interface (its zone), which these forms do not carry, so it is not served yet. After "]:" comes the port, 1 to 5 digits without a
+// leading zero, at most 65535 (the name form's port is checked the same way; the IPv4 forms read their port as
+// before). An IPv6 socket carries IPv6 only: "listen:[::]:port" is every IPv6 interface and never IPv4 as well,
+// and "listen:any:port" stays every IPv4 interface and never IPv6. A program that wants both opens two listeners.
+// The link rules are those of IPv4: without a link any address may be bound; (:loopback) refuses every
+// "listen:[ipv6]:port" but "listen:[::1]:port"; a named link refuses one that is not an address of its interface
+// (so "[::]" is refused under every link, as "listen:any" is); a bare "listen:port" still binds the IPv4 address
+// (127.0.0.1, or the interface's first IPv4 address). An IPv6 dial under a named link leaves from the first IPv6
+// address of the link's interface that is not link-local; an interface with no such address ends the carrier
+// with (:explicit, :link_unavailable).
+//
+// A listener bound by name (request SR-1). "listen:name:<name>:<port>:<timeout_ms>" asks the system resolver
+// (getaddrinfo: the hosts file, mDNS, DNS, as the host is configured) for the name once, at :open, and binds one
+// address: the resolver's addresses are taken in its order, IPv4 and IPv6 alike, link-local IPv6 ones and those
+// the link does not allow are passed over (under (:loopback) only 127.0.0.0/8 and ::1, under a named link only its interface's addresses), and
+// the first that binds is the listener's. A name that does not resolve, or none of whose addresses is allowed and
+// binds, is a failed open: (:link_down, :fault), then (:explicit, :link_unavailable). The resolver is the one
+// thing a listener waits for, so the address states how long, as a dial does and with the same rules (1 to 9
+// digits, greater than 0, no default): a resolver that has not answered by then is (:link_down, :timeout), then
+// (:explicit, :link_timeout). The name is 1 to 253 bytes of dot-separated labels of letters, digits and hyphens
+// (1 to 63 each, no hyphen first or last) whose last label starts with a letter, so no numeric form reaches the
+// resolver (an address is written as an address); anything else is (:explicit, :bad_address). Only a listener
+// takes a name: a dial takes an address, and resolving a peer's name (which address, in what order, how often) is
+// the program's own, done before it opens the carrier.
 //
 // The link (transport_links_design.md §3.2, hosted Ethernet plan stage E2). The state's `link_spec` is written by
 // the target's transport pack when spawn_dangerous_carrier expands a `carried_on` declaration: "" for a carrier
@@ -66,7 +105,7 @@
 // (nothing listens on the port) is a failed open as before: (:link_down, :fault), then
 // (:explicit, :link_unavailable). The carrier handles no other message while it waits, so the timeout is also
 // the longest time a :close sent during the connect stays unread. The :link_up of a dialled connection carries
-// the peer, "host:port", without the timeout.
+// the peer, "host:port" or "[ipv6]:port", without the timeout.
 //
 // A connection carrier answers :link_up, grants 8 send credits, and then moves bytes: each :tx
 // consumes one credit and :tx_credit hands it back once the bytes are written; received bytes are
@@ -74,8 +113,8 @@
 //
 // A listener answers (:link_up, "port:<n>") once bound and never carries bytes itself. For every
 // peer it accepts it spawns one connection carrier holding the accepted descriptor and tells its
-// owner (:accepted, conn: dangerous_actor_ref, "peer:<ipv4>:<port>") (getpeername; "peer:accepted" if the
-// peer's address cannot be read). That connection carrier waits
+// owner (:accepted, conn: dangerous_actor_ref, "peer:<ipv4>:<port>"), or "peer:[<ipv6>]:<port>" for an IPv6 peer,
+// the address in its canonical text (getpeername; "peer:accepted" if the peer's address cannot be read). That connection carrier waits
 // for its own (:open, owner, _) (the address is ignored: the peer is already connected); whoever
 // sends it becomes the connection's owner and receives its :link_up, its credits, its :rx and its
 // :link_down, exactly as the owner of a connecting carrier does. The listener keeps listening until
@@ -130,11 +169,86 @@ fn port_of(address: string) -> int64 {
     digits_from(address, length_bytes(h) + 1, 0)
 }
 
+// Where the port starts after a bracketed IPv6 address whose text starts at open_at (just after '['): after the
+// "]:" that closes it, or -1 when the bracket is not closed, is not followed by ':' or nothing follows that.
+fn bracket_port_start(address: string, open_at: int64) -> int64 {
+    rb: int64 <- open_at + length_bytes(substring_until_char(address, open_at, ']'));
+    case rb + 1 < length_bytes(address) of {
+        false -> 0 - 1;
+        true -> case at(address, rb) == 93 and at(address, rb + 1) == 58 of {
+            true -> rb + 2;
+            false -> 0 - 1
+        }
+    }
+}
+
+// Whether s is a port as the IPv6 and name forms write it: 1 to 5 decimal digits and nothing else, no leading zero
+// except a bare "0", at most 65535.
+fn port_text_ok(s: string) -> boolean {
+    n: int64 <- length_bytes(s);
+    case n < 1 or n > 5 of {
+        true -> false;
+        false -> case all_digits_from(s, 0) == false of {
+            true -> false;
+            false -> case n > 1 and at(s, 0) == 48 of {
+                true -> false;
+                false -> digits_from(s, 0, 0) <= 65535
+            }
+        }
+    }
+}
+
+// A timeout text as milliseconds, or 0 when it is not one: 1 to 9 decimal digits and nothing else (0 is never a
+// timeout).
+fn timeout_of_text(s: string) -> int64 {
+    case length_bytes(s) < 1 or length_bytes(s) > 9 of {
+        true -> 0;
+        false -> case all_digits_from(s, 0) of {
+            true -> digits_from(s, 0, 0);
+            false -> 0
+        }
+    }
+}
+
+// Where the port of a dial address starts: after "host:", or after "[ipv6]:" (-1 when the bracket form is
+// malformed).
+fn dial_port_start(address: string) -> int64 {
+    case starts(address, "[") of {
+        true -> bracket_port_start(address, 1);
+        false -> length_bytes(host_of(address)) + 1
+    }
+}
+
+// The host a dial address names: the dotted quad before the first ':', or the IPv6 text between the brackets.
+fn dial_host(address: string) -> string {
+    case starts(address, "[") of {
+        true -> substring_until_char(address, 1, ']');
+        false -> host_of(address)
+    }
+}
+
+fn dial_port(address: string) -> int64 {
+    start: int64 <- dial_port_start(address);
+    case start < 0 of {
+        true -> 0;
+        false -> digits_from(address, start, 0)
+    }
+}
+
+// Whether the port of a bracketed dial address "[ipv6]:port:timeout_ms" is a port (port_text_ok).
+fn dial6_port_ok(address: string) -> boolean {
+    start: int64 <- dial_port_start(address);
+    case start < 0 or start >= length_bytes(address) of {
+        true -> false;
+        false -> port_text_ok(substring_until_char(address, start, ':'))
+    }
+}
+
 // Where the timeout text of a dial address "host:port:timeout_ms" starts, or -1 when the address has no third
-// part (no second ':' or nothing after it).
+// part (no ':' after the port or nothing after it) or its bracketed host is malformed.
 fn connect_timeout_start(address: string) -> int64 {
-    port_start: int64 <- length_bytes(host_of(address)) + 1;
-    case port_start >= length_bytes(address) of {
+    port_start: int64 <- dial_port_start(address);
+    case port_start < 0 or port_start >= length_bytes(address) of {
         true -> 0 - 1;
         false -> {
             port_text: string <- substring_until_char(address, port_start, ':');
@@ -174,34 +288,91 @@ fn connect_timeout_of(address: string) -> int64 {
     }
 }
 
-// The peer of a dial address whose timeout is stated: "host:port", what a dialled connection's :link_up carries.
+// The peer of a dial address whose timeout is stated: "host:port" or "[ipv6]:port", what a dialled connection's
+// :link_up carries.
 fn dial_peer_text(address: string) -> string {
     substring(address, 0, connect_timeout_start(address) - 1)
 }
 
-// The port of a listener address: "listen:any:<port>", "listen:<ipv4>:<port>" or "listen:<port>".
-fn listen_port_of(address: string) -> int64 {
+// The listener forms: "listen:any:<port>" -> :any; "listen:name:<name>:<port>:<timeout_ms>" -> :name;
+// "listen:[<ipv6>]:<port>" -> :ip6; "listen:<ipv4>:<port>" -> :ip; "listen:<port>" -> :port.
+fn listen_form(address: string) -> atom {
+    rest: string <- substring(address, 7, length_bytes(address));
     case starts(address, "listen:any:") of {
-        true -> digits_from(address, 11, 0);
-        false -> {
+        true -> :any;
+        false -> case starts(address, "listen:name:") of {
+            true -> :name;
+            false -> case starts(address, "listen:[") of {
+                true -> :ip6;
+                false -> case length_bytes(substring_until_char(rest, 0, ':')) == length_bytes(rest) of {
+                    true -> :port;
+                    false -> :ip
+                }
+            }
+        }
+    }
+}
+
+// The address text of "listen:[<ipv6>]:<port>", without its brackets.
+fn listen_ip6_text(address: string) -> string {
+    substring_until_char(address, 8, ']')
+}
+
+// Whether "listen:[<ipv6>]:<port>" is closed by "]:" and ends with a port and nothing else (port_text_ok).
+fn listen_ip6_ok(address: string) -> boolean {
+    start: int64 <- bracket_port_start(address, 8);
+    case start < 0 of {
+        true -> false;
+        false -> port_text_ok(substring(address, start, length_bytes(address)))
+    }
+}
+
+// The parts of "listen:name:<name>:<port>:<timeout_ms>": the name, where its port starts, the port's text ("" when
+// there is none) and the timeout in milliseconds (0 when it is missing or malformed, timeout_of_text).
+fn listen_name_text(address: string) -> string {
+    substring_until_char(address, 12, ':')
+}
+
+fn listen_name_port_start(address: string) -> int64 {
+    12 + length_bytes(listen_name_text(address)) + 1
+}
+
+fn listen_name_port_text(address: string) -> string {
+    start: int64 <- listen_name_port_start(address);
+    case start >= length_bytes(address) of {
+        true -> "";
+        false -> substring_until_char(address, start, ':')
+    }
+}
+
+fn listen_name_timeout(address: string) -> int64 {
+    start: int64 <- listen_name_port_start(address) + length_bytes(listen_name_port_text(address)) + 1;
+    case start >= length_bytes(address) of {
+        true -> 0;
+        false -> timeout_of_text(substring(address, start, length_bytes(address)))
+    }
+}
+
+// The port of a listener address: "listen:any:<port>", "listen:name:<name>:<port>:<timeout_ms>",
+// "listen:[<ipv6>]:<port>", "listen:<ipv4>:<port>" or "listen:<port>".
+fn listen_port_of(address: string) -> int64 {
+    case listen_form(address) of {
+        :any -> digits_from(address, 11, 0);
+        :name -> digits_from(address, listen_name_port_start(address), 0);
+        :ip6 -> {
+            start: int64 <- bracket_port_start(address, 8);
+            case start < 0 of {
+                true -> 0;
+                false -> digits_from(address, start, 0)
+            }
+        };
+        _: atom -> {
             rest: string <- substring(address, 7, length_bytes(address));
             first: string <- substring_until_char(rest, 0, ':');
             case length_bytes(first) == length_bytes(rest) of {
                 true -> port_of(address);
                 false -> digits_from(rest, length_bytes(first) + 1, 0)
             }
-        }
-    }
-}
-
-// The listener forms: "listen:any:<port>" -> :any; "listen:<ipv4>:<port>" -> :ip; "listen:<port>" -> :port.
-fn listen_form(address: string) -> atom {
-    rest: string <- substring(address, 7, length_bytes(address));
-    case starts(address, "listen:any:") of {
-        true -> :any;
-        false -> case length_bytes(substring_until_char(rest, 0, ':')) == length_bytes(rest) of {
-            true -> :port;
-            false -> :ip
         }
     }
 }
@@ -249,13 +420,93 @@ fn is_loopback_ipv4(a: int64) -> boolean {
     a / 16777216 == 127
 }
 
-// Which listen wrapper an :open uses: :any (0.0.0.0), :addr (one IPv4 address), :loopback (127.0.0.1), :none.
+// The canonical text of an IPv6 address (RFC 5952, the one text the strict parser accepts) from its four 32-bit
+// words, as dangerous_sockets@peer_addr6_word answers them: lowercase hexadecimal groups without leading zeros,
+// and "::" for the longest run of two or more zero groups (the first when two are equally long).
+fn hex_text_from(n: int64, acc: string) -> string {
+    case n < 16 of {
+        true -> concat(substring("0123456789abcdef", n, n + 1), acc);
+        false -> hex_text_from(n / 16, concat(substring("0123456789abcdef", n % 16, n % 16 + 1), acc))
+    }
+}
+
+// Group i (0 to 7) of the address.
+fn group_of(w0: int64, w1: int64, w2: int64, w3: int64, i: int64) -> int64 {
+    w: int64 <- case i < 2 of {
+        true -> w0;
+        false -> case i < 4 of {
+            true -> w1;
+            false -> case i < 6 of {
+                true -> w2;
+                false -> w3
+            }
+        }
+    };
+    case i % 2 == 0 of {
+        true -> w / 65536;
+        false -> w % 65536
+    }
+}
+
+// How many zero groups stand in a row from group i on (acc counts them).
+fn zero_run(w0: int64, w1: int64, w2: int64, w3: int64, i: int64, acc: int64) -> int64 {
+    case i >= 8 of {
+        true -> acc;
+        false -> case group_of(w0, w1, w2, w3, i) == 0 of {
+            true -> zero_run(w0, w1, w2, w3, i + 1, acc + 1);
+            false -> acc
+        }
+    }
+}
+
+// The run "::" replaces, as start * 16 + length; 0 when no run is two groups long.
+fn best_zero_run(w0: int64, w1: int64, w2: int64, w3: int64, i: int64, best: int64) -> int64 {
+    case i >= 8 of {
+        true -> best;
+        false -> {
+            n: int64 <- zero_run(w0, w1, w2, w3, i, 0);
+            case n >= 2 and n > best % 16 of {
+                true -> best_zero_run(w0, w1, w2, w3, i + n, i * 16 + n);
+                false -> best_zero_run(w0, w1, w2, w3, i + 1, best)
+            }
+        }
+    }
+}
+
+fn ipv6_groups_text(w0: int64, w1: int64, w2: int64, w3: int64, i: int64, run: int64, acc: string) -> string {
+    run_start: int64 <- run / 16;
+    run_length: int64 <- run % 16;
+    case i >= 8 of {
+        true -> acc;
+        false -> case run_length >= 2 and i == run_start of {
+            true -> ipv6_groups_text(w0, w1, w2, w3, i + run_length, run, concat(acc, "::"));
+            false -> {
+                separator: string <- case i == 0 or (run_length >= 2 and i == run_start + run_length) of {
+                    true -> "";
+                    false -> ":"
+                };
+                group_text: string <- hex_text_from(group_of(w0, w1, w2, w3, i), "");
+                ipv6_groups_text(w0, w1, w2, w3, i + 1, run, concat(concat(acc, separator), group_text))
+            }
+        }
+    }
+}
+
+fn ipv6_text(w0: int64, w1: int64, w2: int64, w3: int64) -> string {
+    run: int64 <- best_zero_run(w0, w1, w2, w3, 0, 0);
+    ipv6_groups_text(w0, w1, w2, w3, 0, run, "")
+}
+
+// Which listen wrapper an :open uses: :any (0.0.0.0), :addr (one IPv4 address), :addr6 (one IPv6 address), :name
+// (the address a host name resolves to), :loopback (127.0.0.1), :none.
 fn listen_call(do_listen: boolean, refused: boolean, form: atom, named: boolean) -> atom {
     case do_listen and refused == false of {
         false -> :none;
         true -> case form of {
             :any -> :any;
             :ip -> :addr;
+            :ip6 -> :addr6;
+            :name -> :name;
             _: atom -> case named of {
                 true -> :addr;
                 false -> :loopback
@@ -350,6 +601,12 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         lkind: atom <- link_kind(state.link_spec);
         named: boolean <- lkind == :interface or lkind == :ethernet or lkind == :wifi;
         form: atom <- listen_form(text);
+        // The IPv6 and name forms: a dial of "[<ipv6>]:<port>:<timeout_ms>", "listen:[<ipv6>]:<port>" and
+        // "listen:name:<name>:<port>:<timeout_ms>".
+        dial6: boolean <- do_connect and starts(text, "[");
+        listen6: boolean <- do_listen and form == :ip6;
+        listen_name: boolean <- do_listen and form == :name;
+        use_link: int64 <- case named of { true -> 1; false -> 0 };
         do_select: boolean <- (do_connect and named) or (do_listen and named and form != :any);
         res_sel: { tag: int64, value: int64, error_code: int64 } <- case do_select of {
             true -> dangerous_sockets@link_select(link_param(state.link_spec), link_family(lkind), link_instance(state.link_spec));
@@ -359,43 +616,86 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         sel_addr_raw: int64 <- res_sel.value;
         sel_tag: int64 <- pure_int(recreate(sel_tag_raw));
         sel_addr: int64 <- pure_int(recreate(sel_addr_raw));
-        // The literal of "listen:<ipv4>:<port>", or the host a connection dials: both are checked by the
-        // strict parser before anything is bound or dialled, so either malformed ends (:explicit, :bad_address).
+        // The literal of "listen:<ipv4>:<port>" or "listen:[<ipv6>]:<port>", the name of "listen:name:...", or
+        // the host a connection dials: each is checked by its strict parser before anything is resolved, bound or
+        // dialled, so any of them malformed ends (:explicit, :bad_address). An IPv6 literal answers 1 as its
+        // address when it is the loopback address ::1, else 0.
         parse_listen: boolean <- do_listen and form == :ip;
-        do_parse: boolean <- parse_listen or do_connect;
-        parse_text: string <- case do_connect of { true -> host_of(text); false -> listen_ip_text(text) };
+        do_parse: boolean <- parse_listen or listen6 or listen_name or do_connect;
+        parse_text: string <- case do_connect of {
+            true -> dial_host(text);
+            false -> case form of {
+                :ip6 -> listen_ip6_text(text);
+                :name -> listen_name_text(text);
+                _: atom -> listen_ip_text(text)
+            }
+        };
         res_ip: { tag: int64, value: int64, error_code: int64 } <- case do_parse of {
-            true -> dangerous_sockets@parse_ipv4(parse_text);
+            true -> case listen_name of {
+                true -> dangerous_sockets@parse_host_name(parse_text);
+                false -> case dial6 or listen6 of {
+                    true -> dangerous_sockets@parse_ipv6(parse_text);
+                    false -> dangerous_sockets@parse_ipv4(parse_text)
+                }
+            };
             false -> none_res()
         };
         ip_tag_raw: int64 <- res_ip.tag;
         ip_addr_raw: int64 <- res_ip.value;
         ip_tag: int64 <- pure_int(recreate(ip_tag_raw));
         ip_addr: int64 <- pure_int(recreate(ip_addr_raw));
-        // The connect timeout a dial states (header): none, or a malformed one, is a malformed address.
-        timeout_ms: int64 <- case do_connect of { true -> connect_timeout_of(text); false -> 0 };
-        bad_address: boolean <- (do_parse and ip_tag != 0) or (do_connect and timeout_ms <= 0);
-        do_owns: boolean <- parse_listen and named and bad_address == false and sel_tag == 0;
+        // The timeout a dial or a name states (header): none, or a malformed one, is a malformed address. So is
+        // an IPv6 or name form whose brackets or port are malformed.
+        timeout_ms: int64 <- case do_connect of {
+            true -> connect_timeout_of(text);
+            false -> case listen_name of {
+                true -> listen_name_timeout(text);
+                false -> 0
+            }
+        };
+        shape_bad: boolean <- case dial6 of {
+            true -> dial6_port_ok(text) == false;
+            false -> case listen6 of {
+                true -> listen_ip6_ok(text) == false;
+                false -> case listen_name of {
+                    true -> port_text_ok(listen_name_port_text(text)) == false;
+                    false -> false
+                }
+            }
+        };
+        bad_address: boolean <- (do_parse and ip_tag != 0) or ((do_connect or listen_name) and timeout_ms <= 0) or shape_bad;
+        do_owns: boolean <- (parse_listen or listen6) and named and bad_address == false and sel_tag == 0;
         res_owns: { tag: int64, value: int64, error_code: int64 } <- case do_owns of {
-            true -> dangerous_sockets@link_owns(ip_addr);
+            true -> case listen6 of {
+                true -> dangerous_sockets@link_owns6(listen_ip6_text(text));
+                false -> dangerous_sockets@link_owns(ip_addr)
+            };
             false -> none_res()
         };
         owns_raw: int64 <- res_owns.value;
         owns: int64 <- pure_int(recreate(owns_raw));
-        link_refused: boolean <- (do_listen and form == :any and lkind != :none) or (do_select and sel_tag != 0) or (parse_listen and bad_address == false and lkind == :loopback and is_loopback_ipv4(ip_addr) == false) or (do_owns and owns != 1);
+        link_refused: boolean <- (do_listen and form == :any and lkind != :none) or (do_select and sel_tag != 0) or (parse_listen and bad_address == false and lkind == :loopback and is_loopback_ipv4(ip_addr) == false) or (listen6 and bad_address == false and lkind == :loopback and ip_addr != 1) or (do_owns and owns != 1);
         refused: boolean <- bad_address or link_refused;
         bind_ip: string <- case form == :ip of {
             true -> listen_ip_text(text);
             false -> ipv4_text(sel_addr)
         };
+        // The addresses of a name that a link allows (dangerous_sockets@tcp_listen_name): any, loopback ones under
+        // (:loopback), the interface's own under a named link.
+        name_rule: int64 <- case lkind == :loopback of { true -> 1; false -> use_link * 2 };
         res_open: { tag: int64, value: int64, error_code: int64 } <- case do_connect and refused == false of {
-            true -> case named of {
-                true -> dangerous_sockets@tcp_connect_from(host_of(text), port_of(text), sel_addr, timeout_ms);
-                false -> dangerous_sockets@tcp_connect(host_of(text), port_of(text), timeout_ms)
+            true -> case dial6 of {
+                true -> dangerous_sockets@tcp_connect6(dial_host(text), dial_port(text), use_link, timeout_ms);
+                false -> case named of {
+                    true -> dangerous_sockets@tcp_connect_from(host_of(text), port_of(text), sel_addr, timeout_ms);
+                    false -> dangerous_sockets@tcp_connect(host_of(text), port_of(text), timeout_ms)
+                }
             };
             false -> case listen_call(do_listen, refused, form, named) of {
                 :any -> dangerous_sockets@tcp_listen_any(listen_port_of(text));
                 :addr -> dangerous_sockets@tcp_listen_addr(bind_ip, listen_port_of(text));
+                :addr6 -> dangerous_sockets@tcp_listen_addr6(listen_ip6_text(text), listen_port_of(text));
+                :name -> dangerous_sockets@tcp_listen_name(listen_name_text(text), listen_port_of(text), name_rule, timeout_ms);
                 :loopback -> dangerous_sockets@tcp_listen(listen_port_of(text));
                 _: atom -> none_res()
             }
@@ -439,9 +739,53 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         pa: int64 <- pure_int(recreate(pa_raw));
         pp_tag: int64 <- pure_int(recreate(pp_tag_raw));
         pp: int64 <- pure_int(recreate(pp_raw));
+        // An IPv6 peer: its address as four words (peer_addr answers only an IPv4 peer).
+        res_pf: { tag: int64, value: int64, error_code: int64 } <- case peer_fd >= 0 of {
+            true -> dangerous_sockets@peer_family(peer_fd);
+            false -> none_res()
+        };
+        pf_raw: int64 <- res_pf.value;
+        pf: int64 <- pure_int(recreate(pf_raw));
+        peer6: boolean <- peer_fd >= 0 and pf == 6;
+        res_w0: { tag: int64, value: int64, error_code: int64 } <- case peer6 of {
+            true -> dangerous_sockets@peer_addr6_word(peer_fd, 0);
+            false -> none_res()
+        };
+        res_w1: { tag: int64, value: int64, error_code: int64 } <- case peer6 of {
+            true -> dangerous_sockets@peer_addr6_word(peer_fd, 1);
+            false -> none_res()
+        };
+        res_w2: { tag: int64, value: int64, error_code: int64 } <- case peer6 of {
+            true -> dangerous_sockets@peer_addr6_word(peer_fd, 2);
+            false -> none_res()
+        };
+        res_w3: { tag: int64, value: int64, error_code: int64 } <- case peer6 of {
+            true -> dangerous_sockets@peer_addr6_word(peer_fd, 3);
+            false -> none_res()
+        };
+        w0_tag_raw: int64 <- res_w0.tag;
+        w0_raw: int64 <- res_w0.value;
+        w1_tag_raw: int64 <- res_w1.tag;
+        w1_raw: int64 <- res_w1.value;
+        w2_tag_raw: int64 <- res_w2.tag;
+        w2_raw: int64 <- res_w2.value;
+        w3_tag_raw: int64 <- res_w3.tag;
+        w3_raw: int64 <- res_w3.value;
+        w0_tag: int64 <- pure_int(recreate(w0_tag_raw));
+        w0: int64 <- pure_int(recreate(w0_raw));
+        w1_tag: int64 <- pure_int(recreate(w1_tag_raw));
+        w1: int64 <- pure_int(recreate(w1_raw));
+        w2_tag: int64 <- pure_int(recreate(w2_tag_raw));
+        w2: int64 <- pure_int(recreate(w2_raw));
+        w3_tag: int64 <- pure_int(recreate(w3_tag_raw));
+        w3: int64 <- pure_int(recreate(w3_raw));
+        peer6_read: boolean <- peer6 and pp_tag == 0 and w0_tag == 0 and w1_tag == 0 and w2_tag == 0 and w3_tag == 0;
         peer_text: string <- case pa_tag == 0 and pp_tag == 0 of {
             true -> concat(concat(concat("peer:", ipv4_text(pa)), ":"), int_text(pp));
-            false -> "peer:accepted"
+            false -> case peer6_read of {
+                true -> concat(concat(concat("peer:[", ipv6_text(w0, w1, w2, w3)), "]:"), int_text(pp));
+                false -> "peer:accepted"
+            }
         };
         bound: boolean <- do_listen and open_tag == 0;
         res_port: { tag: int64, value: int64, error_code: int64 } <- case bound of {
@@ -473,9 +817,10 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
         // or the read failed, or a write failed (a peer that went away, or a write that timed out
         // part way and left a torn frame in the stream).
         open_failed: boolean <- kind == :open and adoptable == false and open_tag != 0;
-        // A dial that was made and whose peer did not answer within the stated timeout (tag 2 of the connect; a
-        // refused :open makes no socket call and is not one).
-        connect_timed_out: boolean <- do_connect and refused == false and open_tag == 2;
+        // A dial that was made and whose peer did not answer within the stated timeout, or a name the resolver did
+        // not answer for in its stated timeout (tag 2 of the connect and of the name listen; a refused :open makes
+        // no socket call and is not one).
+        connect_timed_out: boolean <- (do_connect or listen_name) and refused == false and open_tag == 2;
         rx_ended: boolean <- do_rx and (rx_tag == 1 or rx_tag == 3);
         tx_broke: boolean <- do_tx and tx_tag != 0;
         do_close: boolean <- (kind == :close or rx_ended or tx_broke) and state.fd >= 0;

@@ -50,6 +50,12 @@ JOBS_linux_aarch64="${PI_JOBS:-2}"            # 4 GB board
 SDS_linux_aarch64="${PI_SDS_JOBS:-1}"
 JOBS_linux_x86_64="${NIX_JOBS:-3}"            # 13 GB, 8 cores
 SDS_linux_x86_64="${NIX_SDS_JOBS:-1}"
+# The two boards run together on this machine once its own run is over, so each gets a share of the
+# cores and the memory (16 GB Mac): 5 jobs each, 10 compiles at once, instead of one per core apiece.
+JOBS_ESP32_S3_raw="${ESP32_JOBS:-5}"
+SDS_ESP32_S3_raw="${ESP32_SDS_JOBS:-1}"
+JOBS_STM32_L476RG_raw="${NUCLEO_JOBS:-5}"
+SDS_STM32_L476RG_raw="${NUCLEO_SDS_JOBS:-1}"
 
 STAMP="$(date '+%Y%m%d-%H%M%S')"
 LOG_DIR="${LOG_DIR:-$REPO/../silica_trial_runs/$STAMP}"

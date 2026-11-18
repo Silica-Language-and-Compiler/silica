@@ -601,34 +601,59 @@ fn slot_type(ftype: string) -> string {
     j3("(:some, ", spell(ftype), ") | :none")
 }
 
-// The state of a record decode is one slot per field, `(:some, value) | :none`, each its own
-// parameter of the pair walker: a tuple of sums cannot be written with atom literals in it, and
-// a sum carried inside a tuple through the walk's recursion is not kept alive.
-fn slot_params(fields: List[string, mem(normal)]) -> string {
-    case fields of {
-        []: List[string, mem(normal)] -> "";
-        [h: string, t: List[string, mem(normal)]] -> j5(", s_", transport_types@field_name(h), ": ", slot_type(transport_types@field_type(h)), slot_params(t))
-    }
-}
-
-// The initial arguments: every slot `:none`.
-fn none_args(fields: List[string, mem(normal)]) -> string {
-    case fields of {
-        []: List[string, mem(normal)] -> "";
-        [_h: string, t: List[string, mem(normal)]] -> concat(", :none", none_args(t))
-    }
-}
-
-// The arguments with the slot of `fname` filled with `x`: the other slots keep their names.
-fn filled_args(fields: List[string, mem(normal)], fname: string, ftype: string) -> string {
+// The state of a record decode is one slot per field, `(:some, value) | :none`, held in one
+// record `st: { s_<field>: slot, ... }` that the pair walker takes as a single parameter and
+// rebuilds for each pair: the walker then has the same number of parameters for a record of any
+// number of fields (a function has at most 8, E1070). A record is used, not a tuple: a tuple of
+// sums cannot be written with atom literals in it.
+fn state_fields(fields: List[string, mem(normal)]) -> string {
     case fields of {
         []: List[string, mem(normal)] -> "";
         [h: string, t: List[string, mem(normal)]] -> {
-            this: string <- case transport_types@field_name(h) == fname of {
-                true -> j3(", (:some, ", arg_of(ftype, "x"), ")");
-                false -> concat(", s_", transport_types@field_name(h))
+            rest: string <- state_fields(t);
+            sep: string <- case length_bytes(rest) == 0 of { true -> ""; false -> ", " };
+            j5("s_", transport_types@field_name(h), ": ", slot_type(transport_types@field_type(h)), concat(sep, rest))
+        }
+    }
+}
+
+fn state_type(fields: List[string, mem(normal)]) -> string {
+    j3("{ ", state_fields(fields), " }")
+}
+
+// A record of no fields has no state: the walker takes no state parameter.
+fn state_param(fields: List[string, mem(normal)]) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [_h: string, _t: List[string, mem(normal)]] -> concat(", st: ", state_type(fields))
+    }
+}
+
+// The initial state: every slot `:none`.
+fn none_state(fields: List[string, mem(normal)]) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- none_state(t);
+            sep: string <- case length_bytes(rest) == 0 of { true -> ""; false -> ", " };
+            j5("s_", transport_types@field_name(h), ": :none", sep, rest)
+        }
+    }
+}
+
+// The state with the slot of `fname` filled with `x`: the other slots are read from `st`.
+fn filled_state(fields: List[string, mem(normal)], fname: string, ftype: string) -> string {
+    case fields of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, t: List[string, mem(normal)]] -> {
+            rest: string <- filled_state(t, fname, ftype);
+            sep: string <- case length_bytes(rest) == 0 of { true -> ""; false -> ", " };
+            hn: string <- transport_types@field_name(h);
+            this: string <- case hn == fname of {
+                true -> j5("s_", hn, ": (:some, ", arg_of(ftype, "x"), ")");
+                false -> j4("s_", hn, ": st.s_", hn)
             };
-            concat(this, filled_args(t, fname, ftype))
+            j3(this, sep, rest)
         }
     }
 }
@@ -641,13 +666,13 @@ fn record_key_arms(fmt: string, tid: string, subs: List[string, mem(normal)], k:
             rest: string <- record_key_arms(fmt, tid, subs, k, t, all);
             fname: string <- transport_types@field_name(h);
             ftype: string <- transport_types@field_type(h);
-            arm: string <- j8(j3("                ", q(fname), concat(" -> case s_", concat(fname, " of {\n"))),
+            arm: string <- j8(j3("                ", q(fname), concat(" -> case st.s_", concat(fname, " of {\n"))),
                 j3("                    (:some, _d: ", spell(ftype), ") -> (:rejected, :duplicate_field);\n"),
                 j3("                    :none -> case ", dec_fn(fmt, tid, index_of(subs, ftype)), "(bs, pk, depth@RA@) of {\n                        "),
                 reject_arm("r"),
-                j3(concat("                        (:ok, ", bind_of(ftype, "x")), concat(": ", spell(ftype)), ", p: int64) -> "),
-                j6("__tr_decm_", fmt, "_", tid, "_", concat(it(k), "(bs, p, depth@RA@, n - 1")),
-                concat(filled_args(all, fname, ftype), ")\n                    }\n                };\n"), "");
+                j3(concat("                        (:ok, ", bind_of(ftype, "x")), concat(": ", spell(ftype)), ", p: int64) -> {\n                            sequence\n"),
+                j5("                                st2: ", state_type(all), " <- { ", filled_state(all, fname, ftype), " }\n                            produces\n                                pure "),
+                j3(decm_fn(fmt, tid, k), "(bs, p, depth@RA@, n - 1, st2)\n", "                            end\n                        }\n                    }\n                };\n"), "");
             concat(arm, rest)
         }
     }
@@ -661,7 +686,7 @@ fn record_finish(fields: List[string, mem(normal)], final: string, indent: strin
             fname: string <- transport_types@field_name(h);
             ftype: string <- transport_types@field_type(h);
             inner: string <- record_finish(t, final, concat(indent, "    "));
-            j8(indent, j3("case s_", fname, " of {\n"), indent, "    :none -> (:rejected, :missing_field);\n", indent, j5("    (:some, ", bind_of(ftype, concat("x_", fname)), ": ", spell(ftype), ") ->\n"), inner, concat(indent, "}\n"))
+            j8(indent, j3("case st.s_", fname, " of {\n"), indent, "    :none -> (:rejected, :missing_field);\n", indent, j5("    (:some, ", bind_of(ftype, concat("x_", fname)), ": ", spell(ftype), ") ->\n"), inner, concat(indent, "}\n"))
         }
     }
 }
@@ -670,11 +695,11 @@ fn decm_fn(fmt: string, tid: string, k: int64) -> string {
     j6("__tr_decm_", fmt, "_", tid, "_", it(k))
 }
 
-// The pair walker of a record: n pairs left at pos, the slots filled so far in s_<field>.
+// The pair walker of a record: n pairs left at pos, the slots filled so far in st.
 fn record_map_fn(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, t: string) -> string {
     fields: List[string, mem(normal)] <- transport_types@record_fields(t);
     final: string <- j3("(:ok, { ", record_literal(fields), " }, pos)");
-    head: string <- j7("fn ", decm_fn(fmt, tid, k), "(bs: string, pos: int64, depth: int64@RP@, n: int64", slot_params(fields), ") -> ", result_type(t), " {\n");
+    head: string <- j7("fn ", decm_fn(fmt, tid, k), "(bs: string, pos: int64, depth: int64@RP@, n: int64", state_param(fields), ") -> ", result_type(t), " {\n");
     done: string <- j3("    case n == 0 of {\n        true ->\n", record_finish(fields, final, "            "), "        ;\n");
     more: string <- j8("        false -> case ", wire(fmt, "dec_atom_name"), "(bs, pos) of {\n            ", reject_arm("rk"), "            (:ok, key: string, pk: int64) -> case key of {\n", record_key_arms(fmt, tid, subs, k, fields, fields), "                _: string -> (:rejected, :unknown_field)\n            }\n        }\n    }\n}\n", "");
     j3(head, done, more)
@@ -683,9 +708,13 @@ fn record_map_fn(fmt: string, tid: string, subs: List[string, mem(normal)], k: i
 fn record_dec_body(fmt: string, tid: string, subs: List[string, mem(normal)], k: int64, t: string) -> string {
     fields: List[string, mem(normal)] <- transport_types@record_fields(t);
     m: int64 <- count(fields, 0);
+    start: string <- case m == 0 of {
+        true -> j3(decm_fn(fmt, tid, k), "(bs, p0, depth - 1@RA@, ms)", "\n");
+        false -> j7("{\n                    sequence\n                        st0: ", state_type(fields), " <- { ", none_state(fields), " }\n                    produces\n                        pure ", decm_fn(fmt, tid, k), "(bs, p0, depth - 1@RA@, ms, st0)\n                    end\n                }\n")
+    };
     j8("    case depth <= 0 of {\n        true -> (:rejected, :too_deep);\n        false -> case ", wire(fmt, "dec_map_size"), "(bs, pos) of {\n            ", reject_arm("r0"),
        j3("            (:ok, ms: int64, p0: int64) -> case ms > ", it(m), " of {\n                true -> (:rejected, :unknown_field);\n                false -> "),
-       j7(decm_fn(fmt, tid, k), "(bs, p0, depth - 1@RA@, ms", none_args(fields), ")\n            }\n        }\n    }\n", "", "", ""), "", "")
+       start, "            }\n        }\n    }\n", "")
 }
 
 fn last_of(xs: List[string, mem(normal)]) -> string {

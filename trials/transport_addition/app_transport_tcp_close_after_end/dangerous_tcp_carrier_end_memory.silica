@@ -1,0 +1,71 @@
+// A2 (BEES request, SD-46): each ended (:tcp) carrier that made a foreign call left one 512-byte block behind, the
+// guarded-FFI per-thread state of its own thread, because the pthread key had no destructor. main spawns 60000
+// carriers whose dial to "127.0.0.1:1:3000" (a loopback port nothing listens on) is refused at once: each tells the
+// owner (:link_down, :fault) and ends itself. The owner counts the link_downs, prints the count at the last one and
+// ends the program with exit code 0. The resident set must stay under the ceiling in
+// dangerous_tcp_carrier_end_memory.max_rss_mb (measured by the harness, as for report_hundred_thousand_reports_rss):
+// the harness measured about 85 MB before the fix and about 45 MB after, on the Mac (ceiling 60).
+module dangerous_tcp_carrier_end_memory;
+
+use dangerous_sockets;
+use dangerous_tcp_carrier;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(msg: string, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state + 1)
+}
+
+fn is_down(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom)) -> boolean {
+    case msg of {
+        (:link_up, _info: string) -> false;
+        (:accepted, _conn: dangerous_actor_ref, _peer: string) -> false;
+        (:rx, _segment: string) -> false;
+        (:tx_credit, _n2: int64) -> false;
+        (:tx_failed, _why: atom) -> false;
+        (:link_down, _why2: atom) -> true
+    }
+}
+
+fn owner(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { left: int64 })
+    -> (:no_reply, { left: int64 }) {
+    sequence proc[concurrency, device_io]
+        down: boolean <- is_down(msg);
+        left: int64 <- case down of { true -> state.left - 1; false -> state.left };
+        _: atom <- case down and left == 0 of {
+            true -> println("60000 carriers ended");
+            false -> :ok
+        };
+        _: boolean <- case down and left == 0 of {
+            true -> cast_exit(0);
+            false -> true
+        }
+    produces
+        pure (:no_reply, { left: left })
+    end
+}
+
+fn spawn_all(own: actor_ref, left: int64) -> int64 {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, own, "127.0.0.1:1:3000") impl ActorMessage {});
+        rest: int64 <- case left > 1 of { true -> spawn_all(own, left - 1); false -> 0 }
+    produces
+        pure rest
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        own: actor_ref <- spawn({ left: 60000 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: int64 <- spawn_all(own, 60000);
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

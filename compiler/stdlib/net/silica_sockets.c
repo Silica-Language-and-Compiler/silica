@@ -20,7 +20,12 @@
    bounded by a timeout in milliseconds, so a carrier actor polls between its mailbox messages and
    never blocks its thread for long. A TCP connect is bounded too: the socket is non-blocking while it
    connects and the wait ends at the timeout the caller stated (silica_sockets_set_connect_timeout).
-   There is no default: a connect whose timeout was not stated is refused with EINVAL.
+   There is no default: a connect whose timeout was not stated is refused with EINVAL. The one call
+   that asks the system resolver (silica_sockets_tcp_listen_name) is bounded the same way.
+
+   Addresses are IPv4 (dotted quad, ipv4_strict) or IPv6 (ipv6_strict); both parsers are this file's
+   own and accept exactly one text for each address. An IPv6 socket is always IPV6_V6ONLY, so the two
+   families never mix on one socket.
 
    Result conventions (FFI wrapper specification §9): a tagged result { tag, value, error_code } with
    tag 0 = ok, 1 = error (errno in error_code), 2 = timeout, 3 = closed by the peer. Received bytes
@@ -45,6 +50,8 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <ifaddrs.h>
+#include <netdb.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #if defined(__APPLE__)
 #include <sys/sockio.h>
@@ -127,6 +134,139 @@ static int ipv4_strict_text(const char *s, uint32_t *out) {
     return ipv4_strict((const uint8_t *)s, (uint64_t)strlen(s), out);
 }
 
+/* The canonical text of an IPv6 address given as its eight groups (RFC 5952): lowercase hexadecimal, no leading
+   zeros in a group, and "::" in place of the longest run of two or more zero groups (the first such run when two
+   are equally long). out holds at least 40 bytes; the answer is the length, without a terminating NUL. */
+static size_t ipv6_render(const uint16_t g[8], char *out) {
+    static const char hex[] = "0123456789abcdef";
+    int best_start = -1, best_len = 0;
+    for (int i = 0; i < 8; ) {
+        int j = i;
+        while (j < 8 && g[j] == 0) j++;
+        if (j - i >= 2 && j - i > best_len) { best_start = i; best_len = j - i; }
+        i = j > i ? j : i + 1;
+    }
+    size_t o = 0;
+    for (int i = 0; i < 8; ) {
+        if (i == best_start) { out[o++] = ':'; out[o++] = ':'; i += best_len; continue; }
+        if (o > 0 && out[o - 1] != ':') out[o++] = ':';
+        uint16_t v = g[i];
+        int started = 0;
+        for (int shift = 12; shift >= 0; shift -= 4) {
+            int d = (v >> shift) & 15;
+            if (d != 0 || started || shift == 0) { out[o++] = hex[d]; started = 1; }
+        }
+        i++;
+    }
+    return o;
+}
+
+/* The one IPv6 text parser of this file, in the style of ipv4_strict: no libc parser, the same on every host, and
+   exactly one text for each address, the canonical one of RFC 5952 (ipv6_render). The text is read as groups of
+   1 to 4 lowercase hexadecimal digits separated by single colons, with at most one "::"; it is then accepted only
+   if it is byte for byte the canonical text of the address it names. So these are refused: uppercase digits
+   ("2001:DB8::1"), a leading zero in a group ("2001:0db8::1"), a run of zero groups written out where "::"
+   belongs ("0:0:0:0:0:0:0:1" for "::1"), "::" standing for a single group, a dotted-quad tail
+   ("::ffff:1.2.3.4"), a zone ("fe80::1%en0"), brackets, spaces, and a text with a NUL inside. The address is
+   answered as its eight groups. (The wrappers refuse one more thing, a link-local address: ipv6_usable.) */
+static int ipv6_strict(const uint8_t *s, uint64_t n, uint16_t g[8]) {
+    uint16_t head[8], tail[8];
+    int nh = 0, nt = 0, gap = 0;
+    uint64_t i = 0;
+    char canon[40];
+    if (s == 0 || n < 2 || n > 39) return 0;
+    if (s[0] == ':') {
+        if (s[1] != ':') return 0;
+        gap = 1;
+        i = 2;
+    }
+    while (i < n) {
+        uint32_t v = 0;
+        uint64_t start = i;
+        for (;;) {
+            int d;
+            if (i >= n) break;
+            if (s[i] >= '0' && s[i] <= '9') d = s[i] - '0';
+            else if (s[i] >= 'a' && s[i] <= 'f') d = s[i] - 'a' + 10;
+            else break;
+            if (i - start == 4) return 0;
+            v = v * 16 + (uint32_t)d;
+            i++;
+        }
+        if (i == start) return 0;
+        if (nh + nt == 8) return 0;
+        if (gap) tail[nt++] = (uint16_t)v; else head[nh++] = (uint16_t)v;
+        if (i == n) break;
+        if (s[i] != ':') return 0;
+        i++;
+        if (i == n) return 0;
+        if (s[i] == ':') {
+            if (gap) return 0;
+            gap = 1;
+            i++;
+        }
+    }
+    if (gap ? nh + nt > 7 : nh != 8) return 0;
+    for (int k = 0; k < 8; k++) g[k] = 0;
+    for (int k = 0; k < nh; k++) g[k] = head[k];
+    for (int k = 0; k < nt; k++) g[8 - nt + k] = tail[k];
+    if (ipv6_render(g, canon) != (size_t)n || memcmp(canon, s, (size_t)n) != 0) return 0;
+    return 1;
+}
+
+static int ipv6_is_loopback(const uint16_t g[8]) {
+    for (int k = 0; k < 7; k++) if (g[k] != 0) return 0;
+    return g[7] == 1;
+}
+
+/* fe80::/10: an address that means something only on one interface (its scope). */
+static int ipv6_is_link_local(const uint16_t g[8]) {
+    return (g[0] & 0xffc0) == 0xfe80;
+}
+
+static void ipv6_groups_of(const struct in6_addr *a, uint16_t g[8]) {
+    for (int k = 0; k < 8; k++) g[k] = (uint16_t)((a->s6_addr[2 * k] << 8) | a->s6_addr[2 * k + 1]);
+}
+
+static void ipv6_sockaddr(struct sockaddr_in6 *addr, const uint16_t g[8], int64_t port) {
+    memset(addr, 0, sizeof *addr);
+#if defined(__APPLE__)
+    addr->sin6_len = sizeof *addr;
+#endif
+    addr->sin6_family = AF_INET6;
+    addr->sin6_port = htons((uint16_t)port);
+    for (int k = 0; k < 8; k++) {
+        addr->sin6_addr.s6_addr[2 * k] = (uint8_t)(g[k] >> 8);
+        addr->sin6_addr.s6_addr[2 * k + 1] = (uint8_t)(g[k] & 255);
+    }
+}
+
+/* The one host-name check of this file: what silica_sockets_tcp_listen_name hands to the system resolver. A name
+   is 1 to 253 bytes of labels separated by single dots; a label is 1 to 63 letters, digits and hyphens and neither
+   starts nor ends with a hyphen; the last label starts with a letter. That last rule keeps every numeric form
+   away from the resolver, whose own number parsing differs between hosts ("010.0.0.1", "127.1", "0x7f000001"):
+   an address is written as an address, in the forms the strict parsers accept. No trailing dot, no underscore. */
+static int host_name_strict(const uint8_t *s, uint64_t n) {
+    uint64_t label_start = 0;
+    if (s == 0 || n == 0 || n > 253) return 0;
+    for (uint64_t i = 0; i <= n; i++) {
+        if (i == n || s[i] == '.') {
+            uint64_t len = i - label_start;
+            if (len == 0 || len > 63) return 0;
+            if (s[label_start] == '-' || s[i - 1] == '-') return 0;
+            if (i == n) {
+                uint8_t c = s[label_start];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) return 0;
+            }
+            label_start = i + 1;
+            continue;
+        }
+        uint8_t c = s[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-')) return 0;
+    }
+    return 1;
+}
+
 /* A write to a connection whose peer has gone must fail with EPIPE, which the carrier reports to its
    owner, and must never raise SIGPIPE, which would end the whole program. Each platform's own
    per-socket mechanism is used, so the program's signal dispositions are left alone: macOS marks the
@@ -170,8 +310,9 @@ silica_sockets_tagged silica_sockets_set_args(int64_t a, int64_t b) {
     return ok(0);
 }
 
-/* States the timeout of the next TCP connect of this thread, in milliseconds. Only 1 to INT_MAX is a
-   timeout; anything else is EINVAL and leaves none stated. */
+/* States the timeout of the next TCP connect of this thread (or of the next name resolution,
+   silica_sockets_tcp_listen_name), in milliseconds. Only 1 to INT_MAX is a timeout; anything else is
+   EINVAL and leaves none stated. */
 silica_sockets_tagged silica_sockets_set_connect_timeout(int64_t timeout_ms) {
     silica_sockets_connect_timeout_ms = 0;
     if (timeout_ms <= 0 || timeout_ms > (int64_t)INT_MAX) { errno = EINVAL; return err(); }
@@ -205,12 +346,12 @@ static int64_t take_connect_timeout(void) {
    back in blocking mode (every later call on it is bounded by its own poll), timeout() when the peer did not
    answer in time, or err() with the connect's errno (ECONNREFUSED, EHOSTUNREACH, ...). fd is closed on every
    answer but ok. */
-static silica_sockets_tagged connect_bounded(int fd, const struct sockaddr_in *addr, int64_t timeout_ms) {
+static silica_sockets_tagged connect_bounded(int fd, const struct sockaddr *addr, socklen_t addr_len, int64_t timeout_ms) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { int e = errno; close(fd); errno = e; return err(); }
     int64_t start = monotonic_ms();
     if (start < 0) { int e = errno; close(fd); errno = e; return err(); }
-    if (connect(fd, (const struct sockaddr *)addr, sizeof *addr) < 0) {
+    if (connect(fd, addr, addr_len) < 0) {
         /* EINPROGRESS: the connect is under way. EINTR: a signal interrupted the call, and the connect goes
            on in the background all the same (POSIX); calling connect again would answer EALREADY. Both are
            waited for below. Any other errno is the connect's answer. */
@@ -256,7 +397,7 @@ silica_sockets_tagged silica_sockets_tcp_connect(const uint8_t *host_ptr, uint64
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     no_sigpipe(fd);
-    return connect_bounded(fd, &addr, timeout_ms);
+    return connect_bounded(fd, (const struct sockaddr *)&addr, sizeof addr, timeout_ms);
 }
 
 static silica_sockets_tagged tcp_listen_on(int64_t port, uint32_t host_order_addr) {
@@ -326,7 +467,7 @@ silica_sockets_tagged silica_sockets_tcp_connect_from(const uint8_t *host_ptr, u
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     no_sigpipe(fd);
     if (bind(fd, (struct sockaddr *)&local, sizeof local) < 0) { int e = errno; close(fd); errno = e; return err(); }
-    return connect_bounded(fd, &addr, timeout_ms);
+    return connect_bounded(fd, (const struct sockaddr *)&addr, sizeof addr, timeout_ms);
 }
 
 /* A dotted-quad IPv4 text as its address in host order (value), or EINVAL (ipv4_strict): the check a carrier makes
@@ -336,6 +477,29 @@ silica_sockets_tagged silica_sockets_parse_ipv4(const uint8_t *host_ptr, uint64_
     uint32_t a;
     if (!ipv4_strict(host_ptr, host_len, &a)) { errno = EINVAL; return err(); }
     return ok((int64_t)a);
+}
+
+/* An IPv6 text as an address a carrier can bind or dial: the canonical text (ipv6_strict) of an address that is
+   not link-local. A link-local address (fe80::/10) means something only together with its interface (its zone),
+   which the address forms do not carry, so it is refused here with the malformed ones. */
+static int ipv6_usable(const uint8_t *s, uint64_t n, uint16_t g[8]) {
+    return ipv6_strict(s, n, g) && !ipv6_is_link_local(g);
+}
+
+/* The same check for an IPv6 text (ipv6_usable; the text is the address alone, without the brackets a carrier
+   address writes around it): EINVAL when it is not the canonical text of an address or the address is link-local,
+   else value 1 for the loopback address ::1 and 0 for every other address, which is all a carrier's link rules
+   ask of it. */
+silica_sockets_tagged silica_sockets_parse_ipv6(const uint8_t *host_ptr, uint64_t host_len) {
+    uint16_t g[8];
+    if (!ipv6_usable(host_ptr, host_len, g)) { errno = EINVAL; return err(); }
+    return ok(ipv6_is_loopback(g) ? 1 : 0);
+}
+
+/* The check of a host name before it is resolved (host_name_strict): value 0, or EINVAL. */
+silica_sockets_tagged silica_sockets_parse_host_name(const uint8_t *host_ptr, uint64_t host_len) {
+    if (!host_name_strict(host_ptr, host_len)) { errno = EINVAL; return err(); }
+    return ok(0);
 }
 
 /* ---- links: the interface a carrier binds to (transport_links_design.md §3.2) ------------------- */
@@ -451,30 +615,307 @@ silica_sockets_tagged silica_sockets_link_owns(int64_t addr) {
     return ok(found);
 }
 
-/* The peer of a connected descriptor: its IPv4 address in host order (silica_sockets_peer_addr) and its port
-   (silica_sockets_peer_port), so a listener reports who connected ("peer:<ipv4>:<port>"). */
+/* Whether the interface the last silica_sockets_link_select chose holds the IPv6 address g. */
+static int link_holds_ipv6(const uint16_t g[8]) {
+    struct ifaddrs *list = 0;
+    int found = 0;
+    if (silica_sockets_link_ifname[0] == 0) return 0;
+    if (getifaddrs(&list) < 0) return 0;
+    for (struct ifaddrs *p = list; p != 0; p = p->ifa_next) {
+        uint16_t h[8];
+        if (p->ifa_addr == 0 || p->ifa_addr->sa_family != AF_INET6 || p->ifa_name == 0) continue;
+        if (strcmp(p->ifa_name, silica_sockets_link_ifname) != 0) continue;
+        ipv6_groups_of(&((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr, h);
+        if (memcmp(h, g, sizeof h) == 0) { found = 1; break; }
+    }
+    freeifaddrs(list);
+    return found;
+}
+
+static int link_holds_ipv4(uint32_t host_order_addr) {
+    silica_sockets_tagged r = silica_sockets_link_owns((int64_t)host_order_addr);
+    return r.tag == 0 && r.value == 1;
+}
+
+/* The first IPv6 address of the link's interface that is not link-local: where a connection to an IPv6 peer
+   leaves from under a named link. 0 when the interface holds none. */
+static int link_first_ipv6(uint16_t g[8]) {
+    struct ifaddrs *list = 0;
+    int found = 0;
+    if (silica_sockets_link_ifname[0] == 0) return 0;
+    if (getifaddrs(&list) < 0) return 0;
+    for (struct ifaddrs *p = list; p != 0; p = p->ifa_next) {
+        if (p->ifa_addr == 0 || p->ifa_addr->sa_family != AF_INET6 || p->ifa_name == 0) continue;
+        if (strcmp(p->ifa_name, silica_sockets_link_ifname) != 0) continue;
+        ipv6_groups_of(&((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr, g);
+        if (ipv6_is_link_local(g)) continue;
+        found = 1;
+        break;
+    }
+    freeifaddrs(list);
+    return found;
+}
+
+/* 1 when the interface the last silica_sockets_link_select chose holds the IPv6 address the text names, else 0
+   (EINVAL when the text is not an address): the check that a "listen:[<ipv6>]:<port>" under a named link names
+   one of that interface's addresses. */
+silica_sockets_tagged silica_sockets_link_owns6(const uint8_t *host_ptr, uint64_t host_len) {
+    uint16_t g[8];
+    if (!ipv6_usable(host_ptr, host_len, g)) { errno = EINVAL; return err(); }
+    return ok(link_holds_ipv6(g) ? 1 : 0);
+}
+
+/* ---- TCP over IPv6, and a listener bound by name ---------------------------------------------- */
+
+/* Binds and listens on one address of either family. An IPv6 socket is IPV6_V6ONLY on every host (the default
+   differs between them), so "::" is every IPv6 interface and never IPv4 as well. */
+static silica_sockets_tagged tcp_listen_sockaddr(const struct sockaddr *addr, socklen_t addr_len) {
+    int fd = socket(addr->sa_family, SOCK_STREAM, 0);
+    if (fd < 0) return err();
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (addr->sa_family == AF_INET6 && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one) < 0) { int e = errno; close(fd); errno = e; return err(); }
+    if (bind(fd, addr, addr_len) < 0) { int e = errno; close(fd); errno = e; return err(); }
+    if (listen(fd, 16) < 0) { int e = errno; close(fd); errno = e; return err(); }
+    return ok(fd);
+}
+
+/* Binds one given IPv6 address (canonical text, "2001:db8::5", "::1"; "::" is every IPv6 interface): the carrier
+   address "listen:[<ipv6>]:<port>". A text that is not one, or a link-local address, is EINVAL (ipv6_usable); the
+   carrier checks it first with silica_sockets_parse_ipv6.
+   port: set_args a */
+silica_sockets_tagged silica_sockets_tcp_listen_addr6(const uint8_t *host_ptr, uint64_t host_len) {
+    struct sockaddr_in6 addr;
+    uint16_t g[8];
+    int64_t port = silica_sockets_arg_a;
+    if (!ipv6_usable(host_ptr, host_len, g)) { errno = EINVAL; return err(); }
+    ipv6_sockaddr(&addr, g, port);
+    return tcp_listen_sockaddr((const struct sockaddr *)&addr, sizeof addr);
+}
+
+/* Connects to an IPv6 peer (canonical text, not link-local: ipv6_usable): the carrier address
+   "[<ipv6>]:<port>:<timeout_ms>". Under a named link (use_link 1, after silica_sockets_link_select) the connection
+   leaves by the link's interface: it is dialled from the interface's first IPv6 address that is not link-local
+   (ENXIO when it holds none).
+   port: set_args a, use_link: set_args b, timeout in milliseconds: set_connect_timeout (EINVAL when none was
+   stated) */
+silica_sockets_tagged silica_sockets_tcp_connect6(const uint8_t *host_ptr, uint64_t host_len) {
+    struct sockaddr_in6 addr;
+    struct sockaddr_in6 local;
+    uint16_t g[8];
+    uint16_t from[8];
+    int64_t port = silica_sockets_arg_a;
+    int bind_source = silica_sockets_arg_b == 1;
+    int64_t timeout_ms = take_connect_timeout();
+    if (timeout_ms <= 0) { errno = EINVAL; return err(); }
+    if (!ipv6_usable(host_ptr, host_len, g)) { errno = EINVAL; return err(); }
+    if (bind_source && !link_first_ipv6(from)) { errno = ENXIO; return err(); }
+    ipv6_sockaddr(&addr, g, port);
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return err();
+    int one = 1;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    no_sigpipe(fd);
+    if (bind_source) {
+        ipv6_sockaddr(&local, from, 0);
+        if (bind(fd, (struct sockaddr *)&local, sizeof local) < 0) { int e = errno; close(fd); errno = e; return err(); }
+    }
+    return connect_bounded(fd, (const struct sockaddr *)&addr, sizeof addr, timeout_ms);
+}
+
+/* One resolution of a host name, made by a helper thread so that the caller's wait can end at its timeout
+   (getaddrinfo itself cannot be bounded). The helper closes wfd when it has finished, which wakes the caller's
+   poll. Whoever is last frees the job: the caller when the helper finished in time, the helper when the caller
+   gave up (abandoned). */
+struct resolve_job {
+    pthread_mutex_t lock;
+    int done;
+    int abandoned;
+    int rc;
+    struct addrinfo *found;
+    int wfd;
+    char name[256];
+};
+
+static void *resolve_main(void *arg) {
+    struct resolve_job *job = (struct resolve_job *)arg;
+    struct addrinfo hints;
+    struct addrinfo *found = 0;
+    int wfd = job->wfd;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(job->name, 0, &hints, &found);
+    pthread_mutex_lock(&job->lock);
+    int abandoned = job->abandoned;
+    job->rc = rc;
+    job->found = rc == 0 ? found : 0;
+    job->done = 1;
+    pthread_mutex_unlock(&job->lock);
+    if (abandoned) {
+        if (rc == 0 && found != 0) freeaddrinfo(found);
+        pthread_mutex_destroy(&job->lock);
+        free(job);
+    }
+    close(wfd);
+    return 0;
+}
+
+/* Whether a resolved address may be bound under the link rule: 0 any address, 1 loopback addresses only
+   (127.0.0.0/8 and ::1, the (:loopback) link), 2 addresses of the named link's interface only. A link-local IPv6
+   address is never bound (ipv6_usable). */
+static int link_rule_allows(const struct sockaddr *sa, int64_t rule) {
+    if (sa->sa_family == AF_INET) {
+        uint32_t a = ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
+        if (rule == 1) return (a >> 24) == 127;
+        if (rule == 2) return link_holds_ipv4(a);
+        return 1;
+    }
+    if (sa->sa_family == AF_INET6) {
+        uint16_t g[8];
+        ipv6_groups_of(&((const struct sockaddr_in6 *)sa)->sin6_addr, g);
+        if (ipv6_is_link_local(g)) return 0;
+        if (rule == 1) return ipv6_is_loopback(g);
+        if (rule == 2) return link_holds_ipv6(g);
+        return 1;
+    }
+    return 0;
+}
+
+/* Binds the address a host name resolves to: the carrier address "listen:name:<name>:<port>:<timeout_ms>". The
+   name (host_name_strict, else EINVAL) is resolved once, now, by the system resolver (getaddrinfo: the hosts
+   file, mDNS, DNS, as the host is configured), waiting at most the stated timeout: tag 2 when the resolver has
+   not answered by then. Its addresses are taken in the order the resolver gives them, IPv4 and IPv6 alike; those
+   the link rule does not allow are passed over, and the listener is bound to the first that binds, one address
+   and one socket. ENXIO when the name does not resolve or none of its addresses is allowed; otherwise the errno
+   of the last bind that failed (EADDRNOTAVAIL for an address that is not this host's).
+   port: set_args a, link rule (link_rule_allows): set_args b, timeout in milliseconds: set_connect_timeout
+   (EINVAL when none was stated) */
+silica_sockets_tagged silica_sockets_tcp_listen_name(const uint8_t *host_ptr, uint64_t host_len) {
+    int64_t port = silica_sockets_arg_a;
+    int64_t rule = silica_sockets_arg_b;
+    int64_t timeout_ms = take_connect_timeout();
+    int pipe_fds[2];
+    pthread_t helper;
+    pthread_attr_t attr;
+    if (timeout_ms <= 0) { errno = EINVAL; return err(); }
+    if (!host_name_strict(host_ptr, host_len)) { errno = EINVAL; return err(); }
+    struct resolve_job *job = (struct resolve_job *)calloc(1, sizeof *job);
+    if (job == 0) { errno = ENOMEM; return err(); }
+    memcpy(job->name, host_ptr, (size_t)host_len);
+    job->name[host_len] = 0;
+    if (pipe(pipe_fds) < 0) { int e = errno; free(job); errno = e; return err(); }
+    job->wfd = pipe_fds[1];
+    pthread_mutex_init(&job->lock, 0);
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    int started = pthread_create(&helper, &attr, resolve_main, job);
+    pthread_attr_destroy(&attr);
+    if (started != 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        pthread_mutex_destroy(&job->lock);
+        free(job);
+        errno = started;
+        return err();
+    }
+    /* The wait: the helper closes its end of the pipe when it has finished, against a monotonic deadline. */
+    int64_t start = monotonic_ms();
+    for (;;) {
+        int64_t now = monotonic_ms();
+        int64_t left = (start < 0 || now < 0) ? 0 : timeout_ms - (now - start);
+        if (left <= 0) break;
+        struct pollfd p;
+        p.fd = pipe_fds[0];
+        p.events = POLLIN;
+        p.revents = 0;
+        int n = poll(&p, 1, (int)left);
+        if (n > 0) break;
+        if (n < 0 && errno != EINTR) break;
+    }
+    close(pipe_fds[0]);
+    pthread_mutex_lock(&job->lock);
+    if (!job->done) {
+        job->abandoned = 1;
+        pthread_mutex_unlock(&job->lock);
+        return timeout();
+    }
+    int rc = job->rc;
+    struct addrinfo *found = job->found;
+    pthread_mutex_unlock(&job->lock);
+    pthread_mutex_destroy(&job->lock);
+    free(job);
+    if (rc != 0 || found == 0) { errno = ENXIO; return err(); }
+    silica_sockets_tagged answer = {1, 0, (int64_t)ENXIO};
+    for (struct addrinfo *a = found; a != 0; a = a->ai_next) {
+        struct sockaddr_storage addr;
+        if (a->ai_addr == 0 || a->ai_addrlen > sizeof addr) continue;
+        if (!link_rule_allows(a->ai_addr, rule)) continue;
+        memcpy(&addr, a->ai_addr, a->ai_addrlen);
+        if (addr.ss_family == AF_INET) ((struct sockaddr_in *)&addr)->sin_port = htons((uint16_t)port);
+        else ((struct sockaddr_in6 *)&addr)->sin6_port = htons((uint16_t)port);
+        answer = tcp_listen_sockaddr((const struct sockaddr *)&addr, a->ai_addrlen);
+        if (answer.tag == 0) break;
+    }
+    freeaddrinfo(found);
+    return answer;
+}
+
+/* The peer of a connected descriptor: its IPv4 address in host order (silica_sockets_peer_addr; EAFNOSUPPORT for
+   an IPv6 peer) and its port (silica_sockets_peer_port, either family), so a listener reports who connected
+   ("peer:<ipv4>:<port>"). */
 silica_sockets_tagged silica_sockets_peer_addr(int64_t fd) {
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     socklen_t n = sizeof addr;
     if (getpeername((int)fd, (struct sockaddr *)&addr, &n) < 0) return err();
-    if (addr.sin_family != AF_INET) { errno = EAFNOSUPPORT; return err(); }
-    return ok((int64_t)ntohl(addr.sin_addr.s_addr));
+    if (addr.ss_family != AF_INET) { errno = EAFNOSUPPORT; return err(); }
+    return ok((int64_t)ntohl(((struct sockaddr_in *)&addr)->sin_addr.s_addr));
 }
 
 silica_sockets_tagged silica_sockets_peer_port(int64_t fd) {
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     socklen_t n = sizeof addr;
     if (getpeername((int)fd, (struct sockaddr *)&addr, &n) < 0) return err();
-    if (addr.sin_family != AF_INET) { errno = EAFNOSUPPORT; return err(); }
-    return ok((int64_t)ntohs(addr.sin_port));
+    if (addr.ss_family == AF_INET) return ok((int64_t)ntohs(((struct sockaddr_in *)&addr)->sin_port));
+    if (addr.ss_family == AF_INET6) return ok((int64_t)ntohs(((struct sockaddr_in6 *)&addr)->sin6_port));
+    errno = EAFNOSUPPORT;
+    return err();
+}
+
+/* The family of the peer of a connected descriptor: 4 for IPv4 (silica_sockets_peer_addr then answers its
+   address), 6 for IPv6 (silica_sockets_peer_addr6_word answers it). */
+silica_sockets_tagged silica_sockets_peer_family(int64_t fd) {
+    struct sockaddr_storage addr;
+    socklen_t n = sizeof addr;
+    if (getpeername((int)fd, (struct sockaddr *)&addr, &n) < 0) return err();
+    if (addr.ss_family == AF_INET) return ok(4);
+    if (addr.ss_family == AF_INET6) return ok(6);
+    errno = EAFNOSUPPORT;
+    return err();
+}
+
+/* One 32-bit word of the IPv6 address of the peer of a connected descriptor: word 0 is its first two groups,
+   word 3 its last two, each 0 to 4294967295. The address crosses to the carrier as numbers, as an IPv4 peer's
+   does, and the carrier writes its canonical text ("peer:[<ipv6>]:<port>"). EAFNOSUPPORT for a peer that is not
+   IPv6, EINVAL for a word outside 0 to 3. */
+silica_sockets_tagged silica_sockets_peer_addr6_word(int64_t fd, int64_t word) {
+    struct sockaddr_storage addr;
+    socklen_t n = sizeof addr;
+    if (word < 0 || word > 3) { errno = EINVAL; return err(); }
+    if (getpeername((int)fd, (struct sockaddr *)&addr, &n) < 0) return err();
+    if (addr.ss_family != AF_INET6) { errno = EAFNOSUPPORT; return err(); }
+    const uint8_t *b = ((struct sockaddr_in6 *)&addr)->sin6_addr.s6_addr + 4 * word;
+    return ok(((int64_t)b[0] << 24) | ((int64_t)b[1] << 16) | ((int64_t)b[2] << 8) | (int64_t)b[3]);
 }
 
 /* The port a listener was given 0 for: the one the system chose. */
 silica_sockets_tagged silica_sockets_local_port(int64_t fd) {
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
     socklen_t n = sizeof addr;
     if (getsockname((int)fd, (struct sockaddr *)&addr, &n) < 0) return err();
-    return ok((int64_t)ntohs(addr.sin_port));
+    if (addr.ss_family == AF_INET6) return ok((int64_t)ntohs(((struct sockaddr_in6 *)&addr)->sin6_port));
+    return ok((int64_t)ntohs(((struct sockaddr_in *)&addr)->sin_port));
 }
 
 silica_sockets_tagged silica_sockets_tcp_accept(int64_t fd, int64_t timeout_ms) {

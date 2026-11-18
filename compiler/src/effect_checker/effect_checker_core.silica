@@ -76,6 +76,8 @@ export mem_any_parameter/0;
 export is_builtin_alias_name/1;
 export is_builtin_fn/1;
 export fn_effective_effects/1;
+export dangerous_behavior_marker_name/0;
+export decl_uses_dangerous_code/1;
 export expand_builtin_alias/1;
 export builtin_fn_effects/1;
 
@@ -359,11 +361,123 @@ fn effects_name_register_rwr(effs: List[{ name: string, parameter: string, locat
     }
 }
 
+// --- Dangerous behaviours (E4044, E4045, E2224) ---
+// A behaviour is dangerous code when the statement chain of its body holds a
+// `sequence proc[external_danger]` or its body calls into a dangerous_* module. spawn_dangerous requires
+// such a behaviour and the other spawns refuse one (type_checker_expressions_actor_spawn). The rule reads
+// the body, and a unit compiled against a dependency's .iface has only a stub without a body, so the
+// answer travels with the interface: module_iface writes the names of the exported dangerous behaviours
+// in the `dangerous_behaviors=` header line and gives the stub of each one the marker entry named below
+// in its declared effects. The marker is not an effect: fn_effective_effects leaves it out, so no caller
+// has to account for it.
+fn dangerous_behavior_marker_name() -> string {
+    "!dangerous_behavior"
+}
+
+fn effects_have_dangerous_behavior_marker(effs: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> boolean {
+    case effs.is_nil of {
+        true -> false;
+        false -> case effs.head.name == dangerous_behavior_marker_name() of {
+            true -> true;
+            false -> effects_have_dangerous_behavior_marker(effs.tail)
+        }
+    }
+}
+
+fn effects_without_dangerous_behavior_marker(effs: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
+    case effs.is_nil of {
+        true -> parser_ast@empty_effect_name_list();
+        false -> case effs.head.name == dangerous_behavior_marker_name() of {
+            true -> effects_without_dangerous_behavior_marker(effs.tail);
+            false -> parser_ast@cons_effect_name({ name: effs.head.name, parameter: effs.head.parameter, location: effs.head.location }, effects_without_dangerous_behavior_marker(effs.tail))
+        }
+    }
+}
+
+fn effects_name_external_danger(effs: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)]) -> boolean {
+    case effs.is_nil of {
+        true -> false;
+        false -> case effs.head.name == "external_danger" of {
+            true -> true;
+            false -> effects_name_external_danger(effs.tail)
+        }
+    }
+}
+
+// First index of "@" in s at or after i, or -1.
+fn first_at_in_dangerous_call_name(s: string, i: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0 - 1;
+        false -> case substring(s, i, i + 1) == "@" of {
+            true -> i;
+            false -> first_at_in_dangerous_call_name(s, i + 1)
+        }
+    }
+}
+
+// A call written dangerous_<module>@<function>: the module part begins with "dangerous_".
+fn call_name_is_dangerous_qualified(name: string) -> boolean {
+    at: int64 <- first_at_in_dangerous_call_name(name, 0);
+    case at >= 10 of {
+        false -> false;
+        true -> substring(name, 0, 10) == "dangerous_"
+    }
+}
+
+// The root sequence of the body (through leading bindings and statements) declares external_danger.
+fn statement_chain_has_external_danger(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    case node.kind < 0 of {
+        true -> false;
+        false -> case node.kind == 11 of {
+            true -> effects_name_external_danger(node.sequence_effects);
+            false -> case node.kind == 6 of {
+                true -> statement_chain_has_external_danger(parser_ast@expr_at(expr, node.right_expr));
+                false -> case node.kind == 10 of {
+                    true -> statement_chain_has_external_danger(parser_ast@expr_at(expr, node.right_expr));
+                    false -> false
+                }
+            }
+        }
+    }
+}
+
+fn expr_has_dangerous_qualified_call(expr: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }) -> boolean {
+    node: { kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] } <- parser_ast@expr_root_node(expr);
+    case node.kind < 0 of {
+        true -> false;
+        false -> case node.kind == 4 and call_name_is_dangerous_qualified(node.name) of {
+            true -> true;
+            false -> case expr_has_dangerous_qualified_call(parser_ast@expr_at(expr, node.inner)) of {
+                true -> true;
+                false -> expr_has_dangerous_qualified_call(parser_ast@expr_at(expr, node.right_expr))
+            }
+        }
+    }
+}
+
+// Whether a function declaration is a dangerous behaviour: by its body, or, for an iface stub (no
+// body), by the marker module_iface gave it.
+fn decl_uses_dangerous_code(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> boolean {
+    case effects_have_dangerous_behavior_marker(decl.declared_effects) of {
+        true -> true;
+        false -> case statement_chain_has_external_danger(decl.body) of {
+            true -> true;
+            false -> expr_has_dangerous_qualified_call(decl.body)
+        }
+    }
+}
+
 // The effects a caller must account for: the signature's, plus register_rwr when the body declares it.
+// The dangerous-behaviour marker of an iface stub is not an effect and is left out.
 fn fn_effective_effects(decl: { tag: int64, name: string, parameters: List[{ name: string, type_name: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)], return_type_name: string, return_type_location: { file: string, line: int64, column: int64, offset: int64 }, location: { file: string, line: int64, column: int64, offset: int64 }, body: { nodes: List[{ kind: int64, value: string, name: string, location: { file: string, line: int64, column: int64, offset: int64 }, inner: int64, right_expr: int64, pattern_bindings: List[{ name: string, path: string, type_str: string }, mem(normal)], sequence_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }, mem(normal)], root: int64 }, declared_effects: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] }) -> List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] {
-    case effects_name_register_rwr(decl.declared_effects) == false and expr_declares_register_rwr(decl.body) of {
-        true -> parser_ast@cons_effect_name({ name: "register_rwr", parameter: "", location: decl.location }, decl.declared_effects);
+    declared: List[{ name: string, parameter: string, location: { file: string, line: int64, column: int64, offset: int64 } }, mem(normal)] <- case effects_have_dangerous_behavior_marker(decl.declared_effects) of {
+        true -> effects_without_dangerous_behavior_marker(decl.declared_effects);
         false -> decl.declared_effects
+    };
+    case effects_name_register_rwr(declared) == false and expr_declares_register_rwr(decl.body) of {
+        true -> parser_ast@cons_effect_name({ name: "register_rwr", parameter: "", location: decl.location }, declared);
+        false -> declared
     }
 }
 
