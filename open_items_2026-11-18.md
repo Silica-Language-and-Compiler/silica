@@ -4,7 +4,7 @@ Made on 2026-11-18 from the audit of `ROADMAP.md` and `compiler/design_documents
 `update_design_plan_docs` (commit 28799ea475). Items the audit found done were corrected in the documents
 and are not listed here.
 
-- **Part 1, still open:** 309 items. The document records each as open or partly done, and the code,
+- **Part 1, still open:** 299 items. The document records each as open or partly done, and the code,
   trials or git history did not show it done.
 - **Part 2, undecided:** 33 items. The audit could not settle these by reading.
 
@@ -19,28 +19,23 @@ How the list was made, and its limits:
 
 Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by Lee and removed; the remaining items keep their numbers. Items 301 and 344 were checked again by reading and moved to Part 1. Items 302 and 326 were ruled on by Lee and removed; items 304 and 352 (the use-tree first pass) were merged into item 245; items 308, 309, 311, 312, 325 and 347 were ruled open by Lee and moved to Part 1. Items 300 and 307 were ruled on by Lee and moved to Part 1 with new wording.
 
+Updated 2026-11-19: items 1, 75, 84, 89, 90, 135, 226, 228, 244 and 312 were done (PR #74 and branch soi2-trial-run) and removed; items 91, 96, 99, 134, 258, 276 and 344 are partly done and keep their numbers with new Found lines.
+
 | Area | Open | Undecided |
 | --- | --- | --- |
-| Language specification | 42 | 2 |
-| Transport and storage carriers | 42 | 1 |
-| Memory: region safety and chunk 15 | 36 | 2 |
-| Actors | 31 | 2 |
+| Language specification | 41 | 2 |
+| Transport and storage carriers | 41 | 1 |
+| Memory: region safety and chunk 15 | 32 | 2 |
+| Actors | 30 | 2 |
 | Data structures | 27 | 1 |
 | Boards and ports | 54 | 6 |
-| Compiler and phase notes | 41 | 15 |
+| Compiler and phase notes | 38 | 15 |
 | Roadmap, FFI and the remaining documents | 36 | 4 |
-| **Total** | **309** | **33** |
+| **Total** | **299** | **33** |
 
 # Part 1: still open
 
-## Language specification (42)
-
-### 1. The word region is not rejected with a reserved-word diagnostic, and a record field named region is not rejected
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/silica-specification.md, 2.2.1 Keywords, about line 238
-- **Recorded as:** "No diagnostic yet says that `region` is a reserved word, and the field case is not rejected"
-- **Found:** Searched the parser sources for a reserved-word message for region and found none; no commit since 2026-10-16 mentions one. Bindings and parameters still get the generic E1040 and E1000.
+## Language specification (41)
 
 ### 2. Function literals cannot capture anything except a binding holding an integer literal, so closure environments do not exist and a capturing literal cannot be returned
 
@@ -329,7 +324,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Recorded as:** "Phase A (single scope) is implemented. Phases B (nested scopes) and C (cross-function analysis) require implementation after functions are fully supported."
 - **Found:** Lee chose on 2026-11-18 to mark Phases B and C as superseded by the region checker and E2311. Checked 2026-11-18 by reading. Not built: (1) the reference-use rule of Phase B, since nothing in `region_checker_core.silica` or `type_checker_memory_regions.silica` checks that the region behind a `ref` is still live when the ref is used; (2) the callee-side rule of Phase C, since a `ref(L)` parameter with no `region(L)` parameter may still be returned or sent (the Phase A check runs only on a sequence's return type). E2300 cases (b) and (c) are item 87 and hazard H8 (the Phase A check does not look inside records or lists) is item 309. The comment in `type_checker_memory_regions.silica` near line 577 that Phases B and C require implementation is stale; correcting it is a compiler source change.
 
-## Transport and storage carriers (42)
+## Transport and storage carriers (41)
 
 ### 41. The board medium for storage carriers (phase S3) is not built
 
@@ -569,13 +564,6 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Recorded as:** "`happy_path` runs on the Mac only"
 - **Found:** Only `run_timeout_checks.sh` (11 checks) is recorded on the three hosts.
 
-### 75. `E2418` does not yet look at IPv6 listen literals; the carrier's refusal at `:open` is the only guard
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/transport_serialization_design.md, 6.3 IPv6 paragraph "Link rules", about line 606
-- **Recorded as:** "`E2418` does not yet look at IPv6 literals"
-- **Found:** The effect and type checker changes of c063517bd9 did not add IPv6 handling to E2418.
-
 ### 76. Authentication, encryption and peer identity for `(:tcp)` (SEMP/TRUST over mutual TLS, cookie handshake) are planned in Project BEES and not built
 
 - [ ] reviewed
@@ -625,7 +613,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Recorded as:** "the ESP32-S3 and Nucleo cross compilers were not rebuilt ... unchecked"
 - **Found:** Lee, 2026-11-18: "The drivers are not complete for Ethernet on the boards." Checked 2026-11-18 by reading: in `compiler/src/emitter/ESP32-S3_raw/transport_pack.silica` `provides_carrier` is true only for `serial`, `uart1` and `usb_serial_jtag`, and `provides_link` only for `uart` instance 1 and `usb_serial_jtag`; in `compiler/src/emitter/STM32-L476RG_raw/transport_pack.silica` `provides_carrier` and `provides_link` are always false. The E2418 scan (`listen_conflict` in `compiler/src/parser/carried_on_expand.silica`) reports only when the target pack serves the carrier kind and the link, so it has nothing to check on the boards today.
 
-## Memory: region safety and chunk 15 (36)
+## Memory: region safety and chunk 15 (32)
 
 ### 81. The atomic surface (the four atomic_* builtins, lowering on four targets, shared atomic regions) is not built
 
@@ -647,13 +635,6 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Document:** compiler/design_documents/region_memory_safety_design.md, section 10 error table and section 14.1, about lines 723 to 725 and 805; compiler/design_documents/region_memory_safety_plan.md, stage 8 row, about line 29
 - **Recorded as:** "Stays (atomics)"; "static buffer checks E2315 to E2318 not emitted" in ROADMAP
 - **Found:** grep for E2315, E2316 and E2317 in compiler/src, compiler/error_codes.md and trials finds nothing; they depend on the atomic builtins that do not exist.
-
-### 84. Error E2318 (comparison operators on region, ref, buf or device_window types) is not emitted
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/region_memory_safety_design.md, section 10 error table and section 14.1, about lines 726 and 806
-- **Recorded as:** "Stays (comparison on region-kind types)"
-- **Found:** grep for E2318 in compiler/src, the registry and trials finds nothing.
 
 ### 85. Error E2310 (cross-region reference, isolation) is not emitted or registered, and the isolation check of spec 12.4.1 is not enforced as the design describes
 
@@ -683,26 +664,12 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Recorded as:** "Open: the device_window single-owner check code"; "E2242 ... are later stages"
 - **Found:** E2242 appears only in a comment of region_checker_core.silica; no device_window_used_after_spawn_device or device_window_sent_twice trial exists.
 
-### 89. E2321, the strict state_release error, is not emitted
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/chunk15_stack_memory_design.md, section 12 (P3), about line 780; compiler/design_documents/chunk15_stack_memory_plan.md, section 11.1 phase 3 and 11.3, about lines 53 and 92; compiler/design_documents/data_structure_redesign_requirements.md, section 7.5 item 2, about line 257
-- **Recorded as:** "E2321 in strict mode, spelled strict state_release; at module level"
-- **Found:** the declaration strict state_release; parses (tag 10) but main_compile_pipeline.silica only mentions E2321 in a comment; no code emits it and no trial exists.
-
-### 90. Warning W2300 is not registered in the error registry and has no trial
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, sections 11.3 and 11.6, about lines 92 and 164
-- **Recorded as:** "W2300, E2301, E2302, E2310, E2311, E2321, E2242 registered"
-- **Found:** compiler/error_codes.md mentions W2300 only inside the E4037 text and error_codes.jsonld has no entry; trials/warning_enforcement_addition has no state_release trial.
-
 ### 91. The specification text for the new memory model (state area, lifetime-scoped regions, spawn copies state, messages copy, W2300) is not written, and the error registry rows for E2310, E2321, E2242 and W2300 are not added
 
 - [ ] reviewed
 - **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, section 11.6, about lines 142 to 164; compiler/design_documents/region_memory_safety_plan.md, work item 17, about line 65; compiler/design_documents/data_structure_redesign_requirements.md, section 7.5 item 12, about line 267
 - **Recorded as:** "partly done ... The specification has no state area or lifetime-scoped-region text yet"
-- **Found:** grep of silica-specification.md for state area, lifetime-scoped and E2302 finds no such text; data_structure_designs still shows the r: region field (common_contract.md about line 150).
+- **Found:** Partly done 2026-11-18: W2300 and E2321 are registered (b22eada00a) and E2321 is emitted under `strict state_release;` (0559a5a252, c482408060). Left: the specification text for the state area and lifetime-scoped regions, and the registry rows for E2310 and E2242; data_structure_designs still shows the r: region field (common_contract.md about line 150).
 
 ### 92. The scrub-on-free and zero-on-alloc requirement for runtime memory is not implemented and the before and after speed table is empty
 
@@ -737,7 +704,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - [ ] reviewed
 - **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, section 11.3, about lines 89 and 90
 - **Recorded as:** "Trials to add (named; one per rule)"
-- **Found:** no file named state_policy_* exists under trials/; only stack_policy_missing_in_spawn and the stack_keep_*_unproven_state_survives trials exist.
+- **Found:** Partly done 2026-11-19: the E2005 trials `state_policy_missing_in_spawn` and `state_policy_missing_before_core_id` exist (2cca6d1919). Left: the keep, shrink, compact_on_request and compact_state_noop_under_keep trials, which were not found.
 
 ### 97. The compiler-proven release trials (proven_release_flat_memory, evacuation_fills_exact_holes, fallback_copy_compacts_holes, and the warning_enforcement state_release_* trials) are not in the tree
 
@@ -758,7 +725,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - [ ] reviewed
 - **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, section 11.3, about line 104; compiler/design_documents/region_memory_safety_design.md, section 14.1, about line 800
 - **Recorded as:** "Trials to add"
-- **Found:** no golden_fail in trials/ carries E2302; region_hazards_open_addition/write_ref_young_into_older_cell is a run trial, not an error trial.
+- **Found:** Partly done 2026-11-19: the E2302 error trial `write_ref_young_into_older_cell_e2302` exists (2cca6d1919). Left: write_ref_fresh_into_state_cell, write_ref_fresh_into_param_cell and write_ref_old_into_state_cell, which were not found.
 
 ### 100. The error trial catalogue of section 14.1 and the send_then_use_* catalogue of section 18.6 are largely not written
 
@@ -872,14 +839,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Recorded as:** "Stays (isolation)"
 - **Found:** Lee's ruling of 2026-11-18: "A ref in one lifetime in a region of another is allowed as long as both regions move together when being passed or returned. I believe this is current behavior." Checked 2026-11-18 by reading, not by a compile. What is checked: the Phase A return check (`check_sequence_return_lifetime`, E2100, `type_checker_memory_regions.silica`) requires `region(L, ...)` in the return type for each `ref(L, ...)` that the return type's text names; E2311 reports one callee lifetime bound to two caller lifetimes at a call; the region checker (`region_checker_core.silica`) reports E2301 for a use after a move, E2300 case (a) for foreign retention and E2302 for a `write_ref` of a frame value into an older cell. What is not checked: nothing tests that the region holding a ref of another lifetime travels with that ref when the value is passed, returned inside a record or list, or sent, and E2310 is not emitted. The condition is therefore at most partly enforced.
 
-### 312. Whether E2005 is raised on a missing state_policy argument
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/data_structure_redesign_requirements.md, section 7.5 item 13, about line 268
-- **Recorded as:** "E2005 on a missing argument not individually verified"
-- **Found:** Lee ruled it open on 2026-11-18. The only trials are the stack_policy ones, whose goldens show E2005; no trial isolates a missing state_policy, and I ran nothing.
-
-## Actors (31)
+## Actors (30)
 
 ### 114. The runtime has no monitor or link table, and `link`, `monitor` and `demonitor` are still stubs
 
@@ -1026,14 +986,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - [ ] reviewed
 - **Document:** compiler/design_documents/actor_memory_budget_plan.md, Remaining gaps item 10, about line 1503
 - **Recorded as:** "Latent and deliberately unfixed"
-- **Found:** Read from source only; no later commit addresses it.
-
-### 135. E2094 and E2095 (a `:dangerous` row must be cast-type and carry a `:dangerous_` id) are enforced only for a module's `init`, not for child supervisors' start functions
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/actor_memory_budget_plan.md, Remaining gaps item 9, about line 1500
-- **Recorded as:** "Checker gap, to be filed and not fixed"
-- **Found:** No later commit or trial mentions it.
+- **Found:** Fix written 2026-11-19 in e7a89cfd07 (rsp kept 16-byte aligned at the call), by reading; it has not yet been run on the Linux x86-64 host (nix). Left: run the actor trials there.
 
 ### 136. Stale `__silica_runtime.*.ascomp` goldens are never compared by the harness
 
@@ -1669,7 +1622,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Recorded as:** "still faults"
 - **Found:** Lee ruled it open on 2026-11-18. The trial is listed in ESP32 skip as having no sources; I did not run it.
 
-## Compiler and phase notes (41)
+## Compiler and phase notes (38)
 
 ### 225. The emitter function record_make_link_promotes_field still gives callee-saved shadows for a promote call that no longer exists, and has not been removed
 
@@ -1678,26 +1631,12 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Recorded as:** "remove it when a trial shows it can go. Still open (2026-11-14 check)"
 - **Found:** The function is still defined in compiler/src/emitter/linux_aarch64/emitter_core.silica (line 771) and STM32-L476RG_raw/emitter_core.silica (line 888); no trial or commit removing it was found.
 
-### 226. There is no error trial that expects E2302 for a write_ref of a frame-young value into an older cell
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/Phase2_notes.md, section 3 item 4 (known hazards), about line 154
-- **Recorded as:** "the trial is still a positive hazard trial (.scout 7,0) and no E2302 error trial exists yet; still open: add it"
-- **Found:** E2302 is implemented in region_checker_core.silica, but grep of trials/ finds no golden naming E2302, and region_hazards_open_addition/write_ref_young_into_older_cell is still the positive trial.
-
 ### 227. The trials directory has no codegen_regressions suite
 
 - [ ] reviewed
 - **Document:** compiler/design_documents/Phase2_notes.md, section 3 item 7, about line 172
 - **Recorded as:** "No codegen_regressions suite exists in trials/ (gate list item)"
 - **Found:** ls of trials/ shows no codegen_regressions directory.
-
-### 228. strict state_release; parses, but E2321 (turning W2300 into an error) is not emitted anywhere and is not in the error code list
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/Phase3_notes.md, section 10.8.4 first bullet, about line 706 (also stage table row 3c, about line 19; Phase6_notes.md section 1, about line 127)
-- **Recorded as:** "Still open: E2321 is not emitted anywhere"
-- **Found:** grep of compiler/src and trials finds E2321 only in main_compile_pipeline.silica, as a comment; W2300 is emitted at main_compile_pipeline.silica line 204.
 
 ### 229. The trials actors_addition/proven_release_flat_memory, actors_addition/fallback_copy_compacts_holes, warning_enforcement_addition/state_release_not_proven_alias, the three actor_stacks_addition/state_policy_* trials, memory_region_addition/retire_outside_actor_is_noop and the retire type-error pair (E2010, E2003) are not written under those names
 
@@ -1804,13 +1743,6 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - **Recorded as:** "ESP32-S3_raw prims_memory.silica:135,544 still refer to it"
 - **Found:** grep finds region_grow in ESP32-S3_raw emitter_core, prims_memory, term_reg_spill, xt_frame, rt_heap.S and rt_ordering.S.
 
-### 244. The process-wide _silica_rt_region_lock word is still defined with no user now that L_region_grow is not emitted on the Mac
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/Phase5_notes.md, section 8.3 first bullet, about line 473
-- **Recorded as:** "It goes when L_region_grow goes" (my 2026-11-18 note: partly done)
-- **Found:** prims_actors_runtime_asm.silica line 3789 still defines it; no other use was found on the Mac.
-
 ### 245. The use-tree first pass (prefix parse to the first function, banner "Building use tree") is not implemented
 
 - [ ] reviewed
@@ -1907,7 +1839,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - [ ] reviewed
 - **Document:** compiler/design_documents/Phase1_TODOs/bootstrap_retirement_and_self_host_plan.md, status section about line 47 and Step 3.3 about line 354
 - **Recorded as:** "Step 3.3 (string_literal_pool) is NOT migrated" and "Status 2026-09-08: not started"
-- **Found:** compiler/src/emitter/apple_silicon_mac/atoms/string_literal_pool.silica still defines and calls find_index_in_list (lines 111 to 128) and uses no wbt_map.
+- **Found:** Done on the Mac 2026-11-19: e532958edb makes `string_literal_pool` deduplicate through a wbt_map. Left: the Linux AArch64, Linux x86-64 and both board emitters still use the linear list scan.
 
 ### 259. Recursion phase 4 (source-mapped stack traces from an explicit frame list) is not implemented
 
@@ -1956,7 +1888,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - [ ] reviewed
 - **Document:** compiler/design_documents/HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md, section "Inconsistent or misleading diagnostics", about line 214; compiler_defects_resolution_plan.md, Phase 6 message-text cleanups
 - **Recorded as:** "not re-checked and are still open"
-- **Found:** Checked 2026-11-18 by reading, not by a compile. `check_field_access_expr` (`type_checker_expressions_data.silica` lines 211 to 215) infers the base type and reports E2005 `cannot infer type of field access base` when the head is not bound; the base never reaches the identifier check that reports E2002. No trial covers the case and no commit fixed it. The E2010 binding-position part was not tied to one place.
+- **Found:** Part done 2026-11-18 in fa4636a360: an undefined name at the head of a field access now gives E2002 (trials `field_access_undefined_head` and `field_access_undefined_head_one_level`). Left: the E2010 binding-position part, which was not tied to one place.
 
 ## Roadmap, FFI and the remaining documents (36)
 
@@ -2042,7 +1974,7 @@ Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by 
 - [ ] reviewed
 - **Document:** ROADMAP.md, chunk 4, about line 134
 - **Recorded as:** "static buffer checks E2315 to E2318 not emitted"
-- **Found:** Grep for E2315 and E2318 in `compiler/src` and `trials` returns nothing.
+- **Found:** E2318 is done (item 84, 2026-11-19: b67521cd75, registry 63dffc7fd2, trials `compare_regions_e2318`, `compare_refs_e2318`, `compare_ref_opt_none_e2318`). Left: E2315 to E2317, which grep still finds nowhere in `compiler/src` or `trials`.
 
 ### 277. Typed variant constructors (spec §4.2.5) and §6.1.2 are not implemented, and there is no dedicated trial for effect composition
 

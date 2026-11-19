@@ -1427,7 +1427,7 @@ This is the **first** self-host source change after the parallel tree exists. Ke
 
 **§11 exit gate:** `src/` has zero `type` aliases and zero `bst` uses; emitter pools there are WBT-backed; Phase 0 inventory recorded; remaining class-A items (including the named-struct dialect rewrite) are fixed or explicitly listed as §12 inputs. Frozen `src/` and `silica-bootstrap-compiler` remain untouched; default build still bootstrap → `src/`.
 
-**§11 status:** Complete (2026-09-08 audit) — `src/` has zero `type` aliases, zero named `struct` declarations and zero `bst` uses; the seed (`binaries/seed-compiler`) compiles and links the full 331-unit `src/silica.config.compiler`. Residual: `string_literal_pool.silica` still deduplicates by linear scan (bootstrap-plan Step 3.3); the Step 0.2 W-id comments survive in `src/` as history.
+**§11 status:** Complete (2026-09-08 audit) — `src/` has zero `type` aliases, zero named `struct` declarations and zero `bst` uses; the seed (`binaries/seed-compiler`) compiles and links the full 331-unit `src/silica.config.compiler`. Residual: `string_literal_pool.silica` still deduplicates by linear scan (bootstrap-plan Step 3.3); the Step 0.2 W-id comments survive in `src/` as history. (Status 2026-11-19: done on the Mac, `e532958edb`; the other emitters remain.)
 
 **§11 delivered (so far):**
 

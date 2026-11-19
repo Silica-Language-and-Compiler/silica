@@ -16,7 +16,7 @@ under the build-slot lock; builder `/Volumes/2T/silica/binaries/silica-compiler`
 | --- | --- | --- |
 | 3a | `state_policy(...)` accepted (optional) after `stack_policy(...)` in every hosted spawning form; `compact_state()` builtin; ACB #576 stored at spawn, #584 set by `compact_state()` under `:compact_on_request`; no behaviour change | code done (Mac + the shared front end; ESP32 accepts the prim as a pass-through); Haiku build + gate: see §5. **Status 2026-11-18: done**: built into the published 999937 and later compilers, and `compact_state` is handled in `main_compile_pipeline.silica` and the board runtime (`board/runtime/rt_state.S`). |
 | 3b | per-slot copier tables, free lists (§2.3, §5.4, P5) | Mac source written 2026-10-29 (§10), not built; Linux twins listed, not applied. **Status 2026-11-18: built and done**: phase 3 closed with 999937 built from the 3d sources, which contain 3b, and the Linux twins landed in chunk 15 phase 8 (see row 3e). |
-| 3c | dispatch end (§4.1-§4.7), W2300/E2321, `strict state_release;` | Mac source written 2026-10-30 (§10.8), not built; `strict state_release;` / E2321 and the `\|_upd=` update-call rules deferred (§10.8.4). **Status 2026-11-18: partly done**: built (W2300 is emitted, `main_compile_pipeline.silica:204`, and `_silica_rt_state_evacuate` is in `prims_actors_state_asm.silica`); `strict state_release;` parses, but E2321 is still not emitted. |
+| 3c | dispatch end (§4.1-§4.7), W2300/E2321, `strict state_release;` | Mac source written 2026-10-30 (§10.8), not built; `strict state_release;` / E2321 and the `\|_upd=` update-call rules deferred (§10.8.4). **Status 2026-11-18: partly done**: built (W2300 is emitted, `main_compile_pipeline.silica:204`, and `_silica_rt_state_evacuate` is in `prims_actors_state_asm.silica`); `strict state_release;` parses, but E2321 is still not emitted. **Status 2026-11-19:** E2321 is now emitted under `strict state_release;` (`0559a5a252`, `c482408060`; trial `error_enforcement_addition/strict_state_release_e2321`) and W2300 and E2321 are registered (`b22eada00a`). |
 | 3d | `state_policy` required (E2005), the bootstrap rewrite script | **done** (verified 2026-11-14): `type_checker_supervisor.silica:150-185` requires the `state_policy` field (E2092, "required since phase 3d"); phase 3 closed 2026-10-31, compiler published as 999937 from the 3d sources |
 | 3e | linux_aarch64 / linux_x86_64 ports | **done in chunk 15 phase 8** (verified 2026-11-14): x86-64 2026-11-04 (`04bb9d4c53`, `a2dd0caa42`, `5614f4bb09`), aarch64 green via `81c1144bb6` 2026-11-11; ESP32-S3 ported `029447ad31` 2026-11-07, green `978f663e08` 2026-11-12. (Was: removed from the phase-3 completion gate by Lee 2026-10-30; Linux and ESP32 ports moved to after phase 7) |
 
@@ -135,6 +135,7 @@ Stage 3a needs these now (positive ones run with the 3a compiler; the `missing_*
   (init list and add_child with the field; the shape of `scratchpad/p3/probe3a/pos2/sup.silica`).
 * `error_enforcement_addition/state_policy_missing_in_spawn` and `..._missing_in_spawn_registered`: write them in 3a,
   they are expected to compile until 3d (stage them, golden after 3d).
+  **Status 2026-11-19:** `state_policy_missing_in_spawn` and `state_policy_missing_before_core_id` exist (`2cca6d1919`), both with E2005.
 * `actor_stacks_addition/state_policy_compact_state_noop_under_keep` can be written now (a behaviour that calls
   `compact_state()` under `:keep_state_area` and `:shrink_after_compaction`; output unchanged); the other four
   `state_policy_*` trials need 3c.
@@ -703,7 +704,7 @@ proof rejects), so nothing in the new state reaches the old root. **Lee: confirm
   (`declarations_from_slots`: `decl.tag < 0 -> declarations_from_slots(slots.tail)`), so the line is
   silently ignored today; a real statement needs a new declaration tag (0-9 are taken; 72 `tag == 0`
   tests and 9 `tag of` switches would need an audit) read by `main_compile_pipeline` to turn W2300
-  into E2321. Deferred to a 3c-2 pass with that audit. **Partly done (2026-11-14 check):** `strict <what>;` is now parsed (decl tag 10, `parser/constraint_extract_decls.silica:575+`). **Still open:** E2321 is not emitted anywhere (only a stale comment at `main_compile_pipeline.silica:174`) and is not in `error_codes.md`.
+  into E2321. Deferred to a 3c-2 pass with that audit. **Partly done (2026-11-14 check):** `strict <what>;` is now parsed (decl tag 10, `parser/constraint_extract_decls.silica:575+`). **Still open:** E2321 is not emitted anywhere (only a stale comment at `main_compile_pipeline.silica:174`) and is not in `error_codes.md`. **Status 2026-11-19: done:** E2321 is emitted under `strict state_release;` with the TypeError header (`0559a5a252`, `c482408060`), registered in `error_codes.md` (`b22eada00a`), and covered by trial `error_enforcement_addition/strict_state_release_e2321`.
 * The `|_upd=` marker and the update-chain rules of §4.1 (P1, P4, the version argument): no logging
   updater exists before the stdlib's phase 5, so every update is unproven now (the conservative side).
   The `.iface` carriage of the marker goes with it.

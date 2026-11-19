@@ -197,7 +197,7 @@ Counts are from the two generation runs (151 rejected candidate mistakes in tota
 
 - `E2002` (undefined identifier) is reported as `E2005` (`no field z on this type`) when the
   undefined name is the head of a field access (`missing_rect.top_left.x`), and as `E2010`
-  in some binding positions.
+  in some binding positions.   **Status 2026-11-18:** the field-access head case is fixed (PR #74, `fa4636a360`; trials `error_enforcement_addition/field_access_undefined_head` and `field_access_undefined_head_one_level`): it now gives `E2002`. The `E2010` binding-position part is still open.
 - `E2003` "type mismatch: x" names only the identifier; the expected and actual types are
   not reported.
 - An unterminated string literal is reported as `E1060 unclosed '{'`.

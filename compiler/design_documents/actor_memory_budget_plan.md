@@ -1495,12 +1495,14 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
          and carry a `:dangerous_` id) are enforced only for a module's `init`, not for the start
          functions of child supervisors. A call-type `:dangerous` row in a sub-supervisor compiles and
          runs.
+         **Status 2026-11-19: done** in `83655cc84f`: E2094 and E2095 now also check a child supervisor's start function; trials `error_enforcement_addition/sub_supervisor_dangerous_row_plain_id_trial` and `sub_supervisor_dangerous_row_reply_behavior_trial`.
       10. Latent and deliberately unfixed: on Linux x86-64, `LBBsl_common` (the shared body of
           `spawn_linked`, in `prims_actors_runtime_asm.silica`) does `push rax` before
           `call silica_rt_beh_convention` and pops it after, so that call is made with `rsp` 8 bytes off
           16-byte alignment (the frame is aligned after `push rbp` and `sub rsp, 80`). Read from the
           source only; no failure has been observed and the callee's use of aligned instructions was not
           checked. Left as is; fix it by padding with `sub rsp, 8` around the push if it ever shows.
+         **Status 2026-11-19:** fixed in `e7a89cfd07`, which keeps `rsp` 16-byte aligned at that call. The fix was written by reading; it has not yet been run on the Linux x86-64 host (nix).
 
       Final status of the gap list (2026-10-21):
       - Final full gate run on pix and nix. 148 goldens that went stale when `04fdd8ac2d` removed the

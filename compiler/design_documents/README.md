@@ -269,7 +269,7 @@ Tutorial for **`sequence` blocks** (`sequence` / `produces` / `pure` / monadic s
 
 ## [Phase1_TODOs/bootstrap_retirement_and_self_host_plan.md](./Phase1_TODOs/bootstrap_retirement_and_self_host_plan.md)
 
-**Self-host migration plan and record.** Self-hosting is reached (first fixed point 2026-09-12; fixed points on Apple Silicon, Linux AArch64 and Linux x86-64; the Rust bootstrap crate was removed 2026-09-17). Its status section lists what is done and what is left (the `string_literal_pool` linear scan, two orphan files); the body is the original plan.
+**Self-host migration plan and record.** Self-hosting is reached (first fixed point 2026-09-12; fixed points on Apple Silicon, Linux AArch64 and Linux x86-64; the Rust bootstrap crate was removed 2026-09-17). Its status section lists what is done and what is left (the `string_literal_pool` linear scan, two orphan files); the body is the original plan. (Status 2026-11-19: the scan is replaced by a `wbt_map` on the Mac, `e532958edb`; the other emitters remain.)
 
 ---
 

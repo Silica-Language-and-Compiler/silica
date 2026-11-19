@@ -35,7 +35,7 @@ How the build works now (details in `compiler/src/README.md`, `compiler/src/Make
 | Phase 0 (audit, parallel tree) | Done |
 | Phase 1 (build targets, Rust-free link, config-driven batch) | Done; superseded by `make build`, `gen1`, `gen2`, `fixpoint` and the per-target build directory |
 | Phase 2 (bootstrap workarounds W01-W16) | Done as a gate: the selfhost reproduces itself. Individual workaround comments may remain in source as history; this plan no longer tracks them |
-| Phase 3 (BST to WBT in the emitter pools) | Done for the five pools; `data_structures/bst.silica` is gone from `src`. Step 3.3 (`string_literal_pool`) is NOT migrated: it still deduplicates by linear list scan (`find_index_in_list`) |
+| Phase 3 (BST to WBT in the emitter pools) | Done for the five pools; `data_structures/bst.silica` is gone from `src`. Step 3.3 (`string_literal_pool`) is NOT migrated: it still deduplicates by linear list scan (`find_index_in_list`) (Status 2026-11-19: Step 3.3 is done on the Mac, `e532958edb`; the other emitters still scan the list.) |
 | Phase 4, Phase 7 (compiler adoption of standard structures) | Withdrawn 2026-09-29, removed |
 | Phase 5.1 (no `type` aliases) | Done: zero `type` aliases and zero named `struct` declarations in `compiler/src` (verified with `git grep`) |
 | Phase 5.2 (no legacy stdlib `use`) | Done; compiler-internal stdlib is `wbt_map` and `OrderedMap` only |
@@ -351,7 +351,7 @@ Work items map to W-ids from Step 0.2. Prefer fixing and simplifying **inside `s
 
 - Parallel string literal / UTF-8 path green; frozen `src/` unchanged.
 
-**Status 2026-09-08: not started.** `src/emitter/apple_silicon_mac/atoms/string_literal_pool.silica` still deduplicates by linear list scan (`find_index_in_list`); the five pools in Step 3.2 are migrated.
+**Status 2026-09-08: not started.** `src/emitter/apple_silicon_mac/atoms/string_literal_pool.silica` still deduplicates by linear list scan (`find_index_in_list`); the five pools in Step 3.2 are migrated. **Status 2026-11-19:** done on the Mac (`e532958edb`): `string_literal_pool` now deduplicates through a `wbt_map`. The Linux AArch64, Linux x86-64 and both board emitters still use the linear list scan.
 
 ### Step 3.4 — Drop `bst` from the parallel graph only
 
@@ -470,4 +470,4 @@ That sequences **freeze production → parallel alias ban → parallel WBT emitt
 
 ## Completion Tracking
 
-Superseded by the Status (2026-10-16) tables at the top of this document. Remaining open: Step 3.3 (`string_literal_pool` linear scan). The two orphan files named there were removed 2026-10-16.
+Superseded by the Status (2026-10-16) tables at the top of this document. Remaining open: Step 3.3 (`string_literal_pool` linear scan). The two orphan files named there were removed 2026-10-16. Status 2026-11-19: Step 3.3 is done on the Mac (`e532958edb`); the other emitters remain.

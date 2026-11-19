@@ -128,6 +128,7 @@ first-encounter order (parameters first, then the body). No diagnostic code is p
   accepts `strict <identifier>;` generally (tag 10, the word in `name`) so `state_release` needs no
   second tag. Nothing reads `state_release` yet (Phase3_notes §10.8.4 item 1 stays open: W2300 is
   still a warning).
+  **Status 2026-11-19:** the strict mode is now read; E2321 is emitted under `strict state_release;` (`0559a5a252`, `c482408060`).
 * The `module` extractor is `sequence … produces pure … end`-wrapped with the record literal packed
   into the returned pair (its comment on the dangling frame pointer); the `strict` extractor copies
   that shape exactly.

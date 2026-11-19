@@ -192,6 +192,7 @@ Type checker
   print expected and actual types; unterminated string as E1010-class lexer error instead of
   E1060; E1040 to name the two statements. Do these last: message text changes move
   existing .golden_fail files, so each is a deliberate golden regeneration.
+  Status 2026-11-18: the E2002 field-access head case is done (PR #74, `fa4636a360`; trials `field_access_undefined_head` and `field_access_undefined_head_one_level`); the E2010 binding-position part is open.
 
 Effect checker
 - B3: the outside-walker does descend into case branches (kind 13), so trace the repro to
