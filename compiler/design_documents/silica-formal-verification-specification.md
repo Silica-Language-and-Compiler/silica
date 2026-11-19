@@ -12,7 +12,7 @@ This document states proof-side rules; the compiler contains no mechanized proof
 
 - Section 2.4: the 8-parameter limit is enforced at parse time as `E1070 FunctionTooManyParameters` for every target, not only AArch64 (the parser does not look at the emit target).
 - Sections 5.1 to 5.4: `rec`, `ref?` and the occurs-checked structural equality are implemented in `src/type_checker/type_checker_recursive_tuples.silica` (see [recursive_tuple_specification.md](recursive_tuple_specification.md)).
-- Section 6: region lifetime analysis is partly implemented in the type checker (`type_checker_memory_regions.silica`) and the scope rules of `silica-specification.md` section 12.1.4; the remaining gaps are tracked in [region_memory_safety_design.md](region_memory_safety_design.md) and `Phase1_TODOs/region_memory_safety_todo.md`. Not verified here: whether every extended-judgment rule in section 6 is enforced.
+- Section 6: region lifetime analysis is partly implemented in the type checker (`type_checker_memory_regions.silica`) and the scope rules of `silica-specification.md` section 12.1.4; the remaining gaps are tracked in [region_memory_safety_design.md](region_memory_safety_design.md) and `Phase1_TODOs/region_memory_safety_todo.md`. Not verified here: whether every extended-judgment rule in section 6 is enforced. **Status 2026-11-18 (Lee): the Phase B and Phase C text of specification §12.1.4 is superseded by the per-call lifetime check (E2311) and the region checker; the reference-use rule of Phase B and the callee-side rule of Phase C are not built.**
 
 ---
 

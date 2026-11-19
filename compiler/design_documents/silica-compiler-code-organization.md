@@ -87,6 +87,7 @@ process exits 75 between units to be resumed; the prefix-only use-tree pass is s
 | `linux_aarch64/` | Linux AArch64 hosted |
 | `linux_x86_64/` | Linux x86-64 hosted (`regs/` holds the register and frame model README; `ladder/` the bring-up ladder programs) |
 | `ESP32-S3_raw/` | ESP32-S3 bare metal, native Xtensa (`board/` holds the board runtime, apps and tools; `board_pack.silica` the board pack) |
+| `STM32-L476RG_raw/` | STM32L476RG (NUCLEO-L476RG) bare metal, Arm Cortex-M4 (`board/` holds the board runtime and apps). Added to this table 2026-11-18; `RP2350_raw/` holds a README only. |
 
 Every backend has the same internal shape: `emitter_core.silica`, `module_linkage.silica`, and the
 subdirectories `atoms/` (atom table and read-only data pools), `constraints/`, `control/`,

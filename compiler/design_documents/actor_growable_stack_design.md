@@ -37,6 +37,8 @@
 > stacks are chains of heap chunks, designed and built in [actor_memory_budget_plan.md](actor_memory_budget_plan.md)
 > (§5 item F, §11).
 
+> **Update 2026-11-18.** The carriers named above are done on all three hosted paths (ROADMAP chunk 2: Apple Silicon 2026-10-19, `aa8101edf2` Linux AArch64 and `ef2e778126` Linux x86-64, both 2026-10-20), so the thread-per-actor, 128 KB pthread stack and 64 KB `sigaltstack` per actor statements above now hold only for a dangerous actor, and `:release_when_idle` is released by a per-carrier idle sweep (Apple `53c8ce38d6`, Linux `7a3c57db2c`, `67ac65ad4c`, `82bdfc6208`; see actor_memory_budget_plan.md §5 N). The Mac holds up to 1,000,000 idle actors (actor_memory_budget_plan.md §16). Still not implemented: the NUMA items, the proactive growth hints, and a trial that holds more than 1,000 actors.
+
 This document describes the complete actor memory architecture for Silica, replacing the per-actor heap model with **growable stacks and lazy page migration**. Key design principles:
 
 - **Complete actor isolation**: No concurrent shared mutable data between actors; regions may still **move** across actors by ownership transfer (not aliasing)
@@ -1929,6 +1931,8 @@ memory_used: int64 <- get_actor_memory_usage(actor);
 **Recommendation**: Option D (hybrid). The default is **unlimited**, bounded only by machine memory, which matches
 spec §15.1.2.2. An explicit limit is opt-in.
 
+**Status 2026-11-18: decided and implemented** as in the decisions block at the top: `stack_policy(reserve, release)` is a required argument of every spawn form (`trials/actor_stacks_addition`, `error_enforcement_addition/stack_policy_*`).
+
 ### 13.2 Proactive Growth Hints
 
 **Question**: Should developers provide hints about large allocations?
@@ -1961,6 +1965,8 @@ spec §15.1.2.2. An explicit limit is opt-in.
 - C: Suspend actor and retry later
 
 **Recommendation**: Option A (send message, let actor decide)
+
+**Status 2026-11-18: decided differently.** Exhausting a lowered reservation ends the actor with `(:explicit, :stack_exhausted)`, reported to its supervisor and the failure reporter, and a reservation that cannot be made is `(:explicit, :stack_reserve_failed)` on the spawning actor (`trials/actor_stacks_addition`, `error_enforcement_addition/stack_policy_*`).
 
 ---
 
@@ -2020,4 +2026,4 @@ spec §15.1.2.2. An explicit limit is opt-in.
 ---
 
 **Document Status**: Phase 1 (§11) implemented on the hosted paths; Phases 2 and 3 not started (NUMA-only); see Implementation status at the top
-**Next Step**: carriers (ROADMAP chunk 2) to lift the thread-per-actor bound; the NUMA phases when a NUMA target is taken up
+**Next Step**: carriers (ROADMAP chunk 2) to lift the thread-per-actor bound (done 2026-10-20 on all three hosted paths); the NUMA phases when a NUMA target is taken up

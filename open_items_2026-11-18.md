@@ -6,7 +6,7 @@ and are not listed here.
 
 - **Part 1, still open:** 299 items. The document records each as open or partly done, and the code,
   trials or git history did not show it done.
-- **Part 2, undecided:** 54 items. The audit could not settle these by reading.
+- **Part 2, undecided:** 33 items. The audit could not settle these by reading.
 
 How the list was made, and its limits:
 
@@ -17,28 +17,25 @@ How the list was made, and its limits:
 - A few entries rest on a search or on the document's own status text, not on a full read of the code;
   the "Found" line says what was checked.
 
+Updated 2026-11-18: items 310, 313, 340, 341, 345, 348 and 351 were ruled on by Lee and removed; the remaining items keep their numbers. Items 301 and 344 were checked again by reading and moved to Part 1. Items 302 and 326 were ruled on by Lee and removed; items 304 and 352 (the use-tree first pass) were merged into item 245; items 308, 309, 311, 312, 325 and 347 were ruled open by Lee and moved to Part 1. Items 300 and 307 were ruled on by Lee and moved to Part 1 with new wording.
+
+Updated 2026-11-19: items 1, 75, 84, 89, 90, 135, 226, 228, 244 and 312 were done (PR #74 and branch soi2-trial-run) and removed; items 91, 96, 99, 134, 258, 276 and 344 are partly done and keep their numbers with new Found lines.
+
 | Area | Open | Undecided |
 | --- | --- | --- |
-| Language specification | 40 | 6 |
-| Transport and storage carriers | 40 | 3 |
-| Memory: region safety and chunk 15 | 33 | 7 |
-| Actors | 31 | 2 |
+| Language specification | 41 | 2 |
+| Transport and storage carriers | 41 | 1 |
+| Memory: region safety and chunk 15 | 32 | 2 |
+| Actors | 30 | 2 |
 | Data structures | 27 | 1 |
-| Boards and ports | 53 | 8 |
-| Compiler and phase notes | 40 | 18 |
-| Roadmap, FFI and the remaining documents | 35 | 9 |
-| **Total** | **299** | **54** |
+| Boards and ports | 54 | 6 |
+| Compiler and phase notes | 38 | 15 |
+| Roadmap, FFI and the remaining documents | 36 | 4 |
+| **Total** | **299** | **33** |
 
 # Part 1: still open
 
-## Language specification (40)
-
-### 1. The word region is not rejected with a reserved-word diagnostic, and a record field named region is not rejected
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/silica-specification.md, 2.2.1 Keywords, about line 238
-- **Recorded as:** "No diagnostic yet says that `region` is a reserved word, and the field case is not rejected"
-- **Found:** Searched the parser sources for a reserved-word message for region and found none; no commit since 2026-10-16 mentions one. Bindings and parameters still get the generic E1040 and E1000.
+## Language specification (41)
 
 ### 2. Function literals cannot capture anything except a binding holding an integer literal, so closure environments do not exist and a capturing literal cannot be returned
 
@@ -313,7 +310,21 @@ How the list was made, and its limits:
 - **Recorded as:** "Not verified: the Layer 1 formal-verification rules in section 4 are a proof-side statement with no compiler counterpart."
 - **Found:** The compiler has no mechanized proof checker or proof-term output; nothing has been added since 2026-10-16.
 
-## Transport and storage carriers (40)
+### 301. A device worker cannot yet be a supervisor child on the ESP32-S3
+
+- [ ] reviewed
+- **Document:** compiler/design_documents/silica-specification.md, 16.4.9 Carrier links, about line 10756
+- **Recorded as:** "a device worker cannot yet be a supervisor child"
+- **Found:** Checked 2026-11-18 by reading. A supervisor child can be only `:plain` or `:dangerous` (`compiler/stdlib/Supervisor.silica` line 40; any other flavor is E2092 in `type_checker_supervisor.silica`). The ESP32-S3 `rt_supervisors.S` starts every child through the ordinary linked spawn and has no device start path. No trial or board app has a device worker as a supervisor child; the board apps start their workers with `spawn_device` directly. The specification sentence is still true.
+
+### 300. Region lifetime analysis: Phases B and C are superseded by the region checker and E2311 (Lee, 2026-11-18); the reference-use rule of Phase B and the callee-side borrowed-parameter rule of Phase C are not built
+
+- [ ] reviewed
+- **Document:** compiler/design_documents/silica-specification.md, 12.1.4 Static Region Lifetime Analysis, about line 6673
+- **Recorded as:** "Phase A (single scope) is implemented. Phases B (nested scopes) and C (cross-function analysis) require implementation after functions are fully supported."
+- **Found:** Lee chose on 2026-11-18 to mark Phases B and C as superseded by the region checker and E2311. Checked 2026-11-18 by reading. Not built: (1) the reference-use rule of Phase B, since nothing in `region_checker_core.silica` or `type_checker_memory_regions.silica` checks that the region behind a `ref` is still live when the ref is used; (2) the callee-side rule of Phase C, since a `ref(L)` parameter with no `region(L)` parameter may still be returned or sent (the Phase A check runs only on a sequence's return type). E2300 cases (b) and (c) are item 87 and hazard H8 (the Phase A check does not look inside records or lists) is item 309. The comment in `type_checker_memory_regions.silica` near line 577 that Phases B and C require implementation is stale; correcting it is a compiler source change.
+
+## Transport and storage carriers (41)
 
 ### 41. The board medium for storage carriers (phase S3) is not built
 
@@ -553,13 +564,6 @@ How the list was made, and its limits:
 - **Recorded as:** "`happy_path` runs on the Mac only"
 - **Found:** Only `run_timeout_checks.sh` (11 checks) is recorded on the three hosts.
 
-### 75. `E2418` does not yet look at IPv6 listen literals; the carrier's refusal at `:open` is the only guard
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/transport_serialization_design.md, 6.3 IPv6 paragraph "Link rules", about line 606
-- **Recorded as:** "`E2418` does not yet look at IPv6 literals"
-- **Found:** The effect and type checker changes of c063517bd9 did not add IPv6 handling to E2418.
-
 ### 76. Authentication, encryption and peer identity for `(:tcp)` (SEMP/TRUST over mutual TLS, cookie handshake) are planned in Project BEES and not built
 
 - [ ] reviewed
@@ -595,7 +599,21 @@ How the list was made, and its limits:
 - **Recorded as:** "`(:msgpack)`, `(:json)`, `(:protobuf)` after decision 7; the distribution protocol design (§7)"
 - **Found:** Only wire_etf.silica exists in compiler/stdlib, and no distribution protocol module exists.
 
-## Memory: region safety and chunk 15 (33)
+### 308. The IPv6 and name-bind forms of the `(:tcp)` carrier have no record of a real-network run, and the Linux hosts are recorded as not run
+
+- [ ] reviewed
+- **Document:** compiler/design_documents/transport_serialization_design.md, 6.3 IPv6 paragraph, about line 600
+- **Recorded as:** "the Linux hosts not run"
+- **Found:** Lee ruled it open on 2026-11-18. Trials and hosted goldens exist and commit c063517bd9 says hosted goldens were refreshed where output matched, but the commit does not name pix or nix for these trials, so I could not tell whether they ran on Linux.
+
+### 307. E2418 on the board cross compilers is to be checked when a board gains a network carrier (the Ethernet drivers on the boards are not complete)
+
+- [ ] reviewed
+- **Document:** compiler/design_documents/transport_hosted_ethernet_plan.md, 5 E2 status, about line 159
+- **Recorded as:** "the ESP32-S3 and Nucleo cross compilers were not rebuilt ... unchecked"
+- **Found:** Lee, 2026-11-18: "The drivers are not complete for Ethernet on the boards." Checked 2026-11-18 by reading: in `compiler/src/emitter/ESP32-S3_raw/transport_pack.silica` `provides_carrier` is true only for `serial`, `uart1` and `usb_serial_jtag`, and `provides_link` only for `uart` instance 1 and `usb_serial_jtag`; in `compiler/src/emitter/STM32-L476RG_raw/transport_pack.silica` `provides_carrier` and `provides_link` are always false. The E2418 scan (`listen_conflict` in `compiler/src/parser/carried_on_expand.silica`) reports only when the target pack serves the carrier kind and the link, so it has nothing to check on the boards today.
+
+## Memory: region safety and chunk 15 (32)
 
 ### 81. The atomic surface (the four atomic_* builtins, lowering on four targets, shared atomic regions) is not built
 
@@ -617,13 +635,6 @@ How the list was made, and its limits:
 - **Document:** compiler/design_documents/region_memory_safety_design.md, section 10 error table and section 14.1, about lines 723 to 725 and 805; compiler/design_documents/region_memory_safety_plan.md, stage 8 row, about line 29
 - **Recorded as:** "Stays (atomics)"; "static buffer checks E2315 to E2318 not emitted" in ROADMAP
 - **Found:** grep for E2315, E2316 and E2317 in compiler/src, compiler/error_codes.md and trials finds nothing; they depend on the atomic builtins that do not exist.
-
-### 84. Error E2318 (comparison operators on region, ref, buf or device_window types) is not emitted
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/region_memory_safety_design.md, section 10 error table and section 14.1, about lines 726 and 806
-- **Recorded as:** "Stays (comparison on region-kind types)"
-- **Found:** grep for E2318 in compiler/src, the registry and trials finds nothing.
 
 ### 85. Error E2310 (cross-region reference, isolation) is not emitted or registered, and the isolation check of spec 12.4.1 is not enforced as the design describes
 
@@ -653,26 +664,12 @@ How the list was made, and its limits:
 - **Recorded as:** "Open: the device_window single-owner check code"; "E2242 ... are later stages"
 - **Found:** E2242 appears only in a comment of region_checker_core.silica; no device_window_used_after_spawn_device or device_window_sent_twice trial exists.
 
-### 89. E2321, the strict state_release error, is not emitted
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/chunk15_stack_memory_design.md, section 12 (P3), about line 780; compiler/design_documents/chunk15_stack_memory_plan.md, section 11.1 phase 3 and 11.3, about lines 53 and 92; compiler/design_documents/data_structure_redesign_requirements.md, section 7.5 item 2, about line 257
-- **Recorded as:** "E2321 in strict mode, spelled strict state_release; at module level"
-- **Found:** the declaration strict state_release; parses (tag 10) but main_compile_pipeline.silica only mentions E2321 in a comment; no code emits it and no trial exists.
-
-### 90. Warning W2300 is not registered in the error registry and has no trial
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, sections 11.3 and 11.6, about lines 92 and 164
-- **Recorded as:** "W2300, E2301, E2302, E2310, E2311, E2321, E2242 registered"
-- **Found:** compiler/error_codes.md mentions W2300 only inside the E4037 text and error_codes.jsonld has no entry; trials/warning_enforcement_addition has no state_release trial.
-
 ### 91. The specification text for the new memory model (state area, lifetime-scoped regions, spawn copies state, messages copy, W2300) is not written, and the error registry rows for E2310, E2321, E2242 and W2300 are not added
 
 - [ ] reviewed
 - **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, section 11.6, about lines 142 to 164; compiler/design_documents/region_memory_safety_plan.md, work item 17, about line 65; compiler/design_documents/data_structure_redesign_requirements.md, section 7.5 item 12, about line 267
 - **Recorded as:** "partly done ... The specification has no state area or lifetime-scoped-region text yet"
-- **Found:** grep of silica-specification.md for state area, lifetime-scoped and E2302 finds no such text; data_structure_designs still shows the r: region field (common_contract.md about line 150).
+- **Found:** Partly done 2026-11-18: W2300 and E2321 are registered (b22eada00a) and E2321 is emitted under `strict state_release;` (0559a5a252, c482408060). Left: the specification text for the state area and lifetime-scoped regions, and the registry rows for E2310 and E2242; data_structure_designs still shows the r: region field (common_contract.md about line 150).
 
 ### 92. The scrub-on-free and zero-on-alloc requirement for runtime memory is not implemented and the before and after speed table is empty
 
@@ -707,7 +704,7 @@ How the list was made, and its limits:
 - [ ] reviewed
 - **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, section 11.3, about lines 89 and 90
 - **Recorded as:** "Trials to add (named; one per rule)"
-- **Found:** no file named state_policy_* exists under trials/; only stack_policy_missing_in_spawn and the stack_keep_*_unproven_state_survives trials exist.
+- **Found:** Partly done 2026-11-19: the E2005 trials `state_policy_missing_in_spawn` and `state_policy_missing_before_core_id` exist (2cca6d1919). Left: the keep, shrink, compact_on_request and compact_state_noop_under_keep trials, which were not found.
 
 ### 97. The compiler-proven release trials (proven_release_flat_memory, evacuation_fills_exact_holes, fallback_copy_compacts_holes, and the warning_enforcement state_release_* trials) are not in the tree
 
@@ -728,7 +725,7 @@ How the list was made, and its limits:
 - [ ] reviewed
 - **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, section 11.3, about line 104; compiler/design_documents/region_memory_safety_design.md, section 14.1, about line 800
 - **Recorded as:** "Trials to add"
-- **Found:** no golden_fail in trials/ carries E2302; region_hazards_open_addition/write_ref_young_into_older_cell is a run trial, not an error trial.
+- **Found:** Partly done 2026-11-19: the E2302 error trial `write_ref_young_into_older_cell_e2302` exists (2cca6d1919). Left: write_ref_fresh_into_state_cell, write_ref_fresh_into_param_cell and write_ref_old_into_state_cell, which were not found.
 
 ### 100. The error trial catalogue of section 14.1 and the send_then_use_* catalogue of section 18.6 are largely not written
 
@@ -828,7 +825,21 @@ How the list was made, and its limits:
 - **Recorded as:** "Known residuals, mirrored from the Mac and not fixed"
 - **Found:** not re-checked in code today; recorded as left open by the document.
 
-## Actors (31)
+### 309. Whether hazard H8 (the Phase A return lifetime check misses ref?, records and lists) is still true
+
+- [ ] reviewed
+- **Document:** compiler/design_documents/region_memory_safety_design.md, section 1.3 table, about line 135
+- **Recorded as:** "Phase A misses ref?, records and lists"
+- **Found:** Lee ruled it open on 2026-11-18. The function check_sequence_return_lifetime still exists, but I did not read it against the example, and the region checker may cover it. The Phase A check (`check_sequence_return_lifetime` in `type_checker_memory_regions.silica`) is a check of the return type's text only and does not look inside records or lists.
+
+### 311. The rule for a ref of one lifetime stored in a region of another (allowed when both regions move together when passed or returned) is decided; whether the compiler enforces the move-together condition
+
+- [ ] reviewed
+- **Document:** compiler/design_documents/region_memory_safety_design.md, section 10 and hazard H6, about lines 718 and 133
+- **Recorded as:** "Stays (isolation)"
+- **Found:** Lee's ruling of 2026-11-18: "A ref in one lifetime in a region of another is allowed as long as both regions move together when being passed or returned. I believe this is current behavior." Checked 2026-11-18 by reading, not by a compile. What is checked: the Phase A return check (`check_sequence_return_lifetime`, E2100, `type_checker_memory_regions.silica`) requires `region(L, ...)` in the return type for each `ref(L, ...)` that the return type's text names; E2311 reports one callee lifetime bound to two caller lifetimes at a call; the region checker (`region_checker_core.silica`) reports E2301 for a use after a move, E2300 case (a) for foreign retention and E2302 for a `write_ref` of a frame value into an older cell. What is not checked: nothing tests that the region holding a ref of another lifetime travels with that ref when the value is passed, returned inside a record or list, or sent, and E2310 is not emitted. The condition is therefore at most partly enforced.
+
+## Actors (30)
 
 ### 114. The runtime has no monitor or link table, and `link`, `monitor` and `demonitor` are still stubs
 
@@ -975,14 +986,7 @@ How the list was made, and its limits:
 - [ ] reviewed
 - **Document:** compiler/design_documents/actor_memory_budget_plan.md, Remaining gaps item 10, about line 1503
 - **Recorded as:** "Latent and deliberately unfixed"
-- **Found:** Read from source only; no later commit addresses it.
-
-### 135. E2094 and E2095 (a `:dangerous` row must be cast-type and carry a `:dangerous_` id) are enforced only for a module's `init`, not for child supervisors' start functions
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/actor_memory_budget_plan.md, Remaining gaps item 9, about line 1500
-- **Recorded as:** "Checker gap, to be filed and not fixed"
-- **Found:** No later commit or trial mentions it.
+- **Found:** Fix written 2026-11-19 in e7a89cfd07 (rsp kept 16-byte aligned at the call), by reading; it has not yet been run on the Linux x86-64 host (nix). Left: run the actor trials there.
 
 ### 136. Stale `__silica_runtime.*.ascomp` goldens are never compared by the harness
 
@@ -1238,7 +1242,7 @@ How the list was made, and its limits:
 - **Recorded as:** The exact generated helper syntax is open
 - **Found:** No wrapper generator exists.
 
-## Boards and ports (53)
+## Boards and ports (54)
 
 ### 172. I2C0 `:timeout` outcome has not been provoked on the board
 
@@ -1611,7 +1615,14 @@ How the list was made, and its limits:
 - **Recorded as:** "Design only"
 - **Found:** grep of compiler/src and compiler/stdlib for broker, NetOpen and helper-process found nothing.
 
-## Compiler and phase notes (40)
+### 325. Linux x86-64: app_sd18_worker_second_message still faults (the documented SD-18 defect)
+
+- [ ] reviewed
+- **Document:** compiler/design_documents/porting_to_linux_x86_64_hosted.md, about line 373
+- **Recorded as:** "still faults"
+- **Found:** Lee ruled it open on 2026-11-18. The trial is listed in ESP32 skip as having no sources; I did not run it.
+
+## Compiler and phase notes (38)
 
 ### 225. The emitter function record_make_link_promotes_field still gives callee-saved shadows for a promote call that no longer exists, and has not been removed
 
@@ -1620,26 +1631,12 @@ How the list was made, and its limits:
 - **Recorded as:** "remove it when a trial shows it can go. Still open (2026-11-14 check)"
 - **Found:** The function is still defined in compiler/src/emitter/linux_aarch64/emitter_core.silica (line 771) and STM32-L476RG_raw/emitter_core.silica (line 888); no trial or commit removing it was found.
 
-### 226. There is no error trial that expects E2302 for a write_ref of a frame-young value into an older cell
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/Phase2_notes.md, section 3 item 4 (known hazards), about line 154
-- **Recorded as:** "the trial is still a positive hazard trial (.scout 7,0) and no E2302 error trial exists yet; still open: add it"
-- **Found:** E2302 is implemented in region_checker_core.silica, but grep of trials/ finds no golden naming E2302, and region_hazards_open_addition/write_ref_young_into_older_cell is still the positive trial.
-
 ### 227. The trials directory has no codegen_regressions suite
 
 - [ ] reviewed
 - **Document:** compiler/design_documents/Phase2_notes.md, section 3 item 7, about line 172
 - **Recorded as:** "No codegen_regressions suite exists in trials/ (gate list item)"
 - **Found:** ls of trials/ shows no codegen_regressions directory.
-
-### 228. strict state_release; parses, but E2321 (turning W2300 into an error) is not emitted anywhere and is not in the error code list
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/Phase3_notes.md, section 10.8.4 first bullet, about line 706 (also stage table row 3c, about line 19; Phase6_notes.md section 1, about line 127)
-- **Recorded as:** "Still open: E2321 is not emitted anywhere"
-- **Found:** grep of compiler/src and trials finds E2321 only in main_compile_pipeline.silica, as a comment; W2300 is emitted at main_compile_pipeline.silica line 204.
 
 ### 229. The trials actors_addition/proven_release_flat_memory, actors_addition/fallback_copy_compacts_holes, warning_enforcement_addition/state_release_not_proven_alias, the three actor_stacks_addition/state_policy_* trials, memory_region_addition/retire_outside_actor_is_noop and the retire type-error pair (E2010, E2003) are not written under those names
 
@@ -1746,19 +1743,12 @@ How the list was made, and its limits:
 - **Recorded as:** "ESP32-S3_raw prims_memory.silica:135,544 still refer to it"
 - **Found:** grep finds region_grow in ESP32-S3_raw emitter_core, prims_memory, term_reg_spill, xt_frame, rt_heap.S and rt_ordering.S.
 
-### 244. The process-wide _silica_rt_region_lock word is still defined with no user now that L_region_grow is not emitted on the Mac
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/Phase5_notes.md, section 8.3 first bullet, about line 473
-- **Recorded as:** "It goes when L_region_grow goes" (my 2026-11-18 note: partly done)
-- **Found:** prims_actors_runtime_asm.silica line 3789 still defines it; no other use was found on the Mac.
-
 ### 245. The use-tree first pass (prefix parse to the first function, banner "Building use tree") is not implemented
 
 - [ ] reviewed
-- **Document:** compiler/design_documents/Phase2_TODO/use_tree_first_pass.md, Implementation status, about line 9 (also silica-compiler-code-organization.md, pipeline paragraph, about line 77; module_interface_cache_and_bottom_up_typecheck_plan.md, section on first process, about line 197)
+- **Document:** compiler/design_documents/Phase2_TODO/use_tree_first_pass.md, Implementation status, about line 9 (also silica-specification.md, 19.4.5 Module Dependency Resolution Algorithm, about line 12277; README.md, entry for Phase2_TODO/use_tree_first_pass.md, about line 266; silica-compiler-code-organization.md, pipeline paragraph, about line 77; module_interface_cache_and_bottom_up_typecheck_plan.md, section on first process, about line 197)
 - **Recorded as:** "not implemented"
-- **Found:** main_parse.silica still prints Parsing, Lexing... and runs the full parse_program on every config path; grep finds no parse_use_prefix or use-tree banner.
+- **Found:** main_parse.silica still prints Parsing, Lexing... and runs the full parse_program on every config path; grep finds no parse_use_prefix or use-tree banner. Lee ruled it open on 2026-11-18. `main_parse.silica` still lexes and parses every file in full; `Phase2_TODO/use_tree_first_pass.md` records the pass as not implemented. Items 304 and 352 recorded the same pass and were merged into this one.
 
 ### 246. Iface-cache Phase 5 trial: a stale iface is rejected
 
@@ -1849,7 +1839,7 @@ How the list was made, and its limits:
 - [ ] reviewed
 - **Document:** compiler/design_documents/Phase1_TODOs/bootstrap_retirement_and_self_host_plan.md, status section about line 47 and Step 3.3 about line 354
 - **Recorded as:** "Step 3.3 (string_literal_pool) is NOT migrated" and "Status 2026-09-08: not started"
-- **Found:** compiler/src/emitter/apple_silicon_mac/atoms/string_literal_pool.silica still defines and calls find_index_in_list (lines 111 to 128) and uses no wbt_map.
+- **Found:** Done on the Mac 2026-11-19: e532958edb makes `string_literal_pool` deduplicate through a wbt_map. Left: the Linux AArch64, Linux x86-64 and both board emitters still use the linear list scan.
 
 ### 259. Recursion phase 4 (source-mapped stack traces from an explicit frame list) is not implemented
 
@@ -1893,7 +1883,14 @@ How the list was made, and its limits:
 - **Recorded as:** "the E1040 message does not say which"
 - **Found:** The message at constraint_extract_validate.silica line 396 now reads "expected ';' after this statement before the next statement", which is clearer but still names no token.
 
-## Roadmap, FFI and the remaining documents (35)
+### 344. E2002 (undefined identifier) is reported as E2005 when the undefined name is the head of a field access, and as E2010 in some binding positions
+
+- [ ] reviewed
+- **Document:** compiler/design_documents/HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md, section "Inconsistent or misleading diagnostics", about line 214; compiler_defects_resolution_plan.md, Phase 6 message-text cleanups
+- **Recorded as:** "not re-checked and are still open"
+- **Found:** Part done 2026-11-18 in fa4636a360: an undefined name at the head of a field access now gives E2002 (trials `field_access_undefined_head` and `field_access_undefined_head_one_level`). Left: the E2010 binding-position part, which was not tied to one place.
+
+## Roadmap, FFI and the remaining documents (36)
 
 ### 265. The I2C0 driver outcomes :timeout and :arbitration_lost, the minibadge I2C and its GPIO lines were not provoked or completed on the ESP32-S3 board
 
@@ -1977,7 +1974,7 @@ How the list was made, and its limits:
 - [ ] reviewed
 - **Document:** ROADMAP.md, chunk 4, about line 134
 - **Recorded as:** "static buffer checks E2315 to E2318 not emitted"
-- **Found:** Grep for E2315 and E2318 in `compiler/src` and `trials` returns nothing.
+- **Found:** E2318 is done (item 84, 2026-11-19: b67521cd75, registry 63dffc7fd2, trials `compare_regions_e2318`, `compare_refs_e2318`, `compare_ref_opt_none_e2318`). Left: E2315 to E2317, which grep still finds nowhere in `compiler/src` or `trials`.
 
 ### 277. Typed variant constructors (spec §4.2.5) and §6.1.2 are not implemented, and there is no dedicated trial for effect composition
 
@@ -2140,30 +2137,16 @@ How the list was made, and its limits:
 - **Recorded as:** "Future development (not implemented)"; "no fuel"; "Open work (nothing done)"
 - **Found:** No TLS engine, no instruction encoders or object writers under `compiler/src`, `recursion_support.silica` says the fuel and trampoline phases are not implemented, and `prims_list.silica` still describes the fixed 16-byte layout.
 
+### 347. A device_window keeps one owner, with a check that still needs its own error code
+
+- [ ] reviewed
+- **Document:** ROADMAP.md, chunk 4, decisions 15 to 17, about line 134
+- **Recorded as:** "`device_window` keeps one owner with a check that still needs its own code (decisions 22 to 24; design §10)"
+- **Found:** Lee ruled it open on 2026-11-18. `type_checker_expressions_device.silica` has E2003 and E2213 checks for windows but I could not tell whether any is the owner check the text means.
+
 # Part 2: undecided
 
-## Language specification (6)
-
-### 300. Static region lifetime analysis Phases B (nested scopes) and C (cross-function analysis) are not done
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/silica-specification.md, 12.1.4 Static Region Lifetime Analysis, about line 6673
-- **Recorded as:** "Phase A (single scope) is implemented. Phases B (nested scopes) and C (cross-function analysis) require implementation after functions are fully supported."
-- **Why undecided:** The comment in type_checker_memory_regions.silica still says B and C are to come, but compiler/src/region_checker now exists (E2300, E2301, E2302 under strict region_check;, with flow-sensitive and callee handling). I could not tell without a deep read whether that checker is what Phases B and C meant.
-
-### 301. A device worker cannot yet be a supervisor child on the ESP32-S3
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/silica-specification.md, 16.4.9 Carrier links, about line 10756
-- **Recorded as:** "a device worker cannot yet be a supervisor child"
-- **Why undecided:** I did not check the supervisor and device-worker code for this, so I cannot say whether it still holds.
-
-### 302. The failure report reason line has not been run on the ESP32-S3 board
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/silica-specification.md, 15.4.6.4 Stack Unwinding for Diagnostics, about line 9028
-- **Recorded as:** "verified on the Mac, Linux verification in progress, ESP32-S3 board run pending"
-- **Why undecided:** trials/failure_reason_line_addition has .esp32_s3.ascomp assembly goldens and Mac .sout files but no Linux or board run output, and I found no commit recording a board run; Linux is probably covered by the later hosted runs but the trial's own record does not say so.
+## Language specification (2)
 
 ### 303. The variant-pattern example says sum types and variant patterns are not yet implemented in experiments
 
@@ -2172,13 +2155,6 @@ How the list was made, and its limits:
 - **Recorded as:** "Sum types and variant patterns not yet implemented in experiments"
 - **Why undecided:** This is a comment inside an example. Sum types and sum literals exist in the compiler (the language notes and trials use them), but I did not verify variant patterns against this example, so I left the comment.
 
-### 304. The Phase 2 use-tree first pass (parse only declarations through the first function, then sort) may not be implemented
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/silica-specification.md, 19.4.5 Module Dependency Resolution Algorithm, about line 12277
-- **Recorded as:** "Phase 2 compiler (use-tree first pass) ... It does not parse function bodies." (the linked Phase2_TODO note says "not implemented", 2026-10-16)
-- **Why undecided:** I did not re-read main_parse.silica or main_driver_first.silica; commit c6efd99635 (units in silica.up_to_date are not compiled again) is related but does not obviously implement this pass.
-
 ### 305. Whether every extended region-lifetime judgment of section 6 is enforced by the compiler is not established
 
 - [ ] reviewed
@@ -2186,7 +2162,7 @@ How the list was made, and its limits:
 - **Recorded as:** "region lifetime analysis is partly implemented ... Not verified here: whether every extended-judgment rule in section 6 is enforced."
 - **Why undecided:** The region checker (compiler/src/region_checker, E2300 to E2302) and type_checker_memory_regions.silica now exist, but mapping each section 6 rule to a check needs a rule-by-rule read that I did not do.
 
-## Transport and storage carriers (3)
+## Transport and storage carriers (1)
 
 ### 306. Whether the handler that receives an FFI result cast is a taint source (FFI specification 7.6) is left open, so E2406 fires only for a nested plain sequence
 
@@ -2195,56 +2171,7 @@ How the list was made, and its limits:
 - **Recorded as:** "FFI wrapper specification §7.6 is open"
 - **Why undecided:** I did not trace the taint checker, and FFI spec 7.6 (line about 1028) was not read for its current state, so I cannot say whether this has since been resolved.
 
-### 307. Whether the ESP32-S3 and Nucleo cross compilers are unaffected by the E2418 change is recorded as unchecked
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/transport_hosted_ethernet_plan.md, 5 E2 status, about line 159
-- **Recorded as:** "the ESP32-S3 and Nucleo cross compilers were not rebuilt ... unchecked"
-- **Why undecided:** Newer cross compilers (silica-999956 and 999953) were built from later trees, but I did not check that E2418 is gated on the pack for the boards, so I cannot say if this is closed.
-
-### 308. The IPv6 and name-bind forms of the `(:tcp)` carrier have no record of a real-network run, and the Linux hosts are recorded as not run
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/transport_serialization_design.md, 6.3 IPv6 paragraph, about line 600
-- **Recorded as:** "the Linux hosts not run"
-- **Why undecided:** Trials and hosted goldens exist and commit c063517bd9 says hosted goldens were refreshed where output matched, but the commit does not name pix or nix for these trials, so I could not tell whether they ran on Linux.
-
-## Memory: region safety and chunk 15 (7)
-
-### 309. Whether hazard H8 (the Phase A return lifetime check misses ref?, records and lists) is still true
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/region_memory_safety_design.md, section 1.3 table, about line 135
-- **Recorded as:** "Phase A misses ref?, records and lists"
-- **Why undecided:** the function check_sequence_return_lifetime still exists, but I did not read it against the example, and the region checker may cover it.
-
-### 310. Whether the staged trial directories (region_hazards_open_addition, region_hazards_open_errors_addition, bees_regions_open_addition) now run in the gate
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/region_memory_safety_design.md, section 14.2 status note and section 1.3, about line 815; compiler/design_documents/region_memory_safety_plan.md, work item 1, about line 47
-- **Recorded as:** "INTEGRATE_PENDING" in the suites' READMEs
-- **Why undecided:** each directory still has an INTEGRATE_PENDING file, but the Linux and board goldens suggest they were run; no record says they were promoted.
-
-### 311. Whether isolation (ref of one lifetime stored in a region of another) is enforced under some other error code
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/region_memory_safety_design.md, section 10 and hazard H6, about lines 718 and 133
-- **Recorded as:** "Stays (isolation)"
-- **Why undecided:** E2310 is not emitted and E2311 covers only call-site lifetime conflicts; I did not test a program that stores a ref across regions.
-
-### 312. Whether E2005 is raised on a missing state_policy argument
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/data_structure_redesign_requirements.md, section 7.5 item 13, about line 268
-- **Recorded as:** "E2005 on a missing argument not individually verified"
-- **Why undecided:** the only trials are the stack_policy ones, whose goldens show E2005; no trial isolates a missing state_policy, and I ran nothing.
-
-### 313. Whether the STM32-L476RG board runtime was moved to the chunk 15 stack model
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/chunk15_stack_memory_plan.md, section 11.1 phases 8 and 9, about lines 25 and 26; compiler/design_documents/Phase1_TODOs/region_memory_safety_todo.md, section 1.2, about line 54
-- **Recorded as:** "Phase 9 ESP32-S3 ... done"
-- **Why undecided:** the plan names only the ESP32-S3 for phase 9, and the STM32 emitter still contains body_has_moving_call, so I could not tell whether the Nucleo follows the new model.
+## Memory: region safety and chunk 15 (2)
 
 ### 314. Whether the verification checklist item "error messages reference specification sections" is met
 
@@ -2285,7 +2212,7 @@ How the list was made, and its limits:
 - **Recorded as:** Housekeeping carried into 13: ... reclassify the residual workaround comments, and either wire or delete HOST_COMPILER in src/Makefile
 - **Why undecided:** grep finds no HOST_COMPILER in src/Makefile now, so that part looks done, but whether the residual workaround comments were reclassified cannot be told without reading all of src/.
 
-## Boards and ports (8)
+## Boards and ports (6)
 
 ### 319. Step 4 coverage check is recorded in section 3 but the original open point of poke_n reopening is conditional only; no action
 
@@ -2329,21 +2256,7 @@ How the list was made, and its limits:
 - **Recorded as:** "Still to do, in order"
 - **Why undecided:** No GOLDEN_MISSING in trials/*.mk; SKIP_TRIALS appears only in trials/platform/*.mk; I did not count the inline blocks. Phase 3 is complete so these may be moot.
 
-### 325. Linux x86-64: app_sd18_worker_second_message still faults (the documented SD-18 defect)
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/porting_to_linux_x86_64_hosted.md, about line 373
-- **Recorded as:** "still faults"
-- **Why undecided:** The trial is listed in ESP32 skip as having no sources; I did not run it.
-
-### 326. STM32 flash mode: the harness refusal of BOARD_EXEC=flash is not implemented in board_suite.sh and run_one_trial.sh
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/stm32_flash_execution_design.md, section 2.6, about line 170
-- **Recorded as:** "must refuse BOARD_EXEC=flash outright"
-- **Why undecided:** grep of trials/targets for BOARD_EXEC found nothing, so there is no refusal; the harness just never passes it.
-
-## Compiler and phase notes (18)
+## Compiler and phase notes (15)
 
 ### 327. The Phase 2 hazards that heap-mode evacuation rewrites an old aggregate in place, and that write_ref of a pointer to a younger frame's node into an older REF cell is not scanned, have no covering trials
 
@@ -2436,20 +2349,6 @@ How the list was made, and its limits:
 - **Recorded as:** "- [ ] Dangerous / supervisor / failure-reporter module flags available"
 - **Why undecided:** Not checked against module_iface.silica.
 
-### 340. Correctness checklist: seed and selfhost behave the same for the same sources
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/module_interface_cache_and_bottom_up_typecheck_plan.md, section 11, about line 414
-- **Recorded as:** "- [ ] Seed and selfhost behavior match for the same sources (modulo dialect)"
-- **Why undecided:** The separate seed source tree no longer exists (one tree, compiler/src), so the item may be obsolete; Lee should say.
-
-### 341. A trials/self_host_addition suite was not created
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/Phase1_TODOs/bootstrap_retirement_and_self_host_plan.md, status table row Step 6.1, about line 40
-- **Recorded as:** "trials/self_host_addition/ was not created; make trials-gen1, trials-gen2, trials-both run the whole tree instead"
-- **Why undecided:** The directory is still absent from trials/, but the document records this as an accepted substitute; only Lee can say whether the suite is still wanted.
-
 ### 342. Parser design section 9.2, sparse matrix output of structure extraction
 
 - [ ] reviewed
@@ -2464,21 +2363,7 @@ How the list was made, and its limits:
 - **Recorded as:** "Each capability can export disambiguation rules"
 - **Why undecided:** The section is an optional future consideration with no status wording, and I did not search the parser for it.
 
-### 344. E2002 (undefined identifier) is reported as E2005 when the undefined name is the head of a field access, and as E2010 in some binding positions
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md, section "Inconsistent or misleading diagnostics", about line 214; compiler_defects_resolution_plan.md, Phase 6 message-text cleanups
-- **Recorded as:** "not re-checked and are still open"
-- **Why undecided:** Deciding needs a compile of the repro, which this reading audit may not run.
-
-## Roadmap, FFI and the remaining documents (9)
-
-### 345. Ending an actor that is running on the other ESP32-S3 core waits for that actor's next dispatch boundary
-
-- [ ] reviewed
-- **Document:** ROADMAP.md, Actor placement in chunk 2 table, Raw (OS-free) row, about line 68
-- **Recorded as:** "Open: ending an actor that is running on the other core waits for its next dispatch boundary"
-- **Why undecided:** This is a board runtime behaviour in the ESP32-S3 `rt_actors.S`; I could not tell from reading the tree whether it is a limitation to remove or the intended design, and no trial names it.
+## Roadmap, FFI and the remaining documents (4)
 
 ### 346. Negative trials for unsupported list element shapes and the closing spec audit of lists are not done
 
@@ -2486,20 +2371,6 @@ How the list was made, and its limits:
 - **Document:** ROADMAP.md, chunk 3, about line 133
 - **Recorded as:** "negative trials for unsupported element shapes and the closing spec audit are still open"
 - **Why undecided:** `trials/list_addition` holds no obviously named negative trial, but I did not read the error_enforcement trials one by one to rule one out, and the spec audit has no testable closing criterion.
-
-### 347. A device_window keeps one owner, with a check that still needs its own error code
-
-- [ ] reviewed
-- **Document:** ROADMAP.md, chunk 4, decisions 15 to 17, about line 134
-- **Recorded as:** "`device_window` keeps one owner with a check that still needs its own code (decisions 22 to 24; design §10)"
-- **Why undecided:** `type_checker_expressions_device.silica` has E2003 and E2213 checks for windows but I could not tell whether any is the owner check the text means.
-
-### 348. What happens to mailbox buffers still pending when an actor ends was recorded as an open mechanism question
-
-- [ ] reviewed
-- **Document:** ROADMAP.md, chunk 4, plan item 3, about line 134
-- **Recorded as:** "mailbox buffers pending at actor end are an open mechanism question"
-- **Why undecided:** Chunk 15 in the same file records decisions 30 to 33 that such buffers are freed by one walk of the mailbox queue, so the chunk 4 sentence may simply be stale; I did not trace the runtime to confirm the walk is implemented.
 
 ### 349. Tooling and proof (formal-verification tooling, IDE and developer-experience surface, tighter emission) has not landed
 
@@ -2514,20 +2385,6 @@ How the list was made, and its limits:
 - **Document:** ROADMAP.md, chunk 14, about line 143
 - **Recorded as:** "Each raw path's port notes list every item as delivered with trials or as not applicable"
 - **Why undecided:** Status covers memory spaces only (`b9bdc0d547`, trials `memory_space_*_addition`); I did not look in the port notes for a §21 list.
-
-### 351. Chunk 15 phase 10 on the Mac records a fixed point but no gen3 byte-identical to gen2 (only the two Linux compilers record it)
-
-- [ ] reviewed
-- **Document:** ROADMAP.md, chunk 15, about line 144
-- **Recorded as:** "the Mac reached a fixed point (`bddbec327c` records no more), and gen3 byte-identical to gen2 is recorded only for the two Linux compilers"
-- **Why undecided:** Whether the missing byte-identity record is a gap or only an unrecorded fact needs Lee; I only read the note.
-
-### 352. The use-tree first pass (parse only the declarations up to the first function, then exit 75) is recorded as not implemented
-
-- [ ] reviewed
-- **Document:** compiler/design_documents/README.md, entry for Phase2_TODO/use_tree_first_pass.md, about line 266
-- **Recorded as:** "design; not implemented as of 2026-10-16"
-- **Why undecided:** I read only the document's own status; `main_driver_first.silica` exists but I did not trace whether it stops at the first function, and that file is another agent's.
 
 ### 353. Per-space pools, alloc_region space routing and atomic LDAR/STLR access are recorded as not implemented for the AArch64 memory-effects plan
 

@@ -151,7 +151,7 @@ Apple Silicon (`emitter/apple_silicon_mac/`), mirrored in `emitter/linux_aarch64
      expectation (7, 0) contradicts that rule; under the design it becomes an error trial (expect
      E2302) once phase 6's checker lands. Making the evacuator scan every older cell would mean a
      remembered set (a write barrier on every pointer store into a ref cell), which is not in the
-     design. **Update (2026-11-14 check):** E2302 is implemented (`region_checker_core.silica:298`, `55040488fc` 2026-11-01), but the trial is still a positive hazard trial (`.scout` 7,0) and no E2302 error trial exists yet; still open: add it.
+     design. **Update (2026-11-14 check):** E2302 is implemented (`region_checker_core.silica:298`, `55040488fc` 2026-11-01), but the trial is still a positive hazard trial (`.scout` 7,0) and no E2302 error trial exists yet; still open: add it. **Update 2026-11-19:** the E2302 error trial now exists, `error_enforcement_addition/write_ref_young_into_older_cell_e2302` (`2cca6d1919`); the positive hazard trial is unchanged.
    * Heap-mode evacuation of a send/call payload rewrites, in place, the words of an *old* aggregate
      that reaches young nodes (S6c): the sender's old shell then names the heap copies. Equal for
      immutable values, but a mutable ref cell reached that way is copied, so the sender's later writes
@@ -343,6 +343,7 @@ promote/reclaim in call_tail, the part2/part3 slab pops (`cons_dealloc`, `tuple_
 * linux_aarch64 (pix) and linux_x86_64 (nix): the S8 diff is applied in the source trees but NOT
   built or gated on either host. Next: sync, touch the edited emitter sources on the host (rsync
   mtime trap), rebuild (pix builder 999964, nix builder 999972, `~/p2_remote_gate.sh`), run the suites below.
+**Status 2026-11-18: done.** The Mac final tree and both Linux trees were built and gated: pix and nix green on the full integrate (section 3 items 1 and 2, fixed point `df3357ce38`, goldens `81c1144bb6`).
 
 **S9: `actor_ref` is frame-free (2026-10-27).** `bees_regions_addition/bees_sd7_message_region_released`
 faulted (exit 70, actor 0, fault address in the main stack's guard area) on pix and nix. Root cause:
