@@ -26,7 +26,7 @@
 // compaction, which builds a fresh chain. ACB_SBYTES counts the bytes allocated and not freed.
 //
 // THE COPIER walks a value through the descriptors the emitter spells (terms/term_message_copy.silica:
-// KIND 0 word, 1 region witness, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST, 8 STRING, 9 closure),
+// KIND 0 word, 1 region witness, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST, 8 STRING, 9 closure, 10 opaque: below 65536 a word, else the copy is refused),
 // given in the ROOT-WORD form `.quad 1, -1; .quad KIND, AUX` (16-byte entries, the low word read). The
 // data words are 8 bytes (lo, hi), a pointer in the low word; a value below 65536 is an atom, nil or a
 // small scalar and travels as it is. Sizes: an aggregate N * 8; a REF1 cell 8; a REFTUP cell 8 plus its
@@ -108,6 +108,13 @@
 #define SCH_HEADS_BYTES  520
 #define SCH_FIRST        2048
 #define SCH_CAP          16384
+// The largest byte count one run-time-sized allocation may ask for: far
+// above this board's memory, and small enough that no sum the allocators make from it (the count plus
+// headers, rounding, headroom, the transient part or an address) can pass 32 bits. A larger request can
+// never be met, so each entry refuses it before doing any arithmetic with it. The emitter refuses the
+// same sizes in 64 bits before the low word is passed (terms/prims/prims_memory.silica emit_alloc_buf,
+// emit_alloc_buf_retained).
+#define RT_ALLOC_MAX     0x08000000
 #define SLOG_FIRST       64
 
 #define CCB_DMODE        0
@@ -427,7 +434,13 @@ silica_rt_state_hole_pop:
     .type   silica_rt_state_alloc, @function
 silica_rt_state_alloc:
     entry   a1, 32
-    mov     a10, a2
+    // A node of no bytes has no free-list head and one above RT_ALLOC_MAX can never be met: neither is allocated.
+    bnez    a3, 1f
+    j       9f
+1:  movi    a8, RT_ALLOC_MAX
+    bgeu    a8, a3, 1f
+    j       9f
+1:  mov     a10, a2
     call8   silica_rt_state_chain_init
     mov     a10, a2
     mov     a11, a3
@@ -436,8 +449,9 @@ silica_rt_state_alloc:
     l32i    a4, a2, ACB_SCUR
     l32i    a5, a4, SCH_CUR
     l32i    a6, a4, SCH_END
+    sub     a6, a6, a5                  // what the chunk has left (the cursor never passes the end)
+    bltu    a6, a3, 2f                  // bytes > end - cursor: no cursor + bytes that could wrap
     add     a7, a5, a3
-    bltu    a6, a7, 2f
     s32i    a7, a4, SCH_CUR
     mov     a10, a5
     j       7f
@@ -672,6 +686,8 @@ rt_sm_val:
     beqi    a3, 7, 7f
     movi    a8, 8
     beq     a3, a8, 8f
+    movi    a8, 10
+    beq     a3, a8, 11f
 9:  retw                                // 0 word, 1 region, 9 closure, unknown
     // every node kind: an old node is kept, not followed
 2:  mov     a10, a2
@@ -753,9 +769,25 @@ rt_sm_val:
     mov     a11, a4
     call8   rt_buf_bytes
     call8   rt_sm_add
-    mov     a10, a5
+    movi    a8, 65536                   // AUX a label: elements that can hold pointers, each by the
+    bltu    a4, a8, 69f                 // element entry of the one-entry descriptor `.quad 1, 8`
+    l32i    a6, a2, -8                  // count
+    mov     a7, a2
+68: beqz    a6, 69f
+    l32i    a10, a7, 0
+    l32i    a11, a4, 16
+    l32i    a12, a4, 24
+    call8   rt_sm_val
+    addi    a7, a7, 8
+    addi    a6, a6, -1
+    j       68b
+69: mov     a10, a5
     call8   rt_slot_leave
     retw
+    // KIND 10: a word the descriptors cannot follow, 65536 or more (it may point into the sender's
+    // frame or state): the copying actor fails as when the copy cannot be placed
+11: call8   silica_rt_region_alloc_failed
+    j       11b
 7:  mov     a10, a2
     call8   rt_is_old
     bnez    a10, 9b
@@ -882,7 +914,10 @@ rt_sum_desc:
     .type   rt_buf_bytes, @function
 rt_buf_bytes:
     entry   a1, 32
-    l32i    a4, a2, -8
+    movi    a5, 65536                   // AUX a label (elements that can hold pointers): 8 bytes each
+    bltu    a3, a5, 1f
+    movi    a3, 8
+1:  l32i    a4, a2, -8
     mull    a4, a4, a3
     addi    a4, a4, 15
     movi    a5, -8
@@ -921,6 +956,8 @@ rt_sc_val:
     beqi    a4, 7, 7f
     movi    a8, 8
     beq     a4, a8, 8f
+    movi    a8, 10
+    beq     a4, a8, 11f
 9:  retw
     // REF1: a cell of one word
 2:  mov     a10, a2
@@ -1035,6 +1072,7 @@ rt_sc_val:
     call8   rt_buf_bytes
     s32i    a10, a1, 16
     call8   rt_place
+    s32i    a10, a1, 4                  // dest
     s32i    a11, a1, 8
     addi    a11, a2, -8                 // from the count word
     mov     a12, a10
@@ -1043,12 +1081,36 @@ rt_sc_val:
     mov     a11, a12
     mov     a12, a13
     call8   rt_copy_bytes
-    l32i    a10, a1, 0
+    movi    a8, 65536                   // AUX a label: each element through the element entry
+    bltu    a5, a8, 69f
+    l32i    a6, a2, -8                  // count
+    mov     a7, a2                      // the source element
+    l32i    a8, a1, 4
+    addi    a8, a8, 8
+    s32i    a8, a1, 20                  // the destination element
+68: beqz    a6, 69f
+    l32i    a10, a7, 0
+    l32i    a11, a7, 4
+    l32i    a12, a5, 16
+    l32i    a13, a5, 24
+    call8   rt_sc_val
+    l32i    a8, a1, 20
+    s32i    a10, a8, 0
+    s32i    a11, a8, 4
+    addi    a8, a8, 8
+    s32i    a8, a1, 20
+    addi    a7, a7, 8
+    addi    a6, a6, -1
+    j       68b
+69: l32i    a10, a1, 0
     call8   rt_slot_leave
     l32i    a2, a1, 8
     addi    a2, a2, 8                   // the elements
     movi    a3, 0
     retw
+    // KIND 10 (see rt_sm_val): the copying actor fails
+11: call8   silica_rt_region_alloc_failed
+    j       11b
     // LIST: the handle, then the spine chunk by chunk, each element by the element entry
 7:  mov     a10, a2
     call8   rt_is_old
@@ -1410,7 +1472,9 @@ silica_rt_reply_place:
     beqz    a5, 9f
     l32i    a8, a5, MSG_KIND
     bnei    a8, 1, 9f
-    l32i    a6, a5, MSG_CALLER
+    mov     a10, a5                     // the caller, claimed under the lock (rt_actors.S): its exit
+    call8   silica_rt_reply_claim_caller    // path waits for the end of this copy (label 7)
+    mov     a6, a10
     beqz    a6, 9f
     s32i    a6, a1, 12
     s32i    a5, a1, 40                  // [40] the call node
@@ -1422,7 +1486,7 @@ silica_rt_reply_place:
     l32i    a10, a1, 0
     l32i    a11, a1, 8
     call8   rt_measure_root
-    beqz    a10, 9f
+    beqz    a10, 7f
     addi    a10, a10, 15
     movi    a8, -16
     and     a10, a10, a8
@@ -1498,6 +1562,8 @@ silica_rt_reply_place:
     l32i    a6, a1, 40
     l32i    a8, a1, 36
     s32i    a8, a6, MSG_PARK_SP         // the caller's SP on waking (rt_actors.S silica_rt_actor_call)
+7:  l32i    a10, a1, 40                 // the claim ends: the caller may end now
+    call8   silica_rt_reply_place_done
 9:  l32i    a2, a1, 0
     l32i    a3, a1, 4
     retw
@@ -1852,6 +1918,11 @@ silica_rt_state_log_drain:
     .type   silica_rt_state_retain_node, @function
 silica_rt_state_retain_node:
     entry   a1, 32
+    // n is X0 = a2:a3. A count that does not fit the low word, or above RT_ALLOC_MAX, is refused before
+    // the rounding below (size check).
+    bnez    a3, 9f
+    movi    a8, RT_ALLOC_MAX
+    bltu    a8, a2, 9f
     mov     a3, a2
     call8   silica_rt_current_actor
     beqz    a10, 9f

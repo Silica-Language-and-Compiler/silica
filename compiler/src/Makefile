@@ -24,6 +24,38 @@
 #   make TARGET=apple_silicon_mac   # explicit emit / emitter backend
 
 THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+
+# ---- Build flavor: TRIAL_BUILD (the one switch) ------------------------------------------------
+# TRIAL_BUILD=0 (default): a normal compiler, the only kind that is ever published as
+#   binaries/silica-compiler[-<TARGET>] or used as a seed.
+# TRIAL_BUILD=1: a trial build, the compiler the trials are compiled with. It also knows the
+#   trial-only builtins (today: supervision_ingress_enqueue). Everything it writes is named with the
+#   TRIAL_BUILD_ prefix, so it can never be mistaken for a normal build:
+#     build directory  compiler/build/TRIAL_BUILD_<TARGET>/       (normal: compiler/build/<TARGET>/)
+#     compiler         TRIAL_BUILD_silica-compiler in that directory (normal: silica-compiler)
+#     installed as     binaries/TRIAL_BUILD_silica-compiler        (host TARGET)
+#                      binaries/TRIAL_BUILD_silica-compiler-<TARGET> (any other TARGET)
+#                      only when INSTALL_SELFHOST=1; never through install_compiler.bash, never as
+#                      binaries/silica-compiler[-<TARGET>], never numbered, never a seed
+#     generations      binaries/TRIAL_BUILD_silica-gen1 / TRIAL_BUILD_silica-gen2
+# The flavor reaches the compiler's code through one unit: topo_silica_config.sh --flavor puts
+# build_flavor/normal/build_flavor.silica or build_flavor/trial/build_flavor.silica (never both) into
+# silica.config, and the checkers ask build_flavor@trial_hooks_enabled(). Nothing else selects it.
+#   make build TRIAL_BUILD=1 INSTALL_SELFHOST=0 SILICA_TARGET_PROMPT=0            # trial build, host target
+#   make build TRIAL_BUILD=1 TARGET=ESP32-S3_raw INSTALL_SELFHOST=0 SILICA_TARGET_PROMPT=0
+TRIAL_BUILD ?= 0
+ifeq ($(TRIAL_BUILD),1)
+TRIAL_BUILD_PREFIX := TRIAL_BUILD_
+BUILD_FLAVOR := trial
+else ifeq ($(TRIAL_BUILD),0)
+TRIAL_BUILD_PREFIX :=
+BUILD_FLAVOR := normal
+else
+$(error TRIAL_BUILD must be 0 (normal build) or 1 (trial build), not '$(TRIAL_BUILD)')
+endif
+# Sub-makes (the objects fan-out, gen1/gen2/fixpoint, all-targets) build the same flavor.
+export TRIAL_BUILD
+
 include $(THIS_DIR)emit_target.mk
 
 BINARIES_DIR := $(abspath $(THIS_DIR)../../binaries)
@@ -53,6 +85,13 @@ STDLIB_DS := $(abspath $(THIS_DIR)../stdlib/data_structures)
 # re-add an archive. Assembler and linker are clang only.
 
 EXECUTABLE := silica-compiler
+# A trial build's compiler always carries the TRIAL_BUILD_ prefix, also under an EXECUTABLE given on
+# the command line (all-targets); a normal build may not take a TRIAL_BUILD_ name.
+ifeq ($(TRIAL_BUILD),1)
+override EXECUTABLE := $(TRIAL_BUILD_PREFIX)$(patsubst $(TRIAL_BUILD_PREFIX)%,%,$(EXECUTABLE))
+else ifneq ($(filter TRIAL_BUILD_%,$(EXECUTABLE)),)
+$(error EXECUTABLE=$(EXECUTABLE): a TRIAL_BUILD_ name is only for a trial build (TRIAL_BUILD=1))
+endif
 
 # A successful build publishes itself to binaries/ (binaries/install_compiler.bash):
 #   - TARGET is the host's emit target and EXECUTABLE is the default: the new selfhost,
@@ -244,7 +283,7 @@ CONFIG_FILE := $(BUILD_DIR)silica.config
 $(shell \
 	if [ -x "$(TOPO_SILICA_CONFIG)" ] && [ -d "$(EMITTER_ROOT)/$(TARGET)" ]; then \
 		mkdir -p "$(BUILD_DIR)"; \
-		"$(TOPO_SILICA_CONFIG)" --list-units "$(TARGET)" > "$(SILICA_CONFIG_UNITS_FILE).tmp" 2>/dev/null || true; \
+		"$(TOPO_SILICA_CONFIG)" --list-units --flavor "$(BUILD_FLAVOR)" "$(TARGET)" > "$(SILICA_CONFIG_UNITS_FILE).tmp" 2>/dev/null || true; \
 		if [ -f "$(SILICA_CONFIG_UNITS_FILE).tmp" ]; then \
 			if ! cmp -s "$(SILICA_CONFIG_UNITS_FILE).tmp" "$(SILICA_CONFIG_UNITS_FILE)" 2>/dev/null; then \
 				mv "$(SILICA_CONFIG_UNITS_FILE).tmp" "$(SILICA_CONFIG_UNITS_FILE)"; \
@@ -260,14 +299,14 @@ SILICA_CONFIG_UNITS := $(addprefix $(THIS_DIR),$(shell cat "$(SILICA_CONFIG_UNIT
 # Membership list (real file). Built when missing; parse-time shell above refreshes on add/delete.
 $(SILICA_CONFIG_UNITS_FILE): $(TOPO_SILICA_CONFIG) $(LIB_STAGED) $(TARGET_FILE)
 	@mkdir -p "$(BUILD_DIR)"
-	@"$(TOPO_SILICA_CONFIG)" --list-units "$(TARGET)" > "$@"
+	@"$(TOPO_SILICA_CONFIG)" --list-units --flavor "$(BUILD_FLAVOR)" "$(TARGET)" > "$@"
 
 $(CONFIG_COMPILER): $(TARGET_FILE) $(TOPO_SILICA_CONFIG) $(LIB_STAGED) \
 		$(SILICA_CONFIG_UNITS_FILE) $(SILICA_CONFIG_UNITS)
-	@echo "Regenerating silica.config.compiler (TARGET=$(TARGET), build dir $(BUILD_DIR))..."
+	@echo "Regenerating silica.config.compiler (TARGET=$(TARGET), flavor $(BUILD_FLAVOR), build dir $(BUILD_DIR))..."
 	@mkdir -p "$(BUILD_DIR)"
-	@"$(TOPO_SILICA_CONFIG)" --list-units "$(TARGET)" > "$(SILICA_CONFIG_UNITS_FILE)"
-	@"$(TOPO_SILICA_CONFIG)" "$(TARGET)" > "$(CONFIG_COMPILER).tmp"
+	@"$(TOPO_SILICA_CONFIG)" --list-units --flavor "$(BUILD_FLAVOR)" "$(TARGET)" > "$(SILICA_CONFIG_UNITS_FILE)"
+	@"$(TOPO_SILICA_CONFIG)" --flavor "$(BUILD_FLAVOR)" "$(TARGET)" > "$(CONFIG_COMPILER).tmp"
 	@mv "$(CONFIG_COMPILER).tmp" "$(CONFIG_COMPILER)"
 	@test -s "$(CONFIG_COMPILER)" || (echo "FAIL: silica.config.compiler empty"; exit 1)
 	@test -n "$$(find "$(THIS_DIR)emitter/$(TARGET)" -type f -name '*.silica' 2>/dev/null | head -n 1)" \
@@ -474,8 +513,15 @@ executables: objects
 		$(REPORT_COMPILE_TIME); \
 		exit 1; \
 	fi; \
-	echo "✅ Built $(EXECUTABLE)"; \
-	if [ "$(INSTALL_SELFHOST)" = "1" ] && [ "$(TARGET)" != "$(HOST_DEFAULT_TARGET)" ]; then \
+	echo "✅ Built $(EXECUTABLE)$(if $(TRIAL_BUILD_PREFIX), (TRIAL BUILD: trial-only builtins enabled; never published as silica-compiler))"; \
+	if [ "$(TRIAL_BUILD)" = "1" ]; then \
+		if [ "$(INSTALL_SELFHOST)" = "1" ] && { [ "$(TARGET)" != "$(HOST_DEFAULT_TARGET)" ] || [ "$(EXECUTABLE)" = "$(TRIAL_BUILD_PREFIX)silica-compiler" ]; }; then \
+			trial_dest="$(BINARIES_DIR)/$(TRIAL_BUILD_PREFIX)silica-compiler$(if $(filter-out $(HOST_DEFAULT_TARGET),$(TARGET)),-$(TARGET))"; \
+			install -m 755 "$(BUILD_DIR)$(EXECUTABLE)" "$$trial_dest.tmp" && mv -f "$$trial_dest.tmp" "$$trial_dest" \
+				|| { echo "FAIL: could not install $$trial_dest"; $(REPORT_COMPILE_TIME); exit 1; }; \
+			echo "✅ Installed trial build: $$trial_dest (binaries/silica-compiler* untouched)"; \
+		fi; \
+	elif [ "$(INSTALL_SELFHOST)" = "1" ] && [ "$(TARGET)" != "$(HOST_DEFAULT_TARGET)" ]; then \
 		if [ -x "$(INSTALL_COMPILER_SH)" ]; then \
 			"$(INSTALL_COMPILER_SH)" target "$(TARGET)" "$(BUILD_DIR)$(EXECUTABLE)" || { $(REPORT_COMPILE_TIME); exit 1; }; \
 		else \
@@ -507,8 +553,8 @@ BOOTSTRAP_CROSS_COMPILER := $(BINARIES_DIR)/silica-compiler-$(BOOTSTRAP_TARGET)
 bootstrap-assembly:
 	@$(MAKE) -C "$(THIS_DIR)" -f "$(THIS_DIR)Makefile" assembly TARGET=$(BOOTSTRAP_TARGET) \
 		SILICA_COMPILER="$(BOOTSTRAP_CROSS_COMPILER)" INSTALL_SELFHOST=0 SILICA_TARGET_PROMPT=0
-	@n=$$(find "$(BUILD_ROOT)/$(BOOTSTRAP_TARGET)" -name '*.sams' -type f ! -path '*/_wd_probe/*' | wc -l | tr -d ' '); \
-	echo "bootstrap-assembly: $$n .sams emitted for $(BOOTSTRAP_TARGET) into $(BUILD_ROOT)/$(BOOTSTRAP_TARGET)/; copy this tree and that directory to the Linux host and run make bootstrap-link there"
+	@n=$$(find "$(BUILD_ROOT)/$(TRIAL_BUILD_PREFIX)$(BOOTSTRAP_TARGET)" -name '*.sams' -type f ! -path '*/_wd_probe/*' | wc -l | tr -d ' '); \
+	echo "bootstrap-assembly: $$n .sams emitted for $(BOOTSTRAP_TARGET) into $(BUILD_ROOT)/$(TRIAL_BUILD_PREFIX)$(BOOTSTRAP_TARGET)/; copy this tree and that directory to the Linux host and run make bootstrap-link there"
 
 bootstrap-link:
 	@if [ "$$(uname -s)" != Linux ]; then echo "FAIL: bootstrap-link assembles and links on the Linux host, not here"; exit 1; fi
@@ -536,8 +582,9 @@ build-selfhost: build
 #   make trials-gen2     make -C trials integrate SILICA_COMPILER=binaries/silica-gen2
 #   make trials-both     trials-gen1 then trials-gen2 (reports kept as .integrate_report.gen1/.gen2)
 TRIALS_DIR := $(abspath $(THIS_DIR)../../trials)
-GEN1_BIN := $(BINARIES_DIR)/silica-gen1
-GEN2_BIN := $(BINARIES_DIR)/silica-gen2
+# A trial build's generations are binaries/TRIAL_BUILD_silica-gen1 / TRIAL_BUILD_silica-gen2.
+GEN1_BIN := $(BINARIES_DIR)/$(TRIAL_BUILD_PREFIX)silica-gen1
+GEN2_BIN := $(BINARIES_DIR)/$(TRIAL_BUILD_PREFIX)silica-gen2
 
 gen1:
 	@$(MAKE) -C "$(THIS_DIR)" -f "$(THIS_DIR)Makefile" build SILICA_COMPILER="$(BINARIES_DIR)/seed-compiler"
@@ -585,9 +632,9 @@ trials-both:
 # LC_UUID and the ad-hoc signature identifier from the output path, so a binary linked under
 # another name can never be byte-identical. It is not installed (INSTALL_SELFHOST=0) and is
 # kept as silica-compiler-gen3.
-FIXPOINT_DIR := $(BUILD_ROOT)/$(TARGET).fixpoint
+FIXPOINT_DIR := $(BUILD_ROOT)/$(TRIAL_BUILD_PREFIX)$(TARGET).fixpoint
 GEN1_EMISSION_STAMP := $(BUILD_DIR).gen1_emission_stamp
-GEN3_EXE := silica-compiler-gen3
+GEN3_EXE := $(TRIAL_BUILD_PREFIX)silica-compiler-gen3
 
 fixpoint:
 	@if [ ! -x "$(GEN2_BIN)" ]; then echo "FAIL: $(GEN2_BIN) is missing; run 'make gen2' first"; exit 1; fi
@@ -719,6 +766,12 @@ help:
 	@echo "    make TARGET=linux_x86_64          # Linux x86-64 backend (Debian-family x86-64 hosts)"
 	@echo "    make assembly TARGET=apple_silicon_mac"
 	@echo "    make all-targets              # loop clean/build for each allowable TARGET"
+	@echo "    make build TRIAL_BUILD=1 INSTALL_SELFHOST=0   # trial build: compiler/build/TRIAL_BUILD_<TARGET>/TRIAL_BUILD_silica-compiler"
+	@echo ""
+	@echo "Build flavor (TRIAL_BUILD, default 0; now: $(TRIAL_BUILD), flavor $(BUILD_FLAVOR))"
+	@echo "  TRIAL_BUILD=1 builds the compiler the trials use: it also accepts the trial-only builtins and"
+	@echo "  every output name starts with TRIAL_BUILD_ (installed, with INSTALL_SELFHOST=1, only as"
+	@echo "  binaries/TRIAL_BUILD_silica-compiler[-<TARGET>]). TRIAL_BUILD=0 builds the normal compiler."
 	@echo ""
 	@echo "Build targets"
 	@echo "  make / build              create silica.config if missing/stale, then seed → .o → $(EXECUTABLE)"

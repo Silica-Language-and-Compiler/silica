@@ -1362,7 +1362,12 @@ rt_handle_notice:
     .size   silica_rt_actor_supervision_wait_and_drain_one, . - silica_rt_actor_supervision_wait_and_drain_one
 
 // add_child(X0 parent, X1 child) -> 0: the child's exits go to the parent's ingress (the parent's
-// supervision block comes with the first notice, silica_rt_enqueue_ingress).
+// supervision block comes with the first notice, silica_rt_enqueue_ingress). Who may ask: the parent
+// itself, or main. What may be added: an actor with no supervisor yet (or this parent already), never
+// the parent itself and never the registry actor; anything else fails the caller with
+// :language_error. A supervised child is never moved to another parent (its supervisor's row would
+// keep naming it and its exit would go elsewhere). An ended actor on either side is :ok, nothing
+// changed. When the parent ends, the child's pointer to it is cleared (silica_rt_actor_exit_body).
     FUNC silica_rt_actor_add_child
     ENTRY_SAVE
     mov     r4, r0
@@ -1377,10 +1382,28 @@ rt_handle_notice:
     beq.w   9f
     cmp     r5, #0
     beq.w   9f
-    str     r0, [r5, #ACB_SUP]
+    mov     r6, r0                          // r6 = parent, r5 = child
+    cmp     r5, r6
+    beq.w   7f
+    mov     r0, r5
+    bl      silica_rt_is_registry_acb
+    cmp     r0, #0
+    bne.w   7f
+    bl      silica_rt_current_actor
+    cmp     r0, #0
+    beq.w   1f
+    cmp     r0, r6
+    bne.w   7f
+1:  ldr     r0, [r5, #ACB_SUP]
+    cmp     r0, r6
+    beq.w   9f
+    cmp     r0, #0
+    bne.w   7f
+    str     r6, [r5, #ACB_SUP]
 9:  movw    r0, #0
     movw    r1, #0
     ENTRY_RET_X0
+7:  bl      silica_rt_language_error_current   // never returns
     .size   silica_rt_actor_add_child, . - silica_rt_actor_add_child
 
 // =============================================================================================

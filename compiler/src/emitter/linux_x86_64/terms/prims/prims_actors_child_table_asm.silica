@@ -138,9 +138,18 @@ silica_rt_child_table_free:
 # The rows and the block outlive this actor while a linked child still holds a reference: the
 # child's last act is its row's exit_done store (sb_child_done), after its own teardown. This
 # actor's teardown drops its reference; the last one frees the rows and the block (sb_unref).
+# +216 is cleared under this actor's lock, where a call_supervisor body takes its reference
+# (silica_rt_sup_ref_call), so a reader either holds the block or finds none.
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_lock
 	mov	rax, QWORD PTR [rbp - 8]
-	mov	rdi, QWORD PTR [rax + 216]
+	mov	rcx, QWORD PTR [rax + 216]
+	mov	QWORD PTR [rbp - 16], rcx
 	mov	QWORD PTR [rax + 216], 0
+	lea	rdi, [rax + 16]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
 	call	silica_rt_sb_unref
 Lct_free_none:
 	leave
@@ -318,6 +327,32 @@ Lsbu_free_block:
 	call	free
 	leave
 Lsbu_ret:
+	ret
+# silica_rt_sup_release_if_mine(rdi = supervisor): releases its restart token when the running actor
+# (1 for main) holds it (a drain_hold that may have answered 0 took nothing).
+	.globl	silica_rt_sup_release_if_mine
+	.p2align	4
+silica_rt_sup_release_if_mine:
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 16
+	mov	QWORD PTR [rbp - 8], rdi
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jnz	Lsrim_have
+	mov	edi, 1
+Lsrim_have:
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rax, QWORD PTR [rax + 216]
+	test	rax, rax
+	jz	Lsrim_ret
+	cmp	QWORD PTR [rax + 120], rdi
+	jne	Lsrim_ret
+	mov	rdi, QWORD PTR [rbp - 8]
+	leave
+	jmp	silica_rt_sup_restart_release
+Lsrim_ret:
+	leave
 	ret
 	.globl	silica_rt_sb_child_done
 	.p2align	4
@@ -659,9 +694,51 @@ fn child_table_rt_asm_chunk_2(danger_idx: int64) -> string {
 	.p2align	2
 silica_rt_supervisor_start_child:
 # The builtin start_child(spec): the supervisor is the thread's current actor (the supervisor's own
-# init or behaviour). rsi = 0 asks the body to read it.
-	xor	esi, esi
-	jmp	silica_rt_supervisor_start_child_in
+# init or behaviour). The row is made while the supervisor holds its own restart token (taken
+# without draining: pending notices stay for its dispatch, signalled by the release), so a
+# call_supervisor operation of another actor cannot change the table meanwhile. The block the
+# token lives in is made first when the supervisor is alive and has none. When the token cannot
+# be taken (the supervisor is ending) the row is made as before, without it.
+# [rbp-8] spec, [rbp-16] supervisor (0: none), [rbp-24] 1 when the token is held, [rbp-32] answer.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 32
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	QWORD PTR [rbp - 24], 0
+	call	silica_rt_tls_current_actor_get
+	mov	QWORD PTR [rbp - 16], rdi
+	test	rdi, rdi
+	jz	Lscown_run
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rdi, QWORD PTR [rbp - 16]
+	cmp	DWORD PTR [rdi + 152], 0
+	je	Lscown_sb_done
+	call	silica_rt_sb_require
+Lscown_sb_done:
+	mov	rdi, QWORD PTR [rbp - 16]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	mov	rsi, rdi
+	mov	edx, 1
+	call	silica_rt_sup_restart_acquire
+	cmp	rdi, 1
+	jne	Lscown_run
+	mov	QWORD PTR [rbp - 24], 1
+Lscown_run:
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	call	silica_rt_supervisor_start_child_in
+	cmp	QWORD PTR [rbp - 24], 0
+	je	Lscown_ret
+	mov	QWORD PTR [rbp - 32], rdi
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_sup_restart_release
+	mov	rdi, QWORD PTR [rbp - 32]
+Lscown_ret:
+	leave
+	ret
 	.globl	silica_rt_supervisor_start_child_in
 	.p2align	2
 silica_rt_supervisor_start_child_in:
@@ -1037,9 +1114,27 @@ silica_rt_supervisor_add_child_acb:
 	mov	QWORD PTR [rbp - 24], rsi
 	call	silica_rt_tls_current_actor_get
 	mov	QWORD PTR [rbp - 32], rdi
-	mov	rsi, rdi
+# The new row is made while this actor holds the supervisor's restart token, after draining
+# (silica_rt_supervisor_drain_hold), so no restart, other add, start_child or row stop changes the
+# table meanwhile. The block the token lives in is made first, under the supervisor's lock, when
+# the supervisor is alive and has none. No token (the supervisor or this actor has ended): no child
+# is started, the answer is the no-child identity.
 	mov	rdi, QWORD PTR [rbp - 16]
-	call	silica_rt_supervisor_drain_ingress
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rdi, QWORD PTR [rbp - 16]
+	cmp	DWORD PTR [rdi + 152], 0
+	je	Ladd_child_sb_done
+	call	silica_rt_sb_require
+Ladd_child_sb_done:
+	mov	rdi, QWORD PTR [rbp - 16]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rsi, QWORD PTR [rbp - 32]
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_supervisor_drain_hold
+	test	rdi, rdi
+	jz	Ladd_child_no_token
 # §20.3.1: an id a live actor or supervisor already holds starts no child; the actor that asked for
 # the add fails with (:explicit, :duplicate_child_id). In main (no current actor) it is the
 # language-level failure of §15.4.5.5: the atom's name on standard error, exit status 1.
@@ -1053,9 +1148,19 @@ silica_rt_supervisor_add_child_acb:
 	mov	rdi, QWORD PTR [rbp - 24]
 	mov	rsi, QWORD PTR [rbp - 16]
 	call	silica_rt_supervisor_start_child_in
+	mov	QWORD PTR [rbp - 8], rdi
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_sup_restart_release
+	mov	rdi, QWORD PTR [rbp - 8]
+	leave
+	ret
+Ladd_child_no_token:
+	mov	rdi, -1
 	leave
 	ret
 Ladd_child_duplicate:
+	mov	rdi, QWORD PTR [rbp - 16]
+	call	silica_rt_sup_restart_release
 	mov	rdi, QWORD PTR [rbp - 32]
 	test	rdi, rdi
 	jz	Ladd_child_duplicate_main
@@ -1390,6 +1495,11 @@ Lmr_ofa_kill_at_idx:
 	mov	rsi, QWORD PTR [rbp - 88]
 	xor	ecx, ecx
 	call	silica_rt_row_wait
+# The stopped sibling's notice is dropped as in the :rest_for_one loop below: its row gets a new
+# child, so no later handler could match it, and a cascade over many siblings must not fill the ingress.
+	mov	rdi, QWORD PTR [rbp - 16]
+	mov	rsi, QWORD PTR [rbp - 72]
+	call	silica_rt_supervisor_drop_pending_exit
 Lmr_ofa_kill_next:
 	add	QWORD PTR [rbp - 56], 1
 	jmp	Lmr_ofa_kill_loop
@@ -1965,10 +2075,13 @@ silica_rt_supervisor_which_children_acb:
 	mov	rbp, rsp
 	sub	rsp, 96
 	mov	QWORD PTR [rbp - 8], rdi
+# The rows are counted and then filled in while this actor holds the restart token (drain_hold), so
+# no row is added between the two walks (the area is sized by the count); released at the end
+# (silica_rt_sup_release_if_mine).
 	call	silica_rt_tls_current_actor_get
 	mov	rsi, rdi
 	mov	rdi, QWORD PTR [rbp - 8]
-	call	silica_rt_supervisor_drain_ingress
+	call	silica_rt_supervisor_drain_hold
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	rax, QWORD PTR [rax + 216]
 	test	rax, rax
@@ -1992,6 +2105,10 @@ Lswhich_counted:
 	imul	rcx, rcx, 120
 	add	rcx, 15
 	and	rcx, -16
+# The area is as large as the supervisor has children: the caller's stack must hold it before rsp moves
+# (silica_rt_stack_room keeps every register; too large ends the calling actor).
+	mov	rax, rcx
+	call	silica_rt_stack_room
 	mov	r10, rsp
 	sub	rsp, rcx
 	mov	QWORD PTR [rbp - 96], r10
@@ -2070,6 +2187,8 @@ Lswhich_next:
 	mov	QWORD PTR [rbp - 16], rax
 	jmp	Lswhich_scan
 Lswhich_done:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_sup_release_if_mine
 	mov	rdi, QWORD PTR [rbp - 24]
 	mov	rax, QWORD PTR [rbp - 96]
 	and	rax, -16
@@ -2078,6 +2197,8 @@ Lswhich_done:
 	mov	rbp, QWORD PTR [rbp]
 	jmp	rax
 Lswhich_none:
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_sup_release_if_mine
 	xor	edi, edi
 	leave
 	ret

@@ -2259,6 +2259,37 @@ fn emit_sp_add_sub_imm(op: string, nbytes: int64) -> string {
     }
 }
 
+// Stack probes for the prologue's slot-area subtraction (size check: rsp must never leave the
+// stack it is on). The lowest page of an actor's reservation is never committed and a touch of it ends
+// the actor (prims_actors_stack_asm, ffi_fault_runtime_asm L_sfh_exhausted), so rsp stays inside the
+// reservation as long as two consecutive touches are never more than a page (4,096 bytes) apart. A
+// call pushes its return address and the prologue pushes rbp; the home area (SVR_AREA) is at most 392
+// bytes; L_dyn_alloc is called (a push) and moves rsp by at most 2,048 bytes without asking the runtime
+// (prims_memory). So a slot area of up to 1,024 bytes needs nothing, and a larger one stores a zero
+// every 2,048 bytes from its top down to rsp, in slots nothing has been written to yet. A slot area
+// above 65,536 bytes asks the runtime before rsp moves (silica_rt_stack_room: rax = the bytes, every
+// register kept).
+fn frame_spill_room_asm(nbytes: int64) -> string {
+    case nbytes > 65536 of {
+        false -> "";
+        true -> concat(concat("    mov rax, ", atom_table@int64_to_decimal_string(nbytes)), "\n    call silica_rt_stack_room\n")
+    }
+}
+
+fn frame_spill_probe_asm(nbytes: int64) -> string {
+    case nbytes > 1024 and nbytes <= 65536 of {
+        false -> "";
+        true -> frame_spill_probe_from(nbytes - 2048)
+    }
+}
+
+fn frame_spill_probe_from(off: int64) -> string {
+    case off <= 0 of {
+        true -> "    mov QWORD PTR [rsp], 0\n";
+        false -> concat(concat("    mov QWORD PTR [rsp + ", atom_table@int64_to_decimal_string(off)), concat("], 0\n", frame_spill_probe_from(off - 2048)))
+    }
+}
+
 // Float params the full shadow parks in D8-D15, so the D-pair frame predicates cover them as well
 // as the float let spills (the GPR pairs get the same bump through full_shadow_pressure_bump).
 fn fs_shadowed_float_param_count(fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> int64 {
@@ -2604,7 +2635,7 @@ fn emit_sir_function(fn_val: { name: string, return_type: string, effects: strin
         copy_markers: string <- concat(term_message_copy@md_fn_label_marker(entry_label), term_message_copy@fn_copy_markers(fn_val));
         param_outer_emit_fnret: string <- concat(concat(concat(concat(param_outer_emit_ffi, concat("|_fnret=", fn_val.return_type)), sret_outer_markers(fn_val)), reply_buffer_outer_markers(fn_val)), copy_markers);
         frame_spill_nbytes: int64 <- frame_spill_bytes(fn_val);
-        frame_spill_alloc: string <- emit_sp_add_sub_imm("SUB", frame_spill_nbytes);
+        frame_spill_alloc: string <- concat(frame_spill_room_asm(frame_spill_nbytes), concat(emit_sp_add_sub_imm("SUB", frame_spill_nbytes), frame_spill_probe_asm(frame_spill_nbytes)));
         shadow_prologue: string <- case string_shadow of {
             true -> case second_param_shadow of {
                 true -> concat(x86_isa@x86_mov("X19", "X0"), x86_isa@x86_mov("X20", "X1"));

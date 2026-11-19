@@ -109,6 +109,9 @@ silica_rt_idle_sweep_ns:
 	.globl	silica_rt_idle_stack_budget
 silica_rt_idle_stack_budget:
 	.zero	8
+// The growth lock (silica_rt_stack_grow_to): the owning thread's pointer (TPIDR_EL0), 0 when free.
+silica_rt_stack_grow_lock:
+	.zero	8
 	.data
 	.p2align	3
 	.globl	silica_rt_reservation_exceeded_atom
@@ -562,6 +565,13 @@ silica_rt_stack_grow_to:
 // X0 = ACB, X1 = faulting address inside the reservation. Commits chunks below the committed run
 // until the address is covered. X0 = 0 grown, 1 the lowered reservation is exhausted, 2 the host
 // refused the commit, 3 the address was already committed (not stack growth).
+// Two threads may grow one reservation at once: the actor's own fault handler and a replier placing a
+// reply under the parked caller's SP (prims_actors_state_asm silica_rt_reply_place). The read of #288,
+// the commit and the update run under silica_rt_stack_grow_lock, a leaf spin lock (nothing else is
+// taken under it; mprotect holds the kernel's per-process mapping lock anyway, so one process-wide lock
+// serialises nothing more). It holds the owning thread's pointer: a fault handler nested on the thread
+// that holds it (this routine's own frame faulting on the actor stack) runs unlocked, as before,
+// instead of waiting on itself. [sp, #56] = 1 when this call took the lock.
 	stp	x29, x30, [sp, #-64]!
 	mov	x29, sp
 	stp	x19, x20, [sp, #16]
@@ -570,6 +580,25 @@ silica_rt_stack_grow_to:
 	mov	x19, x0
 	mov	x20, x1
 	mov	x23, xzr
+	str	xzr, [sp, #56]
+	mrs	x9, tpidr_el0
+	adrp	x10, silica_rt_stack_grow_lock
+	add	x10, x10, :lo12:silica_rt_stack_grow_lock
+	ldr	x11, [x10]
+	cmp	x11, x9
+	b.eq	Lsgt_loop
+Lsgt_lock:
+	ldaxr	x11, [x10]
+	cbnz	x11, Lsgt_lock_wait
+	stxr	w12, x9, [x10]
+	cbnz	w12, Lsgt_lock
+	mov	x11, #1
+	str	x11, [sp, #56]
+	b	Lsgt_loop
+Lsgt_lock_wait:
+	clrex
+	yield
+	b	Lsgt_lock
 Lsgt_loop:
 	ldr	x8, [x19, #272]
 	ldr	x9, [x19, #280]
@@ -623,6 +652,12 @@ Lsgt_exhausted:
 Lsgt_commit_failed:
 	mov	x0, #2
 Lsgt_ret:
+	ldr	x11, [sp, #56]
+	cbz	x11, Lsgt_unlocked
+	adrp	x10, silica_rt_stack_grow_lock
+	add	x10, x10, :lo12:silica_rt_stack_grow_lock
+	stlr	xzr, [x10]
+Lsgt_unlocked:
 	ldr	x23, [sp, #48]
 	ldp	x21, x22, [sp, #32]
 	ldp	x19, x20, [sp, #16]
@@ -1316,6 +1351,115 @@ silica_rt_list_index_failed:
 Llif_main:
 	ldp	x29, x30, [sp], #16
 	b	silica_rt_abort_list_index
+	.globl	silica_rt_stack_room
+	.p2align	2
+silica_rt_stack_room:
+// X16 = bytes emitted code is about to take below SP in one step (L_dyn_alloc, L_adopt, the evacuation's
+// scratch, a prologue whose fixed part is too large to probe inline). Returns only when [SP - X16, SP) lies
+// in the stack the thread is running on; every register is kept (X30 is the caller's link, the flags change).
+// On an actor's reservation the request is compared with the room above the reservation's floor (the base,
+// the never-committed lowest page and 256 bytes for the saves the allocation makes below its new SP); the
+// fault handler commits any address above that floor, so nothing is touched here. Too large: the actor ends
+// as it does when a touch reaches the lowest page (L_sfh_exhausted): (:explicit, :reservation_exceeded) under
+// a lowered reservation, (:explicit, :out_of_memory) under the default one. Nothing was allocated.
+// On any other stack (main, a thread's own stack) the bounds are the platform's: one byte is read every
+// 4,096 from SP down to SP - X16, so the stack's guard is reached before anything below it.
+	sub	sp, sp, #560
+	stp	x0, x1, [sp, #0]
+	stp	x2, x3, [sp, #16]
+	stp	x4, x5, [sp, #32]
+	stp	x6, x7, [sp, #48]
+	stp	x8, x9, [sp, #64]
+	stp	x10, x11, [sp, #80]
+	stp	x12, x13, [sp, #96]
+	stp	x14, x15, [sp, #112]
+	stp	x16, x17, [sp, #128]
+	stp	x29, x30, [sp, #144]
+	str	x18, [sp, #544]
+	add	x29, sp, #144
+	stp	q0, q1, [sp, #160]
+	stp	q2, q3, [sp, #192]
+	stp	q4, q5, [sp, #224]
+	stp	q6, q7, [sp, #256]
+	stp	q16, q17, [sp, #288]
+	stp	q18, q19, [sp, #320]
+	stp	q20, q21, [sp, #352]
+	stp	q22, q23, [sp, #384]
+	stp	q24, q25, [sp, #416]
+	stp	q26, q27, [sp, #448]
+	stp	q28, q29, [sp, #480]
+	stp	q30, q31, [sp, #512]
+	bl	silica_rt_tls_current_actor_get
+	ldr	x16, [sp, #128]
+	add	x9, sp, #560
+	cbz	x0, Lsrm_probe
+	ldr	x10, [x0, #272]
+	cbz	x10, Lsrm_probe
+	cmp	x9, x10
+	b.lo	Lsrm_probe
+	ldr	x11, [x0, #280]
+	add	x11, x10, x11
+	cmp	x9, x11
+	b.hs	Lsrm_probe
+	adrp	x12, silica_rt_stack_page
+	add	x12, x12, :lo12:silica_rt_stack_page
+	ldr	x12, [x12]
+	add	x10, x10, x12
+	add	x10, x10, #256
+	subs	x9, x9, x10
+	b.ls	Lsrm_fail
+	cmp	x16, x9
+	b.hi	Lsrm_fail
+Lsrm_ok:
+	ldp	q0, q1, [sp, #160]
+	ldp	q2, q3, [sp, #192]
+	ldp	q4, q5, [sp, #224]
+	ldp	q6, q7, [sp, #256]
+	ldp	q16, q17, [sp, #288]
+	ldp	q18, q19, [sp, #320]
+	ldp	q20, q21, [sp, #352]
+	ldp	q22, q23, [sp, #384]
+	ldp	q24, q25, [sp, #416]
+	ldp	q26, q27, [sp, #448]
+	ldp	q28, q29, [sp, #480]
+	ldp	q30, q31, [sp, #512]
+	ldp	x0, x1, [sp, #0]
+	ldp	x2, x3, [sp, #16]
+	ldp	x4, x5, [sp, #32]
+	ldp	x6, x7, [sp, #48]
+	ldp	x8, x9, [sp, #64]
+	ldp	x10, x11, [sp, #80]
+	ldp	x12, x13, [sp, #96]
+	ldp	x14, x15, [sp, #112]
+	ldp	x16, x17, [sp, #128]
+	ldr	x18, [sp, #544]
+	ldp	x29, x30, [sp, #144]
+	add	sp, sp, #560
+	ret
+Lsrm_probe:
+// x9 = the caller's SP, x16 = the bytes. A request larger than SP itself has no low end: it probes to 0.
+	subs	x10, x9, x16
+	csel	x10, xzr, x10, lo
+Lsrm_probe_loop:
+	sub	x9, x9, #4096
+	cmp	x9, x10
+	b.ls	Lsrm_probe_last
+	ldrb	w11, [x9]
+	b	Lsrm_probe_loop
+Lsrm_probe_last:
+	ldrb	w11, [x10]
+	b	Lsrm_ok
+Lsrm_fail:
+	ldr	x9, [x0, #376]
+	adrp	x8, silica_rt_out_of_memory_atom
+	add	x8, x8, :lo12:silica_rt_out_of_memory_atom
+	cbz	x9, Lsrm_fail_reason
+	adrp	x8, silica_rt_reservation_exceeded_atom
+	add	x8, x8, :lo12:silica_rt_reservation_exceeded_atom
+Lsrm_fail_reason:
+	ldr	x1, [x8]
+	bl	silica_rt_actor_fail_current
+	b	silica_rt_abort_region_overflow
 ")
 }
 

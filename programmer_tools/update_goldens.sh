@@ -60,14 +60,16 @@
 #     a file is reported loudly and skipped, never copied.
 #
 # WHERE THE .sams COME FROM
-#   This script never compiles and never builds a compiler. "Current .sams" means the files the
+#   This script never compiles and never builds a compiler (the trials are compiled by the trial
+#   compilers, binaries/TRIAL_BUILD_silica-compiler[-<target>], so the .sams it reads come from them).
+#   "Current .sams" means the files the
 #   last trial run left in the tree:
 #     native platform   trials/<suite>/**/<stem>.sams  (a suite's `integrate` cleans first and
 #                       leaves its .sams behind; a tree-wide `make clean` removes them)
 #     other hosted      the same files on that machine, pulled here with rsync over key-based ssh
 #                       into a staging directory, then compared against the local golden
 #     raw target        trials/.target/<target>/<suite>/src/**/<stem>.sams, the board run's work
-#                       area, produced here by binaries/silica-compiler-<target>
+#                       area, produced here by binaries/TRIAL_BUILD_silica-compiler-<target>
 #   If a suite has no .sams, run its trials first (`make -C trials/<suite> integrate`).
 #
 # WHICH PLATFORMS, AND WHERE THEIR MACHINES ARE

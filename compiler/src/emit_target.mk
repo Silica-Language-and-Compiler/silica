@@ -52,7 +52,9 @@ export TARGET
 # intermediate output of a build for TARGET lives there (see the header of Makefile). It is outside
 # src/ on purpose, so no scan of the source tree ever sees a build product.
 BUILD_ROOT := $(abspath $(THIS_DIR)../build)
-BUILD_DIR := $(BUILD_ROOT)/$(TARGET)/
+# A trial build (TRIAL_BUILD=1, see Makefile) sets TRIAL_BUILD_PREFIX to TRIAL_BUILD_ and builds in
+# compiler/build/TRIAL_BUILD_<TARGET>/, so its units never mix with a normal build's.
+BUILD_DIR := $(BUILD_ROOT)/$(TRIAL_BUILD_PREFIX)$(TARGET)/
 TARGET_FILE := $(BUILD_DIR)silica.target
 
 # user: given on the command line or in the environment; prompt: picked from the menu;

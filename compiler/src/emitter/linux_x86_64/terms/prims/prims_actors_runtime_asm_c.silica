@@ -69,6 +69,8 @@ fn actor_rt_asm_phase_c_chunk(table: { is_empty: boolean, index_map: { root: ref
     explicit_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":explicit"));
     unknown_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":unknown"));
     foreign_fault_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":foreign_fault"));
+    // (:explicit, :ingress_full): the reason a supervisor ends with when its ingress is full (Lsee_full).
+    ingress_full_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":ingress_full"));
     p0: string <- concat("	.text
 	.globl	silica_rt_actor_deliver_exit
 	.p2align	2
@@ -159,7 +161,7 @@ silica_rt_sup_enqueue_exit:
 	call	silica_rt_sb_require
 	mov	r11d, DWORD PTR [rdi + 16]
 	cmp	r11d, 1024
-	jae	Lsee_abort
+	jae	Lsee_full
 	mov	edi, 1
 	mov	esi, 152
 	call	calloc
@@ -190,6 +192,27 @@ Lsee_dead:
 	mov	rdi, QWORD PTR [rbp - 16]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 24]
+	call	silica_rt_exit_payload_free
+	mov	edi, 1
+	leave
+	ret
+# The ingress holds its limit of notices. A supervisor with a supervisor of its own ends with
+# (:explicit, :ingress_full) through the ordinary stop (silica_rt_actor_stop): its exit path shuts
+# its children down, frees the notices still queued with its block (silica_rt_sb_unref) and
+# delivers its exit to its own supervisor, which decides. Its alive flag is now 0, so this notice
+# and every later one are dropped as for an ended supervisor (Lsee_dead). A root supervisor (no
+# supervisor of its own) takes the whole program down (Lsee_abort, status 71).
+Lsee_full:
+	mov	r10, QWORD PTR [rbp - 16]
+	cmp	QWORD PTR [r10 + 192], 0
+	je	Lsee_abort
+	lea	rdi, [r10 + 16]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 16]
+	mov	esi, 4
+	mov	rdx, QWORD PTR [rip + silica_rt_ingress_full_atom]
+	call	silica_rt_actor_stop
 	mov	rdi, QWORD PTR [rbp - 24]
 	call	silica_rt_exit_payload_free
 	mov	edi, 1
@@ -357,9 +380,16 @@ silica_rt_actor_failure_release:
 Lfrr_zero:
 	mov	rdi, ");
     p12: string <- concat(p11, ok_idx);
-    concat(p12, "
+    p13: string <- concat(p12, "
 	ret
                                         # -- End function
+	.data
+	.p2align	3
+	.globl	silica_rt_ingress_full_atom
+silica_rt_ingress_full_atom:
+	.quad	");
+    concat(concat(p13, ingress_full_idx), "
+	.text
 
 ")
 }
@@ -1096,10 +1126,11 @@ silica_rt_sup_op_child:
 Lsoc_own:
 	ret
 # PID registry primitive actor (spec §20.3.1).
-# State layout: one calloc block of silica_registry_slots * 16 B: occ[slots] (int64, 1 = held) at +0,
-# actor_ref words[slots] at +slots*8. The same block is read directly by the keyed forms and by
-# silica_rt_register_actor_named (the store writes the ref before the occ word; a removal clears the
-# occ word first).
+# State layout: one calloc block of silica_registry_slots * 16 B; the first slots words are the
+# slots: the holder's identity + 1, 0 when the name is free (an identity can be 0, so 0 is never a
+# held slot); the second half is unused. Every write is a compare-and-swap on that one word
+# (silica_rt_register_*_named, :insert, :delete, silica_rt_registry_table_forget) and every read is
+# one load, so no reader sees a slot half written. The same block is read directly by the keyed forms.
 # Message record layout follows record emission: shape word@0, op@8, name@16, pid@24.
 # Behavior return layout follows actor runtime convention: tag@0, reply@8, next_state@16.
 # :insert replies :ok (stored, or the actor already holds this very name), :name_taken (a live actor
@@ -1177,11 +1208,13 @@ L_pidreg_insert:
 	mov	r9, QWORD PTR [rip + silica_registry_slots]
 	cmp	QWORD PTR [rbp - 56], 0
 	je	L_pidreg_actor_not_found
+# [rbp - 24] (the op, no longer needed) keeps the slot word the store is conditional on.
+L_pidreg_insert_load:
 	mov	rax, QWORD PTR [rsi + r11*8]
-	cmp	rax, 1
-	jne	L_pidreg_insert_free
-	lea	r8, [rsi + r9*8]
-	mov	rax, QWORD PTR [r8 + r11*8]
+	mov	QWORD PTR [rbp - 24], rax
+	test	rax, rax
+	jz	L_pidreg_insert_free
+	dec	rax
 	cmp	rax, rcx
 	je	L_pidreg_insert_ok
 	mov	rdi, rax
@@ -1207,9 +1240,10 @@ L_pidreg_insert_free:
 	mov	r9, QWORD PTR [rip + silica_registry_slots]
 	test	rax, rax
 	jnz	L_pidreg_already_registered
-	lea	r8, [rsi + r9*8]
-	mov	QWORD PTR [r8 + r11*8], rcx
-	mov	QWORD PTR [rsi + r11*8], 1
+	lea	r8, [rcx + 1]
+	mov	rax, QWORD PTR [rbp - 24]
+	lock cmpxchg	QWORD PTR [rsi + r11*8], r8
+	jne	L_pidreg_insert_load
 L_pidreg_insert_ok:
 	mov	rax, ");
     p9: string <- concat(p8, ok_idx);
@@ -1243,15 +1277,14 @@ L_pidreg_lookup:
 	jl	L_pidreg_not_found
 	cmp	r11, r9
 	jge	L_pidreg_not_found
-	mov	rax, QWORD PTR [rsi + r11*8]
-	cmp	rax, 1
-	jne	L_pidreg_not_found
+	mov	r9, QWORD PTR [rsi + r11*8]
+	test	r9, r9
+	jz	L_pidreg_not_found
+	dec	r9
 	mov	rax, ");
     p11: string <- concat(p10g, found_idx);
     p12: string <- concat(p11, "
 	mov	QWORD PTR [rdi], rax
-	lea	r8, [rsi + r9*8]
-	mov	r9, QWORD PTR [r8 + r11*8]
 	mov	QWORD PTR [rdi + 8], r9
 	jmp	L_pidreg_done
 L_pidreg_not_found:
@@ -1262,16 +1295,61 @@ L_pidreg_not_found:
 	mov	QWORD PTR [rdi + 8], 0
 	jmp	L_pidreg_done
 L_pidreg_delete:
+# A name is removed by its holder, by main, or once its holder has ended; any other asker is answered
+# :name_taken and the slot is kept. The asker is the caller of the call being served (wrapper +56; 0 is
+# main); a cast carries no asker, so it removes only an ended holder's name. [rbp - 24] = the slot word.
 	cmp	r11, 0
 	jl	L_pidreg_delete_ok
 	cmp	r11, r9
 	jge	L_pidreg_delete_ok
-	mov	QWORD PTR [rsi + r11*8], 0
-	lea	r8, [rsi + r9*8]
-	mov	QWORD PTR [r8 + r11*8], 0
-L_pidreg_delete_ok:
+L_pidreg_delete_load:
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	r11, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rsi + r11*8]
+	mov	QWORD PTR [rbp - 24], rax
+	test	rax, rax
+	jz	L_pidreg_delete_ok
+	call	silica_rt_tls_current_actor_get
+	mov	rax, QWORD PTR [rdi + 240]
+	test	rax, rax
+	jz	L_pidreg_delete_holder
+	mov	rax, QWORD PTR [rax + 56]
+	test	rax, rax
+	jz	L_pidreg_delete_clear
+	mov	rax, QWORD PTR [rax + 408]
+	inc	rax
+	cmp	rax, QWORD PTR [rbp - 24]
+	je	L_pidreg_delete_clear
+L_pidreg_delete_holder:
+	mov	rdi, QWORD PTR [rbp - 24]
+	dec	rdi
+	call	silica_rt_ref_alive
+	test	rdi, rdi
+	jnz	L_pidreg_delete_refused
+L_pidreg_delete_clear:
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	r11, QWORD PTR [rbp - 32]
+	mov	rax, QWORD PTR [rbp - 24]
+	xor	r8d, r8d
+	lock cmpxchg	QWORD PTR [rsi + r11*8], r8
+	jne	L_pidreg_delete_load
+	jmp	L_pidreg_delete_ok
+L_pidreg_delete_refused:
+	mov	rdi, QWORD PTR [rbp - 48]
+	mov	rdi, QWORD PTR [rdi + 8]
+	mov	rcx, QWORD PTR [rbp - 40]
 	mov	rax, ");
-    p15: string <- concat(p14, ok_idx);
+    p14b: string <- concat(p14, name_taken_idx);
+    p14c: string <- concat(p14b, "
+	mov	QWORD PTR [rdi], rax
+	mov	QWORD PTR [rdi + 8], rcx
+	jmp	L_pidreg_done
+L_pidreg_delete_ok:
+	mov	rdi, QWORD PTR [rbp - 48]
+	mov	rdi, QWORD PTR [rdi + 8]
+	mov	rcx, QWORD PTR [rbp - 40]
+	mov	rax, ");
+    p15: string <- concat(p14c, ok_idx);
     concat(p15, "
 	mov	QWORD PTR [rdi], rax
 	mov	QWORD PTR [rdi + 8], rcx
@@ -1289,16 +1367,13 @@ L_pidreg_ret_null:
 	.p2align	2
 silica_rt_registry_table_holds:
 	mov	r9, QWORD PTR [rip + silica_registry_slots]
-	lea	r10, [rdi + r9*8]
+	lea	r10, [rsi + 1]
 	xor	r11d, r11d
 Lrth_loop:
 	cmp	r11, r9
 	jge	Lrth_no
-	cmp	QWORD PTR [rdi + r11*8], 1
-	jne	Lrth_next
-	cmp	QWORD PTR [r10 + r11*8], rsi
+	cmp	QWORD PTR [rdi + r11*8], r10
 	je	Lrth_yes
-Lrth_next:
 	inc	r11
 	jmp	Lrth_loop
 Lrth_yes:
@@ -1308,22 +1383,20 @@ Lrth_no:
 	xor	eax, eax
 	ret
 # silica_rt_registry_table_forget(rdi = registry state block, rsi = actor_ref): clears every slot the
-# actor holds in that table, occ word first so a reader never sees a held slot with a stale ref.
+# actor holds in that table. Each clear is a compare-and-swap from this actor's word to 0, so a slot
+# another actor has taken meanwhile is left alone.
 	.globl	silica_rt_registry_table_forget
 	.p2align	2
 silica_rt_registry_table_forget:
 	mov	r9, QWORD PTR [rip + silica_registry_slots]
-	lea	r10, [rdi + r9*8]
+	lea	r10, [rsi + 1]
 	xor	r11d, r11d
+	xor	r8d, r8d
 Lrtf_loop:
 	cmp	r11, r9
 	jge	Lrtf_done
-	cmp	QWORD PTR [rdi + r11*8], 1
-	jne	Lrtf_next
-	cmp	QWORD PTR [r10 + r11*8], rsi
-	jne	Lrtf_next
-	mov	QWORD PTR [rdi + r11*8], 0
-	mov	QWORD PTR [r10 + r11*8], 0
+	mov	rax, r10
+	lock cmpxchg	QWORD PTR [rdi + r11*8], r8
 Lrtf_next:
 	inc	r11
 	jmp	Lrtf_loop
@@ -1341,6 +1414,7 @@ silica_rt_registry_forget_actor:
 	push	rbx
 	sub	rsp, 8
 	mov	rbx, rdi
+	call	silica_rt_sup_token_drop
 	mov	rax, QWORD PTR [rip + silica_pid_registry_ref]
 	test	rax, rax
 	jz	Lrfa_dangerous
@@ -1388,10 +1462,10 @@ silica_rt_registry_held_in:
 	mov	r10, QWORD PTR [rip + silica_registry_slots]
 	cmp	rsi, r10
 	jge	Lrhi_no
-	cmp	QWORD PTR [r9 + rsi*8], 1
-	jne	Lrhi_no
-	lea	r11, [r9 + r10*8]
-	mov	rdi, QWORD PTR [r11 + rsi*8]
+	mov	rdi, QWORD PTR [r9 + rsi*8]
+	test	rdi, rdi
+	jz	Lrhi_no
+	dec	rdi
 	push	rbp
 	mov	rbp, rsp
 	call	silica_rt_ref_alive
@@ -1512,8 +1586,9 @@ silica_rt_pid_registry_init_spawn:
 	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], rax
 	call	silica_rt_actor_spawn
 	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], 0
-# The registries never end, so their ACBs are kept (not held) for the runtime's own use.
-	call	silica_rt_ref_peek
+# The registries never end (remove_actor and kill_abnormal refuse them, silica_rt_is_registry_acb),
+# and the runtime keeps a hold on each for good, so their ACBs are never freed.
+	call	silica_rt_ref_hold
 	leave
 	ret
 # silica_pid_registry_init: called once at program start from emitter-injected main prologue.
@@ -1550,8 +1625,9 @@ silica_rt_dangerous_pid_registry_init_spawn:
 	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], rax
 	call	silica_rt_actor_spawn
 	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], 0
-# The registries never end, so their ACBs are kept (not held) for the runtime's own use.
-	call	silica_rt_ref_peek
+# The registries never end (remove_actor and kill_abnormal refuse them, silica_rt_is_registry_acb),
+# and the runtime keeps a hold on each for good, so their ACBs are never freed.
+	call	silica_rt_ref_hold
 	leave
 	ret
 # silica_dangerous_pid_registry_init: called once at program start from emitter-injected main prologue.
@@ -1587,8 +1663,9 @@ silica_rt_device_pid_registry_init_spawn:
 	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], rax
 	call	silica_rt_actor_spawn
 	mov	QWORD PTR [rip + silica_rt_spawn_rec_override], 0
-# The registries never end, so their ACBs are kept (not held) for the runtime's own use.
-	call	silica_rt_ref_peek
+# The registries never end (remove_actor and kill_abnormal refuse them, silica_rt_is_registry_acb),
+# and the runtime keeps a hold on each for good, so their ACBs are never freed.
+	call	silica_rt_ref_hold
 	leave
 	ret
 # silica_device_pid_registry_init: called once at program start from emitter-injected main prologue.
@@ -2126,6 +2203,24 @@ silica_rt_acb_hold:
 	jz	Lacbh_ret
 	lock add	QWORD PTR [rdi + 392], 1
 Lacbh_ret:
+	ret
+# silica_rt_is_registry_acb(rdi = ACB) -> rax = 1 when it is one of the three runtime registries'
+# control blocks (they never end: remove_actor and kill_abnormal refuse them), else 0. Leaf; rdi kept.
+	.globl	silica_rt_is_registry_acb
+	.p2align	2
+silica_rt_is_registry_acb:
+	xor	eax, eax
+	test	rdi, rdi
+	jz	Lira_ret
+	cmp	rdi, QWORD PTR [rip + silica_pid_registry_ref]
+	je	Lira_yes
+	cmp	rdi, QWORD PTR [rip + silica_dangerous_pid_registry_ref]
+	je	Lira_yes
+	cmp	rdi, QWORD PTR [rip + silica_device_pid_registry_ref]
+	jne	Lira_ret
+Lira_yes:
+	mov	eax, 1
+Lira_ret:
 	ret
 	.globl	silica_rt_acb_release
 	.p2align	4
@@ -2713,7 +2808,7 @@ silica_rt_ref_call:
 silica_rt_sup_ref_call:
 	push	rbp
 	mov	rbp, rsp
-	sub	rsp, 48
+	sub	rsp, 64
 	mov	QWORD PTR [rbp - 8], rsi
 	mov	QWORD PTR [rbp - 16], rdx
 	mov	QWORD PTR [rbp - 24], rcx
@@ -2724,11 +2819,28 @@ silica_rt_sup_ref_call:
 	jz	Lsrc_not_found
 	cmp	DWORD PTR [rdi + 152], 0
 	je	Lsrc_dead
+# The supervision block, and with it every row the body walks or writes, is held (+112) for the
+# body: taken under the supervisor's lock, where silica_rt_child_table_free clears +216, so a
+# supervisor that ends meanwhile frees its rows only when the body is done ([rbp - 56] = the block
+# or 0).
+	add	rdi, 16
+	call	silica_rt_lock_lock
+	mov	rdi, QWORD PTR [rbp - 40]
+	mov	rax, QWORD PTR [rdi + 216]
+	mov	QWORD PTR [rbp - 56], rax
+	test	rax, rax
+	jz	Lsrc_sb_held
+	lock add	QWORD PTR [rax + 112], 1
+Lsrc_sb_held:
+	add	rdi, 16
+	call	silica_rt_lock_unlock
 	mov	rsi, QWORD PTR [rbp - 8]
 	mov	rdx, QWORD PTR [rbp - 16]
 	mov	rcx, QWORD PTR [rbp - 24]
 	call	QWORD PTR [rbp - 32]
 	mov	QWORD PTR [rbp - 48], rdi
+	mov	rdi, QWORD PTR [rbp - 56]
+	call	silica_rt_sb_unref
 	mov	rdi, QWORD PTR [rbp - 40]
 	call	silica_rt_acb_release
 	mov	rdi, QWORD PTR [rbp - 48]
@@ -2736,7 +2848,7 @@ silica_rt_sup_ref_call:
 # get_child_info) returns with rsp lowered onto it; the lowered rsp is passed on to the emitted call
 # site, which adopts it (prims_actors@runtime_call_asm). A body that kept rsp gets this frame popped as
 # before. The release above ran below the answer and did not touch it.
-	lea	rax, [rbp - 48]
+	lea	rax, [rbp - 64]
 	cmp	rsp, rax
 	jne	Lsrc_adopt
 	leave

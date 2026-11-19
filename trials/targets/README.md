@@ -4,11 +4,11 @@
 
 | Target | Compiler | Where the programs run |
 | ------ | -------- | ---------------------- |
-| `host` | `binaries/silica-compiler` | this machine (the Mac: key `macos_applesilicon`; a Linux machine: its own `linux_*` key) |
-| `linux_aarch64` | the compiler built on that machine (`~/silica/binaries/silica-compiler` there) | the Raspberry Pi ("pix"), reached over ssh: remote hosted |
+| `host` | `binaries/TRIAL_BUILD_silica-compiler` | this machine (the Mac: key `macos_applesilicon`; a Linux machine: its own `linux_*` key) |
+| `linux_aarch64` | the compiler built on that machine (`~/silica/binaries/TRIAL_BUILD_silica-compiler` there) | the Raspberry Pi ("pix"), reached over ssh: remote hosted |
 | `linux_x86_64` | the compiler built on that machine | the x86-64 Linux machine ("nix"), reached over ssh: remote hosted |
-| `ESP32-S3_raw` | `binaries/silica-compiler-ESP32-S3_raw` | an ESP32-S3 board on USB, bare metal |
-| `STM32-L476RG_raw` | `binaries/silica-compiler-STM32-L476RG_raw` | an ST NUCLEO-L476RG over its ST-LINK, bare metal (see below) |
+| `ESP32-S3_raw` | `binaries/TRIAL_BUILD_silica-compiler-ESP32-S3_raw` | an ESP32-S3 board on USB, bare metal |
+| `STM32-L476RG_raw` | `binaries/TRIAL_BUILD_silica-compiler-STM32-L476RG_raw` | an ST NUCLEO-L476RG over its ST-LINK, bare metal (see below) |
 
 A board target is defined by `<target>.conf` in this directory. The software each target needs is
 listed in [docs/required-software.md](../../docs/required-software.md). A remote hosted target is a
@@ -34,11 +34,11 @@ An interactive `make integrate` (in `trials/` or in a suite) asks first:
 
 ```
 Select the trial target (make integrate):
-  1) host   this Mac (Apple Silicon), binaries/silica-compiler  [default]
-  2) linux_aarch64   Linux AArch64 (pix), remote hosted: sync, then its own binaries/silica-compiler
-  3) linux_x86_64   Linux x86-64 (nix), remote hosted: sync, then its own binaries/silica-compiler
-  4) ESP32-S3_raw   ESP32-S3 board over USB (bare metal), binaries/silica-compiler-ESP32-S3_raw
-  5) STM32-L476RG_raw   ST NUCLEO-L476RG over ST-LINK (bare metal), binaries/silica-compiler-STM32-L476RG_raw
+  1) host   this Mac (Apple Silicon), binaries/TRIAL_BUILD_silica-compiler  [default]
+  2) linux_aarch64   Linux AArch64 (pix), remote hosted: sync, then its own binaries/TRIAL_BUILD_silica-compiler
+  3) linux_x86_64   Linux x86-64 (nix), remote hosted: sync, then its own binaries/TRIAL_BUILD_silica-compiler
+  4) ESP32-S3_raw   ESP32-S3 board over USB (bare metal), binaries/TRIAL_BUILD_silica-compiler-ESP32-S3_raw
+  5) STM32-L476RG_raw   ST NUCLEO-L476RG over ST-LINK (bare metal), binaries/TRIAL_BUILD_silica-compiler-STM32-L476RG_raw
   6) all   every target above, at the same time (the host run, the remote runs and the boards)
 Number(s) or name(s) [host]:
 ```
@@ -225,7 +225,7 @@ or a new directory under `$TMPDIR`) and works for both board targets. It refuses
 | `BOARD_MAC` | (none) | refuse any board with another MAC (ESP32; the STM32 driver ignores it) |
 | `BOARD_ST_SERIAL` | the lab Nucleo's | STM32 target: the ST-LINK serial `--probe` must find |
 | `BOARD_ASCOMP` | (on) | `off`: skip the `<trial>.<platform>.ascomp` check |
-| `BOARD_SILICA_COMPILER` | `binaries/silica-compiler-<target>` | the board compiler |
+| `BOARD_SILICA_COMPILER` | `binaries/TRIAL_BUILD_silica-compiler-<target>` | the board compiler |
 | `BOARD_PYTHON` | from `<target>.conf` | Python with esptool and pyserial (pyserial only for the STM32) |
 | `TRIAL_REMOTE_SYNC` | 1 | `0`: a remote run skips the sync step |
 | `SILICA_REMOTE_DRY_RUN` | (off) | `1`: a remote run checks ssh, dry-runs the sync, prints the remote command |

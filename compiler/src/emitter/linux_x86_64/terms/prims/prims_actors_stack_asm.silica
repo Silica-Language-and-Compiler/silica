@@ -113,6 +113,9 @@ silica_rt_idle_sweep_ns:
 	.globl	silica_rt_idle_stack_budget
 silica_rt_idle_stack_budget:
 	.zero	8
+# The growth lock (silica_rt_stack_grow_to): the owning thread's pointer (fs:0), 0 when free.
+silica_rt_stack_grow_lock:
+	.zero	8
 	.data
 	.p2align	3
 	.globl	silica_rt_reservation_exceeded_atom
@@ -589,14 +592,34 @@ silica_rt_stack_grow_to:
 # X0 = ACB, X1 = faulting address inside the reservation. Commits chunks below the committed run
 # until the address is covered. X0 = 0 grown, 1 the lowered reservation is exhausted, 2 the host
 # refused the commit, 3 the address was already committed (not stack growth).
+# Two threads may grow one reservation at once: the actor's own fault handler and a replier placing a
+# reply under the parked caller's SP (prims_actors_state_asm silica_rt_reply_place). The read of #288,
+# the commit and the update run under silica_rt_stack_grow_lock, a leaf spin lock (nothing else is
+# taken under it; mprotect holds the kernel's per-process mapping lock anyway, so one process-wide lock
+# serialises nothing more). It holds the owning thread's pointer: a fault handler nested on the thread
+# that holds it (this routine's own frame faulting on the actor stack) runs unlocked, as before,
+# instead of waiting on itself.
 # Frame: [rbp - 8] ACB (x19), [rbp - 16] address (x20), [rbp - 24] run low address (x21),
-# [rbp - 32] chunk (x22), [rbp - 40] 1 = grew (x23).
+# [rbp - 32] chunk (x22), [rbp - 40] 1 = grew (x23), [rbp - 48] 1 = this call took the lock.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rbp - 16], rsi
 	mov	QWORD PTR [rbp - 40], 0
+	mov	QWORD PTR [rbp - 48], 0
+	mov	rcx, QWORD PTR fs:0
+	lea	rdx, [rip + silica_rt_stack_grow_lock]
+	cmp	QWORD PTR [rdx], rcx
+	je	Lsgt_loop
+Lsgt_lock:
+	xor	eax, eax
+	lock cmpxchg	QWORD PTR [rdx], rcx
+	je	Lsgt_locked
+	pause
+	jmp	Lsgt_lock
+Lsgt_locked:
+	mov	QWORD PTR [rbp - 48], 1
 Lsgt_loop:
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	r8, QWORD PTR [rax + 272]
@@ -657,6 +680,11 @@ Lsgt_exhausted:
 Lsgt_commit_failed:
 	mov	edi, 2
 Lsgt_ret:
+	cmp	QWORD PTR [rbp - 48], 0
+	je	Lsgt_unlocked
+	lea	rdx, [rip + silica_rt_stack_grow_lock]
+	mov	QWORD PTR [rdx], 0
+Lsgt_unlocked:
 	leave
 	ret
 	.globl	silica_rt_stack_measure
@@ -1404,6 +1432,130 @@ silica_rt_list_index_failed:
 Llif_main:
 	pop	rbp
 	jmp	silica_rt_abort_list_index
+	.globl	silica_rt_stack_room
+	.p2align	4
+silica_rt_stack_room:
+# rax = bytes emitted code is about to take below rsp in one step (L_dyn_alloc, L_adopt, the evacuation's
+# scratch, a prologue whose fixed part is too large to probe inline). Returns only when [rsp - rax, rsp)
+# lies in the stack the thread is running on; every register is kept (the flags change). rsp may have any
+# alignment at the call. On an actor's reservation the request is compared with the room above the
+# reservation's floor (the base, the never-committed lowest page and 256 bytes); the fault handler commits
+# any address above that floor, so nothing is touched here. Too large: the actor ends as it does when a
+# touch reaches the lowest page (L_sfh_exhausted): (:explicit, :reservation_exceeded) under a lowered
+# reservation, (:explicit, :out_of_memory) under the default one. Nothing was allocated.
+# On any other stack (main, a thread's own stack) the bounds are the platform's: one byte is read every
+# 4,096 from rsp down to rsp - rax, so the stack's guard is reached before anything below it.
+	push	rbp
+	mov	rbp, rsp
+	sub	rsp, 384
+	and	rsp, -16
+	mov	QWORD PTR [rbp - 8], rax
+	mov	QWORD PTR [rbp - 16], rcx
+	mov	QWORD PTR [rbp - 24], rdx
+	mov	QWORD PTR [rbp - 32], rbx
+	mov	QWORD PTR [rbp - 40], rsi
+	mov	QWORD PTR [rbp - 48], rdi
+	mov	QWORD PTR [rbp - 56], r8
+	mov	QWORD PTR [rbp - 64], r9
+	mov	QWORD PTR [rbp - 72], r10
+	mov	QWORD PTR [rbp - 80], r11
+	mov	QWORD PTR [rbp - 88], r12
+	mov	QWORD PTR [rbp - 96], r13
+	mov	QWORD PTR [rbp - 104], r14
+	mov	QWORD PTR [rbp - 112], r15
+	movdqu	XMMWORD PTR [rsp + 0], xmm0
+	movdqu	XMMWORD PTR [rsp + 16], xmm1
+	movdqu	XMMWORD PTR [rsp + 32], xmm2
+	movdqu	XMMWORD PTR [rsp + 48], xmm3
+	movdqu	XMMWORD PTR [rsp + 64], xmm4
+	movdqu	XMMWORD PTR [rsp + 80], xmm5
+	movdqu	XMMWORD PTR [rsp + 96], xmm6
+	movdqu	XMMWORD PTR [rsp + 112], xmm7
+	movdqu	XMMWORD PTR [rsp + 128], xmm8
+	movdqu	XMMWORD PTR [rsp + 144], xmm9
+	movdqu	XMMWORD PTR [rsp + 160], xmm10
+	movdqu	XMMWORD PTR [rsp + 176], xmm11
+	movdqu	XMMWORD PTR [rsp + 192], xmm12
+	movdqu	XMMWORD PTR [rsp + 208], xmm13
+	movdqu	XMMWORD PTR [rsp + 224], xmm14
+	movdqu	XMMWORD PTR [rsp + 240], xmm15
+	call	silica_rt_tls_current_actor_get
+	mov	rax, QWORD PTR [rbp - 8]
+	lea	r10, [rbp + 16]
+	test	rdi, rdi
+	jz	Lsrm_probe
+	mov	r11, QWORD PTR [rdi + 272]
+	test	r11, r11
+	jz	Lsrm_probe
+	cmp	r10, r11
+	jb	Lsrm_probe
+	mov	rcx, QWORD PTR [rdi + 280]
+	add	rcx, r11
+	cmp	r10, rcx
+	jae	Lsrm_probe
+	lea	rcx, [rip + silica_rt_stack_page]
+	add	r11, QWORD PTR [rcx]
+	add	r11, 256
+	sub	r10, r11
+	jbe	Lsrm_fail
+	cmp	rax, r10
+	ja	Lsrm_fail
+Lsrm_ok:
+	movdqu	xmm0, XMMWORD PTR [rsp + 0]
+	movdqu	xmm1, XMMWORD PTR [rsp + 16]
+	movdqu	xmm2, XMMWORD PTR [rsp + 32]
+	movdqu	xmm3, XMMWORD PTR [rsp + 48]
+	movdqu	xmm4, XMMWORD PTR [rsp + 64]
+	movdqu	xmm5, XMMWORD PTR [rsp + 80]
+	movdqu	xmm6, XMMWORD PTR [rsp + 96]
+	movdqu	xmm7, XMMWORD PTR [rsp + 112]
+	movdqu	xmm8, XMMWORD PTR [rsp + 128]
+	movdqu	xmm9, XMMWORD PTR [rsp + 144]
+	movdqu	xmm10, XMMWORD PTR [rsp + 160]
+	movdqu	xmm11, XMMWORD PTR [rsp + 176]
+	movdqu	xmm12, XMMWORD PTR [rsp + 192]
+	movdqu	xmm13, XMMWORD PTR [rsp + 208]
+	movdqu	xmm14, XMMWORD PTR [rsp + 224]
+	movdqu	xmm15, XMMWORD PTR [rsp + 240]
+	mov	rax, QWORD PTR [rbp - 8]
+	mov	rcx, QWORD PTR [rbp - 16]
+	mov	rdx, QWORD PTR [rbp - 24]
+	mov	rbx, QWORD PTR [rbp - 32]
+	mov	rsi, QWORD PTR [rbp - 40]
+	mov	rdi, QWORD PTR [rbp - 48]
+	mov	r8, QWORD PTR [rbp - 56]
+	mov	r9, QWORD PTR [rbp - 64]
+	mov	r10, QWORD PTR [rbp - 72]
+	mov	r11, QWORD PTR [rbp - 80]
+	mov	r12, QWORD PTR [rbp - 88]
+	mov	r13, QWORD PTR [rbp - 96]
+	mov	r14, QWORD PTR [rbp - 104]
+	mov	r15, QWORD PTR [rbp - 112]
+	leave
+	ret
+Lsrm_probe:
+# r10 = the caller's rsp, rax = the bytes. A request larger than rsp itself has no low end: it probes to 0.
+	mov	r11, r10
+	sub	r11, rax
+	jae	Lsrm_probe_loop
+	xor	r11d, r11d
+Lsrm_probe_loop:
+	sub	r10, 4096
+	cmp	r10, r11
+	jbe	Lsrm_probe_last
+	mov	cl, BYTE PTR [r10]
+	jmp	Lsrm_probe_loop
+Lsrm_probe_last:
+	mov	cl, BYTE PTR [r11]
+	jmp	Lsrm_ok
+Lsrm_fail:
+	mov	rsi, QWORD PTR [rip + silica_rt_out_of_memory_atom]
+	cmp	QWORD PTR [rdi + 376], 0
+	je	Lsrm_fail_reason
+	mov	rsi, QWORD PTR [rip + silica_rt_reservation_exceeded_atom]
+Lsrm_fail_reason:
+	call	silica_rt_actor_fail_current
+	jmp	silica_rt_abort_region_overflow
 ")
 }
 

@@ -25,6 +25,14 @@
    lr, and r0:r1 when it answers in X0: ENTRY_SAVE / ENTRY_RET below. Internal routines follow the
    AAPCS (arguments r0-r3, result r0/r1, r0-r3 and r12 clobbered, r4-r11 kept). */
 
+/* The largest byte count one run-time-sized allocation may ask for: far
+   above this board's 128 KiB of RAM, and small enough that no sum the allocators make from it (the
+   count plus headers, rounding, headroom, the transient part or an address) can pass 32 bits. A larger
+   request can never be met, so each entry refuses it before doing any arithmetic with it. The emitter
+   refuses the same sizes in 64 bits before the low word is passed (terms/prims/prims_memory.silica
+   emit_alloc_buf, emit_alloc_buf_retained). */
+#define RT_ALLOC_MAX     0x08000000
+
 #define VRG_BLOCK_SIZE   192
 #define VRG_VSP          112
 #define VRG_MLIMIT       116

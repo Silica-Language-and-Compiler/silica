@@ -31,8 +31,8 @@
 //          .quad RIDX         index of the first word of kind REGION, or -1
 //          .quad KIND, AUX    one entry per word
 //
-//   KIND 0 WORD    scalars, atoms, strings, actor references, function values, lists (slice-1
-//                  limit: a List is shared with the sender as before), type parameters: copied as is
+//   KIND 0 WORD    scalars, atoms and actor references: copied as is (the builtin scalar and handle types,
+//                  ev_word_type_ok and mc_known_word; every other name is KIND 10)
 //   KIND 1 REGION  an owned region handle: replaced by the fresh region it maps to
 //   KIND 2 REF1    ref / ref? to a one-word cell; AUX = a one-entry descriptor for the cell's word
 //   KIND 3 REFTUP  ref / ref? to an alloc_rec cell (one word pointing at the tuple payload); AUX =
@@ -41,13 +41,17 @@
 //                  entry of a `ref?(L, S, rec)` points back at that tuple's own descriptor. An
 //                  UNBOUND `rec` (no enclosing tuple: a record field, a parameter or return type
 //                  such as a structure's `root: ref?(L, normal, rec)`) names no layout; that ref is
-//                  a WORD, shared with the sender as before (Lee decides its handling)
+//                  KIND 10
 //   KIND 4 AGG     pointer to a record or tuple; AUX = its descriptor (a value below 65536 is an
 //                  atom or nil and is copied as is)
 //   KIND 5 SUM     a sum value; AUX = a table `.quad -1-M; .quad TAG, DESC ...` matched against the
 //                  value's first word (a tuple alternative's tag atom, a record alternative's
 //                  shape number); an atom alternative (< 65536) is copied as is
-//   KIND 6 BUF     a buffer (length word before the elements); AUX = element byte size
+//   KIND 6 BUF     a buffer (length word before the elements); AUX = the element byte size (1, 2, 4 or 8,
+//                  prims_tuple@buf_elem_bytes, the size the allocation and buf_load / buf_store use) when
+//                  no element can hold a pointer, else (a value of 65536 or more) the label of a one-entry
+//                  descriptor `.quad 1, 8` whose entry describes one element word: every copy walks each
+//                  element through it
 //   KIND 7 LIST    a list handle (chunk15_stack_memory_design.md §3.6, decision 30); AUX = a one-entry
 //                  descriptor `.quad 1, SLOT` whose entry describes one element word (SLOT = the
 //                  chunk slot bytes; a slot above 8 holds an inline aggregate). Phase 0 (2026-10-24):
@@ -61,6 +65,14 @@
 //                  L_mc_root; the phase 4a mailbox buffer copies header and bytes
 //   KIND 9 CLOSURE a function value (§3.6): copied as a WORD until closure environments are described
 //                  records (phase 2 rejects a captured closure at a send or return, E2300)
+//   KIND 10 OPAQUE a word whose type the descriptors cannot follow: a type parameter, a trait type, an
+//                  unbound `rec`, nesting deeper than mc_depth_bound, a sum whose alternatives the value's
+//                  first word cannot tell apart (mc_sum_shape). A value below 65536 (an atom, a small
+//                  scalar) is copied as is; any other value ends the copying actor (in main the process)
+//                  with a contained failure, so no word that may point into the sender's frame or state
+//                  reaches another actor. A sum with one untagged pointer alternative and otherwise atoms
+//                  is described by that alternative's own entry (every walker copies a value below 65536
+//                  as is)
 //
 // Measuring mode (§5.1): L_mc_measure(value, descriptor) walks exactly as the copy does, with the
 // same per-message table, and returns the byte total of the copy; phase 0 emits it with the helper
@@ -138,6 +150,7 @@ export md_type_label/2;
 export md_type_descriptors_block/3;
 export ev_type_described/1;
 export ev_type_has_node_root/1;
+export ev_type_boundary_root/1;
 export ev_site_descriptor_rodata/3;
 
 // ---- strings ----------------------------------------------------------------------------------
@@ -313,7 +326,7 @@ fn mc_kind_of_rest(t: string, bound: boolean) -> int64 {
 // `bound`: an enclosing tuple binds `rec` here. A ref to a tuple counts without looking inside it
 // (its payload is a described cell).
 fn mc_needs_copy_at(t: string, depth: int64, bound: boolean) -> boolean {
-    case depth > 12 of {
+    case depth > mc_depth_bound() of {
         true -> false;
         false -> case mc_kind_of(t, bound) of {
             0 -> false;
@@ -408,6 +421,15 @@ fn ev_type_has_node_root(t0: string) -> boolean {
     md_root_needs_descriptor(prims_record@strip_spaces_rt(t0))
 }
 
+// Whether an actor boundary (a message, a reply, a spawn or child-spec state, a behaviour's new state) passes a
+// root-word descriptor for a value of this type: a node root (ev_type_has_node_root), or a root word the
+// descriptors cannot follow (KIND 10: a bare type parameter, a trait type), which the copier then refuses unless
+// it is below 65536. Only the boundary sites ask this; ev_type_has_node_root keeps its meaning elsewhere.
+fn ev_type_boundary_root(t0: string) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    md_root_needs_descriptor(t) or mc_entry_kind(t, false) == 10
+}
+
 fn ev_word_type_ok(t: string) -> boolean {
     t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16" or t == "int8" or t == "uint8"
         or t == "float64" or t == "float32" or t == "float16" or t == "boolean" or t == "bool" or t == "unit" or t == "lifetime"
@@ -415,7 +437,7 @@ fn ev_word_type_ok(t: string) -> boolean {
 }
 
 fn ev_described_at(t: string, depth: int64, bound: boolean) -> boolean {
-    case depth > 12 or length_bytes(t) == 0 of {
+    case depth > mc_depth_bound() or length_bytes(t) == 0 of {
         true -> false;
         false -> case mc_kind_of(t, bound) of {
             0 -> ev_word_type_ok(t);
@@ -429,8 +451,12 @@ fn ev_described_at(t: string, depth: int64, bound: boolean) -> boolean {
                 true -> ev_fields_described(substring(t, 1, length_bytes(t) - 1), 0, depth, bound);
                 false -> ev_elems_described(substring(t, 1, length_bytes(t) - 1), 0, depth)
             };
-            5 -> ev_alts_described(t, 0, depth, bound);
-            6 -> true;
+            5 -> case mc_sum_shape(t, bound) of {
+                0 -> ev_alts_described(t, 0, depth, bound);
+                1 -> ev_described_at(mc_sum_lone_alt(t, 0, bound), depth + 1, bound);
+                _: int64 -> false
+            };
+            6 -> ev_buf_described(t, depth, bound);
             7 -> ev_described_at(prims_list@list_elem_type_from_list_t(t), depth + 1, bound);
             8 -> true;
             // A function value is a code address (no captured environment is built today), never a node.
@@ -490,6 +516,135 @@ fn ev_site_descriptor_rodata(t0: string, label: string, table: { is_empty: boole
     concat(mc_lbl(label, 0), concat(":\n    .quad 1, -1\n", concat(e.line, e.child)))
 }
 
+// ---- what the descriptors can follow -----------------------------------------------------------
+
+// Aggregate nesting the descriptors describe; a word nested deeper is KIND 10 (and not described).
+fn mc_depth_bound() -> int64 {
+    64
+}
+
+// Builtin names whose values are scalars, handles or device addresses, never a node of the sender's frame,
+// carried as words (KIND 0) although ev_word_type_ok does not list them (they stay undescribed for the
+// evacuation, which adopts the callee's frame for them as before).
+fn mc_known_word(t: string) -> boolean {
+    t == "discard" or t == "supervisor_ref" or t == "monitor_ref" or t == "pid" or t == "dangerous_pid" or t == "char"
+        or t == "failure_reason" or t == "bytes" or t == "Bytes" or t == "String" or t == "stack_policy" or t == "device_window"
+        or mc_starts_with(t, "device_window(") or mc_starts_with(t, "state_policy(") or mc_starts_with(t, "stack_policy(")
+}
+
+// A KIND 0 spelling that names no builtin word: a type parameter, a trait type, an unbound `rec` or a ref with
+// no layout. Only meaningful where mc_kind_of answers 0.
+fn mc_is_opaque_word(t: string) -> boolean {
+    length_bytes(t) > 0 and ev_word_type_ok(t) == false and mc_known_word(t) == false
+}
+
+// The kind a descriptor entry gets: mc_kind_of, with KIND 10 for an opaque word and for a sum whose
+// alternatives cannot be told apart.
+fn mc_entry_kind(t: string, bound: boolean) -> int64 {
+    k: int64 <- mc_kind_of(t, bound);
+    case k of {
+        0 -> case mc_is_opaque_word(t) of {
+            true -> 10;
+            false -> 0
+        };
+        5 -> case mc_sum_shape(t, bound) == 2 of {
+            true -> 10;
+            false -> 5
+        };
+        _: int64 -> k
+    }
+}
+
+// The class of one sum alternative: 0 an atom; 1 untagged and able to hold a pointer (a string, list, buffer,
+// ref, untagged tuple or opaque word); 2 untagged and pointer-free (a builtin word, a function value, a region
+// witness); 3 tagged (a record, matched by its shape number, or a tuple led by an atom).
+fn mc_alt_class(a: string, bound: boolean) -> int64 {
+    case mc_starts_with(a, ":") of {
+        true -> 0;
+        false -> case mc_is_record(a) or (mc_is_tuple(a) and mc_starts_with(substring(a, 1, length_bytes(a)), ":")) of {
+            true -> 3;
+            false -> {
+                k: int64 <- mc_kind_of(a, bound);
+                case k == 1 or k == 9 or (k == 0 and mc_is_opaque_word(a) == false) of {
+                    true -> 2;
+                    false -> 1
+                }
+            }
+        }
+    }
+}
+
+fn mc_sum_count(t: string, i: int64, bound: boolean, cls: int64) -> int64 {
+    case i >= length_bytes(t) of {
+        true -> 0;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, "|");
+            here: int64 <- case mc_alt_class(substring(t, i, e), bound) == cls of { true -> 1; false -> 0 };
+            here + mc_sum_count(t, e + 1, bound, cls)
+        }
+    }
+}
+
+// How the copier tells a sum's alternatives apart by the value: 0 every alternative that can hold a pointer is
+// tagged (the alternative table, mc_sum_table); 1 exactly one alternative can hold a pointer, it has no tag and
+// every other alternative is an atom (an atom is below 65536, so the value is that alternative whenever it is
+// 65536 or more: the alternative's own entry describes the sum); 2 anything else (KIND 10).
+fn mc_sum_shape(t: string, bound: boolean) -> int64 {
+    p: int64 <- mc_sum_count(t, 0, bound, 1);
+    case p == 0 of {
+        true -> 0;
+        false -> case p == 1 and mc_sum_count(t, 0, bound, 2) == 0 and mc_sum_count(t, 0, bound, 3) == 0 of {
+            true -> 1;
+            false -> 2
+        }
+    }
+}
+
+// The first alternative of class 1, or "".
+fn mc_sum_lone_alt(t: string, i: int64, bound: boolean) -> string {
+    case i >= length_bytes(t) of {
+        true -> "";
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, "|");
+            a: string <- substring(t, i, e);
+            case mc_alt_class(a, bound) == 1 of {
+                true -> a;
+                false -> mc_sum_lone_alt(t, e + 1, bound)
+            }
+        }
+    }
+}
+
+// A buffer is described when no element can hold a pointer, or when its element type is.
+fn ev_buf_described(t: string, depth: int64, bound: boolean) -> boolean {
+    e: string <- prims_tuple@buf_elem_type(t);
+    case length_bytes(e) == 0 or prims_tuple@buf_elem_bytes_of(e) < 8 of {
+        true -> true;
+        false -> ev_described_at(e, depth + 1, bound)
+    }
+}
+
+// A buffer's entry: AUX = the element bytes when no element can hold a pointer (a narrow scalar, or an element
+// entry of KIND 0, 1 or 9), else the label of the one-entry descriptor `.quad 1, 8` over one element word.
+fn mc_buf_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
+    e: string <- prims_tuple@buf_elem_type(t);
+    ek: int64 <- case length_bytes(e) == 0 or prims_tuple@buf_elem_bytes_of(e) < 8 of {
+        true -> 0;
+        false -> case depth + 1 > mc_depth_bound() of {
+            true -> 10;
+            false -> mc_entry_kind(e, length_bytes(encl) > 0)
+        }
+    };
+    case ek == 0 or ek == 1 or ek == 9 of {
+        true -> { line: concat("    .quad 6, ", concat(mc_itos(mc_buf_elem_bytes(t)), "\n")), child: "", k: k };
+        false -> {
+            c: { line: string, child: string, k: int64 } <- mc_entry(e, base, k + 1, table, depth + 1, encl);
+            own: string <- concat(mc_lbl(base, k), concat(":\n    .quad 1, 8\n", c.line));
+            { line: mc_label_entry(6, mc_lbl(base, k)), child: concat(own, c.child), k: c.k }
+        }
+    }
+}
+
 // ---- descriptors --------------------------------------------------------------------------------
 
 fn md_site_label(fnl: string, node: int64) -> string {
@@ -503,7 +658,7 @@ fn mc_lbl(base: string, k: int64) -> string {
 // One entry line and the rodata of the descriptors it points at; `encl` is the label of the
 // innermost enclosing tuple's descriptor ("" when none), which is what `rec` names.
 fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
-    kind: int64 <- case depth > 12 of { true -> 0; false -> mc_kind_of(t, length_bytes(encl) > 0) };
+    kind: int64 <- case depth > mc_depth_bound() of { true -> 10; false -> mc_entry_kind(t, length_bytes(encl) > 0) };
     case kind of {
         0 -> { line: "    .quad 0, 0\n", child: "", k: k };
         1 -> { line: "    .quad 1, 0\n", child: "", k: k };
@@ -514,7 +669,8 @@ fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index
                 { line: mc_label_entry(3, mc_lbl(base, k)), child: d.text, k: d.k }
             }
         };
-        6 -> { line: concat("    .quad 6, ", concat(mc_itos(mc_buf_elem_bytes(t)), "\n")), child: "", k: k };
+        6 -> mc_buf_entry(t, base, k, table, depth, encl);
+        10 -> { line: "    .quad 10, 0\n", child: "", k: k };
         2 -> {
             // A one-word descriptor for the cell's content.
             c: { line: string, child: string, k: int64 } <- mc_entry(mc_ref_elem_type(t), base, k + 1, table, depth + 1, encl);
@@ -533,9 +689,12 @@ fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index
         };
         8 -> { line: "    .quad 8, 0\n", child: "", k: k };
         9 -> { line: "    .quad 9, 0\n", child: "", k: k };
-        _: int64 -> {
-            d: { text: string, k: int64 } <- mc_sum_table(t, base, k, table, depth + 1, encl);
-            { line: mc_label_entry(5, mc_lbl(base, k)), child: d.text, k: d.k }
+        _: int64 -> case mc_sum_shape(t, length_bytes(encl) > 0) == 1 of {
+            true -> mc_entry(mc_sum_lone_alt(t, 0, length_bytes(encl) > 0), base, k, table, depth, encl);
+            false -> {
+                d: { text: string, k: int64 } <- mc_sum_table(t, base, k, table, depth + 1, encl);
+                { line: mc_label_entry(5, mc_lbl(base, k)), child: d.text, k: d.k }
+            }
         }
     }
 }
@@ -545,12 +704,22 @@ fn mc_label_entry(kind: int64, label: string) -> string {
     concat("    .quad ", concat(mc_itos(kind), concat(", ", concat(label, "\n"))))
 }
 
+// The element bytes of a buffer type: prims_tuple@buf_elem_bytes, exactly what the allocation and the element
+// loads and stores use (prims_memory). A spelling that is not `buf(L, S, T, N)` falls back to the allocator's
+// own by-name rule (prims_memory elem_size_shift_by_name).
 fn mc_buf_elem_bytes(t: string) -> int64 {
-    case mc_has(t, "int8") or mc_has(t, "uint8") or mc_has(t, "boolean") of {
+    case length_bytes(prims_tuple@buf_elem_type(t)) > 0 of {
+        true -> prims_tuple@buf_elem_bytes(t);
+        false -> mc_buf_elem_bytes_by_name(t)
+    }
+}
+
+fn mc_buf_elem_bytes_by_name(t: string) -> int64 {
+    case mc_has(t, "int8") of {
         true -> 1;
-        false -> case mc_has(t, "int16") or mc_has(t, "uint16") or mc_has(t, "float16") of {
+        false -> case mc_has(t, "int16") of {
             true -> 2;
-            false -> case mc_has(t, "int32") or mc_has(t, "uint32") or mc_has(t, "float32") of {
+            false -> case mc_has(t, "int32") of {
                 true -> 4;
                 false -> 8
             }

@@ -170,7 +170,7 @@ fn emit_alloc_region(dest: string) -> string {
 // region does (design §3.8). The heap path through silica_rt_region_grow is gone.
 fn emit_region_bump_check(size_math: string) -> string {
     load_size: string <- "2:\n    ldr r10, [r9, #32]\n";
-    attempt: string <- "    ldrex r8, [r2]\n    ldr r12, [r2, #8]\n    add r11, r8, r10\n    cmp r12, r11\n    blo.w 3f\n    strex lr, r11, [r2]\n    cmp lr, #0\n    bne.w 2b\n";
+    attempt: string <- "    ldrex r8, [r2]\n    ldr r12, [r2, #8]\n    adds r11, r8, r10\n    bcs.w 3f\n    cmp r12, r11\n    blo.w 3f\n    strex lr, r11, [r2]\n    cmp lr, #0\n    bne.w 2b\n";
     publish: string <- "    add r11, r8, r10\n    str r8, [r9, #0]\n    str r12, [r9, #8]\n    str r11, [r9, #16]\n    movw r11, #0\n    str r11, [r9, #4]\n    str r11, [r9, #12]\n    str r11, [r9, #20]\n    b.w 1f\n";
     frame_block: string <- concat("3:\n", concat(arm_isa@xt_add("X16", "X7", "#15"), concat(arm_isa@xt_and("X16", "X16", "#-16"), concat(arm_frame@dyn_alloc_asm("X16", "X3"), "1:\n"))));
     concat(size_math, concat(load_size, concat(attempt, concat(publish, frame_block))))
@@ -298,6 +298,19 @@ fn emit_write_ref(term: { nodes: List[{ kind: int64, type_name: string, value: s
 // alloc_buf(region, N): bump-allocate buffer of N elements within region.
 // Operands: X1 = region, X2 = N (element count). Rejects negative N, byte-size overflow, and arena overflow.
 fn elem_size_shift_from_buf_type(buf_type: string) -> int64 {
+    case length_bytes(prims_tuple@buf_elem_type(buf_type)) > 0 of {
+        true -> case prims_tuple@buf_elem_bytes(buf_type) of {
+            1 -> 0;
+            2 -> 1;
+            4 -> 2;
+            _: int64 -> 3
+        };
+        false -> elem_size_shift_by_name(buf_type)
+    }
+}
+
+// The element size of a spelling that is not `buf(L, S, T, N)` (kept from before the exact parse).
+fn elem_size_shift_by_name(buf_type: string) -> int64 {
     case memory_type_contains(buf_type, "int8") of {
         true -> 0;
         false -> case memory_type_contains(buf_type, "uint8") of {
@@ -341,6 +354,10 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
     mov_elem: string <- arm_isa@xt_mov("X8", concat("#", eb));
     mul_bytes: string <- arm_isa@xt_mul("X7", "X2", "X8");
     mul_ov: string <- concat(arm_isa@xt_sdiv("X9", "X7", "X8"), emit_abort_when("NE", "X9", "X2", "silica_rt_buf_invalid_failed"));
+    // The runtime takes the byte count as one 32-bit word (dyn_alloc_asm, the bump below), so a count
+    // that does not fit one, or that no memory of this board can hold, is refused here in 64 bits
+    // (size check). 134217712 = RT_ALLOC_MAX - 16 (board/runtime): the two roundings below stay under it.
+    byte_cap: string <- emit_abort_when("HI", "X7", "#134217712", "silica_rt_buf_invalid_failed");
     // X7 = element bytes + 8 (the length word), rounded up to a multiple of 8: the request the
     // reservation takes.
     with_len: string <- concat(arm_isa@xt_add("X7", "X7", "#15"), concat(arm_isa@xt_lsr("X7", "X7", "#3"), arm_isa@xt_lsl("X7", "X7", "#3")));
@@ -348,7 +365,7 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
     store_len: string <- concat(arm_mem@xt_str("X2", "[X4]"), arm_isa@xt_add("X4", "X4", "#8"));
     mov_dest: string <- arm_isa@xt_mov(dest, "X4");
     size_calc1: string <- concat(neg_check, mov_elem);
-    size_calc: string <- concat(size_calc1, concat(mul_bytes, concat(mul_ov, with_len)));
+    size_calc: string <- concat(size_calc1, concat(mul_bytes, concat(mul_ov, concat(byte_cap, with_len))));
     case alloc_in_frame(term) of {
         // A frame buffer: X7 bytes (length word included) rounded to 16, the elements zeroed.
         true -> {
@@ -373,7 +390,9 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
 // it as an old node and keeps it. Operands as alloc_buf's region-less form: X1 = the lifetime witness
 // (unused), X2 = n. A 0 answer ends the actor through silica_rt_region_alloc_failed.
 fn emit_alloc_buf_retained(dest: string) -> string {
-    neg_check: string <- emit_abort_when("LT", "X2", "#0", "silica_rt_buf_invalid_failed");
+    // One unsigned compare refuses a negative count and one above what the runtime takes (it reads the
+    // low word; 134217712 = RT_ALLOC_MAX - 16, as emit_alloc_buf).
+    neg_check: string <- emit_abort_when("HI", "X2", "#134217712", "silica_rt_buf_invalid_failed");
     call: string <- concat(arm_isa@xt_mov("X0", "X2"), arm_isa@xt_call("silica_rt_state_retain_node"));
     fail: string <- concat(arm_isa@xt_cbnz("X0", "1f"), concat(arm_isa@xt_call("silica_rt_region_alloc_failed"), "1:\n"));
     concat(neg_check, concat(call, concat(fail, arm_isa@xt_mov(dest, "X0"))))
@@ -435,10 +454,34 @@ fn w_reg_from_gpr(reg: string) -> string {
     }
 }
 
+// The exact element type of the buffer operand of a buf_load / buf_store (the prim's first operand;
+// prims_tuple@buf_elem_type, the one source of element sizes), or `fallback` when that operand's type is not a
+// buffer spelling.
+fn buf_access_elem_type(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fallback: string) -> string {
+    e: string <- prims_tuple@buf_elem_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name);
+    case length_bytes(e) == 0 of {
+        true -> fallback;
+        false -> e
+    }
+}
+
+// buf_store's width as emit_buf_store names it: the buffer operand's narrow element type, else int64 (a
+// wider element is one 8-byte word); `fallback` when the operand's type is not a buffer spelling.
+fn buf_store_width_type(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fallback: string) -> string {
+    e: string <- prims_tuple@buf_elem_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name);
+    case length_bytes(e) == 0 of {
+        true -> fallback;
+        false -> case prims_tuple@buf_elem_bytes_of(e) < 8 of {
+            true -> e;
+            false -> "int64"
+        }
+    }
+}
+
 // buf_load(buf, index): load from buf[index] after optional bounds check in caller wrapper.
 fn emit_buf_load(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     wd: string <- w_reg_from_gpr(dest);
-    case sir_term_root_node(term).type_name of {
+    case buf_access_elem_type(term, sir_term_root_node(term).type_name) of {
         "int8" -> arm_mem@xt_ldrsb(wd, "[X1, X2]");
         "uint8" -> arm_mem@xt_ldrb(wd, "[X1, X2]");
         "int16" -> arm_mem@xt_ldrsh(wd, "[X1, X2, LSL #1]");
@@ -474,7 +517,7 @@ fn buf_store_value_type(tuple_type: string) -> string {
 // buf_store(buf, index, value): store value at buf[index]
 // Operands: X1 = buf, X2 = pointer to tuple(index, value) from tuple_make.
 fn emit_buf_store(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, outer_reg: string) -> string {
-    value_type: string <- buf_store_value_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name);
+    value_type: string <- buf_store_width_type(term, buf_store_value_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name));
     ldr_val: string <- case value_type of {
         "int8" -> arm_mem@xt_ldrsb("W3", "[X2, #8]");
         "uint8" -> arm_mem@xt_ldrb("W3", "[X2, #8]");

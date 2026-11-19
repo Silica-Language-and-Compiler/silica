@@ -174,8 +174,10 @@ silica_rt_acb_free:
     .space  4
 silica_rt_node_free:
     .space  4
+    .global silica_rt_registry_acb         // read by rt_failure.S (silica_rt_is_registry_acb)
 silica_rt_registry_acb:                     // the plain registry's actor, made on first request
     .space  4
+    .global silica_rt_acb_all              // walked by rt_failure.S (silica_rt_actor_exit_body)
 silica_rt_acb_all:                          // the chain of every ACB taken from the heap (ACB_ALL_NEXT)
     .space  4
 silica_rt_idle_scan_at:                     // SysTick ms of the last :release_when_idle scan
@@ -2430,6 +2432,11 @@ silica_rt_identity_exhausted_msg:
     cmp     r1, #0
     it      eq
     streq   r1, [r2, #SB_IN_TAIL]
+    ldr     r1, [r2, #SB_IN_DEPTH]          // counted down as every other ingress dequeue does
+    cmp     r1, #0
+    it      ne
+    subne   r1, r1, #1
+    str     r1, [r2, #SB_IN_DEPTH]
     b.w     2f
 1:  ldr     r3, [r0, #ACB_MB_HEAD]
     cmp     r3, #0

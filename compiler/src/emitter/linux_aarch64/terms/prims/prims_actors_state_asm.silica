@@ -92,7 +92,7 @@
 // twice and two slots never share a node afterwards (the invariant decision 18's release needs, §13
 // item 1); within a slot sharing is preserved. The walk is type-directed by the module's descriptors
 // (term_message_copy: KIND 0 word, 1 region witness, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST,
-// 8 STRING, 9 closure), given as the ROOT-WORD form `.quad 1, -1; .quad KIND, AUX` that every spawn site
+// 8 STRING, 9 closure, 10 opaque: below 65536 a word, else the copy is refused), given as the ROOT-WORD form `.quad 1, -1; .quad KIND, AUX` that every spawn site
 // and every child spec carries (ev_site_descriptor_rodata), so a state that is a bare ref, list or string
 // is described like a record. Sizes are the message copier's (L_mc_measure): an aggregate N * 8; a REF1
 // cell 8; a REFTUP cell its payload rounded to 16 plus the 8-byte cell word; a buffer its length word plus
@@ -778,11 +778,13 @@ Lstm_root_entry:
 	mov	x24, #0
 	cbz	x22, Lstm_root_notable
 	ldp	x1, x2, [x20, #16]
+	mov	x20, xzr
 	mov	x0, x19
 	bl	Lstm_word
 	mov	x0, x22
 	bl	free
-	b	Lstm_root_done
+	cbz	x20, Lstm_root_done
+	b	Lstm_root_notable
 Lstm_root_notable:
 	mov	x25, #-1
 Lstm_root_done:
@@ -809,7 +811,17 @@ Lstm_word:
 	b.eq	Lstm_list
 	cmp	x1, #8
 	b.eq	Lstm_str
+	cmp	x1, #10
+	b.eq	Lstm_opaque
 	b	Lstm_ref
+Lstm_opaque:
+; KIND 10: a word the descriptors cannot follow. Below 65536 (an atom, a small scalar) it is counted as a
+; word; any other value marks the measure refused (X20 = 1, cleared at the root): the measure answers -1,
+; which every caller already turns into a contained failure of the copying actor.
+	cmp	x0, #65536
+	b.lo	Lstm_w_ret
+	mov	x20, #1
+	ret
 Lstm_w_agg:
 	mov	x1, x2
 	b	Lstm_agg
@@ -912,12 +924,33 @@ fn state_asm_measure_ref() -> string {
 	b.eq	Lstm_ref1
 	cmp	x27, #3
 	b.eq	Lstm_refrec
+	cmp	x28, #65536
+	b.hs	Lstm_refbuf
 	ldr	x9, [x26, #-8]
 	mul	x9, x9, x28
 	add	x9, x9, #15
 	and	x9, x9, #0xfffffffffffffff8
 	add	x25, x25, x9
 	b	Lstm_ref_done
+Lstm_refbuf:
+; A buffer whose elements can hold pointers (AUX = the one-entry descriptor `.quad 1, 8` of an element):
+; the count word and 8 bytes an element, then every element through Lstm_word. [sp] = the element index.
+	ldr	x9, [x26, #-8]
+	add	x9, x9, #1
+	add	x25, x25, x9, lsl #3
+	str	xzr, [sp]
+Lstm_rb_loop:
+	ldr	x9, [sp]
+	ldr	x10, [x26, #-8]
+	cmp	x9, x10
+	b.hs	Lstm_ref_done
+	ldr	x0, [x26, x9, lsl #3]
+	ldp	x1, x2, [x28, #16]
+	bl	Lstm_word
+	ldr	x9, [sp]
+	add	x9, x9, #1
+	str	x9, [sp]
+	b	Lstm_rb_loop
 Lstm_ref1:
 	add	x25, x25, #8
 	ldr	x0, [x26]
@@ -967,7 +1000,8 @@ Lstm_ref_asis:
 // to 8, once.
 fn state_asm_measure_list_str() -> string {
     "Lstm_list:
-	cbz	x0, Lstm_ml_ret
+	cmp	x0, #65536
+	b.lo	Lstm_ml_ret
 	stp	x29, x30, [sp, #-16]!
 	mov	x29, sp
 	stp	x26, x27, [sp, #-16]!
@@ -1232,7 +1266,19 @@ Lstc_word:
 	b.eq	Lstc_list
 	cmp	x1, #8
 	b.eq	Lstc_str
+	cmp	x1, #10
+	b.eq	Lstc_opaque
 	b	Lstc_ref
+Lstc_opaque:
+; KIND 10 (Lstm_opaque): below 65536 copied as is. Otherwise, in evacuation mode (no measure ran) the actor
+; fails as a state that cannot be placed does (Lstc_fail_actor); a bump copy always follows a measure, which
+; refused this value, so meeting one there is the measure-copy disagreement the overrun check aborts on.
+	cmp	x0, #65536
+	b.lo	Lstc_w_ret
+	ldr	x9, [x20, #8]
+	cbz	x9, Lstc_bump_overrun
+	ldr	x0, [x20, #16]
+	b	Lstc_fail_actor
 Lstc_w_agg:
 	mov	x1, x2
 	b	Lstc_agg
@@ -1391,6 +1437,8 @@ Lstc_ref_new:
 	b.eq	Lstc_ref1
 	cmp	x27, #3
 	b.eq	Lstc_refrec
+	cmp	x28, #65536
+	b.hs	Lstc_refbuf
 	ldr	x9, [x26, #-8]
 	mul	x7, x9, x28
 	add	x7, x7, #15
@@ -1419,6 +1467,40 @@ Lstc_buf_copied:
 	mov	x1, x27
 	bl	Lstc_insert
 	mov	x0, x27
+	b	Lstc_ref_done
+Lstc_refbuf:
+; A buffer whose elements can hold pointers: the count word and 8 bytes an element are bumped and the node is
+; entered in the table (by its final element pointer) before each element is copied through Lstc_word into
+; the copy. [sp] = the element index, [sp, #8] = the copy's final address; X27 = where the copy is written.
+	ldr	x9, [x26, #-8]
+	add	x7, x9, #1
+	lsl	x7, x7, #3
+	bl	Lstc_bump
+	mov	x27, x0
+	str	x1, [sp, #8]
+	ldr	x9, [x26, #-8]
+	str	x9, [x27]
+	mov	x0, x26
+	add	x1, x1, #8
+	bl	Lstc_insert
+	str	xzr, [sp]
+Lstc_rb_loop:
+	ldr	x9, [sp]
+	ldr	x10, [x26, #-8]
+	cmp	x9, x10
+	b.hs	Lstc_rb_done
+	ldr	x0, [x26, x9, lsl #3]
+	ldp	x1, x2, [x28, #16]
+	bl	Lstc_word
+	ldr	x9, [sp]
+	add	x11, x27, #8
+	str	x0, [x11, x9, lsl #3]
+	add	x9, x9, #1
+	str	x9, [sp]
+	b	Lstc_rb_loop
+Lstc_rb_done:
+	ldr	x0, [sp, #8]
+	add	x0, x0, #8
 	b	Lstc_ref_done
 Lstc_ref1:
 	mov	x7, #8
@@ -1494,7 +1576,8 @@ Lstc_ref_asis:
 // bytes and their NUL. [sp] = the final address.
 fn state_asm_copy_list_str() -> string {
     "Lstc_list:
-	cbz	x0, Lstc_ml_ret
+	cmp	x0, #65536
+	b.lo	Lstc_ml_ret
 	ldr	x9, [x20, #8]
 	cbz	x9, Lstc_ml_new
 	ldr	x10, [x20, #24]

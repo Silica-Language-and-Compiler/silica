@@ -375,6 +375,13 @@ Lcad_have_index:
 	jz	Lcad_no_carrier
 	mov	QWORD PTR [rbp - 16], rdi
 Lcad_bound:
+# The carrier fields are set under the actor's lock: its identity resolves already, so a cast or a
+# stop may reach it before this, and the mail signal reads #440/#448 under that lock (a cast seen
+# with #440 = 0 made nobody ready; one between the stores below would have pushed it and then had
+# its run-queue link #456 cleared). Mail that came first, or an end, makes it ready here instead.
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_lock
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	rcx, QWORD PTR [rbp - 16]
 	mov	QWORD PTR [rax + 440], rcx
@@ -385,17 +392,33 @@ Lcad_bound:
 	mov	QWORD PTR [rax + 512], 0
 	cmp	QWORD PTR [rbp - 32], 0
 	jne	Lcad_ready
+	cmp	DWORD PTR [rax + 152], 0
+	je	Lcad_pending
+	mov	r10, QWORD PTR [rax + 216]
+	test	r10, r10
+	jz	Lcad_std
+	mov	r11, QWORD PTR [r10]
+	or	r11, QWORD PTR [r10 + 8]
+	jnz	Lcad_pending
+Lcad_std:
+	mov	r11, QWORD PTR [rax + 128]
+	or	r11, QWORD PTR [rax + 136]
+	jz	Lcad_idle
+Lcad_pending:
+	mov	QWORD PTR [rax + 448], 2
 	mov	rdi, rax
+	call	silica_rt_carrier_push
+Lcad_idle:
+	mov	rdi, QWORD PTR [rbp - 8]
+	add	rdi, 16
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 8]
 	mov	esi, 1
 	call	silica_rt_started_store
 	mov	edi, 1
 	jmp	Lcad_ret
 Lcad_ready:
-# A trampoline to run: ready on its carrier, under its lock (its identity resolves already, so a
-# cast could race the status; a push needs the status guarded by the actor's lock).
-	lea	rdi, [rax + 16]
-	call	silica_rt_lock_lock
-	mov	rax, QWORD PTR [rbp - 8]
+# A trampoline to run: ready on its carrier, under its lock (taken at Lcad_bound).
 	mov	QWORD PTR [rax + 448], 2
 	mov	rdi, rax
 	call	silica_rt_carrier_push
@@ -1119,16 +1142,26 @@ silica_rt_started_store:
 # makes a carrier actor parked in the spawn (#472) ready. The parker stores #472 and then reads #224
 # under its own lock; this side stores #224 and then reads #472: with the full barriers (mfence)
 # one of them sees the other's store, and the status check under the parker's lock settles the rest.
-# Frame: [rbp-8] the parker (x19).
+# The parker is TAKEN from #472 (a compare-exchange to 0), so a parker that has already left its
+# spawn wait (it takes #472 back the same way, silica_rt_spawn_wait_started) is never touched: its
+# status 4 may by then be another park, or its block freed. Once done with a parker this side
+# stores 1 in #472, which the parker waits for when it found #472 already taken: until then its
+# block stays in use here. 0 and 1 name no parker.
+# Frame: [rbp-8] the parker (x19), [rbp-16] the child.
 	push	rbp
 	mov	rbp, rsp
 	sub	rsp, 16
 	mov	QWORD PTR [rdi + 224], rsi
 	mfence
+	mov	QWORD PTR [rbp - 16], rdi
+Lsts_take:
 	mov	rax, QWORD PTR [rdi + 472]
+	cmp	rax, 1
+	jbe	Lsts_ret
+	xor	ecx, ecx
+	lock cmpxchg	QWORD PTR [rdi + 472], rcx
+	jne	Lsts_take
 	mov	QWORD PTR [rbp - 8], rax
-	test	rax, rax
-	jz	Lsts_ret
 	lea	rdi, [rax + 16]
 	call	silica_rt_lock_lock
 	mov	rax, QWORD PTR [rbp - 8]
@@ -1141,6 +1174,8 @@ Lsts_unlock:
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
+	mov	rax, QWORD PTR [rbp - 16]
+	mov	QWORD PTR [rax + 472], 1
 Lsts_ret:
 	leave
 	ret
@@ -1195,6 +1230,21 @@ Lsws_started:
 	mov	rdi, QWORD PTR [rbp - 16]
 	add	rdi, 16
 	call	silica_rt_lock_unlock
+# Take #472 back (silica_rt_started_store): this actor, or the started store's 1, means no started
+# store holds this actor any more; 0 means one took it and is still using it (it waits for this
+# actor's lock, which is free now), so this actor waits for its 1 before it parks anywhere else.
+	mov	rax, QWORD PTR [rbp - 8]
+	xor	ecx, ecx
+	xchg	QWORD PTR [rax + 472], rcx
+	test	rcx, rcx
+	jnz	Lsws_ret
+Lsws_wait_store:
+	cmp	QWORD PTR [rax + 472], 1
+	je	Lsws_store_done
+	pause
+	jmp	Lsws_wait_store
+Lsws_store_done:
+	mov	QWORD PTR [rax + 472], 0
 	jmp	Lsws_ret
 Lsws_spin:
 	mov	rax, QWORD PTR [rbp - 8]
@@ -1616,6 +1666,13 @@ silica_rt_sup_restart_try:
 	mov	r11d, 1
 Lsrt_take:
 	mov	QWORD PTR [r10 + 120], r11
+# An asking actor records the supervisor whose token it holds (ACB +184), so its exit path gives
+# the token back if it ends before its release (silica_rt_sup_token_drop).
+	mov	rcx, QWORD PTR [rbp - 16]
+	test	rcx, rcx
+	jz	Lsrt_taken
+	mov	QWORD PTR [rcx + 184], rax
+Lsrt_taken:
 	mov	QWORD PTR [rbp - 16], 1
 	jmp	Lsrt_unlock
 Lsrt_no:
@@ -1645,6 +1702,14 @@ silica_rt_sup_restart_release:
 	mov	QWORD PTR [rbp - 16], r10
 	test	r10, r10
 	jz	Lsrr_unlock
+# The holder's record of this token (ACB +184) goes with it; 1 is main, which has no record.
+	mov	rcx, QWORD PTR [r10 + 120]
+	cmp	rcx, 1
+	jbe	Lsrr_clear
+	cmp	QWORD PTR [rcx + 184], rax
+	jne	Lsrr_clear
+	mov	QWORD PTR [rcx + 184], 0
+Lsrr_clear:
 	mov	QWORD PTR [r10 + 120], 0
 	mov	r11, QWORD PTR [r10]
 	or	r11, QWORD PTR [r10 + 8]
@@ -1662,6 +1727,34 @@ Lsrr_unlock:
 	call	silica_rt_wait_list_wake
 Lsrr_ret:
 	leave
+	ret
+# silica_rt_sup_token_drop(rdi = an ending actor's ACB; rdi kept): when the actor still holds the
+# restart token of the supervisor it recorded (+184, set when it took the token, cleared at the
+# release), it ended inside a call_supervisor operation or a drain before releasing it: the token is
+# released here, on its exit path, so the supervisor and every later drainer are not blocked for
+# good. The supervisor's control block is still allocated: the operation that took the token holds it.
+	.globl	silica_rt_sup_token_drop
+	.p2align	4
+silica_rt_sup_token_drop:
+	mov	rax, QWORD PTR [rdi + 184]
+	test	rax, rax
+	jz	Lstd_ret
+	mov	QWORD PTR [rdi + 184], 0
+	mov	rcx, QWORD PTR [rax + 216]
+	test	rcx, rcx
+	jz	Lstd_ret
+	cmp	QWORD PTR [rcx + 120], rdi
+	jne	Lstd_ret
+	push	rbp
+	mov	rbp, rsp
+	push	rdi
+	sub	rsp, 8
+	mov	rdi, rax
+	call	silica_rt_sup_restart_release
+	add	rsp, 8
+	pop	rdi
+	pop	rbp
+Lstd_ret:
 	ret
 	.globl	silica_rt_sup_restart_acquire
 	.p2align	4
@@ -1740,6 +1833,13 @@ Lsra_take_now:
 	mov	r11d, 1
 Lsra_take:
 	mov	QWORD PTR [r10 + 120], r11
+# An asking actor records the supervisor whose token it holds (ACB +184), so its exit path gives
+# the token back if it ends before its release (silica_rt_sup_token_drop).
+	mov	rcx, QWORD PTR [rbp - 16]
+	test	rcx, rcx
+	jz	Lsra_taken
+	mov	QWORD PTR [rcx + 184], rax
+Lsra_taken:
 	mov	QWORD PTR [rbp - 40], 1
 	jmp	Lsra_unlock
 Lsra_settle:

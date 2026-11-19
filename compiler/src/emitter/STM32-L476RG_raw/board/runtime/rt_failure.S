@@ -301,6 +301,10 @@ rt_end_common:
     bl      rt_in_actor
     cmp     r0, r4
     beq.w   8f
+    mov     r0, r4                          // the registry never ends: refused as the caller itself is
+    bl      silica_rt_is_registry_acb
+    cmp     r0, #0
+    bne.w   8f
     mov     r0, r4
     movw    r1, #0
     bl      silica_rt_end_actor
@@ -348,6 +352,10 @@ rt_end_common:
     bl      rt_in_actor
     cmp     r0, r4
     beq.w   8f
+    mov     r0, r4                          // the registry never ends: refused as the caller itself is
+    bl      silica_rt_is_registry_acb
+    cmp     r0, #0
+    bne.w   8f
     ldr     r5, [r4, #ACB_SUP]              // r5 = the victim's supervisor (read before the ACB can go)
     MOV32   r0, silica_registry_atom_killed
     ldr     r0, [r0]
@@ -600,21 +608,17 @@ rt_end_common:
     beq.w   71f
     MOV32   r0, silica_rt_root_exit_msg
     bl      silica_rt_puts
-71: // the registered name (§20.3.1): the slot is cleared only while it still names this actor
-    ldrh    r1, [r4, #ACB_REG_NAME]
-    cmp     r1, #0
-    beq.w   72f
-    sub     r1, r1, #1
+71: // the registered names (§20.3.1): every slot of the three tables that names this ACB is cleared,
+    // whatever names the actor held, so no name outlives it and none reaches the next actor that
+    // receives this ACB
     movw    r0, #0
     strh    r0, [r4, #ACB_REG_NAME]
-    REG_BOUND r1, r2
-    bhs.w   72f
     REG_TABLE r2, silica_pid_registry_ref
-    bl      rt_forget_in
+    bl      rt_sweep_in
     REG_TABLE r2, silica_dangerous_pid_registry_ref
-    bl      rt_forget_in
+    bl      rt_sweep_in
     REG_TABLE r2, silica_device_pid_registry_ref
-    bl      rt_forget_in
+    bl      rt_sweep_in
 72: // the state chain goes back with the actor (rt_state.S)
     mov     r0, r4
     bl      silica_rt_state_chain_free_all
@@ -624,6 +628,23 @@ rt_end_common:
     // a supervisor's rows go back (left to the last walker that holds them, rt_supervisors.S)
     mov     r0, r4
     bl      silica_rt_child_table_free
+    // an actor this one took on with add_child (no row) keeps no pointer to this ACB once it ends:
+    // its later exit is then a root actor's, never a notice into whatever actor receives the ACB
+    MOV32   r2, silica_rt_acb_all
+    ldr     r2, [r2]
+    movw    r1, #0
+73: cmp     r2, #0
+    beq.w   74f
+    ldr     r0, [r2, #ACB_SUP]
+    cmp     r0, r4
+    bne.w   75f
+    ldr     r0, [r2, #ACB_ROW]
+    cmp     r0, #0
+    it      eq
+    streq   r1, [r2, #ACB_SUP]
+75: ldr     r2, [r2, #ACB_ALL_NEXT]
+    b.w     73b
+74:
     // the child-table row is stamped for the supervisor's cascade
     ldr     r0, [r4, #ACB_ROW]
     cmp     r0, #0
@@ -635,15 +656,40 @@ rt_end_common:
     pop     {r4-r8, pc}
     .size   silica_rt_actor_exit_body, . - silica_rt_actor_exit_body
 
-// rt_forget_in(r1 = atom, r2 = table, r4 = acb): the slot is cleared when it names this actor. Clobbers r0.
-    LFUNC rt_forget_in
+// rt_sweep_in(r2 = table, r4 = acb): every slot of the table that names this actor is cleared.
+// Clobbers r0, r1, r3.
+    LFUNC rt_sweep_in
+    cmp     r2, #0
+    beq.w   9f
+    MOV32   r3, silica_rt_reg_slots
+    ldr     r3, [r3]
+    movw    r1, #0
+1:  cmp     r1, r3
+    bhs.w   9f
     ldr     r0, [r2, r1, lsl #2]
     cmp     r0, r4
-    bne.w   9f
+    bne.w   2f
     movw    r0, #0
     str     r0, [r2, r1, lsl #2]
+2:  add     r1, r1, #1
+    b.w     1b
 9:  bx      lr
-    .size   rt_forget_in, . - rt_forget_in
+    .size   rt_sweep_in, . - rt_sweep_in
+
+// silica_rt_is_registry_acb(r0 = acb) -> r0 = 1 when it is the registry actor's ACB (it never ends:
+// remove_actor and kill_abnormal refuse it), else 0. Clobbers r12.
+    FUNC silica_rt_is_registry_acb
+    MOV32   r12, silica_rt_registry_acb
+    ldr     r12, [r12]
+    cmp     r12, #0
+    beq.w   8f
+    cmp     r0, r12
+    bne.w   8f
+    movw    r0, #1
+    bx      lr
+8:  movw    r0, #0
+    bx      lr
+    .size   silica_rt_is_registry_acb, . - silica_rt_is_registry_acb
 
 // rt_spawn_waiter_wake(r0 = acb): the spawner suspended in spawn_common until this supervisor's start
 // trampoline ran is woken (once): by actor_main after the trampoline, or here when the actor died first.
@@ -706,17 +752,29 @@ rt_end_common:
     str     r1, [r0, #MSG_KIND]
     str     r5, [r0, #MSG_PAYLOAD]
     mov     r1, r0
+    mov     r4, r0                          // the node (the ACB is not needed past here)
     mov     r0, r6
     bl      silica_rt_enqueue_ingress
+    cmp     r0, #0
+    beq.w   9f
+    mov     r0, r5                          // not queued (a full ingress ended the supervisor):
+    bl      silica_rt_exit_payload_free     // the notice and its node go back
+    mov     r0, r4
+    bl      silica_rt_free_node
 9:  movw    r0, #0
     pop     {r4-r6, pc}
 8:  movw    r0, #1
     pop     {r4-r6, pc}
     .size   silica_rt_deliver_exit, . - silica_rt_deliver_exit
 
-// silica_rt_enqueue_ingress(r0 = acb, r1 = node) -> r0 = 0 queued, 1 the target is dead (the node and its
-// payload are then the caller's). The ingress is bounded (1024: silica_rt_abort_ingress_full); the target
-// becomes ready. AAPCS.
+// silica_rt_enqueue_ingress(r0 = acb, r1 = node) -> r0 = 0 queued, 1 not queued (the node and its
+// payload are then the caller's): the target is dead, or its ingress is full (INGRESS_LIMIT). A full
+// ingress ends its owner when it has a supervisor: failure_reason (:explicit, :ingress_full), tag 4,
+// alive cleared and made ready, so the scheduler runs its exit path in its own context (as
+// rt_supervisors.S rt_sup_end_elsewhere): its children are shut down, its queued notices go with it,
+// and its supervisor gets its exit and decides. Every later notice finds it dead. A full ingress of an
+// actor with no supervisor (a root supervisor) ends the program (silica_rt_abort_ingress_full). The
+// target otherwise becomes ready. AAPCS.
 #define INGRESS_LIMIT    1024
     FUNC silica_rt_enqueue_ingress
     push    {r4, r5, lr}
@@ -746,7 +804,20 @@ rt_end_common:
     bl      silica_rt_make_ready            // (a supervision_wait_and_drain_one waiter too: ST_WAIT_INGRESS)
     movw    r0, #0
     pop     {r4, r5, pc}
-7:  bl      silica_rt_abort_ingress_full
+7:  ldr     r1, [r4, #ACB_SUP]
+    cmp     r1, #0
+    beq.w   6f
+    MOV32   r1, silica_registry_atom_ingress_full
+    ldr     r1, [r1]
+    strh    r1, [r4, #ACB_REASON_ATOM]
+    movw    r1, #4
+    strb    r1, [r4, #ACB_REASON_TAG]
+    movw    r1, #0
+    strb    r1, [r4, #ACB_ALIVE]
+    mov     r0, r4
+    bl      silica_rt_make_ready
+    b.w     8f
+6:  bl      silica_rt_abort_ingress_full
 8:  movw    r0, #1
     pop     {r4, r5, pc}
     .size   silica_rt_enqueue_ingress, . - silica_rt_enqueue_ingress
@@ -1503,6 +1574,9 @@ silica_rt_banner_tail:
     .balign 4
     .weak   silica_registry_atom_killed
 silica_registry_atom_killed:
+    .word   -1
+    .weak   silica_registry_atom_ingress_full
+silica_registry_atom_ingress_full:
     .word   -1
     .weak   silica_registry_atom_out_of_memory
 silica_registry_atom_out_of_memory:

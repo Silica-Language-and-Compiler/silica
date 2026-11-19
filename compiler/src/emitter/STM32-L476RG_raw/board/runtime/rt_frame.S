@@ -136,6 +136,8 @@
     FUNC silica_rt_dyn_alloc
     ENTRY_SAVE
     ldr     r4, [r9, #VRG_ARG]              // r4 = n
+    cmp     r4, #RT_ALLOC_MAX
+    bhi.w   8f                              // no chunk can hold it; the sums below must not wrap
     ldr     r5, [r9, #VRG_VSP]              // r5 = sp
     ldr     r6, [r9, #VRG_FLOOR]            // r6 = floor
     ldr     r7, [r9, #VRG_ACHUNK]           // r7 = chunk
@@ -144,17 +146,22 @@
     mov     r2, r7
     bl      rt_transient_len
     mov     r8, r0                          // r8 = len
-    // the floor in this chunk and room for the block and the moved transient part above the limit
+    // the floor in this chunk and room for the block and the moved transient part above the limit:
+    // n + len <= floor - limit, compared without forming floor - n (size check: no
+    // subtraction that can wrap)
     ldr     r0, [r7, #CH_LIMIT]
     ldr     r1, [r7, #CH_TOP]
     cmp     r6, r0
     blo.w   2f
     cmp     r1, r6
     blo.w   2f
+    sub     r1, r6, r0                      // r1 = the room: floor - limit
+    cmp     r4, r1
+    bhi.w   2f
+    sub     r1, r1, r4
+    cmp     r8, r1
+    bhi.w   2f
     sub     r3, r6, r4                      // r3 = block
-    sub     r1, r3, r8
-    cmp     r1, r0
-    blo.w   2f
     b.w     3f
 2:  // a fresh chunk after this one: the block at its top, the transient part under it
     bl      silica_rt_current
@@ -452,6 +459,8 @@
 // runtime call returns. The block comes back ZEROED: the dynamic part is reused transient memory.
     FUNC silica_rt_frame_alloc
     push    {r4, lr}
+    cmp     r0, #RT_ALLOC_MAX
+    bhi.w   8f                              // before the rounding can wrap
     add     r0, r0, #15
     bic     r0, r0, #15
     mov     r4, r0
@@ -463,6 +472,8 @@
     bl      silica_rt_zero_block
     pop     {r0}
     pop     {r4, pc}
+8:  bl      silica_rt_region_alloc_failed
+    b.w     8b
     .size   silica_rt_frame_alloc, . - silica_rt_frame_alloc
 
 // silica_rt_in_aux_chain(r0 = ptr) -> r0 = 1 when ptr lies in a chunk of the running context's

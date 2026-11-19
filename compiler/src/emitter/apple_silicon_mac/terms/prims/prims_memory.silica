@@ -261,6 +261,19 @@ fn emit_write_ref(term: { nodes: List[{ kind: int64, type_name: string, value: s
 // Operands: X1 = region, X2 = N (element count). Rejects negative N and byte-size overflow; a buffer of
 // any size is a frame allocation (a full atomic/device block hands it to L_dyn_alloc, emit_region_bump_check).
 fn elem_size_shift_from_buf_type(buf_type: string) -> int64 {
+    case length_bytes(prims_tuple@buf_elem_type(buf_type)) > 0 of {
+        true -> case prims_tuple@buf_elem_bytes(buf_type) of {
+            1 -> 0;
+            2 -> 1;
+            4 -> 2;
+            _: int64 -> 3
+        };
+        false -> elem_size_shift_by_name(buf_type)
+    }
+}
+
+// The element size of a spelling that is not `buf(L, S, T, N)` (kept from before the exact parse).
+fn elem_size_shift_by_name(buf_type: string) -> int64 {
     case memory_type_contains(buf_type, "int8") of {
         true -> 0;
         false -> case memory_type_contains(buf_type, "uint8") of {
@@ -303,7 +316,7 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
     neg_check: string <- "    CMP X2, #0\n    B.LT L_buf_invalid\n";
     mov_elem: string <- concat(concat("    MOV X8, #", eb), "\n");
     mul_bytes: string <- "    MUL X7, X2, X8\n";
-    mul_ov: string <- "    SDIV X9, X7, X8\n    CMP X9, X2\n    B.NE L_buf_invalid\n";
+    mul_ov: string <- "    SDIV X9, X7, X8\n    CMP X9, X2\n    B.NE L_buf_invalid\n    LSR X9, X7, #47\n    CBNZ X9, L_buf_invalid\n";
     // X7 = element bytes + 8 (the length word), rounded up to a multiple of 8: the request the
     // reservation takes.
     with_len: string <- "    ADD X7, X7, #15\n    AND X7, X7, #0xfffffffffffffff8\n";
@@ -346,7 +359,7 @@ fn emit_alloc_buf(term: { nodes: List[{ kind: int64, type_name: string, value: s
 // clobbers X0-X18 as every memory prim is assumed to (body_has_bl_producing_prim). A 0 answer (no current
 // actor, or the state header cannot be committed) ends the actor through L_region_overflow.
 fn emit_alloc_buf_retained(dest: string) -> string {
-    neg_check: string <- "    CMP X2, #0\n    B.LT L_buf_invalid\n";
+    neg_check: string <- "    LSR X16, X2, #47\n    CBNZ X16, L_buf_invalid\n";
     size: string <- "    ADD X16, X2, #39\n    AND X16, X16, #0xfffffffffffffff0\n    MOV X7, X16\n";
     frame_block: string <- "    BL L_dyn_alloc\n    MOV X0, X16\n    MOV X1, X7\n";
     retain: string <- "    BL _silica_rt_state_retain_node\n    CBZ X0, L_region_overflow\n";
@@ -401,10 +414,34 @@ fn w_reg_from_gpr(reg: string) -> string {
     }
 }
 
+// The exact element type of the buffer operand of a buf_load / buf_store (the prim's first operand;
+// prims_tuple@buf_elem_type, the one source of element sizes), or `fallback` when that operand's type is not a
+// buffer spelling.
+fn buf_access_elem_type(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fallback: string) -> string {
+    e: string <- prims_tuple@buf_elem_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name);
+    case length_bytes(e) == 0 of {
+        true -> fallback;
+        false -> e
+    }
+}
+
+// buf_store's width as emit_buf_store names it: the buffer operand's narrow element type, else int64 (a
+// wider element is one 8-byte word); `fallback` when the operand's type is not a buffer spelling.
+fn buf_store_width_type(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, fallback: string) -> string {
+    e: string <- prims_tuple@buf_elem_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).inner)).type_name);
+    case length_bytes(e) == 0 of {
+        true -> fallback;
+        false -> case prims_tuple@buf_elem_bytes_of(e) < 8 of {
+            true -> e;
+            false -> "int64"
+        }
+    }
+}
+
 // buf_load(buf, index): load from buf[index] after optional bounds check in caller wrapper.
 fn emit_buf_load(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string) -> string {
     wd: string <- w_reg_from_gpr(dest);
-    case sir_term_root_node(term).type_name of {
+    case buf_access_elem_type(term, sir_term_root_node(term).type_name) of {
         "int8" -> concat(concat("    LDRSB ", wd), ", [X1, X2]");
         "uint8" -> concat(concat("    LDRB ", wd), ", [X1, X2]");
         "int16" -> concat(concat("    LDRSH ", wd), ", [X1, X2, LSL #1]");
@@ -440,7 +477,7 @@ fn buf_store_value_type(tuple_type: string) -> string {
 // buf_store(buf, index, value): store value at buf[index]
 // Operands: X1 = buf, X2 = pointer to tuple(index, value) from tuple_make.
 fn emit_buf_store(term: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, dest: string, outer_reg: string) -> string {
-    value_type: string <- buf_store_value_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name);
+    value_type: string <- buf_store_width_type(term, buf_store_value_type(sir_term_root_node(sir_term_at(term, sir_term_root_node(term).right_expr)).type_name));
     ldr_val: string <- case value_type of {
         "int8" -> "    LDRSB W3, [X2, #8]\n";
         "uint8" -> "    LDRB W3, [X2, #8]\n";
@@ -646,10 +683,10 @@ fn emit_str_forget_helper() -> string {
 fn emit_frame_helpers() -> string {
     // X16 becomes the new SP first, so X17 is never touched (an indirect callee waits in it while a
     // call's result buffer is allocated, term_emit_kind_call x8_alloc).
-    da1: string <- "L_dyn_alloc:\n    SUB X16, SP, X16\n    STP X9, X10, [X16, #-16]\n    STP X11, X12, [X16, #-32]\n    MOV X9, SP\n    MOV X10, X16\n    LDR X11, [X29, #16]\n";
-    da2: string <- "1:\n    CMP X9, X11\n    B.HS 2f\n    LDR X12, [X9], #8\n    STR X12, [X10], #8\n    B 1b\n2:\n    STR X10, [X29, #16]\n    LDP X11, X12, [X16, #-32]\n    MOV SP, X16\n    MOV X16, X10\n    LDP X9, X10, [SP, #-16]\n    RET\n";
-    ad1: string <- "L_adopt:\n    LDR X9, [X29, #24]\n    LDR X10, [X29, #16]\n    MOV X11, SP\n    CMP X11, X9\n    B.HS 3f\n    SUB X12, X10, X9\n    SUB X13, X11, X12\n    MOV SP, X13\n";
-    ad2: string <- "1:\n    CMP X9, X10\n    B.HS 2f\n    LDR X15, [X9], #8\n    STR X15, [X13], #8\n    B 1b\n2:\n    STR X11, [X29, #16]\n    RET\n3:\n    MOV SP, X9\n    RET\n";
+    da1: string <- "L_dyn_alloc:\n    CMP X16, #2048\n    B.HI 9f\n8:\n    SUB X16, SP, X16\n    STP X9, X10, [X16, #-16]\n    STP X11, X12, [X16, #-32]\n    MOV X9, SP\n    MOV X10, X16\n    LDR X11, [X29, #16]\n";
+    da2: string <- "1:\n    CMP X9, X11\n    B.HS 2f\n    LDR X12, [X9], #8\n    STR X12, [X10], #8\n    B 1b\n2:\n    STR X10, [X29, #16]\n    LDP X11, X12, [X16, #-32]\n    MOV SP, X16\n    MOV X16, X10\n    LDP X9, X10, [SP, #-16]\n    RET\n9:\n    STR X30, [SP, #-16]!\n    BL _silica_rt_stack_room\n    LDR X30, [SP], #16\n    B 8b\n";
+    ad1: string <- "L_adopt:\n    LDR X9, [X29, #24]\n    LDR X10, [X29, #16]\n    MOV X11, SP\n    CMP X11, X9\n    B.HS 3f\n    SUB X12, X10, X9\n    CMP X12, #2048\n    B.HI 7f\n6:\n    SUB X13, X11, X12\n    MOV SP, X13\n";
+    ad2: string <- "1:\n    CMP X9, X10\n    B.HS 2f\n    LDR X15, [X9], #8\n    STR X15, [X13], #8\n    B 1b\n2:\n    STR X11, [X29, #16]\n    RET\n3:\n    MOV SP, X9\n    RET\n7:\n    MOV X14, X30\n    MOV X16, X12\n    BL _silica_rt_stack_room\n    MOV X30, X14\n    B 6b\n";
     concat(concat(concat(da1, da2), concat(ad1, ad2)), emit_str_forget_helper())
 }
 
@@ -681,11 +718,11 @@ fn emit_frame_helpers() -> string {
 fn emit_evacuation_helper() -> string {
     ev0: string <- "L_ev_frame:\n    STP X29, X30, [SP, #-192]!\n    MOV X29, SP\n    STP X19, X20, [SP, #16]\n    STP X21, X22, [SP, #32]\n    STP X23, X24, [SP, #48]\n    STP X25, X26, [SP, #64]\n    STP X27, X28, [SP, #80]\n    ADD X19, X29, #192\n    MOV X20, X3\n    MOV X26, X4\n    MOV X21, X4\n    MOV X22, XZR\n    MOV X24, SP\n    STP X0, X1, [X29, #144]\n    STR X2, [X29, #160]\n    BL L_evw\n    STR X0, [X29, #128]\n";
     ev1: string <- "";
-    ev2: string <- "Lev_root_done:\n    MOV X23, X24\nLev_scan:\n    MOV X9, SP\n    CMP X23, X9\n    B.LS Lev_scan_done\n    LDP X10, X11, [X23, #-48]\n    LDP X12, X13, [X23, #-32]\n    LDP X14, X15, [X23, #-16]\n    SUB X16, X23, #48\n    SUB X16, X16, X15\n    CMP X15, #0\n    CSEL X16, X16, X11, NE\n    SUB X23, X23, #48\n    SUB X23, X23, X15\n    CMP X12, #4\n    B.EQ Lev_s_agg\n    CMP X12, #3\n    B.EQ Lev_s_reftup\n    CMP X12, #2\n    B.EQ Lev_s_ref1\n    CMP X12, #7\n    B.EQ Lev_s_handle\n    CMP X12, #17\n    B.EQ Lev_s_chunk\n    B Lev_scan\nLev_s_agg:\n    MOV X0, X16\n    MOV X1, X13\n    BL Lev_words\n";
-    ev3: string <- "    B Lev_scan\nLev_s_reftup:\n    ADD X0, X16, #8\n    MOV X1, X13\n    BL Lev_words\n    B Lev_scan\nLev_s_ref1:\n    MOV X0, X16\n    MOV X1, X13\n    BL Lev_words\n    B Lev_scan\nLev_s_handle:\n    STR X16, [X29, #144]\n    LDR X0, [X16, #8]\n    MOV X1, #17\n    MOV X2, X13\n    BL L_evw\n    LDR X16, [X29, #144]\n    STR X0, [X16, #8]\n    B Lev_scan\nLev_s_chunk:\n    STR X16, [X29, #144]\n    STR X13, [X29, #152]\n    LDR X9, [X13, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X10, X9, X10, HI\n    STR X10, [X29, #168]\n    ADD X11, X16, X10\n    LDR X12, [X11, #8]\n";
+    ev2: string <- "Lev_root_done:\n    MOV X23, X24\nLev_scan:\n    MOV X9, SP\n    CMP X23, X9\n    B.LS Lev_scan_done\n    LDP X10, X11, [X23, #-48]\n    LDP X12, X13, [X23, #-32]\n    LDP X14, X15, [X23, #-16]\n    SUB X16, X23, #48\n    SUB X16, X16, X15\n    CMP X15, #0\n    CSEL X16, X16, X11, NE\n    SUB X23, X23, #48\n    SUB X23, X23, X15\n    CMP X12, #4\n    B.EQ Lev_s_agg\n    CMP X12, #3\n    B.EQ Lev_s_reftup\n    CMP X12, #2\n    B.EQ Lev_s_ref1\n    CMP X12, #7\n    B.EQ Lev_s_handle\n    CMP X12, #17\n    B.EQ Lev_s_chunk\n    CMP X12, #6\n    B.EQ Lev_s_buf\n    B Lev_scan\nLev_s_agg:\n    MOV X0, X16\n    MOV X1, X13\n    BL Lev_words\n";
+    ev3: string <- "    B Lev_scan\nLev_s_buf:\n    MOV X9, #65536\n    CMP X13, X9\n    B.LO Lev_scan\n    STR X16, [X29, #144]\n    STR X13, [X29, #152]\n    STR XZR, [X29, #160]\nLev_sb_loop:\n    LDR X16, [X29, #144]\n    LDR X9, [X29, #160]\n    LDR X10, [X16]\n    CMP X9, X10\n    B.HS Lev_scan\n    ADD X11, X16, #8\n    LDR X0, [X11, X9, LSL #3]\n    LDR X13, [X29, #152]\n    LDP X1, X2, [X13, #16]\n    BL L_evw\n    LDR X16, [X29, #144]\n    LDR X9, [X29, #160]\n    ADD X11, X16, #8\n    STR X0, [X11, X9, LSL #3]\n    ADD X9, X9, #1\n    STR X9, [X29, #160]\n    B Lev_sb_loop\nLev_s_reftup:\n    ADD X0, X16, #8\n    MOV X1, X13\n    BL Lev_words\n    B Lev_scan\nLev_s_ref1:\n    MOV X0, X16\n    MOV X1, X13\n    BL Lev_words\n    B Lev_scan\nLev_s_handle:\n    STR X16, [X29, #144]\n    LDR X0, [X16, #8]\n    MOV X1, #17\n    MOV X2, X13\n    BL L_evw\n    LDR X16, [X29, #144]\n    STR X0, [X16, #8]\n    B Lev_scan\nLev_s_chunk:\n    STR X16, [X29, #144]\n    STR X13, [X29, #152]\n    LDR X9, [X13, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X10, X9, X10, HI\n    STR X10, [X29, #168]\n    ADD X11, X16, X10\n    LDR X12, [X11, #8]\n";
     ev4: string <- "    STR X12, [X29, #160]\n    LDP X1, X2, [X13, #16]\n    CMP X1, #0\n    B.EQ Lev_sc_next\n    CMP X1, #1\n    B.EQ Lev_sc_next\n    CMP X1, #9\n    B.EQ Lev_sc_next\nLev_sc_loop:\n    LDR X9, [X29, #160]\n    LDR X10, [X29, #168]\n    CMP X9, X10\n    B.HS Lev_sc_next\n    LDR X13, [X29, #152]\n    LDR X11, [X13, #8]\n    ADD X12, X9, X11\n    STR X12, [X29, #160]\n    STR X9, [X29, #176]\n    LDR X16, [X29, #144]\n    LDP X1, X2, [X13, #16]\n    CMP X11, #8\n    B.HI Lev_sc_inline\n    LDR X0, [X16, X9]\n    BL L_evw\n    LDR X16, [X29, #144]\n    LDR X9, [X29, #176]\n    STR X0, [X16, X9]\n    B Lev_sc_loop\nLev_sc_inline:\n    CMP X1, #4\n";
     ev5: string <- "    B.NE Lev_sc_loop\n    ADD X0, X16, X9\n    MOV X1, X2\n    BL Lev_words\n    B Lev_sc_loop\nLev_sc_next:\n    LDR X16, [X29, #144]\n    LDR X10, [X29, #168]\n    LDR X0, [X16, X10]\n    MOV X1, #17\n    LDR X2, [X29, #152]\n    BL L_evw\n    LDR X16, [X29, #144]\n    LDR X10, [X29, #168]\n    STR X0, [X16, X10]\n    B Lev_scan\nLev_scan_done:\n    LDR X0, [X29, #128]\n    SUB X9, X26, X21\n    MOV X10, X20\n    MOV X11, X26\n    MOV X12, X24\n    MOV X13, SP\n    SUB X14, X10, X9\n    CMP X12, X14\n    B.LS Lev_f_noshift\n    SUB X15, X12, X14\n    ADD X15, X15, #15\n    AND X15, X15, #0xfffffffffffffff0\n";
-    ev6: string <- "    SUB X16, X13, X15\n    MOV SP, X16\n    MOV X17, X13\nLev_f_shift:\n    CMP X17, X12\n    B.HS Lev_f_shifted\n    LDR X8, [X17], #8\n    STR X8, [X16], #8\n    B Lev_f_shift\nLev_f_shifted:\n    SUB X12, X12, X15\n    SUB X13, X13, X15\nLev_f_noshift:\n    LDP X19, X20, [X29, #16]\n    LDP X21, X22, [X29, #32]\n    LDP X23, X24, [X29, #48]\n    LDP X25, X26, [X29, #64]\n    LDP X27, X28, [X29, #80]\n    LDP X29, X30, [X29]\n    MOV X15, X10\n    MOV X16, X14\nLev_f_tmove:\n    CMP X15, X11\n    B.HS Lev_f_tmoved\n    LDR X17, [X15], #8\n    STR X17, [X16], #8\n    B Lev_f_tmove\nLev_f_tmoved:\n    MOV X15, X12\nLev_f_body:\n";
+    ev6: string <- "    MOV X16, X15\n    CMP X16, #2048\n    B.LS Lev_f_room\n    BL _silica_rt_stack_room\nLev_f_room:\n    SUB X16, X13, X15\n    MOV SP, X16\n    MOV X17, X13\nLev_f_shift:\n    CMP X17, X12\n    B.HS Lev_f_shifted\n    LDR X8, [X17], #8\n    STR X8, [X16], #8\n    B Lev_f_shift\nLev_f_shifted:\n    SUB X12, X12, X15\n    SUB X13, X13, X15\nLev_f_noshift:\n    LDP X19, X20, [X29, #16]\n    LDP X21, X22, [X29, #32]\n    LDP X23, X24, [X29, #48]\n    LDP X25, X26, [X29, #64]\n    LDP X27, X28, [X29, #80]\n    LDP X29, X30, [X29]\n    MOV X15, X10\n    MOV X16, X14\nLev_f_tmove:\n    CMP X15, X11\n    B.HS Lev_f_tmoved\n    LDR X17, [X15], #8\n    STR X17, [X16], #8\n    B Lev_f_tmove\nLev_f_tmoved:\n    MOV X15, X12\nLev_f_body:\n";
     ev7: string <- "    CMP X15, X13\n    B.LS Lev_f_done\n    LDP X1, X2, [X15, #-48]\n    LDP X3, X4, [X15, #-16]\n    SUB X15, X15, #48\n    SUB X15, X15, X4\n    ADD X3, X3, #7\n    AND X3, X3, #0xfffffffffffffff8\n    MOV X5, #0\nLev_f_copy:\n    CMP X5, X3\n    B.HS Lev_f_body\n    LDR X6, [X15, X5]\n    STR X6, [X2, X5]\n    ADD X5, X5, #8\n    B Lev_f_copy\nLev_f_done:\n    MOV SP, X14\n    SUB X1, X11, X9\n    RET\n";
     ev8: string <- "";
     ev9: string <- "Lev_words:\n    STR X30, [X29, #136]\n    STR X0, [X29, #96]\n    STR X1, [X29, #104]\n    LDR X9, [X1]\n    STR X9, [X29, #120]\n    STR XZR, [X29, #112]\nLev_w_loop:\n    LDR X9, [X29, #112]\n    LDR X10, [X29, #120]\n    CMP X9, X10\n    B.HS Lev_w_done\n    LDR X11, [X29, #104]\n";
@@ -694,9 +731,9 @@ fn emit_evacuation_helper() -> string {
     ev12: string <- "    B.EQ Lw_ref1\n    CMP X1, #6\n    B.EQ Lw_buf\n    CMP X1, #7\n    B.EQ Lw_handle\n    CMP X1, #17\n    B.EQ Lw_chunk\n    CMP X1, #8\n    B.EQ Lw_string\nLw_ret:\n    RET X28\nLw_old:\n    MOV X9, SP\n    CMP X0, X9\n    B.LO Lw_old_ok\n    CMP X0, X19\n    B.LO Lw_ret\nLw_old_ok:\n    CMP X1, #4\n    B.EQ Lw_old_agg\n    CMP X1, #5\n    B.NE Lw_ret\n    LDR X9, [X0]\n    LDR X10, [X2]\n    MVN X10, X10\n    ADD X11, X2, #8\nLw_old_sum:\n    CBZ X10, Lw_ret\n    LDP X12, X13, [X11], #16\n    SUB X10, X10, #1\n";
     ev13: string <- "    CMP X12, X9\n    B.NE Lw_old_sum\n    MOV X2, X13\nLw_old_agg:\n    MOV X10, X24\nLw_old_seen:\n    MOV X9, SP\n    CMP X10, X9\n    B.LS Lw_old_new\n    LDP X11, X12, [X10, #-16]\n    LDR X13, [X10, #-48]\n    SUB X10, X10, #48\n    SUB X10, X10, X12\n    CBNZ X12, Lw_old_seen\n    CBNZ X11, Lw_old_seen\n    CMP X13, X0\n    B.NE Lw_old_seen\n    RET X28\nLw_old_new:\n    SUB SP, SP, #48\n    MOV X11, SP\n    STP X0, X0, [X11]\n    MOV X9, #4\n    STP X9, X2, [X11, #16]\n    STP XZR, XZR, [X11, #32]\n    RET X28\nLw_fwd:\n    AND X0, X9, #0x7fffffffffffffff\n    RET X28\nLw_agg:\n";
     ev14: string <- "    LDR X3, [X2]\n    LSL X3, X3, #3\n    BL Lw_copy\n    MOV X0, X5\n    RET X28\nLw_reftup:\n    LDR X9, [X0]\n    TBNZ X9, #63, Lw_fwd\n    LDR X3, [X2]\n    LSL X3, X3, #3\n    ADD X3, X3, #8\n    BL Lw_copy\n    ADD X9, X5, #8\n    STR X9, [X6]\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_ref1:\n    LDR X9, [X0, #8]\n    TBNZ X9, #63, Lw_fwd\n    MOV X3, #16\n    BL Lw_copy\n    STR XZR, [X6, #8]\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0, #8]\n    MOV X0, X5\n    RET X28\nLw_buf:\n    LDR X9, [X0, #-8]\n";
-    ev15: string <- "    TBZ X9, #63, Lw_buf_copy\n    AND X9, X9, #0x7fffffffffffffff\n    ADD X0, X9, #8\n    RET X28\nLw_buf_copy:\n    MUL X3, X9, X2\n    ADD X3, X3, #15\n    AND X3, X3, #0xfffffffffffffff8\n    SUB X0, X0, #8\n    BL Lw_copy\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    ADD X0, X5, #8\n    RET X28\nLw_handle:\n    LDR X9, [X0]\n    TBNZ X9, #63, Lw_fwd\n    MOV X3, #24\n    BL Lw_copy\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_chunk:\n    LDR X9, [X2, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X10, X9, X10, HI\n    ADD X11, X0, X10\n    LDR X9, [X11, #8]\n";
+    ev15: string <- "    TBZ X9, #63, Lw_buf_copy\n    AND X9, X9, #0x7fffffffffffffff\n    ADD X0, X9, #8\n    RET X28\nLw_buf_copy:\n    MOV X3, X2\n    LSR X10, X2, #16\n    CBZ X10, Lw_buf_eb\n    MOV X3, #8\nLw_buf_eb:\n    MUL X3, X9, X3\n    ADD X3, X3, #15\n    AND X3, X3, #0xfffffffffffffff8\n    SUB X0, X0, #8\n    BL Lw_copy\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    ADD X0, X5, #8\n    RET X28\nLw_handle:\n    LDR X9, [X0]\n    TBNZ X9, #63, Lw_fwd\n    MOV X3, #24\n    BL Lw_copy\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_chunk:\n    LDR X9, [X2, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X10, X9, X10, HI\n    ADD X11, X0, X10\n    LDR X9, [X11, #8]\n";
     ev16: string <- "    TBNZ X9, #63, Lw_fwd\n    ADD X3, X10, #16\n    BL Lw_copy\n    LDR X9, [X2, #8]\n    MOV X10, #16\n    CMP X9, X10\n    CSEL X10, X9, X10, HI\n    ADD X11, X0, X10\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X11, #8]\n    MOV X0, X5\n    RET X28\nLw_string:\n    LDR X9, [X0]\n    CMN X9, #1\n    B.EQ Lw_str_copy\n    TBZ X9, #63, Lw_ret\n    CMN X9, #2\n    B.EQ Lw_ret\n    B Lw_fwd\nLw_str_copy:\n    LDR X3, [X0, #16]\n    ADD X3, X3, #25\n    BL Lw_copy\n    LDR X9, [X0, #8]\n    ADD X10, X0, #24\n    CMP X9, X10\n    B.EQ Lw_str_fix\n    LDR X11, [X0, #16]\n    ADD X11, X11, #1\n";
-    ev17: string <- "    ADD X12, X6, #24\nLw_str_bytes:\n    CBZ X11, Lw_str_fix\n    LDRB W13, [X9], #1\n    STRB W13, [X12], #1\n    SUB X11, X11, #1\n    B Lw_str_bytes\nLw_str_fix:\n    MOV X9, X5\n    BL L_str_forget\n    ADD X9, X5, #24\n    STR X9, [X6, #8]\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_copy:\n    MOV X27, X30\n    ADD X7, X3, #7\n    AND X7, X7, #0xfffffffffffffff8\n    ADD X8, X3, #15\n    AND X8, X8, #0xfffffffffffffff0\n    SUB X21, X21, X8\n    MOV X5, X21\n    ADD X9, X8, #48\n    MOV X10, SP\n    SUB X10, X10, X9\n    MOV SP, X10\n    MOV X6, X10\n";
+    ev17: string <- "    ADD X12, X6, #24\nLw_str_bytes:\n    CBZ X11, Lw_str_fix\n    LDRB W13, [X9], #1\n    STRB W13, [X12], #1\n    SUB X11, X11, #1\n    B Lw_str_bytes\nLw_str_fix:\n    MOV X9, X5\n    BL L_str_forget\n    ADD X9, X5, #24\n    STR X9, [X6, #8]\n    ORR X9, X5, #0x8000000000000000\n    STR X9, [X0]\n    MOV X0, X5\n    RET X28\nLw_copy:\n    MOV X27, X30\n    ADD X7, X3, #7\n    AND X7, X7, #0xfffffffffffffff8\n    ADD X8, X3, #15\n    AND X8, X8, #0xfffffffffffffff0\n    SUB X21, X21, X8\n    MOV X5, X21\n    ADD X9, X8, #48\n    MOV X16, X9\n    CMP X16, #2048\n    B.LS Lw_copy_room\n    BL _silica_rt_stack_room\nLw_copy_room:\n    MOV X10, SP\n    SUB X10, X10, X9\n    MOV SP, X10\n    MOV X6, X10\n";
     ev18: string <- "    ADD X11, X10, X8\n    STP X0, X5, [X11]\n    STP X1, X2, [X11, #16]\n    STP X3, X8, [X11, #32]\nLw_copy_bytes:\n    MOV X12, #0\nLw_copy_loop:\n    CMP X12, X7\n    B.HS Lw_copy_done\n    LDR X13, [X0, X12]\n    STR X13, [X6, X12]\n    ADD X12, X12, #8\n    B Lw_copy_loop\n";
     ev19: string <- "Lw_copy_done:\n    RET X27\n";
     concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(concat(ev0, ev1), ev2), ev3), ev4), ev5), ev6), ev7), ev8), ev9), ev10), ev11), ev12), ev13), ev14), ev15), ev16), ev17), ev18), ev19)

@@ -20,7 +20,7 @@
 #
 # It reads trials/targets/<target>.conf, then calls board_suite.sh with BOARD_ONLY_STEM=<stem>, so the
 # staging (the trial, the suite's lib/ modules, the trial-support module the trial `use`s and Supervisor),
-# the compile with binaries/silica-compiler-<target>, the assembly-golden check, the image build with the
+# the compile with binaries/TRIAL_BUILD_silica-compiler-<target>, the assembly-golden check, the image build with the
 # target's board/tools/build_image.sh, the load and run through the target's board/tools/run_on_board.py
 # and the comparison with <stem>.scout (or <stem>.<target>.scout) with the suite's compare script are the
 # suite run's own code. The diff is printed on a mismatch. A compile-failure trial (.golden_fail) works too.
@@ -64,7 +64,7 @@ TARGET_IMAGE_EXT="bin"; TARGET_PORT_DEFAULT=""; TARGET_PY_MODULES="esptool seria
 . "$conf"
 tools="$repo_root/$TARGET_BOARD_DIR/tools"
 py="${BOARD_PYTHON:-$TARGET_PYTHON}"
-compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/silica-compiler-$target}"
+compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/TRIAL_BUILD_silica-compiler-$target}"
 
 # The per-target trial lock (trials/.integrate.lock.<target>): refuses while a run of this target is in
 # progress, and keeps one off while this trial runs; other targets are not affected.
