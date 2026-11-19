@@ -257,6 +257,32 @@ done < <(cd "$src" && find . -type f -name '*.silica' -not -path './.*' | sed 's
 # supervisor_addition). Staging those too compiled every such module twice, and the two objects
 # defined every function of the module again (ld: multiple definition of `brodal_okasaki_...`).
 
+# TRIAL_SUITE_SLICE=<suite>:<mod>:<res> keeps one slice of this suite. Other
+# suites in the same job are named in full and ignore the variable.
+case "${TRIAL_SUITE_SLICE:-}" in
+    "$suite":*:*)
+        _slice=${TRIAL_SUITE_SLICE#"$suite":}
+        _mod=${_slice%%:*}
+        _res=${_slice#*:}
+        _kept=()
+        _i=0
+        for _stem in "${programs[@]+"${programs[@]}"}"; do
+            if [ $((_i % _mod)) -eq "$_res" ]; then _kept+=("$_stem"); fi
+            _i=$((_i + 1))
+        done
+        programs=("${_kept[@]+"${_kept[@]}"}")
+        _kept=()
+        _i=0
+        for _stem in "${failtrials[@]+"${failtrials[@]}"}"; do
+            if [ $((_i % _mod)) -eq "$_res" ]; then _kept+=("$_stem"); fi
+            _i=$((_i + 1))
+        done
+        failtrials=("${_kept[@]+"${_kept[@]}"}")
+        printf 'Slice %s of %s: %d programs, %d compile-failure trials\n' \
+            "$_res" "$_mod" "${#programs[@]}" "${#failtrials[@]}"
+        ;;
+esac
+
 # Standard-library modules the suite's Makefile adds to its silica.config (echo "../../compiler/stdlib/
 # <Module>.silica"): compiled with the programs as support modules, the way the host does.
 while IFS= read -r m; do

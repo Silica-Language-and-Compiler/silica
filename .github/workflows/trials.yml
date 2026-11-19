@@ -1,0 +1,176 @@
+# Run the trial tree for one architecture, or for every architecture.
+#
+# Dispatch only. Push the branch first so the Compiler workflow builds it.
+# This workflow waits for that run, installs its artifacts, and runs the trials.
+# A failed shard is the list `gh run view --log-failed` shows.
+#
+# Fifteen shards split the suites by source count. error_enforcement_addition
+# is about half the sources, so every shard runs one slice of it
+# (TRIAL_SUITE_SLICE) and the other suites run whole, each in one shard.
+# Suites with INTEGRATE_PENDING are left out, which is what `make integrate`
+# does. The ESP32-S3 shards boot each image in Espressif QEMU
+# (SILICA_BOARD_EMULATOR=qemu). That is not a board: USB, the GPIO matrix, and
+# the wall-clock stamp are absent, and a trial that dies before SILICA:START
+# is a model gap showing up as a failed trial.
+
+name: Trials
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Architecture
+        type: choice
+        default: all
+        options:
+          - all
+          - apple_silicon_mac
+          - linux_aarch64
+          - linux_x86_64
+          - ESP32-S3_raw
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: trials-${{ github.ref }}-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    outputs:
+      run_id: ${{ steps.compiler.outputs.run_id }}
+      include: ${{ steps.matrix.outputs.include }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Wait for the compiler build of this commit
+        id: compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/wait_for_compiler_run.sh
+
+      - name: Split the trial tree into 15 shards
+        id: matrix
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          include="$(python3 .github/scripts/trial_matrix.py --trials trials --target "$TARGET" --shards 15)"
+          python3 -c 'import json,os,sys; rows=json.loads(sys.argv[1]); print("%d jobs" % len(rows))' "$include"
+          delimiter="$(uuidgen)"
+          {
+            echo "include<<${delimiter}"
+            echo "$include"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+  run:
+    name: ${{ matrix.target }} ${{ matrix.shard }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.include) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux host tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang
+
+      - name: Leave memory for the trials
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
+          sudo systemctl mask systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
+          have_kb="$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)"
+          if [ "${have_kb}" -lt $((4 * 1024 * 1024)) ]; then
+            avail_kb="$(df -Pk / | awk 'NR==2 { print $4 }')"
+            swap_kb="$((avail_kb - 4 * 1024 * 1024))"
+            if [ "${swap_kb}" -gt $((8 * 1024 * 1024)) ]; then
+              swap_kb="$((8 * 1024 * 1024))"
+            fi
+            if [ "${swap_kb}" -gt $((2 * 1024 * 1024)) ]; then
+              if sudo fallocate -l "${swap_kb}K" /swap-ci \
+                && sudo chmod 600 /swap-ci \
+                && sudo mkswap /swap-ci \
+                && sudo swapon /swap-ci; then
+                echo "added ${swap_kb}K of swap at /swap-ci"
+              else
+                sudo swapoff /swap-ci 2>/dev/null || true
+                sudo rm -f /swap-ci
+              fi
+            fi
+          fi
+          free -h
+
+      - name: Cache the ESP32 emulator tools
+        if: matrix.target == 'ESP32-S3_raw'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/silica-esp32
+          key: silica-esp32-emulator-v1
+
+      - name: Install the ESP32 emulator
+        if: matrix.target == 'ESP32-S3_raw'
+        env:
+          SILICA_ESP32_TOOLS: ${{ runner.tool_cache }}/silica-esp32
+        run: bash .github/scripts/install_esp32_emulator.sh
+
+      - name: Install the compiler this commit built
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/install_trial_compiler.sh "${{ needs.plan.outputs.run_id }}" "${{ matrix.target }}"
+
+      - name: Run this shard
+        working-directory: trials
+        env:
+          SILICA_TARGET_PROMPT: "0"
+          INTEGRATE_WATCHDOG_MINUTES: "45"
+          TRIAL_SUITE_SLICE: ${{ matrix.suite_slice }}
+        run: |
+          set -euo pipefail
+          make integrate \
+            TRIAL_TARGET="${{ matrix.trial_target }}" \
+            TRIAL_SUITES="${{ matrix.suites }}" \
+            JOBS=2 \
+            SDS_JOBS=1 \
+            SILICA_TARGET_PROMPT=0
+
+      - name: Collect the reports
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/trial-report"
+          find trials \
+            \( -name '.integrate_report' -o -name '.integrate_report.*' \
+               -o -name '.integrate_log' -o -name '.integrate_log.*' \) \
+            -type f -print0 |
+            while IFS= read -r -d '' file; do
+              rel="${file#trials/}"
+              mkdir -p "${RUNNER_TEMP}/trial-report/$(dirname "$rel")"
+              cp -p "$file" "${RUNNER_TEMP}/trial-report/$rel"
+            done
+
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trials-${{ matrix.target }}-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/trial-report
+          if-no-files-found: ignore

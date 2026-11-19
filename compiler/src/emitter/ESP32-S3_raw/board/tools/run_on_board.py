@@ -63,6 +63,10 @@ Exit status: 0 a marker pair was seen; 3 no exit marker before the timeout (the 
 to stderr); 4 the board is unavailable (no or ambiguous port, cannot connect, not an ESP32-S3,
 MAC mismatch, serial error); 2 usage.
 
+SILICA_BOARD_EMULATOR=qemu runs the image under Espressif QEMU instead of a serial port.
+SILICA_QEMU is qemu-system-xtensa. The .bin is placed at offset 0 of a 2 MB flash image and the
+model boots it, the same way a flashed board does. There is no USB port and no wall-clock stamp.
+
 Must run under the ESP-IDF Python environment (it provides esptool and pyserial), e.g.
     ~/.espressif/python_env/idf6.2_py3.14_env/bin/python run_on_board.py image.bin
 """
@@ -70,9 +74,12 @@ Must run under the ESP-IDF Python environment (it provides esptool and pyserial)
 import argparse
 import glob
 import os
+import signal
+import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 START = b"\x02SILICA:START\x03"
@@ -260,6 +267,125 @@ def flash(port, image):
         raise BoardUnavailable("flashing failed")
 
 
+class _SocketPort:
+    """Enough of a pyserial port for capture(): read, write, flush, timeout."""
+
+    def __init__(self, sock):
+        self._sock = sock
+        self.timeout = 0.05
+
+    def read(self, n):
+        self._sock.settimeout(self.timeout)
+        try:
+            return self._sock.recv(n)
+        except socket.timeout:
+            return b""
+        except OSError:
+            return b""
+
+    def write(self, data):
+        self._sock.sendall(data)
+
+    def flush(self):
+        pass
+
+
+def _drain_pipe(pipe, bucket, limit=65536):
+    try:
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                break
+            bucket.extend(chunk)
+            if len(bucket) > limit:
+                del bucket[:len(bucket) - limit]
+    except Exception:
+        pass
+
+
+def _qemu_flash(image_path):
+    """The ROM boots an image flashed at offset 0. QEMU wants a 2, 4, 8, or 16 MB flash."""
+    with open(image_path, "rb") as f:
+        data = f.read()
+    size = 2 * 1024 * 1024
+    while size < len(data):
+        size *= 2
+    if size > 16 * 1024 * 1024:
+        raise BoardUnavailable("image is %d bytes, larger than QEMU's 16 MB flash" % len(data))
+    flash = image_path + ".qemu-flash"
+    with open(flash, "wb") as f:
+        f.write(data)
+        if size > len(data):
+            f.write(b"\xff" * (size - len(data)))
+    return flash
+
+
+def _connect_qemu(port, proc):
+    deadline = time.time() + 20
+    last = "timed out"
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise BoardUnavailable("qemu exited before the console opened (status %s)" % proc.returncode)
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=1)
+        except OSError as e:
+            last = str(e)
+            time.sleep(0.1)
+    raise BoardUnavailable("qemu console did not accept a connection: %s" % last)
+
+
+def run_under_qemu(image, timeout, send=None, send_delay=1.0):
+    qemu = os.environ.get("SILICA_QEMU", "")
+    if not qemu or not os.path.isfile(qemu) or not os.access(qemu, os.X_OK):
+        raise BoardUnavailable("SILICA_BOARD_EMULATOR=qemu but SILICA_QEMU is not an executable (%s)" % (qemu or "unset"))
+    flash = _qemu_flash(image)
+    holder = socket.socket()
+    holder.bind(("127.0.0.1", 0))
+    port = holder.getsockname()[1]
+    holder.close()
+    cmd = [
+        qemu, "-machine", "esp32s3", "-display", "none", "-nographic", "-monitor", "none",
+        "-drive", "file=%s,if=mtd,format=raw" % flash,
+        "-serial", "tcp:127.0.0.1:%d,server,nowait" % port,
+        # TG0's watchdog is on at reset. A slow model can fire it before _start disarms it.
+        "-global", "driver=timer.esp32c3.timg,property=wdt_disable,value=true",
+    ]
+    stderr_tail = bytearray()
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, start_new_session=True)
+    drainer = threading.Thread(target=_drain_pipe, args=(proc.stderr, stderr_tail), daemon=True)
+    drainer.start()
+    try:
+        sock = _connect_qemu(port, proc)
+        adapter = _SocketPort(sock)
+        try:
+            out, status, diag = capture(adapter, timeout, send, send_delay)
+        finally:
+            sock.close()
+        if out is None and stderr_tail:
+            note = bytes(stderr_tail).decode(errors="replace").strip()
+            if note:
+                diag = diag + b"\n" + note.encode()
+        if proc.poll() is not None and out is None:
+            diag = diag + ("\nqemu exited %s" % proc.returncode).encode()
+        return out, status, diag
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        try:
+            os.remove(flash)
+        except OSError:
+            pass
+
+
 def reset_and_capture(port_name, timeout, send=None, send_delay=1.0):
     import serial  # from the ESP-IDF Python environment
     try:
@@ -304,6 +430,37 @@ def main():
     send = None
     if a.send is not None:
         send = a.send.encode("utf-8").decode("unicode_escape").encode("latin-1")
+
+    if os.environ.get("SILICA_BOARD_EMULATOR") == "qemu":
+        if a.list_ports:
+            print("qemu")
+            return 0
+        if a.probe:
+            if a.expect_mac:
+                sys.stderr.write("run_on_board: the QEMU model has no board MAC (expected %s)\n" % a.expect_mac)
+                return EXIT_BOARD
+            print("qemu ESP32-S3 emulated")
+            return 0
+        if not a.image:
+            ap.error("an image is required")
+        try:
+            out, status, diag = run_under_qemu(a.image, a.timeout, send, a.send_delay)
+        except BoardUnavailable as e:
+            sys.stderr.write("run_on_board: %s\n" % e)
+            return EXIT_BOARD
+        if out is None:
+            sys.stderr.write("run_on_board: no exit marker within %.0fs; raw console:\n" % a.timeout)
+            sys.stderr.write(diag.decode(errors="replace") + "\n")
+            return EXIT_TIMEOUT
+        text = out + status.encode() + b"\n"
+        if a.out:
+            with open(a.out, "wb") as f:
+                f.write(text)
+        else:
+            sys.stdout.buffer.write(text)
+        if diag.strip():
+            sys.stderr.write(diag.decode(errors="replace").strip() + "\n")
+        return 0
 
     if a.list_ports:
         for p in candidate_ports():
