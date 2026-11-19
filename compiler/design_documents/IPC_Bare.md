@@ -251,6 +251,8 @@ If no message exists, the scheduler selects another ready actor.
 
 # Mailbox Full Policy
 
+> **Superseded (2026-11-14, Lee).** This policy assumed fixed-slot circular mailboxes with a compile-time payload ceiling. The runtime uses queues of allocated message nodes instead (see the implementation status note at the top), so the policy is not wanted and is not scheduled. It is kept below for the record.
+
 When every slot is occupied, `send` must not grow storage. The runtime uses a compile-time policy, for example:
 
 - **Reject** — return a full/busy result to the sender (preferred for actor-to-actor sends).
@@ -453,6 +455,8 @@ mailbox_bytes ≈ SLOT_COUNT × (HEADER_BYTES + MAX_PAYLOAD + ALIGNMENT_PADDING)
 - Multi-core support
 - Optional large-payload path (shared buffer or DMA) alongside fixed slots
 - Compact payload arenas to reduce internal fragmentation
+
+*Status (2026-11-14): timers and delayed messages exist (`send_after`/`cancel_timer`), priority handling and multi-core exist in other forms in the ESP32-S3_raw runtime. Still absent: publish/subscribe, DMA message producers, the large-payload path and payload arenas.*
 
 ---
 

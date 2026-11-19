@@ -5,7 +5,7 @@ connects to an Erlang node's `gen_tcp` listener, sends one accelerometer reading
 4-byte length prefix (`{packet, 4}`), and prints the LED command the Erlang side answers with.
 
 - `dangerous_telemetry.silica`: the program. A `(:tcp)` carrier (`dangerous_tcp_carrier`) is installed with
-  `spawn_dangerous` and opened against `127.0.0.1:<port>`; on `:link_up` the owner grants receive credit and
+  `spawn_dangerous` and opened against `127.0.0.1:<port>:<timeout_ms>` (the connect timeout in milliseconds is required; the demo uses 3000); on `:link_up` the owner grants receive credit and
   sends `(:accel, { x: 1, y: -2, z: 512, at_ms: 1000 })` through `encode((:etf), ...)` and
   `wireframe@frame(frame, Carrier@mtu((:tcp)), Carrier@boundaries((:tcp)))`, the carrier tag spelled as the
   design spells it; the reply segment is reassembled with `wireframe@unframe` and decoded into

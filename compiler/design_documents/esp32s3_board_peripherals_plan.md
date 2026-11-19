@@ -153,7 +153,7 @@ that OS adaptation, which conflicts with the port being ESP-IDF-free and with th
 (the radio's internals are not reachable). This is a separate decision, together with
 [ROADMAP.md](../../ROADMAP.md) chunk 9, "Networking through Fifi": networking is not part of the language
 (spec §20.4) and is reached through the Foreign Function Interface, so a radio stack would arrive as foreign
-code under that model rather than as device workers. The radio decision is independent of the Silica
+code under that model rather than as device workers. **Decided 2026-11-09:** Lee chose route R2 (ESP-IDF's Wi-Fi component as foreign code; `transport_esp32s3_wifi_plan.md` §3); the radio work is deferred, not cancelled (§8 there), and no radio code exists yet. The radio decision is independent of the Silica
 network stack of §4.6, which can sit on a wired link (UART1, USB, SPI Ethernet) and, if Wi-Fi is ever
 adopted, on top of the radio's link layer.
 
@@ -279,12 +279,35 @@ Items A to D are the agreed steps 1 to 4, in that order. Prerequisites sit where
 | E | `poke_n` spec addition and implementation, only if C or a later driver needs it. Closed 2026-10-29, not needed (see §2) | spec decision first (§2) | none |
 | F | USB-Serial-JTAG second-console worker | B | USB-Serial-JTAG (full register set) |
 | G | I2C0 controller worker; accelerometer readings; minibadge I2C; GPIO worker for minibadge lines | B; minibadge pin question (§6) settled | I2C0, GPIO, IO_MUX |
+
+**Item G, status 2026-11-16.** Done on the board: the I2C0 controller as a master (`device_lib/device_esp32s3_i2c0`, board-pack
+window 13 at 0x60013000, 100 kHz from the 40 MHz crystal, polled) and the accelerometer worker over it
+(`device_lib/device_mma8452q`); apps `silica_34_device_accelerometer` (matches its expected output) and
+`silica_35_device_accelerometer_tilt`. The base address is confirmed by the part answering WHO_AM_I, and the gate
+"readings change when the board tilts" was met with the tilt app on 2026-11-16 (Lee turned the board while it ran).
+Two of the four failure outcomes are provoked without hands and recovered from: `:nack` (`silica_36`, a device address
+with nothing at it) and `:stuck` (`silica_37`, the controller's clock gate off). The first of them found a fault in the
+driver: after a refused transfer the controller took no further transfer until the whole peripheral was reset
+(`i2c0_recover`); neither the state-machine reset in CTR nor a STOP-only program brought it back. Not done: the
+minibadge I2C and its GPIO lines; a bus worker that serves several devices; `:timeout` and `:arbitration_lost` (below).
+
+**Item G, not completed (logged 2026-11-16).** The plan's gate "I2C ACK and timeout paths exercised" is met for the ACK
+path only.
+
+| Outcome | State | What it needs |
+| --- | --- | --- |
+| `:timeout` | not provoked, not completed | SCL (GPIO42) held to ground at a minibadge header during a transfer; an app that prints each read's outcome while a person holds and releases the line; a check that `i2c0_recover` brings the controller back afterwards |
+| `:arbitration_lost` | not provoked, not completed | the same with SDA (GPIO41); the outcome may depend on when the line goes low (held before the start, the controller may see a busy bus and report `:stuck`), so the app should record what each timing gives |
+
+Until both are provoked on the board, the driver's handling of them is written from the register description and
+unverified.
+
 | H | DMA per spec §5.3 (GDMA window, buffer move-and-return) | B; optional for G | GDMA |
 | I | SD block access on SPI3 | B; H recommended | SPI3, GDMA, GPIO, IO_MUX |
 | J | Filesystem layer chosen per §4.3 and its `file_io` backend for this target | I; choice settled (§6) | none beyond I |
 | K | Interrupt runtime per spec §9 (handler acks and enqueues to the owning worker; pack names IRQ to worker) | design decision (§6) | interrupt matrix, SYSTEM |
 | L | USB OTG device/host stack | B, H, K | USB OTG, GDMA |
-| M | Radio: a decision, not scheduled work | networking chunk | n/a |
+| M | Radio: decided 2026-11-09 (Lee chose R2, ESP-IDF Wi-Fi as foreign code, `transport_esp32s3_wifi_plan.md` §3); the radio work (stages 3 to 9) is deferred, not cancelled (that plan's §8); no radio code exists | networking chunk | n/a |
 | N | UART1 device worker and SLIP (or PPP) link worker | B | UART1, GPIO, IO_MUX, SYSTEM (clock gate) |
 | O | Silica network stack core: owned packet buffers, checksum and byte-order helpers, IPv4, ARP (Ethernet links), ICMP, DHCP, DNS as supervised actors; UDP endpoint actors (one per bound port, a datagram per message) | N; bounds checking (chunk 4) | none beyond N |
 | P | TCP demultiplexer, connection actors (own state machine, retransmission and delayed-ACK timers) and listener actors; the actor surface for programs (connect message returning the connection ref, owner delivery, owned-buffer cast to send, credit-based flow control in both directions) | O; timer source settled (§6) | SYSTIMER or TIMG0/1 if a board-local timer worker is used |
@@ -318,7 +341,9 @@ Items A to D are the agreed steps 1 to 4, in that order. Prerequisites sit where
   that allows.
 - SLIP or PPP for the first link (PPP adds negotiation and authentication; SLIP is smaller).
 
-### Known issue: board emitter heap (recorded 2026-10-28)
+### Known issue: board emitter heap (recorded 2026-10-28; fixed 2026-11-07)
+
+**Fixed (2026-11-07):** chunk 15 phase 9 landed in `029447ad31` ("ESP32-S3_raw: port to the chunk 15 stack memory model (state chains, no actor heap use)"; `make integrate ESP32-S3_raw` 22,694 pass, 0 fail). The two reproducers below were not re-run against the fixed compiler. The text below is the record as written before the fix.
 
 On the board emitter, before chunk 15 phase 9 (`chunk15_stack_memory_design.md` §9.1, §11.1; phase 2 changed only the hosted emitters):
 

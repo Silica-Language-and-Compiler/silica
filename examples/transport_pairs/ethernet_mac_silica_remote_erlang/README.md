@@ -46,7 +46,7 @@ compares each frame it receives with `term_to_binary(binary_to_term(F), [determi
 ## The two ends
 
 - **The Mac end** is the accel side of `../ethernet_direct`, built here with `binaries/silica-compiler` from that
-  source. It dials `138.197.209.113:4550`, sends accel requests and answers status requests.
+  source. It dials `138.197.209.113:4550` (the dial address is `138.197.209.113:4550:3000`; the third part is the required connect timeout in ms), sends accel requests and answers status requests.
   - Its carrier declaration is `carried_on wire: (:tcp) (:interface, "en0");`, the interface of this Mac's
     default route (`run.sh` reads it from `route -n get default`; `MAC_IFACE` overrides it; the `--local` copy
     declares `(:interface, "lo0")`). The interface binding is enforced since stage E2 (built 2026-11-12; not yet re-run here):

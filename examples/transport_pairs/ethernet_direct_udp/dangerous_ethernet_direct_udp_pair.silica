@@ -1,0 +1,353 @@
+// One Silica program for both ends of the direct Mac -> Linux UDP pair (examples/transport_pairs/ethernet_direct_udp,
+// run_direct_udp.sh). UDP is datagram: there is no connection and no delivery guarantee, and the carrier's :rx carries
+// no peer address, so this pair is one-way and tolerates loss by repetition instead of by acknowledgement:
+//
+//   sender (the Mac)    sends the 5 numbered samples (:sample, n: int64, value: int64), n = 1..5, value = 100 * n + 7,
+//                       three rounds of five, one datagram every 100 ms (15 datagrams); each is a bare ETF term
+//                       behind wireframe's 4-byte length prefix, one per datagram.
+//   receiver (Linux)    counts DISTINCT numbers (a bit mask); a repeat is ignored. It is done when all five numbers have
+//                       arrived, so any two of the three copies of a number may be lost, and reordering does not matter.
+//
+// The sender does not wait for the receiver (nothing comes back): run_direct_udp.sh starts the receiver first and waits
+// until it is bound. Each end opens "<peer ip>:<port>@<port>": the peer of every :tx segment, then the local form
+// "<port>", which under the declared link binds that interface's FIRST IPv4 address (datagrams leave from it and arrive
+// on it). The Linux end's peer is never used (it never sends); the link does not restrict the peer.
+//
+// The per-host differences are made at compile time by run_direct_udp.sh with sed: the carrier's link (the first
+// line below), the open address, and the role (sends()). A named link refuses the local form "any:<port>": a literal
+// one is E2418 at compile time, a computed one ends the carrier (:link_down, :fault) and then (:explicit,
+// :link_unavailable); an end that sees :link_down prints "link down <why>" and exits 1.
+//
+// Done: the sender prints "sent 15 datagrams" 500 ms after the last one and exits 0; the receiver prints "received all 5
+// numbers" and exits 0 one second later (it closes its endpoint first). Without all five numbers within 45 s the
+// receiver prints "timeout: not all 5 numbers arrived" and exits 5.
+module dangerous_ethernet_direct_udp_pair;
+
+use wire_etf;
+use wireframe;
+use Carrier;
+use dangerous_sockets;
+use trial_wait_int64;
+
+// ---- Per-host settings (run_direct_udp.sh rewrites these three lines; the defaults are the Mac's copy) ----
+carried_on wire: (:udp) (:interface, "en0");
+fn open_address() -> string { "138.197.209.113:4551@4551" }
+fn sends() -> boolean { true }
+
+fn timeout_ms() -> uint64 {
+    45000
+}
+
+fn sample_count() -> int64 {
+    5
+}
+
+fn round_count() -> int64 {
+    3
+}
+
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+fn bit_of(n: int64) -> uint32 {
+    one: uint32 <- 1;
+    one shl n
+}
+
+fn all_mask() -> uint32 {
+    62
+}
+
+fn say(label: string, why: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(why);
+        _: atom <- println("")
+    produces
+        pure :ok
+    end
+}
+
+// ---- The sender ----
+fn sample_segment(n: int64) -> string {
+    sequence proc[mem(normal), transport]
+        body: (:sample, int64, int64) <- (:sample, n, 100 * n + 7);
+        frame: string <- encode((:etf), body);
+        segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(wire), Carrier@boundaries(wire))
+    produces
+        pure first_segment(segs)
+    end
+}
+
+fn s_next_tick(n: int64, round: int64) -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- case n < sample_count() of {
+            true -> send_after(100, self(), (:tick, n + 1, round) impl ActorMessage {});
+            false -> case round < round_count() of {
+                true -> send_after(100, self(), (:tick, 1, round + 1) impl ActorMessage {});
+                false -> send_after(500, self(), :finish impl ActorMessage {})
+            }
+        }
+    produces
+        pure true
+    end
+}
+
+fn s_send(st: { car: dangerous_actor_ref, phase: int64 }, n: int64, round: int64) -> { car: dangerous_actor_ref, phase: int64 } {
+    case st.phase == 0 of {
+        true -> {
+            sequence proc[concurrency]
+                seg: string <- sample_segment(n);
+                _: boolean <- cast(st.car, (:tx, seg, self()) impl ActorMessage {});
+                _: boolean <- s_next_tick(n, round)
+            produces
+                pure st
+            end
+        };
+        false -> st
+    }
+}
+
+fn s_up(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[device_io]
+        _: atom <- println("sender up")
+    produces
+        pure s_send(st, 1, 1)
+    end
+}
+
+fn s_finish(st: { car: dangerous_actor_ref, phase: int64 }) -> { car: dangerous_actor_ref, phase: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- println("sent 15 datagrams: 5 numbers, 3 rounds");
+        _: boolean <- cast(st.car, :close impl ActorMessage {});
+        _: boolean <- cast_exit(0)
+    produces
+        pure { car: st.car, phase: 2 }
+    end
+}
+
+fn s_failed(st: { car: dangerous_actor_ref, phase: int64 }, why: atom) -> { car: dangerous_actor_ref, phase: int64 } {
+    _: atom <- say("tx failed ", why);
+    st
+}
+
+fn s_down(st: { car: dangerous_actor_ref, phase: int64 }, why: atom) -> { car: dangerous_actor_ref, phase: int64 } {
+    case st.phase == 0 of {
+        true -> {
+            sequence proc[concurrency]
+                _: atom <- say("link down ", why);
+                _: boolean <- cast_exit(1)
+            produces
+                pure { car: st.car, phase: 3 }
+            end
+        };
+        false -> st
+    }
+}
+
+fn sender(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:tick, int64, int64) | :timeout | :finish, state: { car: dangerous_actor_ref, phase: int64 }) -> (:no_reply, { car: dangerous_actor_ref, phase: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, s_up(state));
+        (:tick, n: int64, round: int64) -> (:no_reply, s_send(state, n, round));
+        :finish -> (:no_reply, s_finish(state));
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _c: int64) -> (:no_reply, state);
+        (:tx_failed, why: atom) -> (:no_reply, s_failed(state, why));
+        (:link_down, why2: atom) -> (:no_reply, s_down(state, why2));
+        :timeout -> (:no_reply, state)
+    }
+}
+
+// ---- The receiver ----
+fn r_with_rx(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, rx2: { mode: atom, expected: int64, pending: string }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    { car: st.car, rx: rx2, mask: st.mask, phase: st.phase }
+}
+
+fn r_up(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- println("receiver up");
+        _: boolean <- cast(st.car, (:credit, 8) impl ActorMessage {})
+    produces
+        pure st
+    end
+}
+
+fn r_complete(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- println("received all 5 numbers");
+        _: timer_ref <- send_after(1000, self(), :finish impl ActorMessage {})
+    produces
+        pure { car: st.car, rx: st.rx, mask: st.mask, phase: 2 }
+    end
+}
+
+fn r_check(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    case st.mask == all_mask() and st.phase == 0 of {
+        true -> r_complete(st);
+        false -> st
+    }
+}
+
+fn r_fresh(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, rx2: { mode: atom, expected: int64, pending: string }, n: int64, v: int64, bit: uint32) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    sequence proc[device_io]
+        _: atom <- print("sample ");
+        _: atom <- print_int64(n);
+        _: atom <- print(" value ");
+        _: atom <- print_int64(v);
+        _: atom <- println("")
+    produces
+        pure r_check({ car: st.car, rx: rx2, mask: st.mask bor bit, phase: st.phase })
+    end
+}
+
+fn r_record(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, rx2: { mode: atom, expected: int64, pending: string }, n: int64, v: int64) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    bit: uint32 <- bit_of(n);
+    case (st.mask band bit) == 0 of {
+        true -> r_fresh(st, rx2, n, v, bit);
+        false -> r_with_rx(st, rx2)
+    }
+}
+
+fn r_reject(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, rx2: { mode: atom, expected: int64, pending: string }, why: atom) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    _: atom <- say("rejected ", why);
+    r_with_rx(st, rx2)
+}
+
+fn r_sample(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, rx2: { mode: atom, expected: int64, pending: string }, n: int64, v: int64) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    case n >= 1 and n <= sample_count() of {
+        true -> r_record(st, rx2, n, v);
+        false -> r_reject(st, rx2, :out_of_range)
+    }
+}
+
+fn r_take(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, rx2: { mode: atom, expected: int64, pending: string }, decoded: (:ok, (:sample, int64, int64)) | (:rejected, atom)) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    case decoded of {
+        (:ok, s: (:sample, int64, int64)) -> r_sample_term(st, rx2, s);
+        (:rejected, why: atom) -> r_reject(st, rx2, why)
+    }
+}
+
+fn r_sample_term(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, rx2: { mode: atom, expected: int64, pending: string }, s: (:sample, int64, int64)) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    case s of {
+        (:sample, n: int64, v: int64) -> r_sample(st, rx2, n, v)
+    }
+}
+
+fn r_frame(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, rx2: { mode: atom, expected: int64, pending: string }, frame: string) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    sequence proc[mem(normal), transport]
+        decoded: (:ok, (:sample, int64, int64)) | (:rejected, atom) <- decode((:etf), frame)
+    produces
+        pure r_take(st, rx2, decoded)
+    end
+}
+
+fn r_rx(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, segment: string) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    sequence proc[concurrency]
+        un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(st.rx, segment, 4096);
+        _: boolean <- cast(st.car, (:credit, 1) impl ActorMessage {});
+        next: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } <- case un of {
+            (:more, r1: { mode: atom, expected: int64, pending: string }) -> r_with_rx(st, r1);
+            (:frame, frame: string, r2: { mode: atom, expected: int64, pending: string }) -> r_frame(st, r2, frame);
+            (:rejected, why: atom) -> r_reject(st, st.rx, why)
+        }
+    produces
+        pure next
+    end
+}
+
+fn r_timeout(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    case st.phase == 0 of {
+        true -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- println("timeout: not all 5 numbers arrived");
+                _: boolean <- cast_exit(5)
+            produces
+                pure { car: st.car, rx: st.rx, mask: st.mask, phase: 3 }
+            end
+        };
+        false -> st
+    }
+}
+
+fn r_down(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }, why: atom) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    case st.phase == 0 of {
+        true -> {
+            sequence proc[concurrency]
+                _: atom <- say("link down ", why);
+                _: boolean <- cast_exit(1)
+            produces
+                pure { car: st.car, rx: st.rx, mask: st.mask, phase: 3 }
+            end
+        };
+        false -> st
+    }
+}
+
+fn r_finish(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.car, :close impl ActorMessage {});
+        _: boolean <- cast_exit(0)
+    produces
+        pure st
+    end
+}
+
+fn receiver(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:tick, int64, int64) | :timeout | :finish, state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }) -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, mask: uint32, phase: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, r_up(state));
+        (:rx, segment: string) -> (:no_reply, r_rx(state, segment));
+        :timeout -> (:no_reply, r_timeout(state));
+        :finish -> (:no_reply, r_finish(state));
+        (:tx_credit, _c: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> (:no_reply, r_down(state, why2));
+        (:tick, _n: int64, _round: int64) -> (:no_reply, state)
+    }
+}
+
+// ---- Start ----
+fn start_sender(car: dangerous_actor_ref) -> actor_ref {
+    sequence proc[concurrency]
+        me: actor_ref <- spawn({ car: car, phase: 0 }, sender, stack_policy(0, :keep_last_message), state_policy(:keep_state_area))
+    produces
+        pure me
+    end
+}
+
+fn start_receiver(car: dangerous_actor_ref) -> actor_ref {
+    sequence proc[concurrency]
+        me: actor_ref <- spawn({ car: car, rx: wireframe@fresh(Carrier@boundaries(wire)), mask: 0, phase: 0 }, receiver, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: timer_ref <- send_after(timeout_ms(), me, :timeout impl ActorMessage {})
+    produces
+        pure me
+    end
+}
+
+fn start_endpoint(car: dangerous_actor_ref) -> actor_ref {
+    case sends() of {
+        true -> start_sender(car);
+        false -> start_receiver(car)
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        _: supervisor_ref <- trial_wait_int64@start();
+        _: boolean <- trial_wait_int64@run(fn() -> int64 {
+            sequence proc[concurrency]
+                car: dangerous_actor_ref <- spawn_dangerous_carrier(wire, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                me: actor_ref <- start_endpoint(car);
+                _: boolean <- cast(car, (:open, me, open_address()) impl ActorMessage {})
+            produces
+                pure 0
+            end
+        });
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

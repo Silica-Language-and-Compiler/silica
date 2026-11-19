@@ -68,8 +68,8 @@
 // are the guard. `main` is not an actor: its two stacks are fixed, sized by the linker script, and a
 // limit it crosses is a fatal fault (status 70).
 //
-// Result and status conventions follow the reference: spawn -> the actor's reference, cast -> 1,
-// send -> 0, register -> 0, wait_for_exit -> the first cast_exit value (or 0 for an "exit" line),
+// Result and status conventions follow the reference: spawn -> the actor's reference, cast -> 1 (0 when
+// the target has ended or is unknown), send -> 0, register -> 0, wait_for_exit -> the first cast_exit value (or 0 for an "exit" line),
 // cast_exit -> 1 when its request was recorded, 0 when an earlier one was.
 
 #include "rt_defs.h"
@@ -2259,8 +2259,9 @@ silica_rt_identity_exhausted_msg:
 9:  pop     {r4-r8, pc}
     .size   rt_cast_backpressure, . - rt_cast_backpressure
 
-// cast(X0 reference, X1 message, X2 bytes, X3 block) -> 1; send -> 0. An ended or unknown target
-// raises actor_not_found (a runtime abort here).
+// cast(X0 reference, X1 message, X2 bytes, X3 block) -> 1 (true) enqueued, 0 (false) when the target
+// has ended or is unknown: the message copy is freed and the sender goes on (§16.1.2, §16.1.4). cast()
+// and cast_device() enter here. send -> 0; for send an ended or unknown target raises actor_not_found.
     FUNC silica_rt_actor_cast
     ENTRY_SAVE
     bl      silica_rt_ref_acb
@@ -2275,7 +2276,9 @@ silica_rt_identity_exhausted_msg:
     ENTRY_RET_X0
 8:  ldr     r0, [r9, #0]                    // no live target: the message copy goes back
     bl      silica_rt_free
-    bl      silica_rt_actor_not_found       // does not return
+    movw    r0, #0                          // false
+    movw    r1, #0
+    ENTRY_RET_X0
     .size   silica_rt_actor_cast, . - silica_rt_actor_cast
 
     FUNC silica_rt_actor_send

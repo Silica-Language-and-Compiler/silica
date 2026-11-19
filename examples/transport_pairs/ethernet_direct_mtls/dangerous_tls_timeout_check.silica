@@ -1,0 +1,316 @@
+// The dial-timeout checks of the mutual-TLS carrier (run_timeout_checks.sh in this directory). One program dials
+// eight addresses in turn, each through a carrier of its own (dangerous_tls_carrier), and says what its owner
+// saw. It dials nothing in the first five (the address states no usable timeout), a closed loopback port, an
+// address that drops packets, and a plain TCP listener that accepts and never answers; the script writes the
+// ports and the blackhole address into the three address lines below with sed, as run_mtls.sh does for the pair.
+//
+// The failure reporter is the ONLY writer of standard output. The owner sends it lines ("P <text>") and the
+// name of the case now running ("L <name>"); the reporter also receives the runtime's failure reports, and for
+// the carrier's explicit end it prints the reason ((:explicit, :bad_address) or (:explicit, :link_timeout)),
+// labelled with the case that was running. Output lines are therefore:
+//
+//   <case>: link_down <why> elapsed_ms=<n>                       the owner's first (:link_down, why), n = time since the open
+//   <case>: unexpected second link_down <why>                    a message after the carrier's end (must not appear)
+//   <case>: carrier ended <reason>                               the carrier stopped itself with this reason
+//   done
+//
+// Every dial now ends its carrier (the owner's :link_down is the last message, the carrier's exit reason is
+// (:explicit, :bad_address), :link_timeout or :link_unavailable), and the owner does not cast to it afterwards (such a
+// cast would return false and do nothing: specification 16.1.2). After the first link_down the owner waits
+// 600 ms and starts the next case. The lines of one case may come in either order.
+module dangerous_tls_timeout_check;
+
+use dangerous_tls;
+use dangerous_tls_carrier;
+
+// ---- Per-run settings (run_timeout_checks.sh rewrites these three lines) ----
+fn refused_address() -> string { "127.0.0.1:45611:1500" }
+fn blackhole_address() -> string { "10.255.255.1:45612:300" }
+fn silent_address() -> string { "127.0.0.1:45613:500" }
+
+fn case_count() -> int64 {
+    8
+}
+
+fn address_of(k: int64) -> string {
+    case k of {
+        0 -> "127.0.0.1:4599";
+        1 -> "127.0.0.1:4599:";
+        2 -> "127.0.0.1:4599:0";
+        3 -> "127.0.0.1:4599:12x";
+        4 -> "127.0.0.1:4599:1234567890";
+        5 -> refused_address();
+        6 -> blackhole_address();
+        _: int64 -> silent_address()
+    }
+}
+
+fn name_of(k: int64) -> string {
+    case k of {
+        0 -> "no_timeout";
+        1 -> "empty_timeout";
+        2 -> "zero_timeout";
+        3 -> "nondigit_timeout";
+        4 -> "ten_digit_timeout";
+        5 -> "refused";
+        6 -> "blackhole";
+        _: int64 -> "silent"
+    }
+}
+
+fn why_text(why: atom) -> string {
+    case why of {
+        :fault -> "fault";
+        :timeout -> "timeout";
+        :closed -> "closed";
+        _: atom -> "other"
+    }
+}
+
+fn starts(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+fn int_text_from(n: int64, acc: string) -> string {
+    case n < 10 of {
+        true -> concat(substring("0123456789", n, n + 1), acc);
+        false -> int_text_from(n / 10, concat(substring("0123456789", n % 10, n % 10 + 1), acc))
+    }
+}
+
+fn int_text(n: int64) -> string {
+    int_text_from(n, "")
+}
+
+// ---- The failure reporter: the only writer of standard output ----
+// FailureReporter (spec 15.4.13.4): registered before anything else is started (E2236). region_dump_limit is
+// called once at registration; 0 disables region dumps.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// What a message to the reporter is: "L " (the label of the case now running), "P " (a line to print under the label),
+// "B " (a line to print without one), a failure
+// report (the runtime's text), or anything else.
+fn message_kind(m: string) -> atom {
+    case starts(m, "L ") of {
+        true -> :label;
+        false -> case starts(m, "B ") of {
+            true -> :bare;
+            false -> case starts(m, "P ") of {
+                true -> :line;
+                false -> case contains(m, "=== Silica Actor Failure ===") of {
+                    true -> :report;
+                    false -> :other
+                }
+            }
+        }
+    }
+}
+
+fn rest_of(m: string) -> string {
+    substring(m, 2, length_bytes(m))
+}
+
+fn end_reason(report: string) -> string {
+    case contains(report, "(:explicit, :bad_address)") of {
+        true -> "(:explicit, :bad_address)";
+        false -> case contains(report, "(:explicit, :link_timeout)") of {
+            true -> "(:explicit, :link_timeout)";
+            false -> case contains(report, "(:explicit, :link_unavailable)") of {
+                true -> "(:explicit, :link_unavailable)";
+                false -> case contains(report, "(:explicit, :link_lost)") of {
+                    true -> "(:explicit, :link_lost)";
+                    false -> "other"
+                }
+            }
+        }
+    }
+}
+
+fn labelled(label: string, text: string) -> string {
+    case length_bytes(label) == 0 of {
+        true -> text;
+        false -> concat(concat(label, ": "), text)
+    }
+}
+
+// A marker on standard error at the start of each case, so the script can tell which case wrote what there.
+fn mark(label: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- println_stderr(concat("== ", label))
+    produces
+        pure :ok
+    end
+}
+
+fn show(label: string, text: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- println(labelled(label, text))
+    produces
+        pure :ok
+    end
+}
+
+fn reporter_shown(m: string, label: string) -> atom {
+    case message_kind(m) of {
+        :label -> mark(rest_of(m));
+        :bare -> show("", rest_of(m));
+        :line -> show(label, rest_of(m));
+        :report -> show(label, concat("carrier ended ", end_reason(m)));
+        _: atom -> show(label, "unexpected message")
+    }
+}
+
+fn reporter_label(m: string, label: string) -> string {
+    case message_kind(m) of {
+        :label -> rest_of(m);
+        _: atom -> label
+    }
+}
+
+fn reporter_next(_shown: atom, m: string, label: string) -> (:no_reply, string) {
+    (:no_reply, reporter_label(m, label))
+}
+
+fn reporter(m: string, label: string) -> (:no_reply, string) {
+    reporter_next(reporter_shown(m, label), m, label)
+}
+
+// ---- The owner: one carrier, one case at a time ----
+fn fresh_carrier() -> dangerous_actor_ref {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tls_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area))
+    produces
+        pure car
+    end
+}
+
+fn tell(rep: actor_ref, text: string) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast(rep, text impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn settle_later(k: int64) -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(600, self(), (:settle, k) impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+fn guard_later(k: int64) -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(8000, self(), (:guard, k) impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+fn finish_later() -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(300, self(), :finish impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+fn begin_case(st: { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }, k: int64) -> { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 } {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- fresh_carrier();
+        label: string <- concat("L ", name_of(k));
+        _: boolean <- tell(st.rep, label);
+        _: boolean <- guard_later(k);
+        t0: int64 <- monotonic_time();
+        _: boolean <- cast(car, (:open, self(), address_of(k)) impl ActorMessage {})
+    produces
+        pure { car: car, rep: st.rep, k: k, t0: t0, downs: 0 }
+    end
+}
+
+fn on_down(st: { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 } {
+    sequence proc[concurrency]
+        now: int64 <- monotonic_time();
+        ms: int64 <- (now - st.t0) / 1000000;
+        first: boolean <- st.downs == 0;
+        line: string <- case first of {
+            true -> concat(concat("P link_down ", why_text(why)), concat(" elapsed_ms=", int_text(ms)));
+            false -> concat("P unexpected second link_down ", why_text(why))
+        };
+        _: boolean <- tell(st.rep, line);
+        _: boolean <- case first of {
+            true -> settle_later(st.k);
+            false -> false
+        }
+    produces
+        pure { car: st.car, rep: st.rep, k: st.k, t0: st.t0, downs: st.downs + 1 }
+    end
+}
+
+fn on_guard(st: { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }, k: int64) -> { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 } {
+    sequence proc[concurrency]
+        stuck: boolean <- k == st.k and st.downs == 0;
+        _: boolean <- case stuck of {
+            true -> cast(self(), (:link_down, :guard) impl ActorMessage {});
+            false -> false
+        }
+    produces
+        pure st
+    end
+}
+
+fn on_settle(st: { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }, k: int64) -> { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 } {
+    case k == st.k of {
+        true -> case k + 1 < case_count() of {
+            true -> begin_case(st, k + 1);
+            false -> all_done(st)
+        };
+        false -> st
+    }
+}
+
+fn kept(_done: boolean, st: { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }) -> { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 } {
+    st
+}
+
+fn all_done(st: { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }) -> { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 } {
+    kept(tell(st.rep, "B done"), kept(finish_later(), st))
+}
+
+fn on_finish(st: { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }) -> { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- cast_exit(0)
+    produces
+        pure st
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | :start | (:settle, int64) | (:guard, int64) | :finish, state: { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }) -> (:no_reply, { car: dangerous_actor_ref, rep: actor_ref, k: int64, t0: int64, downs: int64 }) {
+    case msg of {
+        :start -> (:no_reply, begin_case(state, 0));
+        (:link_up, _peer: string) -> (:no_reply, state);
+        (:rx, _bytes: string) -> (:no_reply, state);
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> (:no_reply, on_down(state, why2));
+        (:settle, k2: int64) -> (:no_reply, on_settle(state, k2));
+        (:guard, k3: int64) -> (:no_reply, on_guard(state, k3));
+        :finish -> (:no_reply, on_finish(state))
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn("", reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- fresh_carrier();
+        me: actor_ref <- spawn({ car: car, rep: rep, k: 0, t0: 0, downs: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(me, :start impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

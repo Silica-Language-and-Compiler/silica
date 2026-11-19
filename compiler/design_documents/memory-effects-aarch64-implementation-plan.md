@@ -144,6 +144,7 @@ This section is the **Phase 0 deliverable**: what must be tracked in IR, what ha
 ## Phase 5 — Documentation
 
 - Per-board README: **which `Space` values are exact vs emulated**.
+  - 2026-11-16: the ESP32-S3 hardware facts (exact, equivalent, emulated, not found) are in `compiler/src/emitter/ESP32-S3_raw/board/README.md` ("Memory spaces") and, with the STM32L476 columns, in `porting_for_os_free_targets.md` §7.1. They describe the hardware only; the row stays open because Phase 4's verification, which would say what the runtime actually does, is not done. The STM32L476 board has no README table yet.
 - Keep **§12.1.1.0** in sync: OS-free = full support; OS-hosted = no portable guarantee.
 
 ---

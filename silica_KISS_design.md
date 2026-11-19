@@ -1,5 +1,7 @@
 # Silica KISS Design Document
 
+> **Superseded (2026-11-14, Lee).** The implementation steps in this design are no longer relevant and are not scheduled. The document is kept for the record.
+
 ## 1. Purpose
 
 Silica KISS is a lightweight macOS development application for working on the Silica programming language and its compiler.

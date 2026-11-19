@@ -432,6 +432,8 @@ then 7, 8, 13, 18, 19, 20.
 
 ## Gate
 
+**Status (2026-11-14):** items 1 to 19 are in the tree; `silica_16` and `silica_17` ran on the board (2026-10-28) and the `error_enforcement_addition` `device_*` trials exist. The ESP32-S3 full integrate was green on 2026-11-07 (`029447ad31`, 22,694 pass, 0 fail). Still open: re-establishing the fixed point (done only when Lee asks).
+
 Board release 1's peek-and-poke half is delivered when all of the following hold.
 
 - **Shared checks.** Every row of device spec §11's shared table has an `error_enforcement_addition` trial whose

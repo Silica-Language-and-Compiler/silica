@@ -1,0 +1,175 @@
+// claim_free: claim one block of memory, free it, and do that again, many times, on the
+// ST NUCLEO-L476RG (emit target STM32-L476RG_raw). It measures how fast a Silica program can claim
+// memory, which is the speed of the zeroing the claim does: every claim is the same size.
+//
+// The claim is `alloc_buf` into a region in the `normal` memory space. The compiled code takes the
+// buffer in the frame of the function that executes it and stores zero over every element before
+// the program sees it (the zero loop of emit_alloc_buf, compiler/src/emitter/STM32-L476RG_raw/terms/
+// prims/prims_memory.silica). The free is the return of that function: the frame goes, and the
+// buffer with it. This program has no zeroing or filling loop of its own.
+//
+// main registers the FailureReporter, spawns the bench actor, casts it the cycle count and waits.
+// The bench actor runs a short warm-up, reads the clock, runs the cycles, reads the clock again,
+// prints the result and ends the program: status 0 when the checksums are right, 1 when not.
+
+// The one claim size, in bytes. Change it here. It must be a multiple of 8 (the elements are int64).
+// 8 KiB: the chip has 96 KiB + 32 KiB of SRAM for everything. The buffer needs one auxiliary stack
+// chunk of about 9.1 KiB (the buffer, its 8-byte count, up to 527 bytes mirrored from the chunk
+// below, a 128-byte header and 256 bytes of headroom), which fits in the 29,696-byte SRAM2 chunk
+// arena beside the actors' first chunks. It is also 1,024 zero stores a claim, so the zeroing is
+// most of each cycle and the fixed cost of the call is a small part.
+fn claim_bytes() -> int64 {
+    8192
+}
+
+// Timed claim/free cycles. 10,000 x 8 KiB is 81,920,000 bytes zeroed: seconds on the 80 MHz
+// Cortex-M4, against a clock that resolves 12.5 ns.
+fn cycle_count() -> int64 {
+    10000
+}
+
+// Cycles run before the clock is read. The first claim makes the runtime take the stack chunk from
+// the heap; every later claim finds that chunk already in the actor's chain.
+fn warm_up_cycles() -> int64 {
+    16
+}
+
+fn claim_words() -> int64 {
+    claim_bytes() / 8
+}
+
+// One cycle. Claims `words` int64 elements, reads the last element before anything is stored (the
+// runtime's zero), stores the cycle number in the first and the last element, and reads the first
+// back. The answer is cycle + 0. A claim that came back without being zeroed would still hold the
+// last element the cycle before stored, and the answer would be larger. The buffer is freed when
+// this function returns.
+fn claim_one(cycle: int64, words: int64) -> int64 {
+    sequence proc[mem(normal)]
+        L1: lifetime <- fresh_lifetime();
+        r: region(L1, normal) <- alloc_region(normal);
+        pad: buf(L1, normal, int64, words) <- alloc_buf(r, words);
+        last: int64 <- words - 1;
+        stale: int64 <- read_buf(pad, last);
+        _: atom <- write_buf(pad, 0, cycle);
+        _: atom <- write_buf(pad, last, cycle);
+        first: int64 <- read_buf(pad, 0)
+    produces
+        pure first + stale
+    end
+}
+
+// Runs cycles left..1 and adds up their answers: left * (left + 1) / 2 when every claim was zeroed.
+fn claim_free_loop(left: int64, words: int64, acc: int64) -> int64 {
+    case left <= 0 of {
+        true -> acc;
+        false -> claim_free_loop(left - 1, words, acc + claim_one(left, words))
+    }
+}
+
+fn expected_checksum(cycles: int64) -> int64 {
+    cycles * (cycles + 1) / 2
+}
+
+fn at_least_one(n: int64) -> int64 {
+    case n < 1 of {
+        true -> 1;
+        false -> n
+    }
+}
+
+// Prints the result and ends the program. Speeds are whole numbers: bytes claimed in the timed
+// cycles, divided by the time in microseconds. 1 MB is 1,048,576 bytes here.
+fn report(cycles: int64, elapsed_ns: int64, checksum: int64, warm_up: int64) -> int64 {
+    sequence proc[concurrency, device_io]
+        total_bytes: int64 <- cycles * claim_bytes();
+        elapsed_us: int64 <- at_least_one(elapsed_ns / 1000);
+        bytes_per_second: int64 <- total_bytes * 1000000 / elapsed_us;
+        expected: int64 <- expected_checksum(cycles);
+        code: int64 <- case checksum == expected and warm_up == expected_checksum(warm_up_cycles()) of {
+            true -> 0;
+            false -> 1
+        };
+        _: atom <- print_string("claim size bytes: ");
+        _: atom <- print_int64(claim_bytes());
+        _: atom <- println("");
+        _: atom <- print_string("cycles: ");
+        _: atom <- print_int64(cycles);
+        _: atom <- println("");
+        _: atom <- print_string("total bytes: ");
+        _: atom <- print_int64(total_bytes);
+        _: atom <- println("");
+        _: atom <- print_string("total time ns: ");
+        _: atom <- print_int64(elapsed_ns);
+        _: atom <- println("");
+        _: atom <- print_string("time per cycle ns: ");
+        _: atom <- print_int64(elapsed_ns / at_least_one(cycles));
+        _: atom <- println("");
+        _: atom <- print_string("bytes per second: ");
+        _: atom <- print_int64(bytes_per_second);
+        _: atom <- println("");
+        _: atom <- print_string("KiB per second: ");
+        _: atom <- print_int64(bytes_per_second / 1024);
+        _: atom <- println("");
+        _: atom <- print_string("MB per second: ");
+        _: atom <- print_int64(bytes_per_second / 1048576);
+        _: atom <- println("");
+        _: atom <- print_string("checksum: ");
+        _: atom <- print_int64(checksum);
+        _: atom <- print_string(" expected ");
+        _: atom <- print_int64(expected);
+        _: atom <- println("");
+        _: boolean <- cast_exit(code)
+    produces
+        pure code
+    end
+}
+
+// The bench actor. Its message is the number of cycles to time.
+fn bench(cycles: int64, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        words: int64 <- claim_words();
+        warm_up: int64 <- claim_free_loop(warm_up_cycles(), words, 0);
+        started: int64 <- monotonic_time();
+        checksum: int64 <- claim_free_loop(cycles, words, 0);
+        finished: int64 <- monotonic_time();
+        _: int64 <- report(cycles, finished - started, checksum, warm_up)
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        reporter_ref: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(reporter_ref);
+        bench_ref: actor_ref <- spawn(0, bench, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        cycles: int64 <- cycle_count();
+        _: boolean <- cast(bench_ref, cycles impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+
+// FailureReporter: registered before anything else is started. It writes each report to the
+// console; the root supervisor's own report ends the program with status 70.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn report_is_from_root_supervisor(report: string) -> boolean {
+    no_supervisor: boolean <- contains(report, "supervisor_acb:  0x0\n") or contains(report, "supervisor_acb:  (nil)\n") or contains(report, "supervisor_acb:  0x00000000\n");
+    no_supervisor and contains(report, "#0  <unknown behavior>")
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency, device_io]
+        _: atom <- println_stderr(report);
+        _: boolean <- case report_is_from_root_supervisor(report) of {
+            true -> cast_exit(70);
+            false -> true
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}

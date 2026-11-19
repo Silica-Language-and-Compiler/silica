@@ -1,0 +1,268 @@
+{-
+
+   Copyright 2026 Lee Scott Barney
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not USE this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The memory spaces this board provides (silica-specification §4.4.1; the chip facts are in
+// porting_for_os_free_targets.md §7.1 and board/README.md "Memory spaces").
+//
+// NUCLEO-L476RG: normal and normal_writeback (the default space) and atomic (LDREX/STREX; loads and
+// stores ordered with DMB, prims_memory). The STM32L476 has no data cache and no setting for one, so
+// normal_writethrough and normal_noncacheable cannot be backed exactly, and device memory is not
+// provided: all three are refused.
+//
+// A refused space is reported the way this emitter refuses every construct it cannot compile: one
+// `.error` line in the emitted assembly, so the module does not assemble.
+//
+// What counts as a use of a space (one concrete space, never a choice among several):
+//   - the operand of alloc_region(<space>);
+//   - `mem(<space>)` in a type or an effect string, unless it is one alternative of a union
+//     (`mem(normal) | mem(device)`: the text next to it, spaces skipped, is a `|`). A union names the
+//     spaces a value may be in and uses none of them (Supervisor's child-spec list names all six);
+//   - the second parameter of region(L, <space>), ref(L, <space>, T), ref?(L, <space>, T),
+//     buf(L, <space>, T, N) and atomic_ref(L, <space>, T).
+
+export provides_space/1;
+export provided_spaces/0;
+export board_name/0;
+export space_operand_refusal/1;
+export space_text_refusal/1;
+export signature_refusal/3;
+
+fn provides_space(space: string) -> boolean {
+    case space of {
+        "normal" -> true;
+        "normal_writeback" -> true;
+        "atomic" -> true;
+        _: string -> false
+    }
+}
+
+fn provided_spaces() -> string {
+    "normal, normal_writeback, atomic"
+}
+
+fn board_name() -> string {
+    "NUCLEO-L476RG"
+}
+
+// The six spaces of the specification, in its order.
+fn space_name_at(i: int64) -> string {
+    case i of {
+        0 -> "normal";
+        1 -> "normal_writeback";
+        2 -> "normal_writethrough";
+        3 -> "normal_noncacheable";
+        4 -> "atomic";
+        5 -> "device";
+        _: int64 -> ""
+    }
+}
+
+fn is_space_name(name: string) -> boolean {
+    case name of {
+        "normal" -> true;
+        "normal_writeback" -> true;
+        "normal_writethrough" -> true;
+        "normal_noncacheable" -> true;
+        "atomic" -> true;
+        "device" -> true;
+        _: string -> false
+    }
+}
+
+fn space_error_line(space: string) -> string {
+    concat(".error \"memory space '", concat(space, concat("' is not available on ", concat(board_name(), concat("; this board provides: ", concat(provided_spaces(), "\"\n"))))))
+}
+
+// alloc_region(<space>): the operand is a SIR variable node named `%<space>`. "" when the board
+// provides the space (or the name is not a space), otherwise the `.error` line.
+fn space_operand_refusal(operand_name: string) -> string {
+    space: string <- case length_bytes(operand_name) > 0 and substring(operand_name, 0, 1) == "%" of {
+        true -> substring(operand_name, 1, length_bytes(operand_name));
+        false -> operand_name
+    };
+    case is_space_name(space) and provides_space(space) == false of {
+        true -> space_error_line(space);
+        false -> ""
+    }
+}
+
+// A type or effect string: "" when every space it uses is provided, otherwise the `.error` line of
+// the first one that is not (in the specification's order).
+fn space_text_refusal(text: string) -> string {
+    space: string <- unprovided_space_used_from(text, 0);
+    case space == "" of {
+        true -> "";
+        false -> space_error_line(space)
+    }
+}
+
+// A function's parameter types, return type and effects.
+fn signature_refusal(param_types: string, return_type: string, effects: string) -> string {
+    space_text_refusal(concat(param_types, concat(" ; ", concat(return_type, concat(" ; ", effects)))))
+}
+
+fn unprovided_space_used_from(text: string, i: int64) -> string {
+    case i > 5 of {
+        true -> "";
+        false -> {
+            space: string <- space_name_at(i);
+            case provides_space(space) == false and text_uses_space_from(text, space, 0) of {
+                true -> space;
+                false -> unprovided_space_used_from(text, i + 1)
+            }
+        }
+    }
+}
+
+fn text_uses_space_from(text: string, space: string, i: int64) -> boolean {
+    at: int64 <- find_from(text, space, i);
+    case at < 0 of {
+        true -> false;
+        false -> case occurrence_is_use(text, space, at) of {
+            true -> true;
+            false -> text_uses_space_from(text, space, at + 1)
+        }
+    }
+}
+
+// The occurrence of `space` at `at` is a whole word in a space position, and not a union alternative.
+fn occurrence_is_use(text: string, space: string, at: int64) -> boolean {
+    stop: int64 <- at + length_bytes(space);
+    case is_ident_char(char_at(text, at - 1)) or is_ident_char(char_at(text, stop)) of {
+        true -> false;
+        false -> {
+            before: int64 <- prev_nonspace(text, at - 1);
+            after: int64 <- next_nonspace(text, stop);
+            case char_at(text, before) of {
+                "(" -> char_at(text, after) == ")" and mem_single_use(text, before, after);
+                "," -> (char_at(text, after) == ")" or char_at(text, after) == ",") and comma_follows_handle_lifetime(text, before);
+                _: string -> false
+            }
+        }
+    }
+}
+
+// `open` is the "(" before the space and `close` the ")" after it. True when the word before the
+// "(" is `mem` and the `mem(<space>)` has no `|` on either side.
+fn mem_single_use(text: string, open: int64, close: int64) -> boolean {
+    word_last: int64 <- prev_nonspace(text, open - 1);
+    word_first: int64 <- ident_start(text, word_last);
+    case word_first <= word_last and substring(text, word_first, word_last + 1) == "mem" of {
+        false -> false;
+        true -> char_at(text, prev_nonspace(text, word_first - 1)) != "|" and char_at(text, next_nonspace(text, close + 1)) != "|"
+    }
+}
+
+// `comma` is the "," before the space. True when the text before it is `<handle>(<lifetime>` with
+// the handle one of region, ref, ref?, buf, atomic_ref: the space is the handle's second parameter.
+fn comma_follows_handle_lifetime(text: string, comma: int64) -> boolean {
+    life_last: int64 <- prev_nonspace(text, comma - 1);
+    life_first: int64 <- ident_start(text, life_last);
+    case life_first > life_last of {
+        true -> false;
+        false -> {
+            open: int64 <- prev_nonspace(text, life_first - 1);
+            case char_at(text, open) == "(" of {
+                false -> false;
+                true -> {
+                    mark: int64 <- prev_nonspace(text, open - 1);
+                    word_last: int64 <- case char_at(text, mark) == "?" of {
+                        true -> mark - 1;
+                        false -> mark
+                    };
+                    word_first: int64 <- ident_start(text, word_last);
+                    case word_first > word_last of {
+                        true -> false;
+                        false -> is_handle_word(substring(text, word_first, word_last + 1))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_handle_word(word: string) -> boolean {
+    case word of {
+        "region" -> true;
+        "ref" -> true;
+        "buf" -> true;
+        "atomic_ref" -> true;
+        _: string -> false
+    }
+}
+
+// --- Text helpers ---
+
+fn char_at(text: string, i: int64) -> string {
+    case i < 0 or i >= length_bytes(text) of {
+        true -> "";
+        false -> substring(text, i, i + 1)
+    }
+}
+
+fn is_blank(ch: string) -> boolean {
+    ch == " " or ch == "\n"
+}
+
+// Index of the last character at or before i that is not blank; -1 when there is none.
+fn prev_nonspace(text: string, i: int64) -> int64 {
+    case i < 0 of {
+        true -> -1;
+        false -> case is_blank(char_at(text, i)) of {
+            true -> prev_nonspace(text, i - 1);
+            false -> i
+        }
+    }
+}
+
+// Index of the first character at or after i that is not blank; the length when there is none.
+fn next_nonspace(text: string, i: int64) -> int64 {
+    case i >= length_bytes(text) of {
+        true -> length_bytes(text);
+        false -> case is_blank(char_at(text, i)) of {
+            true -> next_nonspace(text, i + 1);
+            false -> i
+        }
+    }
+}
+
+fn is_ident_char(ch: string) -> boolean {
+    case length_bytes(ch) == 1 of {
+        false -> false;
+        true -> find_from("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", ch, 0) >= 0
+    }
+}
+
+// First index of the identifier that ends at `last`; last + 1 when the character there is not an
+// identifier character.
+fn ident_start(text: string, last: int64) -> int64 {
+    case last >= 0 and is_ident_char(char_at(text, last)) of {
+        true -> ident_start(text, last - 1);
+        false -> last + 1
+    }
+}
+
+// Index of the first occurrence of needle at or after i; -1 when there is none.
+fn find_from(text: string, needle: string, i: int64) -> int64 {
+    case i < 0 or i + length_bytes(needle) > length_bytes(text) of {
+        true -> -1;
+        false -> case substring(text, i, i + length_bytes(needle)) == needle of {
+            true -> i;
+            false -> find_from(text, needle, i + 1)
+        }
+    }
+}

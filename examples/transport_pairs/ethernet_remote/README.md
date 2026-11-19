@@ -17,7 +17,7 @@ sides interleaved, every reply matched to its request by id.
   - **Why `(:loopback)`.** Both ends only touch 127.0.0.1; the ssh tunnels carry the bytes between the hosts.
   - **Not enforced.** A hosted link declaration binds nothing yet (`compiler/design_documents/transport_links_design.md`
     §3.2; binding is the future stage E2). The compiler checks only its tags. The address strings
-    (`"listen:<port>"`, `127.0.0.1:<port>`) are what keep this program on loopback, not the declaration.
+    (`"listen:<port>"`, `127.0.0.1:<port>:<timeout_ms>`) are what keep this program on loopback, not the declaration.
 
 ```
             Mac (accel side)                                        Linux x86-64 (status side)

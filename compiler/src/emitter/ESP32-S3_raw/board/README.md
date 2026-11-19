@@ -148,6 +148,31 @@ Actors run on both LX7 cores (`get_cpu_topology()` reports two `:performance` co
 to core 1 runs on the APP cpu, which the runtime starts at its first actor entry point --
 [design §8.9](../../../../design_documents/ports/esp32s3_xtensa_port.md)).
 
+## Memory spaces: exact, equivalent or emulated
+
+What the chip provides for each `Space` of the specification (§4.4.2), read from the ESP32-S3 Technical Reference
+Manual v1.8 on 2026-11-16. **This describes the hardware. The runtime does not yet implement per-`Space` behaviour**
+(`Space` is not passed to the allocator and there are no per-`Space` pools; see
+[porting_for_os_free_targets.md](../../../../design_documents/porting_for_os_free_targets.md) §7 and §7.1, which also
+has the STM32L476 columns). Nothing here was run on the board.
+
+**Exact** means the hardware provides the behaviour. **Equivalent** means the memory has no cache, so the behaviour
+holds trivially at no cost, but the chip has no such setting. **Emulated** means the runtime would have to supply it.
+**Not found** means the manual says nothing and nothing is assumed.
+
+| `Space` | Internal SRAM | External RAM (PSRAM, through the DCache) |
+| --- | --- | --- |
+| `normal` (write-back) | equivalent: no data cache is described for internal SRAM (TRM 4.3.2) | **exact**: the DCache is write-back, with dirty bits and write-back, clean and invalidate operations, on the DCache only (TRM 4.3.3.3) |
+| `normal_writethrough` | equivalent: every write reaches memory | **emulated**: the TRM describes no write-through mode and no per-region cache-policy register; the runtime would run the DCache write-back operation after each write |
+| `normal_noncacheable` | **exact**: internal SRAM is not cached | **not found**: no uncached path or bypass is described; emulate with write-back plus invalidate around each use, or keep the data in internal SRAM |
+| `atomic` | **exact**: `S32C1I`, already used for the runtime's spin locks (`rt_heap.S`, `rt_actors.S`, `rt_supervisors.S`, `rt_console.S`). The TRM does not describe `S32C1I` or `ATOMCTL` (that is the Xtensa ISA manual, not read) | **not confirmed**: a forum answer (not Espressif documentation) says hardware compare-and-swap does not work on PSRAM addresses; treat as not available until checked |
+| `device` | no cache attribute exists; peripherals have their own address ranges, and Permission Control (TRM chapter 15) gives read, write and execute rights per Secure and Non-secure world, not memory attributes | n/a |
+
+Unconfirmed: `S32C1I` and `ATOMCTL` behaviour, and whether any uncached path to PSRAM exists. Today the whole
+program (code, data, heap and stack) lives in about 390 KB of internal SRAM with no flash cache mapping (see "Image
+model"), so the external RAM column applies only once PSRAM support is added: the badge carries 2 MB of quad PSRAM
+(`PORT_TEST_BOARD_byu_idaho_v4.0_feb26.md`), which the runtime does not use yet.
+
 ## Stack budget
 
 `main`'s stacks are fixed and sized per image; every actor's and supervisor's two stacks are chains
@@ -416,6 +441,10 @@ record for the language features.
 | `silica_31_device_usb_console` | A second console: UART0 and the USB-Serial-JTAG worker (`device_lib/device_esp32s3_usb_serial_jtag`, `:exchange`) together; the worker waits up to about 20 s for a byte from the USB host, then writes `hello from usb serial jtag`, the byte and a newline to the USB console | UART0: `waiting for usb host`, `usb byte 65`, status 0 (`expected.scout` written from the source, with a host sending `A`); no byte in time: `usb timed out`, then seven register lines (`usb ep1_conf N`, `usb conf0 N`, `usb out_ep1_st N`, `usb in_ep1_st N`, `usb jfifo_st N`, `usb fram_num N`, `usb fram_num_100ms_later N`, decimal), status 3. Gate passed on the board 2026-10-30 (`usb_console_check.py` exit 0: UART0 matched, USB console `hello from usb serial jtag` and `A`), and again 2026-11-09 after the app moved to the chunk-15 spawn forms (`state_policy`). Run it with `tools/usb_console_check.py`, which plays the USB host |
 | `silica_32_transport_uart1_etf` | One ETF frame over the `(:uart1)` transport carrier (`device_lib/device_esp32s3_uart1`, the §6.2 carrier contract of `transport_serialization_design.md` on the UART1 header, GPIO35 TX / GPIO36 RX, 115200 8N1): the owner opens the carrier, encodes `(:accel, { x: 1, y: -2, z: 512, at_ms: 1000 })` with `encode((:etf), ...)`, frames it with the carrier's properties (52 bytes) and sends it as one `:tx`, then closes. The Mac peer is `programmer_tools/transport_uart1_demo` (needs a USB-serial adapter on the header: adapter RX to GPIO35, GND to GND) | expected `link up uart1@115200`, `tx credit 8`, `sent 52 bytes`, `link down :closed`, status 0 (`expected.scout` written from the source); ✓ 2026-11-09 with `run_app.sh` (compiler built from the tree, `BUILD_ROOT` scratch): matched twice; nothing was wired to the header, so the bytes left on GPIO35 unobserved |
 | `silica_33_transport_usb_serial_jtag_etf` | ETF frames both ways over the `(:usb_serial_jtag)` transport carrier (`device_esp32s3_usb_serial_jtag@usb_serial_jtag_carrier`, the native USB-C jack, `/dev/cu.usbmodem*` 303A:1001 on the Mac): the owner opens the carrier, grants receive credit, encodes `(:accel, { x: 1, y: -2, z: 512, at_ms: 1000 })` and sends it as one 52-byte `:tx`, then decodes the peer's reply `(:led, { which: :red, on: true })` from the `:rx` segments and prints it, then closes. The Mac peer is `programmer_tools/transport_usb_serial_jtag_demo` (the hosted `(:serial)` carrier, or the Erlang peer behind the bridge); start it after `run_app.sh` prints `running ... on the board` | expected `link up usb_serial_jtag`, `tx credit 8`, `sent 52 bytes`, `led red on`, `link down :closed`, status 0 (`expected.scout` written from the source); ✓ 2026-11-09 with `run_app.sh --timeout 120`: matched against the Silica peer and against the Erlang peer (the bridge showed the 52 bytes out and the 39-byte reply in); waits for the reply until `--timeout` when no peer opens the port |
+| `silica_34_device_accelerometer` | The MMA8452Q accelerometer (I2C address 0x1C, SCL GPIO42, SDA GPIO41) through its device worker (`device_lib/device_mma8452q`) over the I2C0 controller as a master (`device_lib/device_esp32s3_i2c0`, board-pack window 13), both written in Silica against the registers. The worker checks WHO_AM_I (0x2A), sets +-2 g and 100 Hz, and five readings are each checked to measure about 1 g, so the expected output does not depend on how the board lies: `accelerometer: MMA8452Q`, `reading: about 1 g` five times, `done`. Run on the board 2026-11-16: MATCH |
+| `silica_35_device_accelerometer_tilt` | The same worker, printing forty readings a quarter of a second apart as `x=<n> y=<n> z=<n>` in counts of 1/1024 g, for a person to watch while turning the board (peripherals plan item G). No `expected.scout`; `run_tilt.sh` beside it runs it. At rest on the bench 2026-11-16: about `x=-165 y=65 z=-995`, and the readings followed the board when it was turned |
+| `silica_36_device_accelerometer_nack` | The I2C "nobody answered" path, without hands: WHO_AM_I is asked for at 0x1D, where no device is, and the controller reports `:nack`; the same question at 0x1C is then answered and a reading taken, which shows the recovery (`device_esp32s3_i2c0@i2c0_recover`: on this chip a controller that had a transfer refused takes no further transfer until the whole peripheral is reset and set up again). Expected: `accelerometer: MMA8452Q`, `probe 0x1D: nack`, `probe 0x1C: ok, who_am_i 42`, `reading: about 1 g`, `done`. Run on the board 2026-11-16: MATCH |
+| `silica_37_device_accelerometer_stuck` | The I2C "the controller never finished" path, without hands: the worker is started with the I2C0 clock gate off (`:init_unclocked`), the first transfer runs out its polling budget and the answer is `:stuck`; the clock is then turned on (`:reclock`), the part answers and a reading is taken. Expected: `unclocked: stuck`, `clocked: MMA8452Q`, `reading: about 1 g`, `done`. Run on the board 2026-11-16: MATCH. The other two I2C outcomes, `:timeout` and `:arbitration_lost`, are NOT completed: neither has been provoked on the board (peripherals plan, item G) |
 
 Every `silica_*` app is compiled by the ESP32-S3_raw emitter and compared byte for byte with the
 `expected.scout` the macOS compiler produced for the same source (`tools/host_reference.sh <app dir>`

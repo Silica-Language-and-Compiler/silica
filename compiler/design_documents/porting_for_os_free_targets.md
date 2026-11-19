@@ -2,7 +2,7 @@
 
 **Status:** Design plan. The ESP32-S3_raw path implements the device MMIO surface (§5) and its board pack (§10); see the implementation status below. Not a substitute for [silica-specification.md](silica-specification.md). Use this document when adding a **board** or **OS-free** compiler/runtime target. Hosted ports (macOS, Linux, Windows) are out of scope except where this text contrasts them.
 
-**Implementation status (2026-10-16), ESP32-S3_raw.** Delivered: the `register_rwr` effect; device descriptions as compile-time data (`impl fn registers(device: (:tag))` of the built-in `DeviceDescription` trait, checked by E2201-E2210; stdlib `DeviceDescription.silica`, `Register8.silica`..`Register64.silica`); `map_device`, `peek` and `poke` through the shared stages (`type_checker/device/`, `type_checker/expressions/type_checker_expressions_device.silica`, `module_checker/module_checker_device.silica`, `sir_generator/terms/sir_device_calls.silica`); `spawn_device`, `spawn_device_registered`, `cast_device`, `cast_device_registered` with a third registry; the `device_*` module rules (E2216-E2233); the pre-emit rejection `sir_generator/sir_target_verify.silica` (E2220 for a prim the target cannot compile, through `emitter_core@unsupported_prim_reason`), which stops all three hosted emitters before they emit; the ESP32-S3 lowering in `emitter/ESP32-S3_raw/terms/prims/prims_device.silica` (one `memw`, one `l32i` / `s32i`, and for a `poke` a trailing `memw`; **only 32-bit accesses** are accepted, any other width is refused with an `.error` line naming it); the board pack `emitter/ESP32-S3_raw/board_pack.silica` (window table, `window_containing`, `window_allows_width`, pins, register facts) with its runtime twin `board/runtime/rt_device.S` (`silica_rt_map_device_check`, the abort `illegal device map` for a computed base outside every window); generated per-peripheral descriptions with access modes under `board/pack/` (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT; `board/tools/gen_board_pack.py`); device drivers in Silica under `board/apps/device_lib/` and the board apps `silica_16_device_uart` to `silica_22_device_buzzer`; fatal fault (status 70) and runtime abort (status 71) reports as console output before the exit marker; a first-fit heap with release; per-core cooperative schedulers on both LX7 cores; growable actor stacks. Not delivered: any bare-metal AArch64 / QEMU board pack (§11, §12 Phases B, D, E remain a plan), per-`Space` pools (the ESP32-S3 `alloc_region` still ignores its space operand), a timer-IRQ clock (the board reads the 16 MHz system timer by polling), Fifi on OS-free targets (§9.1 is planned, not implemented), the wide emitter diagnostic channel (the narrow channel is `sir_target_verify`; the ESP32-S3 refusals for foreign calls, file io, frame size and an unsupported width are still `.error` lines). The rows of §4 below describe the starting inventory; the status paragraph and the port status document win where they differ.
+**Implementation status (2026-10-16), ESP32-S3_raw.** Delivered: the `register_rwr` effect; device descriptions as compile-time data (`impl fn registers(device: (:tag))` of the built-in `DeviceDescription` trait, checked by E2201-E2210; stdlib `DeviceDescription.silica`, `Register8.silica`..`Register64.silica`); `map_device`, `peek` and `poke` through the shared stages (`type_checker/device/`, `type_checker/expressions/type_checker_expressions_device.silica`, `module_checker/module_checker_device.silica`, `sir_generator/terms/sir_device_calls.silica`); `spawn_device`, `spawn_device_registered`, `cast_device`, `cast_device_registered` with a third registry; the `device_*` module rules (E2216-E2233); the pre-emit rejection `sir_generator/sir_target_verify.silica` (E2220 for a prim the target cannot compile, through `emitter_core@unsupported_prim_reason`), which stops all three hosted emitters before they emit; the ESP32-S3 lowering in `emitter/ESP32-S3_raw/terms/prims/prims_device.silica` (one `memw`, one `l32i` / `s32i`, and for a `poke` a trailing `memw`; **only 32-bit accesses** are accepted, any other width is refused with an `.error` line naming it); the board pack `emitter/ESP32-S3_raw/board_pack.silica` (window table, `window_containing`, `window_allows_width`, pins, register facts) with its runtime twin `board/runtime/rt_device.S` (`silica_rt_map_device_check`, the abort `illegal device map` for a computed base outside every window); generated per-peripheral descriptions with access modes under `board/pack/` (GPIO, IO_MUX, UART0, SPI2, SYSTEM, LEDC, RMT; `board/tools/gen_board_pack.py`); device drivers in Silica under `board/apps/device_lib/` and the board apps `silica_16_device_uart` to `silica_22_device_buzzer`; fatal fault (status 70) and runtime abort (status 71) reports as console output before the exit marker; a first-fit heap with release; per-core cooperative schedulers on both LX7 cores; growable actor stacks. Not delivered: any bare-metal AArch64 / QEMU board pack (§11, §12 Phases B, D, E remain a plan), per-`Space` pools (the ESP32-S3 `alloc_region` still ignores its space operand), a timer-IRQ clock (the board reads the 16 MHz system timer by polling), Fifi on OS-free targets (done 2026-11-07 on ESP32-S3, commit d036d03b43: FFI on the board in the actor's stack chain, `rt_ffi.S` call block, a C fault mapped to `:foreign_fault`, 30 FFI trials pass on the board; STM32 has `rt_ffi.S` too; updated 2026-11-14), the wide emitter diagnostic channel (the narrow channel is `sir_target_verify`; the ESP32-S3 refusals for foreign calls, file io, frame size and an unsupported width are still `.error` lines). The rows of §4 below describe the starting inventory; the status paragraph and the port status document win where they differ.
 
 **Audience:** someone who already knows Silica’s region/`Space`/`sequence` model and needs a single list of what a raw-metal image must provide, what the current compiler already does, and what still has to be added.
 
@@ -88,7 +88,7 @@ Raw-metal *applications* need device MMIO. Raw-metal *runtimes* also need privil
 | Privileged CPU regs | — | Runtime-only access at EL1 (or ESP32 equivalent); not app MMIO |
 | Actors | Hosted runtime | ESP32-S3_raw: done (`rt_actors.S`, per-core cooperative schedulers on both cores, [esp32s3_xtensa_port.md](ports/esp32s3_xtensa_port.md) §8). Other targets: [IPC_Bare](IPC_Bare.md) scheduling, no Darwin threads |
 | Fault notes | macOS FFI crash note | Per-board fault/IRQ document |
-| Fatal fault / runtime abort reports (spec §15.4.5.5) | `sigaction` + `sigaltstack` handler, `silica_rt_print_fault_site` (status 70), `silica_rt_abort_with` (status 71), on stderr | Exception vectors and stack-guard data breakpoints into the same report line, written as console output before the exit marker with status 70 / 71; see [runtime_failure_reporting.md](runtime_failure_reporting.md) |
+| Fatal fault / runtime abort reports (spec §15.4.5.5) | `sigaction` + `sigaltstack` handler, `silica_rt_print_fault_site` (status 70), `silica_rt_abort_with` (status 71), on stderr | (Status 2026-11-14: ESP32-S3 and STM32 `rt_vectors.S` deliver fatal fault 70 and abort 71 reports as console output; no per-board fault/IRQ document and no AArch64 vectors yet; stack-guard breakpoints not verified.) Exception vectors and stack-guard data breakpoints into the same report line, written as console output before the exit marker with status 70 / 71; see [runtime_failure_reporting.md](runtime_failure_reporting.md) |
 
 A port is **not complete** if only the MMIO prims land, or only the object format lands.
 
@@ -184,6 +184,25 @@ Follow [memory-effects-aarch64-implementation-plan.md](memory-effects-aarch64-im
 
 `device` RAM-like arenas (if any) stay distinct from **mapped peripheral windows**.
 
+### 7.1 What the chips provide: exact, equivalent or emulated (read 2026-11-16)
+
+For each `Space` of the specification (§4.4.2: `normal`/`normal_writeback`, `normal_writethrough`, `normal_noncacheable`, `atomic`, `device`) this table says what the hardware gives, so that the capability flag of item 4 above can be set from facts. **Exact** means the hardware provides the behaviour. **Equivalent** means the chip has no cache on that memory, so the behaviour holds trivially and costs nothing, but the hardware has no such setting. **Emulated** means the runtime has to supply it. **Not found** means the manual says nothing and nothing is assumed. Sources: ESP32-S3 Technical Reference Manual v1.8 (the whole manual, read locally); STM32L4 reference manual RM0351 chapter 2 (a mirror, one chapter); ST application note AN4838 and the Cortex-M4 documentation (PM0214 and the Arm Cortex-M4 TRM) through search excerpts only. Nothing here was run on a board.
+
+| `Space` | ESP32-S3 internal SRAM | ESP32-S3 external RAM (PSRAM, through the DCache) | STM32L476 SRAM1 / SRAM2 | STM32L476 peripherals |
+| --- | --- | --- | --- | --- |
+| `normal` (write-back) | equivalent: no data cache is described for internal SRAM (TRM 4.3.2) | **exact**: the DCache is write-back, with dirty bits and write-back, clean and invalidate operations on the DCache only (TRM 4.3.3.3) | equivalent: RM0351 chapter 2 describes no cache for SRAM; SRAM runs at full clock with no wait state | n/a |
+| `normal_writethrough` | equivalent (every write reaches memory) | **emulated**: the TRM describes no write-through mode and no per-region cache-policy register; the runtime would run the DCache write-back operation after each write | equivalent | n/a |
+| `normal_noncacheable` | **exact**: internal SRAM is not cached | **not found**: no uncached path or bypass is described (a search of the TRM for uncached, non-cacheable and bypass found none); emulate with write-back plus invalidate around each use, or place the data in internal SRAM | equivalent: the Cortex-M4 has no data cache, and the MPU's cacheable bit has no effect on SRAM | n/a |
+| `atomic` | **exact**: `S32C1I`, which the runtime already uses for its spin locks (`rt_heap.S`, `rt_actors.S`, `rt_supervisors.S`, `rt_console.S`). The TRM does not describe `S32C1I` or `ATOMCTL` (Xtensa ISA manual, not read) | **not confirmed**: a forum answer, not Espressif documentation, says hardware compare-and-swap does not work on PSRAM addresses and the IDF falls back to a critical section; treat as not available until checked | **exact** with `LDREX`/`STREX` on ordinary SRAM addresses: a load-exclusive tag is cleared by any `STREX`, by `CLREX` and by an exception, so every sequence needs a retry loop; exclusive access to the bit-band alias (`0x22000000`) is **not** supported; DMA takes no part in the monitor | n/a |
+| `device` | no cache attribute exists; peripherals are at their own address ranges; Permission Control (TRM chapter 15) gives read, write and execute rights per Secure and Non-secure world, not memory attributes | n/a | n/a | **exact through the MPU**: TEX, S, C and B bits select Device or Strongly-ordered (AN4838); the runtime programs the MPU for guard regions only (`rt_start.S`, `rt_failure.S`), not for attributes |
+
+**What follows for the port** (proposals; Lee to confirm):
+
+1. The capability flag reports **exact** only for rows marked exact. Rows marked equivalent are a decision for Lee: true by construction, but not a hardware setting a program could rely on if a later chip adds a cache.
+2. On the ESP32-S3 the real choices are three: internal SRAM (uncached, atomic by `S32C1I`), external RAM through the write-back DCache, and peripherals. A program that needs write-through or uncached external RAM today needs explicit write-back and invalidate calls; those two operations are the whole emulation.
+3. On the STM32L476 the only space that needs hardware set-up is `device` (an MPU region); `atomic` needs a lowering to `LDREX`/`STREX` retry loops, written so that it never targets the bit-band alias.
+4. Unconfirmed, to check before relying on the row: `S32C1I`/`ATOMCTL` behaviour on the ESP32-S3 (the Xtensa ISA manual), whether any uncached path to PSRAM exists, the Cortex-M4 exclusive monitor on Device and Strongly-ordered regions, and what the L4 flash accelerator caches (RM0351 chapter 3, not read).
+
 ---
 
 ## 8. Boot, image, and I/O without Darwin
@@ -208,6 +227,8 @@ Minimum for “actors on metal”: timer tick, mailbox in normal or atomic RAM, 
 Normative rules, registries, `device_*` vs `dangerous_*`, and the boot/panic/IRQ exceptions: [silica_device_actor_specification.md](silica_device_actor_specification.md).
 
 ### 9.1 Fifi on OS-free targets (normative)
+
+*Status (2026-11-14): implemented on ESP32-S3 (commit d036d03b43, 2026-11-07, 30 FFI trials pass on the board) and carried by `rt_ffi.S` on STM32; no bare-metal AArch64 path exists yet.*
 
 Fifi is optional for a port. A port that provides it follows these rules.
 
@@ -285,17 +306,25 @@ Wire `alloc_region(Space)` to a real allocator on one QEMU image. `device` pool 
 
 Device descriptions, `map_device`, and 32-bit `peek` / `poke`, with the hosted emitters' rejection (§5.5). First QEMU trial may use the **reset-stub** UART exception. Application poke waits for Phase F.
 
+*Status (2026-11-14), partly done: ESP32-S3_raw has `map_device` and 32-bit `peek`/`poke` (`prims_device.silica`). Still open: the bare-metal AArch64/QEMU pack.*
+
 ### Phase D — Console and panic
 
 Early panic UART stays in the stub. After Phase F, hosted `device_io` print on that target is replaced by casts to a UART device worker.
+
+*Status (2026-11-14), partly done: ESP32-S3 fault/abort reports (status 70/71) exist as console output. Still open: AArch64 early-panic UART stub; the UART worker needs Phase F.*
 
 ### Phase E — Image
 
 `aarch64-none-elf` (or direct ELF writer). Reset stub. CI: QEMU boot + UART output golden.
 
+*Status (2026-11-14), partly done: the ESP32-S3 image path exists (`board/tools/build_image.sh`, esptool elf2image). Still open: `aarch64-none-elf`/direct ELF and QEMU UART golden CI.*
+
 ### Phase F — Time and device workers
 
 Tick + `spawn_device` UART (or timer) worker. Clients `cast_device`. Privilege/sysreg stays in the stub. Checker markers from [silica_device_actor_specification.md](silica_device_actor_specification.md) §11 land with this phase or immediately after.
+
+*Status (2026-11-14), partly done: `spawn_device`/`cast_device` delivered with E2216-E2233 rules and ESP32-S3 board apps silica_16..22. Still open: timer-IRQ clock (polling today) and any AArch64 device worker.*
 
 ### Phase G — Second chip
 

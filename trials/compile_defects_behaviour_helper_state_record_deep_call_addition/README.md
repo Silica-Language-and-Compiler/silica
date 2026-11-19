@@ -15,6 +15,11 @@ dispatch then prints a state with garbage fields.
   prints (the prints are the "deeper calls"), returns it. Fails on its own, with no recursion.
 - `helper_state_record_deep_recursion`: same with `deep(6)` and `deep(9)` (recursive frames) between the
   bind and the return.
+- `helper_state_record_by_name`: the behaviour (`keeper`) tail-calls `settle(state, 1)` with the whole state
+  record (an `actor_ref`, a string built by `concat` in `arm`, an `int64`) passed BY NAME; `settle` builds the
+  new record in its own frame (after printing and casting to the peer) and returns `(:no_reply, record)`.
+  Distilled from the transport_addition `dangerous_link_dial_link_up_text` fault (exit 70, garbage string
+  pointer). Expected: `seen=1 expect=key:7` .. `seen=3 expect=key:7`, `done`, `0`.
 - `helper_state_nested_record`: nested record state (`in: { x, y }`) with a 8-word-local helper and
   `deep(20)` between the bind and the return.
 
@@ -31,11 +36,16 @@ No `.ascomp`: generate the goldens only after the fix, from correct output.
 Fix to apply on each hosted emitter: the STM32 change (`fn_epilogue_adopts` true for behaviour-shaped
 functions; the actor runtime's dispatch puts SP back itself after the dispatch end places the state).
 
+Status (2026-11-15): the defect was fixed in the hosted `fn_epilogue_adopts` (apple_silicon_mac, linux_aarch64
+and linux_x86_64 emitters, matching the boards). Verified on the Mac with the three programs above plus
+`helper_state_record_by_name`; still UNVERIFIED on Linux (pix, nix). The move into `actors_addition` and the
+deletion of this directory wait for Linux verification.
+
 Run by hand from `trials/` (INTEGRATE_PENDING keeps it out of tree-wide runs):
 
 ```
 make -C compile_defects_behaviour_helper_state_record_deep_call_addition integrate TRIAL_TARGET=host SILICA_COMPILER=/Volumes/2T/silica/binaries/silica-compiler
 ```
 
-When it passes on every hosted target, move the three programs into `actors_addition` with goldens and
+When it passes on every hosted target, move the four programs into `actors_addition` with goldens and
 delete this directory.

@@ -520,37 +520,47 @@ upgrade below.
 
 | Carriers | `:close` | A fault (failed open, read, write or flush) | A peer that closes |
 | --- | --- | --- | --- |
-| hosted `(:tcp)`, `(:udp)`, `(:serial)` | `(:link_down, :closed)`, then the carrier ends, `stop_self(:normal)` | `(:link_down, :fault)`, then the carrier ends with `stop_self((:explicit, :link_unavailable))` for a failed open and `(:explicit, :link_lost)` for a failed read or write, so its supervisor restarts it | `(:link_down, :closed)`, then the carrier ends, `stop_self(:normal)` |
+| hosted `(:tcp)`, `(:udp)`, `(:serial)` | `(:link_down, :closed)`, then the carrier ends, `stop_self(:normal)` | `(:link_down, :fault)`, then the carrier ends with `stop_self((:explicit, :link_unavailable))` for a failed open and `(:explicit, :link_lost)` for a failed read or write; a `(:tcp)` dial whose peer does not answer within the connect timeout its address states answers `(:link_down, :timeout)` and ends with `(:explicit, :link_timeout)` (built 2026-11-15; not yet compiled or run); in each case its supervisor restarts it | `(:link_down, :closed)`, then the carrier ends, `stop_self(:normal)` |
 | `(:store)` on `(:memory)` and `(:backing)` (§6.8) | the same | `(:link_down, :medium)` (or `:in_use`, `:mismatch` for a refused open); the backing is closed and **the carrier stays**, not open, until its owner sends `:close` | does not apply |
 
-**The hazard.** A `cast` to an actor that has ended ends the sender with `actor_not_found` (specification §16.1.4). A
-carrier that ends on its own can end before its owner has read `:link_down`, and an owner that then sends a `:tx`, a
-`:credit` or a `:close` it had already decided on is ended too. Nothing the owner does closes that window. The hosted
-network carriers have it on every fault and on a peer's close; the store carriers do not, because only their owner's
-`:close` ends them. For a store the owner is usually the actor that holds the application's unsaved data, which is why
-the store carriers were built the safe way first.
+**The hazard (removed for `cast`, 2026-11-16).** Until 2026-11-16 a `cast` to an actor that had ended ended the sender
+with `actor_not_found`. A carrier that ends on its own can end before its owner has read `:link_down`, and an owner that
+then sent a `:tx`, a `:credit` or a `:close` it had already decided on was ended too. Nothing the owner did closed that
+window. The hosted network carriers had it on every fault and on a peer's close; the store carriers did not, because only
+their owner's `:close` ends them. For a store the owner is usually the actor that holds the application's unsaved data,
+which is why the store carriers were built the safe way first. A `cast` to an ended actor now returns `false` and the
+sender goes on (specification §16.1.2 and §16.1.4), so such a `:tx`, `:credit` or `:close` is dropped and the owner is
+not ended. `call`, `call_with_timeout` and the registered casts still raise `actor_not_found`.
 
-**Upgrade note: end on failure everywhere, and change the language (decided in direction, Lee, 2026-11-12; not built).**
+**Upgrade note: end on failure everywhere, and change the language (decided in direction, Lee, 2026-11-12; item 1
+built for `cast` 2026-11-16, items 2 to 4 not built).**
 The intended rule is the one this section states: every carrier ends when its link fails, with an exit reason, and its
 supervisor decides what happens next. Making that safe is a change to the language, not to the carriers:
 
-1. **The language.** A `cast` to an ended carrier must not end its sender. The change is to what a `cast` to an ended
-   actor does (for instance: it answers `false` and the sender goes on), in specification §16.1.4, §15.1.2.3 and
-   §15.4.11, and in the runtime of every target (Apple Silicon, Linux AArch64, Linux x86-64, ESP32-S3_raw,
-   STM32-L476RG_raw). Whether it holds for every actor reference or only for a carrier's is part of that design.
-2. **The store carriers.** `store_memory_carrier` and `dangerous_store_backing_carrier` then end on a medium failure and
-   on a refused open, with `stop_self((:explicit, :link_lost))` and `(:explicit, :link_unavailable)`, as the network
-   carriers do, and §6.8.2 and §6.8.10 lose their exception.
-3. **Owners.** An owner written against today's store carriers sends `:close` after `(:link_down, :medium)`. After the
-   upgrade that `:close` reaches an ended carrier and is harmless, so such an owner needs no change; an owner that relies
-   on the carrier staying to be opened again must start a new carrier, or leave that to its supervisor.
+1. **The language (done for `cast`, 2026-11-16).** A `cast` to an ended carrier must not end its sender. A `cast` or a
+   `cast_device` to an actor that has ended, or never existed, now returns `false` and the sender goes on. It holds for
+   every actor reference, not only a carrier's. It is stated in specification §16.1.2, §16.1.4 and §15.1.2.3 and made in
+   the runtime of every target. Built and run on Apple Silicon; changed but not run on Linux AArch64, Linux x86-64,
+   STM32-L476RG_raw; run on the ESP32-S3 board on 2026-11-16 (the trial `cast_to_ended_actor_returns_false` as a board
+   app: its output matched). `call`, `call_with_timeout` and the registered casts are unchanged and still raise
+   `actor_not_found`: **decided (Lee, 2026-11-16), they keep raising.** The legacy builtin `send` also still raises;
+   what becomes of it is not decided.
+2. **The store carriers: not to be changed (decided, Lee, 2026-11-16).** `store_memory_carrier` and
+   `dangerous_store_backing_carrier` keep ending only on their owner's `:close`, and stay, not open, after a medium
+   failure or a refused open. The exception of §6.8.2 and §6.8.10 stands as the design, not as an interim state. (The
+   note first said they would end on failure as the network carriers do.)
+3. **Owners.** With item 2 decided as it is, an owner of a store carrier is unchanged: it sends `:close` after
+   `(:link_down, :medium)` to be rid of the carrier, or opens it again. An owner of a hosted network carrier that sends
+   after the carrier has ended gets `false` and goes on.
 4. **Trials.** A trial in which an owner sends to a carrier that has already ended, for each carrier kind; the
    `ethernet_direct` example's dial retry, which closes a carrier that a refused dial has already ended, is the case
-   that exists today.
+   that exists today. The `(:tcp)` carrier has its trial (2026-11-16,
+   `transport_addition/app_transport_tcp_close_after_end`, run on Apple Silicon);
+   the other carrier kinds have none yet.
 
-Until then a program that owns a hosted network carrier should treat `:link_down` as the last use of that reference
-and should not send to a carrier it has not heard from, and a program that owns a store carrier must send `:close` to
-be rid of it.
+What remains is the trials of item 4 for the other carrier kinds. A program that owns a store carrier must send
+`:close` to be rid of it. A program that owns a hosted network carrier should still
+treat `:link_down` as the last use of that reference: a message sent after it is dropped.
 
 **Listeners.** A carrier whose `addressing` is `:endpoint` and whose `boundaries` are `:stream` may be opened to
 listen instead of connect (`(:tcp)`: `"listen:<port>"` binds 127.0.0.1 only; `"listen:any:<port>"` binds every IPv4
@@ -581,11 +591,21 @@ not list the same rows (BLE on a headless server, for instance).
 
 | Tag | Provided by | `mtu` | `boundaries` | `delivery` | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor spawns one per accepted peer and announces it with `(:accepted, conn, "peer:<ipv4>:<port>")` (§6.2). Address forms (hosted Ethernet plan stage E2, built 2026-11-12; loopback, refusals and E2418 verified on the three hosted targets; Linux classifier, Wi-Fi and a real non-loopback interface not verified): with no link declared, `"listen:<port>"` binds 127.0.0.1, `"listen:any:<port>"` binds 0.0.0.0 and `"listen:<ipv4>:<port>"` binds that address; under `(:loopback)`, `"listen:<port>"` binds 127.0.0.1, `"listen:any:<port>"` is refused and `"listen:<ipv4>:<port>"` is allowed only inside 127.0.0.0/8; under `(:interface, name)`, `(:ethernet, n)` or `(:wifi, n)`, `"listen:<port>"` binds that interface's first IPv4 address, `"listen:any:<port>"` is refused and `"listen:<ipv4>:<port>"` is allowed only for one of that interface's addresses, and a dial leaves from the interface's address (dials under `(:loopback)` are unchanged). A refusal makes the carrier tell its owner `(:link_down, :fault)` and end `(:explicit, :link_unavailable)`; a malformed IPv4 ends `(:explicit, :bad_address)`. `(:ethernet, n)` and `(:wifi, n)` count only interfaces holding an IPv4 address. Where the checker sees the spawn and a refused address literal in one function it is E2418 (specification §16.4.9). The `(:udp)` carrier still binds nothing. **Plain TCP: no authentication, no encryption, no peer identity** (see the security note under this table) |
-| `(:udp)` | the same wrappers | 65507 | `:datagram` | `:unreliable` | an endpoint actor per bound port |
+| `(:tcp)` | a dangerous actor over the chunk 9 Fifi socket wrappers | 0 | `:stream` | `:reliable_ordered` | the connection actor of board plan §4.6, hosted form. One actor per connection; a listener actor spawns one per accepted peer and announces it with `(:accepted, conn, "peer:<ipv4>:<port>")` (§6.2). Address forms (hosted Ethernet plan stage E2, built 2026-11-12; verified by real runs 2026-11-13/14 on the three hosted targets: loopback, refusals, E2418, the classifier, real non-loopback binds, real Wi-Fi on pix; not verified: wireless on nix and the Mac, two addresses on one interface): with no link declared, `"listen:<port>"` binds 127.0.0.1, `"listen:any:<port>"` binds 0.0.0.0 and `"listen:<ipv4>:<port>"` binds that address; under `(:loopback)`, `"listen:<port>"` binds 127.0.0.1, `"listen:any:<port>"` is refused and `"listen:<ipv4>:<port>"` is allowed only inside 127.0.0.0/8; under `(:interface, name)`, `(:ethernet, n)` or `(:wifi, n)`, `"listen:<port>"` binds that interface's first IPv4 address, `"listen:any:<port>"` is refused and `"listen:<ipv4>:<port>"` is allowed only for one of that interface's addresses, and a dial leaves from the interface's address (dials under `(:loopback)` are unchanged). A refusal makes the carrier tell its owner `(:link_down, :fault)` and end `(:explicit, :link_unavailable)`; a malformed IPv4 ends `(:explicit, :bad_address)`. `(:ethernet, n)` and `(:wifi, n)` count only interfaces holding an IPv4 address. Where the checker sees the spawn and a refused address literal in one function it is E2418 (specification §16.4.9). IPv4 literals, including a TCP dial host, use a strict dotted-quad parse (no leading zeros except a bare `0`); a malformed one ends `(:explicit, :bad_address)`. A dial address is `"host:port:timeout_ms"` (hosted Ethernet plan stage E8; built 2026-11-15, not yet compiled or run): the connect timeout in whole milliseconds, 1 to 9 decimal digits, greater than 0, stated by the program; there is no default, and an address without it, or with a malformed or zero one, ends `(:explicit, :bad_address)` with nothing dialled. The connect is non-blocking and the carrier waits at most that long; a peer that does not answer in time gives the owner `(:link_down, :timeout)` and ends the carrier `(:explicit, :link_timeout)`; a refused connection is a failed open as before. `:link_up` of a dialled connection carries `"host:port"`. UDP binds the same way (see the `(:udp)` row; verified by trials 2026-11-13/14, and by the example `ethernet_direct_udp` Mac to nix over the LAN). **Plain TCP: no authentication, no encryption, no peer identity** (see the security note under this table) |
+| `(:udp)` | the same wrappers | 65507 | `:datagram` | `:unreliable` | an endpoint actor per bound port; the open string is `"host:port@local"`, `local` being `<port>`, `<ipv4>:<port>` or `any:<port>`: no link `<port>` 127.0.0.1, `any` 0.0.0.0, ip that ip; `(:loopback)` `<port>` 127.0.0.1, `any` refused, ip only in 127.0.0.0/8; a named link `<port>` the interface's first IPv4, `any` refused, ip only that interface's address; datagrams leave from the bound address; refusal `(:link_down, :fault)` then `(:explicit, :link_unavailable)`; malformed host or ip `(:explicit, :bad_address)`; the link does not restrict the peer (built; trials added, run in the next trial pass) |
 | `(:serial)` | a dangerous actor over a Fifi wrapper of the host's serial port (termios on macOS and Linux) | 0 | `:stream` | `:reliable_ordered` | the port and line speed come from the carrier's declaration, `carried_on <name>: (:serial) (:serial_port, "/dev/cu.usbmodem101", 115200);` (§6.7; `spawn_dangerous_carrier(<name>, ...)` puts them in the initial state and `:open`'s `address` is `""`); an `address` `"path@baud"` still names a port directly. This is the host end of the board's USB-UART, USB-Serial-JTAG and USB CDC carriers, so a Mac and the board exchange frames Silica to Silica with no Erlang in between. The wrapper does not flush the port's input at open, which this path needs (§14, board carrier notes) |
 | `(:ble_gatt)` | a dangerous actor over a Fifi wrapper of the host's Bluetooth stack (CoreBluetooth on macOS, BlueZ D-Bus on Linux) | negotiated ATT_MTU minus 3 (20 by default, up to 244 after MTU exchange; a characteristic value is at most 512 bytes) | `:datagram` | `:ordered_lossy` for notifications, `:reliable_ordered` for indications and writes with response | `address` names the role and the service, `"central:<uuid>"` or `"peripheral:<uuid>"` (the service has one characteristic toward each side; [transport_ble_plan.md](transport_ble_plan.md) §4 and stage 3); `:link_up` carries the negotiated MTU as `"mtu:<n>"`. Built on macOS (2026-11-10): `dangerous_ble_gatt_carrier`, writes with response and indications only, so its row in `Carrier` is `:reliable_ordered` with `mtu` 20. One program holds up to four sessions, each a carrier of its own, opened one after another. Encryption is as §6.5 says. Not built on Linux (the plan's stage 11, deferred) |
 | `(:unix_dgram)` | later, if [IPC_OS.md](IPC_OS.md) is ever built | per OS | `:datagram` | `:reliable_ordered` | cross-process actors on one host |
+
+**`(:tcp)` over IPv6, and a listener bound by name (requests SR-1 and SR-2; built 2026-11-17, hosted targets only; checked on the Mac by scratch runs over ::1 (listen, dial, peer texts, link rules, refusals, a name bind of `localhost`); no trials yet, the Linux hosts not run).** Decisions:
+
+- **Forms.** Dial `"[<ipv6>]:<port>:<timeout_ms>"`; listen `"listen:[<ipv6>]:<port>"`; listen by name `"listen:name:<name>:<port>:<timeout_ms>"`. The IPv4 forms are unchanged, and `"listen:<ipv4>:<port>"` was already the bind to one IPv4 address.
+- **Brackets always.** An IPv6 address is written between brackets in every form, because every form ends with `:<port>` and an address made of colons has no other unambiguous end. An unbracketed one is never accepted (`"::1:80:3000"` is `(:explicit, :bad_address)`).
+- **One text per address.** As the IPv4 parser accepts one text for each address (no leading zeros), the IPv6 parser (`ipv6_strict` in `silica_sockets.c`, `dangerous_sockets@parse_ipv6`; no libc parser) accepts only the canonical text of RFC 5952: lowercase hexadecimal, no leading zeros in a group, `::` for the longest run of two or more zero groups (the first when two are equally long). Uppercase, a leading zero, an uncompressed zero run, a dotted-quad tail (`::ffff:1.2.3.4`) and a zone (`%en0`) are `(:explicit, :bad_address)`. So is a link-local address (fe80::/10): it needs the zone the forms do not carry, and is not served yet. The port of the new forms is 1 to 5 digits, no leading zero, at most 65535 (the IPv4 forms read their port as before).
+- **Families never mix.** Every IPv6 socket is `IPV6_V6ONLY`: `"listen:[::]:<port>"` is every IPv6 interface and never IPv4, `"listen:any:<port>"` every IPv4 interface and never IPv6. A program that wants both opens two listeners. A bare `"listen:<port>"` still binds IPv4 (127.0.0.1, or a named link's first IPv4 address).
+- **Link rules** are those of IPv4: `(:loopback)` allows only `"listen:[::1]:<port>"`; a named link allows only an address its interface holds (so `[::]` is refused under every link); a refusal is `(:link_down, :fault)` then `(:explicit, :link_unavailable)`. An IPv6 dial under a named link leaves from the interface's first IPv6 address that is not link-local (none: `(:explicit, :link_unavailable)`). `(:ethernet, n)` and `(:wifi, n)` still count only interfaces holding an IPv4 address. `E2418` does not yet look at IPv6 literals: the carrier's refusal at `:open` is the guard.
+- **Peers.** `:accepted` and an accepted connection's `:link_up` carry `"peer:[<ipv6>]:<port>"` for an IPv6 peer, in the canonical text; a dialled connection's `:link_up` carries `"[<ipv6>]:<port>"`. The IPv4 texts are unchanged.
+- **A name binds, a name is not dialled.** A listener's name is resolved once at `:open` by the system resolver (`getaddrinfo`); its addresses are taken in the resolver's order, both families, link-local IPv6 ones and those the link does not allow are passed over, and the first that binds is the listener's one address. The resolver is the only thing a listener waits for, so the address states the wait, with the dial's rules (no default): no answer in time is `(:link_down, :timeout)` then `(:explicit, :link_timeout)`; a name that does not resolve or binds nowhere is `(:explicit, :link_unavailable)`. A name is letters, digits, hyphens and dots whose last label starts with a letter, so no numeric form reaches the resolver; anything else is `(:explicit, :bad_address)`. A dial takes an address only: choosing among a peer's addresses, their order and the retries is the program's own (Project BEES resolves its peers itself, by ruling).
 
 **Security.** The `(:tcp)` carrier is plain TCP. It provides no authentication, no encryption and no peer identity: anyone who can reach a listening port can connect and send frames, and anyone on the path can read and change the bytes. Secure interchange is being built on top of this carrier in Project BEES (https://github.com/Silica-Language-and-Compiler/project-bees): SEMP/TRUST over mutual TLS 1.3 (ALPN `trust/1`, a certificate whitelist; the TLS engine is selected: OpenSSL on macOS and Linux, Mbed TLS on the NUCLEO-L476RG and the ESP32-S3) and an Erlang-compatible BEAM mode with cookie authentication. As of 2026-11-10 BEES's TLS and TRUST code is not built yet and its cookie handshake is in progress; both build on this carrier's non-loopback support. Today BEES's BEAM-mode wire runs between BEES nodes on loopback only, without the cookie digest (test-only, unauthenticated). The `"listen:any:<port>"` form and direct (non-loopback) TCP are the prerequisite BEES milestone N1 (non-loopback addresses) needs.
 
@@ -963,6 +983,12 @@ at a time, ending at the `next` of its `:read`, with `:read_stop` and `:busy` (�
 its reference an `actor_ref`; a hosted `(:backing)` carrier is a dangerous actor (§6.8.1). (20) Receive credit outlives
 a replay (§6.8.2).
 
+**Decided (Lee, 2026-11-16).** Three points that were written into this section during the review without a ruling are
+accepted as written: (21) `:trim` is answered by `:log` and a trimmed queue delivers at least once (§6.8.5, decision 14);
+(22) a record never spans two blocks, and the block size gives the `mtu` (§6.8.4, decision 16); (23) the recovery
+trials run on `(:backing)` and not on `(:memory)` (§6.8.7). (24) The store carriers end only on their owner's `:close`
+and stay, not open, after a failure (§6.2, upgrade note item 2).
+
 **Open.**
 1. (Closed 2026-11-12: there is no default retention.)
 2. Which medium comes first on the board, internal flash or the SD card, and the board pack's region table.
@@ -1080,7 +1106,8 @@ actor either. Composite `recreate` is not built. So the backing carrier keeps no
 - **A medium failure does not end the carrier (now the documented behaviour, §6.2 and §6.8.2; to change with the upgrade
   note of §6.2).** A write, a flush or a read that fails answers `(:link_down, :medium)`
   and closes the backing; the carrier stays, not open, until its owner sends `:close`. An owner that sends a late message
-  then finds an actor: a cast to an ended actor ends its sender with `actor_not_found`. Only `:close` ends the carrier.
+  then finds an actor: until 2026-11-16 a cast to an ended actor ended its sender with `actor_not_found` (it now returns
+  `false`, §6.2). Only `:close` ends the carrier.
 - **A refused open leaves the carrier too:** `(:link_down, :in_use)`, `(:link_down, :mismatch)` or `(:link_down, :medium)`,
   and the owner may open again or close.
 - **`(:tx_credit, n)` and `(:synced, next)` follow the write and the flush** they report, in the same dispatch.
@@ -1626,11 +1653,12 @@ with phase 2.
   `dangerous_exposure_source/sockets/`.
 - The carriers are library FFI workers: `dangerous_tcp_carrier`, `dangerous_udp_carrier` and
   `dangerous_serial_carrier`, each one exported cast-only behaviour `carrier/2` that a program installs
-  with `spawn_dangerous` and opens with `(:open, owner, address)`: `"host:port"` connects, `"listen:port"`
+  with `spawn_dangerous` and opens with `(:open, owner, address)`: `"host:port:timeout_ms"` connects, waiting at most the stated `timeout_ms`
+  milliseconds (no default; an address without it is refused, `(:explicit, :bad_address)`), `"listen:port"`
   listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"`
   listens on every IPv4 interface (2026-11-10, `silica_sockets_tcp_listen_any`; trial
   `transport_addition/app_transport_tcp_listen_any`),
-  `"host:port@local"` for a UDP endpoint, `"path@baud"` for a serial port. The contract of §6.2 is
+  `"host:port@local"` for a UDP endpoint (`local` is `<port>`, `<ipv4>:<port>` or `any:<port>`), `"path@baud"` for a serial port. The contract of §6.2 is
   spoken as written, with `int64` counts; a carrier polls its descriptor between mailbox messages with a
   20 ms timeout and delivers `:rx` only against the owner's `:credit`. Because the language allows a
   `sequence proc[external_danger]` only as a function's root body, each carrier is one sequence that

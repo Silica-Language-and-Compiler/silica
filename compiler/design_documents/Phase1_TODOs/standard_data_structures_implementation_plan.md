@@ -2180,7 +2180,7 @@ Sections §6–§37 are the authoritative serial queue. Complete each section in
 5. `wbt_set` and `OrderedSet` (§10). **(complete)**
 6. Self-host source prerequisites on `src/` only: crafted BST → WBT, then alias ban (§11). **(complete)**
 7. Additive build-selfhost / ABI hardening on the parallel tree (§12). **(exit gate met 2026-09-02; the selfhost binary runs all trials; bootstrap now builds only the seed)**
-8. Fixed-point + cutover / bootstrap retirement (§13). **(fixed points reached on the hosted platforms, see §13 status; bootstrap retirement not verified)**
+8. Fixed-point + cutover / bootstrap retirement (§13). **(done: fixed points reached on the hosted platforms, see §13 status; bootstrap retired, Rust crate deleted in 8dcf493d4 on 2026-09-17, verified 2026-11-14 per bootstrap_retirement_and_self_host_plan.md)**
 9. Join/split reopen checkpoint (§14). **(deferral reaffirmed in code; ledger record owed)**
 10. Skew binary random-access-list core (§15). **(implemented 2026-09-08 ahead of §13 at Lee's direction; see §15 status)**
 11. Brodal–Okasaki core (§16). **(complete 2026-09-18; see section status)**

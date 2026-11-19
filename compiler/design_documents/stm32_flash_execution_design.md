@@ -204,7 +204,7 @@ the object's text/rodata split was not measured; read it with `arm-none-eabi-siz
 ## 4. Verification plan
 
 1. **Link-only**: the combined two-pin program built with `BOARD_EXEC=flash` links (the 16 KiB heap assert passes
-   with margin) where the RAM build fails.
+   with margin) where the RAM build fails. **Done (2026-11-12, `83ff3cd7dc`):** flash linker script, `BOARD_EXEC=flash`, example `nucleo_flash_max_actors`, link-verified. Steps 2 to 5 have not been run on the board (2026-11-14).
 2. **Flash/RAM equality**: a base-suite sample (say 30-50 trials covering actors, supervisors, strings, floats,
    behaviour conventions with `(:reply, ...)` and `(:no_reply, ...)` shapes, `behaviour_case_arm_helper_state_record`,
    timers) run in RAM mode through the trial harness; build the same programs once in flash mode and load each by
@@ -231,4 +231,4 @@ the object's text/rodata split was not measured; read it with `arm-none-eabi-siz
 
 Whether the second linker script is generated from the first (a shared `INCLUDE` for the SRAM2 and heap
 parts) to avoid drift; whether `BOARD_EXEC` becomes a per-suite default for suites whose images exceed the RAM
-budget; whether to enable the ART in the RAM image too (RAM code does not need it).
+budget; whether to enable the ART in the RAM image too (RAM code does not need it). **Status (2026-11-14):** the second linker script is a separate hand-written file, `runtime/silica_stm32l476rg_flash.ld` (not generated); `BOARD_EXEC` is set by hand only and the trials never use flash; the ART in the RAM image is still undecided.

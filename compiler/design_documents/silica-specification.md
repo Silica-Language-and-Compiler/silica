@@ -7745,6 +7745,8 @@ When an actor ends, the runtime:
 - Removes the actor's registered name, if it has one (§20.3.1)
 - Releases the actor's stack and resources
 
+After an actor has ended, a `cast()` to it returns `false` and a `call()` to it raises `actor_not_found` (§16.1.4).
+
 **Failure and outstanding calls:** If an actor terminates for any reason before replying to a synchronous `call()`--including runtime traps, explicit abnormal kill, supervisor cascade termination, or ordinary shutdown--the runtime must wake every affected caller before actor teardown completes. This includes the call currently being processed, if any, and any queued call messages that have not yet been processed. Each wrapper is completed exactly once with the actor-death result; queued cast/send messages are discarded without reply. A restarted actor does not inherit or replay the failed actor's pending calls.
 
 **Example:**
@@ -8878,7 +8880,7 @@ same on every target, hosted or OS-free; only where the report is written differ
 |-------|------|-------------------|-------------|
 | **Fatal fault** | A synchronous hardware exception that is not recovered: the containment gate fails (§15.4.4); the fault is outside any actor, including exhausting the stack of `main`, which is not an actor (§15.1.2.2); the fault is in trusted runtime code; a fault in guarded foreign code (§26) when no actor is current; a fault inside the fault handler itself; or debug mode (§15.4.15.1) | `[silica] fault at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>`, then `  addr=0x<fault address>` and, on targets with actors, `  actor=0x<actor>  sbase=0x<stack base>  ssize=0x<stack size>` | **70** |
 | **Runtime abort** | The runtime detects a condition it cannot continue from: a failed runtime check in `main` (region capacity, buffer validity or bounds, list index, an internal invariant; inside an actor the same failures end the actor instead, with `(:explicit, :region_alloc_failed)`, `:buf_invalid`, `:buf_bounds` or `:list_index`, and reach its supervisor), a resource the runtime cannot obtain (memory to commit for a growing stack, §15.4.10.2; an actor stack reservation requested by `main`, §15.1.2.2), or a containment failure that was not raised by hardware | `[silica] abort: <reason> at 0x<pc>` followed, where available, by ` in <symbol>+0x<offset>` | **71** |
-| **Language-level failure in `main`** | A pattern-match or arithmetic failure raised in `main`, which has no supervisor; a `call` or `cast` from `main` to an ended actor (§16.1.4); a calling-convention mismatch found at run time (§16.2.6.4) | the failure's atom name (`case_clause`, `badarith`, `actor_not_found`, `language_error`) | **1** |
+| **Language-level failure in `main`** | A pattern-match or arithmetic failure raised in `main`, which has no supervisor; a `call` from `main` to an ended actor (§16.1.4; a `cast` to one returns `false` and is not a failure); a calling-convention mismatch found at run time (§16.2.6.4) | the failure's atom name (`case_clause`, `badarith`, `actor_not_found`, `language_error`) | **1** |
 
 Rules:
 
@@ -9385,7 +9387,7 @@ When a child exits and the **row** in the internal child table (§15.4.13.3) for
 3. Updates that row in the **heap child table** with the new `actor_ref`; the old ref is permanently dead.
 4. Numbers the replacement with the supervisor's next child number, so the replacement's identity differs from the old child's (§15.1.4). If the child is itself a spawner, its position and the high-water mark of its child numbering are kept in this row and handed to the replacement, so its numbering continues (§15.1.4).
 
-`call()` or `cast()` to a dead `actor_ref` raises `actor_not_found` (§16.1.4). User code is not involved in the restart; the runtime-owned supervisor behavior applies the strategy from `supervisor_flags` directly.
+`call()` to a dead `actor_ref` raises `actor_not_found`; `cast()` to one returns `false` (§16.1.4). User code is not involved in the restart; the runtime-owned supervisor behavior applies the strategy from `supervisor_flags` directly.
 
 ##### 15.4.12.2 Coordinated Shutdown of Live Children
 
@@ -9938,9 +9940,11 @@ cast(actor: actor_ref, message: ActorMessage) -> boolean proc[concurrency]
 **Semantics:**
 - **Non-Blocking**: The caller returns immediately; the message is queued and processing continues without waiting for a response
 - **No Reply Expected**: The target behavior must return `(:no_reply, new_state)` — no reply is sent back to the caller
-- **Immediate Death Detection**: Raises `actor_not_found` immediately if the actor is already dead (does not queue the message)
-- **Success/Failure**: Message is successfully enqueued if the actor exists and is alive; raises `actor_not_found` if the actor doesn't exist or is dead
-- **Result**: `true` when the message was enqueued. `cast` has no failing return: every case in which the message cannot be enqueued (the actor has ended, never existed, or is a reference to a name nobody holds) raises `actor_not_found`, so a `cast` that returns has always returned `true`. Verified 2026-10-16 in the hosted runtimes (`_silica_rt_actor_cast` turns the enqueue routine's 0 into `actor_not_found`) and the ESP32-S3 runtime (`silica_rt_actor_cast`); no mailbox-full case exists, since mailboxes are unbounded. The `boolean` in the signature is kept for source compatibility and for `cast_exit`, which does return `false` (§15.1.2.5).
+- **Immediate Death Detection**: Returns `false` immediately if the actor is already dead (does not queue the message)
+- **Success/Failure**: Message is successfully enqueued if the actor exists and is alive; the message is dropped and `cast` returns `false` if the actor doesn't exist or is dead. The sender is not ended and goes on
+- **Result**: `true` when the message was enqueued, `false` when it was not because the actor has ended or never existed. A `cast` never raises `actor_not_found`. A sender that must know whether its message was accepted reads the result; a sender that does not care ignores it. `true` does not mean the message will be handled: the actor can end before it reaches the message (§16.1.4). No mailbox-full case exists, since mailboxes are unbounded. `cast_device` follows the same rule. `cast_registered`, `cast_dangerous_registered` and `cast_device_registered` do not: they raise `actor_not_found` when no live actor holds the name (§20.3.1). `cast_exit` also returns `false`, for its own reason (§15.1.2.5). A `cast` to a call-only actor found at run time is still a calling-convention mismatch (§16.2.6.4).
+
+**Implementation status (2026-11-16).** Until this date a `cast` to an ended actor raised `actor_not_found` and ended its sender. The runtime entry of `cast` and `cast_device` now returns the enqueue routine's result on all five targets. Built and run: Apple Silicon macOS (trials `actors_addition/cast_to_ended_actor_returns_false`, `actors_addition/identity_dead_ref_raises` and `transport_addition/app_transport_tcp_close_after_end`). Changed but not run: Linux AArch64, Linux x86-64 and STM32-L476RG_raw (not built), and ESP32-S3_raw (the runtime was assembled into an image, which was not run); their goldens for the changed trials are not regenerated.
 
 **Behavior Function Contract**: The target actor must be spawned with a **cast-only** behavior function that returns `(:no_reply, new_state)`.
 
@@ -9973,10 +9977,10 @@ Messages are delivered exactly once, in FIFO order. The actor runtime processes 
 When a message is sent to an actor that has terminated, the following behavior applies:
 
 - **Messages are Dropped**: Messages sent to terminated actors are dropped (not queued) and will never be delivered
-- **Exception Raised**: Both `call()` and `cast()` raise `actor_not_found` when targeting a terminated actor, providing consistent error handling across all message-passing operations
-- **Explicit Handling Required**: Callers must handle the `actor_not_found` exception when calling or casting to actors that may have terminated
+- **`call()` Raises**: `call()` raises `actor_not_found` when targeting a terminated actor (§16.1.1)
+- **`cast()` Returns `false`**: `cast()` to a terminated actor returns `false` and the sender goes on (§16.1.2)
 
-**Implementation status (2026-10-16).** `actor_not_found` cannot be caught: Silica has no exception handler. A `call` or `cast` that raises it ends the sender. A sender that is an actor fails with `failure_reason` `(:explicit, :actor_not_found)` (reason tag 4). When the sender is `main`, which has no supervisor, the process writes `actor_not_found` to standard error and exits with status 1 (§15.4.5.5). A caller that must not fail uses a reference it knows to be alive, or learns of the end of an actor through supervision or a monitor (trial `actors_addition/identity_dead_ref_raises`).
+**Implementation status (2026-10-16; `cast` changed 2026-11-16).** `actor_not_found` cannot be caught: Silica has no exception handler. A `call` that raises it ends the sender. A sender that is an actor fails with `failure_reason` `(:explicit, :actor_not_found)` (reason tag 4). When the sender is `main`, which has no supervisor, the process writes `actor_not_found` to standard error and exits with status 1 (§15.4.5.5). A caller that must not fail uses a reference it knows to be alive, or learns of the end of an actor through supervision or a monitor (trial `actors_addition/identity_dead_ref_raises`). Since 2026-11-16 a `cast` does not raise it: a `cast` to an ended actor returns `false` (§16.1.2, which states what was built and run).
 - **No Delivery Guarantee**: There is no guarantee that messages sent to an actor will be delivered if the actor terminates before message processing
 
 **Termination Detection:**
@@ -9996,13 +10000,13 @@ actor_b_ref: actor_ref <- spawn(initial_state, behavior_fn, stack_policy(0, :kee
 // ... Actor B terminates ...
 
 // Actor A casts a message to terminated Actor B
-cast(actor_b_ref, SomeMessage {});  // Raises actor_not_found exception
+cast(actor_b_ref, SomeMessage {});  // Returns false; Actor A goes on
 
 // Actor A calls (expects reply) from terminated Actor B
 call(actor_b_ref, SomeRequest {});  // Raises actor_not_found exception
 
-// Both operations consistently raise actor_not_found when targeting a terminated actor
-// Caller must handle the exception explicitly
+// A cast to a terminated actor returns false; a call to one raises actor_not_found,
+// which cannot be caught and ends the caller
 ```
 
 **Race Conditions:**
@@ -10068,16 +10072,16 @@ While mailboxes are unbounded, developers should be aware of memory implications
 
 **Message Acceptance Guarantees:**
 
-`cast()` operations guarantee message acceptance or raise `actor_not_found`:
+`cast()` operations accept the message or return `false`:
 
 - **`cast()`** always accepts messages - never fails due to mailbox capacity
   - Messages are always queued successfully
   - No blocking - returns immediately after queuing message
   - No capacity errors - mailboxes never reject messages
   
-- **`cast()` Function**: Accepts messages from existing actors or raises `actor_not_found`
+- **`cast()` Function**: Accepts messages for existing actors or returns `false`
   - Message is successfully enqueued if actor exists and is alive
-  - Raises `actor_not_found` if the actor doesn't exist or has terminated
+  - Returns `false` if the actor doesn't exist or has terminated
   - Never fails due to mailbox capacity - mailboxes are unbounded
 
 **Performance Characteristics:**
@@ -10138,12 +10142,12 @@ The message parameter is automatically provided by the actor runtime when a mess
 | **Return Value** | Reply from behavior | `atom` (always returns unit on success) |
 | **Behavior Return** | `(:reply, reply_value, new_state)` | `(:no_reply, new_state)` |
 | **Use Case** | Request-reply patterns | Fire-and-forget notifications |
-| **Exception on Fail** | `actor_not_found` | `actor_not_found` |
+| **Target Has Ended** | raises `actor_not_found` | returns `false` |
 
 **Usage Guidance:**
 - Use `call()` for **request-reply** patterns where the caller needs a response before continuing
 - Use `cast()` for **notifications** or **commands** where no reply is expected
-- Both operations provide consistent error handling via `actor_not_found` exception when the target actor is terminated
+- A `call()` to a terminated actor raises `actor_not_found`; a `cast()` to one returns `false` (§16.1.4)
 
 **Outbound FFI:** Foreign library calls use cast-only client and FFI worker actors; results are delivered by cast. See [silica_ffi_wrapper_specification.md](silica_ffi_wrapper_specification.md) §4.
 
@@ -10466,7 +10470,7 @@ The `reply_to` field is optional - messages without it cannot be used for cast-b
 - **Compile-Time Verification**: Field access (e.g., `reply_to`) is verified at compile time - attempting to access a field that doesn't exist in the message type results in a compile-time error
 - **Immutability**: Message data cannot be mutated after it is queued for delivery
 - **Isolation**: Message contents are copied between actors
-- **Cast Exception Handling**: `cast()` raises `actor_not_found` exception if the target actor has terminated
+- **Cast to an Ended Actor**: `cast()` returns `false` if the target actor has terminated (§16.1.2)
 - **Actor Reference Type**: `actor_ref` is a primitive type (like `int` or `boolean`), not parameterized by message type
 
 
@@ -10659,8 +10663,8 @@ socket only; the connections it spawned live on.
 
 | Tag | Module and behaviour | `address` | `mtu` | `boundaries` | `delivery` |
 | --- | --- | --- | --- | --- | --- |
-| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port"` connects; `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"` the same on every IPv4 interface (0.0.0.0), and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
-| `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx`, and the local port to bind (`:link_up` carries `"port:<n>"`) | 65507 | `:datagram` | `:unreliable` |
+| `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port:timeout_ms"` connects and waits at most `timeout_ms` milliseconds for the peer to answer (the connect timeout is stated in the address, 1 to 9 decimal digits, greater than 0; there is no default, and `"host:port"` without it is a malformed address; `:link_up` carries `"host:port"`); `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"` the same on every IPv4 interface (0.0.0.0), and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
+| `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx` (the link does not restrict it), and the local address to bind (`:link_up` carries `"port:<n>"`); `local` is `<port>`, `<ipv4>:<port>` or `any:<port>`: with no link `<port>` binds 127.0.0.1, `any` 0.0.0.0, an ip that ip; under `(:loopback)` `any` is refused and an ip must lie in 127.0.0.0/8; under a named link `<port>` binds the interface's first IPv4 address, `any` is refused and an ip must be that interface's address; a refusal tells the owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)`; a malformed peer host or local ip ends `(:explicit, :bad_address)` (strict dotted quad) | 65507 | `:datagram` | `:unreliable` |
 | `:serial` | `dangerous_serial_carrier@carrier` | `""` when the port is declared (`carried_on ... (:serial_port, path, baud)`, §16.4.9), else `"path@baud"`; raw 8N1; `:link_up` carries `"path@baud"` | 0 | `:stream` | `:reliable_ordered` |
 | `:ble_gatt` | `dangerous_ble_gatt_carrier@carrier` (Apple Silicon macOS only) | `"central:<uuid>"` scans for a peripheral offering the service and connects; `"peripheral:<uuid>"` advertises the service and waits for a central; `<uuid>` is the service's UUID, and nothing after the colon means the Nordic UART Service; `:link_up` carries `"mtu:<n>"`, the largest segment the link negotiated | 20 | `:datagram` | `:reliable_ordered` |
 
@@ -10689,15 +10693,22 @@ socket wrappers behind the hosted carriers are the dangerous module `dangerous_s
 link. After `:close`, and after a peer closes, it answers `(:link_down, :closed)` and ends with `stop_self(:normal)`.
 After a failed open it answers `(:link_down, :fault)` and ends with `stop_self((:explicit, :link_unavailable))`; after
 a failed read or write, with `(:explicit, :link_lost)`, so a supervisor restarts a faulted link and leaves a closed one.
+A `(:tcp)` dial never blocks in the connect: the socket is non-blocking while it connects and the carrier waits at most
+the timeout its address states (`"host:port:timeout_ms"`). A peer that does not answer in that time is a timed-out
+open: the carrier answers `(:link_down, :timeout)` and ends with `stop_self((:explicit, :link_timeout))`. A dial address
+that states no timeout, or a malformed or zero one, is refused before anything is dialled: `(:link_down, :fault)`, then
+`stop_self((:explicit, :bad_address))`, as for a host that is not a dotted quad (built 2026-11-15; not yet compiled or
+run).
 `:link_down` is the last message the owner receives, and the carrier's reference is dead afterwards. A write that fails
 is a link failure: the owner receives `(:tx_failed, :link_down)` and then `:link_down`. A write to a peer that has gone
 fails with an error and never raises `SIGPIPE`.
 
-Because a `cast` to an ended actor ends its sender with `actor_not_found` (§16.1.4), **an owner must not send to a hosted
-carrier after it has received that carrier's `:link_down`**, and a carrier can end before its owner has read that
-message: an owner that sends in that interval is ended. A storage carrier does not have this hazard (§16.4.11). *Planned
-change (transport design §6.2, upgrade note):* a `cast` to an ended carrier is to stop ending its sender, and every
-carrier, the storage carriers included, is then to end on a failure.
+A carrier can end before its owner has read its `:link_down`. A `cast` to an ended carrier returns `false` and the
+owner goes on (§16.1.2, changed 2026-11-16; before that date such a `cast` ended the owner with `actor_not_found`). A
+message sent after the carrier has ended is dropped, so **an owner should treat `:link_down` as the last use of that
+reference**. `call`, `call_with_timeout` and the registered casts still raise `actor_not_found` for an ended actor.
+The storage carriers do not end on a failure (§16.4.11): that is decided (transport design §6.2, 2026-11-16) and
+no change is planned.
 
 #### 16.4.9 Carrier links
 
@@ -10759,7 +10770,7 @@ business, spelled by the target's transport pack:
 - on a hosted target, `spawn_dangerous(<initial state>, dangerous_<kind>_carrier@carrier, <policies>...)`: a
   `dangerous_actor_ref`. The `(:serial)` carrier's initial state carries the declared path and baud, so its `:open`
   address is `""` (an address `"path@baud"` still names a port directly); `:link_up` carries `"path@baud"`. The
-  `(:tcp)` and `(:udp)` carriers keep their address strings at `:open` (`"listen:0"`, `"host:port"`, ...), and
+  `(:tcp)` and `(:udp)` carriers keep their address strings at `:open` (`"listen:0"`, `"host:port:timeout_ms"`, ...), and
   `(:loopback)` is where they already bind. The module the spawn names is an implicit `use`, as `wire_etf` is for
   `(:etf)`;
 - on the ESP32-S3, `spawn_device(:idle, <device worker>@<carrier behaviour>, <policies>...)`: a `device_actor_ref`,
@@ -10809,7 +10820,7 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2415 | two carrier declarations, in one module or across the modules of a compile, claim the same exclusive hardware: a UART or USB CDC instance, a serial port path, or the USB-Serial-JTAG controller |
 | E2416 | reserved: the link needs a board configuration function that is not defined (phase D; nothing reaches it yet) |
 | E2417 | a link parameter is not a literal, is of the wrong kind, is missing or is one too many, a baud is not positive, or the pack rejects the baud |
-| E2418 | a `(:tcp)` carrier on a link the target serves (`(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`) is opened by a `cast(x, (:open, owner, "<address>"))` whose address literal the link refuses: `"listen:any:<port>"` under any of them, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; `x` is bound in the same function by `spawn_dangerous_carrier`. An address the checker cannot see (a variable, a function's result) is refused at run time instead: the carrier tells its owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)` |
+| E2418 | a `(:tcp)` or `(:udp)` carrier on a link the target serves (`(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`) is opened by a `cast(x, (:open, owner, "<address>"))` whose address literal the link refuses: `"listen:any:<port>"` under any of them, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; for `(:udp)`, a local part `any:<port>` under any of them, or `<ipv4>:<port>` outside 127.0.0.0/8 under `(:loopback)`; a literal that is not a strict dotted quad gets no E2418 and ends `(:explicit, :bad_address)` at run time; `x` is bound in the same function by `spawn_dangerous_carrier`. An address the checker cannot see (a variable, a function's result) is refused at run time instead: the carrier tells its owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)` |
 
 #### 16.4.10 Diagnostics
 
@@ -10880,10 +10891,10 @@ exclusive: it names the first record not covered. `:sync`, `:read_stop` and `:cl
 **What ends a storage carrier.** Only its owner's `:close`: the carrier drains, answers `(:link_down, :closed)` and ends
 with `stop_self(:normal)`, and its reference is dead afterwards. A refused open (`:in_use`, `:mismatch`) and a medium
 failure (`:medium`) give the medium back and leave the carrier, not open; the owner may open it again or close it. This
-differs from the hosted network carriers of §16.4.8, which end on a fault, and exists because a `cast` to an ended actor
-ends its sender (§16.1.4): an owner must always find its store carrier. *Planned change (transport design §6.2, upgrade
-note):* every carrier is to end on a failure with an exit reason, once a `cast` to an ended carrier no longer ends its
-sender; a program should not rely on a failed store carrier staying.
+differs from the hosted network carriers of §16.4.8, which end on a fault. It was built this way because a `cast` to an
+ended actor then ended its sender, so an owner had always to find its store carrier. Since 2026-11-16 such a `cast`
+returns `false` (§16.1.2) and that reason is gone. This is the decided behaviour (transport design §6.2, 2026-11-16): a store carrier that has failed stays until it is
+closed, and a program may rely on that.
 
 **What a program may rely on.** After a crash, a power loss or a restart the log holds every record below the last
 `(:synced, next)` the owner saw, in order and with no holes, possibly some records after it, and never a reordered or a
@@ -12705,7 +12716,7 @@ The **ordinary registry** maps a name to a live ordinary actor. Names are atoms,
 - **`spawn_registered`** (§15.1.1) is `spawn` followed by `register`, done as one step. If the name is taken, no actor is spawned and the calling actor fails with `failure_reason` `:language_error`.
 - **`whereis`** returns the actor that holds the name, or `None`. It never returns a supervisor. The calling convention of the reference it returns is checked at run time (§16.2.6.4).
 - **`unregister`** removes a name. It returns `:not_registered` when no actor holds the name.
-- **`cast_registered`** and **`call_registered`** send to the actor that holds the name when the message is sent. They raise `actor_not_found` when no actor holds it, as `cast()` and `call()` do for an ended actor. Like `cast`, `cast_registered` therefore returns `true` whenever it returns; it never returns `false` (trial `cast_registered_unheld_name_addition/cast_registered_unheld_name_fails`: main casts to an unheld name and ends with `actor_not_found`, status 1; earlier hosted runtimes answered `false` silently).
+- **`cast_registered`** and **`call_registered`** send to the actor that holds the name when the message is sent. They raise `actor_not_found` when no actor holds it, as `call()` does for an ended actor. `cast_registered` therefore returns `true` whenever it returns; it never returns `false`. In this it differs from `cast()`, which since 2026-11-16 returns `false` for an ended actor (§16.1.2) (trial `cast_registered_unheld_name_addition/cast_registered_unheld_name_fails`: main casts to an unheld name and ends with `actor_not_found`, status 1; earlier hosted runtimes answered `false` silently).
 
 **Removal when an actor ends.** When an actor ends for any reason, its name is removed as part of its teardown (§15.1.2.3), before its supervisor handles the exit. A name therefore never refers to an ended actor.
 
@@ -14951,7 +14962,7 @@ As `call()`, but returns `:timeout` if no reply arrives within `timeout_ms` mill
 cast(actor: actor_ref, message: ActorMessage) -> boolean proc[concurrency]
 ```
 
-**Casts** a message to an actor and **returns immediately** without waiting for a response. The target behavior should return `(:no_reply, new_state)`. Raises `actor_not_found` if the actor doesn't exist or has terminated.
+**Casts** a message to an actor and **returns immediately** without waiting for a response. The target behavior should return `(:no_reply, new_state)`. Returns `true` when the message was enqueued and `false` if the actor doesn't exist or has terminated (§16.1.2).
 
 #### Runtime Message Reception
 ```
@@ -15954,7 +15965,7 @@ This section provides a quick reference for performance characteristics document
 
 | Operation | Typical Latency | Throughput | Notes |
 |-----------|-----------------|-------------|-------|
-| `cast()` message enqueue | 10-50ns | 10-50M messages/sec | Unbounded mailbox, O(1) enqueue; raises `actor_not_found` if target terminated |
+| `cast()` message enqueue | 10-50ns | 10-50M messages/sec | Unbounded mailbox, O(1) enqueue; returns `false` if target terminated |
 | Message delivery (same core) | 50-200ns | 5-20M messages/sec | Includes actor scheduling overhead |
 | Message delivery (cross-core) | 100-500ns | 2-10M messages/sec | Includes cache coherency and scheduling |
 | Message delivery (cross-NUMA) | 200-1000ns | 1-5M messages/sec | Includes NUMA access latency |

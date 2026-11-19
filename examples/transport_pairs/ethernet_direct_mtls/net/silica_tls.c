@@ -40,6 +40,11 @@
    certificate and fails the handshake without one. A peer that is not accepted never reaches Silica:
    connect answers an error, accept answers "no peer this time" (a timeout) and says why on stderr.
 
+   A dial is bounded (hosted Ethernet plan stage E8, as silica_sockets.c): the caller states one timeout
+   (silica_tls_set_connect_timeout) and the TCP connect AND the client's TLS handshake together end by
+   it. The socket is non-blocking for both and every wait is a poll against one monotonic deadline.
+   There is no default: a connect whose timeout was not stated is refused with EINVAL.
+
    Result conventions: those of silica_sockets.c. A tagged result { tag, value, error_code } with tag 0 =
    ok, 1 = error, 2 = timeout, 3 = closed by the peer; received bytes land in a buffer private to the
    calling thread and silica_tls_take answers them as a pointer plus length. A connection is named by its
@@ -58,6 +63,7 @@
 #include <dirent.h>
 #include <pthread.h>
 #include <time.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -233,6 +239,11 @@ static __thread uint64_t silica_tls_rx_len = 0;
 static __thread int64_t silica_tls_arg_a = 0;
 static __thread int64_t silica_tls_arg_b = 0;
 
+/* The timeout the caller stated for the next connect of this thread, in milliseconds
+   (silica_tls_set_connect_timeout). 0 means "not stated": there is no default, so a connect then
+   answers EINVAL. Each connect consumes the value, so one statement bounds exactly one connect. */
+static __thread int64_t silica_tls_connect_timeout_ms = 0;
+
 static silica_tls_tagged ok(int64_t v) { silica_tls_tagged r = {0, v, 0}; return r; }
 static silica_tls_tagged err(void) { silica_tls_tagged r = {1, 0, (int64_t)errno}; return r; }
 static silica_tls_tagged err_code(int e) { silica_tls_tagged r = {1, 0, (int64_t)e}; return r; }
@@ -354,6 +365,32 @@ static int wait_fd(int fd, short events, int64_t timeout_ms) {
     }
 }
 
+static int64_t monotonic_ms(void) {
+    struct timespec t;
+    if (clock_gettime(CLOCK_MONOTONIC, &t) < 0) return -1;
+    return (int64_t)t.tv_sec * 1000 + (int64_t)(t.tv_nsec / 1000000);
+}
+
+/* Waits for events on fd until the deadline start + timeout_ms (monotonic milliseconds), so signals
+   (EINTR) cannot lengthen the wait. 1: poll reported the descriptor (ready, or an error or hang-up
+   that the next call on it will name); 0: the deadline passed; -1: error, errno set. */
+static int wait_until(int fd, short events, int64_t start, int64_t timeout_ms) {
+    for (;;) {
+        int64_t now = monotonic_ms();
+        if (now < 0) return -1;
+        int64_t left = timeout_ms - (now - start);
+        if (left <= 0) return 0;
+        struct pollfd p;
+        p.fd = fd;
+        p.events = events;
+        p.revents = 0;
+        int n = poll(&p, 1, (int)left);
+        if (n > 0) return 1;
+        if (n == 0) return 0;
+        if (errno != EINTR) return -1;
+    }
+}
+
 /* A write to a peer that has gone must fail with EPIPE and must not raise SIGPIPE, which would end the
    program. OpenSSL writes the socket itself, so each platform's own mechanism is used around it: macOS
    marks the socket (SO_NOSIGPIPE); Linux has no such option, so the calling thread holds SIGPIPE
@@ -368,7 +405,8 @@ static void socket_options(int fd, int handshake) {
 #ifdef SO_NOSIGPIPE
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
-    /* the handshake is bounded: a peer that connects and says nothing is dropped */
+    /* the server's handshake is bounded: a peer that connects and says nothing is dropped (the client's
+       is bounded by the deadline of its connect instead, on a non-blocking socket) */
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 }
@@ -398,16 +436,42 @@ static void sigpipe_release(const sigset_t *saved, int was_pending) {
 #endif
 
 /* The handshake on a connected socket, in the given role. Answers the TLS state, or 0 after saying on
-   stderr why the peer was not accepted (the socket is then closed). */
-static SSL *handshake(int fd, int server) {
+   stderr why the peer was not accepted (the socket is then closed).
+
+   The server's handshake (timeout_ms 0) runs on a blocking socket whose reads and writes are each
+   bounded at SILICA_TLS_HANDSHAKE_SECONDS. The client's (timeout_ms > 0) is the second half of a
+   bounded connect: fd is non-blocking, every wait for the peer is a poll that ends at the deadline
+   start + timeout_ms (monotonic milliseconds), and a handshake that has not finished by then is
+   dropped with *timed_out set. On success the client's socket is put back in blocking mode
+   (blocking_flags, its F_GETFL flags before the connect): every later call on it is bounded by its own
+   poll. */
+static SSL *handshake(int fd, int server, int64_t start, int64_t timeout_ms, int blocking_flags, int *timed_out) {
+    int bounded = timeout_ms > 0;
+    *timed_out = 0;
     pthread_once(&identity_once, load_identity);
     if (ctx == 0) { fprintf(stderr, "tls: no usable identity; connection refused\n"); close(fd); return 0; }
-    socket_options(fd, 1);
+    socket_options(fd, bounded ? 0 : 1);
     SSL *ssl = SSL_new(ctx);
     if (ssl == 0 || SSL_set_fd(ssl, fd) != 1) { SSL_free(ssl); close(fd); return 0; }
-    SIGPIPE_HOLD;
-    int r = server ? SSL_accept(ssl) : SSL_connect(ssl);
-    SIGPIPE_RELEASE;
+    int r;
+    for (;;) {
+        ERR_clear_error();
+        SIGPIPE_HOLD;
+        r = server ? SSL_accept(ssl) : SSL_connect(ssl);
+        int e = r == 1 ? SSL_ERROR_NONE : SSL_get_error(ssl, r);
+        SIGPIPE_RELEASE;
+        if (r == 1 || !bounded || (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE)) break;
+        int n = wait_until(fd, e == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT, start, timeout_ms);
+        if (n == 0) {
+            fprintf(stderr, "tls: %s handshake timed out\n", server ? "server" : "client");
+            ERR_clear_error();
+            SSL_free(ssl);
+            close(fd);
+            *timed_out = 1;
+            return 0;
+        }
+        if (n < 0) break;
+    }
     if (r != 1) {
         long v = SSL_get_verify_result(ssl);
         unsigned long e = ERR_peek_last_error();
@@ -418,6 +482,7 @@ static SSL *handshake(int fd, int server) {
         close(fd);
         return 0;
     }
+    if (bounded && fcntl(fd, F_SETFL, blocking_flags) < 0) { SSL_free(ssl); close(fd); return 0; }
     socket_options(fd, 0);
     if (!conn_put(fd, ssl)) { fprintf(stderr, "tls: connection table full\n"); SSL_free(ssl); close(fd); return 0; }
     return ssl;
@@ -429,12 +494,30 @@ silica_tls_tagged silica_tls_set_args(int64_t a, int64_t b) {
     return ok(0);
 }
 
-/* Dials host:port (port: set_args a), then the TLS handshake as the client. An error when the host
-   does not answer, and EACCES when the handshake fails: this node or the peer was not accepted. */
+/* States the timeout of the next connect of this thread, in milliseconds. Only 1 to INT_MAX is a
+   timeout; anything else is EINVAL and leaves none stated. */
+silica_tls_tagged silica_tls_set_connect_timeout(int64_t timeout_ms) {
+    silica_tls_connect_timeout_ms = 0;
+    if (timeout_ms <= 0 || timeout_ms > (int64_t)INT_MAX) return err_code(EINVAL);
+    silica_tls_connect_timeout_ms = timeout_ms;
+    return ok(0);
+}
+
+/* Dials host:port (port: set_args a), then the TLS handshake as the client, both within the timeout
+   the caller stated (set_connect_timeout, milliseconds; EINVAL when none was stated: there is no
+   default). One monotonic deadline covers the TCP connect and the handshake, and neither blocks: the
+   socket is non-blocking and every wait is a poll that ends at the deadline. The answer is ok(fd)
+   with the socket back in blocking mode; a timeout (tag 2) when the peer did not answer the connect,
+   or did not finish the handshake, in time; an error with the connect's errno (ECONNREFUSED,
+   EHOSTUNREACH, ...) when the connect failed; and EACCES when the handshake failed: this node or the
+   peer was not accepted. */
 silica_tls_tagged silica_tls_connect(const uint8_t *host_ptr, uint64_t host_len) {
     char host[256];
     struct sockaddr_in addr;
     int64_t port = silica_tls_arg_a;
+    int64_t timeout_ms = silica_tls_connect_timeout_ms;
+    silica_tls_connect_timeout_ms = 0;   /* taken: the next connect has none until one is stated again */
+    if (timeout_ms <= 0) return err_code(EINVAL);
     if (host_ptr == 0 || host_len == 0 || host_len >= sizeof host) return err_code(EINVAL);
     memcpy(host, host_ptr, (size_t)host_len);
     host[host_len] = 0;
@@ -442,10 +525,28 @@ silica_tls_tagged silica_tls_connect(const uint8_t *host_ptr, uint64_t host_len)
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) return err_code(EINVAL);
+    int64_t start = monotonic_ms();
+    if (start < 0) return err();
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return err();
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { int e = errno; close(fd); return err_code(e); }
-    if (handshake(fd, 0) == 0) return err_code(EACCES);
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { int e = errno; close(fd); return err_code(e); }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        /* EINPROGRESS: the connect is under way. EINTR: a signal interrupted the call, and the connect
+           goes on in the background all the same (POSIX); calling connect again would answer EALREADY.
+           Both are waited for below. Any other errno is the connect's answer. */
+        if (errno != EINPROGRESS && errno != EINTR) { int e = errno; close(fd); return err_code(e); }
+        int n = wait_until(fd, POLLOUT, start, timeout_ms);
+        if (n == 0) { close(fd); return timeout(); }
+        if (n < 0) { int e = errno; close(fd); return err_code(e); }
+        /* Writable, or an error or hang-up reported by poll: SO_ERROR says which. */
+        int so_error = 0;
+        socklen_t so_len = sizeof so_error;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) < 0) { int e = errno; close(fd); return err_code(e); }
+        if (so_error != 0) { close(fd); return err_code(so_error); }
+    }
+    int timed_out = 0;
+    if (handshake(fd, 0, start, timeout_ms, flags, &timed_out) == 0) return timed_out ? timeout() : err_code(EACCES);
     return ok(fd);
 }
 
@@ -484,7 +585,8 @@ silica_tls_tagged silica_tls_accept(int64_t fd, int64_t timeout_ms) {
     if (n == 0) return timeout();
     int c = accept((int)fd, 0, 0);
     if (c < 0) return err();
-    if (handshake(c, 1) == 0) return timeout();
+    int timed_out = 0;
+    if (handshake(c, 1, 0, 0, 0, &timed_out) == 0) return timeout();
     return ok(c);
 }
 

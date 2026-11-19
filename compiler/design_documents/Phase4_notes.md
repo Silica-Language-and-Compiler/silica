@@ -1,7 +1,7 @@
 # Chunk 15 phase 4: running notes (Fable)
 
 Design: [chunk15_stack_memory_design.md](chunk15_stack_memory_design.md) §5 (5.1 the copier and the mailbox buffer),
-§11.1 row 4; preparation: [Phase4_prep.md](Phase4_prep.md) §2 rows 4, 5, 12, 13; phase 3's copier:
+§11.1 row 4; preparation: [Phase4_prep.md](completed_plans/Phase4_prep.md) §2 rows 4, 5, 12, 13; phase 3's copier:
 [Phase3_notes.md](Phase3_notes.md) §10.8. Mac tree (`compiler/src/emitter/apple_silicon_mac/terms/`) only; the Linux
 twins and the board are untouched. Nothing here was built or run by the implementing agent (Haiku builds, Sonnet reads).
 
@@ -724,4 +724,5 @@ pass trivially (thousand_actors_at_rest, init_failure_frees_acb, supervisor_end_
 failure_reports_free_heap) and the carriers released() poll cannot see its drop: flagged for a rewrite (not done).
 
 Phase 4 is complete on the Mac tree. Linux and ESP32 ports come after phase 7.
+2026-11-14 (verification pass): partly done. The Linux twins were done in chunk 15 phase 8 (design §11.1) and the ESP32-S3 in `029447ad31` / `978f663e08` (2026-11-07 / 11-12). Still open: `md_type_needs_copy`, `md_descriptor_rodata`, `md_site_label`, `mc_site_is_last_use` are still defined (unused, harmless) in `term_message_copy.silica` of the Mac, linux_aarch64 and linux_x86_64 trees, and `module_uses_alloc_region` still exists; the carriers `released()` poll trial rewrite is not recorded as done.
 2026-11-01: superseded: alloc_region is a frame area (Lee's decision); see chunk15 section 3.8.

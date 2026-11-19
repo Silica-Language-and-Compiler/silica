@@ -111,6 +111,8 @@ The following is implemented in `src/emitter/apple_silicon_mac/terms/prims/prims
 
 ## Phase D — Type checker
 
+**Status**: **Done** (verified 2026-11-14) — `type_checker_expressions_actor_spawn.silica` types `get_cpu_topology`/`get_core_capabilities`; `type_checker_tuple_decompose_helpers` handles the records; trials `cpu_spawn_third_arg_affinity` and `cpu_spawn_third_nonliteral_affinity`.
+
 **Goal**: **Sound typing** for topology types and spawn affinity **together** (no drift between third-argument forms and `cpu_topology` fields).
 
 **Tasks**
@@ -127,6 +129,8 @@ The following is implemented in `src/emitter/apple_silicon_mac/terms/prims/prims
 
 ## Phase E — Effect checker
 
+**Status**: **Done** (verified 2026-11-14) — `effect_checker_core.silica` (~lines 453, 619) classifies both calls under the concurrency list rule.
+
 **Goal**: Correct **effect signatures** for topology discovery vs. actor operations.
 
 **Tasks**
@@ -141,6 +145,8 @@ The following is implemented in `src/emitter/apple_silicon_mac/terms/prims/prims
 ---
 
 ## Phase F — SIR generator
+
+**Status**: **Done** (verified 2026-11-14) — `sir_generator/terms/actor_calls.silica` and `terms_actor_lowering.silica` lower both calls to prims (see Phase G).
 
 **Goal**: Lower topology calls to **SIR prims** that carry enough information for the emitter to allocate and fill **structured** results.
 
@@ -176,6 +182,8 @@ The following is implemented in `src/emitter/apple_silicon_mac/terms/prims/prims
 ---
 
 ## Phase H — Verification
+
+**Update (2026-11-14)**: still open: `trials/cpu_discovery_and_spawn_pinning/INTEGRATE_PENDING` is still present, so integrate skips that directory (decision with Lee: remove it or keep it); bootstrap parity item 3 remains deferred. Trials `cpu_topology_*` exist.
 
 **Status**: **Complete (static)** — runtime **assembly** is checked in; **binary** golden trials for `get_cpu_topology` / `get_core_capabilities` remain **blocked** until the emitter lowers **`sequence proc[concurrency, …]`** bodies for `main` (today’s `.sams` stubs `main` to a constant atom return, so integrate `.scout` lines like `print_int64` never run).
 

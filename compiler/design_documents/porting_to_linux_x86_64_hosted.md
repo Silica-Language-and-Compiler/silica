@@ -9,7 +9,7 @@
 1. **The Rust bootstrap and the `src/` seed tree are retired.** Every Silica compiler is now built from `src/` by a published Silica compiler (`binaries/silica-compiler`), and a new platform gets its first compiler by a **cross hand-off** from the Mac (§5), not by a bootstrap. There is no way to run any Silica compiler on x86-64 before the x86-64 backend exists, so the old Phase 1 (cargo, LLVM 15, seed chain, text oracle) is gone, and with it the old Phase 0 items for LLVM 15 and cargo.
 2. **The trial harness already has the per-target golden axis and host detection.** `trials/silica_compiler.mk` maps a Linux x86_64 host to `linux_x86_64`, derives `ASCOMP_EXT` = `.linux_x86_64.ascomp`, and runs a cross compiler named `silica-compiler-<target>` compile-only. Phase 2's golden handling is therefore mostly done; §6 Phase 2 says what remains.
 
-The AArch64 Linux port is the precedent for everything here: [ports/linux_aarch64_port_checklist.md](ports/linux_aarch64_port_checklist.md), `src/emitter/linux_aarch64/` (its `README.md` lists every Darwin → GNU/ELF change), its runtime shims in `emitter/linux_aarch64/terms/linux_rt_shims_asm.silica` and `src/runtime_asm/linux_aarch64/`. [ROADMAP.md](../../ROADMAP.md) "Later paths" fixes the rule: **Linux x86-64's first fixed point has the behaviours of the current Linux AArch64 fixed point**, and the backend is copied from `linux_aarch64`, not from `apple_silicon_mac`.
+The AArch64 Linux port is the precedent for everything here: [completed_plans/linux_aarch64_port_checklist.md](completed_plans/linux_aarch64_port_checklist.md), `src/emitter/linux_aarch64/` (its `README.md` lists every Darwin → GNU/ELF change), its runtime shims in `emitter/linux_aarch64/terms/linux_rt_shims_asm.silica` and `src/runtime_asm/linux_aarch64/`. [ROADMAP.md](../../ROADMAP.md) "Later paths" fixes the rule: **Linux x86-64's first fixed point has the behaviours of the current Linux AArch64 fixed point**, and the backend is copied from `linux_aarch64`, not from `apple_silicon_mac`.
 
 **Scope of execution:** the Mac tree (`/Volumes/2T/silica`) is the source of truth and does every compile until Phase 4; the x86-64 machine assembles, links and runs. The machine measured while revising this (`nix`, `ssh lee@nix.local`): Ubuntu 24.04.3 LTS, glibc 2.39, kernel 6.8, AMD Ryzen 5 PRO 3400G (8 threads; AVX2, BMI2, F16C, FMA), 13 GB RAM + 39 GB swap (`free -g`: `Mem: 13 total, 12 available; Swap: 39`), 4 KB pages, `cc` 13.3, GNU `as`/`ld` 2.42, clang 18.1.3, GNU make 4.3, python3, perl, git, rsync. **Not installed:** `lld`, `gdb` (`sudo apt install lld gdb`). Disk: 7.7 GB free of 98 GB (92 % used) — enough for the hand-off tree, not for every trial's `.o` at once.
 
@@ -19,7 +19,7 @@ The AArch64 Linux port is the precedent for everything here: [ports/linux_aarch6
 
 | Document | Role here |
 | --- | --- |
-| [ports/linux_aarch64_port_checklist.md](ports/linux_aarch64_port_checklist.md) | The hosted-port precedent: naming axes, Darwin-ism inventory, hand-off (§6 there), gates |
+| [completed_plans/linux_aarch64_port_checklist.md](completed_plans/linux_aarch64_port_checklist.md) | The hosted-port precedent: naming axes, Darwin-ism inventory, hand-off (§6 there), gates |
 | `src/emitter/linux_aarch64/README.md` | What the GNU/ELF port changed; this port starts from that tree |
 | `src/emitter/linux_x86_64/regs/README.md` | The virtual-register home table and frame model (Step 0.5, revised to the VR method 2026-09-18) |
 | [direct_machine_object_emitter_future.md](direct_machine_object_emitter_future.md) | Reserves `chip/x86_64`; `platform/` and `regs/` are shaped to become that layer later |
@@ -377,14 +377,15 @@ the same fault in `os_unfair_lock_lock`.
 Two Linux-only harness defects the run exposed (fixed in the Mac tree by the session coordinator, not part of this
 backend): the `compare_scout_*.sh` scripts need bash (`set -o pipefail`) but the makefiles start them with
 `$(SHELL)`, which is dash on Debian-family hosts; and `error_enforcement_addition`'s `silica.config` recipe
-expanded ~11k file names into one shell argument, over Linux's 128 KB `MAX_ARG_STRLEN`. A third, still open:
-`src/Makefile`'s `fixpoint` target prints the binary sizes with BSD `stat -f %z` and no GNU fallback, so
-that one line reads as a filesystem dump on Linux (the verdict itself is a `cmp` and is unaffected).
+expanded ~11k file names into one shell argument, over Linux's 128 KB `MAX_ARG_STRLEN`. A third, fixed (verified 2026-11-14):
+`src/Makefile`'s `fixpoint` target printed the binary sizes with BSD `stat -f %z` and no GNU fallback, so
+that one line read as a filesystem dump on Linux (the verdict itself is a `cmp` and was unaffected). The target now uses
+`stat -c %s ... || stat -f %z` (`compiler/src/Makefile` line ~629).
 
 ### Phase 6 — Droplets and project builds
 
 - `deploy/linux/install_silica.sh`: `apt install build-essential clang make`, clone or pull, run the symlink updater, compile a hello project with `project_makefiles/Makefile`. Idempotent; `sudo` only for apt.
-- `project_makefiles/Makefile`: include `project_makefiles/platform/<host emit target>.mk` (assembler, linker, `LDFLAGS_STACK` empty on Linux) instead of its inline macOS values; `silica_link.sh` returns ELF archives.
+- *(Partly done, 2026-11-14: `project_makefiles/platform/platforms.mk` exists (commit b575c4f6fa); not verified: per-host emit-target `.mk` fragments complete, `silica_link.sh` returning ELF archives.)* `project_makefiles/Makefile`: include `project_makefiles/platform/<host emit target>.mk` (assembler, linker, `LDFLAGS_STACK` empty on Linux) instead of its inline macOS values; `silica_link.sh` returns ELF archives.
 - Stdlib outputs per target: emit to `stdlib/**/build/<target>/`, `trials/stdlib_prereq.mk` reads from there, and the committed Darwin files at the stdlib root stop being overwritten.
 - Docs: `design_documents/README.md`, `tutorials_and_howtos/ffi_wrappers_and_makefiles.md` (SysV notes), the top-level `README.md` platform list; mark this document Implemented.
 

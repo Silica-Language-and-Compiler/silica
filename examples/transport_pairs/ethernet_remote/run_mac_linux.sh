@@ -69,7 +69,7 @@ trap cleanup EXIT
 
 side_copy() {   # SRC OUT SIDE LISTEN DIAL HOST: the per-host copy (SIDE mac = the accel side, linux = the status side)
     local args=(-e "s/^fn listen_address() -> string { \"listen:[0-9]*\" }/fn listen_address() -> string { \"listen:$4\" }/"
-                -e "s/^fn dial_address() -> string { \"127.0.0.1:[0-9]*\" }/fn dial_address() -> string { \"127.0.0.1:$5\" }/"
+                -e "s/^fn dial_address() -> string { \"127.0.0.1:[0-9:]*\" }/fn dial_address() -> string { \"127.0.0.1:$5:3000\" }/"
                 -e "s/^fn host_name() -> string { \"[^\"]*\" }/fn host_name() -> string { \"$6\" }/")
     if [ "$3" = linux ]; then
         args+=(-e 's/^\/\/ ==== BEGIN accel side ====$/{- ==== BEGIN accel side ====/'

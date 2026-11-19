@@ -1,0 +1,371 @@
+// The link-teardown checks of the mutual-TLS carrier (run_timeout_checks.sh in this directory). One source, three
+// builds, chosen by the three settings below (the script rewrites them with sed):
+//
+//   "server"        listens, opens a session on the first accepted peer, says what it sees, closes its listener when
+//                   the session ends and exits 0 (or says why it gave up after 10 s without a peer / 25 s of session)
+//   "client_close"  dials, grants receive credit, sends :close to its carrier as soon as the link is up
+//   "client_tx"     dials, grants receive credit and sends a :tx "ping" every 300 ms while the link is up, until
+//                   (:link_down, why) ends it (a peer that was killed, or refused this node's certificate)
+//
+// The failure reporter is the ONLY writer of standard output. The owner sends it lines ("P <text>"); the reporter
+// also receives the runtime's failure reports, and prints, labelled with the role:
+//   <role>: carrier ended <reason>                 the carrier ended: "normal" (the runtime reports a :normal end of an
+//                                                  unsupervised actor too), (:explicit, :link_lost) and so on, or "other"
+//   <role>: carrier ref dead (cast returned false) a throw-away probe actor cast to the ended carrier and the cast answered
+//                                                  false: the reference is dead (specification 16.1.2: a cast to an ended
+//                                                  actor returns false and its sender goes on). "carrier ref ALIVE (cast
+//                                                  returned true)" must never appear
+//   <role>: an actor ended with actor_not_found    must never appear: it would mean a call, or a registered cast, to an
+//                                                  ended actor
+// Owner lines: "<role>: link_up <peer>", "<role>: link_down <why>", "<role>: tx_failed <why>", "server: listening",
+// "server: accepted", "server: session link_down <why>", "<role>: message after the end: <kind>" (must never
+// appear: :link_down is the last message the owner receives) and "<role>: <gave up ...>".
+//
+// The owner does not cast to a carrier it knows has ended. The client_tx tick can race the carrier's end by at most
+// the time one message takes to be handled: a tick that wins that race casts to an ended carrier, the cast returns
+// false and the owner goes on (before the 2026-11-16 language change it ended the owner with actor_not_found).
+module dangerous_tls_link_check;
+
+use dangerous_tls;
+use dangerous_tls_carrier;
+
+// ---- Per-run settings (run_timeout_checks.sh rewrites these three lines) ----
+fn mode() -> string { "server" }
+fn listen_address() -> string { "listen:45620" }
+fn dial_address() -> string { "127.0.0.1:45620:5000" }
+
+fn is_server() -> boolean {
+    mode() == "server"
+}
+
+fn role_name() -> string {
+    case is_server() of {
+        true -> "server";
+        false -> "client"
+    }
+}
+
+fn why_text(why: atom) -> string {
+    case why of {
+        :fault -> "fault";
+        :timeout -> "timeout";
+        :closed -> "closed";
+        :link_down -> "link_down";
+        _: atom -> "other"
+    }
+}
+
+fn starts(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, 0, length_bytes(p)) == p
+}
+
+// ---- The failure reporter: the only writer of standard output ----
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn end_reason(report: string) -> string {
+    case contains(report, "(:explicit, :link_timeout)") of {
+        true -> "(:explicit, :link_timeout)";
+        false -> case contains(report, "(:explicit, :link_unavailable)") of {
+            true -> "(:explicit, :link_unavailable)";
+            false -> case contains(report, "(:explicit, :link_lost)") of {
+                true -> "(:explicit, :link_lost)";
+                false -> case contains(report, "(:explicit, :bad_address)") of {
+                    true -> "(:explicit, :bad_address)";
+                    false -> case contains(report, "reason:          :normal") of {
+                        true -> "normal";
+                        false -> "other"
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn message_kind(m: string) -> atom {
+    case starts(m, "P ") of {
+        true -> :line;
+        false -> case contains(m, "(:explicit, :actor_not_found)") of {
+            true -> :dead;
+            false -> case contains(m, "=== Silica Actor Failure ===") of {
+                true -> :report;
+                false -> :other
+            }
+        }
+    }
+}
+
+fn labelled(text: string) -> string {
+    concat(concat(role_name(), ": "), text)
+}
+
+fn show(text: string) -> atom {
+    sequence proc[device_io]
+        _: atom <- println(labelled(text))
+    produces
+        pure :ok
+    end
+}
+
+fn reporter_shown(m: string) -> atom {
+    case message_kind(m) of {
+        :line -> show(substring(m, 2, length_bytes(m)));
+        :dead -> show("an actor ended with actor_not_found");
+        :report -> show(concat("carrier ended ", end_reason(m)));
+        _: atom -> show("unexpected message")
+    }
+}
+
+fn reporter_next(_shown: atom, state: int64) -> (:no_reply, int64) {
+    (:no_reply, state)
+}
+
+fn reporter(m: string, state: int64) -> (:no_reply, int64) {
+    reporter_next(reporter_shown(m), state)
+}
+
+// ---- Helpers with their own effects ----
+fn fresh_carrier() -> dangerous_actor_ref {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false }, dangerous_tls_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area))
+    produces
+        pure car
+    end
+}
+
+fn tell(rep: actor_ref, text: string) -> boolean {
+    sequence proc[concurrency]
+        sent: boolean <- cast(rep, text impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+fn tick_later() -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(300, self(), :tick impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+fn guard_later(p: int64, ms: uint64) -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(ms, self(), (:guard, p) impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+fn finish_later(ms: uint64) -> boolean {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(ms, self(), :finish impl ActorMessage {})
+    produces
+        pure true
+    end
+}
+
+// A throw-away actor that casts to a carrier that has ended and tells the reporter what the cast answered: false
+// for an ended carrier (specification 16.1.2). The owner is not involved.
+fn probe(msg: int64, state: { target: dangerous_actor_ref, rep: actor_ref }) -> (:no_reply, { target: dangerous_actor_ref, rep: actor_ref }) {
+    sequence proc[concurrency]
+        enqueued: boolean <- cast(state.target, :poll impl ActorMessage {});
+        _: boolean <- cast(state.rep, case enqueued of { true -> "P carrier ref ALIVE (cast returned true)"; false -> "P carrier ref dead (cast returned false)" } impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn probe_dead(target: dangerous_actor_ref, rep: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        p: actor_ref <- spawn({ target: target, rep: rep }, probe, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        sent: boolean <- cast(p, 0 impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// ---- The owner ----
+// phase: server 0 waiting for a peer, 1 session open, 2 session ended (listener being closed); client 0 dialing,
+// 1 link up. ended: the carrier whose end this owner waits for has ended (or the run is over).
+// A function without a sequence: its one effect (the cast in tell) is declared where tell is written.
+fn kept(_done: boolean, st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    st
+}
+
+fn say(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, text: string) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    kept(tell(st.rep, concat("P ", text)), st)
+}
+
+fn quiet(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, kind: string) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    case st.ended of {
+        true -> say(st, concat("message after the end: ", kind));
+        false -> st
+    }
+}
+
+fn on_start(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    sequence proc[concurrency]
+        address: string <- case is_server() of {
+            true -> listen_address();
+            false -> dial_address()
+        };
+        _: boolean <- cast(st.car, (:open, self(), address) impl ActorMessage {});
+        wait_ms: uint64 <- case is_server() of { true -> 10000; false -> 12000 };
+        _: boolean <- guard_later(0, wait_ms)
+    produces
+        pure st
+    end
+}
+
+fn client_up(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.car, (:credit, 1000) impl ActorMessage {});
+        _: boolean <- case mode() == "client_close" of {
+            true -> cast(st.car, :close impl ActorMessage {});
+            false -> tick_later()
+        }
+    produces
+        pure { car: st.car, rep: st.rep, sess: st.sess, phase: 1, ended: st.ended }
+    end
+}
+
+fn session_up(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.sess, (:credit, 1000) impl ActorMessage {})
+    produces
+        pure say(st, "session link_up")
+    end
+}
+
+fn on_link_up(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, peer: string) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    case st.ended of {
+        true -> quiet(st, "link_up");
+        false -> case is_server() of {
+            true -> case starts(peer, "port:") of {
+                true -> say(st, "listening");
+                false -> session_up(st)
+            };
+            false -> client_up(say(st, concat("link_up ", peer)))
+        }
+    }
+}
+
+fn on_accepted(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, conn: dangerous_actor_ref) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    sequence proc[concurrency]
+        _: boolean <- cast(conn, (:open, self(), "") impl ActorMessage {});
+        _: boolean <- guard_later(1, 25000)
+    produces
+        pure say({ car: st.car, rep: st.rep, sess: conn, phase: 1, ended: st.ended }, "accepted")
+    end
+}
+
+fn server_session_down(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    sequence proc[concurrency]
+        _: boolean <- probe_dead(st.sess, st.rep);
+        _: boolean <- cast(st.car, :close impl ActorMessage {})
+    produces
+        pure say({ car: st.car, rep: st.rep, sess: st.sess, phase: 2, ended: st.ended }, concat("session link_down ", why_text(why)))
+    end
+}
+
+fn server_listener_down(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    kept(finish_later(700), say({ car: st.car, rep: st.rep, sess: st.sess, phase: st.phase, ended: true }, concat("listener link_down ", why_text(why))))
+}
+
+fn client_down(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    kept(probe_dead(st.car, st.rep), kept(finish_later(800), say({ car: st.car, rep: st.rep, sess: st.sess, phase: 2, ended: true }, concat("link_down ", why_text(why)))))
+}
+
+fn on_down(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    case st.ended of {
+        true -> quiet(st, "link_down");
+        false -> case is_server() of {
+            true -> case st.phase == 1 of {
+                true -> server_session_down(st, why);
+                false -> server_listener_down(st, why)
+            };
+            false -> client_down(st, why)
+        }
+    }
+}
+
+fn on_failed(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, why: atom) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    case st.ended of {
+        true -> quiet(st, "tx_failed");
+        false -> say(st, concat("tx_failed ", why_text(why)))
+    }
+}
+
+fn on_tick(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    sequence proc[concurrency]
+        live: boolean <- st.ended == false and st.phase == 1;
+        _: boolean <- case live of {
+            true -> cast(st.car, (:tx, "ping", self()) impl ActorMessage {});
+            false -> false
+        };
+        _: boolean <- case live of {
+            true -> tick_later();
+            false -> false
+        }
+    produces
+        pure st
+    end
+}
+
+fn give_up(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, text: string) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    kept(finish_later(700), say({ car: st.car, rep: st.rep, sess: st.sess, phase: st.phase, ended: true }, text))
+}
+
+fn on_guard(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }, p: int64) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    case st.ended of {
+        true -> st;
+        false -> case is_server() of {
+            true -> case p == st.phase of {
+                true -> case p == 0 of {
+                    true -> give_up(st, "no peer accepted within 10000 ms");
+                    false -> give_up(st, "session did not end within 25000 ms")
+                };
+                false -> st
+            };
+            false -> give_up(st, "no end within 12000 ms")
+        }
+    }
+}
+
+fn on_finish(st: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }) -> { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean } {
+    sequence proc[concurrency]
+        _: boolean <- cast_exit(0)
+    produces
+        pure st
+    end
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:accepted, dangerous_actor_ref, string) | :start | :tick | (:guard, int64) | :finish, state: { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }) -> (:no_reply, { car: dangerous_actor_ref, rep: actor_ref, sess: dangerous_actor_ref, phase: int64, ended: boolean }) {
+    case msg of {
+        :start -> (:no_reply, on_start(state));
+        (:link_up, peer: string) -> (:no_reply, on_link_up(state, peer));
+        (:rx, _bytes: string) -> (:no_reply, quiet(state, "rx"));
+        (:tx_credit, _n: int64) -> (:no_reply, quiet(state, "tx_credit"));
+        (:tx_failed, why: atom) -> (:no_reply, on_failed(state, why));
+        (:link_down, why2: atom) -> (:no_reply, on_down(state, why2));
+        (:accepted, conn: dangerous_actor_ref, _peer2: string) -> (:no_reply, on_accepted(state, conn));
+        :tick -> (:no_reply, on_tick(state));
+        (:guard, p: int64) -> (:no_reply, on_guard(state, p));
+        :finish -> (:no_reply, on_finish(state))
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- fresh_carrier();
+        me: actor_ref <- spawn({ car: car, rep: rep, sess: car, phase: 0, ended: false }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(me, :start impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

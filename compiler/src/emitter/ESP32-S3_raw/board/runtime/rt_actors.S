@@ -140,8 +140,9 @@
 //     32 holds-its-actor word  40 the ended child's identity (8 B; the exit report, spec §15.4.10.5)
 //
 // Result and status conventions follow the reference: spawn -> the actor's identity (the
-// actor_ref), cast -> 1, send -> 0, call -> the reply (an ended or unknown target raises
-// actor_not_found: cast, send and call; so does a call whose target ends before replying), remove_actor / kill_abnormal /
+// actor_ref), cast -> 1, or 0 when the target has ended or is unknown, send -> 0, call -> the reply (an
+// ended or unknown target raises actor_not_found: send and call; so does a call whose target ends before
+// replying), remove_actor / kill_abnormal /
 // link / demonitor / register -> 0, monitor -> its argument, migrate_actor -> 0 :ok, 1
 // :invalid_target, 2 :actor_not_found, 3 :migration_blocked (the emitter maps the code to the
 // program's atom indices). wait_for_exit (spec §15.1.2.5) returns to main the int64 value of the
@@ -4161,8 +4162,10 @@ silica_rt_actor_send:
     j       62b
     .size   silica_rt_actor_send, . - silica_rt_actor_send
 
-// silica_rt_actor_cast(X0 reference, X1 message, X2 payload owned) -> 1 enqueued. An ended (or
-// unknown) actor raises actor_not_found; the message is dropped (§16.1.2, §16.1.4).
+// silica_rt_actor_cast(X0 reference, X1 message, X2 payload owned) -> 1 (true) enqueued, 0 (false)
+// when the actor has ended or is unknown: silica_rt_cast_try has dropped the message and freed its
+// buffer, and the sender goes on (§16.1.2, §16.1.4). cast() and cast_device() enter here; the
+// registered casts call it and raise actor_not_found on 0. A call-only target still raises.
     .align  4
     .global silica_rt_actor_cast
     .type   silica_rt_actor_cast, @function
@@ -4182,8 +4185,9 @@ silica_rt_actor_cast:
     movi    a2, 1
     movi    a3, 0
     retw
-61: call8   silica_rt_actor_not_found   // never returns
-    j       61b
+61: movi    a2, 0                       // false: no live actor
+    movi    a3, 0
+    retw
 62: call8   silica_rt_convention_mismatch   // a call-only target (§16.2.6.4); never returns
     j       62b
     .size   silica_rt_actor_cast, . - silica_rt_actor_cast
@@ -4351,6 +4355,7 @@ silica_rt_actor_cast_registered:
     mov     a13, a5
     mov     a14, a6
     call8   silica_rt_actor_cast
+    beqz    a10, 9f                     // the holder ended since the lookup: actor_not_found
     mov     a2, a10
     mov     a3, a11
     retw
@@ -4372,6 +4377,7 @@ silica_rt_actor_cast_dangerous_registered:
     mov     a13, a5
     mov     a14, a6
     call8   silica_rt_actor_cast
+    beqz    a10, 9f                     // the holder ended since the lookup: actor_not_found
     mov     a2, a10
     mov     a3, a11
     retw
@@ -4396,6 +4402,7 @@ silica_rt_actor_cast_device_registered:
     mov     a13, a5
     mov     a14, a6
     call8   silica_rt_actor_cast
+    beqz    a10, 9f                     // the holder ended since the lookup: actor_not_found
     mov     a2, a10
     mov     a3, a11
     retw
@@ -4989,7 +4996,7 @@ silica_rt_registry_name_taken:
 
 // silica_rt_actor_not_found(): cast_registered / call_registered / cast_dangerous_registered /
 // cast_device_registered named a name no live actor holds in its registry
-// (§20.3.1: they raise actor_not_found, as cast() and call() do for an ended actor). In an actor it
+// (§20.3.1: they raise actor_not_found, as call() does for an ended actor). In an actor it
 // is failure_reason (:explicit, :actor_not_found), tag 4, ended where it stands; in main it is the
 // language-level failure of §15.4.5.5: the atom's name on the console, exit status 1. Never returns.
     .align  4
