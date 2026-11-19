@@ -11,7 +11,7 @@
 # ordered_data_structures runs in its own, smaller pool (SDS_JOBS, default 4) because
 # its per-unit compiles are memory-bound, not core-bound.
 # Suites start largest first (by .silica file count; see TRIAL_ORDER below); `make print-trial-order`
-# lists the order. The final report is alphabetical.
+# lists the order; ordered_data_structures is always first. The final report is alphabetical.
 #
 #   make integrate                       # everything, cores-wide
 #   make integrate JOBS=4 SDS_JOBS=2     # gentler
@@ -35,6 +35,9 @@ SDS_DIR := ordered_data_structures
 TRIAL_SIZED := $(shell for d in $(TRIAL_SUBDIRS); do \
 	printf '%s %s\n' "$$(find "$(THIS_DIR)$$d" -name '*.silica' -type f | wc -l | tr -d ' ')" "$$d"; \
 	done | LC_ALL=C sort -k1,1nr -k2,2 | awk '{print $$1 ":" $$2}')
+# ordered_data_structures is pinned first whatever its size: its own memory-bound pool makes it
+# a long suite, so it must not start late (a TRIAL_SUITES filter below drops it if not selected).
+TRIAL_SIZED := $(filter %:$(SDS_DIR),$(TRIAL_SIZED)) $(filter-out %:$(SDS_DIR),$(TRIAL_SIZED))
 TRIAL_ORDER := $(foreach e,$(TRIAL_SIZED),$(word 2,$(subst :, ,$(e))))
 TRIAL_REPORT_ORDER := $(TRIAL_SUBDIRS)
 
@@ -119,7 +122,7 @@ help:
 	@echo "                                 (interactive: asks where to run the trials; Enter = this host: macOS, Linux x86-64 or Linux AArch64)"
 	@echo "  make integrate TRIAL_TARGET=T  T = host, linux_aarch64, linux_x86_64, ESP32-S3_raw, STM32-L476RG_raw, all, both, or a list; see targets/README.md"
 	@echo "  make integrate TRIAL_SUITES=\"a b\"                         only these suites (host or board; a named suite runs even if INTEGRATE_PENDING)"
-	@echo "  make print-trial-order         suites in start order (largest first, with .silica counts)"
+	@echo "  make print-trial-order         suites in start order (ordered_data_structures first, then largest first, with .silica counts)"
 	@echo "  make integrate JOBS=N         cap the parallel pool"
 	@echo "  make integrate SDS_JOBS=N      cap ordered_data_structures separately (memory-bound)"
 	@echo "  make -C <suite> integrate      one suite; prints that suite's own report"

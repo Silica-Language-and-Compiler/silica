@@ -38,7 +38,7 @@ make clean                          # every suite's clean, plus the integrate lo
 ```
 
 `make integrate` at this level runs all suites concurrently under one make jobserver.
-The suites are started largest-first, by the number of `.silica` files under each suite
+The suites are started largest-first (ordered_data_structures always first), by the number of `.silica` files under each suite
 (ties alphabetical), so the big suites begin at once and the small ones fill the other
 cores meanwhile; `make print-trial-order` lists the order with the sizes. The final
 report lists the suites alphabetically. ordered_data_structures runs in its own, smaller
