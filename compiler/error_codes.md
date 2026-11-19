@@ -53,7 +53,7 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E1055 UnusedVariable — a binding is never used in its scope (use it, pass it on, return it, or bind it as `_`)
 - E1056 EmptyProcOnPureSequence — empty `proc[]` on a pure sequence block
 - E1057 SequenceAsArrowRhs — sequence...produces pure...end cannot be the right-hand side of `->`; use a `{ ... }` block
-- E1058 ReservedKeywordAsBindingName — a reserved keyword used as a variable binding name
+- E1058 ReservedKeywordAsBindingName — a reserved keyword (`meta`, `wrapper_meta`, `region`) used as a variable binding name
 - E1059 ReservedKeywordAsFieldName — a reserved keyword used as a record field name
 - E1060 UnbalancedDelimiters — unbalanced brackets, braces or parentheses
 - E1061 NamedStructConstruction — named struct construction is not allowed; use an anonymous record `{ field: ... }`
@@ -150,6 +150,7 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 - E2311 LifetimeConflictAtCall — one call binds a lifetime name of the callee's signature to two different caller lifetimes (lifetimes in a signature are quantified per call and instantiated consistently across arguments and result, spec §12.1.4); reported at the call
 - E2313 BufferLengthMismatch — `alloc_buf`'s literal element count differs from the literal N of the `buf(R, Space, T, N)` type it is bound to (spec §12.3.3); reported at the size argument
 - E2314 BufferIndexOutOfRange — a literal index of `read_buf`, `buf_load`, `write_buf` or `buf_store` is outside 0..N-1 for a `buf` type with a literal N (spec §12.3.3); reported at the index argument
+- E2321 StateReleaseNotProven — in a unit that declares `strict state_release;` at module level, a behaviour whose state release is not proven (the case W2300 warns about in other units); the text is W2300's, naming the behaviour and the reason, and only the first such behaviour of the unit is reported (chunk 15 design §4.5, decision P3; emitted after SIR generation by the compile pipeline)
 - E2323 BufferWithoutRegion — (approved by Lee 2026-11-01: a bare buffer type is accepted only in a foreign fn's signature and in calls to a foreign fn; everywhere else a buffer must come with its region) a parse-level check with two parts: (a) a function or required method whose parameter or return types name `buf(L, ...)` does not name `region(L, ...)` in the same signature (a parameter, a record field or a tuple element); a `foreign c_wrapper` fn is exempt; reported at the parameter (or the return type); (b) a region-less `alloc_buf(n)` / `alloc_buf_retained(n)` binding whose name is not passed to a foreign fn of the module in its scope, or is passed to any other function (the buffer operations read_buf, write_buf, buf_load and buf_store are not counted); reported at the binding. Allocate with `alloc_buf(r, n)` from `r: region(L, S) <- alloc_region(S)` and pass `r` with the buffer
 
 ### Effect checker (E3000-E3999)
@@ -213,6 +214,7 @@ The lexer stops at the first lexical error and the driver reports it as a `Lexic
 
 ### Warnings (W-codes; the compile succeeds)
 - W2201 DeviceWriteOneToClearWriteBack — in a device_* module, `poke(w, :r, v)` writes back the unmodified value just read by `v <- peek(w, :r)` from the same `:write_one_to_clear` register, which clears every bit that was set (device spec §4.9); printed as a `DeviceWarning` at the poke
+- W2300 StateReleaseNotProven — a behaviour's state release is not proven, so every dispatch of it copies its whole state at dispatch end; one warning per such behaviour, printed as a `RegionWarning` at the behaviour's declaration as `state release not proven for behaviour '<name>': <reason>. Every dispatch of this behaviour copies its whole state at dispatch end (cost proportional to the state's size).` (chunk 15 design §4.5, decision 19; emitted after SIR generation by the compile pipeline); the compile succeeds. A behaviour that allocates a buffer C keeps is E4037 or E4039 instead, and a unit that declares `strict state_release;` gets E2321
 - W4001 FFI_Warning — a module declares an FFI wrapper function (a declaration of tag 9 with a foreign-symbol body); one warning per wrapper, printed at the declaration as `DANGER DANGER DANGER: this module uses FFI wrapper '<name>' for foreign symbol '<symbol>'. FFI breaks the Silica security model for this app and exposes the entire application to memory insecurity, ABI unsafety, undefined behavior, privilege-boundary collapse, and other security issues from the foreign code and wrapper boundary.` (module checker, section 3); the compile succeeds
 
 ### Notes
