@@ -315,7 +315,7 @@ This script never builds a compiler. Each machine must already have its own nati
 - `--targets "<list>"` takes emit-target names, or the short names `mac`, `pi`, `nix`, `esp32`, `all` and `hosted`, which are accepted anywhere a platform is.
 - `--board` also runs a raw target's trials on an attached board; board runs are off by default.
 - `--sync` copies trials, stdlib and project makefiles to each remote machine first — never binaries or build products.
-- `--log-dir DIR` sets where logs and reports land (default: `../silica_trial_runs/<timestamp>`).
+- `--log-dir DIR` sets where logs and reports land (default: `silica_trial_runs/<timestamp>` beside the main checkout, also when run from a git worktree).
 - `--mac-jobs`, `--pi-jobs` and `--nix-jobs` set the parallelism for those machines.
 
 Remote machines run at the same time as each other. This machine runs its own trials and then the board, because each takes its own per-target lock (`trials/.integrate.lock.<target>`). The script prints one summary table at the end and exits 0 only when every platform passed.

@@ -58,7 +58,16 @@ JOBS_STM32_L476RG_raw="${NUCLEO_JOBS:-5}"
 SDS_STM32_L476RG_raw="${NUCLEO_SDS_JOBS:-1}"
 
 STAMP="$(date '+%Y%m%d-%H%M%S')"
-LOG_DIR="${LOG_DIR:-$REPO/../silica_trial_runs/$STAMP}"
+# Default log location: beside the MAIN checkout, never inside a .claude/worktrees directory (the
+# agent-worktree cleanup owns that and has deleted a run's logs mid-run). In a git worktree the main
+# checkout is the parent of the common git dir; fall back to $REPO when git cannot say.
+MAIN_REPO="$REPO"
+if _common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+        && [ -n "$_common" ] && [ -d "$_common" ] && [ "$(basename "$_common")" = ".git" ]; then
+    MAIN_REPO="$(dirname "$_common")"
+fi
+case "$MAIN_REPO" in */.claude/worktrees/*) MAIN_REPO="${MAIN_REPO%%/.claude/worktrees/*}" ;; esac
+LOG_DIR="${LOG_DIR:-$MAIN_REPO/../silica_trial_runs/$STAMP}"
 DO_SYNC=0
 SYNC_ONLY=0
 DO_BOARD=0
@@ -205,7 +214,10 @@ if [ "$LIST_ONLY" = 1 ]; then
     exit 0
 fi
 
-mkdir -p "$LOG_DIR"
+if ! mkdir -p "$LOG_DIR" || [ ! -d "$LOG_DIR" ] || [ ! -w "$LOG_DIR" ]; then
+    echo "error: cannot create or write the log directory $LOG_DIR (use --log-dir or LOG_DIR=)" >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------- sync (optional)
 
