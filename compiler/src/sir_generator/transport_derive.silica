@@ -111,7 +111,8 @@ fn limits_slug_from(s: string, i: int64, acc: string) -> string {
 // One derived family per (format, type) for encode and per (format, type, limits) for decode: the
 // limits are compile-time constants baked into the decoder (design §4.1).
 fn family_id(kind: string, nt: string, limits: string) -> string {
-    case kind == "decode" of {
+    // A recreate of a string is keyed by its limits too; a scalar recreate has none and keeps its name.
+    case kind == "decode" or (kind == "recreate" and length_bytes(limits) > 0) of {
         true -> j3(type_id(nt), "_l", limits_slug_from(limits, 0, ""));
         false -> type_id(nt)
     }
@@ -914,6 +915,45 @@ fn value_result(tt: string) -> string {
     }
 }
 
+// recreate of a string (FFI wrapper specification §7.7), keyed by its limits "max_bytes,0,0,utf8":
+//     fn <nm>(v: string) -> (:ok, string) | (:rejected, atom)
+// in this order: a length above max_bytes is (:rejected, :too_large); with utf8, bytes that are not
+// well-formed UTF-8 (Unicode §3.9 table 3-7: no overlong form, no surrogate, nothing above U+10FFFF, no
+// truncated sequence) are (:rejected, :bad_utf8); otherwise (:ok, copy), the copy a fresh string of
+// the caller's frame (byte_slice of the whole). The result sum is built by the Silica of the derived
+// function, as every sum is. byte_at and byte_slice are transport operations, called through the
+// family's own wrappers inside sequences that declare transport, as wire_etf calls them; the wrappers
+// also give the type checker an inferable type where a builtin call is not inferred (a case scrutinee,
+// an arithmetic operand).
+fn string_recreate_source(nm: string, lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean }) -> string {
+    copy_fn: string <- j3("fn ", nm, "_copy(v: string, n: int64) -> string {\n    sequence proc[mem(normal), transport]\n        c: string <- byte_slice(v, 0, n)\n    produces\n        pure c\n    end\n}\n");
+    top_head: string <- j5("fn ", nm, "(v: string) -> (:ok, string) | (:rejected, atom) {\n    n: int64 <- length_bytes(v);\n    case n > ", it(lim.max_bytes), " of {\n        true -> (:rejected, :too_large);\n");
+    top_ok: string <- j3("(:ok, ", nm, "_copy(v, n))");
+    top_tail: string <- case lim.utf8 of {
+        false -> j3("        false -> ", top_ok, "\n    }\n}\n");
+        true -> j5(j3("        false -> case ", nm, "_u8(v, 0, n) of {\n            false -> (:rejected, :bad_utf8);\n"), "            true -> ", top_ok, "\n        }\n    }\n}\n", "")
+    };
+    utf8_fns: string <- case lim.utf8 of {
+        false -> "";
+        true -> utf8_validator_source(nm)
+    };
+    j4(top_head, top_tail, copy_fn, utf8_fns)
+}
+
+// The UTF-8 walk of string_recreate_source: <nm>_b reads a byte, <nm>_u8 walks the sequences and
+// <nm>_u8c checks the continuation bytes of one, the second byte's range narrowed after E0, ED, F0
+// and F4.
+fn utf8_validator_source(nm: string) -> string {
+    b_fn: string <- j3("fn ", nm, "_b(v: string, i: int64) -> int64 {\n    sequence proc[transport]\n        b: int64 <- byte_at(v, i)\n    produces\n        pure b\n    end\n}\n");
+    walk1: string <- j5("fn ", nm, "_u8(v: string, i: int64, n: int64) -> boolean {\n    case i >= n of {\n        true -> true;\n        false -> {\n            b: int64 <- ", nm, "_b(v, i);\n");
+    walk2: string <- j5("            case b < 128 of {\n                true -> ", nm, "_u8(v, i + 1, n);\n                false -> {\n", "                    w: int64 <- case b >= 194 and b <= 223 of {\n                        true -> 2;\n                        false -> case b >= 224 and b <= 239 of {\n                            true -> 3;\n                            false -> case b >= 240 and b <= 244 of {\n                                true -> 4;\n                                false -> 0\n                            }\n                        }\n                    };\n", "");
+    walk3: string <- j5("                    case w == 0 or i + w > n of {\n                        true -> false;\n                        false -> case ", nm, "_u8c(v, i, w, b) of {\n                            true -> ", nm, "_u8(v, i + w, n);\n                            false -> false\n                        }\n                    }\n                }\n            }\n        }\n    }\n}\n");
+    cont1: string <- j5("fn ", nm, "_u8c(v: string, i: int64, w: int64, b: int64) -> boolean {\n    c1: int64 <- ", nm, "_b(v, i + 1);\n");
+    cont2: string <- "    lo: int64 <- case b == 224 of {\n        true -> 160;\n        false -> case b == 240 of {\n            true -> 144;\n            false -> 128\n        }\n    };\n    hi: int64 <- case b == 237 of {\n        true -> 159;\n        false -> case b == 244 of {\n            true -> 143;\n            false -> 191\n        }\n    };\n";
+    cont3: string <- j5("    case c1 >= lo and c1 <= hi of {\n        false -> false;\n        true -> case w == 2 of {\n            true -> true;\n            false -> {\n                c2: int64 <- ", nm, "_b(v, i + 2);\n                case c2 >= 128 and c2 <= 191 of {\n                    false -> false;\n                    true -> case w == 3 of {\n                        true -> true;\n                        false -> {\n                            c3: int64 <- ", nm, "_b(v, i + 3);\n                            c3 >= 128 and c3 <= 191\n                        }\n                    }\n                }\n            }\n        }\n    }\n}\n");
+    j8(b_fn, walk1, walk2, walk3, cont1, cont2, cont3, "")
+}
+
 fn gen_tops(kind: string, fmt: string, tid: string, tt: string, k0: int64, limits: string, lim: { found: boolean, type_text: string, max_bytes: int64, max_depth: int64, max_length: int64, utf8: boolean }) -> string {
     enc: string <- j8(j5("fn ", derived_fn_name("encode", fmt, "", tt), "(v: ", spell(tt), ") -> string {\n"),
         "    sequence proc[mem(normal), transport]\n        tail0: List[string, mem(normal)] <- empty[string, mem(normal)]();\n        parts: List[string, mem(normal)] <- ",
@@ -925,7 +965,10 @@ fn gen_tops(kind: string, fmt: string, tid: string, tt: string, k0: int64, limit
         j7("            (:ok, p0: int64) -> case ", dec_fn(fmt, tid, k0), "(bs, p0, ", it(lim.max_depth), "@RA@) of {\n                ", reject_arm("r1"), j3(concat("                (:ok, ", value_pattern(tt)), ", p1: int64) -> case ", "")),
         j3(wire(fmt, "dec_end"), "(bs, p1) of {\n                    ", reject_arm("r2")),
         j3("                    (:ok, _p2: int64) -> (:ok, ", value_result(tt), ")\n                }\n            }\n        }\n    }\n}\n"), "");
-    rc: string <- j5(j5("fn ", derived_fn_name("recreate", fmt, "", tt), "(", value_pattern(tt), ") -> (:ok, "), spell(tt), ") | (:rejected, atom) {\n    (:ok, ", value_result(tt), ")\n}\n");
+    rc: string <- case spell(tt) == "string" of {
+        true -> string_recreate_source(derived_fn_name("recreate", fmt, limits, tt), lim);
+        false -> j5(j5("fn ", derived_fn_name("recreate", fmt, "", tt), "(", value_pattern(tt), ") -> (:ok, "), spell(tt), ") | (:rejected, atom) {\n    (:ok, ", value_result(tt), ")\n}\n")
+    };
     case kind == "decode" of { true -> dec; false -> case kind == "recreate" of { true -> rc; false -> enc } }
 }
 

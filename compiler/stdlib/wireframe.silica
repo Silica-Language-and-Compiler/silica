@@ -33,6 +33,18 @@
 //   an index 0 during a reassembly drops the unfinished frame and starts the new one, and any other
 //   record that does not continue the reassembly in progress is skipped. A frame may span at most
 //   32768 records (the 15-bit index); frame answers no records at all for a longer one.
+//   :lines carriers (standard input, a text console; the (:stdin) link): a frame is one line, cut at
+//   the 0x0A that ends it, and the "\n" or "\r\n" is not part of the frame. unframe answers one line per
+//   call: call it again with an empty segment to drain the next line of the same segment. expected
+//   is how many bytes of pending are already known to hold no newline, so a line that arrives in many
+//   segments is scanned once; max_frame bounds a line, an unterminated tail included (:too_large).
+//   finish answers the last line of an input that ended without a newline. After (:rejected,
+//   :too_large) the owner recovers with wireframe@unframe(wireframe@skip_line(old_state, segment), "",
+//   max_line), old_state and segment being what unframe was just given: the rejected line is dropped
+//   through its newline and what follows is kept. skip_line answers the state of mode :lines_skip
+//   when the segment holds no newline; unframe then discards segments up to the next newline
+//   (answering (:more, state)) and resumes as :lines with the bytes after it. finish answers :empty
+//   on such a state (its pending is always "").
 //
 // A stored frame is wrapped by record before it is framed and unwrapped by unrecord after it is
 // reassembled (§6.8.3): one byte of format id (format_id: (:etf) is 1, (:cbor) 2, and 0 is never a
@@ -45,6 +57,8 @@
 export fresh/1;
 export frame/3;
 export unframe/3;
+export finish/1;
+export skip_line/2;
 export format_id/1;
 export format_of/1;
 export record/3;
@@ -173,13 +187,89 @@ fn be32_at(s: string, i: int64) -> int64 {
 fn unframe(state: { mode: atom, expected: int64, pending: string }, segment: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
     case state.mode == :stream of {
         true -> unframe_stream(state.mode, state.expected, join2(state.pending, segment), max_frame);
-        false -> case state.mode == :storage of {
+        false -> case state.mode == :lines of {
+            true -> unframe_lines(state, segment, max_frame);
+            false -> case state.mode == :lines_skip of {
+                true -> unframe_skip(segment, max_frame);
+                false -> case state.mode == :storage of {
             true -> unframe_storage(state, segment, max_frame);
             false -> case length_bytes(segment) > max_frame of {
                 true -> (:rejected, :too_large);
                 false -> unframe_datagram(state, segment, max_frame)
             }
+            }
+            }
         }
+    }
+}
+
+// The index of the first 0x0A at or after i, or -1.
+fn newline_from(s: string, i: int64, n: int64) -> int64 {
+    case i >= n of {
+        true -> 0 - 1;
+        false -> case at(s, i) == 10 of {
+            true -> i;
+            false -> newline_from(s, i + 1, n)
+        }
+    }
+}
+
+// A line without its terminator's "\r" (the "\n" is already cut).
+fn chomp(line: string) -> string {
+    n: int64 <- length_bytes(line);
+    case n > 0 of {
+        true -> case at(line, n - 1) == 13 of {
+            true -> slice(line, 0, n - 1);
+            false -> line
+        };
+        false -> line
+    }
+}
+
+// One segment in; one line out when pending holds a newline, else (:more, state).
+fn unframe_lines(state: { mode: atom, expected: int64, pending: string }, segment: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
+    joined: string <- join2(state.pending, segment);
+    n: int64 <- length_bytes(joined);
+    nl: int64 <- newline_from(joined, state.expected, n);
+    case nl < 0 of {
+        true -> case n > max_frame of {
+            true -> (:rejected, :too_large);
+            false -> (:more, { mode: state.mode, expected: n, pending: joined })
+        };
+        false -> case nl > max_frame of {
+            true -> (:rejected, :too_large);
+            false -> (:frame, chomp(slice(joined, 0, nl)), { mode: state.mode, expected: 0, pending: slice(joined, nl + 1, n) })
+        }
+    }
+}
+
+// Drops the line unframe just rejected: the same state and segment in, the state after the first
+// newline out, or :lines_skip when the segment holds none.
+fn skip_line(state: { mode: atom, expected: int64, pending: string }, segment: string) -> { mode: atom, expected: int64, pending: string } {
+    joined: string <- join2(state.pending, segment);
+    n: int64 <- length_bytes(joined);
+    nl: int64 <- newline_from(joined, 0, n);
+    case nl < 0 of {
+        true -> { mode: :lines_skip, expected: 0, pending: "" };
+        false -> { mode: :lines, expected: 0, pending: slice(joined, nl + 1, n) }
+    }
+}
+
+// A segment while a rejected line is being dropped: nothing is kept until its newline arrives.
+fn unframe_skip(segment: string, max_frame: int64) -> (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) {
+    n: int64 <- length_bytes(segment);
+    nl: int64 <- newline_from(segment, 0, n);
+    case nl < 0 of {
+        true -> (:more, { mode: :lines_skip, expected: 0, pending: "" });
+        false -> unframe_lines({ mode: :lines, expected: 0, pending: "" }, slice(segment, nl + 1, n), max_frame)
+    }
+}
+
+// At the end of input: the last line when it had no terminator.
+fn finish(state: { mode: atom, expected: int64, pending: string }) -> (:frame, string) | :empty {
+    case length_bytes(state.pending) > 0 of {
+        true -> (:frame, chomp(state.pending));
+        false -> :empty
     }
 }
 
