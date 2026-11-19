@@ -1,0 +1,171 @@
+// De-tainting the (:rx, chunk) with recreate(chunk, { max_bytes: 8 }): the input is longer than 8 bytes and arrives
+// in one read, so the chunk is (:rejected, :too_large), the owner prints the atom, gives credit again and
+// reads the end of input.
+module dangerous_stdin_recreate_too_large;
+
+use wireframe;
+use dangerous_console_stdin_carrier;
+
+carried_on input: (:serial) (:stdin);
+
+fn say(s: string) -> atom {
+    sequence proc[device_io]
+        o: atom <- println(s)
+    produces
+        pure o
+    end
+}
+
+fn say_n(label: string, n: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_int64(n);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn say_atom(label: string, a: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(a);
+        o: atom <- println("")
+    produces
+        pure o
+    end
+}
+
+fn tell_credit(car: dangerous_actor_ref, n: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast(car, (:credit, n) impl ActorMessage {})
+    produces
+        pure r
+    end
+}
+
+
+fn stop(code: int64) -> boolean {
+    sequence proc[concurrency]
+        r: boolean <- cast_exit(code)
+    produces
+        pure r
+    end
+}
+
+// ---- the owner -----------------------------------------------------------------------------
+
+fn on_line(line: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } {
+    _: atom <- say(concat("line: ", line));
+    { car: st.car, rx: st.rx, lines: st.lines + 1, down: st.down }
+}
+
+// One segment can hold many lines: answer each, then ask again with "" until only a partial is left.
+// seg is the segment the call that produced r was given ("" when draining); st.rx is the state it was
+// given. A :too_large line is dropped through its newline (skip_line) and what follows is kept.
+fn drain(r: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom), seg: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } {
+    case r of {
+        (:more, rx1: { mode: atom, expected: int64, pending: string }) -> { car: st.car, rx: rx1, lines: st.lines, down: st.down };
+        (:frame, line: string, rx2: { mode: atom, expected: int64, pending: string }) -> {
+            st2: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } <- on_line(line, { car: st.car, rx: rx2, lines: st.lines, down: st.down });
+            drain(wireframe@unframe(st2.rx, "", 4096), "", st2)
+        };
+        (:rejected, why: atom) -> {
+            _: atom <- say_atom("line rejected: ", why);
+            drain(wireframe@unframe(wireframe@skip_line(st.rx, seg), "", 4096), "", st)
+        }
+    }
+}
+
+// The chunk is de-tainted (recreate, in the owner's (:rx) arm) before it is framed: this takes the pure bytes.
+// The segment is answered line by line first; only then is the next credit given, so the carrier
+// reads the end of input after every line of this segment has been printed.
+fn on_bytes(segment: string, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } {
+    st2: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } <- drain(wireframe@unframe(st.rx, segment, 4096), segment, st);
+    _: boolean <- tell_credit(st2.car, 1);
+    st2
+}
+
+// A rejected chunk is reported and dropped; the next credit lets the carrier go on.
+fn on_recreated(r: (:ok, string) | (:rejected, atom), st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } {
+    case r of {
+        (:ok, data: string) -> on_bytes(data, st);
+        (:rejected, why: atom) -> {
+            _: atom <- say_atom("chunk rejected: ", why);
+            _: boolean <- tell_credit(st.car, 1);
+            st
+        }
+    }
+}
+
+// The carrier ends right after (:link_down, why): the reason is kept and the report is waited for.
+fn on_link_down(why: atom, st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } {
+    { car: st.car, rx: st.rx, lines: st.lines, down: why }
+}
+
+// The carrier has ended (its failure report reached the reporter, which told the owner): the last
+// unterminated line, if any, then the summary, then the program ends.
+fn on_ended(st: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom }) -> { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } {
+    st2: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } <- case wireframe@finish(st.rx) of {
+        (:frame, last: string) -> on_line(last, st);
+        :empty -> st
+    };
+    _: atom <- say_atom("input ended: ", st2.down);
+    _: atom <- say_n("lines read: ", st2.lines);
+    _: boolean <- stop(0);
+    st2
+}
+
+fn owner(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:carrier_ended, int64), state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom }) -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            _: atom <- say(concat("link up: ", info));
+            _: boolean <- tell_credit(state.car, 1);
+            (:no_reply, state)
+        };
+        (:rx, chunk: string) -> {
+            sequence proc[transport]
+                r: (:ok, string) | (:rejected, atom) <- recreate(chunk, { max_bytes: 8 });
+                st2: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, lines: int64, down: atom } <- on_recreated(r, state)
+            produces
+                pure (:no_reply, st2)
+            end
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> {
+            (:no_reply, state)
+        };
+        (:link_down, why2: atom) -> (:no_reply, on_link_down(why2, state));
+        (:carrier_ended, _k: int64) -> (:no_reply, on_ended(state))
+    }
+}
+
+// The runtime links against region_dump_limit when a failure reporter is registered.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The carrier's end reaches the failure reporter as a report (even a normal end); the reporter tells the
+// owner by its registered name, so the owner's last output follows the runtime's own line about the
+// carrier on stderr.
+fn reporter(_report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[concurrency]
+        _: boolean <- cast_registered(:link_owner, (:carrier_ended, 1) impl ActorMessage {})
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :release_on_return), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous_carrier(input, stack_policy(0, :release_on_return), state_policy(:keep_state_area));
+        rx0: { mode: atom, expected: int64, pending: string } <- wireframe@fresh(:lines);
+        own: actor_ref <- spawn_registered({ car: car, rx: rx0, lines: 0, down: :none }, owner, :link_owner, stack_policy(0, :release_on_return), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, own, "") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
