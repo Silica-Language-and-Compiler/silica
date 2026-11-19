@@ -320,12 +320,19 @@ def _qemu_flash(image_path):
     return flash
 
 
-def _connect_qemu(port, proc):
+def _connect_qemu(port, proc, stderr_tail, drainer):
+    """stderr_tail is the bytearray _drain_pipe fills from QEMU's stderr on the drainer thread."""
     deadline = time.time() + 20
     last = "timed out"
     while time.time() < deadline:
         if proc.poll() is not None:
-            raise BoardUnavailable("qemu exited before the console opened (status %s)" % proc.returncode)
+            # QEMU has exited, so its stderr pipe is at EOF and the drainer ends once it has read
+            # everything (a dyld "Library not loaded" line, a QEMU error). Wait for it, bounded.
+            drainer.join(timeout=2)
+            note = bytes(stderr_tail).decode(errors="replace").strip()
+            note = " | ".join(line.strip() for line in note.splitlines() if line.strip())[:400]
+            raise BoardUnavailable("qemu exited before the console opened (status %s)%s"
+                                   % (proc.returncode, (": " + note) if note else ""))
         try:
             return socket.create_connection(("127.0.0.1", port), timeout=1)
         except OSError as e:
@@ -356,7 +363,7 @@ def run_under_qemu(image, timeout, send=None, send_delay=1.0):
     drainer = threading.Thread(target=_drain_pipe, args=(proc.stderr, stderr_tail), daemon=True)
     drainer.start()
     try:
-        sock = _connect_qemu(port, proc)
+        sock = _connect_qemu(port, proc, stderr_tail, drainer)
         adapter = _SocketPort(sock)
         try:
             out, status, diag = capture(adapter, timeout, send, send_delay)

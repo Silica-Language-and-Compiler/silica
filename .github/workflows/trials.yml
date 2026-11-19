@@ -4,11 +4,32 @@
 # This workflow waits for that run, installs its artifacts, and runs the trials.
 # A failed shard is the list `gh run view --log-failed` shows.
 #
-# Fifteen shards split the suites by source count. error_enforcement_addition
+# Fifteen shards per target split the suites by source count. error_enforcement_addition
 # is about half the sources, so every shard runs one slice of it
 # (TRIAL_SUITE_SLICE) and the other suites run whole, each in one shard.
 # Suites with INTEGRATE_PENDING are left out, which is what `make integrate`
-# does. The ESP32-S3 shards boot each image in Espressif QEMU
+# does. A suite that targets another platform is left out of a target's shards too:
+# trial_matrix.py reads the suite's TRIAL_TARGETS file (target names, or `host`) and its
+# BOARD_ONLY marker, and packs each target's own suites, so a host shard never runs
+# the ESP32-S3 or NUCLEO memory-space suites and no shard is left empty. Suites a
+# target only skips for a stated reason (trials/targets/<target>.skip) stay in; the
+# driver reports them as skipped.
+#
+# Input skip_golden_check (default false) sets TRIAL_SKIP_GOLDEN=1: the generated
+# assembly is not compared with the golden .ascomp copies (neither a difference nor a
+# missing golden fails). Run output, exit status and compile-failure goldens are still
+# checked, and each suite report says the assembly checks were skipped.
+#
+# Each shard uploads two artifacts, always, even when it failed:
+#   trials-<target>-shard-<n>  the .integrate_report*/.integrate_log* files
+#   golden-<target>-shard-<n>  the assembly this run generated, named as its golden
+#                              copies (<suite>/<stem>.ascomp on apple_silicon_mac,
+#                              <stem>.<linux_aarch64|linux_x86_64|esp32_s3>.ascomp elsewhere), laid out
+#                              relative to trials/, with MANIFEST.txt (first line
+#                              target=<target>, then one relative path per line).
+#                              Built by .github/scripts/collect_goldens.py.
+#
+# The ESP32-S3 shards boot each image in Espressif QEMU
 # (SILICA_BOARD_EMULATOR=qemu). That is not a board: USB, the GPIO matrix, and
 # the wall-clock stamp are absent, and a trial that dies before SILICA:START
 # is a model gap showing up as a failed trial.
@@ -28,13 +49,17 @@ on:
           - linux_aarch64
           - linux_x86_64
           - ESP32-S3_raw
+      skip_golden_check:
+        description: Skip comparing generated assembly against the golden .ascomp copies
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: trials-${{ github.ref }}-${{ inputs.target }}
+  group: trials-${{ github.ref }}-${{ inputs.target }}-${{ inputs.skip_golden_check }}
   cancel-in-progress: false
 
 jobs:
@@ -143,9 +168,17 @@ jobs:
           SILICA_TARGET_PROMPT: "0"
           INTEGRATE_WATCHDOG_MINUTES: "45"
           TRIAL_SUITE_SLICE: ${{ matrix.suite_slice }}
+          SKIP_GOLDEN_CHECK: ${{ inputs.skip_golden_check }}
         run: |
           set -euo pipefail
+          golden=""
+          if [ "${SKIP_GOLDEN_CHECK}" = "true" ]; then
+            golden=1
+            echo "::notice::Golden assembly checks are SKIPPED (skip_golden_check); output and exit status are still checked."
+          fi
+          export TRIAL_SKIP_GOLDEN="${golden}"
           make integrate \
+            TRIAL_SKIP_GOLDEN="${golden}" \
             TRIAL_TARGET="${{ matrix.trial_target }}" \
             TRIAL_SUITES="${{ matrix.suites }}" \
             JOBS=2 \
@@ -173,4 +206,23 @@ jobs:
         with:
           name: trials-${{ matrix.target }}-shard-${{ matrix.shard }}
           path: ${{ runner.temp }}/trial-report
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+      - name: Collect the generated assembly as golden copies
+        if: always()
+        run: |
+          python3 .github/scripts/collect_goldens.py \
+            --trials trials \
+            --target "${{ matrix.target }}" \
+            --out "${RUNNER_TEMP}/golden"
+
+      - name: Upload the golden copies
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-${{ matrix.target }}-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/golden
+          retention-days: 14
+          include-hidden-files: true
           if-no-files-found: ignore

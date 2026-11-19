@@ -58,6 +58,21 @@ if [ -z "$gcc" ] || [ -z "$qemu" ]; then
 fi
 chmod +x "$gcc" "$qemu" "$root/py/bin/esptool" "$root/py/bin/python"
 
+# Espressif's macOS qemu-system-xtensa links Homebrew dylibs by absolute path
+# (/opt/homebrew/opt/<formula>/lib/..., e.g. pixman, libgcrypt, sdl2-compat). They live outside
+# the cached tool directory, so install whichever are missing on every run; without them dyld
+# aborts QEMU at load (SIGABRT, "qemu exited before the console opened (status -6)").
+missing=()
+while IFS= read -r formula; do
+    [ -n "$formula" ] && [ ! -d "/opt/homebrew/opt/$formula" ] && missing+=("$formula")
+done < <(otool -L "$qemu" | sed -n 's|^[[:space:]]*/opt/homebrew/opt/\([^/]*\)/.*|\1|p' | sort -u)
+if [ "${#missing[@]}" -gt 0 ]; then
+    echo "installing the Homebrew libraries qemu links against: ${missing[*]}"
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 \
+        brew install "${missing[@]}"
+fi
+"$qemu" --version || { echo "qemu-system-xtensa does not start (see the dyld message above)" >&2; exit 1; }
+
 {
     echo "XTENSA_BIN=$(dirname "$gcc")"
     echo "ESPTOOL=$root/py/bin/esptool"

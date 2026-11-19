@@ -331,7 +331,9 @@ if [ -f "$$sb/__silica_runtime.sams" ]; then \
 		printf 'FAIL\t%s\t__silica_runtime assemble failed\n' "$$b" >> "$$res"; \
 	fi; \
 fi; \
-if [ ! -f "$$b$(ASCOMP_EXT)" ]; then \
+if [ -n "$(TRIAL_SKIP_GOLDEN)" ]; then \
+	: golden assembly check skipped; \
+elif [ ! -f "$$b$(ASCOMP_EXT)" ]; then \
 	echo "❌❌ $(MSG_PREFIX)$$b has no .ascomp file (run make record-golden from trial root)"; \
 	$(INTEGRATE_DOT_FAIL); \
 	printf 'FAIL\t%s\thas no .ascomp file\n' "$$b" >> "$$res"; \
