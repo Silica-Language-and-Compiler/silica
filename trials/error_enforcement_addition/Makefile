@@ -38,6 +38,16 @@ SUB_TRIALS      := ffi_addition module_duplicate_name_trial module_nonexported_c
 # Single-file trial sources: every *.silica directly in this directory. $(wildcard)
 # rather than $(shell find): the tree holds ~20k files and this file is parsed several times.
 SILICA_FILES := $(sort $(notdir $(wildcard $(THIS_DIR)*.silica)))
+# CI shard. TRIAL_SUITE_SLICE=error_enforcement_addition:<mod>:<res> keeps the
+# sources whose sorted index modulo <mod> is <res>, and the same slice of
+# SUB_TRIALS. The board driver applies the same variable to its own file list.
+SLICE_SPEC := $(strip $(TRIAL_SUITE_SLICE))
+ifneq ($(filter $(TRIAL_DIR):%,$(SLICE_SPEC)),)
+SLICE_MOD := $(word 2,$(subst :, ,$(SLICE_SPEC)))
+SLICE_RES := $(word 3,$(subst :, ,$(SLICE_SPEC)))
+SILICA_FILES := $(shell find "$(THIS_DIR)" -maxdepth 1 -name '*.silica' \( -type f -o -type l \) -print | sed 's|.*/||' | LC_ALL=C sort | awk -v m='$(SLICE_MOD)' -v r='$(SLICE_RES)' '(NR-1) % m == r')
+SUB_TRIALS := $(shell printf '%s\n' $(SUB_TRIALS) | LC_ALL=C sort | awk -v m='$(SLICE_MOD)' -v r='$(SLICE_RES)' 'NF && (NR-1) % m == r')
+endif
 CUR_FAILS := $(SILICA_FILES:.silica=.cur_fail)
 SUB_TARGETS := $(SUB_TRIALS:%=ee-sub-%)
 
