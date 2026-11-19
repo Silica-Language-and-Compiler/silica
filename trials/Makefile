@@ -10,6 +10,8 @@
 # prints its own report when it finishes; the final report covers the whole tree.
 # ordered_data_structures runs in its own, smaller pool (SDS_JOBS, default 4) because
 # its per-unit compiles are memory-bound, not core-bound.
+# Suites start largest first (by .silica file count; see TRIAL_ORDER below); `make print-trial-order`
+# lists the order; ordered_data_structures is always first. The final report is alphabetical.
 #
 #   make integrate                       # everything, cores-wide
 #   make integrate JOBS=4 SDS_JOBS=2     # gentler
@@ -22,11 +24,22 @@ include $(THIS_DIR)silica_compiler.mk
 TRIAL_MAKEFILES := $(wildcard */Makefile */makefile)
 TRIAL_SUBDIRS := $(sort $(foreach mf,$(TRIAL_MAKEFILES),$(notdir $(patsubst %/,%,$(dir $(mf))))))
 
-# Longest jobs first: make starts prerequisites in list order, so the heavy suites
-# begin immediately instead of forming a tail behind the small ones.
+# Largest suites first: make starts the prerequisites of integrate-dirs in list order as job slots
+# free up, so the big suites begin at once and the many small ones fill the other cores meanwhile,
+# instead of a few big suites forming a tail at the end of the run. Size = number of .silica files
+# under the suite (nested suites and apps included), a cheap deterministic estimate that needs no
+# earlier run; ties break alphabetically. Plain POSIX find/wc/tr/sort/awk (BSD and GNU alike), and
+# only make 3.81 functions. `make print-trial-order` shows the order with the sizes.
+# The final report lists the suites alphabetically (TRIAL_REPORT_ORDER), not in start order.
 SDS_DIR := ordered_data_structures
-HEAVY_FIRST := $(SDS_DIR) error_enforcement_addition
-TRIAL_ORDER := $(filter $(HEAVY_FIRST),$(TRIAL_SUBDIRS)) $(filter-out $(HEAVY_FIRST),$(TRIAL_SUBDIRS))
+TRIAL_SIZED := $(shell for d in $(TRIAL_SUBDIRS); do \
+	printf '%s %s\n' "$$(find "$(THIS_DIR)$$d" -name '*.silica' -type f | wc -l | tr -d ' ')" "$$d"; \
+	done | LC_ALL=C sort -k1,1nr -k2,2 | awk '{print $$1 ":" $$2}')
+# ordered_data_structures is pinned first whatever its size: its own memory-bound pool makes it
+# a long suite, so it must not start late (a TRIAL_SUITES filter below drops it if not selected).
+TRIAL_SIZED := $(filter %:$(SDS_DIR),$(TRIAL_SIZED)) $(filter-out %:$(SDS_DIR),$(TRIAL_SIZED))
+TRIAL_ORDER := $(foreach e,$(TRIAL_SIZED),$(word 2,$(subst :, ,$(e))))
+TRIAL_REPORT_ORDER := $(TRIAL_SUBDIRS)
 
 # TRIAL_SUITES="a b" limits a host tree run to the named suites (the board target reads the same
 # variable in targets/trial_target.sh). A name that is not a suite is an error. A named suite runs
@@ -37,13 +50,14 @@ ifneq ($(strip $(TRIAL_SUITES)),)
 ifeq ($(strip $(TRIAL_MIRROR)),)
 $(foreach s,$(TRIAL_SUITES),$(if $(filter $(s),$(TRIAL_SUBDIRS)),,$(error TRIAL_SUITES: no suite named $(s))))
 TRIAL_ORDER := $(filter $(TRIAL_SUITES),$(TRIAL_ORDER))
+TRIAL_REPORT_ORDER := $(filter $(TRIAL_SUITES),$(TRIAL_REPORT_ORDER))
 INTEGRATE_NAMED_SUITES := 1
 INTEGRATE_LOG_ROOTS := "$(THIS_DIR).integrate_log" $(foreach s,$(TRIAL_ORDER),"$(THIS_DIR)$(s)")
 endif
 endif
 INTEGRATE_DIR_TARGETS := $(TRIAL_ORDER:%=integrate-dir-%)
 
-.PHONY: integrate-run integrate-prepare integrate-dirs integrate-summary integrate-ffi clean help $(INTEGRATE_DIR_TARGETS)
+.PHONY: print-trial-order integrate-run integrate-prepare integrate-dirs integrate-summary integrate-ffi clean help $(INTEGRATE_DIR_TARGETS)
 
 .DEFAULT_GOAL := integrate
 
@@ -71,8 +85,12 @@ $(INTEGRATE_DIR_TARGETS): integrate-dir-%:
 	@$(call INTEGRATE_CHILD,$*,$(if $(filter $*,$(SDS_DIR)),-j$(SDS_JOBS)))
 
 integrate-summary:
-	@cd "$(THIS_DIR)" && $(call INTEGRATE_SUM_CHILDREN,$(TRIAL_ORDER)); \
+	@cd "$(THIS_DIR)" && $(call INTEGRATE_SUM_CHILDREN,$(TRIAL_REPORT_ORDER)); \
 	[ "$$ko" -eq 0 ] && [ "$$failed" -eq 0 ]
+
+# print-trial-order: the order the suites are handed to the jobserver (size = .silica files).
+print-trial-order:
+	@for e in $(TRIAL_SIZED); do printf '%7s  %s\n' "$${e%%:*}" "$${e#*:}"; done
 
 # integrate-ffi: success-path FFI app trials only (same as make -C ffi_addition integrate).
 # Compile/link failure goldens live under error_enforcement_addition/ffi_addition integrate.
@@ -104,7 +122,8 @@ help:
 	@echo "                                 (interactive: asks where to run the trials; Enter = this host: macOS, Linux x86-64 or Linux AArch64)"
 	@echo "  make integrate TRIAL_TARGET=T  T = host, linux_aarch64, linux_x86_64, ESP32-S3_raw, STM32-L476RG_raw, all, both, or a list; see targets/README.md"
 	@echo "  make integrate TRIAL_SUITES=\"a b\"                         only these suites (host or board; a named suite runs even if INTEGRATE_PENDING)"
-	@echo "  make integrate JOBS=N          cap the parallel pool"
+	@echo "  make print-trial-order         suites in start order (ordered_data_structures first, then largest first, with .silica counts)"
+	@echo "  make integrate JOBS=N         cap the parallel pool"
 	@echo "  make integrate SDS_JOBS=N      cap ordered_data_structures separately (memory-bound)"
 	@echo "  make -C <suite> integrate      one suite; prints that suite's own report"
 	@echo "  make integrate INTEGRATE_WATCHDOG_MINUTES=N   kill running trials after N minutes without a result (default 15)"
