@@ -38,8 +38,10 @@ make clean                          # every suite's clean, plus the integrate lo
 ```
 
 `make integrate` at this level runs all suites concurrently under one make jobserver.
-The suites are started longest-first (ordered_data_structures and
-error_enforcement_addition lead). ordered_data_structures runs in its own, smaller
+The suites are started largest-first, by the number of `.silica` files under each suite
+(ties alphabetical), so the big suites begin at once and the small ones fill the other
+cores meanwhile; `make print-trial-order` lists the order with the sizes. The final
+report lists the suites alphabetically. ordered_data_structures runs in its own, smaller
 pool because its stdlib batch compile peaks at about 7 GB of memory; `SDS_JOBS`
 bounds how many of its leaves and units run at once. `JOBS` and `SDS_JOBS` can also
 be set in the environment. A suite run on its own (`make -C <suite> integrate`) uses
