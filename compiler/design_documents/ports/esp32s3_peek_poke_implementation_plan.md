@@ -31,7 +31,7 @@ today" is that position, not the present one). Where each piece lives now:
 | 9 SIR lowering | `sir_generator/terms/sir_device_calls.silica` (casts lower as `actor_cast_device` / `actor_cast_device_registered`, spawns as `spawn_device` / `spawn_device_registered`) |
 | 10, 11 capability query and rejection pass | `emitter_core@unsupported_prim_reason` in each of the four emitters; `sir_generator/sir_target_verify.silica` reports E2220 and stops the driver before `emit_module` |
 | 12, 13 hosted emitters | the three hosted `terms/prims/prims.silica` catch-alls write an `.error` line naming the prim (they are reached only if the pre-emit pass is bypassed); the device-worker intrinsics are carried by the hosted runtimes with a third registry |
-| 14 window table | `emitter/ESP32-S3_raw/board_pack.silica` (12 windows, `window_containing`, `window_allows_width`), twin `board/runtime/rt_device.S`; the draft in this directory, [board_pack.silica](board_pack.silica), is the design copy |
+| 14 window table | `emitter/ESP32-S3_raw/board_pack.silica` (12 windows on 2026-10-16, 14 on 2026-11-18, `window_containing`, `window_allows_width`), twin `board/runtime/rt_device.S`; the draft in this directory, [board_pack.silica](board_pack.silica), is the design copy |
 | 15, 16 `map_device`, `peek`, `poke` | `emitter/ESP32-S3_raw/terms/prims/prims_device.silica`: a constant base is checked against the table at compile time, a computed base by `silica_rt_map_device_check` (abort `illegal device map`, status 71); `peek` is `memw` + `l32i`, `poke` is `memw` + `s32i` + `memw`; **only 32-bit accesses are accepted**, `Register8`/`16`/`64` are refused with an `.error` line naming the width |
 | 17 workers and third registry | `terms/prims/prims_actors.silica`, `board/runtime/rt_actors.S` (registries are sized per image from the atom table, `silica_registry_slots`) |
 | 18 call-site barriers | unchanged (`effects/emitter_effects.silica`) |
@@ -425,7 +425,7 @@ then 7, 8, 13, 18, 19, 20.
 - **Host-side skipping of a board-only suite.** `trials/targets/ESP32-S3_raw.skip` skips on the board; the only
   host-side mechanism is `INTEGRATE_PENDING`, which skips on every target (`trials/targets/trial_target.sh:251`).
   The device program suite (work item 19c) needs a way to run on the board and be reported as skipped, not failed,
-  on the host: a `host.skip` beside the board one, or a suite-level target marker. Awaiting discussion.
+  on the host: a `host.skip` beside the board one, or a suite-level target marker. Awaiting discussion. **Status 2026-11-18:** the suite-level marker now exists as a `BOARD_ONLY` file (commit `36cdecfcef`; used by `trials/memory_space_esp32s3_addition` and `memory_space_nucleo_addition`); `trials/device_actor_addition` still carries `INTEGRATE_PENDING` and no `BOARD_ONLY`.
 - **Where `spawn_device` runs a hardware `init`.** Device spec §8 says a restarted worker's first work must run a
   documented `init` / `recover`. Nothing in this plan enforces it; the supervisors' restart path
   (`board/runtime/rt_supervisors.S`) is untouched. Recorded so it is not mistaken for delivered.

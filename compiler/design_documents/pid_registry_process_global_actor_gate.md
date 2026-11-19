@@ -1,5 +1,7 @@
 # PID registry: process-global reference, actor-gated table
 
+**Status 2026-11-18:** fully implemented in all four runtimes (see the implementation status below); nothing in this document is open.
+
 ## Goals
 
 - **Process-global:** one logical registry per OS process. The runtime holds a single word (`_silica_pid_registry_ref` in BSS) naming the registry **actor**.

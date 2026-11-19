@@ -326,7 +326,7 @@ Where it is applied:
   assembly `bl __exit`; `bl _exit` there is C's `exit()`; Linux spells them `_exit` and `exit`). Trials:
   `ffi_addition/app_process_fatal_paths` (`fault_before_main`, `fault_inside_handler`,
   `foreign_fault_without_actor`). The Linux AArch64 and x86-64 text is assembled, not yet run on those hosts;
-  the board text is assembled and linked into images, not yet run on the board.
+  the board text is assembled and linked into images, not yet run on the board. **Status 2026-11-18:** the Linux runtimes ran their full trial sets green on 2026-11-04 (`f81d3e136e`, `df3357ce38`; `ffi_addition/app_process_fatal_paths` has `.linux_aarch64.ascomp` and `.linux_x86_64.ascomp` goldens), and the board suites ran green on 2026-11-07 and 2026-11-12 (`029447ad31`, `978f663e08`), as the 2026-10-16 paragraph at the top says.
 - The last-resort test needs the thread to have an alternate signal stack. Every thread the runtime creates has
   one; a thread created by foreign code does not, and a fault inside the handler on such a thread still ends
   with status 139. So does a fault that exhausts the 64 KB alternate stack itself: the kernel cannot deliver
@@ -396,7 +396,7 @@ process-fatal reports of §1 to §5. Checked against the hosted and board runtim
   The dash is U+2014. Detail text follows only where the runtime knows the cause (`integer division by zero`,
   `no case arm matched`); an atom that the runtime's copy of the atom table does not hold prints `:unknown`.
   Covered by `trials/failure_reason_line_addition`. Implemented on all four targets; verified on the Mac, Linux
-  verification in progress, ESP32-S3 board run pending.
+  verification in progress, ESP32-S3 board run pending. **Status 2026-11-18:** `failure_reason_line_addition` has `.linux_aarch64.ascomp`, `.linux_x86_64.ascomp` and `.esp32_s3.ascomp` goldens, is not in `trials/targets/ESP32-S3_raw.skip`, and the Linux and board suites ran green on 2026-11-04, 2026-11-07 and 2026-11-12 (`f81d3e136e`, `029447ad31`, `978f663e08`); the STM32 driver does not run it yet (`STM32-L476RG_raw.skip`).
 - **Reason tags (2026-10-23, `:foreign_fault` 2026-10-24).** 0 `:normal`; 2 `:language_error` (division by zero,
   no case arm matched, convention mismatch, name taken, misuse sites); 3 `:memory_fault` (board CPU exception
   in an actor); 4 every `(:explicit, atom)`, including `(:explicit, :killed)` from `kill_abnormal` and from

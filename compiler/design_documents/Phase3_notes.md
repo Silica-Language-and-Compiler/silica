@@ -14,9 +14,9 @@ under the build-slot lock; builder `/Volumes/2T/silica/binaries/silica-compiler`
 
 | Stage | What | Status |
 | --- | --- | --- |
-| 3a | `state_policy(...)` accepted (optional) after `stack_policy(...)` in every hosted spawning form; `compact_state()` builtin; ACB #576 stored at spawn, #584 set by `compact_state()` under `:compact_on_request`; no behaviour change | code done (Mac + the shared front end; ESP32 accepts the prim as a pass-through); Haiku build + gate: see §5 |
-| 3b | per-slot copier tables, free lists (§2.3, §5.4, P5) | Mac source written 2026-10-29 (§10), not built; Linux twins listed, not applied |
-| 3c | dispatch end (§4.1-§4.7), W2300/E2321, `strict state_release;` | Mac source written 2026-10-30 (§10.8), not built; `strict state_release;` / E2321 and the `\|_upd=` update-call rules deferred (§10.8.4) |
+| 3a | `state_policy(...)` accepted (optional) after `stack_policy(...)` in every hosted spawning form; `compact_state()` builtin; ACB #576 stored at spawn, #584 set by `compact_state()` under `:compact_on_request`; no behaviour change | code done (Mac + the shared front end; ESP32 accepts the prim as a pass-through); Haiku build + gate: see §5. **Status 2026-11-18: done**: built into the published 999937 and later compilers, and `compact_state` is handled in `main_compile_pipeline.silica` and the board runtime (`board/runtime/rt_state.S`). |
+| 3b | per-slot copier tables, free lists (§2.3, §5.4, P5) | Mac source written 2026-10-29 (§10), not built; Linux twins listed, not applied. **Status 2026-11-18: built and done**: phase 3 closed with 999937 built from the 3d sources, which contain 3b, and the Linux twins landed in chunk 15 phase 8 (see row 3e). |
+| 3c | dispatch end (§4.1-§4.7), W2300/E2321, `strict state_release;` | Mac source written 2026-10-30 (§10.8), not built; `strict state_release;` / E2321 and the `\|_upd=` update-call rules deferred (§10.8.4). **Status 2026-11-18: partly done**: built (W2300 is emitted, `main_compile_pipeline.silica:204`, and `_silica_rt_state_evacuate` is in `prims_actors_state_asm.silica`); `strict state_release;` parses, but E2321 is still not emitted. |
 | 3d | `state_policy` required (E2005), the bootstrap rewrite script | **done** (verified 2026-11-14): `type_checker_supervisor.silica:150-185` requires the `state_policy` field (E2092, "required since phase 3d"); phase 3 closed 2026-10-31, compiler published as 999937 from the 3d sources |
 | 3e | linux_aarch64 / linux_x86_64 ports | **done in chunk 15 phase 8** (verified 2026-11-14): x86-64 2026-11-04 (`04bb9d4c53`, `a2dd0caa42`, `5614f4bb09`), aarch64 green via `81c1144bb6` 2026-11-11; ESP32-S3 ported `029447ad31` 2026-11-07, green `978f663e08` 2026-11-12. (Was: removed from the phase-3 completion gate by Lee 2026-10-30; Linux and ESP32 ports moved to after phase 7) |
 
@@ -549,6 +549,7 @@ from a stack slot).
   (`mc_child_spec_desc`): identical to the Mac edits (these files are twins up to spelling).
 * The linux trees also still lack the 3a diff (§2, "linux_aarch64 / linux_x86_64: not ported yet"): 3e
   carries 3a + 3b together.
+  **Status 2026-11-18: done**: the Linux trees were ported in chunk 15 phase 8 (row 3e above).
 
 ### 10.7 Regression fix: the header's page was read before it was committed (2026-10-29, Mac source)
 

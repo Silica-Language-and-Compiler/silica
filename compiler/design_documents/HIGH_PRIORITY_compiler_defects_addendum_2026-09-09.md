@@ -1,5 +1,8 @@
 # HIGH PRIORITY — addendum (2026-09-09): two more silent miscompilations
 
+**Status 2026-11-18:** wholly historical: A7 and A8 are fixed and pinned by trials, and the closing note on diagnostics is covered by the Part B items of the main document (see its status); candidate for `completed_plans/`.
+
+
 **Implementation status (2026-10-16):** both A7 and A8 are fixed. They are pinned by the installed trials `train_defect_a7_*` (one per integer width, in `int8_addition` ... `uint64_addition`) and `train_defect_a8_compound_compare_float32_0001` / `_float64_0001` (`float32_addition`, `float64_addition`); the `.sout` of each equals its hand-derived `.scout`. The fixes (operand staging in `left_reg`, quotient scratch X16, right-first with spill for a float prim on the left) landed in `emitter/*/terms/` and are described in [compiler_defects_execution_status_2026-09-10.md](./compiler_defects_execution_status_2026-09-10.md). The text below is the original report.
 
 Companion to [HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md](./HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md).

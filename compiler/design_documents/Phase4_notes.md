@@ -104,6 +104,8 @@ at the top of `prims_actors_runtime_asm.silica` ("152 B message nodes").
 
 ### 1.5 Not verified (Haiku builds, Sonnet reads)
 
+**Status 2026-11-18: done**: built and gated as part of stage 4e (section 6b, 12-suite gate on c4721975, 2026-10-31, zero `.scout` differences); the Linux twins in chunk 15 phase 8.
+
 Nothing built or run. Expected: `.ascomp` drift in `__silica_runtime` and in every module with a cast site (the
 `L_evs_` descriptor now follows the cast, the `L_mcs` one is gone, four extra MOVs before each cast); `.sout` must equal
 `.scout` everywhere. Trials to watch: `actors_addition` (`record_message_casts_hold_state`, `tuple_message_casts_hold_state`,
@@ -202,6 +204,8 @@ Design §5.2 (decision 32). Mac tree only; nothing built or run (Haiku builds, S
   `send_deep_copy_asm` and `mc_reply_needs_copy`; they go with those in 4c.
 
 ### 3.4 Not verified (Haiku builds, Sonnet reads)
+
+**Status 2026-11-18: done**: built and gated as part of stage 4e (section 6b, 12-suite gate on c4721975, 2026-10-31, zero `.scout` differences); the Linux twins in chunk 15 phase 8.
 
 Nothing built or run. Expected drift: `__silica_runtime` `.ascomp` (the new routine) in every unit, and the
 `.ascomp` of every module with a forwarding site (two extra instructions and the entry's symbol before the
@@ -358,6 +362,8 @@ Design §5.3 (decision 33, the extended call record), §5.2's `|_mvr` removal, a
 
 ### 4.5 Not verified (Haiku builds, Sonnet reads)
 
+**Status 2026-11-18: done**: built and gated as part of stage 4e (section 6b, 12-suite gate on c4721975, 2026-10-31, zero `.scout` differences); the Linux twins in chunk 15 phase 8.
+
 Nothing built or run. Expected drift: `__silica_runtime` `.ascomp` everywhere (the new routine, the 176 B
 record, the X29-relative leaves); every module with a behaviour whose reply type is composite (the `L_evb_` reply
 evacuation block is replaced by the `_silica_rt_reply_place` call; the `L_md_<entry>_r` block disappears for
@@ -480,6 +486,8 @@ Design §5.4 (decision 15 plain spawn, decision 11 / Q14 supervised children), �
    walkers (`which_children`, `get_child`) and by the board port.
 
 ### 5.5 Not verified (Haiku builds, Sonnet reads)
+
+**Status 2026-11-18: done**: built and gated as part of stage 4e (section 6b, 12-suite gate on c4721975, 2026-10-31, zero `.scout` differences); the Linux twins in chunk 15 phase 8.
 
 Nothing built or run. Expected drift: `__silica_runtime` `.ascomp` only (the row size, the two buffer blocks, the
 free in `sb_unref`); no user-module `.ascomp` should move (no emitter output changed; comments only in
@@ -680,7 +688,7 @@ tag the SIR writes stays for the region checker; `|_mva` was emitter-internal an
 
 ### 6.5 Open questions (none block the stage)
 
-* `heap_used()`'s replacement measure (6.3 item 3; design §9.4: stack depth and state-area size): Lee.
+* `heap_used()`'s replacement measure (6.3 item 3; design §9.4: stack depth and state-area size): Lee. **Status 2026-11-18: done**: `heap_used()` is retired and `state_area_bytes()` replaces it (section 6b).
 * The destination bounds (256 bytes per core + 2048; 400; 120 per row) are derived from the layouts and
   written beside each reservation; an overrun aborts with "a runtime builder overran its destination area"
   rather than overrunning a frame. Should a platform ever report more than 8 optional capability flags or
@@ -690,6 +698,8 @@ tag the SIR writes stays for the region checker; `|_mva` was emitter-internal an
   Linux twins (phase 8) and deleted then.
 
 ### 6.6 Not verified (Haiku builds, Sonnet reads)
+
+**Status 2026-11-18: done**: built and gated as part of stage 4e (section 6b, 12-suite gate on c4721975, 2026-10-31, zero `.scout` differences); the Linux twins in chunk 15 phase 8.
 
 Nothing built or run. Expected drift: `__silica_runtime` `.ascomp` in every unit (the builders, the six
 entries, `_silica_rt_sup_ref_call`, the deleted heap routines, the timer); every user-module `.ascomp`

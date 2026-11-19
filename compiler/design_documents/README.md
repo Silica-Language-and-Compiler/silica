@@ -71,7 +71,7 @@ Use the entries below for **quick navigation**. Each item links to a file in thi
 
 ## [ports/esp32s3_port_status.md](./ports/esp32s3_port_status.md)
 
-**ESP32-S3 port status** (native Xtensa, bare metal): the behaviours verified on the board (apps and trial suites, with dates), the behaviours that differ from Apple Silicon (console, exit statuses, faults, stacks, heap, numerics, printing), what the emitter refuses (`.error`), and the gaps ordered for the next addition: actor runtime, peek and poke, the suites not yet run on the board, trial-driver gaps, emitter performance.
+**ESP32-S3 port status** (native Xtensa, bare metal): the behaviours verified on the board (apps and trial suites, with dates), the behaviours that differ from Apple Silicon (console, exit statuses, faults, stacks, heap, numerics, printing), what the emitter refuses (`.error`), and the gaps ordered for the next addition. Status 2026-11-18: the actor runtime and peek and poke are delivered and the whole tree has been run on the board (22,694 pass, 0 fail, 19 skipped, `029447ad31`), so the gap list is shorter than its 2026-10-16 order suggests; its own status notes say which rows remain.
 
 ---
 
@@ -89,7 +89,7 @@ Plans whose steps are all done, completed or superseded, kept as the record. Cur
 
 ## Plan parts split from design files (2026-11-15)
 
-Each design file keeps its design; the work sequencing moved to a `_plan.md` file beside it (open work, so none is in completed_plans yet): [actor_growable_stack_plan.md](./actor_growable_stack_plan.md) (design section 11), [chunk15_stack_memory_plan.md](./chunk15_stack_memory_plan.md) (section 11), [direct_machine_object_emitter_plan.md](./direct_machine_object_emitter_plan.md) (section 13) and [region_memory_safety_plan.md](./region_memory_safety_plan.md) (sections 13 and 16).
+Each design file keeps its design; the work sequencing moved to a `_plan.md` file beside it (each still has a status line saying open work remains, so none is in completed_plans yet; status 2026-11-18: chunk 15 phase 10, the last phase of its plan, is done, 2026-11-15): [actor_growable_stack_plan.md](./actor_growable_stack_plan.md) (design section 11), [chunk15_stack_memory_plan.md](./chunk15_stack_memory_plan.md) (section 11), [direct_machine_object_emitter_plan.md](./direct_machine_object_emitter_plan.md) (section 13) and [region_memory_safety_plan.md](./region_memory_safety_plan.md) (sections 13 and 16).
 
 ---
 
@@ -125,7 +125,7 @@ The supervision roadmap document (`supervisors_implementation_development_plan.m
 
 ## [Phase1_TODOs/cpu_topology_implementation_plan.md](./Phase1_TODOs/cpu_topology_implementation_plan.md)
 
-Apple Silicon + macOS **CPU topology implementation record**: sysctl-backed `get_cpu_topology`, `get_core_capabilities`, core lists, cache/NUMA layout caveats, and remaining portability/frequency-reporting work.
+Apple Silicon + macOS **CPU topology implementation record**: sysctl-backed `get_cpu_topology`, `get_core_capabilities`, core lists, cache/NUMA layout caveats, and remaining portability/frequency-reporting work. Status 2026-11-18: phases D to F are done and phase H has its binary trials; what is left is the `INTEGRATE_PENDING` decision and the `frequency_mhz` follow-up.
 
 ---
 
@@ -189,7 +189,7 @@ How **immutable, Erlang-style lists** are represented and lowered in the compile
 
 ## [Phase1_TODOs/data_structures_as_traits.md](./Phase1_TODOs/data_structures_as_traits.md)
 
-**Trait API specification (not implemented):** maps each trait module to WBT / WBT-graph / Brodal–Okasaki / random-access-list backends per `data_structure_to_algorithms.md`. Constructor function records, `provided` + `fold` surfaces, comparator contracts, views/adapters.
+**Trait API specification (status 2026-11-18: the trait modules are implemented in `compiler/stdlib/data_structures/`, see `data_structure_designs/README.md` for the exceptions):** maps each trait module to WBT / WBT-graph / Brodal–Okasaki / random-access-list backends per `data_structure_to_algorithms.md`. Constructor function records, `provided` + `fold` surfaces, comparator contracts, views/adapters.
 
 ## [graph_representation_design.md](./graph_representation_design.md)
 
@@ -281,26 +281,26 @@ Tutorial for **`sequence` blocks** (`sequence` / `produces` / `pure` / monadic s
 
 ## [memory-effects-aarch64-implementation-plan.md](./memory-effects-aarch64-implementation-plan.md)
 
-**Plan for per-space hardware behaviour** (`mem(Space)`) on OS-free targets (AArch64 `MAIR`, ESP32-S3). The static discipline is implemented; per-space pools, `alloc_region` space routing and atomic `LDAR`/`STLR` access are not (status table at its top).
+**Plan for per-space hardware behaviour** (`mem(Space)`) on OS-free targets (AArch64 `MAIR`, ESP32-S3). The static discipline is implemented. Status 2026-11-18: the ESP32-S3 and NUCLEO-L476RG emitters now check each space against the board's table and bracket atomic ref accesses with `memw` or `dmb sy`; per-space pools, `alloc_region` space routing on the hosted emitters and atomic `LDAR`/`STLR` access on AArch64 are not implemented (status table at its top).
 
 ---
 
 ## [transport_serialization_design.md](./transport_serialization_design.md)
 
-**Design for wire transport as part of the language (2026-11-05; phases 0 and 1, the builtins and the ETF derivation, implemented on Apple Silicon, see its §14)**: a compiler-derived `encode` / `decode` pair that walks the static type at each call as the message copier does, with the limits of a `decode` given as a call argument (no marker trait: decided 2026-11-05, in step with the FFI wrapper specification's `recreate`), and two closed built-in traits (`WireFormat`, one built-in implementation per wire protocol starting with BEAM ETF; `Carrier`, one per carrier kind with an actor message contract and credit-based flow control). Frames are `string`s; `decode` is a validator in the `recreate` sense. Transport and every new protocol are language, specified and shipped with the compiler, never a program library; which carriers and protocols a compiler build provides is decided per target, board or hosted, in a per-target transport pack, with a compile-time rejection for the rest (Lee, 2026-11-05). Covers the ESP32-S3 board's USB-UART, USB-Serial-JTAG, USB CDC dual-role, UART1, SPI, I2C and SD paths, Bluetooth LE on every target, the hooks the BEAM distribution protocol will need, and how CBOR, MessagePack, JSON, Protocol Buffers and a native format are added as further protocols.
+**Design for wire transport as part of the language (2026-11-05; phases 0 and 1, the builtins and the ETF derivation, implemented on Apple Silicon, see its §14)**: a compiler-derived `encode` / `decode` pair that walks the static type at each call as the message copier does, with the limits of a `decode` given as a call argument (no marker trait: decided 2026-11-05, in step with the FFI wrapper specification's `recreate`), and two closed built-in traits (`WireFormat`, one built-in implementation per wire protocol starting with BEAM ETF; `Carrier`, one per carrier kind with an actor message contract and credit-based flow control). Frames are `string`s; `decode` is a validator in the `recreate` sense. Transport and every new protocol are language, specified and shipped with the compiler, never a program library; which carriers and protocols a compiler build provides is decided per target, board or hosted, in a per-target transport pack, with a compile-time rejection for the rest (Lee, 2026-11-05). Covers the ESP32-S3 board's USB-UART, USB-Serial-JTAG, USB CDC dual-role, UART1, SPI, I2C and SD paths, Bluetooth LE on every target, the hooks the BEAM distribution protocol will need, and how CBOR, MessagePack, JSON, Protocol Buffers and a native format are added as further protocols. Status 2026-11-18: beyond phases 0 and 1 the hosted `(:tcp)`, `(:udp)` and `(:serial)` carriers, the ESP32-S3 `(:uart1)` and `(:usb_serial_jtag)` carriers and the `carried_on` links are implemented, and storage carriers (§6.8) are built through S2 (S0 and S1 on Apple Silicon, S2 verified on Linux by the full hosted run of `6e3f85e229`); S3 is not built.
 
 ---
 
 ## [transport_links_design.md](./transport_links_design.md)
 
-**Design for the hardware under a carrier (2026-11-08; design accepted for phase A planning, nothing implemented)**: the link (`(:uart, 1, 115200)`, `(:interface, "en0")`, `(:loopback)`) named in a new top-level declaration `carried_on name: (:kind) (:link, params...);` (with `spawn_dangerous_carrier(<name>)`), a `provides_link` table in each target's transport pack, planned diagnostics E2412 to E2417, a supervised bring-up actor and link failure model, and the phases hosted naming, UART on the ESP32-S3, UART on the Nucleo, then network links on boards. Extends transport_serialization_design.md §6 (see its §6.7); planned specification text is §16.4.9.
+**Design for the hardware under a carrier (2026-11-08). Status 2026-11-18: the `carried_on` grammar, E2412 to E2415 and E2417, `spawn_dangerous_carrier` and the pack `provides_link` rows are implemented (`parser/carried_on_expand.silica`, `type_checker/type_checker_links.silica`, each hosted pack and the board packs; see the design's own status).** Original summary: the link (`(:uart, 1, 115200)`, `(:interface, "en0")`, `(:loopback)`) named in a new top-level declaration `carried_on name: (:kind) (:link, params...);` (with `spawn_dangerous_carrier(<name>)`), a `provides_link` table in each target's transport pack, planned diagnostics E2412 to E2417, a supervised bring-up actor and link failure model, and the phases hosted naming, UART on the ESP32-S3, UART on the Nucleo, then network links on boards. Extends transport_serialization_design.md §6 (see its §6.7); planned specification text is §16.4.9.
 
 ---
 
 ## Further documents in this directory
 
 - [actor_memory_budget_plan.md](./actor_memory_budget_plan.md): what one actor, supervisor and `main` cost in memory on the ESP32-S3 board and on hosted targets, how the cost is cut, and what bounds the number of actors (formerly `esp32s3_memory_budget_plan.md`).
-- [esp32s3_board_peripherals_plan.md](./esp32s3_board_peripherals_plan.md): supporting the test board's peripherals through device workers (`peek` / `poke` over board-pack descriptions) and the efficient Silica versions of the board apps.
+- [esp32s3_board_peripherals_plan.md](./esp32s3_board_peripherals_plan.md): supporting the test board's peripherals through device workers (`peek` / `poke` over board-pack descriptions) and the efficient Silica versions of the board apps. Status 2026-11-18: items A to C are in the tree, D is done on the board except two open points, F is done, item G is partly done (I2C0 master and the MMA8452Q worker), E was closed as not needed, and H to M and O to R have no code.
 - [ports/esp32s3_xtensa_port.md](./ports/esp32s3_xtensa_port.md): the native Xtensa LX7 port (emitter conversion, board pack, runtime on both cores).
 - [ports/esp32s3_peek_poke_implementation_plan.md](./ports/esp32s3_peek_poke_implementation_plan.md) and [ports/esp32s3_peek_poke_implementation_details.md](./ports/esp32s3_peek_poke_implementation_details.md): the peek/poke programme and its design record.
 - [silica_device_actor_specification.md](./silica_device_actor_specification.md): device actors, `map_device` / `peek` / `poke`, and device descriptions.

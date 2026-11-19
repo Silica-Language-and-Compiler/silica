@@ -2,6 +2,8 @@
 
 **Implementation status (2026-10-16):** the scratch work below was accepted into the repository. All Part A items except A2 3b and all Part B items are fixed and pinned by installed `train_defect_*` trials; A3, A9 and A10, listed as open below, are fixed and pass (`actors_addition/train_defect_a3_*`, `_a9_*`, `_a10_*`: `.sout` equals `.scout`). Still open: A2 3b (closure environments; E1067 rejects the returned capturing literal) and the four misleading-diagnostic wordings. The scratch paths, the seed/selfhost patch pair and the "still open" list in this file are the 2026-09-10 record; the seed source tree it mentions no longer exists (the compiler is `compiler/src`, built by the Silica-built seed in `binaries/seed-compiler`).
 
+**Status 2026-11-18: partly done.** Of the four misleading-diagnostic wordings, an unterminated string literal is now its own lexer error E0003 (`lexer/lexer_string_literals.silica`, trials `error_enforcement_addition/lexer_e0003_*`) and the E1040 message now reads "expected ';' after this statement before the next statement" (`parser/constraint_extract_validate.silica:396`). The `E2003` "type mismatch: <name>" wording is unchanged (`type_checker_expressions_identifiers.silica:1051`); the E2002/E2005 field-access wording was not re-checked. A2 closure environments are still not implemented (E1067 and E1072 remain the diagnostics).
+
 All work is in scratch copies; the repository is untouched.
 
 | Tree | Path |
