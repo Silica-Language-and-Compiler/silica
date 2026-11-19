@@ -308,6 +308,7 @@ bash programmer_tools/run_trials_all_platforms.sh            # every platform it
 bash programmer_tools/run_trials_all_platforms.sh --targets linux_x86_64
 bash programmer_tools/run_trials_all_platforms.sh --remote linux_aarch64=admin@pix.local
 bash programmer_tools/run_trials_all_platforms.sh --sync --board
+bash programmer_tools/run_trials_all_platforms.sh --compiler compiler/build/apple_silicon_mac/silica-compiler
 ```
 
 This script never builds a compiler. Each machine must already have its own native compiler at `<repo>/binaries/silica-compiler`; a raw target is driven from this machine with the cross compiler this machine built for it.
@@ -317,6 +318,8 @@ This script never builds a compiler. Each machine must already have its own nati
 - `--sync` copies trials, stdlib and project makefiles to each remote machine first — never binaries or build products.
 - `--log-dir DIR` sets where logs and reports land (default: `silica_trial_runs/<timestamp>` beside the main checkout, also when run from a git worktree).
 - `--mac-jobs`, `--pi-jobs` and `--nix-jobs` set the parallelism for those machines.
+- `--compiler <path>` tests a compiler other than `binaries/silica-compiler` on this machine's own run. The script puts `SILICA_COMPILER=<absolute path>` on the `make integrate` command line (the trials ignore an environment variable). The file must exist, be executable, and be named exactly `silica-compiler`, because the trials read the emit target from the name; anything else is refused before the run starts. A Mac build is `compiler/build/apple_silicon_mac/silica-compiler`.
+- `--compiler <target>=<path>` sets one platform's compiler, and may be repeated. A board (`esp32`, `ESP32-S3_raw`, `STM32-L476RG_raw`) takes a local file and receives it as `BOARD_SILICA_COMPILER` (default `binaries/silica-compiler-<target>`); it needs `--board`. A remote machine takes a path on that machine, also named `silica-compiler`, passed as `SILICA_COMPILER` on its make command line. A target that is not part of the run, an unknown target, or a second compiler for the same target is an error. The plan and `--list` show the compiler per target, each log starts with a `compiler:` line, and the summary ends with a `Compilers used:` list. Without `--compiler` nothing changes.
 
 Remote machines run at the same time as each other. This machine runs its own trials and then the board, because each takes its own per-target lock (`trials/.integrate.lock.<target>`). The script prints one summary table at the end and exits 0 only when every platform passed.
 
