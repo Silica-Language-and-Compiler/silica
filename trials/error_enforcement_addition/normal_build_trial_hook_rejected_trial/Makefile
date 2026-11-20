@@ -4,7 +4,8 @@
 #   hook_call_rejected/        a call to supervision_ingress_enqueue is rejected: E2007 unknown function
 #   own_function_same_name/    a program's own function of that name is an ordinary function and runs
 # The two trials are separate directories so that the rejected unit cannot take the other with it.
-# Each child is run with SILICA_COMPILER set to the normal compiler.
+# Each child is run with SILICA_COMPILER set to the normal compiler. COMPILER is set to it as well:
+# error_enforcement_addition/Makefile passes COMPILER=<trial compiler>, which MAKEFLAGS would carry down.
 
 THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 include $(THIS_DIR)../../silica_compiler.mk
@@ -23,7 +24,7 @@ integrate-run:
 	[ "$$ko" -eq 0 ] && [ "$$failed" -eq 0 ]
 
 $(SUB_TRIALS:%=nb-sub-%): nb-sub-%:
-	@$(call INTEGRATE_CHILD,$*,SILICA_COMPILER="$(SILICA_NORMAL_COMPILER)")
+	@$(call INTEGRATE_CHILD,$*,SILICA_COMPILER="$(SILICA_NORMAL_COMPILER)" COMPILER="$(SILICA_NORMAL_COMPILER)")
 
 clean:
 	@for sub in $(SUB_TRIALS); do $(MAKE) -C "$(THIS_DIR)$$sub" clean SILICA_COMPILER="$(SILICA_NORMAL_COMPILER)" || true; done

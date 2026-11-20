@@ -152,6 +152,9 @@ export ev_type_described/1;
 export ev_type_has_node_root/1;
 export ev_type_boundary_root/1;
 export ev_site_descriptor_rodata/3;
+export md_fn_trait_marker/2;
+export md_site_type/2;
+export md_resolve_type/2;
 
 // ---- strings ----------------------------------------------------------------------------------
 
@@ -270,14 +273,59 @@ fn mc_is_sum(t: string) -> boolean {
     mc_top_sep(t, 0, 0, "|") < length_bytes(t)
 }
 
+// A function type spelled without the `fn` keyword: the type checker's environment and its type printer
+// spell a named function's type `(T1,T2) -> R` (type_checker_declarations_functions build_function_type,
+// type_interner_print kind 100), so a message, reply or state naming a function (a lifted function literal's
+// wrapper, `f impl ActorMessage {}`) carries that spelling. A parenthesised list at the start directly
+// followed by `->` (spaces stripped). Tested before the tuple and sum tests: `()->(int64,int64)` ends in `)`
+// and `()->:a|:b` has a `|` at depth zero, yet both are function values.
+fn mc_is_arrow_fn(t: string) -> boolean {
+    case mc_starts_with(t, "(") of {
+        false -> false;
+        true -> {
+            c: int64 <- mc_close_at(t, 1, 1);
+            case c + 3 <= length_bytes(t) of {
+                false -> false;
+                true -> substring(t, c + 1, c + 3) == "->"
+            }
+        }
+    }
+}
+
+// Index of the closing bracket that brings the nesting depth (over (), [], {}) back to zero, scanning from i
+// at `depth`, or the length when none does.
+fn mc_close_at(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> mc_close_at(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> case depth == 1 of {
+                        true -> i;
+                        false -> mc_close_at(s, i + 1, depth - 1)
+                    };
+                    false -> mc_close_at(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
 // 0 WORD, 1 REGION, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST, 8 STRING, 9 CLOSURE for a
 // (space-stripped) type; `bound` is true when an enclosing tuple type binds `rec` (a bare `rec`, or
 // `ref?(L, S, rec)`, is a WORD otherwise). A function type is tested before the sum test: its result
 // may be a sum (`fn(a, b) -> :less | :equal | :greater`) whose `|` sits at depth zero.
+// `fn_ptr` is the type_name the SIR generator gives a function NAME used as a value (terms
+// expr_to_sir_with_expected / expr_to_sir_in_let_body, kind 1 naming a function: a named function, a lifted
+// literal or its capture wrapper `<fn>.__lwN`), so a message, reply or state written as a bare function name,
+// or a tuple literal holding one (prims_actors message_term_type spells each element by its type_name), carries
+// it. It is a code address like every other function value: KIND 9, never the opaque KIND 10.
 fn mc_kind_of(t: string, bound: boolean) -> int64 {
     case length_bytes(t) == 0 of {
         true -> 0;
-        false -> case mc_starts_with(t, "fn(") of {
+        false -> case t == "fn_ptr" or mc_starts_with(t, "fn(") or mc_is_arrow_fn(t) of {
             true -> 9;
             false -> case mc_starts_with(t, "List[") of {
                 true -> 7;
@@ -1502,5 +1550,178 @@ fn mcp_fields_pointer_free(t: string, i: int64) -> boolean {
                 }
             }
         }
+    }
+}
+
+// ---- collection trait types resolved to their implementing layouts ---------------------------------
+//
+// A collection trait type (`PriorityQueue[int64, string, mem(normal)]`) names no layout, so its word would be
+// KIND 10 and the copier would refuse any value of it. The SIR module's trait_layouts (sir_generator_core
+// tl_layouts_for_functions) records, for each such spelling of the unit that one registered construction
+// module implements, that module's record with the trait's parameters put for its placeholders:
+// `SPELLING=LAYOUT` entries joined by `;`, spaces removed, `|` written `^`. Each function carries the
+// entries whose family it mentions in its binding string ("|_tl=", md_fn_trait_marker); an actor-boundary
+// site passes its type through md_site_type (the behaviour epilogue through md_resolve_type) before the
+// descriptor is built, so the word is described by the record's own entries. Whether a site gets a
+// descriptor (ev_type_boundary_root) and a call result's evacuation (ev_type_described) still read the
+// spelled type. A spelling with no entry stays KIND 10.
+
+fn md_fn_trait_marker(layouts: string, fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    case length_bytes(layouts) == 0 of {
+        true -> "";
+        false -> {
+            kept: string <- mtl_keep(layouts, 0, fn_val, "");
+            case length_bytes(kept) == 0 of {
+                true -> "";
+                false -> concat("|_tl=", kept)
+            }
+        }
+    }
+}
+
+fn mtl_keep(layouts: string, i: int64, fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, acc: string) -> string {
+    case i >= length_bytes(layouts) of {
+        true -> acc;
+        false -> {
+            e: int64 <- mtl_entry_end(layouts, i);
+            entry: string <- substring(layouts, i, e);
+            fam: string <- mtl_family(entry);
+            keep: boolean <- length_bytes(fam) > 0 and (contains(fn_val.return_type, fam) or contains(fn_val.param_types, fam) or mtl_nodes_mention(fn_val.body.nodes, fam));
+            nxt: string <- case keep of {
+                false -> acc;
+                true -> case length_bytes(acc) == 0 of {
+                    true -> entry;
+                    false -> concat(acc, concat(";", entry))
+                }
+            };
+            mtl_keep(layouts, e + 1, fn_val, nxt)
+        }
+    }
+}
+
+fn mtl_nodes_mention(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], fam: string) -> boolean {
+    case nodes.is_nil of {
+        true -> false;
+        false -> case contains(nodes.head.type_name, fam) of {
+            true -> true;
+            false -> mtl_nodes_mention(nodes.tail, fam)
+        }
+    }
+}
+
+fn mtl_entry_end(s: string, i: int64) -> int64 {
+    e: int64 <- mc_find_from(s, ";", i);
+    case e < 0 of {
+        true -> length_bytes(s);
+        false -> e
+    }
+}
+
+// The family name of an entry: its spelling up to the `[`.
+fn mtl_family(entry: string) -> string {
+    b: int64 <- mc_find_from(entry, "[", 0);
+    case b <= 0 of {
+        true -> "";
+        false -> substring(entry, 0, b)
+    }
+}
+
+// `t` with every trait spelling this function's "|_tl=" entries describe replaced by its layout.
+fn md_site_type(t: string, outer_reg: string) -> string {
+    case contains(outer_reg, "|_tl=") of {
+        false -> t;
+        true -> md_resolve_type(t, var@find_sp_binding(outer_reg, "_tl"))
+    }
+}
+
+// `t0` (spaces removed) with every spelling of the `enc` entries replaced by its layout; `t0` unchanged when
+// no entry's family occurs in it.
+fn md_resolve_type(t0: string, enc: string) -> string {
+    case length_bytes(enc) == 0 of {
+        true -> t0;
+        false -> {
+            t: string <- prims_record@strip_spaces_rt(t0);
+            case mtl_mentions_any(t, enc, 0) of {
+                false -> t0;
+                true -> mtl_subst(t, enc, 0, 0, "")
+            }
+        }
+    }
+}
+
+fn mtl_mentions_any(t: string, enc: string, i: int64) -> boolean {
+    case i >= length_bytes(enc) of {
+        true -> false;
+        false -> {
+            e: int64 <- mtl_entry_end(enc, i);
+            fam: string <- mtl_family(substring(enc, i, e));
+            case length_bytes(fam) > 0 and contains(t, fam) of {
+                true -> true;
+                false -> mtl_mentions_any(t, enc, e + 1)
+            }
+        }
+    }
+}
+
+fn mtl_ident_char(c: string) -> boolean {
+    length_bytes(c) == 1 and contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", c)
+}
+
+fn mtl_ident_start(t: string, j: int64) -> int64 {
+    case j > 0 and mtl_ident_char(substring(t, j - 1, j)) of {
+        true -> mtl_ident_start(t, j - 1);
+        false -> j
+    }
+}
+
+// Left to right over the `[` of `t`: a bracket type with an entry is replaced (an enclosing spelling is met
+// before the ones inside it), any other is kept and the scan goes on inside it.
+fn mtl_subst(t: string, enc: string, i: int64, start: int64, acc: string) -> string {
+    j: int64 <- mc_find_from(t, "[", i);
+    case j < 0 of {
+        true -> concat(acc, substring(t, start, length_bytes(t)));
+        false -> {
+            k: int64 <- mtl_ident_start(t, j);
+            c: int64 <- mc_close_at(t, j + 1, 1);
+            layout: string <- case k < j and k >= start and c < length_bytes(t) of {
+                true -> mtl_lookup(enc, mtl_swap(substring(t, k, c + 1), "|", "^"), 0);
+                false -> ""
+            };
+            case length_bytes(layout) == 0 of {
+                true -> mtl_subst(t, enc, j + 1, start, acc);
+                false -> mtl_subst(t, enc, c + 1, c + 1, concat(acc, concat(substring(t, start, k), mtl_swap(layout, "^", "|"))))
+            }
+        }
+    }
+}
+
+// The (escaped) layout of the entry whose (escaped) spelling is `key`, or "".
+fn mtl_lookup(enc: string, key: string, i: int64) -> string {
+    case i >= length_bytes(enc) of {
+        true -> "";
+        false -> {
+            e: int64 <- mtl_entry_end(enc, i);
+            n: int64 <- length_bytes(key);
+            case i + n < e and substring(enc, i, i + n) == key and substring(enc, i + n, i + n + 1) == "=" of {
+                true -> substring(enc, i + n + 1, e);
+                false -> mtl_lookup(enc, key, e + 1)
+            }
+        }
+    }
+}
+
+// Every one-character `from` in `s` written `to`.
+fn mtl_swap(s: string, old_c: string, new_c: string) -> string {
+    case contains(s, old_c) of {
+        false -> s;
+        true -> mtl_swap_from(s, old_c, new_c, 0, "")
+    }
+}
+
+fn mtl_swap_from(s: string, old_c: string, new_c: string, i: int64, acc: string) -> string {
+    j: int64 <- mc_find_from(s, old_c, i);
+    case j < 0 of {
+        true -> concat(acc, substring(s, i, length_bytes(s)));
+        false -> mtl_swap_from(s, old_c, new_c, j + 1, concat(acc, concat(substring(s, i, j), new_c)))
     }
 }
