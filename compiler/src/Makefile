@@ -39,6 +39,8 @@ SILICA_LINK_SH := $(abspath $(THIS_DIR)../../trials/silica_link.sh)
 # assembly's per-unit compiler log is rewritten by this filter (terminal bar, or one
 # line per stage under CI). SILICA_PROGRESS=off on the make command line keeps the raw log.
 COMPILE_PROGRESS := $(abspath $(THIS_DIR)../tools/compile_progress.sh)
+# Stage 1 staleness by content hash with early cutoff (see the Stage 1 comment below).
+UNIT_CACHE := $(abspath $(THIS_DIR)../tools/unit_cache.sh)
 # RAM profile of the assembly batch: one benchmarking/memory_use_reports/data/<UTC>_<compiler>.tsv per build.
 # SILICA_RAM_PROFILE=0 disables it. The wrapper never changes the compiler's args, output or exit code.
 RAM_PROFILE := $(abspath $(THIS_DIR)../../programmer_tools/ram_profile_unit.sh)
@@ -305,23 +307,37 @@ silica.config.regen:
 # new bar line per stage when CI is set or stdout is not a terminal. The reclaim echo is
 # not printed: the bar already moves. Exit 76 still prints a line of its own.
 #
-# Incremental: keep .sams / .iface whose mtime is not older than their .silica source AND not
-# older than the seed that produced them. If either artifact is missing or outdated, remove both
-# and recompile that unit. Orphan .sams/.iface (no matching .silica) are removed.
-# silica.compile.order lists only units that still need a .sams after this prune.
+# Incremental, by content (compiler/tools/unit_cache.sh). A unit's .sams / .iface are kept while
+# three things match what the build directory's .unit_cache.manifest recorded when they were made:
+#   - the host compiler (the sha256 of the binary $(SILICA_COMPILER) names) and TARGET;
+#   - the sha256 of the unit's source;
+#   - the interface of every unit it uses, directly or transitively (each one's .iface without its
+#     source_hash= / deps_hash= lines; a trait-bearing unit counts by its whole source).
+# mtimes play no part, so a fresh checkout or a CI cache restore keeps every unit whose inputs are
+# unchanged, and a unit whose exported interface changes rebuilds what uses it (the old mtime rule
+# never looked past a unit's own source, which left dependents built against an old signature).
+# A body-only edit rebuilds that unit alone (early cutoff).
 #
-# The seed is a staleness input because it decides layout, not just instruction selection: a seed
-# fix that moves a record field affects every unit it compiles, so keeping .sams built by an older
-# seed links writers using the old offsets against readers using the new ones. That is a silent
-# wrong-answer build, and it is exactly what a record-field-offset fix produced here -- the emitter
-# modules were recompiled and the rest were not. Comparing against $(SILICA_COMPILER) follows the
-# seed-compiler symlink to the binary it currently names, so publishing a new seed invalidates the
-# tree on the next build without anyone having to remember to clean.
+# Whether an interface changed is known only once its unit has compiled, so Stage 1 runs in
+# rounds: `unit_cache.sh plan` deletes the artifacts of the units that must compile now and lists
+# them (a unit that uses one of them waits for the next round); the batch compiles that list
+# through silica.compile.order; `unit_cache.sh record` writes their manifest entries; then plan
+# again until nothing is left. A body-only change is one round; each further round is one layer of
+# changed interfaces. A build directory made before the manifest existed is adopted once with the
+# old mtime rule. Orphan .sams/.iface (no matching .silica) are removed.
+#
+# The host compiler is a staleness input because it decides layout, not just instruction
+# selection: a compiler fix that moves a record field affects every unit it compiles, so keeping
+# .sams built by an older compiler links writers using the old offsets against readers using the
+# new ones. That is a silent wrong-answer build, and it is exactly what a record-field-offset fix
+# produced here -- the emitter modules were recompiled and the rest were not. Hashing the binary
+# $(SILICA_COMPILER) names (following the seed-compiler symlink) means publishing a new seed
+# invalidates the tree on the next build without anyone having to remember to clean.
 #
 # The seed runs with the target's BUILD_DIR as its working directory (see the header): `stage`
 # first makes BUILD_DIR hold one symlink per unit of silica.config (and drops links for units that
 # left it), so the relative paths in silica.config resolve there and every output lands there.
-# `-nt` and `[ -f ]` follow the links, so staleness is judged against the real source's mtime.
+# Hashing follows the links, so staleness is judged against the real source's content.
 .PHONY: stage
 stage: $(CONFIG_FILE)
 	@cd "$(BUILD_DIR)" && \
@@ -340,7 +356,6 @@ stage: $(CONFIG_FILE)
 
 assembly: check-seed silica.config stage record-compile-start
 	@cd "$(BUILD_DIR)" && \
-	  SEED_BIN="$(SILICA_COMPILER)"; \
 	  removed=0; \
 	  for art in $$(find . \( -name '*.sams' -o -name '*.iface' \) ! -path './_wd_probe/*' -type f | sed 's|^\./||' | sort); do \
 	    case "$$art" in \
@@ -357,68 +372,52 @@ assembly: check-seed silica.config stage record-compile-start
 	      removed=$$((removed + 1)); \
 	    fi; \
 	  done; \
-	  while IFS= read -r unit || [ -n "$$unit" ]; do \
-	    [ -z "$$unit" ] && continue; \
-	    case "$$unit" in \#*) continue ;; esac; \
-	    [ -f "$$unit" ] || continue; \
-	    base=$${unit%.silica}; \
-	    sams="$$base.sams"; \
-	    iface="$$base.iface"; \
-	    stale=0; \
-	    reason="$$unit"; \
-	    if [ ! -f "$$sams" ] || [ "$$unit" -nt "$$sams" ]; then stale=1; fi; \
-	    if [ ! -f "$$iface" ] || [ "$$unit" -nt "$$iface" ]; then stale=1; fi; \
-	    if [ "$$SEED_BIN" -nt "$$sams" ] || [ "$$SEED_BIN" -nt "$$iface" ]; then stale=1; reason="$$SEED_BIN"; fi; \
-	    if [ "$$stale" -eq 1 ]; then \
-	      if [ -f "$$sams" ] || [ -f "$$iface" ]; then \
-	        echo "  stale: $$base.{sams,iface} (vs $$reason)"; \
-	      fi; \
-	      rm -f "$$sams" "$$iface"; \
-	      removed=$$((removed + 1)); \
-	    fi; \
-	  done < silica.config; \
-	  echo "Invalidated $$removed unit artifact set(s)"; \
-	  rm -f __silica_runtime.sams silica.link silica.needs_runtime silica.compile.inprogress silica.compile.crashed; \
-	  : > silica.compile.order; \
-	  while IFS= read -r unit || [ -n "$$unit" ]; do \
-	    [ -z "$$unit" ] && continue; \
-	    case "$$unit" in \#*) continue ;; esac; \
-	    base=$${unit%.silica}; \
-	    if [ ! -f "$$base.sams" ]; then \
-	      echo "$$unit" >> silica.compile.order; \
-	    fi; \
-	  done < silica.config; \
-	  need=$$(wc -l < silica.compile.order | tr -d ' '); \
-	  if [ "$$need" -eq 0 ]; then \
-	    rm -f silica.compile.order; \
-	    echo "All units up to date (.sams/.iface newer than both .silica and the seed); skipping seed"; \
-	    echo "✅ Assembly generated (.sams)"; \
-	    $(call MAYBE_REPORT_COMPILE_TIME_SUCCESS,assembly); \
-	    exit 0; \
-	  fi; \
-	  echo "Compiling with seed host: $(SILICA_COMPILER) ($$need unit(s) to compile)"; \
-	  echo "Emit target: $(TARGET) (see silica.target)"; \
-	  export SILICA_PROGRESS_TOTAL="$$need"; \
-	  export SILICA_RAM_PROFILE_FILE="$$("$(RAM_PROFILE)" --init "$(SILICA_COMPILER)" "$$need" "$(JOBS)" "$(RAM_MAKE_CMD)")"; \
-	  ecfile=$$(mktemp); \
+	  if [ "$$removed" -gt 0 ]; then echo "Removed $$removed orphan artifact(s)"; fi; \
+	  rm -f __silica_runtime.sams silica.link silica.needs_runtime; \
+	  round=0; \
 	  while true; do \
-	    { "$(RAM_PROFILE)" "$(SILICA_COMPILER)"; echo $$? > "$$ecfile"; } 2>&1 | "$(COMPILE_PROGRESS)"; \
-	    ec=$$(cat "$$ecfile"); \
-	    if [ "$$ec" -eq 0 ]; then break; fi; \
-	    if [ "$$ec" -eq 75 ]; then \
-	      continue; \
+	    if ! "$(UNIT_CACHE)" plan "$(THIS_DIR)" "$(abspath $(SILICA_COMPILER))" "$(TARGET)"; then \
+	      echo "FAIL: compiler/tools/unit_cache.sh plan"; $(REPORT_COMPILE_TIME); exit 1; \
 	    fi; \
-	    if [ "$$ec" -eq 76 ]; then \
-	      printf '\n  (the compiler crashed in a unit; continuing with the rest of the batch)\n'; \
-	      continue; \
+	    need=$$(wc -l < .unit_cache.dirty | tr -d ' '); \
+	    if [ "$$need" -eq 0 ]; then break; fi; \
+	    round=$$((round + 1)); \
+	    cp .unit_cache.dirty silica.compile.order; \
+	    cp .unit_cache.dirty .unit_cache.batch; \
+	    rm -f silica.compile.inprogress silica.compile.crashed; \
+	    echo "Compiling with seed host: $(SILICA_COMPILER) ($$need unit(s) to compile, round $$round)"; \
+	    echo "Emit target: $(TARGET) (see silica.target)"; \
+	    export SILICA_PROGRESS_TOTAL="$$need"; \
+	    if [ "$$round" -eq 1 ]; then \
+	      export SILICA_RAM_PROFILE_FILE="$$("$(RAM_PROFILE)" --init "$(SILICA_COMPILER)" "$$need" "$(JOBS)" "$(RAM_MAKE_CMD)")"; \
 	    fi; \
-	    printf '\n'; \
-	    echo "FAIL: compilation stopped (exit $$ec). The compiler diagnostic is above."; \
+	    ecfile=$$(mktemp); \
+	    while true; do \
+	      { "$(RAM_PROFILE)" "$(SILICA_COMPILER)"; echo $$? > "$$ecfile"; } 2>&1 | "$(COMPILE_PROGRESS)"; \
+	      ec=$$(cat "$$ecfile"); \
+	      if [ "$$ec" -eq 0 ]; then break; fi; \
+	      if [ "$$ec" -eq 75 ]; then \
+	        continue; \
+	      fi; \
+	      if [ "$$ec" -eq 76 ]; then \
+	        printf '\n  (the compiler crashed in a unit; continuing with the rest of the batch)\n'; \
+	        continue; \
+	      fi; \
+	      printf '\n'; \
+	      echo "FAIL: compilation stopped (exit $$ec). The compiler diagnostic is above."; \
+	      rm -f "$$ecfile"; \
+	      $(REPORT_COMPILE_TIME); \
+	      exit 1; \
+	    done; \
 	    rm -f "$$ecfile"; \
-	    $(REPORT_COMPILE_TIME); \
-	    exit 1; \
+	    if ! "$(UNIT_CACHE)" record "$(THIS_DIR)" "$(abspath $(SILICA_COMPILER))" "$(TARGET)" .unit_cache.batch; then \
+	      echo "FAIL: compiler/tools/unit_cache.sh record"; $(REPORT_COMPILE_TIME); exit 1; \
+	    fi; \
 	  done; \
-	  rm -f "$$ecfile"; \
+	  rm -f silica.compile.order .unit_cache.batch; \
+	  if [ "$$round" -eq 0 ]; then \
+	    echo "All units up to date (sources, used interfaces and host compiler unchanged); skipping seed"; \
+	  fi; \
 	  echo "✅ Assembly generated (.sams)"; \
 	  $(call MAYBE_REPORT_COMPILE_TIME_SUCCESS,assembly)
 
