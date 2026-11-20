@@ -112,13 +112,44 @@
 // delivered as :rx only while the owner has granted :credit.
 //
 // A listener answers (:link_up, "port:<n>") once bound and never carries bytes itself. For every
-// peer it accepts it spawns one connection carrier holding the accepted descriptor and tells its
-// owner (:accepted, conn: dangerous_actor_ref, "peer:<ipv4>:<port>"), or "peer:[<ipv6>]:<port>" for an IPv6 peer,
-// the address in its canonical text (getpeername; "peer:accepted" if the peer's address cannot be read). That connection carrier waits
-// for its own (:open, owner, _) (the address is ignored: the peer is already connected); whoever
-// sends it becomes the connection's owner and receives its :link_up, its credits, its :rx and its
-// :link_down, exactly as the owner of a connecting carrier does. The listener keeps listening until
-// it is sent :close, which closes the listening socket only; the connections it spawned live on.
+// peer it accepts it tells its owner (:accepted, fd: int64, "peer:<ipv4>:<port>"), or "peer:[<ipv6>]:<port>" for an
+// IPv6 peer, the address in its canonical text (getpeername; "peer:accepted" if the peer's address cannot be read).
+// fd is the accepted connection's descriptor. The listener starts no actor for it (until 2026-11-20 it spawned the
+// connection carrier itself, an unsupervised root actor no program could put under a supervisor afterwards): the
+// owner starts the connection carrier, so the owner decides where each connection sits in its supervision tree.
+//
+// The connection carrier of an accepted descriptor is this module's carrier/2 started from the state
+//
+//   { owner: actor_ref_of_word(0), fd: <fd>, rx_credit: 0, up: false, listening: false, link_spec: "" }
+//
+// which is initial() with the descriptor in place of -1 (a program writes the literal: a dangerous_* function
+// cannot be called outside an external_danger block). link_spec is "" whatever the listener's link: an accepted
+// connection binds and dials nothing, so it reads no link (the listener's link was applied when it bound). The
+// owner starts it in one of two ways:
+//
+//   supervised, as a child of a supervisor of its own (the reply's `child` is the carrier's actor_ref):
+//     call_supervisor(sup, { op: :add_child, child: { id: <an id no live actor holds>, agent_type: :worker,
+//         initial_state: <the state above>, behavior: dangerous_tcp_carrier@carrier, restart: :temporary,
+//         shutdown: 0, flavor: :dangerous, state_policy: state_policy(:keep_state_area) } } impl SupervisorMessage {})
+//   unsupervised, as the listener did (a root actor: its end is reported as "root actor exited"):
+//     spawn_dangerous(<the state above>, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message),
+//         state_policy(:keep_state_area))
+//
+// The restart policy of a supervised connection is :temporary. The descriptor in the initial state is good for one
+// carrier only: the carrier closes it when the link ends, and the system may give the same number to a later
+// connection, so a carrier restarted from that state (:permanent, or :transient after a lost link, or
+// :restart_child) would hold a descriptor that is closed or is another connection's. A :temporary child is never
+// restarted, and when it ends its row leaves the supervisor's table and its id is free again. A child's id is a
+// name no other live actor may hold (specification section 20.3.1), so connections that are up at the same time
+// need different ids (one atom per connection slot).
+//
+// The started connection carrier waits for its own (:open, owner, _) (the address is ignored: the peer is already
+// connected); whoever sends it becomes the connection's owner and receives its :link_up, its credits, its :rx and
+// its :link_down, exactly as the owner of a connecting carrier does. A connection the owner does not want is
+// started and sent :close instead of :open: that closes the descriptor and ends the carrier normally. An accepted
+// descriptor for which no carrier is ever started stays open until the process ends (nothing else can close it).
+// The listener keeps listening until it is sent :close, which closes the listening socket only; the connections
+// it accepted live on.
 //
 // A carrier polls its descriptor between mailbox messages with a 20 ms timeout. A connect waits for at most
 // the timeout its address states, and a write for at most 1000 ms for each piece the socket accepts.
@@ -585,7 +616,8 @@ fn none_res() -> { tag: int64, value: int64, error_code: int64 } {
 //
 // The state tells the three roles apart: `listening` is a listener; `up` is a connection carrying
 // bytes; a descriptor with neither (fd >= 0, not up, not listening) is a connection a listener
-// accepted that is waiting for its (:open, owner, _).
+// accepted, started by the listener's owner from the descriptor of its :accepted (header), that is
+// waiting for its (:open, owner, _).
 fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }) {
     sequence proc[external_danger, concurrency, transport]
         kind: atom <- msg_kind(msg);
@@ -828,17 +860,11 @@ fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit
             true -> dangerous_sockets@close_fd(state.fd);
             false -> none_res()
         };
-        // An accepted peer gets a connection carrier of its own, holding the accepted descriptor;
-        // the owner learns of it and chooses who opens it.
+        // An accepted peer: the owner is given the accepted descriptor and starts the connection carrier
+        // itself (header), under a supervisor of its choice, and chooses who opens it. The listener starts
+        // no actor.
         _: boolean <- case accepted of {
-            true -> {
-                sequence proc[concurrency]
-                    conn: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: acc_fd, rx_credit: 0, up: false, listening: false, link_spec: state.link_spec }, carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-                    told: boolean <- cast(owner, (:accepted, conn, peer_text) impl ActorMessage {})
-                produces
-                    pure told
-                end
-            };
+            true -> cast(owner, (:accepted, acc_fd, peer_text) impl ActorMessage {});
             false -> true
         };
         // :link_up once when connected, once when a listener is bound ("port:<n>", the port the
