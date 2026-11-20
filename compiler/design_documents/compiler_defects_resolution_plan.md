@@ -4,6 +4,8 @@
 
 Executed. Phase 0 (validation trials) is done: the `train_defect_*` trials are installed in the real suites. Phases 1 (A1, A4, A7, A8), 2 (A5), 4 (A3, A9, A10), 5 (A6) and 6 (B1-B14) are done and each item is pinned by an installed trial whose behaviour or error golden matches the last run. Phase 3 is done only as 3a: the diagnostic E1067 (a function literal that captures local bindings cannot be returned from the function that owns them) is in place; 3b (closure environments, a two-word fn value) is NOT implemented and still needs the design decision. The message-text cleanups at the end of Phase 6 were not re-checked and are still open. Per-item table: [HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md](./HIGH_PRIORITY_compiler_defects_and_diagnostic_gaps_2026-09-08.md); what was found while executing: [compiler_defects_execution_status_2026-09-10.md](./compiler_defects_execution_status_2026-09-10.md). The plan below is kept as written; its tree names are historical (`src_selfhost` is now `compiler/src`, the Rust-free tree; there is no separate seed source tree).
 
+**Status 2026-11-18: partly done.** Of the four misleading-diagnostic wordings, an unterminated string literal is now its own lexer error E0003 (`lexer/lexer_string_literals.silica`, trials `error_enforcement_addition/lexer_e0003_*`) and the E1040 message now reads "expected ';' after this statement before the next statement" (`parser/constraint_extract_validate.silica:396`). The `E2003` "type mismatch: <name>" wording is unchanged (`type_checker_expressions_identifiers.silica:1051`); the E2002/E2005 field-access wording was not re-checked. A2 closure environments are still not implemented (E1067 and E1072 remain the diagnostics).
+
 Scope: the 8 silent miscompilations (A1-A8), the 14 diagnostic gaps (B1-B14), the four misleading
 diagnostics, plus two related defects recorded in memory since the document was written
 (record message + List state in behaviours; a `call` whose message is a call expression).
@@ -190,6 +192,7 @@ Type checker
   print expected and actual types; unterminated string as E1010-class lexer error instead of
   E1060; E1040 to name the two statements. Do these last: message text changes move
   existing .golden_fail files, so each is a deliberate golden regeneration.
+  Status 2026-11-18: the E2002 field-access head case is done (PR #74, `fa4636a360`; trials `field_access_undefined_head` and `field_access_undefined_head_one_level`); the E2010 binding-position part is open.
 
 Effect checker
 - B3: the outside-walker does descend into case branches (kind 13), so trace the repro to

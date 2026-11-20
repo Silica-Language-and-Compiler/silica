@@ -33,12 +33,22 @@ SUB_TRIALS      := ffi_addition module_duplicate_name_trial module_nonexported_c
 	$(if $(filter apple_silicon_mac,$(SILICA_EMIT_TARGET)),,$(DEVICE_APP_TRIALS)) \
 	e2236_supervisor_without_reporter_trial e2236_supervisor_before_registration_trial e2236_helper_starts_supervisor_trial e2236_lib_start_without_reporter_trial e2236_lib_start_through_local_call_trial \
 	cast_check_supervisor_child_trial cast_check_cross_module_trial cast_check_cross_module_param_trial \
-	link_interface_listen_any_trial link_loopback_listen_any_trial link_loopback_listen_ip_trial link_udp_loopback_any_trial link_udp_loopback_ip_trial link_udp_interface_any_trial link_hosted_sd_blocks_e2412_trial link_hosted_flash_region_e2412_trial \
+	link_interface_listen_any_trial link_loopback_listen_any_trial link_loopback_listen_ip_trial link_udp_loopback_any_trial link_udp_loopback_ip_trial link_udp_interface_any_trial link_hosted_sd_blocks_e2412_trial link_hosted_flash_region_e2412_trial link_loopback_listen_ipv6_any_trial link_interface_listen_ipv6_any_trial link_loopback_listen_ipv6_global_trial sub_supervisor_dangerous_row_plain_id_trial sub_supervisor_dangerous_row_reply_behavior_trial \
 	$(if $(filter apple_silicon_mac linux_aarch64 linux_x86_64,$(SILICA_EMIT_TARGET)),normal_build_trial_hook_rejected_trial)
 
 # Single-file trial sources: every *.silica directly in this directory. $(wildcard)
 # rather than $(shell find): the tree holds ~20k files and this file is parsed several times.
 SILICA_FILES := $(sort $(notdir $(wildcard $(THIS_DIR)*.silica)))
+# CI shard. TRIAL_SUITE_SLICE=error_enforcement_addition:<mod>:<res> keeps the
+# sources whose sorted index modulo <mod> is <res>, and the same slice of
+# SUB_TRIALS. The board driver applies the same variable to its own file list.
+SLICE_SPEC := $(strip $(TRIAL_SUITE_SLICE))
+ifneq ($(filter $(TRIAL_DIR):%,$(SLICE_SPEC)),)
+SLICE_MOD := $(word 2,$(subst :, ,$(SLICE_SPEC)))
+SLICE_RES := $(word 3,$(subst :, ,$(SLICE_SPEC)))
+SILICA_FILES := $(shell find "$(THIS_DIR)" -maxdepth 1 -name '*.silica' \( -type f -o -type l \) -print | sed 's|.*/||' | LC_ALL=C sort | awk -v m='$(SLICE_MOD)' -v r='$(SLICE_RES)' '(NR-1) % m == r')
+SUB_TRIALS := $(shell printf '%s\n' $(SUB_TRIALS) | LC_ALL=C sort | awk -v m='$(SLICE_MOD)' -v r='$(SLICE_RES)' 'NF && (NR-1) % m == r')
+endif
 CUR_FAILS := $(SILICA_FILES:.silica=.cur_fail)
 SUB_TARGETS := $(SUB_TRIALS:%=ee-sub-%)
 

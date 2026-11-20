@@ -97,6 +97,7 @@ export user_call_expects_single_tuple_param/2;
 export user_call_first_arg_expected_type/3;
 export tuple_first_element_type/1;
 export tuple_rest_element_type/1;
+export tuple_rest_formals/1;
 export extend_context_for_bind/3;
 export sir_case_extend_context_for_pattern/3;
 
@@ -1103,7 +1104,13 @@ fn expected_or_inferred_call_arg_type(context: { env: List[{ name: string, type_
     // so `tagged_value((:ok, 2.5), 9.0)` against `(atom, float64)` built a boxed float32 slot the
     // callee read as a float64 word (float64_addition/float_literal_in_tuple_argument). Placeholder
     // and nested formals keep the inferred type as before.
-    tuple_literal_takes_formal: boolean <- type_checker_expressions_helpers@expr_kind(expr) == 9 and formal_is_all_scalar_tuple_type(formal_type);
+    // It also takes any concrete tuple formal whose arity the inference got wrong: a tuple literal is
+    // the right-nested chain (a, (b, c)) of parser_ast, so `(:outer, (:pair, s))` -- a pair whose second
+    // element is a pair -- infers as the triple (atom, atom, string). Lowered with that type the caller
+    // built three flat words while the callee, typed (atom, (atom, string)), read word 1 as the pointer
+    // to the inner pair and faulted on the :pair atom
+    // (trials/compile_defects_nested_call_in_tuple_arg_addition/call_nested_two_deep).
+    tuple_literal_takes_formal: boolean <- type_checker_expressions_helpers@expr_kind(expr) == 9 and (formal_is_all_scalar_tuple_type(formal_type) or tuple_formal_fixes_arity(formal_type, inferred));
     // A record literal argument (kind 21) likewise takes an all-scalar record formal: `{ x: 3.5 }`
     // against `{ x: float64 }` must build a float64 field, not the float32 default.
     // The formal must also have the literal's field count (the type checker matched the two).
@@ -1169,6 +1176,92 @@ fn formal_is_all_scalar_record_type(t: string) -> boolean {
             length_bytes(type_checker_record_types@strip_spaces_rt(body)) > 0 and formal_record_fields_all_scalar(body)
         };
         false -> false
+    }
+}
+
+// A tuple formal (not a sum) with no type parameter or lifetime name in it (no identifier starting
+// with an upper-case letter) whose top-level arity differs from the inferred tuple's: the inference
+// flattened a nested tuple literal in last position, and the formal, which the type checker matched
+// the literal against, has the true shape.
+fn tuple_formal_fixes_arity(formal: string, inferred: string) -> boolean {
+    is_tuple: boolean <- length_bytes(formal) >= 2 and substring(formal, 0, 1) == "(" and substring(formal, length_bytes(formal) - 1, length_bytes(formal)) == ")";
+    inferred_tuple: boolean <- length_bytes(inferred) >= 2 and substring(inferred, 0, 1) == "(";
+    case is_tuple and inferred_tuple and formal_is_one_tuple(formal) and type_text_has_upper_name(formal, 0, true) == false of {
+        true -> tuple_top_level_arity(formal) != tuple_top_level_arity(inferred);
+        false -> false
+    }
+}
+
+// `(a, b)` and not `(a, b) | (c, d)`: the opening parenthesis closes at the end of the text.
+fn formal_is_one_tuple(t: string) -> boolean {
+    paren_close_index(t, 1, 1) == length_bytes(t) - 1
+}
+
+fn paren_close_index(t: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(t) of {
+        true -> -1;
+        false -> {
+            c: string <- substring(t, i, i + 1);
+            d: int64 <- case c == "(" or c == "[" or c == "{" of {
+                true -> depth + 1;
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> depth - 1;
+                    false -> depth
+                }
+            };
+            case d == 0 of {
+                true -> i;
+                false -> paren_close_index(t, i + 1, d)
+            }
+        }
+    }
+}
+
+fn tuple_top_level_arity(t: string) -> int64 {
+    count_top_level_commas_sir(tuple_inner_str(t), 0, 0) + 1
+}
+
+fn count_top_level_commas_sir(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> 0;
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> count_top_level_commas_sir(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> count_top_level_commas_sir(s, i + 1, depth - 1);
+                    false -> case c == "," and depth == 0 of {
+                        true -> 1 + count_top_level_commas_sir(s, i + 1, depth);
+                        false -> count_top_level_commas_sir(s, i + 1, depth)
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Whether an identifier starting with an upper-case letter (a type parameter, a lifetime such as the L
+// of ref?(L, normal, rec)) occurs in a type text. at_start is true where an identifier may begin.
+fn type_text_has_upper_name(t: string, i: int64, at_start: boolean) -> boolean {
+    case i >= length_bytes(t) of {
+        true -> false;
+        false -> {
+            c: string <- substring(t, i, i + 1);
+            upper: boolean <- contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c);
+            ident_char: boolean <- upper or contains("abcdefghijklmnopqrstuvwxyz0123456789_", c);
+            case at_start and upper and c != "L" of {
+                true -> true;
+                false -> case at_start and upper of {
+                    // List[...] is the one upper-case built-in type name; any other L... name is a lifetime
+                    // or a parameter.
+                    true -> case i + 5 <= length_bytes(t) and substring(t, i, i + 5) == "List[" of {
+                        true -> type_text_has_upper_name(t, i + 5, true);
+                        false -> true
+                    };
+                    false -> type_text_has_upper_name(t, i + 1, ident_char == false)
+                }
+            }
+        }
     }
 }
 
@@ -1371,6 +1464,20 @@ fn tuple_first_element_type(tuple_type: string) -> string {
     elements: string <- tuple_inner_str(tuple_type);
     (first: string, _: string) <- tuple_split_first(elements);
     tuple_trim_ws(first)
+}
+
+// The formals after the first of a parameter tuple, always as a tuple: "(b, c)" for "(a, b, c)",
+// "(b)" for "(a, b)" -- unlike tuple_rest_element_type, which answers a single remaining element bare,
+// so a remaining formal that is itself a tuple cannot be told from two remaining formals. "" when
+// nothing remains. The rest-chain call lowering (terms_user_call_lowering) walks this form.
+fn tuple_rest_formals(tuple_type: string) -> string {
+    elements: string <- tuple_inner_str(tuple_type);
+    (_: string, rest: string) <- tuple_split_first(elements);
+    trimmed: string <- tuple_trim_ws(rest);
+    case length_bytes(trimmed) == 0 of {
+        true -> "";
+        false -> concat("(", concat(trimmed, ")"))
+    }
 }
 
 fn tuple_rest_element_type(tuple_type: string) -> string {

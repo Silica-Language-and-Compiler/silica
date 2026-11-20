@@ -25,6 +25,7 @@ use reg_conventions;
 use x86_mem;
 
 export term_subterm_has_user_call/1;
+export term_subterm_may_clobber_arg_regs/1;
 export call_arg2_tree_for_gpr_reorder_scan/1;
 export simple_gpr_call_arg_can_stage/2;
 export simple_gpr_rest_can_stage/2;
@@ -69,6 +70,140 @@ fn term_subterm_has_user_call(t: { nodes: List[{ kind: int64, type_name: string,
                 false -> term_subterm_has_user_call(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
             };
             _: int64 -> false
+        }
+    }
+}
+
+// Whether emitting this subterm can overwrite an argument register (X0-X7, D0-D7) that already holds
+// an earlier argument of the call being emitted (trials/compile_defects_nested_call_in_tuple_arg_addition).
+// term_subterm_has_user_call answers only for user calls (kind 4/5) and list_cons, so a prim that
+// calls a helper through the argument registers went unseen: `show(n, (:tag, concat("a", "b")))`
+// left n in X0, then string_concat loaded "a" into X0 for L_concat_helper and show printed the
+// string's address. A call or such a prim anywhere in the subterm counts, at any depth, through
+// tuple and record literals, lets and case arms. A prim counts unless it is known to work in the
+// scratch registers only (prim_keeps_arg_regs); an unknown prim is assumed to clobber, so the
+// guard (a save and restore of the staged arguments) is the default.
+fn term_subterm_may_clobber_arg_regs(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case t.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(t);
+            case n.kind of {
+                0 -> false;
+                1 -> false;
+                4 -> true;
+                5 -> true;
+                6 -> case prim_keeps_arg_regs(t) of {
+                    false -> true;
+                    true -> children_may_clobber_arg_regs(t)
+                };
+                _: int64 -> children_may_clobber_arg_regs(t)
+            }
+        }
+    }
+}
+
+fn children_may_clobber_arg_regs(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term_subterm_may_clobber_arg_regs(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)) of {
+        true -> true;
+        false -> term_subterm_may_clobber_arg_regs(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
+    }
+}
+
+// The prims whose emission stays in the scratch registers (X9-X12, X16) and the stack: integer and
+// boolean arithmetic, bit operations, scalar compares, projections, the flat tuple literal and a
+// record literal with no aggregate literal inside it (a nested one is heap-promoted through
+// _silica_rt_region_alloc). A compare of strings or aggregates calls L_string_cmp_helper, which
+// changes X1 and X2, so only a compare of scalar operands is kept.
+fn prim_keeps_arg_regs(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(t);
+    case n.name of {
+        "add" -> true;
+        "sub" -> true;
+        "mul" -> true;
+        "div" -> true;
+        "rem" -> true;
+        "and" -> true;
+        "or" -> true;
+        "band" -> true;
+        "bor" -> true;
+        "shl" -> true;
+        "shr" -> true;
+        "bnot" -> true;
+        "neg" -> true;
+        "is_nan" -> true;
+        "is_inf" -> true;
+        "is_finite" -> true;
+        "move" -> true;
+        "tuple_make" -> true;
+        "tuple_proj" -> true;
+        "record_proj" -> true;
+        "record_make" -> record_fields_have_aggregate_make(t) == false;
+        "eq" -> compare_operand_is_scalar(t);
+        "nq" -> compare_operand_is_scalar(t);
+        "lt" -> compare_operand_is_scalar(t);
+        "gt" -> compare_operand_is_scalar(t);
+        "le" -> compare_operand_is_scalar(t);
+        "ge" -> compare_operand_is_scalar(t);
+        _: string -> false
+    }
+}
+
+fn compare_operand_is_scalar(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case term_sir_helpers@sir_term_root_node(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)).type_name of {
+        "int64" -> true;
+        "int32" -> true;
+        "int16" -> true;
+        "int8" -> true;
+        "uint64" -> true;
+        "uint32" -> true;
+        "uint16" -> true;
+        "uint8" -> true;
+        "float64" -> true;
+        "float32" -> true;
+        "float16" -> true;
+        "bool" -> true;
+        "boolean" -> true;
+        "atom" -> true;
+        "char" -> true;
+        _: string -> false
+    }
+}
+
+// A record literal is the chain record_make(f0, v0, record_make(f1, v1, ...)) (struct_terms): the
+// chain's own layers are not nested literals, a tuple or record literal inside a field value is.
+fn record_fields_have_aggregate_make(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case t.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(t);
+            case n.kind == 6 and n.name == "record_make" of {
+                true -> case subterm_has_aggregate_make(term_sir_helpers@sir_term_at(t, n.inner)) of {
+                    true -> true;
+                    false -> record_fields_have_aggregate_make(term_sir_helpers@sir_term_at(t, n.right_expr))
+                };
+                false -> false
+            }
+        }
+    }
+}
+
+fn children_have_aggregate_make(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case subterm_has_aggregate_make(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).inner)) of {
+        true -> true;
+        false -> subterm_has_aggregate_make(term_sir_helpers@sir_term_at(t, term_sir_helpers@sir_term_root_node(t).right_expr))
+    }
+}
+
+fn subterm_has_aggregate_make(t: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }) -> boolean {
+    case t.root < 0 of {
+        true -> false;
+        false -> {
+            n: { kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 } <- term_sir_helpers@sir_term_root_node(t);
+            case n.kind == 6 and (n.name == "tuple_make" or n.name == "record_make") of {
+                true -> true;
+                false -> children_have_aggregate_make(t)
+            }
         }
     }
 }

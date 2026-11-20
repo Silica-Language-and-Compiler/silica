@@ -171,7 +171,7 @@ here, called with the Silica pair convention of §4:
   straddle it unseen; an overflow is reported as a fatal fault (spec §15.4.5.5: `[silica] fault at
   0x<pc>`, status 70, the report a host process gives for the same overflow), with cause 1006 in the
   details after the exit marker. See `board/README.md`, "Stack budget".
-- One cooperative scheduler per core, both LX7 cores running actors (§8.9); interrupts off; no FFI (the guarded-FFI runtime is setjmp/signal based).
+- One cooperative scheduler per core, both LX7 cores running actors (§8.9); interrupts off; no FFI (the guarded-FFI runtime is setjmp/signal based). **Status 2026-11-18:** FFI is on the board since commit `d036d03b43` (`board/runtime/rt_ffi.S`: a foreign call runs on an FFI chunk of the actor's stack chain, and a C fault ends the worker with `:foreign_fault`, no setjmp or signals).
 - Non-self tail calls use stack.
 
 ## 7. Order of work
@@ -191,7 +191,7 @@ Driven by the early apps in `board/apps/silica_*` (each has the macOS reference 
 | 8 | the actor trial suites | the actor runtime (§8): the cooperative scheduler, supervisors, placement |
 | 9 | `actors_addition/actor_cross_core_call_reply`, `actor_cross_core_cast_stress`, the three actor suites again | core 1 (§8.9): both LX7 cores run actors |
 | 10 | `silica_16_device_uart` to `silica_22_device_buzzer` | peek and poke, the device workers and the drivers under `board/apps/device_lib` ([esp32s3_peek_poke_implementation_plan.md](esp32s3_peek_poke_implementation_plan.md)) |
-| 11 | next | the remaining trial suites of port status §4.3 |
+| 11 | next | the remaining trial suites of port status §4.3 (**Status 2026-11-18: done**, the whole tree ran on the board: 22,694 pass, 0 fail, commit `029447ad31`; green again 2026-11-12, `978f663e08`) |
 
 ## 8. Actor runtime
 
@@ -388,7 +388,7 @@ A name already held is refused (`:name_taken`, `:already_registered`, `:actor_no
 ### 8.8 What is not done
 
 - `link` / `monitor` / `demonitor` return the reference's benign values (its Phase G surface).
-- Ending an actor that is running on another core waits for its next dispatch boundary.
+- Ending an actor that is running on another core waits for its next dispatch boundary. **Status 2026-11-18 (Lee): working as designed.** Lee ruled that this wait is the intended design, so it is not a limitation to remove.
 
 ### 8.9 Two cores
 
@@ -531,7 +531,7 @@ one of them keeps the invariant that a running actor stops only where §15.1.2 s
   of X2, next to the owned flag in a6.
 - **Not verified on the board yet** (2026-10-23): the code cross-assembles (`xtensa-esp32s3-elf-gcc -c
   -mlongcalls rt_actors.S`) and mirrors the hosted runtime, which passes `trials/timers_addition`; the
-  board run of that suite is open.
+  board run of that suite is open. **Status 2026-11-18:** `trials/timers_addition` is not in `trials/targets/ESP32-S3_raw.skip`, so it ran in the whole-tree board run of 2026-11-07 (22,694 pass, 0 fail, commit `029447ad31`).
 - **Image assembly gap (2026-10-23 to 2026-10-24).** Board images failed to assemble from commit 4d045655
   (2026-10-23 07:51) until the 2026-10-24 fix: `emitter_core.silica` lacked a newline before
   `.global silica_registry_atom_buf_bounds`. So no board image built between those two points, and the

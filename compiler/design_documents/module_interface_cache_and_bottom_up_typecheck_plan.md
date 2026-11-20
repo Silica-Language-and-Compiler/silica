@@ -411,7 +411,7 @@ Alternatively land skeletons in both trees in the same change set if churn contr
 - [ ] Kahn cycle detection unchanged  
 - [ ] SIR/emit still see current unit AST  
 - [ ] Dangerous / supervisor / failure-reporter module flags available if TC or module phase needs them from iface  
-- [ ] Seed and selfhost behavior match for the same sources (modulo dialect)
+- [ ] Seed and selfhost behavior match for the same sources (modulo dialect) **Status 2026-11-18 (Lee): obsolete.** Lee ruled this item obsolete; the separate seed source tree no longer exists (one tree, `compiler/src`).
 
 ---
 

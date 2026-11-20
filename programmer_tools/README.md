@@ -61,6 +61,12 @@ remote machine first with `sync_to_hosts.sh`. `--board` includes a raw target, w
 is off by default because the board has to be plugged in. Short names `mac`, `pi`, `nix`, `esp32`,
 `all` and `hosted` are accepted anywhere a platform is.
 
+`--compiler <path>` tests another compiler on this machine's own run (passed as `SILICA_COMPILER` on
+the make command line; the file must be executable and named exactly `silica-compiler`).
+`--compiler <target>=<path>` does it per platform, repeatable: a board gets `BOARD_SILICA_COMPILER`,
+a remote machine gets a path on that machine. The plan, `--list`, each log's first line and the
+summary name the compiler used per target.
+
 ### build_and_trial_all_platforms.sh
 The two above in one command: build every indicated platform, then run the full trial tree on each.
 Both halves read the same machine file, so platforms named once are used twice. The trials do not run

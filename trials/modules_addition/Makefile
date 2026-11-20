@@ -55,7 +55,9 @@ integrate-run:
 			ko=$$((ko + 1)); failed=1; \
 			continue; \
 		fi; \
-		if [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
+		if [ -n "$(TRIAL_SKIP_GOLDEN)" ]; then \
+			: golden assembly check skipped; \
+		elif [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
 			echo "❌❌ $(MSG_PREFIX)$$base has no .ascomp file"; \
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1; \
