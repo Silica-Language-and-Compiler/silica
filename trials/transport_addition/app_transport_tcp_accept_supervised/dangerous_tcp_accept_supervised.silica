@@ -1,0 +1,361 @@
+// Repro for the 2026-11-20 :accepted contract: the listener hands its owner the accepted descriptor and the
+// owner starts the connection carrier as a :temporary :dangerous child of its own supervisor. The dialling
+// carrier is a child of the same supervisor. Two connections are made one after the other with the same ids.
+module dangerous_tcp_accept_supervised;
+
+use Supervisor;
+use dangerous_sockets;
+use dangerous_tcp_carrier;
+
+impl ConnSup for Supervisor;
+
+carried_on test_net: (:tcp) (:loopback);
+
+fn check_delay() -> uint64 { 300 }
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+// The program's own failure reporter is the ONLY writer to standard output. The owner casts every line it would show as
+// "T:<line>\n" and, after its last check, "E:"; the reporter also receives each carrier's end report (4 in all: two
+// dialling carriers, two accepted connection carriers). It checks that every report says reason :normal and carries a
+// non-null supervisor_acb (a supervised end); a report that fails the check is appended to the output as it came, so a
+// real failure is never hidden. When all 4 reports and the owner's end marker have arrived it prints and ends.
+fn reporter(msg: string, state: { reports: int64, bad: int64, all_in: boolean, out: string }) -> (:no_reply, { reports: int64, bad: int64, all_in: boolean, out: string }) {
+    sequence proc[concurrency, device_io]
+        is_text: boolean <- starts_with(msg, "T:");
+        is_end: boolean <- starts_with(msg, "E:");
+        reason_ok: boolean <- contains(msg, "reason:          :normal");
+        unsup1: boolean <- contains(msg, "supervisor_acb:  0x0\n");
+        unsup2: boolean <- contains(msg, "(nil)");
+        unsup3: boolean <- contains(msg, "0x00000000");
+        report_ok: boolean <- case reason_ok of {
+            true -> case unsup1 of {
+                true -> false;
+                false -> case unsup2 of {
+                    true -> false;
+                    false -> case unsup3 of {
+                        true -> false;
+                        false -> true
+                    }
+                }
+            };
+            false -> false
+        };
+        is_report: boolean <- case is_text of {
+            true -> false;
+            false -> case is_end of {
+                true -> false;
+                false -> true
+            }
+        };
+        reports: int64 <- case is_report of {
+            true -> state.reports + 1;
+            false -> state.reports
+        };
+        bad: int64 <- case is_report of {
+            true -> case report_ok of {
+                true -> state.bad;
+                false -> state.bad + 1
+            };
+            false -> state.bad
+        };
+        all_in: boolean <- case is_end of {
+            true -> true;
+            false -> state.all_in
+        };
+        out: string <- case is_text of {
+            true -> concat(state.out, substring(msg, 2, length_bytes(msg)));
+            false -> case is_report of {
+                true -> case report_ok of {
+                    true -> state.out;
+                    false -> concat(state.out, msg)
+                };
+                false -> state.out
+            }
+        };
+        finished: boolean <- case all_in of {
+            true -> reports == 4;
+            false -> false
+        };
+        _: boolean <- case finished of {
+            true -> {
+                _: atom <- print(out);
+                _: atom <- case bad == 0 of {
+                    true -> println("carrier reports: 4 normal, 0 unsupervised");
+                    false -> println("carrier reports: NOT all normal and supervised")
+                };
+                _: atom <- println("done");
+                cast_exit(0)
+            };
+            false -> true
+        }
+    produces
+        pure (:no_reply, { reports: reports, bad: bad, all_in: all_in, out: out })
+    end
+}
+
+fn init(_initial_state: int64) -> (
+    {
+        strategy: :one_for_one | :one_for_all | :rest_for_one,
+        allowed_restart_count: int64,
+        restarts_time_frame: int64
+    },
+    List[
+        {
+            id: atom,
+            agent_type: :worker | :supervisor,
+            initial_state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string },
+            behavior: fn(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }),
+            restart: :permanent | :temporary | :transient,
+            shutdown: int64,
+            flavor: :plain | :dangerous, state_policy: state_policy
+        },
+        mem(normal)
+    ]
+) {
+    sequence proc[mem(normal)]
+        flags: {
+            strategy: :one_for_one | :one_for_all | :rest_for_one,
+            allowed_restart_count: int64,
+            restarts_time_frame: int64
+        } <- { strategy: :one_for_one, allowed_restart_count: 2, restarts_time_frame: 60 };
+        children: List[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string },
+                behavior: fn(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous, state_policy: state_policy
+            },
+            mem(normal)
+        ] <- empty[
+            {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                initial_state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string },
+                behavior: fn(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | :poll, state: { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }) -> (:no_reply, { owner: actor_ref, fd: int64, rx_credit: int64, up: boolean, listening: boolean, link_spec: string }),
+                restart: :permanent | :temporary | :transient,
+                shutdown: int64,
+                flavor: :plain | :dangerous, state_policy: state_policy
+            },
+            mem(normal)
+        ]()
+    produces
+        pure (flags, children)
+    end
+}
+
+// Starts a (:tcp) carrier as a :temporary child of `sup`: fd is an accepted descriptor, or -1 for a carrier
+// that will dial. The answer is the carrier's reference.
+fn start_conn(sup: supervisor_ref, id: atom, fd: int64, spec: string) -> actor_ref {
+    sequence
+        added: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, {
+            op: :add_child,
+            child: {
+                id: id,
+                agent_type: :worker,
+                initial_state: { owner: actor_ref_of_word(0), fd: fd, rx_credit: 0, up: false, listening: false, link_spec: spec },
+                behavior: dangerous_tcp_carrier@carrier,
+                restart: :temporary,
+                shutdown: 0,
+                flavor: :dangerous, state_policy: state_policy(:keep_state_area)
+            }
+        } impl SupervisorMessage {})
+    produces
+        pure added.child
+    end
+}
+
+fn live_children(sup: supervisor_ref) -> int64 {
+    sequence
+        g: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, { op: :count_children } impl SupervisorMessage {})
+    produces
+        pure g.count
+    end
+}
+
+// The dialling side: on :link_up it sends two bytes and closes.
+fn client(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+          state: { car: actor_ref })
+    -> (:no_reply, { car: actor_ref }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.car, (:tx, "hi", self()) impl ActorMessage {});
+                _: boolean <- cast(state.car, :close impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, _why2: atom) -> (:no_reply, state)
+    }
+}
+
+// The accepted connection's owner: it tells the server what it received and when the peer closed.
+fn session(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+           state: { car: actor_ref, srv: actor_ref })
+    -> (:no_reply, { car: actor_ref, srv: actor_ref }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.car, (:credit, 4) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:rx, segment: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.srv, (:note, concat("session rx ", segment)) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, why2: atom) -> {
+            sequence proc[concurrency]
+                _: boolean <- case why2 of {
+                    :closed -> cast(state.srv, (:note, "session link_down closed") impl ActorMessage {});
+                    _: atom -> cast(state.srv, (:note, "session link_down other") impl ActorMessage {})
+                };
+                _: boolean <- cast(state.srv, :conn_down impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        }
+    }
+}
+
+// A count line: the supervisor holds no live child at these two points.
+fn count_line(prefix: string, n: int64) -> string {
+    case n == 0 of {
+        true -> concat(prefix, "0\n");
+        false -> concat(prefix, "not 0\n")
+    }
+}
+
+// The listener's owner. It never prints: every line goes to the reporter.
+fn server(msg: (:link_up, string) | (:accepted, int64, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:note, string) | :conn_down | :check,
+          state: { sup: supervisor_ref, rep: actor_ref, port: string, round: int64 })
+    -> (:no_reply, { sup: supervisor_ref, rep: actor_ref, port: string, round: int64 }) {
+    case msg of {
+        (:link_up, info: string) -> {
+            sequence proc[concurrency]
+                port: string <- substring(info, 5, length_bytes(info));
+                _: boolean <- cast(state.rep, count_line("T:listening, children: ", live_children(state.sup)) impl ActorMessage {});
+                cli_car: actor_ref <- start_conn(state.sup, :cli_conn, 0 - 1, "loopback");
+                cli: actor_ref <- spawn({ car: cli_car }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(cli_car, (:open, cli, concat(concat("127.0.0.1:", port), ":3000")) impl ActorMessage {})
+            produces
+                pure (:no_reply, { sup: state.sup, rep: state.rep, port: port, round: state.round })
+            end
+        };
+        // the accepted descriptor: the connection carrier is a :temporary :dangerous child of the supervisor
+        (:accepted, fd: int64, _peer: string) -> {
+            sequence proc[concurrency]
+                conn: actor_ref <- start_conn(state.sup, :srv_conn, fd, "");
+                ses: actor_ref <- spawn({ car: conn, srv: self() }, session, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                _: boolean <- cast(conn, (:open, ses, "") impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:note, text: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.rep, concat("T:", concat(text, "\n")) impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        // the supervisor learns of a carrier's end after the session's :link_down: ask 300 ms later
+        :conn_down -> {
+            sequence proc[concurrency]
+                _: timer_ref <- send_after(check_delay(), self(), :check impl ActorMessage {})
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        :check -> {
+            sequence proc[concurrency]
+                _: boolean <- cast(state.rep, count_line("T:after the close, children: ", live_children(state.sup)) impl ActorMessage {});
+                _: boolean <- case state.round of {
+                    0 -> {
+                        cli_car: actor_ref <- start_conn(state.sup, :cli_conn, 0 - 1, "loopback");
+                        cli: actor_ref <- spawn({ car: cli_car }, client, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                        cast(cli_car, (:open, cli, concat(concat("127.0.0.1:", state.port), ":3000")) impl ActorMessage {})
+                    };
+                    _: int64 -> cast(state.rep, "E:" impl ActorMessage {})
+                }
+            produces
+                pure (:no_reply, { sup: state.sup, rep: state.rep, port: state.port, round: state.round + 1 })
+            end
+        };
+        (:rx, _segment: string) -> (:no_reply, state);
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, _why2: atom) -> (:no_reply, state)
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn({ reports: 0, bad: 0, all_in: false, out: "" }, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        sup: supervisor_ref <- spawn_registered_supervisor(ConnSup, 0, :conn_sup, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        lst: dangerous_actor_ref <- spawn_dangerous_carrier(test_net, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        srv: actor_ref <- spawn({ sup: sup, rep: rep, port: "", round: 0 }, server, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(lst, (:open, srv, "listen:0") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
