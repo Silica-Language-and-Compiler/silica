@@ -38,10 +38,10 @@ TARGETS = (
 )
 
 RUNNERS = {
-    "apple_silicon_mac": "macos-26",
+    "apple_silicon_mac": "macos-latest",
     "linux_aarch64": "ubuntu-24.04-arm",
     "linux_x86_64": "ubuntu-24.04",
-    "ESP32-S3_raw": "macos-26",
+    "ESP32-S3_raw": "macos-latest",
 }
 
 # On the matching runner, "host" is that machine. ESP32-S3_raw is the board
