@@ -56,7 +56,7 @@ Erlang peer, run by script outside `make integrate`, output compared with an `ex
 
 ## 4. What exists and what is missing
 
-Exists: `dangerous_tcp_carrier` (connect and listener serving many peers, `(:accepted, conn, info)`), `wireframe`,
+Exists: `dangerous_tcp_carrier` (connect and listener serving many peers, `(:accepted, fd, info)`; changed 2026-11-20: the listener hands the owner the accepted descriptor and the owner starts the connection carrier, supervised or not, where the listener used to spawn it and send `conn`), `wireframe`,
 `wire_etf`, `carried_on` (`(:interface, name)` and `(:ethernet, n)` are accepted and bind nothing, links design
 §3.2), `programmer_tools/transport_beam_demo` (one-shot, one direction).
 

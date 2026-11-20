@@ -85,7 +85,7 @@ change). Stages 0 to 2 need no radio.
 - Parse and check `carried_on` declarations; `Link.silica`; pack `provides_link` rows for the three hosted targets and the
   board; `spawn_dangerous_carrier` taking a declaration; E2412 to E2417; the hosted `(:wifi, n)`, `(:loopback)` and
   `(:serial_port, ...)` rows; hosted `getpeername` (so `:accepted` and `:link_up` carry the peer address, not
-  `"peer:accepted"`).
+  `"peer:accepted"`). (Note 2026-11-20: on the hosted `(:tcp)` carrier `(:accepted, fd, info)` now carries the accepted descriptor `fd: int64` instead of a spawned connection carrier; the owner starts the connection carrier. A Wi-Fi carrier on the ESP32-S3 that accepts connections should follow the same contract, which is the one the owner can supervise.)
 - **Closes when:** the links design's phase A trials pass, and the existing loopback and serial trials pass with a
   declaration in place of the module and address strings.
 

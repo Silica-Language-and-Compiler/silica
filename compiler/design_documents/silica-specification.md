@@ -10648,7 +10648,7 @@ Carrier@provides(c: atom) -> boolean     // whether the language provides the ca
 | carrier to owner | `(:tx_credit, n: int64)` | the carrier can take `n` more `:tx` messages |
 | carrier to owner | `(:tx_failed, reason: atom)` | a segment was not sent (`:no_credit`, `:link_down`, `:too_long`) |
 | carrier to owner | `(:link_down, reason: atom)` | the link ended (`:closed`, `:reset`, `:timeout`, `:fault`) |
-| listener to owner | `(:accepted, conn: dangerous_actor_ref, info: string)` | a listening carrier accepted a peer into the connection carrier `conn`, which holds the peer and waits for its own `(:open, owner, "")`; the sender of that `:open` becomes the connection's owner and receives its `:link_up`, credits, `:rx` and `:link_down` as the owner of a connecting carrier does |
+| listener to owner | `(:accepted, fd: int64, info: string)` | a listening carrier accepted a peer; `fd` is the accepted connection's descriptor and `info` is carrier-specific. The listener starts no actor. The owner starts the connection carrier from the state `{ owner: actor_ref_of_word(0), fd: <fd>, rx_credit: 0, up: false, listening: false, link_spec: "" }`, either with `spawn_dangerous` or as a `:temporary` `:dangerous` child of a supervisor (`call_supervisor(sup, { op: :add_child, ... })` with behaviour `dangerous_tcp_carrier@carrier`); that carrier waits for its own `(:open, owner, "")`, and the sender of that `:open` becomes the connection's owner and receives its `:link_up`, credits, `:rx` and `:link_down` as the owner of a connecting carrier does. **Changed 2026-11-20:** the second field was `conn: dangerous_actor_ref`, a connection carrier the listener spawned itself as an unsupervised root actor. |
 
 Flow control is credit-based in both directions: nothing is pushed without credit. Ordering per sender is
 mailbox order. Failure is the carrier actor exiting with a reason, handled by links, monitors and supervisors
@@ -10656,9 +10656,9 @@ like any actor. The bytes a hosted carrier delivers are external-danger-touched,
 in the handler that receives them, where §16.4.4 permits it.
 
 A carrier opened to listen (`"listen:<port>"` on `:tcp`, or `"listen:any:<port>"` to bind every interface) carries no bytes itself: it answers `:link_up` once
-bound and `(:accepted, conn, info)` for every peer, each in a connection carrier of its own, so a program that
+bound and `(:accepted, fd, info)` for every peer; the owner starts a connection carrier of its own for each descriptor (2026-11-20; before then the listener started it), so a program that
 serves many peers gives each connection an owner of its own. `:close` to a listener closes the listening
-socket only; the connections it spawned live on.
+socket only; the connections it accepted live on.
 
 **The hosted carriers** (Apple Silicon macOS in this phase; Linux follows):
 
