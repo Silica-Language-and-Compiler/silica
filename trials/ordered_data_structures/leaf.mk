@@ -15,7 +15,8 @@ INTEGRATE_JOBS  := $(SDS_JOBS)
 TRIAL_DIR       := $(notdir $(patsubst %/,%,$(THIS_DIR)))
 MSG_PREFIX      := standard_data_structures_phase1/$(TRIAL_DIR)/
 
-# Linker probes, evaluated once per make instead of once per unit recipe.
+# Linker probes, evaluated once per make instead of once per unit recipe. Every link recipe below
+# uses these, so linux_host.mk's override of LEAF_RUST_LLD sends Linux links to $(ASSEMBLER).
 LEAF_RUST_SYSROOT := $(shell rustc --print sysroot 2>/dev/null)
 LEAF_RUST_TARGET  := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
 LEAF_RUST_LLD     := $(LEAF_RUST_SYSROOT)/lib/rustlib/$(LEAF_RUST_TARGET)/bin/rust-lld
@@ -158,10 +159,8 @@ executables: objects
 	@cd "$(THIS_DIR)" || exit 1; \
 	lib_objs=""; \
 	for obj in lib/*.o; do [ -f "$$obj" ] && lib_objs="$$lib_objs $$obj"; done; \
-	rust_sysroot=$$(rustc --print sysroot 2>/dev/null); \
-	rust_target=$$(rustc -vV 2>/dev/null | sed -n 's/^host: //p'); \
-	rust_lld="$$rust_sysroot/lib/rustlib/$$rust_target/bin/rust-lld"; \
-	macos_sdk=$$(xcrun --sdk macosx --show-sdk-path 2>/dev/null); \
+	rust_lld="$(LEAF_RUST_LLD)"; \
+	macos_sdk="$(LEAF_MACOS_SDK)"; \
 	for trial in $(POSITIVE_SILICA); do \
 		base=$${trial%.silica}; \
 		[ -f "$$base.o" ] || continue; \
@@ -496,10 +495,8 @@ record-positive-golden: silica.config
 	@cd "$(THIS_DIR)" || exit 1; \
 	lib_objs=""; \
 	for obj in lib/*.o; do [ -f "$$obj" ] && lib_objs="$$lib_objs $$obj"; done; \
-	rust_sysroot=$$(rustc --print sysroot 2>/dev/null); \
-	rust_target=$$(rustc -vV 2>/dev/null | sed -n 's/^host: //p'); \
-	rust_lld="$$rust_sysroot/lib/rustlib/$$rust_target/bin/rust-lld"; \
-	macos_sdk=$$(xcrun --sdk macosx --show-sdk-path 2>/dev/null); \
+	rust_lld="$(LEAF_RUST_LLD)"; \
+	macos_sdk="$(LEAF_MACOS_SDK)"; \
 	for trial in $(POSITIVE_SILICA); do \
 		base=$${trial%.silica}; \
 		[ -f "$$base.o" ] || continue; \

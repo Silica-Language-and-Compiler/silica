@@ -9,6 +9,8 @@ ifeq ($(shell uname -s),Linux)
   override MACOS_SDK :=
   override LINKER := cc
   override RUST_LLD := /nonexistent
+  # ordered_data_structures/leaf.mk probes its own rust-lld and links it -flavor darwin.
+  override LEAF_RUST_LLD := /nonexistent
   # crt1.o calls main, so no -e main. -no-pie because emitted data tables hold absolute addresses.
   # -rdynamic: the actor failure banner resolves the running behavior's name with dladdr,
   # and glibc's dladdr only sees .dynsym. Without it every banner says <unknown behavior>.
