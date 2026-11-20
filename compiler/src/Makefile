@@ -501,13 +501,48 @@ executables: objects
 # silica.link) to the Linux host. Once a compiler exists there
 # the ordinary `make build` runs natively and these two targets are no longer needed.
 BOOTSTRAP_TARGET ?= linux_aarch64
-BOOTSTRAP_CROSS_COMPILER := $(BINARIES_DIR)/silica-compiler-$(BOOTSTRAP_TARGET)
+# The compiler that emits the assembly. Left empty it is the cross compiler `make build
+# TARGET=$(BOOTSTRAP_TARGET)` just left at $(BUILD_ROOT)/$(BOOTSTRAP_TARGET)/silica-compiler (the one
+# that runs on this machine and emits for the target). binaries/silica-compiler-<target> is NOT used:
+# in this repo that name can point at a native binary of the target's own OS, which cannot run here.
+# Pass BOOTSTRAP_CROSS_COMPILER=<path> to use another one.
+BOOTSTRAP_CROSS_COMPILER ?=
 
+# The compiler is copied out of the build directory first, because the directory is then cleaned for
+# the target assembly (stale .sams from the cross compiler's own build would look up to date and
+# nothing would be emitted). The emitted assembly is then checked to be for the target's architecture
+# and the recipe fails otherwise:
+#   linux_x86_64   every .sams has `.intel_syntax noprefix` (the x86-64 emitter's first line)
+#   linux_aarch64  AArch64 with ELF symbol names: no .sams carries the Mac's `.extern _silica_rt_`
+#                  (underscore-prefixed Mach-O names) and some .sams has `.extern silica_rt_`
 bootstrap-assembly:
-	@$(MAKE) -C "$(THIS_DIR)" -f "$(THIS_DIR)Makefile" assembly TARGET=$(BOOTSTRAP_TARGET) \
-		SILICA_COMPILER="$(BOOTSTRAP_CROSS_COMPILER)" INSTALL_SELFHOST=0 SILICA_TARGET_PROMPT=0
-	@n=$$(find "$(BUILD_ROOT)/$(BOOTSTRAP_TARGET)" -name '*.sams' -type f ! -path '*/_wd_probe/*' | wc -l | tr -d ' '); \
-	echo "bootstrap-assembly: $$n .sams emitted for $(BOOTSTRAP_TARGET) into $(BUILD_ROOT)/$(BOOTSTRAP_TARGET)/; copy this tree and that directory to the Linux host and run make bootstrap-link there"
+	@set -e; t="$(BOOTSTRAP_TARGET)"; bd="$(BUILD_ROOT)/$$t"; cc="$(BOOTSTRAP_CROSS_COMPILER)"; \
+	[ -n "$$cc" ] || cc="$$bd/$(EXECUTABLE)"; \
+	if [ ! -x "$$cc" ]; then \
+		echo "FAIL: bootstrap-assembly needs the cross compiler for $$t, run here, and found none at $$cc"; \
+		echo "      build it first (make build TARGET=$$t INSTALL_SELFHOST=0) or pass BOOTSTRAP_CROSS_COMPILER=<path>"; \
+		exit 1; \
+	fi; \
+	tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	cp "$$cc" "$$tmp/silica-compiler"; \
+	echo "bootstrap-assembly: emitting for $$t with $$cc (copied to $$tmp)"; \
+	$(MAKE) -C "$(THIS_DIR)" -f "$(THIS_DIR)Makefile" clean TARGET=$$t SILICA_TARGET_PROMPT=0; \
+	$(MAKE) -C "$(THIS_DIR)" -f "$(THIS_DIR)Makefile" assembly TARGET=$$t \
+		SILICA_COMPILER="$$tmp/silica-compiler" INSTALL_SELFHOST=0 SILICA_TARGET_PROMPT=0; \
+	n=$$(find "$$bd" -name '*.sams' -type f ! -path '*/_wd_probe/*' | wc -l | tr -d ' '); \
+	[ "$$n" -gt 0 ] || { echo "FAIL: bootstrap-assembly emitted no .sams for $$t"; exit 1; }; \
+	sams() { find "$$bd" -name '*.sams' -type f ! -path '*/_wd_probe/*' -print0; }; \
+	case "$$t" in \
+	linux_x86_64) \
+		bad=$$(sams | xargs -0 grep -L '^[[:space:]]*\.intel_syntax noprefix' | wc -l | tr -d ' '); \
+		[ "$$bad" = 0 ] || { echo "FAIL: $$bad of $$n .sams for $$t are not x86-64 (no .intel_syntax noprefix); the compiler used was not an x86-64 emitter"; exit 1; } ;; \
+	linux_aarch64) \
+		mac=$$(sams | xargs -0 grep -l '^\.extern _silica_rt_' | wc -l | tr -d ' '); \
+		elf=$$(sams | xargs -0 grep -l '^\.extern silica_rt_' | wc -l | tr -d ' '); \
+		{ [ "$$mac" = 0 ] && [ "$$elf" -gt 0 ]; } || { echo "FAIL: .sams for $$t are not Linux AArch64 ($$mac with Mach-O symbol names, $$elf with ELF ones); the compiler used was not a linux_aarch64 emitter"; exit 1; } ;; \
+	*) echo "bootstrap-assembly: no architecture check for $$t" ;; \
+	esac; \
+	echo "bootstrap-assembly: $$n .sams emitted for $$t into $$bd/ (architecture checked); copy this tree and that directory to the Linux host and run make bootstrap-link there"
 
 bootstrap-link:
 	@if [ "$$(uname -s)" != Linux ]; then echo "FAIL: bootstrap-link assembles and links on the Linux host, not here"; exit 1; fi
