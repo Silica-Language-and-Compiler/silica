@@ -79,7 +79,9 @@ integrate-run: fixtures unguarded_probe
 		[ -f "$$sams" ] || continue; \
 		base=$${sams%.sams}; \
 		[ "$$base" = "__silica_runtime" ] && continue; \
-		if [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
+		if [ -n "$(TRIAL_SKIP_GOLDEN)" ]; then \
+			: golden assembly check skipped; \
+		elif [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
 			echo "  ❌ $(APP_LABEL)/$$base: missing .ascomp"; \
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1; \

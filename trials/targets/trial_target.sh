@@ -404,8 +404,13 @@ run_board() {
     if [ "${SILICA_BOARD_EMULATOR:-}" = qemu ] && [ "$target" = ESP32-S3_raw ]; then
         [ -n "${SILICA_QEMU:-}" ] && [ -x "${SILICA_QEMU}" ] \
             || pdie "SILICA_BOARD_EMULATOR=qemu but SILICA_QEMU is not an executable"
+        # Start QEMU once before any trial. A QEMU that cannot load (a missing Homebrew dylib makes
+        # dyld abort it: status -6) otherwise fails every trial as "board unavailable" and
+        # run_on_board.py drops its stderr; here the dyld message is shown and the run stops.
+        probe=$("$SILICA_QEMU" --version 2>&1) \
+            || pdie "SILICA_QEMU does not start ($SILICA_QEMU): $(printf '%s' "$probe" | head -n 5)"
         port=qemu
-        probe="qemu ESP32-S3 (Espressif QEMU, no board)"
+        probe="qemu ESP32-S3 (Espressif QEMU, no board; $(printf '%s' "$probe" | head -n 1))"
     else
         port=$(choose_port "$py" "$tools/run_on_board.py" "$TARGET_PORT_DEFAULT") || exit $?
         probe=$("$py" "$tools/run_on_board.py" --probe --port "$port" ${BOARD_MAC:+--expect-mac "$BOARD_MAC"} 2>&1) \

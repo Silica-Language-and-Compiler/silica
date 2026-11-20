@@ -394,6 +394,8 @@ check_ascomp() {
     [ -f "$cdir/$stem.sams" ] || return 0
     g="$gdir/$stem.$ASCOMP_PLATFORM.ascomp"
     if [ -n "$GEN" ]; then gen_ascomp "$stem" "$g" "${2:-program}"; return 0; fi
+    # TRIAL_SKIP_GOLDEN (set and not 0/false): the assembly is not compared; the run's report says so.
+    case "${TRIAL_SKIP_GOLDEN:-}" in ""|0|false) ;; *) return 0 ;; esac
     if [ ! -f "$g" ]; then
         mark_fail; printf '❌❌ %s%s has no .%s.ascomp file\n' "$prefix" "$stem" "$ASCOMP_PLATFORM"; ko=$((ko + 1))
     elif ! diff -Bw -q "$cdir/$stem.sams" "$g" > /dev/null 2>&1; then

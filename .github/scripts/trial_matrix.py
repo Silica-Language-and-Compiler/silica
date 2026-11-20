@@ -6,9 +6,22 @@ marked INTEGRATE_PENDING. That is the set `make integrate` runs. A pending
 suite stays out, including the board suites that a whole-tree board run skips
 until they are named on their own.
 
-Suites are packed into N shards by source count, heaviest first.
-error_enforcement_addition is about half the sources, so every shard also
-runs one slice of it (TRIAL_SUITE_SLICE). The pack is deterministic.
+A suite also stays out of a target's rows when it does not apply to that target:
+  - TRIAL_TARGETS (optional file in the suite): whitespace-separated target names
+    (apple_silicon_mac, linux_aarch64, linux_x86_64, ESP32-S3_raw,
+    STM32-L476RG_raw) or `host` for the three hosted ones; `#` lines are comments.
+    The suite runs only on the listed targets. No file means every target.
+  - BOARD_ONLY (older marker): the suite is not run on the hosted targets.
+`make integrate` applies the same two files to a whole-tree host run, so local
+and CI agree. A suite a target merely skips for a stated reason
+(trials/targets/<target>.skip) stays in: the driver reports it as skipped, so
+it is visible rather than hidden.
+
+The suites are packed per target (so a board's shards stay balanced when it
+runs a different set than the hosts) into N shards by source count, heaviest
+first. error_enforcement_addition is about half the sources, so every shard
+also runs one slice of it (TRIAL_SUITE_SLICE) when the target runs it. The
+pack is deterministic. A shard left with no suite and no slice is dropped.
 """
 
 from __future__ import annotations
@@ -40,8 +53,31 @@ TRIAL_TARGET = {
     "ESP32-S3_raw": "ESP32-S3_raw",
 }
 
+HOSTS = ("apple_silicon_mac", "linux_aarch64", "linux_x86_64")
+BOARDS = ("ESP32-S3_raw", "STM32-L476RG_raw")
+
 # This suite is large enough that giving it a whole shard wastes the other fourteen.
 SLICED_SUITE = "error_enforcement_addition"
+
+
+def applies(trials: str, suite: str, target: str) -> bool:
+    """True when the suite's TRIAL_TARGETS / BOARD_ONLY markers allow this target."""
+    path = os.path.join(trials, suite)
+    if target in HOSTS and os.path.isfile(os.path.join(path, "BOARD_ONLY")):
+        return False
+    marker = os.path.join(path, "TRIAL_TARGETS")
+    if not os.path.isfile(marker):
+        return True
+    words: set[str] = set()
+    with open(marker, encoding="utf-8") as handle:
+        for line in handle:
+            if line.lstrip().startswith("#"):
+                continue
+            words.update(line.split())
+    unknown = words - (set(HOSTS) | set(BOARDS) | {"host"})
+    if unknown or not words:
+        raise SystemExit("%s: bad TRIAL_TARGETS (%s)" % (marker, ", ".join(sorted(unknown)) or "empty"))
+    return target in words or ("host" in words and target in HOSTS)
 
 
 def suites_of(trials: str) -> list[tuple[str, int]]:
@@ -84,20 +120,24 @@ def matrix(trials: str, target: str, shards: int) -> list[dict[str, object]]:
     all_suites = suites_of(trials)
     if not any(name == SLICED_SUITE for name, _weight in all_suites):
         raise SystemExit("missing suite %s" % SLICED_SUITE)
-    weighted = [(name, weight) for name, weight in all_suites if name != SLICED_SUITE]
-    packed = pack(weighted, shards)
     rows = []
     for name in chosen:
+        mine = [(n, w) for n, w in all_suites if applies(trials, n, name)]
+        sliced = any(n == SLICED_SUITE for n, _w in mine)
+        packed = pack([(n, w) for n, w in mine if n != SLICED_SUITE], shards)
         for shard in range(shards):
             suites = list(packed[shard])
-            suites.append(SLICED_SUITE)
+            if sliced:
+                suites.append(SLICED_SUITE)
+            if not suites:
+                continue
             rows.append({
                 "target": name,
                 "shard": shard,
                 "runner": RUNNERS[name],
                 "trial_target": TRIAL_TARGET[name],
                 "suites": " ".join(sorted(suites)),
-                "suite_slice": "%s:%d:%d" % (SLICED_SUITE, shards, shard),
+                "suite_slice": ("%s:%d:%d" % (SLICED_SUITE, shards, shard)) if sliced else "",
             })
     return rows
 

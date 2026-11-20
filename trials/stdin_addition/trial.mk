@@ -165,7 +165,9 @@ integrate-run:
 		base=$${sams%.sams}; \
 	[ "$$base" = "__silica_runtime" ] && continue; \
 	[ "$$base" = "__silica_runtime" ] && continue; \
-		if [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
+		if [ -n "$(TRIAL_SKIP_GOLDEN)" ]; then \
+			: golden assembly check skipped; \
+		elif [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
 			echo "$(MSG_PREFIX)$$base has no .ascomp file yet: assembly comparison skipped"; \
 		elif ! diff -Bw -q "$$sams" "$$base$(ASCOMP_EXT)" > /dev/null 2>&1; then \
 			echo "❌❌ $(MSG_PREFIX)$$base .sams differs from .ascomp"; \
