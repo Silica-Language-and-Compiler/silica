@@ -1,8 +1,7 @@
 # normal_build_trial_hook_rejected_trial
 
-The trial hook `supervision_ingress_enqueue` is built only into trial compilers
-(`make build TRIAL_BUILD=1`). Every other trial in the tree is compiled by the trial compiler
-(`binaries/TRIAL_BUILD_silica-compiler`). The two trials here are compiled by the NORMAL compiler
+The trial hook `supervision_ingress_enqueue` is built only into a compiler made with `make build TRIAL_BUILD=1`.
+The normal compilers do not have it. The two trials here are compiled by the NORMAL compiler
 (`SILICA_NORMAL_COMPILER`, defined in `trials/silica_compiler.mk`: the unpublished
 `compiler/build/<target>/silica-compiler` when it exists, else the published `binaries/silica-compiler`).
 The parent Makefile passes it to each child as `SILICA_COMPILER`.

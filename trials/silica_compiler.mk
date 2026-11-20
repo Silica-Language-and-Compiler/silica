@@ -1,4 +1,4 @@
-# Shared seed host for trials — always binaries/TRIAL_BUILD_silica-compiler (the trial compiler) unless overridden
+# Shared seed host for trials — always binaries/silica-compiler (the normal compiler) unless overridden
 # on the make command line (e.g. `make SILICA_COMPILER=/path/to/other integrate`).
 # Paths are anchored to this file (trials/silica_compiler.mk).
 #
@@ -25,7 +25,7 @@
 
 _SILICA_COMPILER_MK_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 BINARIES_DIR := $(abspath $(_SILICA_COMPILER_MK_DIR)../binaries)
-_SILICA_COMPILER_SEED := $(BINARIES_DIR)/TRIAL_BUILD_silica-compiler
+_SILICA_COMPILER_SEED := $(BINARIES_DIR)/silica-compiler
 
 # Force the seed binary for undefined / environment origins. Command-line
 # SILICA_COMPILER=... still wins (GNU make: origin "command line").
@@ -63,14 +63,13 @@ include $(_SILICA_COMPILER_MK_DIR)../project_makefiles/platform/platforms.mk
 SOUT_TARGET := $(if $(filter apple_silicon_mac,$(SILICA_HOST_EMIT_TARGET)),macos_applesilicon,$(SILICA_HOST_EMIT_TARGET))
 SOUT_EXT := .$(SOUT_TARGET).sout
 
-# The trial hook is built only into trial compilers (make build TRIAL_BUILD=1); their file names carry
-# the TRIAL_BUILD_ prefix, which is stripped here before the emit target is read from the name.
-_SILICA_COMPILER_NAME := $(patsubst TRIAL_BUILD_%,%,$(notdir $(SILICA_COMPILER)))
+# The emit target is read from the compiler's file name: silica-compiler is the host, silica-compiler-<target> a cross compiler.
+_SILICA_COMPILER_NAME := $(notdir $(SILICA_COMPILER))
 SILICA_EMIT_TARGET ?= $(if $(filter silica-compiler-%,$(_SILICA_COMPILER_NAME)),$(patsubst silica-compiler-%,%,$(_SILICA_COMPILER_NAME)),$(SILICA_HOST_EMIT_TARGET))
 
-# The normal (non-trial) compiler, used by suites that test a normal build (e.g. error_enforcement_addition/
+# The normal compiler, used by suites that test a normal build (e.g. error_enforcement_addition/
 # normal_build_trial_hook_rejected_trial). The unpublished normal build compiler/build/<emit target>/silica-compiler
-# is preferred when it exists; otherwise the published binaries/ compiler of the same name without the prefix.
+# is preferred when it exists; otherwise the published binaries/ compiler of the same name.
 # Override on the make command line.
 _SILICA_NORMAL_UNPUBLISHED := $(abspath $(_SILICA_COMPILER_MK_DIR)../compiler/build/$(SILICA_EMIT_TARGET)/silica-compiler)
 SILICA_NORMAL_COMPILER ?= $(if $(wildcard $(_SILICA_NORMAL_UNPUBLISHED)),$(_SILICA_NORMAL_UNPUBLISHED),$(dir $(SILICA_COMPILER))$(_SILICA_COMPILER_NAME))
@@ -121,7 +120,7 @@ SCOUT_FOR = $(if $(SCOUT_EXT),$(_SCOUT_PICK_SH),$(1).scout)
 # still carry their own macOS values; once those lines are deleted this include is the only source.
 -include $(_SILICA_COMPILER_MK_DIR)platform/$(SILICA_EMIT_TARGET).mk
 
-# If the trial compiler is missing, say how to build it and stop (it is never relinked or published).
+# If the compiler is missing, say how to build it and stop (it is never relinked or published).
 #
 # RULE: the link binaries/silica-compiler is never replaced while a host run of this machine is in
 # progress (a live process holds trials/.integrate.lock.<host key>, e.g. .integrate.lock.macos_applesilicon):
@@ -149,7 +148,7 @@ define ENSURE_SILICA_COMPILER
 	if [ ! -x "$(SILICA_COMPILER)" ]; then \
 		if [ -n "$$ensure_busy" ]; then ensure_note; echo "Missing $(SILICA_COMPILER) and it cannot be relinked during a host run."; exit 1; fi; \
 		echo "Missing $(SILICA_COMPILER)"; \
-		echo "build it: make -C compiler/src build TRIAL_BUILD=1 SILICA_TARGET_PROMPT=0"; \
+		echo "build it: make -C compiler/src build SILICA_TARGET_PROMPT=0 (or bash programmer_tools/build_all_platforms.sh)"; \
 		exit 1; \
 	fi
 endef
@@ -487,8 +486,8 @@ INTEGRATE_KILLED_MSG = killed by the watchdog after $$SILICA_INTEGRATE_WATCHDOG_
 #
 # Trial targets (targets/README.md). The outermost `integrate` -- the one the user typed, in
 # trials/ or in a suite -- first decides where the trials run:
-#   TRIAL_TARGET=host              this host (macOS, Linux x86-64 or AArch64), binaries/TRIAL_BUILD_silica-compiler (what integrate always did)
-#   TRIAL_TARGET=<board target>    e.g. ESP32-S3_raw: compiled by binaries/TRIAL_BUILD_silica-compiler-<target>,
+#   TRIAL_TARGET=host              this host (macOS, Linux x86-64 or AArch64), binaries/silica-compiler (what integrate always did)
+#   TRIAL_TARGET=<board target>    e.g. ESP32-S3_raw: compiled by binaries/silica-compiler-<target>,
 #                                  run on the board (targets/trial_target.sh does the whole run)
 #   TRIAL_TARGET=linux_aarch64 | linux_x86_64   the remote hosted machine of that name in
 #                                  .silica_build_hosts: sync, then `make integrate` there with its own compiler

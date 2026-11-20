@@ -24,11 +24,7 @@
 # Per machine the work is: build, gen1, gen2, fixed-point check, publish (skip the last four with
 # --no-fixpoint). One compiler build at a time per machine; the heaviest unit needs 6-8 GB.
 #
-# After the normal build of a target comes its trial compiler: `make build TRIAL_BUILD=1` in its own
-# build directory (compiler/build/TRIAL_BUILD_<target>/), installed as binaries/TRIAL_BUILD_silica-compiler
-# (host target) or binaries/TRIAL_BUILD_silica-compiler-<target>. The trial hook is built only into trial
-# compilers; the trials use them, and they are never published or used as a seed. The trial build is a
-# full compiler build the first time (later runs are incremental). Raw targets build with at most 5 jobs.
+# Raw targets build with at most 5 jobs.
 #
 # Which platforms are built, and where:
 #   .silica_build_hosts in the repository root remembers the platforms and their machines. It is
@@ -308,11 +304,11 @@ fi
 if [ "$LIST_ONLY" = 1 ]; then
     echo
     [ "$BUILD_NATIVE" = 1 ] && \
-        echo "  $HOST_TARGET: build here$([ "$DO_FIXPOINT" = 1 ] && echo ", then gen1, gen2 and the fixed-point check"), then its trial compiler"
-    for t in $RAW_TARGETS; do echo "  $t: cross compiler built here (no OS, cannot host a compiler), then its trial compiler"; done
+        echo "  $HOST_TARGET: build here$([ "$DO_FIXPOINT" = 1 ] && echo ", then gen1, gen2 and the fixed-point check")"
+    for t in $RAW_TARGETS; do echo "  $t: cross compiler built here (no OS, cannot host a compiler)"; done
     for t in $OTHER_HOSTED; do
         if conn="$(conn_of "$t")"; then
-            echo "  $t: build and fixed point on $conn, then its trial compiler"
+            echo "  $t: build and fixed point on $conn"
         elif [ "$LOCAL_ONLY" = 1 ]; then
             echo "  $t: skipped (--local-only)"
         else
@@ -350,19 +346,6 @@ local_build() {  # $1 = emit target
       make build TARGET="$t" SILICA_TARGET_PROMPT=0 ${JOBS:+JOBS=$JOBS} ) >>"$log" 2>&1 || {
         echo "  FAILED (see $log)"; return 1; }
     grep -hE "Installed (selfhost|target).*compiler:" "$log" | tail -1 | sed 's/^/  /' || true
-}
-
-# The trial compiler of one target (see the header). Never cleans, so a later run is incremental.
-# Raw (board) targets are capped at 5 compile jobs.
-local_trial_build() {  # $1 = emit target
-    local t="$1" log="$LOG_DIR/trial-build-$1.log" jobs="$JOBS"
-    if is_raw "$t"; then
-        { [ -z "$jobs" ] || [ "$jobs" -gt 5 ] 2>/dev/null; } && jobs=5
-    fi
-    echo "== trial compiler $t (here)"
-    ( cd "$SRC" && make build TRIAL_BUILD=1 TARGET="$t" INSTALL_SELFHOST=1 SILICA_TARGET_PROMPT=0 ${jobs:+JOBS=$jobs} ) \
-        >>"$log" 2>&1 || { echo "  FAILED (see $log)"; return 1; }
-    grep -hE "Installed .*compiler|Built TRIAL" "$log" | tail -1 | sed 's/^/  /' || true
 }
 
 local_fixpoint() {
@@ -454,10 +437,6 @@ remote_build_and_fixpoint() {  # $1 = target, $2 = user@host, $3 = remote repo p
             echo "  FAILED on $conn (see $log)"; return 1; }
     fi
 
-    echo "  trial compiler (make build TRIAL_BUILD=1)"
-    remote_sh "$conn" "cd $rpath/$SRC_REL && make build TRIAL_BUILD=1 INSTALL_SELFHOST=1 SILICA_TARGET_PROMPT=0 ${JOBS:+JOBS=$JOBS}" \
-        >>"$log" 2>&1 || { echo "  trial compiler build FAILED on $conn (see $log)"; return 1; }
-
     if [ "$DO_TRIALS" = 1 ]; then
         echo "  trials on $conn"
         remote_sh "$conn" "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host" \
@@ -510,15 +489,12 @@ if [ "$BUILD_NATIVE" = 1 ]; then
     else
         if local_build "$HOST_TARGET"; then ok+=("$HOST_TARGET(native)"); else bad+=("$HOST_TARGET"); fi
     fi
-    # The trial compiler comes after the normal build of the same target.
-    if local_trial_build "$HOST_TARGET"; then ok+=("$HOST_TARGET(trial compiler)"); else bad+=("$HOST_TARGET(trial compiler)"); fi
 else
     echo "== $HOST_TARGET not selected; this machine builds only what was asked for"
 fi
 
 for t in $RAW_TARGETS; do
     if local_build "$t"; then ok+=("$t(cross)"); else bad+=("$t"); fi
-    if local_trial_build "$t"; then ok+=("$t(trial compiler)"); else bad+=("$t(trial compiler)"); fi
 done
 
 # Wait for the remote builds started above and print what each one said.

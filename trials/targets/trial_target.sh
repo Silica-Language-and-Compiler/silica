@@ -112,8 +112,8 @@ is_remote() { local t; for t in $(remote_targets); do [ "$t" = "$1" ] && return 
 # Short description of a remote target for the menu; never prints the machine's address.
 remote_desc() {
     case "$1" in
-        linux_aarch64) echo "Linux AArch64 (pix), remote hosted: sync, then its own binaries/TRIAL_BUILD_silica-compiler" ;;
-        linux_x86_64)  echo "Linux x86-64 (nix), remote hosted: sync, then its own binaries/TRIAL_BUILD_silica-compiler" ;;
+        linux_aarch64) echo "Linux AArch64 (pix), remote hosted: sync, then its own binaries/silica-compiler" ;;
+        linux_x86_64)  echo "Linux x86-64 (nix), remote hosted: sync, then its own binaries/silica-compiler" ;;
         *)             echo "remote hosted machine" ;;
     esac
 }
@@ -257,7 +257,7 @@ cmd_status() {
 # `hostbusy [<own pid>]`: is this machine's host run in progress? Exit 0 and print the holder's pid when a
 # live process other than <own pid> holds the host lock (a nested run, a board or remote run, or any other
 # caller counts as "other"); exit 1 when the lock is free, stale, or held by <own pid> itself. Used by
-# ensure-silica-compiler (../silica_compiler.mk) to leave binaries/TRIAL_BUILD_silica-compiler alone during a host run.
+# ensure-silica-compiler (../silica_compiler.mk) to leave binaries/silica-compiler alone during a host run.
 cmd_hostbusy() {
     local own=${1:-} h pid
     h=$(lock_holder "$(lock_dir_of host)")
@@ -271,11 +271,11 @@ cmd_hostbusy() {
 # name, a number, or several of them separated by spaces or commas.
 cmd_choose() {
     local names=() descs=() t i answer n tok pick sel
-    names+=(host); descs+=("$(host_label), binaries/TRIAL_BUILD_silica-compiler  [default]")
+    names+=(host); descs+=("$(host_label), binaries/silica-compiler  [default]")
     for t in $(remote_targets); do names+=("$t"); descs+=("$(remote_desc "$t")"); done
     for t in $(board_targets); do
         # shellcheck disable=SC1090
-        descs+=("$(TARGET_DESCRIPTION=""; . "$here/$t.conf"; printf '%s, binaries/TRIAL_BUILD_silica-compiler-%s' "$TARGET_DESCRIPTION" "$t")")
+        descs+=("$(TARGET_DESCRIPTION=""; . "$here/$t.conf"; printf '%s, binaries/silica-compiler-%s' "$TARGET_DESCRIPTION" "$t")")
         names+=("$t")
     done
     n=${#names[@]}
@@ -379,7 +379,7 @@ run_board() {
     local board_dir="$repo_root/$TARGET_BOARD_DIR"
     local tools="$board_dir/tools"
     local py="${BOARD_PYTHON:-$TARGET_PYTHON}"
-    local compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/TRIAL_BUILD_silica-compiler-$target}"
+    local compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/silica-compiler-$target}"
     local mirror="$trials_root/.target/$target"
     local reqs="docs/required-software.md"
 

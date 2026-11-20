@@ -60,6 +60,7 @@ APP_DIRS := \
 	app_dangerous_spawn_thread_limit \
 	app_transport_tcp_loopback \
 	app_retained_buf_keep_state_area \
+	app_retained_buf_size_check \
 	app_frame_buf_nonretaining_wrapper
 
 GUARDED_APP_DIRS := \

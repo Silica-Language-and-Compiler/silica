@@ -5,8 +5,8 @@
 #   bash programmer_tools/rebuild_refresh_verify.sh --targets apple_silicon_mac
 #   bash programmer_tools/rebuild_refresh_verify.sh --skip-build       # sources unchanged since the last build
 #   bash programmer_tools/rebuild_refresh_verify.sh --skip-build --use-build
-#        # trials use each machine's trial build, compiler/build/TRIAL_BUILD_<target>/TRIAL_BUILD_silica-compiler,
-#        # instead of binaries/TRIAL_BUILD_silica-compiler (for builds made with INSTALL_SELFHOST=0, which install nothing)
+#        # trials use each machine's build directory compiler, compiler/build/<target>/silica-compiler,
+#        # instead of binaries/silica-compiler (for builds made with INSTALL_SELFHOST=0, which install nothing)
 #   bash programmer_tools/rebuild_refresh_verify.sh --list
 #
 # On each OS-hosted platform, in order:
@@ -14,9 +14,8 @@
 #      you rather than whatever it happened to hold; --skip-sync trusts what is already there
 #   0b. if a remote machine has no compiler of its own, send the newest matching native one from
 #      this checkout's binaries/, and after a successful build copy the new one back here
-#   1. build the compiler from compiler/src, after a clean, unless --skip-build, then its trial compiler
-#      (make build TRIAL_BUILD=1, installed as binaries/TRIAL_BUILD_silica-compiler[-<target>]); the
-#      trials are compiled by the trial compiler, and a platform without one is refused
+#   1. build the compiler from compiler/src, after a clean, unless --skip-build (installed as
+#      binaries/silica-compiler[-<target>]); the trials are compiled by it, and a platform without one is refused
 #   2. run the whole trial tree once, which is what produces the .sams the goldens come from
 #   3. record the goldens, with programmer_tools/update_goldens.sh --apply, which refreshes only
 #      trials whose run output already matched and never touches .scout or .golden_fail
@@ -249,13 +248,8 @@ do_host() {
         ( cd "$REPO/compiler/src" && make clean SILICA_TARGET_PROMPT=0 && make build SILICA_TARGET_PROMPT=0 ) \
             >"$LOG_DIR/$t-build.log" 2>&1 || { echo "  BUILD FAILED, see $LOG_DIR/$t-build.log"; note "$t" "BUILD FAILED" - - here; return 1; }
     fi
-    if [ "$DO_BUILD" = 1 ]; then
-        echo "  trial compiler"
-        ( cd "$REPO/compiler/src" && make build TRIAL_BUILD=1 INSTALL_SELFHOST=1 SILICA_TARGET_PROMPT=0 ) \
-            >"$LOG_DIR/$t-trial-build.log" 2>&1 || { echo "  TRIAL COMPILER BUILD FAILED, see $LOG_DIR/$t-trial-build.log"; note "$t" "TRIAL BUILD FAILED" - - here; return 1; }
-    fi
-    if [ "$USE_BUILD" = 1 ]; then trial_cc="$REPO/compiler/build/TRIAL_BUILD_$t/TRIAL_BUILD_silica-compiler"; else trial_cc="$REPO/binaries/TRIAL_BUILD_silica-compiler"; fi
-    [ -x "$trial_cc" ] || { echo "  no trial compiler: $trial_cc (build it: make -C compiler/src build TRIAL_BUILD=1 SILICA_TARGET_PROMPT=0)"; note "$t" "NO TRIAL COMPILER" - - here; return 1; }
+    if [ "$USE_BUILD" = 1 ]; then trial_cc="$REPO/compiler/build/$t/silica-compiler"; else trial_cc="$REPO/binaries/silica-compiler"; fi
+    [ -x "$trial_cc" ] || { echo "  no compiler: $trial_cc (build it: make -C compiler/src build SILICA_TARGET_PROMPT=0)"; note "$t" "NO COMPILER" - - here; return 1; }
     echo "  first run"
     ( cd "$REPO/trials" && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host ${USE_BUILD:+$( [ "$USE_BUILD" = 1 ] && echo "SILICA_COMPILER=$trial_cc")} ) >"$LOG_DIR/$t-run1.log" 2>&1
     echo "  before: $(counts "$REPO/trials/.integrate_report")"
@@ -339,17 +333,12 @@ do_remote() {
             fi
         fi
     fi
-    if [ "$DO_BUILD" = 1 ]; then
-        echo "  trial compiler on $conn"
-        ssh -o BatchMode=yes "$conn" "cd $rpath/compiler/src && make build TRIAL_BUILD=1 INSTALL_SELFHOST=1 SILICA_TARGET_PROMPT=0" \
-            >"$LOG_DIR/$t-trial-build.log" 2>&1 || { echo "  TRIAL COMPILER BUILD FAILED on $conn, see $LOG_DIR/$t-trial-build.log"; note "$t" "TRIAL BUILD FAILED" - - "$conn"; return 1; }
-    fi
-    local use_build_arg="" trial_rel="binaries/TRIAL_BUILD_silica-compiler"
-    [ "$USE_BUILD" = 1 ] && trial_rel="compiler/build/TRIAL_BUILD_$t/TRIAL_BUILD_silica-compiler" \
-        && use_build_arg=' SILICA_COMPILER=$PWD/../compiler/build/TRIAL_BUILD_'"$t"'/TRIAL_BUILD_silica-compiler'
+    local use_build_arg="" trial_rel="binaries/silica-compiler"
+    [ "$USE_BUILD" = 1 ] && trial_rel="compiler/build/$t/silica-compiler" \
+        && use_build_arg=' SILICA_COMPILER=$PWD/../compiler/build/'"$t"'/silica-compiler'
     ssh -o BatchMode=yes "$conn" "test -x $rpath/$trial_rel" 2>/dev/null || {
-        echo "  no trial compiler on $conn: $rpath/$trial_rel (build it: make -C compiler/src build TRIAL_BUILD=1 SILICA_TARGET_PROMPT=0)"
-        note "$t" "NO TRIAL COMPILER" - - "$conn"; return 1; }
+        echo "  no compiler on $conn: $rpath/$trial_rel (build it: make -C compiler/src build SILICA_TARGET_PROMPT=0)"
+        note "$t" "NO COMPILER" - - "$conn"; return 1; }
     echo "  first run on $conn"
     ssh -o BatchMode=yes "$conn" "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host$use_build_arg" >"$LOG_DIR/$t-run1.log" 2>&1
     echo "  before: $(ssh -o BatchMode=yes "$conn" "grep -m1 'success:' $rpath/trials/.integrate_report; grep -m1 'fail:' $rpath/trials/.integrate_report" 2>/dev/null | tr -dc '0-9/' )"
@@ -400,14 +389,9 @@ for t in $RAW_PLAN; do
             >"$LOG_DIR/$t-build.log" 2>&1 || { echo "  BUILD FAILED, see $LOG_DIR/$t-build.log"; note "$t" "BUILD FAILED" - - "cross, here"; overall=1; continue; }
         grep -hE "Installed (selfhost|target).*compiler:" "$LOG_DIR/$t-build.log" | tail -1 | sed 's/^/  /'
     fi
-    if [ "$DO_BUILD" = 1 ]; then
-        echo "  trial compiler (at most 5 compile jobs)"
-        ( cd "$REPO/compiler/src" && make build TRIAL_BUILD=1 TARGET="$t" INSTALL_SELFHOST=1 JOBS=5 SILICA_TARGET_PROMPT=0 ) \
-            >"$LOG_DIR/$t-trial-build.log" 2>&1 || { echo "  TRIAL COMPILER BUILD FAILED, see $LOG_DIR/$t-trial-build.log"; note "$t" "TRIAL BUILD FAILED" - - "cross, here"; overall=1; continue; }
-    fi
-    [ -x "$REPO/binaries/TRIAL_BUILD_silica-compiler-$t" ] || {
-        echo "  no trial compiler: $REPO/binaries/TRIAL_BUILD_silica-compiler-$t (build it: make -C compiler/src build TRIAL_BUILD=1 TARGET=$t SILICA_TARGET_PROMPT=0)"
-        note "$t" "NO TRIAL COMPILER" - - "cross, here"; overall=1; continue; }
+    [ -x "$REPO/binaries/silica-compiler-$t" ] || {
+        echo "  no compiler: $REPO/binaries/silica-compiler-$t (build it: make -C compiler/src build TARGET=$t SILICA_TARGET_PROMPT=0)"
+        note "$t" "NO COMPILER" - - "cross, here"; overall=1; continue; }
     echo "  trials on the board (it must be attached)"
     ( cd "$REPO/trials" && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET="$t" ) >"$LOG_DIR/$t-run.log" 2>&1
     rc=$?

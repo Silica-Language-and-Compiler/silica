@@ -25,7 +25,7 @@
 # gets its golden when its compile unit has an eligible program. An existing golden is never overwritten.
 # --dry-run lists what would be written and why each other trial is skipped (GEN-* lines), writes nothing
 # in the trials tree. --suite may repeat; --trial limits to one stem (all suites, or those named by --suite).
-# BOARD_SILICA_COMPILER overrides binaries/TRIAL_BUILD_silica-compiler-<target>; TRIALS_ROOT (default: this tree's trials/)
+# BOARD_SILICA_COMPILER overrides binaries/silica-compiler-<target>; TRIALS_ROOT (default: this tree's trials/)
 # can point at a copy of the trials for experiments.
 
 set -u
@@ -53,7 +53,7 @@ TARGET_ASCOMP_PLATFORM=""
 # shellcheck disable=SC1090
 . "$conf"
 [ -n "$TARGET_ASCOMP_PLATFORM" ] || die "$conf sets no TARGET_ASCOMP_PLATFORM"
-compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/TRIAL_BUILD_silica-compiler-$target}"
+compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/silica-compiler-$target}"
 [ -x "$compiler" ] || die "missing compiler $compiler"
 
 if [ "${#suites[@]}" -eq 0 ]; then

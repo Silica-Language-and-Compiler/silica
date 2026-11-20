@@ -10,10 +10,10 @@
 #   bash programmer_tools/run_trials_all_platforms.sh --compiler esp32=/path/to/silica-compiler-ESP32-S3_raw --board
 #
 # This script never builds a compiler. Each machine must already have its own native compiler at
-# <repo>/binaries/TRIAL_BUILD_silica-compiler (the trial compiler: make build TRIAL_BUILD=1, which
-# build_all_platforms.sh does after each normal build); a raw target is driven from this machine with
-# binaries/TRIAL_BUILD_silica-compiler-<target>. The script refuses to start when one is missing. The
-# one suite that tests a normal build uses the normal compiler through SILICA_NORMAL_COMPILER.
+# <repo>/binaries/silica-compiler (the normal compiler, which build_all_platforms.sh installs);
+# a raw target is driven from this machine with binaries/silica-compiler-<target>. The script
+# refuses to start when one is missing. The suite that tests a normal build uses the normal
+# compiler through SILICA_NORMAL_COMPILER.
 # --compiler (below) tests another one.
 #
 # Which platforms, and where their machines are:
@@ -348,25 +348,24 @@ fi
 
 [ "$SYNC_ONLY" = 1 ] && { echo "sync only: done"; exit 0; }
 
-# ---------------------------------------------------------------- trial compilers
+# ---------------------------------------------------------------- compilers
 
-# The trials are compiled by trial compilers (the trial hook is built only into them). Refuse to start
-# when one is missing, before any run begins.
+# The trials are compiled by the normal compilers. Refuse to start when one is missing, before any run begins.
 missing=""
-[ "$RUN_NATIVE" = 1 ] && [ ! -x "$REPO/binaries/TRIAL_BUILD_silica-compiler" ] \
-    && missing="$missing\n  here: $REPO/binaries/TRIAL_BUILD_silica-compiler"
+[ "$RUN_NATIVE" = 1 ] && [ ! -x "$REPO/binaries/silica-compiler" ] \
+    && missing="$missing\n  here: $REPO/binaries/silica-compiler"
 for t in $RUN_RAW; do
-    [ -x "$REPO/binaries/TRIAL_BUILD_silica-compiler-$t" ] \
-        || missing="$missing\n  here: $REPO/binaries/TRIAL_BUILD_silica-compiler-$t"
+    [ -x "$REPO/binaries/silica-compiler-$t" ] \
+        || missing="$missing\n  here: $REPO/binaries/silica-compiler-$t"
 done
 for t in $RUN_REMOTE; do
     spec="$(conn_of "$t")"
-    ssh -o BatchMode=yes "${spec%%:*}" "test -x ${spec#*:}/binaries/TRIAL_BUILD_silica-compiler" >/dev/null 2>&1 \
-        || missing="$missing\n  $t: ${spec%%:*}:${spec#*:}/binaries/TRIAL_BUILD_silica-compiler"
+    ssh -o BatchMode=yes "${spec%%:*}" "test -x ${spec#*:}/binaries/silica-compiler" >/dev/null 2>&1 \
+        || missing="$missing\n  $t: ${spec%%:*}:${spec#*:}/binaries/silica-compiler"
 done
 if [ -n "$missing" ]; then
-    printf 'No trial compiler, so no trial run starts. Missing:%b\n' "$missing" >&2
-    echo "Build them with: bash programmer_tools/build_all_platforms.sh (or, in compiler/src: make build TRIAL_BUILD=1 [TARGET=<t>] INSTALL_SELFHOST=1 SILICA_TARGET_PROMPT=0)" >&2
+    printf 'No compiler, so no trial run starts. Missing:%b\n' "$missing" >&2
+    echo "Build them with: bash programmer_tools/build_all_platforms.sh (or, in compiler/src: make build [TARGET=<t>] INSTALL_SELFHOST=1 SILICA_TARGET_PROMPT=0)" >&2
     exit 1
 fi
 
