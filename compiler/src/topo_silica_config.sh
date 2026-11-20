@@ -6,6 +6,7 @@
 # Usage:
 #   topo_silica_config.sh [--list-units] <TARGET>
 #   topo_silica_config.sh <TARGET>          # write ordered paths to stdout
+#   topo_silica_config.sh --edges <TARGET>  # write "<dep path><TAB><dependent path>" per in-tree use edge
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -17,12 +18,14 @@ TARGET=""
 usage() {
   echo "Usage: $0 [--list-units] <TARGET>" >&2
   echo "  --list-units   print sorted membership paths only (no topo)" >&2
+  echo "  --edges        print one '<dep path><TAB><dependent path>' line per in-tree use edge" >&2
   exit 2
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --list-units) MODE=list; shift ;;
+    --edges) MODE=edges; shift ;;
     -h|--help) usage ;;
     *)
       if [[ -n "$TARGET" ]]; then usage; fi
@@ -78,7 +81,7 @@ fi
 
 # Edges: dependency module -> dependent path (dep must compile first).
 # Module name = basename without .silica. Duplicate basenames are an error.
-awk -v units_file="$units_file" '
+awk -v units_file="$units_file" -v mode="$MODE" '
 function modname(path,    base) {
   base = path
   sub(/^.*\//, "", base)
@@ -129,6 +132,15 @@ BEGIN {
       }
     }
     close(path)
+  }
+
+  # --edges: the use graph itself, for compiler/tools/unit_cache.sh (no ordering, no cycle check).
+  if (mode == "edges") {
+    for (key in seen_edge) {
+      split(key, ends, SUBSEP)
+      print ends[1] "\t" ends[2]
+    }
+    exit 0
   }
 
   # Kahn: ready set sorted for stable order. Hold main.silica until the end.
