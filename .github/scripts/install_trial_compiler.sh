@@ -1,34 +1,51 @@
 #!/bin/bash
-# Install one compiler artifact from a Compiler workflow run.
-# Host targets replace binaries/silica-compiler. ESP32-S3_raw replaces
-# binaries/silica-compiler-ESP32-S3_raw and leaves the host link alone.
+# Install the latest released Silica compiler for one trial target, the way silica-cli's
+# README says to (https://github.com/Silica-Language-and-Compiler/silica-cli#install),
+# then point binaries/ at it.
+# Host targets replace binaries/silica-compiler. ESP32-S3_raw also installs the cross
+# compiler and replaces binaries/silica-compiler-ESP32-S3_raw.
+#
+# This is the latest release, not a compiler built from this commit.
 
 set -euo pipefail
 
-run_id="${1:?compiler run id}"
-target="${2:?emit target}"
-dest="${RUNNER_TEMP:?}/compiler-artifact"
-rm -rf "$dest"
-mkdir -p "$dest"
-gh run download "$run_id" --name "$target" --dir "$dest"
+target="${1:?emit target}"
+export SILICA_HOME="${RUNNER_TEMP:?}/silica-home"
+# Raises the GitHub API rate limit for the compiler download.
+export GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
-files=()
-while IFS= read -r file; do
-    files+=("$file")
-done < <(find "$dest" -type f)
-if [ "${#files[@]}" -ne 1 ]; then
-    echo "artifact ${target} from run ${run_id} should be one compiler file, found ${#files[@]}" >&2
-    find "$dest" -print >&2
+rm -rf "$SILICA_HOME"
+curl -fsSL https://github.com/Silica-Language-and-Compiler/silica-cli/releases/latest/download/install.sh | bash
+
+silica="$SILICA_HOME/bin/silica"
+case "$target" in
+    ESP32-S3_raw)
+        "$silica" update --target "$target"
+        installed="$SILICA_HOME/bin/silica-compiler-ESP32_S3_raw"
+        link="silica-compiler-ESP32-S3_raw"
+        ;;
+    *)
+        installed="$SILICA_HOME/bin/silica-compiler"
+        link="silica-compiler"
+        ;;
+esac
+
+if [ ! -e "$installed" ]; then
+    echo "silica-cli did not install ${installed}" >&2
+    ls -la "$SILICA_HOME/bin" >&2
     exit 1
 fi
 
-name=$(basename "${files[0]}")
+# Resolve the link to the versioned file (silica-<NNNNNN>-...) and copy that.
+real="$(readlink -f "$installed")"
+name="$(basename "$real")"
 mkdir -p binaries
-cp -p "${files[0]}" "binaries/${name}"
+cp -p "$real" "binaries/${name}"
 chmod +x "binaries/${name}"
-case "$target" in
-    ESP32-S3_raw) link="silica-compiler-ESP32-S3_raw" ;;
-    *) link="silica-compiler" ;;
-esac
 ln -sfn "$name" "binaries/${link}"
-echo "installed binaries/${link} -> ${name}"
+echo "installed binaries/${link} -> ${name} (latest release)"
+"$silica" version
+{
+    echo "### Compiler"
+    echo "Trials for \`${target}\` use the latest released compiler \`${name}\`, installed with silica-cli."
+} >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
