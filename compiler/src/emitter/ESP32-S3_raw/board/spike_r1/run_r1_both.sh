@@ -81,7 +81,7 @@ modules="Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_c
 for m in $modules; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$SRC/$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$SRC/trial_wait_int64.silica"
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" "$SRC/trial_support_hex.silica"
-sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$peer:$PORT\" }|" \
+sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$peer:$PORT:${SPIKE_CONNECT_MS:-5000}\" }|" \
     -e "s|^fn ble_links() -> int64 { 1 }|fn ble_links() -> int64 { $links }|" \
     -e "s|^fn links() -> int64 { 1 }|fn links() -> int64 { $links }|" "$DEMO/dangerous_both_board_peer.silica" > "$SRC/dangerous_both_board_peer.silica"
 # --only wifi|ble: the other radio's carrier is never opened (its libraries are still in the image), and

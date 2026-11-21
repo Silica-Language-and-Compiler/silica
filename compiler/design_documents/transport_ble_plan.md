@@ -2012,6 +2012,35 @@ Each stage's result is recorded here when it closes: date, what was built, trial
   - On the board: the two-radio image, the Mac's end on the hosted carrier and the board's on the
     board carrier, fifteen links of fifteen on each radio, status 0.
 
+- **Stage 12, part 18, 2026-11-21, merge of `main` (7b19729fc1) into this branch: the board's lwIP
+  sockets take the calls of `main`'s `(:tcp)` carrier; compiled, not yet run on the board.** The
+  merge is commit 6366cd71a9. `main`'s `(:tcp)` carrier (`dangerous_tcp_carrier.silica`, over
+  `dangerous_sockets`) now calls socket functions the board's lwIP layer did not have.
+  - `compiler/stdlib/wifi/silica_sockets_lwip.c` gains ten wrappers: `silica_sockets_set_connect_timeout`,
+    `_parse_ipv6`, `_parse_host_name`, `_link_owns6`, `_tcp_connect6`, `_tcp_listen_addr6`,
+    `_tcp_listen_name`, `_peer_family`, `_peer_addr6_word` and `_udp_bind_on`.
+  - The address checks (`ipv4_strict`, `ipv6_strict`, `ipv6_render`, `host_name_strict`) are copied
+    unchanged from the hosted wrapper, so that an address is accepted or refused alike on every
+    target. The dial's connect timeout (`set_connect_timeout`, 1 to INT32_MAX milliseconds, taken by
+    the next connect; EINVAL when none was stated) replaces the fixed 5 s `CONNECT_MS`. The connect
+    is made without blocking and left non-blocking afterwards.
+  - IPv6 on the board: `parse_ipv6` answers 1 for `::1`, 0 for any other usable address and EINVAL
+    otherwise (a link-local address is not usable). `link_owns6` answers 0 for every usable address,
+    the station having no IPv6 address, and `tcp_connect6` with a dial from the link (`set_args b 1`)
+    is ENXIO. Otherwise `tcp_connect6` and `tcp_listen_addr6` open lwIP IPv6 sockets (V6ONLY), so
+    `[::1]` works as lwIP's loopback interface allows. `tcp_listen_name` checks its arguments, then
+    answers ENXIO: route R1 has no resolver. `peer_family` answers 4 or 6, `peer_addr6_word` one
+    32-bit word of an IPv6 peer's address. `udp_bind_on` is ENOSYS, as the other UDP calls are.
+  - `run_r1_wifi_peer.sh` and `run_r1_both.sh` dial `host:port:${SPIKE_CONNECT_MS:-5000}`, `main`'s
+    carrier requiring the timeout part of the address.
+  - Compiles clean with the board toolchain; not run on the board. On the Mac, the suites
+    `transport`, `ffi` and `error_enforcement` after the merge: 11,469 pass. Known failures:
+    `dangerous_tcp_carrier_end_memory` (it fails on `main` too) and two intermittent exit-report-order
+    trials.
+  - Left: `main` has moved to 0f37f5edf8 (PRs #84 to #86, among them the `(:accepted, fd, peer)`
+    listener contract). A second merge of `main`, then the board runs: the core suites, the R1 Wi-Fi,
+    Bluetooth and two-radio images, and `run_r1_tcp_trials.sh`.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is

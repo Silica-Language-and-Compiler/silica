@@ -85,7 +85,7 @@ modules="Supervisor wire_etf wireframe Carrier dangerous_sockets dangerous_tcp_c
 for m in $modules; do ln -sf "$ROOT/compiler/stdlib/$m.silica" "$SRC/$m.silica"; done
 ln -sf "$ROOT/trials/lib_trial_support/trial_wait_int64.silica" "$SRC/trial_wait_int64.silica"
 ln -sf "$ROOT/trials/lib_trial_support/trial_support_hex.silica" "$SRC/trial_support_hex.silica"
-address="$peer:$PORT" listening=false connect_to=""
+address="$peer:$PORT:${SPIKE_CONNECT_MS:-5000}" listening=false connect_to=""
 [ "$listen" = 1 ] && address="listen:$PORT" listening=true connect_to=$peer
 sed -e "s|^fn address() -> string { \"0.0.0.0:0\" }|fn address() -> string { \"$address\" }|" \
     -e "s|^fn listening() -> boolean { false }|fn listening() -> boolean { $listening }|" \
