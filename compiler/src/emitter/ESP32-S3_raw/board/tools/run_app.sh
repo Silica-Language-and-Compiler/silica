@@ -39,6 +39,11 @@
 #   --timeout S        seconds the program may run before the run counts as hung (default 60)
 #   --port P           the board's serial port (default $BOARD_PORT, else the one USB serial port)
 #   --flash            write the image to flash at 0x0 and run it from there (default: RAM)
+#   --guest            run the app as a guest of ESP-IDF (board/guest: ESP-IDF owns the chip and the
+#                      Silica runtime runs in two of its tasks) instead of on bare metal. The image
+#                      is built by guest/tools/build_image.sh, which needs ESP-IDF at IDF_PATH
+#                      (default ~/esp/esp-idf-v6.2) and keeps its build of the ESP-IDF application
+#                      in guest/.cache, and is always written to flash. Silica apps only.
 #   --build-only       compile and build the image, do not touch the board
 #   --keep             keep the temporary directory (its path is printed)
 #   -h, --help         this text
@@ -70,7 +75,7 @@ TRIALS="$REPO/trials"
 usage() { sed -n "/^# Build one board app/,/^$/p" "$0" | sed "s/^# \{0,1\}//"; }
 die() { echo "run_app: $1" >&2; exit "${2:-2}"; }
 
-send="" send_set=0 send_delay="" timeout="" port="" flash=0 build_only=0 keep=0 app=""
+send="" send_set=0 send_delay="" timeout="" port="" flash=0 build_only=0 keep=0 app="" guest=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --send)       [ $# -ge 2 ] || die "--send needs a value"; send=$2; send_set=1; shift 2 ;;
@@ -78,6 +83,7 @@ while [ $# -gt 0 ]; do
         --timeout)    [ $# -ge 2 ] || die "--timeout needs a value"; timeout=$2; shift 2 ;;
         --port)       [ $# -ge 2 ] || die "--port needs a value"; port=$2; shift 2 ;;
         --flash)      flash=1; shift ;;
+        --guest)      guest=1; shift ;;
         --build-only) build_only=1; shift ;;
         --keep)       keep=1; shift ;;
         -h|--help)    usage; exit 0 ;;
@@ -207,7 +213,13 @@ img="$tmp/image/$name"
 echo "run_app: building the image" >&2
 # from the app's directory, so an assembly app's .include (asm_10_pin_hunt's pins.inc) resolves;
 # build_image.sh writes only under $tmp
-if ! ( cd "$appdir" && sh "$HERE/build_image.sh" -r "$tmp/rtcache" -o "$img" "${sources[@]}" ) > "$tmp/image.log" 2>&1; then
+# the guest's builder keeps its own cache (the ESP-IDF application takes minutes to build once)
+tools="$HERE" rtcache=(-r "$tmp/rtcache")
+if [ "$guest" = 1 ]; then
+    [ "$kind" = silica ] || die "--guest runs Silica apps (an assembly app is its own bare-metal start-up)"
+    tools="$BOARD/guest/tools" rtcache=()
+fi
+if ! ( cd "$appdir" && sh "$tools/build_image.sh" ${rtcache[@]+"${rtcache[@]}"} -o "$img" "${sources[@]}" ) > "$tmp/image.log" 2>&1; then
     cat "$tmp/image.log" >&2
     die "image build failed" 6
 fi
@@ -224,15 +236,16 @@ fi
 # --- board -------------------------------------------------------------------------------------------
 # A board trial run holds trials/.integrate.lock.ESP32-S3_raw for its whole length and takes the board lock per
 # trial only, so check the run lock too: between two trials the board lock is free.
-owner="$TRIALS/.integrate.lock.ESP32-S3_raw/owner"
-if [ -f "$owner" ]; then
-    IFS=$'\t' read -r opid otarget _ < "$owner"
-    if [ -n "${opid:-}" ] && kill -0 "$opid" 2>/dev/null; then
-        die "a board trial run is in progress (target $otarget, pid $opid); try again when it ends" 7
+for owner in "$TRIALS/.integrate.lock.ESP32-S3_raw/owner" "$TRIALS/.integrate.lock.ESP32-S3_idf/owner"; do
+    if [ -f "$owner" ]; then
+        IFS=$'\t' read -r opid otarget _ < "$owner"
+        if [ -n "${opid:-}" ] && kill -0 "$opid" 2>/dev/null; then
+            die "a board trial run is in progress (target $otarget, pid $opid); try again when it ends" 7
+        fi
     fi
-fi
+done
 
-runner=("$py" "$HERE/run_on_board.py")
+runner=("$py" "$tools/run_on_board.py")
 [ -n "$port" ] && runner+=(--port "$port")
 [ -n "$timeout" ] && runner+=(--timeout "$timeout")
 [ "$send_set" = 1 ] && runner+=(--send "$send")

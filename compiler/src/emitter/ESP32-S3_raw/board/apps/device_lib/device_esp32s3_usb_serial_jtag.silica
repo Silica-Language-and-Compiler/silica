@@ -48,8 +48,8 @@
 //   (:open, owner, address)   map the window, enable the USB pads (CONF0 USB_PAD_ENABLE, the reset
 //                             default, which rt_board clears only when GPIO19/20 are used as plain
 //                             GPIO), clear the pending flags, discard bytes left in the OUT FIFO, and
-//                             check the link: the SOF frame index (:fram_num) must advance over about
-//                             100 ms, which it does whenever a USB host has the cable (the host sends
+//                             check the link: the SOF frame index (:fram_num) must advance within
+//                             a second, which it does whenever a USB host has the cable (the host sends
 //                             SOFs with the port open or not; the controller is enumerated by the ROM
 //                             and hardware, there is no association step). Then (:link_up,
 //                             "usb_serial_jtag") (with "@<address>" appended when the address is not
@@ -102,6 +102,25 @@ fn byte_of(ch: string) -> uint32 {
 
 fn spin(n: int64) -> int64 {
     case n == 0 of { true -> 0; false -> spin(n - 1) }
+}
+
+// Busy-waits until monotonic_time reaches `deadline` (nanoseconds). The frame checks wait by the clock
+// and not by a count of spins: a count is a time only at one CPU speed, and 40000 spins, about 100 ms
+// on the bare-metal runtime, are under a millisecond as a guest of ESP-IDF, less than one USB frame.
+fn wait_until(deadline: int64) -> int64 {
+    sequence proc[concurrency]
+        now: int64 <- monotonic_time();
+        r: int64 <- case now >= deadline of {
+            true -> 0;
+            false -> wait_until(deadline)
+        }
+    produces
+        pure r
+    end
+}
+
+fn frame_check_ns() -> int64 {
+    1000000000
 }
 
 // Waits (at most `polls` polls) until the IN FIFO has room, then queues the byte; a byte that finds
@@ -211,7 +230,8 @@ fn report_timeout(w: device_window(L, (:esp32s3_usb_serial_jtag)), reply_to: act
         _: boolean <- cast(reply_to, v5 impl ActorMessage {});
         v6: uint32 <- peek(w, :fram_num) impl Register32 {};
         _: boolean <- cast(reply_to, v6 impl ActorMessage {});
-        _: int64 <- spin(40000);
+        t0: int64 <- monotonic_time();
+        _: int64 <- wait_until(t0 + 100000000);
         v7: uint32 <- peek(w, :fram_num) impl Register32 {};
         _: boolean <- cast(reply_to, v7 impl ActorMessage {})
     produces
@@ -516,15 +536,35 @@ fn clear_flags(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> device_window
     end
 }
 
-// True when the SOF frame index advanced over about 100 ms: a USB host is on the cable.
+// Polls the SOF frame index until it differs from `first` or monotonic_time reaches `deadline`.
+fn frame_advanced(w: device_window(L, (:esp32s3_usb_serial_jtag)), first: uint32, deadline: int64) -> boolean {
+    sequence proc[register_rwr, concurrency]
+        mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_sof_frame_index_mask();
+        f: uint32 <- peek(w, :fram_num) impl Register32 {};
+        now: int64 <- monotonic_time();
+        r: boolean <- case (f band mask) != first of {
+            true -> true;
+            false -> case now >= deadline of {
+                true -> false;
+                false -> frame_advanced(w, first, deadline)
+            }
+        }
+    produces
+        pure r
+    end
+}
+
+// True when the SOF frame index advances within the check: a USB host is on the cable. It answers as
+// soon as the index moves (a millisecond with a host), and waits the whole check only without one; the
+// check is long enough for a host that is still enumerating the controller after the board's reset.
 fn sof_running(w: device_window(L, (:esp32s3_usb_serial_jtag))) -> boolean {
-    sequence proc[register_rwr]
+    sequence proc[register_rwr, concurrency]
         mask: uint32 <- board_pack_usb_serial_jtag_values@usb_serial_jtag_sof_frame_index_mask();
         f1: uint32 <- peek(w, :fram_num) impl Register32 {};
-        _: int64 <- spin(40000);
-        f2: uint32 <- peek(w, :fram_num) impl Register32 {}
+        t0: int64 <- monotonic_time();
+        alive: boolean <- frame_advanced(w, f1 band mask, t0 + frame_check_ns())
     produces
-        pure (f1 band mask) != (f2 band mask)
+        pure alive
     end
 }
 

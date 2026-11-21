@@ -185,6 +185,14 @@ reason (`target:` the board cannot run it; `driver:` the board driver does not h
 layout yet). Subdirectories with their own Makefile (the multi-file trials under
 error_enforcement_addition) are skipped automatically. Skips are reported, never counted as passes.
 
+A suite with a `guest_c_sources` file (transport_ble_board_addition) has programs that call ESP-IDF's
+libraries through a Fifi wrapper. The file lists the wrapper's C sources, one path per line relative to
+the repository root. On `ESP32-S3_idf` the driver compiles each into every program's image as ESP-IDF
+code; for the compile it links each source's directory under `dangerous_exposure_source/` (the `.meta`
+files resolve there) and gives every `.meta`'s `link_library` an archive that holds only its symbols,
+which the compiler's existence check wants. On a target whose board tools are not the guest's the
+suite's programs are skipped: bare metal has no ESP-IDF. Its goldens are `<trial>.ESP32-S3_idf.scout`.
+
 ## Target STM32-L476RG_raw (ST NUCLEO-L476RG)
 
 ```

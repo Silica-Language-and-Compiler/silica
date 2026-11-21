@@ -41,9 +41,34 @@
 // console (rt_console.S) and is never a link (decision 17: E2412 with the console note); UART2 is a
 // link of decision 17 but has no window in board_pack yet, so it is not provided until it does. The
 // UART1 worker runs 115200 8N1 with a fixed CLKDIV (crystal clock, 347 + 3/16), so link_baud_ok
-// accepts 115200 only for now; the USB-Serial-JTAG controller has no line speed. (:tcp) and (:udp) and
-// the network links wait for phase D (E2410 / E2412 here). The ESP32-S3 board compiles the carrier
+// accepts 115200 only for now; the USB-Serial-JTAG controller has no line speed. (:udp), and (:tcp) on
+// any link but (:wifi, 0) and (:loopback) (below), wait for phase D (E2410 / E2412 here). The ESP32-S3 board compiles the carrier
 // tags (:uart1) / (:usb_serial_jtag) as well, for programs that read Carrier@mtu((:uart1)) directly.
+//
+// Bluetooth (transport_ble_plan.md stages 7 and 9, 2026-11-14): the kind (:ble_gatt) on the link
+// (:bluetooth, 0), the chip's own radio, in both roles. The carrier
+// (compiler/stdlib/dangerous_ble_gatt_board_carrier.silica) is the connection actor above the radio
+// actor and NimBLE, ESP-IDF's Bluetooth host, so it exists only in a program built as a guest of
+// ESP-IDF (board/guest, with compiler/stdlib/ble/silica_ble_nimble.c in the image); the bare-metal
+// runtime has no radio, and a program that declares the link does not link there. Only the radio actor
+// calls foreign code, so the carrier is an ordinary actor: its expansion is `spawn(<initial state>,
+// dangerous_ble_gatt_board_carrier@carrier, <policies>...)`, an actor_ref the program casts to with
+// cast (the hosted carrier is a dangerous_actor_ref).
+//
+// Wi-Fi (transport_ble_plan.md stage 12, parts 6 to 8, 2026-11-15): the kind (:tcp) on the link
+// (:wifi, 0), the chip's own radio as a station. The carrier is the hosted one
+// (compiler/stdlib/dangerous_tcp_carrier.silica) as it is, a dangerous actor over dangerous_sockets,
+// spawned with the link as text ("wifi:0") in its state as the hosted packs spawn it; on the board
+// the socket wrappers under it are lwIP's (compiler/stdlib/wifi/silica_sockets_lwip.c in place of
+// compiler/stdlib/net/silica_sockets.c), and the link's interface is the station. Those are in an
+// image only on route R1 of that plan so far (board/spike_r1/run_r1_wifi_peer.sh): a program that
+// declares the link does not link without them. The access point is not in the declaration: its
+// name and passphrase are compiled into the wrapper from a file kept out of git.
+//
+// Loopback (stage 12, part 15): the kind (:tcp) on the link (:loopback), the same carrier with the
+// link "loopback" in its state, as the hosted packs spawn it. Both ends are in the one program, on
+// lwIP's own loopback interface (127.0.0.1), which needs lwIP in the image (the same wrappers) and
+// no radio: the station is not started for it.
 //
 // carrier_spawn spells the spawn that `spawn_dangerous_carrier(<name>, <policies>...)` expands to
 // (parser carried_on_expand): on this board the carrier is a device worker reached with spawn_device,
@@ -72,6 +97,8 @@ fn provides_carrier(tag: string) -> boolean {
         "serial" -> true;
         "uart1" -> true;
         "usb_serial_jtag" -> true;
+        "ble_gatt" -> true;
+        "tcp" -> true;
         _: string -> false
     }
 }
@@ -81,12 +108,15 @@ fn provides_link(link_tag: string, instance: int64) -> boolean {
     case link_tag of {
         "uart" -> instance == 1;
         "usb_serial_jtag" -> true;
+        "bluetooth" -> instance == 0;
+        "wifi" -> instance == 0;
+        "loopback" -> true;
         _: string -> false
     }
 }
 
 fn provided_links() -> string {
-    "(:uart, 1, baud), (:usb_serial_jtag)"
+    "(:uart, 1, baud), (:usb_serial_jtag), (:bluetooth, 0), (:wifi, 0), (:loopback)"
 }
 
 // Decision 17: UART0 is the console (rt_console.S, the USB-UART jack) and cannot be a link.
@@ -108,7 +138,13 @@ fn link_baud_ok(link_tag: string, baud: int64) -> boolean {
 
 fn carrier_module(kind: string, link_tag: string) -> string {
     case kind == "serial" of {
-        false -> "";
+        false -> case kind == "ble_gatt" and link_tag == "bluetooth" of {
+            true -> "dangerous_ble_gatt_board_carrier";
+            false -> case kind == "tcp" and (link_tag == "wifi" or link_tag == "loopback") of {
+                true -> "dangerous_tcp_carrier";
+                false -> ""
+            }
+        };
         true -> case link_tag of {
             "uart" -> "device_esp32s3_uart1";
             "usb_serial_jtag" -> "device_esp32s3_usb_serial_jtag";
@@ -121,7 +157,16 @@ fn carrier_module(kind: string, link_tag: string) -> string {
 // no carrier for the kind on the link.
 fn carrier_spawn(kind: string, link_tag: string, instance: int64, params: string) -> string {
     case provides_link(link_tag, instance) and kind == "serial" of {
-        false -> "";
+        false -> case provides_link(link_tag, instance) and kind == "ble_gatt" and link_tag == "bluetooth" of {
+            true -> "spawn({ owner: actor_ref_of_word(0), phase: 0, radio: false }, dangerous_ble_gatt_board_carrier@carrier";
+            false -> case provides_link(link_tag, instance) and kind == "tcp" and link_tag == "wifi" of {
+                true -> "spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: \"wifi:0\" }, dangerous_tcp_carrier@carrier";
+                false -> case kind == "tcp" and link_tag == "loopback" of {
+                    true -> "spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: \"loopback\" }, dangerous_tcp_carrier@carrier";
+                    false -> ""
+                }
+            }
+        };
         true -> case link_tag of {
             "uart" -> "spawn_device(:idle, device_esp32s3_uart1@uart1_carrier";
             "usb_serial_jtag" -> "spawn_device(:idle, device_esp32s3_usb_serial_jtag@usb_serial_jtag_carrier";

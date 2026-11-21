@@ -25,7 +25,12 @@
 #
 # Sources are .S/.s hand-written assembly, .sams emitted by an ESP32-S3_raw silica-compiler, .c files
 # (foreign-call wrappers, spec §20.4: compiled freestanding by the same toolchain's GCC, no C library
-# in the image beyond the memory functions of board/runtime/rt_ffi.S; BOARD_CFLAGS adds flags), and
+# in the image beyond the memory functions of board/runtime/rt_ffi.S; BOARD_CFLAGS adds flags,
+# BOARD_ASFLAGS adds flags for the runtime's and the sources' assembly (-DNCORES_RUN=1: one core);
+# BOARD_STACK_ALLOWANCE=N keeps N more bytes above every stack's guard band, for an interrupt handler
+# of foreign code (rt_vectors.S);
+# BOARD_LDFLAGS adds link options, such as further linker scripts; BOARD_FLASH_FILES names files
+# whose code and constants run from flash: tools/flash_layout.py, and the program maps them), and
 # prebuilt .o objects and .a archives for this triple (an archive built with xtensa-esp32s3-elf-ar
 # rcs; archives are placed after every object on the link line). BOARD_FFI_STACK=N sets the machine
 # stack a foreign call runs on (the link's _silica_ffi_stack_size; 4 KB when unset).
@@ -80,7 +85,7 @@ fi
 # --longcalls: CALL8 reaches +-512 KB, relaxed to L32R+CALLX8 when a target is further away.
 # --auto-litpools is NOT used: literals go to .literal sections, which the link script puts in
 # front of .text (L32R only reaches backwards, 256 KB).
-ASFLAGS="-c -mlongcalls"
+ASFLAGS="-c -mlongcalls ${BOARD_ASFLAGS:-}"
 # C wrappers: freestanding (no C library is linked; rt_ffi.S provides memcpy/memmove/memset/memcmp/
 # strlen), one section per function so --gc-sections keeps only what the program calls, literals in
 # .literal sections as for the runtime. A wrapper's own directory is on the include path.
@@ -134,9 +139,18 @@ for src in "$@"; do
     objs="$objs $obj"
 done
 
+# BOARD_FLASH_FILES: the files whose code and constants run from flash (flash_layout.py)
+# BOARD_FLASH_IRAM=1: their code marked for RAM (.iram1) as well
+ldscript="$RT/silica_esp32s3.ld"
+if [ -n "${BOARD_FLASH_FILES:-}" ]; then
+    ldscript="$objdir/silica_esp32s3_flash.ld"
+    # shellcheck disable=SC2086
+    "${BOARD_PYTHON:-python3}" "$HERE/flash_layout.py" script ${BOARD_FLASH_IRAM:+--iram} "$RT/silica_esp32s3.ld" "$ldscript" $BOARD_FLASH_FILES
+fi
+
 link() {   # the --defsym options must precede -T: the script tests DEFINED() on them
-    "$CC" -nostdlib -nostartfiles -Wl,--gc-sections $ffi_defsym "$@" -Wl,-T,"$RT/silica_esp32s3.ld" \
-        -Wl,-Map,"$out.map" -o "$out.elf" $objs $libs -lgcc
+    "$CC" -nostdlib -nostartfiles -Wl,--gc-sections $ffi_defsym "$@" ${BOARD_LDFLAGS:-} -Wl,-T,"$ldscript" \
+        -Wl,-Map,"$out.map" -o "$out.elf" $objs -Wl,--start-group $libs -lgcc -Wl,--end-group
 }
 
 # Pass 1: small main stacks, only to measure. Pass 2: main's stacks and the runtime reserve from
@@ -154,6 +168,8 @@ machine=$(printf '%s\n' "$bound" | sed -n 's/^machine //p')
 aux=$(printf '%s\n' "$bound" | sed -n 's/^aux //p')
 rt_depth=$(printf '%s\n' "$bound" | sed -n 's/^rt_depth //p')
 [ "$rt_depth" -lt 64 ] && rt_depth=64        # the overflow handlers' own two frames
+# room on every stack for an interrupt handler of foreign code, which runs on the stack it interrupts
+rt_depth=$(( rt_depth + ${BOARD_STACK_ALLOWANCE:-0} ))
 size_with_margin() {                         # bound -> bound + max(bound/4, 128) + guard 64, up to 64
     m=$(( $1 / 4 )); [ "$m" -lt 128 ] && m=128
     echo $(( ( $1 + m + 64 + 63 ) / 64 * 64 ))
@@ -184,11 +200,22 @@ if [ "$main1" != "$main2" ]; then
     exit 1
 fi
 
-"$ESPTOOL" --chip esp32s3 elf2image --flash-mode dio --flash-freq 80m --flash-size 2MB \
-    -o "$out.bin" "$out.elf" >/dev/null
+if [ -n "${BOARD_FLASH_FILES:-}" ]; then
+    # the RAM part as the ROM loads it, then the constants and the code where the program maps them
+    OBJCOPY="$XTENSA_BIN/xtensa-esp32s3-elf-objcopy"
+    "$OBJCOPY" -O binary -j .flash.text "$out.elf" "$out.flash_text.bin"
+    "$OBJCOPY" -O binary -j .flash.rodata "$out.elf" "$out.flash_rodata.bin"
+    "${BOARD_PYTHON:-python3}" "$HERE/flash_layout.py" ram "$out.elf" "$out.ram.elf"
+    "$ESPTOOL" --chip esp32s3 elf2image --flash-mode dio --flash-freq 80m --flash-size 2MB \
+        -o "$out.ram.bin" "$out.ram.elf" >/dev/null
+    "${BOARD_PYTHON:-python3}" "$HERE/flash_layout.py" merge "$out.ram.bin" "$out.flash_rodata.bin" "$out.flash_text.bin" "$out.bin"
+else
+    "$ESPTOOL" --chip esp32s3 elf2image --flash-mode dio --flash-freq 80m --flash-size 2MB \
+        -o "$out.bin" "$out.elf" >/dev/null
+fi
 
 [ "$quiet" = 1 ] && exit 0
-"$XTENSA_BIN/xtensa-esp32s3-elf-size" -A "$out.elf" | awk '/^\.(iram0|dram0)/ {printf "  %-16s %7d bytes @ %s\n", $1, $2, sprintf("0x%x", $3)}'
+"$XTENSA_BIN/xtensa-esp32s3-elf-size" -A "$out.elf" | awk '/^\.(iram0|dram0|flash)/ {printf "  %-16s %7d bytes @ %s\n", $1, $2, sprintf("0x%x", $3)}'
 hs=$("$XTENSA_BIN/xtensa-esp32s3-elf-nm" "$out.elf" | awk '$3 == "_silica_heap_start" {print $1}')
 he=$("$XTENSA_BIN/xtensa-esp32s3-elf-nm" "$out.elf" | awk '$3 == "_silica_heap_end" {print $1}')
 heap=$(( 0x$he - 0x$hs ))

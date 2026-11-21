@@ -1,0 +1,261 @@
+{-
+
+   Copyright 2026 COPYRIGHT-HOLDER-PLACEHOLDER (to be decided before this is merged)
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The (:ble_gatt) carrier of transport_serialization_design.md §6.3 and §6.5 on the ESP32-S3
+// (transport_ble_plan.md stages 7 and 9): the connection actor of §2.2, speaking the carrier contract of §6.2
+// to its owner and casting to the radio actor (dangerous_ble_radio), which alone calls the Bluetooth
+// host. The program runs as a guest of ESP-IDF (board/guest) with compiler/stdlib/ble/
+// silica_ble_nimble.c in its image. The carrier is declared on the chip's radio,
+// `carried_on <name>: (:ble_gatt) (:bluetooth, 0);`, spawned with spawn_dangerous_carrier(<name>, ...)
+// and opened with (:open, owner, address), the address as on a hosted target
+// (dangerous_ble_gatt_carrier). It calls no foreign code itself, so it is an ordinary actor and the
+// spawn answers an actor_ref, where the hosted carrier is a dangerous_actor_ref:
+//
+//   "central:<uuid>"     scans for a peripheral offering the service, connects and subscribes;
+//   "peripheral:<uuid>"  publishes and advertises the service and waits for a central to subscribe.
+//
+// <uuid> is the service's UUID in text (4, 8 or 36 characters); nothing after the colon means the
+// Nordic UART Service. :open answers nothing while the carrier seeks its peer; when the link is up the
+// owner gets (:link_up, "mtu:<n>"), n being the largest segment the link carries (the negotiated ATT_MTU
+// minus 3, at least 20), and 8 send credits.
+//
+// One :tx is one segment: an indication toward a central, a write with response toward a peripheral, so
+// :tx_credit comes back when the peer has taken it. A segment longer than the link's mtu is
+// (:tx_failed, :too_long); a :tx while the link is not up, or one the peer did not confirm, is
+// (:tx_failed, :link_down). Received segments are delivered as :rx, one per :credit the owner granted.
+//
+// (:link_down, reason): :closed after :close or when the peer ended the link, :timeout when the link
+// was lost, :fault for an address that names no role, a UUID that cannot be read, a radio that did not
+// start, a peripheral without the service's characteristics, or any other failure. After :link_down
+// the carrier can be opened again; as a peripheral with the same service, since the host publishes one
+// service for as long as the program runs.
+//
+// As peripheral the carrier requires an encrypted link (pairing with no code, LE Secure Connections;
+// no keys are kept, so every link pairs afresh): :link_up comes when the central has paired and
+// subscribed. As central it pairs when the peripheral requires it, and its link to a peripheral that
+// requires nothing (a program on a Mac) is open. The pairing keeps a listener out and does not prove
+// who the peer is.
+//
+// The board holds one link. The first carrier a program opens takes the radio for as long as the program
+// runs: it registers itself under the name :dangerous_ble_gatt_board_carrier and spawns the radio actor
+// under the name :dangerous_ble_radio. An :open to any other carrier answers (:link_down, :fault).
+module dangerous_ble_gatt_board_carrier;
+
+use dangerous_ble_radio;
+use carrier_support;
+
+export initial/0;
+export carrier/2;
+
+// phase: 0 not open, 1 waiting for a central, 2 up. radio: this carrier has spawned the radio actor.
+fn initial() -> { owner: actor_ref, phase: int64, radio: boolean } {
+    { owner: actor_ref_of_word(0), phase: 0, radio: false }
+}
+
+// NimBLE's reason for a disconnection (0x200 + the controller's code) as the contract's. :closed when an
+// end chose to end the link: 0x213 the peer's user, 0x214 the peer short of resources, 0x215 the peer
+// powering off, 0x216 this end. :timeout when the peer stopped answering: 0x208 the link was lost,
+// 0x222 no answer to a request, 0x23E the connection was never established.
+fn down_reason_of(reason: int64) -> atom {
+    case reason >= 531 and reason <= 534 of {
+        true -> :closed;
+        false -> case reason == 520 or reason == 546 or reason == 574 of {
+            true -> :timeout;
+            false -> :fault
+        }
+    }
+}
+
+// The tags of the messages this actor takes, as values. Nothing calls it. An atom that a program
+// first meets as the tag of a tuple pattern is numbered 0 in that module's code on the compiler's first
+// pass (found 2026-11-14, transport_ble_plan.md §6, stage 7), so no message matches until the program
+// is compiled again; an atom that is also written as a value is numbered rightly. The other carriers
+// name their tags as values in msg_kind.
+fn tag_of(n: int64) -> atom {
+    case n of {
+        0 -> :open;
+        1 -> :tx;
+        2 -> :credit;
+        3 -> :close;
+        4 -> :radio;
+        _: int64 -> :radio_rx
+    }
+}
+
+// Tells the radio actor, spawning it first when this carrier has not done so (a cast to a name that
+// no actor holds ends the sender, so the name is not tried).
+fn to_radio(spawned: boolean, msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:seek, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case spawned of {
+            true -> true;
+            false -> {
+                sequence proc[concurrency]
+                    _: dangerous_actor_ref <- spawn_dangerous_registered({ owner: actor_ref_of_word(0), phase: 0, service: "", wanted: false, serving: false, seeking: false, up: false, central: 0 - 1, rx_credit: 0, waiting: 0 }, dangerous_ble_radio@radio, :dangerous_ble_radio, stack_policy(0, :keep_last_message), state_policy(:keep_state_area))
+                produces
+                    pure true
+                end
+            }
+        };
+        told: boolean <- cast_dangerous_registered(:dangerous_ble_radio, msg impl ActorMessage {})
+    produces
+        pure told
+    end
+}
+
+// This carrier holds the radio: it does already, or the name is free and it takes it now.
+fn holds_radio(spawned: boolean) -> boolean {
+    case spawned of {
+        true -> true;
+        false -> {
+            sequence proc[concurrency]
+                me: actor_ref <- self();
+                reg: actor_ref <- get_pid_registry();
+                answer: (atom, actor_ref) <- call(reg, { op: :insert, name: :dangerous_ble_gatt_board_carrier, pid: me } impl ActorMessage {});
+                (what: atom, _who: actor_ref) <- answer
+            produces
+                pure what == :ok
+            end
+        }
+    }
+}
+
+fn own_ref() -> actor_ref {
+    sequence proc[concurrency]
+        me: actor_ref <- self()
+    produces
+        pure me
+    end
+}
+
+fn tell(owner: actor_ref, down: boolean, reason: atom) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case down of {
+            true -> cast(owner, (:link_down, reason) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn carrier(msg: (:open, actor_ref, string) | (:tx, string, actor_ref) | (:credit, int64) | :close | (:radio, atom, int64) | (:radio_rx, string), state: { owner: actor_ref, phase: int64, radio: boolean }) -> (:no_reply, { owner: actor_ref, phase: int64, radio: boolean }) {
+    case msg of {
+        (:open, o: actor_ref, address: string) -> case state.phase == 0 of {
+            // an :open while the carrier is open is ignored: the owner closes first
+            false -> (:no_reply, state);
+            true -> case holds_radio(state.radio) and carrier_support@starts(address, "peripheral:") of {
+                true -> {
+                    me: actor_ref <- own_ref();
+                    // bound first: a call inside a later argument's tuple overwrites an earlier argument
+                    // (found 2026-11-14, transport_ble_plan.md §6, stage 7)
+                    service: string <- substring(address, 11, length_bytes(address));
+                    _: boolean <- to_radio(state.radio, (:serve, me, service));
+                    (:no_reply, { owner: o, phase: 1, radio: true })
+                };
+                false -> case holds_radio(state.radio) and carrier_support@starts(address, "central:") of {
+                    true -> {
+                        me: actor_ref <- own_ref();
+                        service: string <- substring(address, 8, length_bytes(address));
+                        _: boolean <- to_radio(state.radio, (:seek, me, service));
+                        (:no_reply, { owner: o, phase: 1, radio: true })
+                    };
+                    false -> {
+                        sequence proc[concurrency]
+                            _: boolean <- cast(o, (:link_down, :fault) impl ActorMessage {})
+                        produces
+                            pure (:no_reply, { owner: o, phase: 0, radio: state.radio })
+                        end
+                    }
+                }
+            }
+        };
+        (:tx, seg: string, _from: actor_ref) -> {
+            sequence proc[concurrency]
+                _: boolean <- case state.phase == 2 of {
+                    true -> to_radio(true, (:send, seg));
+                    false -> cast(state.owner, (:tx_failed, :link_down) impl ActorMessage {})
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        // a credit granted before the first :open has no radio to go to
+        (:credit, n: int64) -> {
+            _: boolean <- case state.radio of {
+                true -> to_radio(true, (:rx_credit, n));
+                false -> true
+            };
+            (:no_reply, state)
+        };
+        :close -> {
+            sequence proc[concurrency]
+                _: boolean <- case state.phase != 0 of {
+                    true -> to_radio(true, :drop);
+                    false -> true
+                };
+                _: boolean <- cast(state.owner, (:link_down, :closed) impl ActorMessage {})
+            produces
+                pure (:no_reply, { owner: state.owner, phase: 0, radio: state.radio })
+            end
+        };
+        (:radio_rx, seg: string) -> {
+            sequence proc[concurrency]
+                _: boolean <- case state.phase == 2 of {
+                    true -> cast(state.owner, (:rx, seg) impl ActorMessage {});
+                    false -> true
+                }
+            produces
+                pure (:no_reply, state)
+            end
+        };
+        (:radio, what: atom, n: int64) -> {
+            sequence proc[concurrency]
+                came_up: boolean <- what == :link_up and state.phase == 1;
+                _: boolean <- case came_up of {
+                    true -> cast(state.owner, (:link_up, concat("mtu:", carrier_support@int_text(n))) impl ActorMessage {});
+                    false -> true
+                };
+                _: boolean <- case came_up of {
+                    true -> cast(state.owner, (:tx_credit, 8) impl ActorMessage {});
+                    false -> true
+                };
+                _: boolean <- case what == :sent and state.phase == 2 of {
+                    true -> case n == 0 of {
+                        true -> cast(state.owner, (:tx_credit, 1) impl ActorMessage {});
+                        false -> cast(state.owner, (:tx_failed, :link_down) impl ActorMessage {})
+                    };
+                    false -> true
+                };
+                _: boolean <- case what == :send_failed and state.phase == 2 of {
+                    true -> cast(state.owner, (:tx_failed, case n == 4 of { true -> :too_long; false -> :link_down }) impl ActorMessage {});
+                    false -> true
+                };
+                // the radio did not start or would not publish the service: nothing to drop
+                failed: boolean <- state.phase != 0 and (what == :start_failed or what == :serve_failed or what == :seek_failed or what == :advertise_failed);
+                // the central left, or the host lost the controller, under a link that was up
+                lost: boolean <- state.phase == 2 and (what == :disconnected or what == :reset);
+                _: boolean <- case failed and what == :advertise_failed of {
+                    true -> to_radio(true, :drop);
+                    false -> true
+                };
+                _: boolean <- tell(state.owner, failed or lost, case what == :disconnected of { true -> down_reason_of(n); false -> :fault })
+            produces
+                pure (:no_reply, { owner: state.owner, phase: case failed or lost of { true -> 0; false -> case came_up of { true -> 2; false -> state.phase } }, radio: state.radio })
+            end
+        }
+    }
+}
