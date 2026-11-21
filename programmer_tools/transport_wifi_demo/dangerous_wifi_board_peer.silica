@@ -30,13 +30,16 @@
 // busy actors keep the cores occupied from the start; the program prints how far they got when a
 // link comes up. Run it through spike_r1/run_r1_wifi_peer.sh, which puts the peer's address in place
 // of the one below. With --listen the program listens instead ("listen:<port>": the hosted carrier binds
-// the station's address) and takes each peer the listener accepts as a link: (:accepted, conn, peer),
-// then the same exchange on conn.
+// the station's address) and takes each peer the listener accepts as a link: (:accepted, fd, peer), where
+// fd is the accepted descriptor; the owner starts that connection's carrier itself, from the descriptor, and
+// then the same exchange runs on it.
 module dangerous_wifi_board_peer;
 
 use wire_etf;
 use wireframe;
 use Carrier;
+use dangerous_sockets;
+use dangerous_tcp_carrier;
 use trial_support_hex;
 use trial_wait_int64;
 
@@ -179,22 +182,35 @@ fn finish(car: dangerous_actor_ref, cutting: boolean) -> boolean {
 // cut short, 6 when a link has not ended watch_ms() after its carrier was opened (a carrier that ended
 // without a word, as one refused its memory does, would otherwise leave the owner waiting). cut_link() names one link, by its place in the run, on which this end sends only its first
 // segment and closes: the other end's test of a frame cut short.
-fn owner(msg: (:rounds, int64) | (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:accepted, dangerous_actor_ref, string) | (:watch, int64) | :reopen | :finish,
+fn owner(msg: (:rounds, int64) | (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom) | (:accepted, int64, string) | (:watch, int64) | :reopen | :finish,
          state: { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, up: boolean, sent: int64, acked: int64, got: boolean, cut: boolean, done: int64, lost: int64, rounds: int64, bound: boolean })
     -> (:no_reply, { car: dangerous_actor_ref, rx: { mode: atom, expected: int64, pending: string }, code: int64, up: boolean, sent: int64, acked: int64, got: boolean, cut: boolean, done: int64, lost: int64, rounds: int64, bound: boolean }) {
     case msg of {
         (:rounds, n: int64) -> (:no_reply, { car: state.car, rx: state.rx, code: state.code, up: state.up, sent: state.sent, acked: state.acked, got: state.got, cut: state.cut, done: state.done, lost: state.lost, rounds: state.rounds + n, bound: state.bound });
         // a listener is bound: it carries no bytes itself, and tells of each peer it accepts
-        // a peer connected: the listener made a carrier for the connection, which this owner opens
-        (:accepted, conn: dangerous_actor_ref, who: string) -> {
-            sequence proc[concurrency, device_io]
-                _: atom <- print("accepted ");
-                _: atom <- println(who);
-                _: boolean <- cast(conn, (:open, self(), "") impl ActorMessage {});
-                _: timer_ref <- send_after(watch_ms(), self(), (:watch, state.done + state.lost) impl ActorMessage {})
-            produces
-                pure (:no_reply, { car: conn, rx: wireframe@fresh(Carrier@boundaries(lan)), code: state.code, up: true, sent: 0, acked: 0, got: false, cut: false, done: state.done, lost: state.lost, rounds: state.rounds, bound: state.bound })
-            end
+        // a peer connected: the listener gives this owner the accepted descriptor and starts no carrier; the owner
+        // starts the connection's carrier from it (the descriptor in place of -1) and opens it
+        // A peer accepted while the previous link is still in hand (its :link_down not yet here: the Mac's
+        // probe that found the board, or a link that ended without this owner hearing yet) waits: the
+        // :accepted comes back 50 ms later. :link_down names no carrier, so a link_down that arrived after the
+        // next link was taken would be counted against that one, which then never finished.
+        (:accepted, fd: int64, who: string) -> case state.up of {
+          true -> {
+            sequence proc[concurrency]
+                _: timer_ref <- send_after(50, self(), (:accepted, fd, who) impl ActorMessage {})
+            produces pure (:no_reply, state) end
+          };
+          false -> {
+              sequence proc[concurrency, device_io]
+                  _: atom <- print("accepted ");
+                  _: atom <- println(who);
+                  conn: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: fd, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+                  _: boolean <- cast(conn, (:open, self(), "") impl ActorMessage {});
+                  _: timer_ref <- send_after(watch_ms(), self(), (:watch, state.done + state.lost) impl ActorMessage {})
+              produces
+                  pure (:no_reply, { car: conn, rx: wireframe@fresh(Carrier@boundaries(lan)), code: state.code, up: true, sent: 0, acked: 0, got: false, cut: false, done: state.done, lost: state.lost, rounds: state.rounds, bound: state.bound })
+              end
+          }
         };
         // a listener's first :link_up says it is bound: it carries no bytes itself, and tells of each peer
         // it accepts

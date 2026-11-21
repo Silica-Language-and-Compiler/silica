@@ -2041,6 +2041,75 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     listener contract). A second merge of `main`, then the board runs: the core suites, the R1 Wi-Fi,
     Bluetooth and two-radio images, and `run_r1_tcp_trials.sh`.
 
+- **Stage 12, part 19, 2026-11-21, second merge of `main` (0f37f5edf8, PRs #84 to #86) into this
+  branch, goldens recorded again, the board run: the core suites pass but for known stale goldens, the two-radio image and one
+  `(:tcp)` trial fail for want of memory.** The merge is commit ef317fc072, after part 18's lwIP
+  wrappers (79d2a96820).
+  - The specification conflicted in one place: `main`'s 2026-11-18 link status paragraph is kept,
+    with this branch's `:ble_gatt` kind. 86 macOS `(:tcp)` goldens conflicted; they were taken from
+    `main` and recorded again with the merged compiler (commit 78545596c3), with three goldens only
+    this branch has: `dangerous_tagged_result_e2e`, `dangerous_three_int64_result_e2e` and
+    `transport_ble_segments`. The cause of the differences: this branch's `:ble_gatt` and
+    `:characteristic` atoms shift the atoms' numbers, and `main`'s runtime hardening (06d258b011)
+    adds stack-room checks and buffer scans to the code of the three branch-only trials. Every
+    program's output as its `.scout`.
+  - The two R1 board demos (`dangerous_wifi_board_peer.silica`, `dangerous_both_board_peer.silica`)
+    take `main`'s `(:accepted, fd, peer)` listener contract: the owner spawns the connection carrier
+    from the descriptor, as `examples/transport_pairs/ethernet_direct` does. An `(:accepted ...)`
+    arriving while the previous link is still up is re-sent to the owner after 50 ms: `wifi_peer.py`
+    finds the board by connecting across the /24, and that probe connection ended after the next
+    accept, its `:link_down`, which names no carrier, counted against the new link.
+  - Three ESP32-S3 goldens recorded again from the board (output as `.scout`): the two
+    `ffi_addition` end-to-end ones (one more atom, `:supervisor`) and
+    `supervisor_exit_reports_addition/report_hundred_thousand_reports_rss.esp32_s3.ascomp` (`main`'s
+    golden; only the order of three string-atom entries and their index words differs).
+  - Mac, whole tree (`run_trials_all_platforms.sh --targets apple_silicon_mac`): 35,432 passed, 91
+    failed before the refresh, all 91 assembly-only. After: `transport_addition` and
+    `ffi_addition` 352 of 354 under `LC_ALL=en_US.UTF-8`; the one left is
+    `dangerous_tcp_carrier_end_memory` (the known open defect; the Makefile skips running it on the
+    Mac; its golden differs only by atom numbers and is not recorded again, having no output to
+    check).
+  - Locale: `trials/ffi_addition/common_app.mk` builds `silica.config` with an unpinned `sort`.
+    Under `C.UTF-8` `Supervisor.silica` sorts first, and its `.ascomp` (each module carries the
+    build-wide atom table as of its compile) differs from `main`'s goldens, recorded under
+    `en_US.UTF-8` (`app_transport_tcp_accept_supervised/Supervisor`: 23 atoms against 54). Not
+    changed here: pinning the sort changes goldens tree-wide, which is Lee's call.
+  - A defect found, on `main` too, not fixed here: `print_atom` in a module compiled before the
+    module that first defines an atom prints nothing for that atom (each module's `L_pa_helper`
+    checks the bound against its own table's size, and `L_pa_oob` returns silently;
+    `terms/print_atom_inline.silica` in each emitter). Repro: a module `aaa_shower` with
+    `show(a: atom)` calling `print_atom(a)`, and `zzz_main` calling `show(:defined_only_in_main)`,
+    prints nothing for it. Proposed fix: fall back to the runtime's complete table
+    (`_silica_rt_atom_names`) at `L_pa_oob`. It changes every module's `.ascomp` on every target, so
+    it waits for Lee's go-ahead.
+  - On the board (ESP32-S3 eBadge, route R1, merged compiler), core suites: 1,221 passed, 9 failed.
+    Four are in `transport_board_addition` and two in `cast_exit_board_addition` (both suites
+    INTEGRATE_PENDING, known stale goldens; the two `usb_serial_jtag` trials were run without the
+    native-jack cable); the other three are the assembly-only goldens above, recorded again.
+    Suites: actors 781, supervisors 282, timers 28, ffi 69+2, deep_frame_spill 16,
+    scheduler_policy 12, supervisor_exit_reports 24+1, cast_exit_board 2+2, transport_board 7+4.
+  - R1 Wi-Fi image: the board dials the Mac 5 of 5; the board listens 5 of 5 (after the demo fix).
+    R1 two-radio image, 15 links each: Bluetooth 15 of 15, Wi-Fi 1 of 15 (the board's heap at the
+    end: in use 256,904, free 25,008, largest block 12,328 of 291,904; an
+    `(:explicit, :out_of_memory)` in the log). Before the merge (part 17) the image was fifteen of
+    fifteen on each radio.
+  - The hosts' `(:tcp)` trials on the board (`run_r1_tcp_trials.sh`): 5 pass
+    (`dangerous_tcp_loopback_link`, `dangerous_tcp_listen_any`, `dangerous_tcp_loopback`,
+    `dangerous_link_listen_ip`, `dangerous_link_listen_ip_refused_loopback`), 4 are refused E2412 as
+    before, 1 fails: `dangerous_tcp_listener`, where the fifth live carrier's start ends a dialing
+    carrier with `(:explicit, :out_of_memory)`. Closing link1 before round 2 makes it pass (heap at
+    the end: in use 160,768, free 69,464, largest 12,376 of 277,056). The trial's failure reporter
+    counts only reports it does not expect, so the failure shows as a 60 s timeout, not a diff; a
+    suggestion for `main`'s trial: print an unexpected report (no `.scout` change).
+  - The cause of both memory failures, measured and not fully apportioned: since the last board pass
+    the carrier's frame grew (`dangerous_tcp_carrier_carrier` SFRAME 3,760 to 4,432 bytes; the
+    trial's coordinator 1,024 to 1,232), and `main`'s runtime hardening changed `rt_actors.S` by
+    about 500 lines; neither had been tried on the board before now. `BOARD_FFI_STACK=4096` is not
+    enough.
+  - Left: shrink the carrier's dispatch frame, or give the R1 images more heap (runtime and emitter
+    work), then run the two-radio image and `dangerous_tcp_listener` again. Not yet run: the whole
+    board tree (tier 3, overnight) and the Linux hosts (pix, nix) for this merge.
+
 ## 7. Facts the design rests on
 
 - Silica's board runtime today (`compiler/src/emitter/ESP32-S3_raw/board/runtime`, read 2026-11-10): its image is
