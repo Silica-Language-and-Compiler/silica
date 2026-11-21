@@ -431,8 +431,13 @@ run_program() {
     for m in ${app_link_sams[@]+"${app_link_sams[@]}"}; do
         case " ${extra[*]:-} " in *" $m "*) ;; *) extra+=("$m") ;; esac
     done
+    # A <stem>.<target>.main_aux file (one number, a multiple of 64) sets BOARD_MAIN_AUX for this one image:
+    # the size of main's auxiliary stack, which build_image.sh passes as --defsym _silica_main_aux_req (the
+    # STM32 build reads it; the ESP32-S3 build_image.sh does not, and no such file exists for it).
+    main_aux=""
+    [ -f "$gdir/$stem.$target.main_aux" ] && main_aux=$(awk 'NF { print $1; exit }' "$gdir/$stem.$target.main_aux")
     # Archives (C wrappers, spec §20.4) go last: build_image.sh places .a files after every object.
-    if ! sh "$BOARD_TOOLS/build_image.sh" -q -r "$BOARD_RT_CACHE" -o "$img" "$cdir/$stem.sams" ${extra[@]+"${extra[@]}"} ${link_archives[@]+"${link_archives[@]}"} > "build/$stem.image.log" 2>&1; then
+    if ! BOARD_MAIN_AUX="${main_aux:-${BOARD_MAIN_AUX:-}}" sh "$BOARD_TOOLS/build_image.sh" -q -r "$BOARD_RT_CACHE" -o "$img" "$cdir/$stem.sams" ${extra[@]+"${extra[@]}"} ${link_archives[@]+"${link_archives[@]}"} > "build/$stem.image.log" 2>&1; then
         mark_fail
         printf '❌❌ %s%s: image build failed (assembler or linker)\n' "$prefix" "$stem"
         grep -m 12 -i 'error\|undefined' "build/$stem.image.log" || head -n 12 "build/$stem.image.log"

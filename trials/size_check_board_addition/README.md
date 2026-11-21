@@ -12,3 +12,8 @@ run-time values. Console-only; host runs skip this suite (BOARD_ONLY).
 
 The `.esp32_s3.ascomp` and `.st_nucleo.ascomp` goldens are made from a board run once the output matches the
 `.scout` (trials/targets/gen_board_ascomp.sh).
+
+On the Nucleo, `alloc_buf_size_check_board_atomic_region` links with a main auxiliary stack of 8 KiB (the file
+`alloc_buf_size_check_board_atomic_region.STM32-L476RG_raw.main_aux`, read by targets/board_suite.sh and passed to
+build_image.sh as BOARD_MAIN_AUX). The atomic region's block is a 4,128-byte frame allocation and main's default 2 KB
+auxiliary stack does not grow, so without it main aborts "out of memory" before the buffer size check is reached.
