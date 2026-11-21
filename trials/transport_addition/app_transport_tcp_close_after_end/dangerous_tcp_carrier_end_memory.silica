@@ -1,10 +1,17 @@
 // A2 (BEES request, SD-46): each ended (:tcp) carrier that made a foreign call left one 512-byte block behind, the
-// guarded-FFI per-thread state of its own thread, because the pthread key had no destructor. main spawns 60000
+// guarded-FFI per-thread state of its own thread, because the pthread key had no destructor. The program runs 60000
 // carriers whose dial to "127.0.0.1:1:3000" (a loopback port nothing listens on) is refused at once: each tells the
 // owner (:link_down, :fault) and ends itself. The owner counts the link_downs, prints the count at the last one and
 // ends the program with exit code 0. The resident set must stay under the ceiling in
 // dangerous_tcp_carrier_end_memory.max_rss_mb (measured by the harness, as for report_hundred_thousand_reports_rss):
 // the harness measured about 85 MB before the fix and about 45 MB after, on the Mac (ceiling 60).
+//
+// The number of carriers alive at once is bounded (2026-11-19). The first version spawned all 60000 in an open
+// loop, so how many were alive together depended on how busy the machine was: on a loaded Mac the carriers piled up
+// to about 4,090 and hit the 4,096-thread cap, and the peak resident set measured the load, not the per-carrier
+// cost. Now main starts 64 carriers and the owner starts one replacement for each :link_down it receives, until
+// 60000 have been started, so at most about 64 carriers are alive at a time and the peak measures what each ended
+// carrier leaves behind.
 module dangerous_tcp_carrier_end_memory;
 
 use dangerous_sockets;
@@ -18,10 +25,10 @@ fn reporter(msg: string, state: int64) -> (:no_reply, int64) {
     (:no_reply, state + 1)
 }
 
-fn is_down(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom)) -> boolean {
+fn is_down(msg: (:link_up, string) | (:accepted, int64, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom)) -> boolean {
     case msg of {
         (:link_up, _info: string) -> false;
-        (:accepted, _conn: dangerous_actor_ref, _peer: string) -> false;
+        (:accepted, _fd: int64, _peer: string) -> false;
         (:rx, _segment: string) -> false;
         (:tx_credit, _n2: int64) -> false;
         (:tx_failed, _why: atom) -> false;
@@ -29,41 +36,64 @@ fn is_down(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | 
     }
 }
 
-fn owner(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
-         state: { left: int64 })
-    -> (:no_reply, { left: int64 }) {
+// Starts one carrier whose dial is refused at once and tells it to report to `own`.
+fn start_carrier(own: actor_ref) -> boolean {
+    sequence proc[concurrency]
+        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        sent: boolean <- cast(car, (:open, own, "127.0.0.1:1:3000") impl ActorMessage {})
+    produces
+        pure sent
+    end
+}
+
+// started: carriers started so far (64 by main, then one per link_down); ended: link_downs seen so far.
+fn owner(msg: (:link_up, string) | (:accepted, int64, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { started: int64, ended: int64 })
+    -> (:no_reply, { started: int64, ended: int64 }) {
     sequence proc[concurrency, device_io]
         down: boolean <- is_down(msg);
-        left: int64 <- case down of { true -> state.left - 1; false -> state.left };
-        _: atom <- case down and left == 0 of {
+        ended: int64 <- case down of { true -> state.ended + 1; false -> state.ended };
+        more: boolean <- down and state.started < 60000;
+        started: int64 <- case more of { true -> state.started + 1; false -> state.started };
+        me: actor_ref <- self();
+        _: boolean <- case more of {
+            true -> start_carrier(me);
+            false -> true
+        };
+        _: atom <- case down and ended == 60000 of {
             true -> println("60000 carriers ended");
             false -> :ok
         };
-        _: boolean <- case down and left == 0 of {
+        _: boolean <- case down and ended == 60000 of {
             true -> cast_exit(0);
             false -> true
         }
     produces
-        pure (:no_reply, { left: left })
+        pure (:no_reply, { started: started, ended: ended })
     end
 }
 
-fn spawn_all(own: actor_ref, left: int64) -> int64 {
-    sequence proc[concurrency]
-        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-        _: boolean <- cast(car, (:open, own, "127.0.0.1:1:3000") impl ActorMessage {});
-        rest: int64 <- case left > 1 of { true -> spawn_all(own, left - 1); false -> 0 }
-    produces
-        pure rest
-    end
+// Starts the first `left` carriers (main does 64; the owner starts the rest as carriers end).
+fn spawn_first(own: actor_ref, left: int64) -> int64 {
+    case start_carrier(own) of {
+        true -> spawn_rest(own, left);
+        false -> spawn_rest(own, left)
+    }
+}
+
+fn spawn_rest(own: actor_ref, left: int64) -> int64 {
+    case left > 1 of {
+        true -> spawn_first(own, left - 1);
+        false -> 0
+    }
 }
 
 fn main() -> int64 {
     sequence proc[concurrency, device_io]
         rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
         _: atom <- register_failure_reporter(rep);
-        own: actor_ref <- spawn({ left: 60000 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
-        _: int64 <- spawn_all(own, 60000);
+        own: actor_ref <- spawn({ started: 64, ended: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: int64 <- spawn_first(own, 64);
         code: int64 <- wait_for_exit()
     produces
         pure code

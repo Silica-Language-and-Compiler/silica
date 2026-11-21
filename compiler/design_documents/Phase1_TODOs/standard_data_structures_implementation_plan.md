@@ -1427,7 +1427,7 @@ This is the **first** self-host source change after the parallel tree exists. Ke
 
 **§11 exit gate:** `src/` has zero `type` aliases and zero `bst` uses; emitter pools there are WBT-backed; Phase 0 inventory recorded; remaining class-A items (including the named-struct dialect rewrite) are fixed or explicitly listed as §12 inputs. Frozen `src/` and `silica-bootstrap-compiler` remain untouched; default build still bootstrap → `src/`.
 
-**§11 status:** Complete (2026-09-08 audit) — `src/` has zero `type` aliases, zero named `struct` declarations and zero `bst` uses; the seed (`binaries/seed-compiler`) compiles and links the full 331-unit `src/silica.config.compiler`. Residual: `string_literal_pool.silica` still deduplicates by linear scan (bootstrap-plan Step 3.3); the Step 0.2 W-id comments survive in `src/` as history.
+**§11 status:** Complete (2026-09-08 audit) — `src/` has zero `type` aliases, zero named `struct` declarations and zero `bst` uses; the seed (`binaries/seed-compiler`) compiles and links the full 331-unit `src/silica.config.compiler`. Residual: `string_literal_pool.silica` still deduplicates by linear scan (bootstrap-plan Step 3.3); the Step 0.2 W-id comments survive in `src/` as history. (Status 2026-11-19: done on the Mac, `e532958edb`; the other emitters remain.)
 
 **§11 delivered (so far):**
 
@@ -1492,7 +1492,7 @@ This is the **first** self-host source change after the parallel tree exists. Ke
 
 **Scope:**
 
-- **Phase 6:** self-host integrate suite (`trials/self_host_addition/`), fixed-point (`host_n` compiles `host_{n+1}` from `src/`).
+- **Phase 6:** self-host integrate suite (`trials/self_host_addition/`; **Status 2026-11-18 (Lee): obsolete**, the suite is no longer wanted), fixed-point (`host_n` compiles `host_{n+1}` from `src/`).
 - **Cutover (only after fixed-point green):** promote `src/` over production `src/` (or swap trees per authority plan), make self-host the default build, then retire `silica-bootstrap-compiler` from the default path. Until that moment the freeze in §11 still holds.
 
 **§13 exit gate:** Phase 6.1 fixed-point integrate passes on the parallel tree; `make integrate` includes the self-host trial; after cutover, production compiler source has zero `type` aliases, no `bst` dependency, and builds/maintains itself without `silica-bootstrap-compiler` on the default path. Blocks §14 onward until this gate passes.

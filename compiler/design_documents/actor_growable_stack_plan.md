@@ -80,3 +80,5 @@ Status: open work remains; this plan stays next to its design until every step i
    - Stack overflow handling
    - OOM handling
 ```
+
+*Status 2026-11-18: items 1 and 3 are done in the decided form. Stack allocation replaced malloc on the hosted targets (chunk 15 phases 4e and 8, see actor_memory_budget_plan.md), and stack exhaustion and a failed reservation are the failure reasons `(:explicit, :stack_exhausted)` and `(:explicit, :stack_reserve_failed)` (`trials/actor_stacks_addition`, `error_enforcement_addition/stack_policy_*`); the decided design has no runtime cap and no `:oom`.*

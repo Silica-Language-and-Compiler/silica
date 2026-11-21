@@ -1,4 +1,4 @@
-# Shared seed host for trials — always binaries/silica-compiler unless overridden
+# Shared seed host for trials — always binaries/silica-compiler (the normal compiler) unless overridden
 # on the make command line (e.g. `make SILICA_COMPILER=/path/to/other integrate`).
 # Paths are anchored to this file (trials/silica_compiler.mk).
 #
@@ -63,8 +63,16 @@ include $(_SILICA_COMPILER_MK_DIR)../project_makefiles/platform/platforms.mk
 SOUT_TARGET := $(if $(filter apple_silicon_mac,$(SILICA_HOST_EMIT_TARGET)),macos_applesilicon,$(SILICA_HOST_EMIT_TARGET))
 SOUT_EXT := .$(SOUT_TARGET).sout
 
+# The emit target is read from the compiler's file name: silica-compiler is the host, silica-compiler-<target> a cross compiler.
 _SILICA_COMPILER_NAME := $(notdir $(SILICA_COMPILER))
 SILICA_EMIT_TARGET ?= $(if $(filter silica-compiler-%,$(_SILICA_COMPILER_NAME)),$(patsubst silica-compiler-%,%,$(_SILICA_COMPILER_NAME)),$(SILICA_HOST_EMIT_TARGET))
+
+# The normal compiler, used by suites that test a normal build (e.g. error_enforcement_addition/
+# normal_build_trial_hook_rejected_trial). The unpublished normal build compiler/build/<emit target>/silica-compiler
+# is preferred when it exists; otherwise the published binaries/ compiler of the same name.
+# Override on the make command line.
+_SILICA_NORMAL_UNPUBLISHED := $(abspath $(_SILICA_COMPILER_MK_DIR)../compiler/build/$(SILICA_EMIT_TARGET)/silica-compiler)
+SILICA_NORMAL_COMPILER ?= $(if $(wildcard $(_SILICA_NORMAL_UNPUBLISHED)),$(_SILICA_NORMAL_UNPUBLISHED),$(dir $(SILICA_COMPILER))$(_SILICA_COMPILER_NAME))
 
 # 1 when the emitted code is for this host and the whole pipeline can run; 0 when the trial
 # can only be compiled here. An unknown host leaves SILICA_HOST_EMIT_TARGET empty, which is
@@ -74,6 +82,14 @@ SILICA_TARGET_IS_HOST := $(if $(SILICA_HOST_EMIT_TARGET),$(if $(filter $(SILICA_
 # Printed once by a suite that stops after compiling, so the run says why rather than
 # looking like the trials silently did nothing.
 SILICA_CROSS_NOTE := emit target $(SILICA_EMIT_TARGET) is not this host ($(SILICA_HOST_EMIT_TARGET)): compiling only, not assembling or running
+
+# TRIAL_SKIP_GOLDEN=1 (any value but empty, 0 or false): do not compare the generated assembly (.sams)
+# with the golden .ascomp, and do not fail when a golden is missing. Every suite's assembly check
+# tests $(TRIAL_SKIP_GOLDEN); the run output (.sout vs .scout), the exit status and the compile-failure
+# goldens are still checked. The integrate report says the assembly checks were skipped, so a green
+# run is never mistaken for one that compared assembly. The generated .sams files stay in place.
+override TRIAL_SKIP_GOLDEN := $(filter-out 0 false,$(strip $(TRIAL_SKIP_GOLDEN)))
+export TRIAL_SKIP_GOLDEN
 
 # The assembly golden a trial is compared against. Assembly is target-specific, so each emit
 # target keeps its own: the plain .ascomp is the original macOS (Darwin) golden, and every other
@@ -104,7 +120,7 @@ SCOUT_FOR = $(if $(SCOUT_EXT),$(_SCOUT_PICK_SH),$(1).scout)
 # still carry their own macOS values; once those lines are deleted this include is the only source.
 -include $(_SILICA_COMPILER_MK_DIR)platform/$(SILICA_EMIT_TARGET).mk
 
-# If silica-compiler is missing, run update_silica_compiler_link.bash and re-check.
+# If the compiler is missing, say how to build it and stop (it is never relinked or published).
 #
 # RULE: the link binaries/silica-compiler is never replaced while a host run of this machine is in
 # progress (a live process holds trials/.integrate.lock.<host key>, e.g. .integrate.lock.macos_applesilicon):
@@ -131,12 +147,9 @@ define ENSURE_SILICA_COMPILER
 	fi; \
 	if [ ! -x "$(SILICA_COMPILER)" ]; then \
 		if [ -n "$$ensure_busy" ]; then ensure_note; echo "Missing $(SILICA_COMPILER) and it cannot be relinked during a host run."; exit 1; fi; \
-		echo "Missing $(SILICA_COMPILER); running update_silica_compiler_link.bash..."; \
-		"$(UPDATE_SILICA_COMPILER_LINK)" || exit 1; \
-		if [ ! -x "$(SILICA_COMPILER)" ]; then \
-			echo "Missing seed host after update: $(SILICA_COMPILER)"; \
-			exit 1; \
-		fi; \
+		echo "Missing $(SILICA_COMPILER)"; \
+		echo "build it: make -C compiler/src build SILICA_TARGET_PROMPT=0 (or bash programmer_tools/build_all_platforms.sh)"; \
+		exit 1; \
 	fi
 endef
 
@@ -623,6 +636,7 @@ else elapsed=$$(printf '%ds' "$$el"); fi; \
 	printf 'success: ✅✅ %s\n' "$$ok"; \
 	printf 'fail: ❌❌ %s\n' "$$ko"; \
 	printf 'elapsed: %s\n' "$$elapsed"; \
+	if [ -n "$(TRIAL_SKIP_GOLDEN)" ]; then printf 'golden assembly checks: SKIPPED (TRIAL_SKIP_GOLDEN=%s); .sams was not compared with .ascomp\n' "$(TRIAL_SKIP_GOLDEN)"; fi; \
 	if [ "$$ko" -ne 0 ]; then \
 		printf 'failures:\n'; \
 		details=$$({ $(INTEGRATE_FAILURE_DETAILS); }); \
@@ -637,6 +651,14 @@ if [ "$$SILICA_INTEGRATE_ROOT" = "$(_INTEGRATE_DIR_NOSLASH)" ]; then cat .integr
 [ "$$ko" -eq 0 ] && [ "$$st" -eq 0 ]
 endef
 
+# TRIAL_TARGETS: an optional file in a suite directory naming the trial targets the suite applies to, as
+# whitespace-separated words (a line starting with # is a comment): apple_silicon_mac, linux_aarch64,
+# linux_x86_64, ESP32-S3_raw, STM32-L476RG_raw, or `host` for the three hosted ones. No file = every
+# target. A whole-tree run on a target the file does not list skips the suite (like BOARD_ONLY); a run that
+# names the suite (TRIAL_SUITES) still runs it. .github/scripts/trial_matrix.py applies the same file to
+# the CI shards. Shell test: true when $$dir has a TRIAL_TARGETS file that omits this run's emit target.
+TRIAL_TARGETS_EXCLUDE = { [ -f "$$dir/TRIAL_TARGETS" ] && ! grep -v '^[[:space:]]*\#' "$$dir/TRIAL_TARGETS" | tr -s ' \t' '\n\n' | grep -qxE '$(SILICA_EMIT_TARGET)$(if $(filter $(SILICA_EMIT_TARGET),apple_silicon_mac linux_aarch64 linux_x86_64),|host)'; }
+
 # $(call INTEGRATE_CHILD,<subdir relative to INTEGRATE_DIR>[,extra make args])
 # Never fails the calling recipe: the parent sums the children's .integrate_counts
 # afterwards and decides the exit status itself, so every sibling always runs.
@@ -644,8 +666,8 @@ define INTEGRATE_CHILD
 cd "$(INTEGRATE_DIR)" || exit 1; \
 dir="$(1)"; \
 rm -f "$$dir/.integrate_counts" "$$dir/.integrate_report" "$$dir/.integrate_status" "$$dir/.integrate_skipped"; \
-if { [ -f "$$dir/INTEGRATE_PENDING" ] || [ -f "$$dir/BOARD_ONLY" ]; } && [ -z "$(INTEGRATE_NAMED_SUITES)" ]; then \
-	echo "SKIP: $$dir ($$( [ -f "$$dir/INTEGRATE_PENDING" ] && echo INTEGRATE_PENDING || echo BOARD_ONLY ) -- see $$dir/README.md)"; \
+if { [ -f "$$dir/INTEGRATE_PENDING" ] || [ -f "$$dir/BOARD_ONLY" ] || $(TRIAL_TARGETS_EXCLUDE); } && [ -z "$(INTEGRATE_NAMED_SUITES)" ]; then \
+	echo "SKIP: $$dir ($$( [ -f "$$dir/INTEGRATE_PENDING" ] && echo INTEGRATE_PENDING || { [ -f "$$dir/BOARD_ONLY" ] && echo BOARD_ONLY || echo "TRIAL_TARGETS: $(SILICA_EMIT_TARGET) not listed"; } ) -- see $$dir/README.md)"; \
 	: > "$$dir/.integrate_skipped"; \
 	find "$$dir" -name .target -prune -o \( -name .integrate_log -o -name .integrate_report -o -name .integrate_status \) -type f -exec rm -f {} + 2>/dev/null || true; \
 else \
@@ -665,7 +687,7 @@ ok=0; ko=0; failed=0; \
 printf '──── %s: per-directory results ────\n' "$(INTEGRATE_LABEL)"; \
 for dir in $(1); do \
 	if [ -f "$$dir/.integrate_skipped" ]; then \
-		printf '  %-48s SKIPPED (%s)\n' "$$dir" "$$( [ -f "$$dir/BOARD_ONLY" ] && echo BOARD_ONLY || echo INTEGRATE_PENDING )"; \
+		printf '  %-48s SKIPPED (%s)\n' "$$dir" "$$( [ -f "$$dir/INTEGRATE_PENDING" ] && echo INTEGRATE_PENDING || { [ -f "$$dir/BOARD_ONLY" ] && echo BOARD_ONLY || echo TRIAL_TARGETS; } )"; \
 		continue; \
 	fi; \
 	n1=0; n2=0; \

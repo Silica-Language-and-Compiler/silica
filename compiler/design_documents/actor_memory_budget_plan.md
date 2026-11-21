@@ -38,7 +38,7 @@ bodies in §5 keep the dates of the work). Detail in §5 and §17.
 | K `wait_for_exit` / `cast_exit` (spec §15.1.2.5) | done; verified on the board 2026-10-08; the board driver ends `.wait_for_exit` trials with the `exit` line | done; trial-verified 2026-10-08 |
 | L the compiler's own small `main` | done: `main.silica` (shared by the cross compilers) | done |
 | M every trial in the supervisor-actor shape | done: shared sources, `trials/lib_trial_support`, `programmer_tools/trial_shape_m` | done |
-| N hosted carrier threads (ROADMAP chunk 2) | does not apply (per-core schedulers built) | built on `apple_silicon_mac` 2026-10-19 (branch `hosted-carriers-item-n`): carriers are the only model, supervisors and the registries on them, one thread per dangerous actor; the Linux runtimes pending ("Carriers are the only model" status under §5 N) |
+| N hosted carrier threads (ROADMAP chunk 2) | does not apply (per-core schedulers built) | built on `apple_silicon_mac` 2026-10-19 (branch `hosted-carriers-item-n`): carriers are the only model, supervisors and the registries on them, one thread per dangerous actor; the Linux runtimes pending ("Carriers are the only model" status under §5 N). **Status 2026-11-18: done on all three hosted paths** (Linux AArch64 `aa8101edf2`, Linux x86-64 `ef2e778126`, both 2026-10-20, each with `prims_actors_carrier_asm.silica`; fixed points on carriers, §5 N remaining gaps item 1) |
 
 # Part I: Common to the board and hosted environments
 
@@ -106,7 +106,7 @@ algorithm can unmap at the message boundary. The aggregate-return rule in the em
 tuples and records, but it lists actor behaviours (`use_actor_reply_sret_buffer`, reply tuple via `X20`) as
 an exclusion (since 2026-10-12 a reply-form callee takes its reply buffer in X<argc> and every other user
 call clears X8, `call.silica` `keeps_x8_for_callee`; the exclusion itself was not re-read). Whether a composite
-state or reply can dangle on hosted after a release is therefore **not determined**; it needs the same two trials item B names, run on the hosted paths.
+state or reply can dangle on hosted after a release is therefore **not determined**; it needs the same two trials item B names, run on the hosted paths. **Status 2026-11-18: resolved.** The two trials (`actors_addition/actor_state_outlives_spawner_frame`, `actor_composite_reply_outlives_callee_dispatch`) exist with Mac and Linux goldens, and chunk 15 phase 4 replaced the heap copy (see §17 row B).
 
 ## 4. Sizing rules for a `main` that only starts a root supervisor
 
@@ -196,7 +196,7 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
   behaviour returns before the child reads its state, and one in which a caller reads a composite reply
   after the callee has served another message. The correctness gate for C, D and F.
   *Board: **appears done** — state and message copies are on the heap and released per dispatch via
-  `silica_rt_state_release`; its gate trials are unverified. Hosted: **not determined** (§3 hosted note).*
+  `silica_rt_state_release`; its gate trials are unverified. Hosted: **not determined** (§3 hosted note).* **Status 2026-11-18: done on both.** The two trials exist (`actors_addition`, with `.esp32_s3.ascomp`, Linux and Mac goldens) and passed in the 2026-11-07 board run (`029447ad31`); see the table at the top and §17 row B.
 - **C. Shrink the `run_behaviour` pad** from 1,568 to 512 (§8.1). Feasible: `entry`'s immediate is 12 bits
   scaled by 8 (0–32,760), and 1,568 appears at exactly one site. Conditions: record the 192-byte derivation
   at the `entry`, or publish it as an assembler symbol computed from the loop's post-behaviour depth, so a
@@ -265,7 +265,7 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
     `compiler_addition` 423/423 (1 skipped), `memory_region_addition` 396/397 (the five capacity skips stand),
     `cast_exit_board_addition` 2/2. The three failures are not D's: `phase_e_decl_10_one_for_all_restart_child`
     and `..._rest_for_one_...` restart ten children across both cores and hang in the cross-core kill (the known
-    "ending an actor on the other core waits for its dispatch boundary"); on one core (`NCORES_RUN 1`) both pass,
+    "ending an actor on the other core waits for its dispatch boundary"; **Status 2026-11-18 (Lee): that wait is working as designed**); on one core (`NCORES_RUN 1`) both pass,
     and before D they died earlier with `stack reservation failed` (ten 10 KB children did not fit the heap).
     `write_buf_flat_tuple` reads the length word of a buffer in a frame region as 0: the committed runtime plus
     nothing but the stack zeroing fails the same way, so the trial passed only on memory left over from the
@@ -386,7 +386,7 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
   suite and an 18-trial supervisors subset match their behaviour goldens (the subset's assembly goldens and
   atom-index lines differ only because a scratch suite numbers atoms differently; a control build from the
   pre-change runtime shows the same). Linux: the runtime text assembles under `clang --target` with the
-  same pre-existing error set as before the change; not run on pix or nix yet.*
+  same pre-existing error set as before the change; not run on pix or nix yet.* **Status 2026-11-18:** the Linux runtimes have since been built and run on pix and nix (448 B ACB, `mov esi, 448` on x86-64; carriers 124/124 and the full Linux trial sets green, items N and the 2026-11-04 fixed points).
   *Since 2026-10-12 (actor identities, spec §15.1.4; checked in the source 2026-10-16): every reference is a
   64-bit identity (position << 32 | child number) resolved through an identity table, so each ACB gained
   words. **Board:** `ACB_SIZE` 144 (128/132 the identity, child number then position; 136/140 the spawner
@@ -576,7 +576,7 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
     instead of owned by a thread, and no thread stack or signal stack per actor;
   - whatever of chunk 11's scheduler this needs comes forward with it (ROADMAP).
   - **Measure:** `docs/examples/idle_actor_capacity` (written 2026-10-08, not run) gives the idle-actor count
-    before and after N, on each hosted machine.
+    before and after N, on each hosted machine. **Status 2026-11-18:** run on the Mac 2026-10-19/20 (§16, up to 1,000,000 actors); not run on Linux (remaining gaps item 6).
   - **Gate:** the hosted part of ROADMAP chunk 2: an actor spawned for a core runs there until moved;
     `migrate_actor` moves a running actor; `get_cpu_topology()` reports the real machine; the scheduler-policy
     order trials pass on the hosts; a hosted machine holds millions of idle actors with no thread per actor
@@ -1322,6 +1322,7 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
       actor is one thread each); the hosted `scheduler_policy_addition` goldens question of stage 4;
       the ROADMAP chunk 2 and specification "implementation status" paragraphs (§15.1.2, §15.1.2.2),
       to be refreshed when this branch is published.
+      **Status 2026-11-18:** the Linux runtimes are done (`aa8101edf2`, `ef2e778126`) and the ROADMAP chunk 2 text is refreshed (its status 2026-10-20); the pooled FFI worker (option A) is still deliberately deferred (remaining gaps item 2).
   - **Linux AArch64 port status (2026-10-19/20, `linux_aarch64`, same branch; superseded by the final status of item N below).** The
     final `apple_silicon_mac` state (the delta `5135f543a^..87e0a61e2e` of the seven runtime and
     emitter units) ported to `compiler/src/emitter/linux_aarch64`: `terms/prims/prims_actors_runtime_asm.silica`,
@@ -1455,7 +1456,7 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
          restart token, no OS threads). `binaries/silica-compiler-ESP32-S3_raw` still points at
          `silica-999979-ESP32_S3_raw-macos-applesilicon`, built before all of it; no board compiler was
          built in the 2026-10-21 round. To be done on a separate branch by Lee, who runs the board.
-         **Partly done (2026-11-14 check):** the board compiler now points at `silica-999958` (no longer 999979); the board is green on 2026-11-07 and 2026-11-12 runs including the supervisors trials (029447ad31, 978f663e08); the gap 3 self check (`:language_error`) is in `rt_supervisors.S`. **Still open:** acquire mode 2 on the board (a design question) and a dedicated board trial for this row.
+         **Partly done (2026-11-14 check):** the board compiler now points at `silica-999958` (no longer 999979); the board is green on 2026-11-07 and 2026-11-12 runs including the supervisors trials (029447ad31, 978f663e08); the gap 3 self check (`:language_error`) is in `rt_supervisors.S`. **Still open:** acquire mode 2 on the board (a design question) and a dedicated board trial for this row. **Update 2026-11-18:** `binaries/silica-compiler-ESP32-S3_raw` now points at `silica-999953` (`c063517bd9`), and the board results with it are unknown because that commit records its board runs as not completed (ROADMAP.md, "Open item: the ESP32-S3 board gap", item 4).
          Recorded in ROADMAP.md, "Open item: the ESP32-S3 board gap".
       4. `get_efficiency_cores` / `get_performance_cores` returned wrong core-id lists: **fixed** in
          `7b8260a0fe` on all three trees (trial `cpu_topology_runtime_queries_portable`); the related
@@ -1494,12 +1495,14 @@ target as of 2026-10-07; board status checked against `board/runtime` that day.
          and carry a `:dangerous_` id) are enforced only for a module's `init`, not for the start
          functions of child supervisors. A call-type `:dangerous` row in a sub-supervisor compiles and
          runs.
+         **Status 2026-11-19: done** in `83655cc84f`: E2094 and E2095 now also check a child supervisor's start function; trials `error_enforcement_addition/sub_supervisor_dangerous_row_plain_id_trial` and `sub_supervisor_dangerous_row_reply_behavior_trial`.
       10. Latent and deliberately unfixed: on Linux x86-64, `LBBsl_common` (the shared body of
           `spawn_linked`, in `prims_actors_runtime_asm.silica`) does `push rax` before
           `call silica_rt_beh_convention` and pops it after, so that call is made with `rsp` 8 bytes off
           16-byte alignment (the frame is aligned after `push rbp` and `sub rsp, 80`). Read from the
           source only; no failure has been observed and the callee's use of aligned instructions was not
           checked. Left as is; fix it by padding with `sub rsp, 8` around the push if it ever shows.
+         **Status 2026-11-19:** fixed in `e7a89cfd07`, which keeps `rsp` 16-byte aligned at that call. The fix was written by reading; it has not yet been run on the Linux x86-64 host (nix).
 
       Final status of the gap list (2026-10-21):
       - Final full gate run on pix and nix. 148 goldens that went stale when `04fdd8ac2d` removed the
@@ -1928,7 +1931,7 @@ longer in the list (2026-10-08).
 - F + I + J, the target: 1,000 actors and supervisors with distinct ids spawned, each registered and each
   dispatched at least once on the board, with ≥100 KB of heap still free (`get_actor_memory_usage` and the
   heap's free total), at K ≤ 8; a name-keyed lookup of the 1,000th resolves.
-  *Partly done (2026-11-14 check):* `stack_budget_board_addition/thousand_actors_at_rest` (golden `0,1000,true,true,0`) passed in the 2026-11-07 board run (22,694 pass). **Still open:** the ≥100 KB free-heap figure is not recorded, and the chunk 15 design's `state_chain_1000_actors` trial does not exist in the tree.
+  *Partly done (2026-11-14 check):* `stack_budget_board_addition/thousand_actors_at_rest` (golden `0,1000,true,true,0`) passed in the 2026-11-07 board run (22,694 pass). **Still open:** the ≥100 KB free-heap figure is not recorded, and the chunk 15 design's `state_chain_1000_actors` trial does not exist in the tree. **Status 2026-11-18:** the free-heap figure was recorded once, on 2026-10-09 (§5 I: 1,005 idle actors, 162,584 B free, with the 128 B ACB); it has not been re-measured since the ACB grew to 144 B or since chunk 15.
 - H: `two_generic_collections_record_round_trip` and `two_generic_collections_round_trip` pass, or are
   skipped with a measured reason like the six in §12.
 
@@ -1959,7 +1962,7 @@ mappings).
 | First growth chunk | one platform page: 16 KB on Apple Silicon and Pi 5, 4 KB on most other Linux; then doubling per fault to 1 MB, then 1 MB per fault | design doc "Runtime constants" |
 | Lowest page of every reservation | never committed (exhaustion detector) | growth plan, status |
 | Release | anonymous `MAP_FIXED` remap to `PROT_NONE` at the message boundary, down to what the algorithm retains (five algorithms) | `prims_actors_stack_asm.silica` |
-| Per-actor OS thread (the runtime is one thread per actor) | pthread stack 128 KB (`pthread_attr_setstacksize`, `0x20000`), carrying the mailbox loop; behaviours run on the reservation (SP switched around each `blr`) | `prims_actors_runtime_asm.silica`; growth plan |
+| Per-actor OS thread (the runtime is one thread per actor; **since 2026-10-19/20 only a dangerous actor has a thread, every other actor runs on a carrier**, §5 N) | pthread stack 128 KB (`pthread_attr_setstacksize`, `0x20000`), carrying the mailbox loop; behaviours run on the reservation (SP switched around each `blr`) | `prims_actors_runtime_asm.silica`; growth plan |
 | Per-thread signal alt stack | 64 KB `mmap` (virtual), freed with a full release | `prims_actors_stack_asm.silica` |
 | Implicit heap (arena) per actor (hosted Mac: removed by chunk 15 phase 4e, Lee 2026-11-01; the row records the state before; Linux and ESP32-S3 keep it until phases 8 and 9) | a chain of 64 MB anonymous RW blocks mapped on first allocation; an idle actor holds none; freed together when the actor ends | `_silica_rt_region_alloc`, `_silica_rt_actor_dealloc_region` |
 | Mappings per actor, stack | 2 (committed run, inaccessible remainder), plus the thread stack, the alt stack and any arena blocks | growth plan; counts beyond the 2 **not measured** |
@@ -1999,7 +2002,7 @@ first limit. In the order they would be met:
    reservations and checks that every one holds zero committed stack. The thread limit of the hosts is **not
    measured**; a thousand is the highest count verified. Chunk 2 of the ROADMAP replaces this with one
    carrier thread per logical core and many actors per carrier, switching cooperatively at yield points
-   (the BEAM pattern); until then the hosted gate "a million idle actors holding no stack memory" is open.
+   (the BEAM pattern); until then the hosted gate "a million idle actors holding no stack memory" is open. **Status 2026-11-18:** the carriers exist on all three hosted paths (§5 N) and §16 records 10^3 to 10^6 idle actors on the Mac; the gate as a trial is still open (no trial holds more than 1,000 actors; Linux counts unmeasured).
 2. **Mappings.** Two per actor for the reservation alone, plus the thread's own stack and the alt stack.
    The growth plan records `vm.max_map_count` at about one million on the Pi image and 65,530 on stock
    Linux kernels, so two mappings per actor reaches the limit at half of those counts: about 32,000 actors
@@ -2088,7 +2091,7 @@ Checked from the hosted runtime source on 2026-10-07 and again on 2026-10-16 (si
 | K | done | `cast_exit` / `wait_for_exit` in the hosted runtimes; trial-verified 2026-10-08 (§5 K) |
 | L | done | `compiler/src/main.silica` (§5 L) |
 | M | done | `trials/lib_trial_support`, `programmer_tools/trial_shape_m` (§5 M) |
-| N | built 2026-10-19, `apple_silicon_mac` only, unpublished branch: carriers are the only model (no gate, no opt-out; `SILICA_CARRIER_COUNT=<n>` overrides the core count) | one carrier thread per logical core for every actor but a dangerous one (workers, supervisors, the registries), bound at spawn (`core mod N`, else in turn), per-carrier idle sweep (FIFO, budgeted, batches of 64, released outside the carrier lock since 2026-10-20; `SILICA_IDLE_RELEASE_MS`, `SILICA_IDLE_STACK_BUDGET`); placement (`migrate_actor`, the `pin_actor_*` family) real on carriers; the four dispatch-order policies and the three priority levels real per carrier; one thread per dangerous actor; the Linux runtimes still thread per actor; §5 N "Carriers are the only model" |
+| N | built 2026-10-19, `apple_silicon_mac` only, unpublished branch: carriers are the only model (no gate, no opt-out; `SILICA_CARRIER_COUNT=<n>` overrides the core count) | one carrier thread per logical core for every actor but a dangerous one (workers, supervisors, the registries), bound at spawn (`core mod N`, else in turn), per-carrier idle sweep (FIFO, budgeted, batches of 64, released outside the carrier lock since 2026-10-20; `SILICA_IDLE_RELEASE_MS`, `SILICA_IDLE_STACK_BUDGET`); placement (`migrate_actor`, the `pin_actor_*` family) real on carriers; the four dispatch-order policies and the three priority levels real per carrier; one thread per dangerous actor; the Linux runtimes still thread per actor; §5 N "Carriers are the only model". **Status 2026-11-18: done on all three hosted paths**; the Linux runtimes have carriers since `aa8101edf2` and `ef2e778126` (2026-10-20), and the branch is merged into main |
 | J | done 2026-10-09 | per-image `silica_registry_slots` (one per atom) sizes the three registries and the keyed-form discriminator; duplicates refused per §20.3.1; names removed at teardown (§5 J) |
 
 ## 18. Gate (hosted)

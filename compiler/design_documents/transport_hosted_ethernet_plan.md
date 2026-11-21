@@ -4,7 +4,7 @@ Status: 2026-11-10. E0 done. E1 dropped: work-network restrictions rule out the 
 L0 to L3 (§5a) ran a Silica-to-Silica interchange between this Mac and the remote Linux x86-64 host; they are done.
 **Tunnels dropped the same day (user ruling): stages D0 to D2 (§5b) run that interchange over one direct TCP
 connection, with the Mac dialing `138.197.209.113:4550` and requests flowing both ways. This adds the carrier's
-`"listen:any:<port>"` wildcard listener.** **E2 is BUILT and verified by real runs except the items listed under "Still not verified" (updated 2026-11-14; branch `E2-transport-work`, pushed in `b943620c00` and merge `2423f477b4`, 2026-11-12; widened by Lee 2026-11-11 to all three hosted targets, a `"listen:<ipv4>:<port>"` listener form, interface binding, refusal rules and the compile guard `E2418`). What is verified, what is only built and what is open are listed in the E2 status table below.** The rest of the stages below are not started. Companion to `transport_serialization_design.md` (carriers, ETF,
+`"listen:any:<port>"` wildcard listener.** **E2 is BUILT and verified by real runs except the items listed under "Still not verified" (updated 2026-11-14; branch `E2-transport-work`, pushed in `b943620c00` and merge `2423f477b4`, 2026-11-12; widened by Lee 2026-11-11 to all three hosted targets, a `"listen:<ipv4>:<port>"` listener form, interface binding, refusal rules and the compile guard `E2418`). What is verified, what is only built and what is open are listed in the E2 status table below.** The rest of the stages below are not started. **Status 2026-11-18: that sentence is out of date; E3, E4 to E8 are done or superseded as each stage's own entry records (E8 on 2026-11-15), and the connect timeout, IPv6 and name binds were added after (`c063517bd9`).** Companion to `transport_serialization_design.md` (carriers, ETF,
 wire framing), `transport_links_design.md` (`carried_on`, `(:ethernet, n)`, `(:interface, name)`) and
 `transport_esp32s3_wifi_plan.md` (the serial plan whose demos this one mirrors).
 
@@ -56,7 +56,7 @@ Erlang peer, run by script outside `make integrate`, output compared with an `ex
 
 ## 4. What exists and what is missing
 
-Exists: `dangerous_tcp_carrier` (connect and listener serving many peers, `(:accepted, conn, info)`), `wireframe`,
+Exists: `dangerous_tcp_carrier` (connect and listener serving many peers, `(:accepted, fd, info)`; changed 2026-11-20: the listener hands the owner the accepted descriptor and the owner starts the connection carrier, supervised or not, where the listener used to spawn it and send `conn`), `wireframe`,
 `wire_etf`, `carried_on` (`(:interface, name)` and `(:ethernet, n)` are accepted and bind nothing, links design
 §3.2), `programmer_tools/transport_beam_demo` (one-shot, one direction).
 
@@ -65,7 +65,7 @@ Missing:
 - Binding for `(:interface, name)` (getifaddrs at `:open`) and `(:ethernet, n)` / `(:wifi, n)` (enumeration by family)
   in `dangerous_sockets`/`silica_sockets.c` and `Link.silica`/the Mac pack. Absent interface fails at open with
   `(:explicit, :link_unavailable)`.
-- `getpeername` (the listener reports `"peer:accepted"` today): needed so the demo can print who connected.
+- `getpeername` (the listener reports `"peer:accepted"` today): needed so the demo can print who connected. (Status 2026-11-18: both missing items are built; the listener reports `"peer:<ipv4>:<port>"`, see the E2 status below.)
 - A request/reply demo with both roles; today's demo is one-shot.
 - Erlang peer that both listens and dials, with the same rule as the Silica peer.
 - Tunnel/run scripts.
@@ -158,7 +158,7 @@ Missing:
     - Compiler fixes made during this work: SD-41 (`silica_rt_stack_trim_scratch` in `copy_all` and `evacuate`) and the interner fix (`type_interner_surface_text.silica`, `strip_named_params_work`).
   - **Still not verified:** the nix host has no wireless hardware (only the `(:wifi, 0)` refusal is verified there); the Mac's Wi-Fi port `en1` was inactive (refusal only); two IPv4 addresses on one interface; a second wired interface so that `(:ethernet, 1)` succeeds; the UDP example over the Internet to aalang.org (it passed Mac to nix over the LAN only). Earlier unreviewed items remain: the 169 rewritten goldens and the wireframe golden (differs from main's) are not reviewed by hand; the x86-64
     `emitter_core` `use_full_param_shadow` change (`n >= 2` for string helpers) regenerated goldens in `string_addition`,
-    `compiler_addition` and `modules_addition` on x86 only; the ESP32-S3 and Nucleo cross compilers were not rebuilt (`E2418` is gated on the pack serving the link, so they should be unaffected; unchecked).
+    `compiler_addition` and `modules_addition` on x86 only; the ESP32-S3 and Nucleo cross compilers were not rebuilt (`E2418` is gated on the pack serving the link, so they should be unaffected; unchecked). **Status 2026-11-18 (Lee): the drivers are not complete for Ethernet on the boards. The board packs serve no TCP or UDP link, so E2418 has nothing to check there; this is to be checked when a board gains a network carrier. The cross compilers have been rebuilt from later trees since this was written.**
   - **Closed gaps (2026-11-13/14):** (1) the supervised retry is met by the trial `trials/transport_addition/app_transport_tcp_link_rules/dangerous_link_refused_supervised_retry` (the supervisor allows 2 restarts, 3 refusals are counted, then the supervisor gives up; 20 identical runs). (2) `dangerous_tcp_listener` round 2 is now started by the failure reporter (the only stdout writer) after it prints `pong 8`; deterministic by construction (100 identical runs).
   - **Open (gaps):** none left.
   - **Closed by decision (2026-11-15, Lee, Option A):** (3) `(:sd_blocks)` and `(:flash_region)` on hosted targets (macOS, linux_aarch64, linux_x86_64) are board-only media, so `E2412` is the intended answer, not a gap: hosted offers only `(:memory)` and `(:backing)` (`transport_serialization_design.md` §6.8.6). The compile-defect trials `trials/error_enforcement_addition/link_hosted_sd_blocks_e2412_trial` and `link_hosted_flash_region_e2412_trial` pin the rejection (beside `store_link_not_provided_hosted`). **Verified 2026-11-15:** both pass on the Mac on their first run (integrate 1 pass, 0 fail); the Linux goldens are hand-derived copies with the target name changed and are unrun.
@@ -267,7 +267,7 @@ checkout `~/silica` there is not used.
     with 999959.
   - **Not verified.** The fixed-point check (the new compiler rebuilding itself byte-identically) was not run.
   - **linux_aarch64.** Its pack has the same rows since 2026-11-11 (`emitter/linux_aarch64/transport_pack.silica`). Pending:
-    a build on an AArch64 host (pix) and trial verification there.
+    a build on an AArch64 host (pix) and trial verification there. (Status 2026-11-18: built and verified on pix 2026-11-13/14, per [transport_hosted_status.md](transport_hosted_status.md).)
 - **Two defects seen in `usb_silica_pair` and worked around on both ends:** an inline nested tuple in `encode` is
   encoded flattened, and a `to_int64(...)` argument can clobber an earlier argument.
 
@@ -291,7 +291,7 @@ from 157.201.64.9) was made by the user beforehand.
   - **Platforms.** The same C file builds on macOS and on glibc (with `-D_GNU_SOURCE`, as before).
   - **New trial.** `trials/transport_addition/app_transport_tcp_listen_any` opens `"listen:any:0"` and connects
     through 127.0.0.1. Its output is `ping 7 / pong 8 / done`, exit 0. It has Apple goldens only; the Linux goldens
-    of the transport apps stay stale, as before.
+    of the transport apps stay stale, as before. (Status 2026-11-18: `dangerous_tcp_listen_any.linux_aarch64.ascomp` and `.linux_x86_64.ascomp` exist since the goldens refresh of `c063517bd9`.)
   - **Regenerated goldens.** Adding the wrapper changes several existing goldens, though not what the loopback
     listener does:
     - the `dangerous_sockets` and `dangerous_tcp_carrier` `.ascomp` and `silica.link.scout` of

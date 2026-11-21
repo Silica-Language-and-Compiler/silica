@@ -44,15 +44,15 @@ Read this before reporting what the hosted Ethernet transport can do. Sources: `
   `ethernet_mac_erlang_remote_silica`, `ethernet_mac_silica_remote_erlang` between this Mac and `manager@aalang.org`
   (Linux x86-64): `--runs 2`, `--timeout-check`, `--local` PASS, re-verified 2026-11-11 (plan §5b). In-suite:
   `transport_addition/app_transport_tcp_listen_any` (loopback, Apple goldens only), `app_transport_tcp_loopback_link`
-  (also run on linux_x86_64 incl. an `(:interface, "lo")` copy; links design §5.1 status). E3 is done (2026-11-15): `app_transport_tcp_both_sides` (both-sides exchange) and `app_transport_tcp_peer_close` (peer closes mid-request) pass on Mac, 3 identical runs each, goldens recorded, integrate 0 failures; Linux goldens are not kept. These example runs are
+  (also run on linux_x86_64 incl. an `(:interface, "lo")` copy; links design §5.1 status). E3 is done (2026-11-15): `app_transport_tcp_both_sides` (both-sides exchange) and `app_transport_tcp_peer_close` (peer closes mid-request) pass on Mac, 3 identical runs each, goldens recorded, integrate 0 failures; Linux goldens are not kept (status 2026-11-18: they exist now, `c063517bd9`). These example runs are
   outside `make integrate`; I did not re-run them for this note.
-- **Not verified:** the fixed point of the current Linux x86-64 compiler (not run, by rule: no fixed point until asked; AArch64 pack verified on pix 2026-11-13/14, see the matrix); Linux goldens of the transport trials are known stale in places (plan §5b D0).
+- **Not verified:** the fixed point of the current Linux x86-64 compiler (not run, by rule: no fixed point until asked; AArch64 pack verified on pix 2026-11-13/14, see the matrix); Linux goldens of the transport trials are known stale in places (plan §5b D0). (Status 2026-11-18: the hosted Linux `.linux_aarch64.ascomp` and `.linux_x86_64.ascomp` goldens of the transport trials were refreshed in `c063517bd9`.)
 - **E8 complete (2026-11-15).** A TCP dial address is `"host:port:timeout_ms"`; the program states the timeout and there
   is no default (an address without it ends `(:explicit, :bad_address)`). The connect is non-blocking inside the carrier
   actor and bounded by that timeout; a peer that does not answer gives `(:link_down, :timeout)` and the carrier ends
   `(:explicit, :link_timeout)`. Verified on the Mac (all timeout, refusal and real-timeout trials pass) and run on pix
   and nix with zero runtime failures; Linux goldens are not kept, and 580 stale or missing asm goldens per host are
-  expected. E2412 trials pass on Mac, pix and nix. Large frames: `app_transport_tcp_large_frame` (70,000-byte frame
+  expected (status 2026-11-18: refreshed in `c063517bd9`). E2412 trials pass on Mac, pix and nix. Large frames: `app_transport_tcp_large_frame` (70,000-byte frame
   accepted under `max_frame` 1,000,000) and `app_transport_tcp_max_frame` (same frame rejected,
   `(:rejected, :too_large)`, under `max_frame` 65,536) pass on the Mac; trial-only, no wire-format change. Also fixed:
   the hosted behaviour epilogue (`fn_epilogue_adopts` true except for the program `main`), regression trial verified on

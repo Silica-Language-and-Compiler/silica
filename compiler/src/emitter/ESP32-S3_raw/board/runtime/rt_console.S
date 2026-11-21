@@ -879,7 +879,7 @@ silica_rt_reason_arena_full:
 silica_rt_reason_not_a_string:
     .asciz  "not a Silica string"
 silica_rt_reason_ingress_full:
-    .asciz  "supervision ingress queue full"
+    .asciz  "supervision ingress queue is full"
 silica_rt_reason_heap_exhausted:
     .asciz  "heap exhausted"
 silica_rt_fault_cause:

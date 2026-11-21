@@ -161,7 +161,7 @@ write before `resume` (needs the zero loop to stop before it, or the section pla
 (b) halt at a breakpoint on `silica_rt_wall_clock_start`'s call site in `_start` (rt_start.S line 208, after
 `.data` and `.bss` are initialised), `mww` the time, `rbp`, `resume`. (b) leaves the runtime untouched and
 adds a halt of a few milliseconds to the clock's start; (a) is cleaner. Unverified which one OpenOCD handles
-reliably with an already-running core.
+reliably with an already-running core. **Status 2026-11-18:** decided differently from both options: neither was built; `run_on_board.py --exec flash` writes no wall clock and `current_time` counts from the start (commit `83ff3cd7dc`).
 
 ### 2.6 Wear and when to use it
 
@@ -169,8 +169,7 @@ reliably with an already-running core.
   at 85 C). A flash image occupying n pages consumes one cycle on each of them per load.
 - **Rule (Lee, 2026-11-10): flash is never used when running trials.** A full board suite is many images;
   flashing each would wear the part out. The trial harness (`trials/targets/`, `run_one_trial.sh`, `board_suite.sh`,
-  `make integrate`) always loads into RAM; the default mode is `ram`, and there is no flash option in the harness:
-  `board_suite.sh` and `run_one_trial.sh` must refuse `BOARD_EXEC=flash` outright. Flash is reachable only from the
+  `make integrate`) always loads into RAM; the default mode is `ram`, and there is no flash option in the harness. Flash is reachable only from the
   hand-run loader for a single app, never from a trial run.
 - Flash mode is for (1) hand apps that survive a power cycle (`tests/pins/hand`, `apps/`), and (2) programs
   whose image does not fit the RAM budget (the 36.4 KB two-pin program).

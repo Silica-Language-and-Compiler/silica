@@ -48,6 +48,8 @@
 // silica_rt_sysctl_u64 keeps the original's order of `str w0, [sp, #8]` then `stp xzr, xzr, [sp]`
 // (the length word is zeroed after being set, as in the Darwin and Linux AArch64 sources).
 
+use build_flavor;
+
 export actor_rt_asm_chunk_9/0;
 export actor_rt_asm_chunk_10/0;
 export actor_rt_asm_chunk_11/0;
@@ -784,11 +786,6 @@ L_bc_push:
 fn actor_rt_asm_chunk_10() -> string {
     "	.bss
 	.p2align	3
-# One process-wide word: L_region_grow (prims_memory, emitted per module) serialized region growth on it.
-# It lived in canonical_arena_runtime_asm until chunk 15 stage 5d removed that module.
-	.globl	silica_rt_region_lock
-silica_rt_region_lock:
-	.zero	8
 silica_actor_pthread_key:
 	.zero	8
 silica_actor_tls_init_lock:
@@ -995,7 +992,12 @@ Lmig_not_found:
 "
 }
 
+// actor_rt_asm_chunk_13 = actor_rt_asm_chunk_13_a, the trial-only ingress hook (empty in a normal build), actor_rt_asm_chunk_13_b.
 fn actor_rt_asm_chunk_13() -> string {
+    concat(concat(actor_rt_asm_chunk_13_a(), actor_rt_asm_trial_ingress_hook()), actor_rt_asm_chunk_13_b())
+}
+
+fn actor_rt_asm_chunk_13_a() -> string {
     "	.text
 # get_actor_memory_usage lives in prims_actors_stack_asm.silica (four-field record).
 # The implicit heap (silica_rt_region_alloc, silica_rt_region_alloc_in, silica_rt_actor_init_region,
@@ -1063,7 +1065,14 @@ LBBrw_oom:
 	leave
 	ret
 # -- End function
-	.globl	silica_rt_actor_supervision_ingress_enqueue
+"
+}
+
+// The trial-only supervision_ingress_enqueue entry point, split out of actor_rt_asm_chunk_13 at its function
+// boundaries: a trial build (build_flavor@trial_hooks_enabled()) emits it, a normal build's runtime does
+// not contain it. Its local labels (Lsie_*) and its ACB body are used by nothing else.
+fn actor_rt_asm_trial_ingress_hook_text() -> string {
+    "	.globl	silica_rt_actor_supervision_ingress_enqueue
 	.p2align	2
 # Phase B: synthetic exit / trial hook; bounded queue
 silica_rt_actor_supervision_ingress_enqueue:
@@ -1087,7 +1096,7 @@ silica_rt_actor_supervision_ingress_enqueue_acb:
 	call	silica_rt_sb_require
 	mov	r10d, DWORD PTR [rdi + 16]
 	cmp	r10d, 1024
-	jae	Lsie_abort
+	jae	Lsie_full
 	mov	edi, 1
 	mov	esi, 152
 	call	calloc
@@ -1123,10 +1132,35 @@ Lsie_fail_nolock:
 	xor	edi, edi
 	leave
 	ret
+# A full ingress ends its owner as silica_rt_sup_enqueue_exit does (Lsee_full): (:explicit,
+# :ingress_full) when it has a supervisor, the whole program (status 71) when it has none. The
+# message is not queued.
+Lsie_full:
+	mov	r10, QWORD PTR [rbp - 8]
+	cmp	QWORD PTR [r10 + 192], 0
+	je	Lsie_abort
+	lea	rdi, [r10 + 16]
+	call	silica_rt_lock_unlock
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	esi, 4
+	mov	rdx, QWORD PTR [rip + silica_rt_ingress_full_atom]
+	call	silica_rt_actor_stop
+	jmp	Lsie_fail_nolock
 Lsie_abort:
 	call	silica_rt_abort_ingress_full
 # -- End function
-	.globl	silica_rt_sb_require
+"
+}
+
+fn actor_rt_asm_trial_ingress_hook() -> string {
+    case build_flavor@trial_hooks_enabled() of {
+        true -> actor_rt_asm_trial_ingress_hook_text();
+        false -> ""
+    }
+}
+
+fn actor_rt_asm_chunk_13_b() -> string {
+    "	.globl	silica_rt_sb_require
 	.p2align	2
 silica_rt_sb_require:
 # rdi = ACB -> rdi = its supervision block (SB, 144 B: +0/+8 ingress front/rear, +16 depth u32,
@@ -1232,17 +1266,27 @@ silica_rt_actor_add_child:
 	mov	rsi, rdi
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_actor_add_child_acb
+	mov	QWORD PTR [rbp - 32], rdi
 	mov	rdi, QWORD PTR [rbp - 8]
 	call	silica_rt_acb_release
 	mov	rdi, QWORD PTR [rbp - 16]
 	call	silica_rt_acb_release
-	xor	edi, edi
+	mov	rdi, QWORD PTR [rbp - 32]
 	leave
+	test	rdi, rdi
+	jnz	Ladd_child_refused_fail
 	ret
+Ladd_child_refused_fail:
+	jmp	silica_rt_language_error_current
 	.p2align	2
 silica_rt_actor_add_child_acb:
-# rdi=parent supervisor ACB, rsi=child ACB (either may be 0) -> rdi=atom :ok.
-# Records the explicit parent/child relationship used by supervisor ingress teardown.
+# rdi = parent ACB, rsi = child ACB (both held by the caller, either 0 when its actor has ended) ->
+# rdi = 0 done (or nothing to do: an ended actor), 1 refused (the caller then fails with
+# :language_error). Records the explicit parent/child relationship used by supervisor ingress teardown.
+# Who may ask: the parent itself, or main. What may be added: an actor with no supervisor yet (or
+# this parent already), never the parent itself and never a runtime registry. A supervised child is
+# never moved to another parent: its supervisor's row would keep naming it and its exit would go
+# elsewhere.
 # frame: [rbp-8] parent (X19), [rbp-16] child (X20)
 	test	rdi, rdi
 	jz	Ladd_child_done
@@ -1253,14 +1297,36 @@ silica_rt_actor_add_child_acb:
 	sub	rsp, 80
 	mov	QWORD PTR [rbp - 8], rdi
 	mov	QWORD PTR [rbp - 16], rsi
-	cmp	QWORD PTR [rsi + 192], rdi
+	cmp	rdi, rsi
+	je	Ladd_child_refused
+	mov	rdi, rsi
+	call	silica_rt_is_registry_acb
+	test	rax, rax
+	jnz	Ladd_child_refused
+	call	silica_rt_tls_current_actor_get
+	test	rdi, rdi
+	jz	Ladd_child_asker_ok
+	cmp	rdi, QWORD PTR [rbp - 8]
+	jne	Ladd_child_refused
+Ladd_child_asker_ok:
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	mov	rax, QWORD PTR [rsi + 192]
+	cmp	rax, rdi
 	je	Ladd_child_held
+	test	rax, rax
+	jnz	Ladd_child_refused
 # The child holds its supervisor until its exit path is done with it (silica_rt_actor_final_release).
+# The supervisor word is set only while it is still 0.
 	lock add	QWORD PTR [rdi + 392], 1
-	mov	rax, rdi
-	xchg	QWORD PTR [rsi + 192], rax
-	mov	rdi, rax
+	xor	eax, eax
+	lock cmpxchg	QWORD PTR [rsi + 192], rdi
+	je	Ladd_child_held
 	call	silica_rt_acb_release
+	mov	rdi, QWORD PTR [rbp - 8]
+	mov	rsi, QWORD PTR [rbp - 16]
+	cmp	QWORD PTR [rsi + 192], rdi
+	jne	Ladd_child_refused
 Ladd_child_held:
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
@@ -1272,6 +1338,10 @@ Ladd_child_held:
 	leave
 Ladd_child_done:
 	xor	edi, edi
+	ret
+Ladd_child_refused:
+	mov	edi, 1
+	leave
 	ret
 # -- End function
 	.globl	silica_rt_actor_link

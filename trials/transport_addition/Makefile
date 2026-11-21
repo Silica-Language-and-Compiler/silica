@@ -35,7 +35,7 @@ MSG_PREFIX := $(TRIAL_DIR)/
 # The language's built-in modules (compiler/stdlib) the flat trials here link.
 STDLIB_MODS := wire_etf wireframe Carrier Link storelog
 # Sub-trials with a Makefile of their own, run after the flat trials and counted with them.
-SUB_TRIALS := app_transport_tcp_listener app_transport_tcp_loopback_link app_transport_tcp_listen_any app_transport_store_memory app_transport_store_backing app_transport_tcp_link_rules app_transport_udp_link_rules app_transport_tcp_both_sides app_transport_tcp_peer_close app_transport_tcp_large_frame app_transport_tcp_max_frame app_transport_tcp_close_after_end
+SUB_TRIALS := app_transport_tcp_listener app_transport_tcp_loopback_link app_transport_tcp_listen_any app_transport_store_memory app_transport_store_backing app_transport_tcp_link_rules app_transport_udp_link_rules app_transport_tcp_both_sides app_transport_tcp_peer_close app_transport_tcp_large_frame app_transport_tcp_max_frame app_transport_tcp_close_after_end app_transport_tcp_accept_supervised
 
 
 .DEFAULT_GOAL := all
@@ -107,7 +107,9 @@ integrate-run:
 		base=$${sams%.sams}; \
 	[ "$$base" = "__silica_runtime" ] && continue; \
 	[ "$$base" = "__silica_runtime" ] && continue; \
-		if [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
+		if [ -n "$(TRIAL_SKIP_GOLDEN)" ]; then \
+			: golden assembly check skipped; \
+		elif [ ! -f "$$base$(ASCOMP_EXT)" ]; then \
 			echo "❌❌ $(MSG_PREFIX)$$base has no .ascomp file"; \
 			$(INTEGRATE_DOT_FAIL); \
 			ko=$$((ko + 1)); failed=1; \

@@ -166,7 +166,9 @@
 #define ACB_PRIO         20     // byte
 #define ACB_ALIVE        21     // byte
 #define ACB_DEVICE       22     // byte
-#define ACB_STATE_OWNED  23     // byte
+#define ACB_ON_CPU       23     // byte: 1 from its dispatch until its core's switch back completes (the
+                                //   context is saved only then): end/migrate leave it to that core
+                                //   (silica_rt_sched_loop). The byte was ACB_STATE_OWNED, unused.
 #define ACB_REASON_TAG   24     // byte
 #define ACB_FAULT_CAUSE  25     // byte: EXCCAUSE + 1
 #define ACB_REASON_ATOM  26     // halfword
@@ -287,6 +289,9 @@
 #define MSG_PARK_SP      48     // a call node (design §5.3): the caller's SP, floor and auxiliary chunk as
 #define MSG_PARK_FLOOR   52     // it parked (written before the node is enqueued); the replier places the
 #define MSG_PARK_CHUNK   56     // reply from them and writes back the SP, floor and chunk the caller resumes with
+#define MSG_PLACING      60     // a call node: 1 while the replier copies the reply into the caller's chunks
+                                //   (silica_rt_reply_claim_caller .. silica_rt_reply_place's end); the
+                                //   caller's exit path waits for 0 before its chunks go back
 #define MSG_SIZE         64
 
 #define CORE_RQ_HEAD     0
@@ -410,6 +415,9 @@ silica_registry_atom_shutdown:
     .word   -1
     .weak   silica_registry_atom_killed
 silica_registry_atom_killed:
+    .word   -1
+    .weak   silica_registry_atom_ingress_full
+silica_registry_atom_ingress_full:
     .word   -1
     // (:explicit, :stack_exhausted) for a stack-guard hit (silica_rt_actor_fault_hook); -1 in a
     // hand-written image, so the report's reason line prints :unknown there
@@ -562,6 +570,29 @@ silica_rt_atom_names:
     memw
 .endm
 
+// The registry lock: the same shape as the scheduler lock (owner core id + 1). Every read and write
+// of a registry slot is made under it, and so is the exit path's sweep of an ending actor's names,
+// so a slot read under it never names a control block that has passed that sweep (and so has not
+// been recycled). The sections are leaves: no other lock is taken while it is held.
+.macro REG_LOCK ra, rb
+    movi    \ra, silica_rt_registry_lock
+.Lreg_lock_spin\@:
+    movi    \rb, 0
+    wsr     \rb, scompare1
+    THIS_CORE \rb
+    addi    \rb, \rb, 1
+    s32c1i  \rb, \ra, 0
+    bnez    \rb, .Lreg_lock_spin\@
+.endm
+
+.macro REG_UNLOCK ra, rb
+    memw
+    movi    \ra, silica_rt_registry_lock
+    movi    \rb, 0
+    s32i    \rb, \ra, 0
+    memw
+.endm
+
 // \r = this core's id (0 or 1) from PRID (0xCDCD on the PRO cpu, 0xABAB on the APP cpu: bit 13).
 .macro THIS_CORE r
     rsr     \r, prid
@@ -596,6 +627,8 @@ silica_rt_sched_stacks:
 silica_rt_sched_lock:
     .space  4
 silica_rt_free_lock:
+    .space  4
+silica_rt_registry_lock:                // the three registry tables (REG_LOCK)
     .space  4
 silica_rt_core1_boot_acb:               // core 1's boot context: saved by its first switch, never resumed
     .space  ACB_SIZE
@@ -1260,6 +1293,46 @@ silica_rt_rq_take:
     mov     a2, a3
     retw
     .size   silica_rt_rq_take, . - silica_rt_rq_take
+
+// silica_rt_rq_remove(acb) -> 1 when acb was unlinked from a ready queue of its core, 0 when it was
+// in none. All three queues are searched (its priority or the policy may have changed since the
+// push). Lock held. Used when a ready actor is ended before its core dispatches it.
+    .align  4
+silica_rt_rq_remove:
+    entry   a1, 32
+    l8ui    a3, a2, ACB_CORE
+    slli    a3, a3, 6
+    movi    a4, silica_rt_cores
+    add     a3, a3, a4                  // a3 = &head of queue 0 (&tail = +12, &len = +40)
+    movi    a7, 3                       // a7 = queues left
+1:  movi    a5, 0                       // a5 = the previous entry
+    l32i    a6, a3, CORE_RQ_HEAD        // a6 = the cursor
+2:  beqz    a6, 5f
+    beq     a6, a2, 3f
+    mov     a5, a6
+    l32i    a6, a6, ACB_NEXT_READY
+    j       2b
+3:  l32i    a6, a2, ACB_NEXT_READY
+    bnez    a5, 31f
+    s32i    a6, a3, CORE_RQ_HEAD
+    j       32f
+31: s32i    a6, a5, ACB_NEXT_READY
+32: l32i    a6, a3, CORE_RQ_TAIL
+    bne     a6, a2, 33f
+    s32i    a5, a3, CORE_RQ_TAIL
+33: l32i    a6, a3, CORE_RQ_LEN
+    addi    a6, a6, -1
+    s32i    a6, a3, CORE_RQ_LEN
+    movi    a6, 0
+    s32i    a6, a2, ACB_NEXT_READY
+    movi    a2, 1
+    retw
+5:  addi    a3, a3, 4
+    addi    a7, a7, -1
+    bnez    a7, 1b
+    movi    a2, 0
+    retw
+    .size   silica_rt_rq_remove, . - silica_rt_rq_remove
 
 // silica_rt_rq_pop(core block) -> acb or 0: the next actor to run under the policy in force.
     .align  4
@@ -2457,6 +2530,7 @@ silica_rt_sched_loop:
     movi    a5, ST_RUNNING
     s8i     a5, a4, ACB_STATUS
     movi    a5, 1
+    s8i     a5, a4, ACB_ON_CPU          // on this core until the switch back below completes
     s32i    a5, a3, CORE_BUSY
     s32i    a4, a3, CORE_CURRENT
     SCHED_UNLOCK a8, a9
@@ -2469,21 +2543,43 @@ silica_rt_sched_loop:
 31: mov     a10, a2
     mov     a11, a4
     call8   silica_rt_ctx_switch
-    // the context suspended, reached its boundary or ended
+    // the context suspended, reached its boundary or ended. It published its status (suspended,
+    // waiting, ready again) under the lock BEFORE its switch saved the context, so until here no
+    // other core may end, move or resume it (ACB_ON_CPU): an end requested meanwhile only cleared
+    // ACB_ALIVE and left the exit path to this core, which runs it now for a context in no queue
+    // (suspended, waiting) or unlinked from this core's queue (ready).
     s32i    a2, a3, CORE_CURRENT
+    SCHED_LOCK a8, a9
+    movi    a5, 0
+    s8i     a5, a4, ACB_ON_CPU
     l8ui    a5, a4, ACB_STATUS
     movi    a6, ST_DEAD
-    bne     a5, a6, 32f
+    beq     a5, a6, 33f
+    movi    a6, ST_BOUNDARY
+    beq     a5, a6, 34f
+    l8ui    a6, a4, ACB_ALIVE
+    bnez    a6, 35f
+    movi    a6, ST_SUSPENDED
+    beq     a5, a6, 6f
+    movi    a6, ST_WAIT_INGRESS
+    beq     a5, a6, 6f
+    movi    a6, ST_READY
+    bne     a5, a6, 35f                 // faulted: queued by the fault hook, label 6 when popped
+    mov     a10, a4
+    call8   silica_rt_rq_remove
+    j       6f
+35: SCHED_UNLOCK a8, a9
+    j       1b
+33: SCHED_UNLOCK a8, a9
     mov     a10, a4
     call8   silica_rt_actor_recycle
     j       1b
-32: movi    a6, ST_BOUNDARY
-    bne     a5, a6, 1b
+34: SCHED_UNLOCK a8, a9
     mov     a10, a4
     call8   silica_rt_actor_boundary
     j       1b
 6:  // exit path on behalf of a context that will never run again: a faulted actor (no root note)
-    // or one ended while parked
+    // or one ended while parked (lock held)
     l8ui    a11, a4, ACB_STATUS
     movi    a5, ST_FAULTED
     sub     a11, a11, a5
@@ -2900,11 +2996,25 @@ silica_rt_actor_exit_body:
     or      a5, a5, a6
     s32i    a5, a4, SB_TRAMP_RAN
 21: SCHED_UNLOCK a8, a9
-20: movi    a3, 0
-    l32i    a4, a2, ACB_WAIT_NODE       // a call this actor was suspended in must not wake it later
-    beqz    a4, 0f
+20: // Under the lock (silica_rt_reply_claim_caller reads MSG_CALLER under it): a reply this actor
+    // was placing as a replier stops (its context is abandoned: whoever waits on the mark goes on),
+    // and a call it was suspended in must not wake it, nor place a reply into its chunks, later. A
+    // reply already being placed is waited for, outside the lock: the replier runs on the other
+    // core and only copies, so the wait is bounded, and the chunks go back only after it.
+    SCHED_LOCK a8, a9
+    movi    a3, 0
+    l32i    a4, a2, ACB_ACTIVE_CALL
+    beqz    a4, 24f
+    s32i    a3, a4, MSG_PLACING
+24: l32i    a4, a2, ACB_WAIT_NODE
+    beqz    a4, 22f
     s32i    a3, a4, MSG_CALLER
     s32i    a3, a2, ACB_WAIT_NODE
+22: SCHED_UNLOCK a8, a9
+    beqz    a4, 0f
+23: memw
+    l32i    a3, a4, MSG_PLACING
+    bnez    a3, 23b
 0:  movi    a7, 0                       // a7 = "no supervisor" from deliver_exit
     l32i    a3, a2, ACB_SB
     beqz    a3, 12f
@@ -3047,12 +3157,8 @@ silica_rt_actor_exit_body:
     beqz    a3, 6f
     movi    a10, silica_rt_root_exit_msg
     call8   silica_rt_puts
-6:  // registered name (§20.3.1)
-    l16ui    a3, a2, ACB_REG_NAME
-    beqz    a3, 7f
-    addi    a3, a3, -1
+6:  // registered names (§20.3.1): every slot of the three tables that names this control block
     mov     a10, a2
-    mov     a11, a3
     call8   silica_rt_registry_forget
 7:  // the state chain (chunk 15, rt_state.S) goes back with the actor
     mov     a10, a2                     // the state chain and the release log go back (rt_state.S)
@@ -3066,11 +3172,58 @@ silica_rt_actor_exit_body:
     beqz    a3, 72f                     // before it frees the rows (silica_rt_child_table_free)
     movi    a4, 1
     s32i    a4, a3, 56                  // row.exit_done for the supervisor's cascade
-72: SCHED_UNLOCK a8, a9
+72: // an actor this one took on with add_child (no row) keeps no pointer to this ACB once it ends
+    // (still under the lock): its later exit is a root actor's, never a notice into whatever actor
+    // receives the ACB
+    movi    a3, silica_rt_acb_all
+    l32i    a3, a3, 0
+    movi    a5, 0
+73: beqz    a3, 74f
+    l32i    a4, a3, ACB_SUP
+    bne     a4, a2, 75f
+    l32i    a4, a3, ACB_ROW
+    bnez    a4, 75f
+    s32i    a5, a3, ACB_SUP
+75: l32i    a3, a3, ACB_ALL_NEXT
+    j       73b
+74: SCHED_UNLOCK a8, a9
 8:  movi    a3, ST_DEAD
     s8i     a3, a2, ACB_STATUS
     retw
     .size   silica_rt_actor_exit_body, . - silica_rt_actor_exit_body
+
+// silica_rt_reply_claim_caller(node) -> the blocked caller of a call node, or 0 when it has ended.
+// Under the lock, so it pairs with the caller's exit path (silica_rt_actor_exit_body clears
+// MSG_CALLER under it): a caller returned here is marked as being replied into (MSG_PLACING), and
+// its exit path waits until silica_rt_reply_place clears the mark before its chunks go back.
+    .align  4
+    .global silica_rt_reply_claim_caller
+    .type   silica_rt_reply_claim_caller, @function
+silica_rt_reply_claim_caller:
+    entry   a1, 32
+    SCHED_LOCK a8, a9
+    l32i    a3, a2, MSG_CALLER
+    beqz    a3, 1f
+    movi    a4, 1
+    s32i    a4, a2, MSG_PLACING
+1:  SCHED_UNLOCK a8, a9
+    mov     a2, a3
+    retw
+    .size   silica_rt_reply_claim_caller, . - silica_rt_reply_claim_caller
+
+// silica_rt_reply_place_done(node): the copy into the caller's chunks is complete (or abandoned);
+// its stores are ordered before the mark is cleared.
+    .align  4
+    .global silica_rt_reply_place_done
+    .type   silica_rt_reply_place_done, @function
+silica_rt_reply_place_done:
+    entry   a1, 32
+    memw
+    movi    a3, 0
+    s32i    a3, a2, MSG_PLACING
+    memw
+    retw
+    .size   silica_rt_reply_place_done, . - silica_rt_reply_place_done
 
 // silica_rt_complete_death_locked(node): the call completes with reply set 2 (the target ended
 // before replying; the caller raises actor_not_found, spec §16.1.1) and its caller is woken.
@@ -3222,6 +3375,16 @@ silica_rt_actor_fault_hook:
     s8i     a7, a6, ACB_ALIVE
     movi    a7, ST_FAULTED
     s8i     a7, a6, ACB_STATUS
+    // a reply this context was placing is abandoned with it: a caller's exit path waiting on the
+    // mark goes on now, not when this core's scheduler reaches the faulted actor (it may be the core
+    // that waits)
+    l32i    a7, a6, ACB_ACTIVE_CALL
+    beqz    a7, 26f
+    movi    a8, 0
+    memw
+    s32i    a8, a7, MSG_PLACING
+    memw
+26:
     // the report counter was bumped by the trampoline; this fault is handled, not fatal
     movi    a7, silica_rt_fatal_depth   // this core's count (rt_vectors.S FATAL_DEPTH_SLOT)
     THIS_CORE a8
@@ -4025,7 +4188,14 @@ silica_rt_enqueue_message:
     retw
     .size   silica_rt_enqueue_message, . - silica_rt_enqueue_message
 
-// silica_rt_enqueue_ingress(acb, node) -> 0 ok, 1 dead target. Bounded; overflow is a runtime abort.
+// silica_rt_enqueue_ingress(acb, node) -> 0 ok, 1 not queued (the caller gives the node back): a
+// dead target, or a full ingress (INGRESS_LIMIT). A full ingress ends its owner when it has a
+// supervisor: failure_reason (:explicit, :ingress_full), tag 4, marked ended and, when parked or
+// suspended, made ready, so its own core's scheduler runs its exit path (as
+// rt_supervisors.S silica_rt_sup_end_elsewhere): its children are shut down, its queued notices go
+// with it, and its supervisor gets its exit and decides. Every later notice finds it dead. A full
+// ingress of an actor with no supervisor (a root supervisor) ends the program
+// (silica_rt_abort_ingress_full).
     .align  4
 silica_rt_enqueue_ingress:
     entry   a1, 32
@@ -4059,7 +4229,23 @@ silica_rt_enqueue_ingress:
 8:  SCHED_UNLOCK a8, a9
     movi    a2, 1
     retw
-9:  SCHED_UNLOCK a8, a9
+9:  l32i    a4, a2, ACB_SUP
+    beqz    a4, 7f
+    movi    a4, silica_registry_atom_ingress_full
+    l32i    a4, a4, 0
+    s16i    a4, a2, ACB_REASON_ATOM
+    movi    a4, 4
+    s8i     a4, a2, ACB_REASON_TAG
+    movi    a4, 0
+    s8i     a4, a2, ACB_ALIVE
+    mov     a10, a2
+    call8   silica_rt_make_ready
+    mov     a10, a2
+    call8   silica_rt_wake
+    SCHED_UNLOCK a8, a9
+    movi    a2, 1
+    retw
+7:  SCHED_UNLOCK a8, a9
     call8   silica_rt_abort_ingress_full
     retw
     .size   silica_rt_enqueue_ingress, . - silica_rt_enqueue_ingress
@@ -4327,9 +4513,10 @@ silica_rt_actor_call_registered:
     entry   a1, 32
     movi    a10, silica_pid_registry_ref
     mov     a11, a2
-    call8   silica_rt_registry_lookup
-    beqz    a10, 9f
-    call8   silica_rt_acb_ident         // the holder's identity (§15.1.4)
+    call8   silica_rt_registry_lookup_ident // the holder's identity (§15.1.4), read under the lock
+    and     a8, a10, a11
+    addi    a8, a8, 1
+    beqz    a8, 9f                      // all ones: no live holder
     mov     a12, a4
     mov     a13, a5
     mov     a14, a6
@@ -4348,9 +4535,10 @@ silica_rt_actor_cast_registered:
     entry   a1, 32
     movi    a10, silica_pid_registry_ref
     mov     a11, a2
-    call8   silica_rt_registry_lookup
-    beqz    a10, 9f
-    call8   silica_rt_acb_ident         // the holder's identity (§15.1.4)
+    call8   silica_rt_registry_lookup_ident // the holder's identity (§15.1.4), read under the lock
+    and     a8, a10, a11
+    addi    a8, a8, 1
+    beqz    a8, 9f                      // all ones: no live holder
     mov     a12, a4
     mov     a13, a5
     mov     a14, a6
@@ -4370,9 +4558,10 @@ silica_rt_actor_cast_dangerous_registered:
     entry   a1, 32
     movi    a10, silica_dangerous_pid_registry_ref
     mov     a11, a2
-    call8   silica_rt_registry_lookup
-    beqz    a10, 9f
-    call8   silica_rt_acb_ident         // the holder's identity (§15.1.4)
+    call8   silica_rt_registry_lookup_ident // the holder's identity (§15.1.4), read under the lock
+    and     a8, a10, a11
+    addi    a8, a8, 1
+    beqz    a8, 9f                      // all ones: no live holder
     mov     a12, a4
     mov     a13, a5
     mov     a14, a6
@@ -4395,9 +4584,10 @@ silica_rt_actor_cast_device_registered:
     entry   a1, 32
     movi    a10, silica_device_pid_registry_ref
     mov     a11, a2
-    call8   silica_rt_registry_lookup
-    beqz    a10, 9f
-    call8   silica_rt_acb_ident         // the holder's identity (§15.1.4)
+    call8   silica_rt_registry_lookup_ident // the holder's identity (§15.1.4), read under the lock
+    and     a8, a10, a11
+    addi    a8, a8, 1
+    beqz    a8, 9f                      // all ones: no live holder
     mov     a12, a4
     mov     a13, a5
     mov     a14, a6
@@ -4440,8 +4630,12 @@ silica_rt_actor_recv:
     beqz    a4, 1f
     l32i    a5, a4, MSG_NEXT
     s32i    a5, a6, SB_IN_HEAD
-    bnez    a5, 2f
+    bnez    a5, 3f
     s32i    a5, a6, SB_IN_TAIL
+3:  l32i    a5, a6, SB_IN_DEPTH         // counted down as every other ingress dequeue does
+    beqz    a5, 2f
+    addi    a5, a5, -1
+    s32i    a5, a6, SB_IN_DEPTH
     j       2f
 1:  l32i    a4, a2, ACB_MB_HEAD
     beqz    a4, 2f
@@ -4473,6 +4667,9 @@ silica_rt_remove_actor:
     // :language_error and nothing is changed on it (as kill_abnormal).
     call8   silica_rt_current_actor
     beq     a10, a2, 8f
+    mov     a10, a2                     // a registry never ends: refused as the caller itself is
+    call8   silica_rt_is_registry_acb
+    bnez    a10, 8f
     mov     a10, a2
     movi    a11, 0
     call8   silica_rt_end_actor
@@ -4493,7 +4690,8 @@ silica_rt_actor_kill_abnormal_named:
     entry   a1, 32
     movi    a10, silica_pid_registry_ref
     mov     a11, a2
-    call8   silica_rt_registry_lookup
+    call8   silica_rt_registry_lookup_ident // the holder's identity, read under the lock
+    call8   silica_rt_ref_acb           // all ones resolves to no actor
     mov     a2, a10
     j       61f
     .size   silica_rt_actor_kill_abnormal_named, . - silica_rt_actor_kill_abnormal_named
@@ -4512,6 +4710,9 @@ silica_rt_actor_kill_abnormal:
     // :language_error and nothing is changed on it (a call it is serving gets no reply).
     call8   silica_rt_current_actor
     beq     a10, a2, 8f
+    mov     a10, a2                     // a registry never ends: refused as the caller itself is
+    call8   silica_rt_is_registry_acb
+    bnez    a10, 8f
 1:  l8ui    a4, a2, ACB_ALIVE
     beqz    a4, 9f
     l32i    a6, a2, ACB_SUP
@@ -4599,9 +4800,11 @@ silica_rt_stop_self_explicit:
 // silica_rt_end_actor(acb, reason tag): request the end. The running actor (a self-kill) ends after
 // its behaviour returns, as the reference does. An actor that is not running -- parked, suspended
 // in a call, or queued but not yet dispatched -- is not in the middle of anything, so its exit
-// path runs here, in the caller's context, and its stacks are recycled; a queued one keeps its
-// ACB until the scheduler pops it (status DEAD). An actor running on another core ends at its
-// next dispatch boundary.
+// path runs here, in the caller's context, and its stacks and ACB are recycled; a queued one is
+// unlinked from its core's ready queue first, under the same lock, so its scheduler never pops it.
+// An actor on a core (ACB_ON_CPU: running, or switching out after publishing a parked, suspended
+// or ready status whose context is not saved yet) ends there: at its next dispatch boundary, or
+// right after its switch completes (silica_rt_sched_loop).
     .align  4
     .global silica_rt_end_actor
 silica_rt_end_actor:
@@ -4616,6 +4819,8 @@ silica_rt_end_actor:
     s8i     a3, a2, ACB_REASON_TAG
 1:  movi    a4, 0
     s8i     a4, a2, ACB_ALIVE
+    l8ui    a4, a2, ACB_ON_CPU
+    bnez    a4, 8f
     l8ui    a4, a2, ACB_STATUS
     movi    a5, ST_IDLE
     beq     a4, a5, 2f
@@ -4636,15 +4841,9 @@ silica_rt_end_actor:
     mov     a10, a2
     call8   silica_rt_actor_recycle
     retw
-3:  movi    a5, ST_RUNNING
-    s8i     a5, a2, ACB_STATUS
-    SCHED_UNLOCK a8, a9
-    mov     a10, a2
-    movi    a11, 1                      // ended by remove_actor / kill_abnormal
-    call8   silica_rt_actor_exit
-    mov     a10, a2
-    call8   silica_rt_actor_recycle_stacks
-    retw
+3:  mov     a10, a2                     // queued: out of the queue, then as a parked one
+    call8   silica_rt_rq_remove
+    j       2b
 8:  SCHED_UNLOCK a8, a9
 29:  retw
     .size   silica_rt_end_actor, . - silica_rt_end_actor
@@ -4666,6 +4865,8 @@ silica_rt_end_actor_leaf:
     s8i     a3, a2, ACB_REASON_TAG
 1:  movi    a4, 0
     s8i     a4, a2, ACB_ALIVE
+    l8ui    a4, a2, ACB_ON_CPU          // on a core: ends there (silica_rt_end_actor)
+    bnez    a4, 8f
     l8ui    a4, a2, ACB_STATUS
     movi    a5, ST_IDLE
     beq     a4, a5, 2f
@@ -4686,15 +4887,9 @@ silica_rt_end_actor_leaf:
     mov     a10, a2
     call8   silica_rt_actor_recycle
     retw
-3:  movi    a5, ST_RUNNING
-    s8i     a5, a2, ACB_STATUS
-    SCHED_UNLOCK a8, a9
-    mov     a10, a2
-    movi    a11, 1                      // ended by remove_actor / kill_abnormal
-    call8   silica_rt_actor_exit_body
-    mov     a10, a2
-    call8   silica_rt_actor_recycle_stacks
-    retw
+3:  mov     a10, a2                     // queued: out of the queue, then as a parked one
+    call8   silica_rt_rq_remove
+    j       2b
 8:  SCHED_UNLOCK a8, a9
 29:  retw
     .size   silica_rt_end_actor_leaf, . - silica_rt_end_actor_leaf
@@ -4707,7 +4902,9 @@ silica_rt_end_actor_leaf:
 // cast forms read it, as in the reference; the actor itself answers {op, name, pid} messages with
 // a (status, pid) pair.
 
-// silica_rt_registry_lookup(&registry ref word, atom) -> acb or 0
+// silica_rt_registry_lookup(&registry ref word, atom) -> acb or 0 (a live holder). The slot is read
+// under the registry lock; the answer is for a test only (name held or not). A caller that goes on
+// to reach the holder takes its identity with silica_rt_registry_lookup_ident.
     .align  4
 silica_rt_registry_lookup:
     entry   a1, 32
@@ -4719,14 +4916,48 @@ silica_rt_registry_lookup:
     bgeu    a3, a4, 9f
     slli    a3, a3, 2
     add     a2, a2, a3
+    REG_LOCK a8, a9
     l32i    a2, a2, 0
-    beqz    a2, 9f
+    beqz    a2, 7f
     l8ui    a4, a2, ACB_ALIVE
-    bnez    a4, 8f
+    bnez    a4, 6f
+7:  movi    a2, 0
+6:  REG_UNLOCK a8, a9
+    movi    a3, 0
+    retw
 9:  movi    a2, 0
-8:  movi    a3, 0
+    movi    a3, 0
     retw
     .size   silica_rt_registry_lookup, . - silica_rt_registry_lookup
+
+// silica_rt_registry_lookup_ident(&registry ref word, atom) -> the live holder's identity (lo, hi),
+// all ones when the name is free or its holder has ended. The identity is read under the registry
+// lock while the slot still names the control block, so it is never a recycled block's.
+    .align  4
+silica_rt_registry_lookup_ident:
+    entry   a1, 32
+    l32i    a2, a2, 0
+    beqz    a2, 9f
+    l32i    a2, a2, ACB_STATE
+    beqz    a2, 9f
+    REGISTRY_SLOTS a4
+    bgeu    a3, a4, 9f
+    slli    a3, a3, 2
+    add     a2, a2, a3
+    REG_LOCK a8, a9
+    l32i    a4, a2, 0
+    beqz    a4, 7f
+    l8ui    a5, a4, ACB_ALIVE
+    beqz    a5, 7f
+    l32i    a2, a4, ACB_ID
+    l32i    a3, a4, ACB_ID + 4
+    REG_UNLOCK a8, a9
+    retw
+7:  REG_UNLOCK a8, a9
+9:  movi    a2, -1
+    movi    a3, -1
+    retw
+    .size   silica_rt_registry_lookup_ident, . - silica_rt_registry_lookup_ident
 
 // silica_rt_registry_store(&registry ref word, atom, acb) -> 0 stored (or the acb already holds this
 // name), 1 the name is held by a live actor or supervisor and nothing was stored (spec §20.3.1). A slot
@@ -4742,18 +4973,24 @@ silica_rt_registry_store:
     bgeu    a3, a5, 8f
     slli    a5, a3, 2
     add     a5, a2, a5
+    REG_LOCK a8, a9                     // the test and the store are one step for both cores
     l32i    a6, a5, 0
     beqz    a6, 1f
-    beq     a6, a4, 9f
+    beq     a6, a4, 7f
     l8ui    a7, a6, ACB_ALIVE
-    bnez    a7, 8f
-1:  s32i    a4, a5, 0
-    beqz    a4, 9f
+    bnez    a7, 6f
+1:  beqz    a4, 5f
+    l8ui    a7, a4, ACB_ALIVE           // tested under the lock: an actor whose exit sweep has run is
+    beqz    a7, 7f                      // never stored (its slot would outlive it)
+5:  s32i    a4, a5, 0
+    beqz    a4, 7f
     addi    a3, a3, 1
     s16i    a3, a4, ACB_REG_NAME
+7:  REG_UNLOCK a8, a9
 9:  movi    a2, 0
     movi    a3, 0
     retw
+6:  REG_UNLOCK a8, a9
 8:  movi    a2, 1
     movi    a3, 0
     retw
@@ -4778,28 +5015,71 @@ silica_rt_registry_slot:
     retw
     .size   silica_rt_registry_slot, . - silica_rt_registry_slot
 
-// silica_rt_registry_forget(acb, atom): clear the slot in whichever registry holds this actor.
+// silica_rt_registry_forget(acb): the exit path's sweep. Every slot of the ordinary, dangerous and
+// device tables that names this control block is cleared, under the registry lock, whatever names
+// the actor held (one per table or more), so no name outlives the actor and none can reach the next
+// actor that receives this block.
     .align  4
 silica_rt_registry_forget:
     entry   a1, 32
     movi    a4, 0
     s16i    a4, a2, ACB_REG_NAME
+    REG_LOCK a8, a9
     movi    a10, silica_pid_registry_ref
-    mov     a11, a3
-    call8   silica_rt_registry_slot
-    beqz    a10, 1f
-    l32i    a5, a10, 0
-    bne     a5, a2, 1f
-    s32i    a4, a10, 0
-1:  movi    a10, silica_dangerous_pid_registry_ref
-    mov     a11, a3
-    call8   silica_rt_registry_slot
-    beqz    a10, 2f
-    l32i    a5, a10, 0
-    bne     a5, a2, 2f
-    s32i    a4, a10, 0
-2:  retw
+    mov     a11, a2
+    call8   silica_rt_registry_sweep
+    movi    a10, silica_dangerous_pid_registry_ref
+    mov     a11, a2
+    call8   silica_rt_registry_sweep
+    movi    a10, silica_device_pid_registry_ref
+    mov     a11, a2
+    call8   silica_rt_registry_sweep
+    REG_UNLOCK a8, a9
+    retw
     .size   silica_rt_registry_forget, . - silica_rt_registry_forget
+
+// silica_rt_registry_sweep(&registry ref word, acb): clears every slot of that table holding acb.
+// The caller holds the registry lock. Leaf.
+    .align  4
+silica_rt_registry_sweep:
+    entry   a1, 32
+    l32i    a2, a2, 0
+    beqz    a2, 9f
+    l32i    a2, a2, ACB_STATE
+    beqz    a2, 9f
+    REGISTRY_SLOTS a4
+    movi    a6, 0
+1:  beqz    a4, 9f
+    l32i    a5, a2, 0
+    bne     a5, a3, 2f
+    s32i    a6, a2, 0
+2:  addi    a2, a2, 4
+    addi    a4, a4, -1
+    j       1b
+9:  retw
+    .size   silica_rt_registry_sweep, . - silica_rt_registry_sweep
+
+// silica_rt_is_registry_acb(acb) -> 1 when it is one of the three registries' control blocks (they
+// never end: remove_actor and kill_abnormal refuse them), else 0.
+    .align  4
+silica_rt_is_registry_acb:
+    entry   a1, 32
+    movi    a3, 0
+    beqz    a2, 9f
+    movi    a4, silica_pid_registry_ref
+    l32i    a4, a4, 0
+    beq     a4, a2, 8f
+    movi    a4, silica_dangerous_pid_registry_ref
+    l32i    a4, a4, 0
+    beq     a4, a2, 8f
+    movi    a4, silica_device_pid_registry_ref
+    l32i    a4, a4, 0
+    bne     a4, a2, 9f
+8:  movi    a3, 1
+9:  mov     a2, a3
+    movi    a3, 0
+    retw
+    .size   silica_rt_is_registry_acb, . - silica_rt_is_registry_acb
 
 // silica_rt_register_actor_named(X0 actor, X1 atom) -> 0 stored, 1 the name is held by a live actor
 // or supervisor and nothing was stored (§20.3.1); the dangerous and device forms the same.
@@ -5080,18 +5360,29 @@ silica_rt_pid_registry_beh:
     beqz    a8, 13f
     slli    a9, a5, 2
     add     a9, a4, a9
+    REG_LOCK a12, a13                   // the test and the store are one step for both cores
+    l8ui    a8, a2, ACB_ALIVE           // again under the lock: an actor whose exit sweep has run is
+    beqz    a8, 20f                     // never stored
     l32i    a8, a9, 0
     beqz    a8, 14f
-    beq     a8, a2, 11f
+    beq     a8, a2, 17f
     l8ui    a10, a8, ACB_ALIVE
-    bnez    a10, 12f
+    bnez    a10, 18f
 14: l16ui    a8, a2, ACB_REG_NAME
     beqz    a8, 15f
     addi    a10, a5, 1
-    bne     a8, a10, 16f
+    bne     a8, a10, 19f
 15: s32i    a2, a9, 0
     addi    a9, a5, 1
     s16i    a9, a2, ACB_REG_NAME
+17: REG_UNLOCK a12, a13
+    j       11f
+18: REG_UNLOCK a12, a13
+    j       12f
+19: REG_UNLOCK a12, a13
+    j       16f
+20: REG_UNLOCK a12, a13
+    j       13f
 11: movi    a8, ATOM_OK
     mov     a9, a2
     j       8f
@@ -5111,10 +5402,20 @@ silica_rt_pid_registry_beh:
     bgeu    a5, a9, 21f
     slli    a9, a5, 2
     add     a9, a4, a9
+    REG_LOCK a12, a13                   // the holder's identity is read while the slot names it
     l32i    a9, a9, 0
+    beqz    a9, 22f
+    l32i    a14, a9, ACB_ID
+    l32i    a15, a9, ACB_ID + 4
+22: REG_UNLOCK a12, a13
     beqz    a9, 21f
     movi    a8, ATOM_FOUND
-    j       8f
+    s32i    a8, a6, 0
+    movi    a8, 0
+    s32i    a8, a6, 4
+    s32i    a14, a6, 8
+    s32i    a15, a6, 12
+    j       81f
 21: movi    a8, ATOM_NOT_FOUND
     movi    a9, 0
     j       8f
@@ -5122,8 +5423,10 @@ silica_rt_pid_registry_beh:
     bgeu    a5, a9, 31f
     slli    a9, a5, 2
     add     a9, a4, a9
+    REG_LOCK a12, a13
     movi    a8, 0
     s32i    a8, a9, 0
+    REG_UNLOCK a12, a13
 31: movi    a8, ATOM_OK
     mov     a9, a2
 8:  s32i    a8, a6, 0
@@ -5133,6 +5436,7 @@ silica_rt_pid_registry_beh:
     call8   silica_rt_acb_ident
     s32i    a10, a6, 8
     s32i    a11, a6, 12
+81:
     mov     a10, a6                     // the pair into the blocked caller's stack (a cast that
     movi    a11, 0                      // reached the registry: the pair stays in the frame)
     movi    a12, silica_rt_pair_word2_desc_root
@@ -5257,11 +5561,13 @@ silica_rt_migrate_actor:
     l32i    a6, a6, 0
     bgeu    a4, a6, 7f
     SCHED_LOCK a8, a9
+    l8ui    a6, a2, ACB_ON_CPU
+    bnez    a6, 3f                      // on a core (its switch-out may not have saved it yet)
     l8ui    a6, a2, ACB_STATUS
     beqz    a6, 1f                      // idle: pin now
     movi    a7, ST_SUSPENDED
     beq     a6, a7, 1f                  // suspended in a call: resumes on the new core
-    addi    a7, a4, 1
+3:  addi    a7, a4, 1
     s8i     a7, a2, ACB_TARGET          // running or queued: at the next dispatch boundary
     j       2f
 1:  s8i     a4, a2, ACB_CORE
@@ -5635,7 +5941,12 @@ silica_rt_actor_monitor:
     retw
     .size   silica_rt_actor_monitor, . - silica_rt_actor_monitor
 
-// silica_rt_actor_add_child(X0 supervisor, X1 child) -> 0: the explicit parent/child relation.
+// silica_rt_actor_add_child(X0 supervisor, X1 child) -> 0: the explicit parent/child relation. Who
+// may ask: the parent itself, or main. What may be added: an actor with no supervisor yet (or this
+// parent already), never the parent itself and never a registry; anything else fails the caller with
+// :language_error. A supervised child is never moved to another parent (its supervisor's row would
+// keep naming it and its exit would go elsewhere). An ended actor on either side is :ok, nothing
+// changed. When the parent ends, the child's pointer to it is cleared (the exit path, label 72).
     .align  4
     .global silica_rt_actor_add_child
     .type   silica_rt_actor_add_child, @function
@@ -5651,10 +5962,25 @@ silica_rt_actor_add_child:
     mov     a2, a10
     beqz    a2, 9f
     beqz    a4, 9f
+    beq     a2, a4, 8f
+    mov     a10, a4
+    call8   silica_rt_is_registry_acb
+    bnez    a10, 8f
+    call8   silica_rt_current_actor
+    beqz    a10, 1f
+    bne     a10, a2, 8f
+1:  SCHED_LOCK a8, a9                   // the test and the store are one step for both cores
+    l32i    a5, a4, ACB_SUP
+    beq     a5, a2, 2f
+    bnez    a5, 7f
     s32i    a2, a4, ACB_SUP             // the parent's supervision block comes with the first
-9:  movi    a2, 0                       // exit notice it receives (silica_rt_enqueue_ingress)
+2:  SCHED_UNLOCK a8, a9                 // exit notice it receives (silica_rt_enqueue_ingress)
+9:  movi    a2, 0
     movi    a3, 0
     retw
+7:  SCHED_UNLOCK a8, a9
+8:  call8   silica_rt_language_error_current   // never returns
+    j       8b
     .size   silica_rt_actor_add_child, . - silica_rt_actor_add_child
 
 // ---------------------------------------------------------------------------------------------
@@ -5744,9 +6070,13 @@ silica_rt_actor_supervision_ingress_enqueue:
     s32i    a8, a10, MSG_INGRESS_KIND
     s32i    a4, a10, MSG_PAYLOAD
     s32i    a5, a10, MSG_PAYLOAD + 4
+    mov     a6, a10
     mov     a11, a10
     mov     a10, a2
     call8   silica_rt_enqueue_ingress
+    beqz    a10, 9f
+    mov     a10, a6                     // not queued (a dead target or a full ingress): the node goes back
+    call8   silica_rt_free_node
 9:  movi    a2, ATOM_OK
     movi    a3, 0
     retw

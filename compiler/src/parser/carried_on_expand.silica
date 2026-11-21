@@ -461,6 +461,13 @@ fn rewrite_spawn(ts: List[{ kind: int64, lexeme: string, location: { file: strin
 // at run time, and so is a named interface's own address, which only the host knows. A literal that is not a
 // strict dotted quad (a leading zero, "010.0.0.1", a fifth part) is not an address the link refuses: the
 // carrier ends it (:explicit, :bad_address) at run time, so this pass leaves it alone.
+//
+// IPv6 (transport_serialization_design.md §6.3, "Link rules"; open item 75): the (:tcp) form
+// "listen:[<ipv6>]:<port>" follows the same rules. "listen:[::]:<port>", every IPv6 interface, is refused under
+// every declared link, as "listen:any:<port>" is; (:loopback) refuses every address but ::1. As with IPv4, only a
+// literal the carrier would accept is judged: the address must be the one canonical text of RFC 5952 that the
+// carrier's parser takes (dangerous_sockets@parse_ipv6) and not link-local, and the brackets must be followed by
+// ':' and a port the carrier takes; anything else ends (:explicit, :bad_address) at run time and is left alone.
 
 fn nil_binds() -> List[{ var: string, decl: string }, mem(normal)] {
     sequence proc[mem(normal)]
@@ -525,6 +532,142 @@ fn is_dotted_quad(s: string) -> boolean {
     quad_from(s, 0, 0, 0, 0)
 }
 
+fn has_suffix(s: string, p: string) -> boolean {
+    length_bytes(s) >= length_bytes(p) and substring(s, length_bytes(s) - length_bytes(p), length_bytes(s)) == p
+}
+
+// Whether c is a lowercase hexadecimal digit (the IPv6 text the carrier takes has no uppercase).
+fn is_lower_hex(c: string) -> boolean {
+    case digit_value(c) >= 0 of {
+        true -> true;
+        false -> case c of {
+            "a" -> true; "b" -> true; "c" -> true; "d" -> true; "e" -> true; "f" -> true;
+            _: string -> false
+        }
+    }
+}
+
+fn all_lower_hex_from(s: string, i: int64) -> boolean {
+    case i >= length_bytes(s) of {
+        true -> true;
+        false -> is_lower_hex(substring(s, i, i + 1)) and all_lower_hex_from(s, i + 1)
+    }
+}
+
+// One group of a canonical IPv6 text: 1 to 4 lowercase hexadecimal digits, no leading zero except a bare "0".
+fn ipv6_group_ok(g: string) -> boolean {
+    n: int64 <- length_bytes(g);
+    n >= 1 and n <= 4 and all_lower_hex_from(g, 0) and (n == 1 or substring(g, 0, 1) != "0")
+}
+
+// The groups of s from i on, separated by single colons (s holds no "::" here): (all groups well formed, the
+// number of groups, the longest run of consecutive "0" groups). `run` is the run of "0" groups just before i.
+fn ipv6_groups_from(s: string, i: int64, count: int64, run: int64, best: int64) -> (boolean, int64, int64) {
+    e: int64 <- index_of_char(s, ":", i);
+    g: string <- substring(s, i, e);
+    run2: int64 <- case g == "0" of { true -> run + 1; false -> 0 };
+    best2: int64 <- case run2 > best of { true -> run2; false -> best };
+    case ipv6_group_ok(g) of {
+        false -> (false, 0, 0);
+        true -> case e >= length_bytes(s) of {
+            true -> (true, count + 1, best2);
+            false -> ipv6_groups_from(s, e + 1, count + 1, run2, best2)
+        }
+    }
+}
+
+// ipv6_groups_from for one side of a "::": an empty side has no groups.
+fn ipv6_side(s: string) -> (boolean, int64, int64) {
+    case length_bytes(s) == 0 of {
+        true -> (true, 0, 0);
+        false -> ipv6_groups_from(s, 0, 0, 0, 0)
+    }
+}
+
+// The index of the first "::" at or after i, or the length of s.
+fn index_of_double_colon(s: string, i: int64) -> int64 {
+    case i + 1 >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> case substring(s, i, i + 2) == "::" of {
+            true -> i;
+            false -> index_of_double_colon(s, i + 1)
+        }
+    }
+}
+
+// Whether s is the canonical text of an IPv6 address (RFC 5952), exactly as the carrier's parser judges it
+// (ipv6_strict in silica_sockets.c, which renders the address and compares): groups of 1 to 4 lowercase digits
+// without leading zeros; without "::", eight groups and no run of two or more "0" groups; with one "::", it stands
+// for at least two zero groups, its neighbours are not "0", and it is the first longest run of zero groups (a run
+// written out before it is shorter, one after it is not longer).
+fn is_canonical_ipv6(s: string) -> boolean {
+    n: int64 <- length_bytes(s);
+    gi: int64 <- index_of_double_colon(s, 0);
+    case n < 2 or n > 39 of {
+        true -> false;
+        false -> case gi >= n of {
+            true -> {
+                (ok: boolean, count: int64, best: int64) <- ipv6_groups_from(s, 0, 0, 0, 0);
+                ok and count == 8 and best < 2
+            };
+            false -> {
+                head: string <- substring(s, 0, gi);
+                tail: string <- substring(s, gi + 2, n);
+                (hok: boolean, hcount: int64, hbest: int64) <- ipv6_side(head);
+                (tok: boolean, tcount: int64, tbest: int64) <- ipv6_side(tail);
+                gap: int64 <- 8 - hcount - tcount;
+                neighbours_ok: boolean <- head != "0" and has_suffix(head, ":0") == false and tail != "0" and has_prefix(tail, "0:") == false;
+                hok and tok and gap >= 2 and neighbours_ok and (hbest < 2 or hbest < gap) and (tbest < 2 or tbest <= gap)
+            }
+        }
+    }
+}
+
+// Whether a canonical IPv6 text is link-local (fe80::/10): its first group is fe80 to febf. The carrier refuses
+// such an address as (:explicit, :bad_address).
+fn is_link_local_ipv6(s: string) -> boolean {
+    index_of_char(s, ":", 0) == 4 and (has_prefix(s, "fe8") or has_prefix(s, "fe9") or has_prefix(s, "fea") or has_prefix(s, "feb"))
+}
+
+// A port as the carrier's IPv6 form takes it (dangerous_tcp_carrier port_text_ok): 1 to 5 decimal digits, no
+// leading zero except a bare "0", at most 65535.
+fn port_digits_value(s: string, i: int64, acc: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> acc;
+        false -> {
+            d: int64 <- digit_value(substring(s, i, i + 1));
+            case d < 0 of {
+                true -> 0 - 1;
+                false -> port_digits_value(s, i + 1, acc * 10 + d)
+            }
+        }
+    }
+}
+
+fn ipv6_port_ok(s: string) -> boolean {
+    n: int64 <- length_bytes(s);
+    v: int64 <- port_digits_value(s, 0, 0);
+    n >= 1 and n <= 5 and v >= 0 and v <= 65535 and (n == 1 or substring(s, 0, 1) != "0")
+}
+
+// The address of a (:tcp) listen literal's bound part "[<ipv6>]:<port>" when the carrier would accept it (a
+// canonical, not link-local address and a port), "" otherwise (an IPv4 or other form, or one that the carrier
+// ends with (:explicit, :bad_address)).
+fn listen_ipv6_address(rest: string) -> string {
+    rb: int64 <- index_of_char(rest, "]", 0);
+    case has_prefix(rest, "[") and rb + 1 < length_bytes(rest) of {
+        false -> "";
+        true -> {
+            addr: string <- substring(rest, 1, rb);
+            port: string <- substring(rest, rb + 2, length_bytes(rest));
+            case substring(rest, rb + 1, rb + 2) == ":" and ipv6_port_ok(port) and is_canonical_ipv6(addr) and is_link_local_ipv6(addr) == false of {
+                true -> addr;
+                false -> ""
+            }
+        }
+    }
+}
+
 // Whether the link is one the carrier reads at :open (every hosted IP link).
 fn link_restricts_listen(link_tag: string) -> boolean {
     case link_tag of {
@@ -568,12 +711,33 @@ fn listen_conflict(d: { name: string, kind: string, link_tag: string, instance: 
     tail: string <- " (transport_links_design.md §3.2)";
     // A link this target does not serve is E2412 at the spawn instead (rewrite_spawn).
     served: boolean <- transport_pack@provides_carrier(d.kind) and transport_pack@provides_link(d.link_tag, d.instance);
+    // The address of a (:tcp) "listen:[<ipv6>]:<port>" the carrier would accept, "" for any other literal.
+    ip6: string <- case d.kind == "tcp" of {
+        true -> listen_ipv6_address(rest);
+        false -> ""
+    };
     case served and (d.kind == "tcp" or is_udp) and link_restricts_listen(d.link_tag) and length_bytes(rest) > 0 of {
         false -> "";
         true -> case has_prefix(rest, "any:") of {
             true -> concat(concat(concat(concat(concat(concat(head, ": "), any_form), " every interface, which a declared link does not allow; write "), port_form), concat(own_form, ", or spawn the carrier without a link")), tail);
             false -> case d.link_tag == "loopback" and length_bytes(ip) < length_bytes(rest) and is_dotted_quad(ip) and has_prefix(ip, "127.") == false of {
                 true -> concat(concat(concat(concat(head, ": it is not a loopback address (127.0.0.0/8); write "), port_form), " for 127.0.0.1"), tail);
+                false -> listen_ipv6_conflict(d.link_tag, ip6, head, tail)
+            }
+        }
+    }
+}
+
+// The E2418 message for an IPv6 listen address (ip6, without brackets; "" when the literal is not one the carrier
+// accepts) under a declared link that restricts listening, "" when the link allows it (transport_serialization_design.md
+// §6.3, "Link rules"): "[::]" is refused under every such link, any address but ::1 under (:loopback).
+fn listen_ipv6_conflict(link_tag: string, ip6: string, head: string, tail: string) -> string {
+    case length_bytes(ip6) == 0 of {
+        true -> "";
+        false -> case ip6 == "::" of {
+            true -> concat(concat(head, ": \"listen:[::]:<port>\" listens on every IPv6 interface, which a declared link does not allow; write \"listen:<port>\" to listen on the link's own address, or spawn the carrier without a link"), tail);
+            false -> case link_tag == "loopback" and ip6 != "::1" of {
+                true -> concat(concat(head, ": it is not the IPv6 loopback address ::1; write \"listen:[::1]:<port>\" for ::1"), tail);
                 false -> ""
             }
         }

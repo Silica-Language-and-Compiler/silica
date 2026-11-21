@@ -70,7 +70,7 @@ Phases (§9): A hosted link naming, B UART on the ESP32-S3, C UART on the Nucleo
    former open question 1; the head was `carrier ... on` until 2026-11-08, when Lee renamed it to `carried_on`, which
    removes the clash with the built-in module `carrier`). `carried_on` is the declaration head and replaces both the
    `carrier` keyword and the `on` word; the kind and the link follow the name. It needs a parser change, and
-   `carried_on` becomes a reserved word when the grammar phase lands. **Planned, not implemented.** The alternative of keeping
+   `carried_on` becomes a reserved word when the grammar phase lands. **Planned, not implemented.** (Status 2026-11-18: implemented 2026-11-09, stage S-C; trials `error_enforcement_addition/link_*` and `transport_addition/app_transport_tcp_loopback_link`.) The alternative of keeping
    `spawn_dangerous` and passing the link as one more argument is dropped.
 9. **The link value is a tagged tuple where the language allows it**, such as `(:uart, 1, 115200)`; otherwise it is
    a record, `{ kind: :uart, n: 1, baud: 115200 }` (Lee, resolving the former open question 2). Which of the two is
@@ -220,7 +220,7 @@ milestone N1 needs.
 
 Today there is no carrier declaration form; carriers are chosen by module at `spawn_dangerous` and by an address string
 at `:open`. This design adds a top-level **carrier declaration**, a pure declaration with no effects, in the style of
-`impl` and device-description declarations. The form is decided (decision 8; parser change planned, not implemented); the exact production is fixed when the
+`impl` and device-description declarations. The form is decided (decision 8; parser change planned, not implemented; status 2026-11-18: implemented 2026-11-09, specification §16.4.9); the exact production is fixed when the
 grammar phase starts.
 
 ```
@@ -378,11 +378,11 @@ E2410 keeps its meaning (the kind is provided) and the new E2412 says the hardwa
     `transport_link_tags`, and the `link_*` error trials. `link_not_provided_hosted` and `link_baud_unsupported` have
     `.linux_x86_64.golden_fail` goldens that differ from the Mac's only in the target name.
   - **Interface binding.** A `(:interface, "lo")` copy of the loopback app also ran. Interface binding itself is still
-    not built (§3.2).
+    not built (§3.2). (Status 2026-11-18: built as stage E2 and verified 2026-11-13/14, §3.2 and [transport_hosted_status.md](transport_hosted_status.md).)
 - **Linux AArch64.** Rows written 2026-11-11: `emitter/linux_aarch64/transport_pack.silica` now has the same carriers, links,
   baud check and `carrier_spawn` as the x86-64 pack (the two files differ only in their header comment). **Pending:** a
   build of the compiler on an AArch64 host (pix) and the trials there (`app_transport_tcp_loopback_link`,
-  `transport_link_tags`, the `link_*` error trials). Until that runs, "works on AArch64" is not established.
+  `transport_link_tags`, the `link_*` error trials). Until that runs, "works on AArch64" is not established. (Status 2026-11-18: built and verified on pix 2026-11-13/14, per [transport_hosted_status.md](transport_hosted_status.md).)
 
 ### 5.2 Diagnostics
 
@@ -399,7 +399,7 @@ rows below, in the style of the §9.3 table; the diagnostics table at implementa
 | E2415 LinkInstanceConflict | two carrier declarations in one application name the same link tag and instance (decision 6); also a UART instance that another subsystem uses (the console, printing, failure banners, peek/poke apps; decision 17), so no UART instance is ever shared. Message names both users |
 | E2416 LinkConfigMissing | the link needs a configuration function (`board_config.silica`, §4) that is not defined; names the function. Phase D |
 | E2417 LinkParameterInvalid | a link parameter fails the pack's check: baud out of the UART's range, a non-literal instance or baud (the declaration is pure and literal-only, as limits records are), an interface name that is not a literal |
-| E2418 LinkListenAddressRefused | `x: T <- spawn_dangerous_carrier(...)` followed in the same function by `cast(x, (:open, _, "<literal>"))`, where the declared link (served by the target) refuses the literal: `"listen:any:<port>"` under `(:loopback)`, `(:interface, n)`, `(:ethernet, n)` or `(:wifi, n)`, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; for a `(:udp)` carrier, a local part `any:<port>` under any of them, or `<ipv4>:<port>` outside 127.0.0.0/8 under `(:loopback)` (an IPv4 that is not a strict dotted quad, such as a leading-zero literal, gets no E2418 and ends `(:explicit, :bad_address)` at run time) (E2 items 1 and 4; implemented in `parser/carried_on_expand.silica`, token level, reported as a ParseError; a link the target does not serve is E2412 at the spawn instead). Addresses it cannot see are refused at run time (`(:link_down, :fault)`, then `(:explicit, :link_unavailable)`). TCP forms built and run in the compile-defect trials (three trials); the `(:udp)` forms built, trials added, run in the next trial pass |
+| E2418 LinkListenAddressRefused | `x: T <- spawn_dangerous_carrier(...)` followed in the same function by `cast(x, (:open, _, "<literal>"))`, where the declared link (served by the target) refuses the literal: `"listen:any:<port>"` under `(:loopback)`, `(:interface, n)`, `(:ethernet, n)` or `(:wifi, n)`, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; for a `(:udp)` carrier, a local part `any:<port>` under any of them, or `<ipv4>:<port>` outside 127.0.0.0/8 under `(:loopback)` (an IPv4 that is not a strict dotted quad, such as a leading-zero literal, gets no E2418 and ends `(:explicit, :bad_address)` at run time) (E2 items 1 and 4; implemented in `parser/carried_on_expand.silica`, token level, reported as a ParseError; a link the target does not serve is E2412 at the spawn instead). Addresses it cannot see are refused at run time (`(:link_down, :fault)`, then `(:explicit, :link_unavailable)`). TCP forms built and run in the compile-defect trials (three trials); the `(:udp)` forms built, trials added, run in the next trial pass **Status 2026-11-19:** IPv6 listen literals are judged as the IPv4 ones are (`bbd6eccbd1`). |
 
 Placement follows E2410: E2413 and E2414 in the shared front end (they depend only on the language's tables), E2415
 in the same pass as E2405 (duplicates), E2412 and E2417 in `sir_target_verify` because they read the pack.

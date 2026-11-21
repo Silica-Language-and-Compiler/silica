@@ -142,7 +142,7 @@ Gate suites named by the phase 4 row, all existing directories: `actors_addition
 `supervisors_board_defects_addition`, `supervisors_host_defects_addition`), `bees_regions_addition`, `ffi_addition`,
 `region_hazards_open_addition` (and `region_hazards_open_errors_addition`; staged trials now pass or are promoted),
 `cpu_discovery_and_spawn_pinning`, `scheduler_policy_addition`. `bees_regions_open_addition` also exists; whether it is in
-the gate is Lee's call. Trials that pass a region down and `write_ref` a fresh node into a caller cell become errors in
+the gate is Lee's call. **Status 2026-11-18 (Lee): resolved.** Lee ruled that `region_hazards_open_addition`, `region_hazards_open_errors_addition` and `bees_regions_open_addition` now run in the gate. Trials that pass a region down and `write_ref` a fresh node into a caller cell become errors in
 phase 6 (the E2302 `write_ref` rule, design 6.3 and 11.1 row 6; 13.4 states the rule, not the phase); none is expected to change in phase 4.
 
 **`heap_used()` trials (27, verified by grep of `trials/`).** 27 trial sources (`.silica`) call `heap_used()`:

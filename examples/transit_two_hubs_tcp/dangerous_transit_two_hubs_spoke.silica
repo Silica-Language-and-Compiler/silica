@@ -1,0 +1,574 @@
+// A spoke of the two-hubs example (examples/transit_two_hubs_tcp, run.sh). The hub is
+// dangerous_transit_two_hubs_hub.silica; its header describes the names, the messages and the routing. A spoke dials
+// its own hub (group A: 127.0.0.1:4620, group B: 127.0.0.1:4621) and talks to nobody else.
+//
+//   at once   (:ctl, 1, me) to the hub: hello
+//   on go     (:ctl, 3, hub): one (:data, 1, me, d, 100 * me + d) for each of the other five spokes d. The hub (and the
+//             other hub, for a spoke of the other group) relays it; each answer arrives as (:data, 2, d, me, id) and is
+//             matched to its request by id
+//   always    a request from spoke s is answered with (:data, 2, me, s, id), sent to the hub
+//
+// A spoke is done with 5 replies matched and 5 requests answered, every :tx confirmed. It prints
+// "spoke a1: 5 of 5 replies, 5 requests answered", waits 1.5 s and exits 0. No completion within 45 s prints a timeout
+// line and exits 5. A refused dial is not retried: run.sh starts a spoke only after its hub is listening.
+//
+// The spoke number (11 to 13, 21 to 23) is the only difference between the six copies: run.sh makes them with sed on
+// `my_node`, because this language has no command line arguments and no environment access.
+//
+// Supervision. main registers a failure reporter and starts the root supervisor transit_sup (../transit_common), whose
+// two :supervisor children are actors_sup (the coordinator and every link, session and dialer actor) and carriers_sup
+// (every carrier). Each actor and carrier is added as a :temporary child of its sub-supervisor with call_supervisor
+// (add_child); no carrier is started with spawn_dangerous_carrier. The reporter drops reports whose reason is :normal and writes any other to stderr.
+// A listener hands the accepted descriptor to its owner as (:accepted, fd, peer); the owner starts the carrier.
+//
+// SECURITY: the (:tcp) carrier is plain TCP, with no authentication, no encryption and no peer identity. Here the
+// carrier is declared (:loopback), so the connection stays on 127.0.0.1.
+module dangerous_transit_two_hubs_spoke;
+
+use wire_etf;
+use wireframe;
+use Carrier;
+use dangerous_sockets;
+use dangerous_tcp_carrier;
+use transit_sup;
+
+carried_on wire: (:tcp) (:loopback);
+
+// ---- The one per-copy setting (run.sh rewrites this line) ----
+fn my_node() -> int64 { 11 }
+
+fn hub_address() -> string {
+    case my_node() / 10 == 1 of { true -> "127.0.0.1:4620:3000"; false -> "127.0.0.1:4621:3000" }
+}
+
+fn peer_total() -> int64 { 5 }
+
+fn timeout_ms() -> uint64 { 45000 }
+
+// ---- Helpers ----
+fn first_segment(xs: List[string, mem(normal)]) -> string {
+    case xs of {
+        []: List[string, mem(normal)] -> "";
+        [h: string, _t: List[string, mem(normal)]] -> h
+    }
+}
+
+fn segment_of(frame: string) -> string {
+    segs: List[string, mem(normal)] <- wireframe@frame(frame, Carrier@mtu(wire), Carrier@boundaries(wire));
+    first_segment(segs)
+}
+
+fn ctl_segment(code: int64, who: int64) -> string {
+    sequence proc[mem(normal), transport]
+        msg: (:ctl, int64, int64) <- (:ctl, code, who);
+        frame: string <- encode((:etf), msg)
+    produces
+        pure segment_of(frame)
+    end
+}
+
+fn data_segment(kind: int64, src: int64, dest: int64, id: int64) -> string {
+    sequence proc[mem(normal), transport]
+        msg: (:data, int64, int64, int64, int64) <- (:data, kind, src, dest, id);
+        frame: string <- encode((:etf), msg)
+    produces
+        pure segment_of(frame)
+    end
+}
+
+// The i-th spoke number, i = 0 to 5: 11, 12, 13, 21, 22, 23.
+fn spoke_at(i: int64) -> int64 {
+    10 * (1 + i / 3) + 1 + i - 3 * (i / 3)
+}
+
+// One request for every spoke except this one, from the i-th on: the traffic as one string of frames.
+fn all_requests(me: int64, i: int64) -> string {
+    case i > 5 of {
+        true -> "";
+        false -> case spoke_at(i) == me of {
+            true -> all_requests(me, i + 1);
+            false -> concat(data_segment(1, me, spoke_at(i), 100 * me + spoke_at(i)), all_requests(me, i + 1))
+        }
+    }
+}
+
+fn say(label: string, why: atom) -> atom {
+    sequence proc[device_io]
+        _: atom <- print(label);
+        _: atom <- print_atom(why);
+        _: atom <- println("")
+    produces
+        pure :ok
+    end
+}
+
+// The group letter and digit of a node number, for output: 11 is a1, 23 is b3.
+fn print_name(n: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- case n / 10 == 1 of { true -> print("a"); false -> print("b") };
+        _: atom <- print_int64(n - 10 * (n / 10))
+    produces
+        pure :ok
+    end
+}
+
+// One line of output: "spoke a1: <label> id=I peer=b2".
+fn say_msg(label: string, id: int64, who: int64) -> atom {
+    sequence proc[device_io]
+        _: atom <- print("spoke ");
+        _: atom <- print_name(my_node());
+        _: atom <- print(": ");
+        _: atom <- print(label);
+        _: atom <- print(" id=");
+        _: atom <- print_int64(id);
+        _: atom <- print(" peer=");
+        _: atom <- print_name(who);
+        _: atom <- println("")
+    produces
+        pure :ok
+    end
+}
+
+// ---- Supervision: every actor is a :temporary child of actors_sup and every carrier a :temporary child of carriers_sup, both children of the root supervisor transit_sup ----
+// The failure reporter takes every report the runtime hands over. A report whose reason is :normal (a connection that
+// ended in the ordinary way) is not printed. Any other report is written to standard error, so a real failure is
+// never hidden.
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(report: string, state: int64) -> (:no_reply, int64) {
+    sequence proc[device_io]
+        is_normal: boolean <- contains(report, "reason:          :normal\n");
+        _: atom <- case is_normal of {
+            true -> :ok;
+            false -> println_stderr(report)
+        }
+    produces
+        pure (:no_reply, state)
+    end
+}
+
+// Child ids are registered names: :hub_conn is the dialing carrier, :dialer the link actor, :coordinator the coordinator.
+// A (:tcp) carrier as a child: fd is an accepted descriptor, or -1 for a carrier that dials or listens. spec is the
+// carrier's link ("loopback" for a dialer or listener, "" for an accepted connection).
+fn start_carrier(sup: supervisor_ref, id: atom, fd: int64, spec: string) -> actor_ref {
+    sequence
+        sub: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, { op: :get_child, id: :carriers_sup } impl SupervisorMessage {});
+        added: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sub.child, {
+            op: :add_child,
+            child: {
+                id: id,
+                agent_type: :worker,
+                initial_state: { owner: actor_ref_of_word(0), fd: fd, rx_credit: 0, up: false, listening: false, link_spec: spec },
+                behavior: dangerous_tcp_carrier@carrier,
+                restart: :temporary,
+                shutdown: 0,
+                flavor: :dangerous, state_policy: state_policy(:keep_state_area)
+            }
+        } impl SupervisorMessage {})
+    produces
+        pure added.child
+    end
+}
+
+// The link actor as a child.
+fn start_link(sup: supervisor_ref, id: atom, st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }) -> actor_ref {
+    sequence
+        sub: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, { op: :get_child, id: :actors_sup } impl SupervisorMessage {});
+        added: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sub.child, {
+            op: :add_child,
+            child: {
+                id: id,
+                agent_type: :worker,
+                initial_state: st,
+                behavior: dialer,
+                restart: :temporary,
+                shutdown: 0,
+                flavor: :plain, state_policy: state_policy(:keep_state_area)
+            }
+        } impl SupervisorMessage {})
+    produces
+        pure added.child
+    end
+}
+
+// The coordinator as a child.
+fn start_coordinator(sup: supervisor_ref, id: atom, st: { phase: int64 }) -> actor_ref {
+    sequence
+        sub: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sup, { op: :get_child, id: :actors_sup } impl SupervisorMessage {});
+        added: {
+            tag: :child_started | :ok | :children | :count | :child_info | :error,
+            child: actor_ref,
+            status: atom,
+            children: List[
+                {
+                    id: atom,
+                    agent_type: :worker | :supervisor,
+                    child: actor_ref,
+                    restart: :permanent | :temporary | :transient
+                },
+                mem(normal)
+            ],
+            count: int64,
+            child_info: {
+                id: atom,
+                agent_type: :worker | :supervisor,
+                child: actor_ref,
+                restart: :permanent | :temporary | :transient
+            },
+            error: atom
+        } <- call_supervisor(sub.child, {
+            op: :add_child,
+            child: {
+                id: id,
+                agent_type: :worker,
+                initial_state: st,
+                behavior: coordinator,
+                restart: :temporary,
+                shutdown: 0,
+                flavor: :plain, state_policy: state_policy(:keep_state_area)
+            }
+        } impl SupervisorMessage {})
+    produces
+        pure added.child
+    end
+}
+
+// ---- The link actor: the spoke's end of its one connection ----
+// stage: 0 = not connected, 1 = connected, 2 = done and reported. count: replies matched plus requests answered.
+// Every output line of the spoke is printed by this one actor.
+fn mks(car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    { car: car, coord: coord, rx: rx, credit: credit, out: out, flight: flight, count: count, stage: stage }
+}
+
+fn s_flush(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    sequence proc[concurrency]
+        go: boolean <- length_bytes(st.out) > 0 and st.credit > 0;
+        _: boolean <- case go of {
+            true -> cast(st.car, (:tx, st.out, self()) impl ActorMessage {});
+            false -> false
+        };
+        next: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } <- case go of {
+            true -> mks(st.car, st.coord, st.rx, st.credit - 1, "", st.flight + 1, st.count, st.stage);
+            false -> st
+        }
+    produces
+        pure next
+    end
+}
+
+fn s_post(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, seg: string) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    s_flush(mks(st.car, st.coord, st.rx, st.credit, concat(st.out, seg), st.flight, st.count, st.stage))
+}
+
+fn s_said(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, _o: atom) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    st
+}
+
+fn s_counted(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    mks(st.car, st.coord, st.rx, st.credit, st.out, st.flight, st.count + 1, st.stage)
+}
+
+// Connected: grant receive credit and say hello.
+fn s_link_up(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.car, (:credit, 4) impl ActorMessage {})
+    produces
+        pure s_post(mks(st.car, st.coord, st.rx, st.credit, st.out, st.flight, st.count, 1), ctl_segment(1, my_node()))
+    end
+}
+
+fn s_tx_credit(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, n: int64) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    confirmed: int64 <- case n == 1 of { true -> 1; false -> 0 };
+    s_maybe_done(s_flush(mks(st.car, st.coord, st.rx, st.credit + n, st.out, st.flight - confirmed, st.count, st.stage)))
+}
+
+// Done: 5 replies matched and 5 requests answered (count 10), every :tx confirmed.
+fn s_maybe_done(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    done: boolean <- st.stage == 1 and st.count == 2 * peer_total() and st.flight <= 0 and length_bytes(st.out) == 0;
+    case done of {
+        true -> s_done(st);
+        false -> st
+    }
+}
+
+fn s_done(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- print("spoke ");
+        _: atom <- print_name(my_node());
+        _: atom <- print(": ");
+        _: atom <- print_int64(peer_total());
+        _: atom <- print(" of ");
+        _: atom <- print_int64(peer_total());
+        _: atom <- print(" replies, ");
+        _: atom <- print_int64(peer_total());
+        _: atom <- println(" requests answered");
+        _: boolean <- cast(st.coord, :done impl ActorMessage {})
+    produces
+        pure mks(st.car, st.coord, st.rx, st.credit, st.out, st.flight, st.count, 2)
+    end
+}
+
+// ---- Frames in ----
+fn s_with_rx(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, rx: { mode: atom, expected: int64, pending: string }) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    mks(st.car, st.coord, rx, st.credit, st.out, st.flight, st.count, st.stage)
+}
+
+fn s_rx(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, segment: string) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- cast(st.car, (:credit, 1) impl ActorMessage {})
+    produces
+        pure s_maybe_done(s_absorb(st, segment))
+    end
+}
+
+fn s_absorb(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, segment: string) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    un: (:more, { mode: atom, expected: int64, pending: string }) | (:frame, string, { mode: atom, expected: int64, pending: string }) | (:rejected, atom) <- wireframe@unframe(st.rx, segment, 4096);
+    case un of {
+        (:more, r1: { mode: atom, expected: int64, pending: string }) -> s_with_rx(st, r1);
+        (:frame, frame0: string, r2: { mode: atom, expected: int64, pending: string }) -> s_absorb(s_take_frame(s_with_rx(st, r2), frame0), "");
+        (:rejected, why: atom) -> s_said(st, say("framing rejected ", why))
+    }
+}
+
+// A frame is a control frame (only go matters), else a data frame.
+fn s_take_frame(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, frame0: string) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    sequence proc[mem(normal), transport]
+        decoded: (:ok, (:ctl, int64, int64)) | (:rejected, atom) <- decode((:etf), frame0);
+        next: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } <- case decoded of {
+            (:ok, m: (:ctl, int64, int64)) -> s_ctl(st, m);
+            (:rejected, _why: atom) -> s_data_frame(st, frame0)
+        }
+    produces
+        pure next
+    end
+}
+
+fn s_ctl(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, m: (:ctl, int64, int64)) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    case m of {
+        (:ctl, code: int64, _who: int64) -> s_ctl_code(st, code)
+    }
+}
+
+fn s_ctl_code(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, code: int64) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    case code == 3 of {
+        true -> s_post(st, all_requests(my_node(), 0));
+        false -> st
+    }
+}
+
+fn s_data_frame(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, frame0: string) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    sequence proc[mem(normal), transport]
+        decoded: (:ok, (:data, int64, int64, int64, int64)) | (:rejected, atom) <- decode((:etf), frame0);
+        next: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } <- case decoded of {
+            (:ok, m: (:data, int64, int64, int64, int64)) -> s_data(st, m);
+            (:rejected, why: atom) -> s_said(st, say("rejected ", why))
+        }
+    produces
+        pure next
+    end
+}
+
+fn s_data(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, m: (:data, int64, int64, int64, int64)) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    case m of {
+        (:data, kind: int64, src: int64, dest: int64, id: int64) -> s_by_kind(st, kind, src, dest, id)
+    }
+}
+
+fn s_by_kind(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, kind: int64, src: int64, dest: int64, id: int64) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    case kind == 1 of {
+        true -> s_serve(st, src, id);
+        false -> s_settle(st, src, dest, id)
+    }
+}
+
+// A request from another spoke (relayed by the hub), answered at once.
+fn s_serve(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, src: int64, id: int64) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    seg: string <- data_segment(2, my_node(), src, id);
+    _: atom <- say_msg("request", id, src);
+    s_post(s_counted(st), seg)
+}
+
+// A reply, matched to this spoke's request by id.
+fn s_settle(st: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }, src: int64, dest: int64, id: int64) -> { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 } {
+    want: int64 <- 100 * my_node() + src;
+    case id == want and dest == my_node() of {
+        true -> s_said(s_counted(st), say_msg("reply", id, src));
+        false -> s_said(st, say_msg("reply to unknown id", id, src))
+    }
+}
+
+fn dialer(msg: (:link_up, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom), state: { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }) -> (:no_reply, { car: actor_ref, coord: actor_ref, rx: { mode: atom, expected: int64, pending: string }, credit: int64, out: string, flight: int64, count: int64, stage: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> (:no_reply, s_link_up(state));
+        (:tx_credit, n: int64) -> (:no_reply, s_tx_credit(state, n));
+        (:rx, segment: string) -> (:no_reply, s_rx(state, segment));
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, _why2: atom) -> (:no_reply, state)
+    }
+}
+
+// ---- The coordinator: starts the dialer, ends the run ----
+fn c_done(st: { phase: int64 }) -> { phase: int64 } {
+    sequence proc[concurrency]
+        _: timer_ref <- send_after(1500, self(), :finish impl ActorMessage {})
+    produces
+        pure { phase: 2 }
+    end
+}
+
+fn c_timeout(st: { phase: int64 }) -> { phase: int64 } {
+    case st.phase == 0 of {
+        true -> c_timed_out(st);
+        false -> st
+    }
+}
+
+fn c_timed_out(st: { phase: int64 }) -> { phase: int64 } {
+    sequence proc[concurrency, device_io]
+        _: atom <- print("spoke ");
+        _: atom <- print_name(my_node());
+        _: atom <- println(": timeout");
+        _: boolean <- cast_exit(5)
+    produces
+        pure { phase: 3 }
+    end
+}
+
+fn c_finish(st: { phase: int64 }) -> { phase: int64 } {
+    sequence proc[concurrency]
+        _: boolean <- cast_exit(0)
+    produces
+        pure st
+    end
+}
+
+fn coordinator(msg: :done | :timeout | :finish, state: { phase: int64 }) -> (:no_reply, { phase: int64 }) {
+    case msg of {
+        :done -> (:no_reply, c_done(state));
+        :timeout -> (:no_reply, c_timeout(state));
+        :finish -> (:no_reply, c_finish(state))
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn(0, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        sup: supervisor_ref <- transit_sup@start();
+        car: actor_ref <- start_carrier(sup, :hub_conn, 0 - 1, "loopback");
+        me: actor_ref <- start_coordinator(sup, :coordinator, { phase: 0 });
+        d: actor_ref <- start_link(sup, :dialer, mks(car, me, wireframe@fresh(Carrier@boundaries(wire)), 0, "", 0, 0, 0));
+        _: boolean <- cast(car, (:open, d, hub_address()) impl ActorMessage {});
+        _: timer_ref <- send_after(timeout_ms(), me, :timeout impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}

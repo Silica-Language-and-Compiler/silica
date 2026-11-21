@@ -1,6 +1,6 @@
 # Embedded Actor Runtime (RTOS)
 
-> **Implementation status (2026-10-16).** Design only. No Silica target runs on an RTOS: the targets are three OS-hosted ports (Apple Silicon macOS, Linux AArch64, Linux x86-64) and the OS-free ESP32-S3_raw port, whose runtime (`rt_actors.S`) is a cooperative per-core scheduler with its own mailboxes, not RTOS tasks. There is no actor-per-RTOS-task mapping, no RTOS mailbox primitive use and no `L_ipc` static mailbox region in the compiler or runtimes. The wire record below is illustrative.
+> **Implementation status (2026-10-16).** Design only. No Silica target runs on an RTOS: the targets are three OS-hosted ports (Apple Silicon macOS, Linux AArch64, Linux x86-64) and the OS-free ESP32-S3_raw port, whose runtime (`rt_actors.S`) is a cooperative per-core scheduler with its own mailboxes, not RTOS tasks. There is no actor-per-RTOS-task mapping, no RTOS mailbox primitive use and no `L_ipc` static mailbox region in the compiler or runtimes. The wire record below is illustrative. **Status 2026-11-18:** still design only; the fourth emitter, `STM32-L476RG_raw`, is also OS-free with its own `rt_actors.S`, not an RTOS port.
 
 ## Purpose
 

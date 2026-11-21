@@ -4,12 +4,24 @@
 # artifact. A push to main (a merge, or a commit pushed straight to main)
 # builds the same compilers and publishes them as a GitHub release.
 #
+# The workflow only starts for a push or pull request that changes a file under
+# compiler/, trials/ or binaries/ (trigger-level paths filters), other than
+# compiler/design_documents/ and compiler/tutorials_and_howtos/. Any other change
+# does not run it at all: no build, specification or release job. workflow_dispatch
+# always runs it. A change to this file alone therefore does not start a run, and
+# neither does a change only to the specification under compiler/design_documents/.
+#
 # Hosted targets build on a runner of that architecture. The host compiler is
 # the newest committed binary for that platform (lowest silica-NNNNNN), not the
 # seed. The seeds are older and, on these runners, are killed while
 # type-checking lib/wbt_map.silica (macOS signal 9, Linux runner shutdown).
 # ESP32-S3_raw has no host: its cross compiler is built on macOS by
 # binaries/silica-compiler, which is what compiler/src/Makefile does.
+#
+# Each job restores compiler/build/<emit target>/ from the Actions cache (the newest entry made
+# with the same host compiler) and saves it afterwards, even when the build fails. The Makefile
+# decides staleness by content (compiler/tools/unit_cache.sh), so a run recompiles only the units
+# whose source, used interfaces or host compiler changed; a cold cache is a full build.
 #
 # The build sets SILICA_COMPILER_WBT_THROUGH=insert so the compiler's own copy
 # of wbt_map stops at insert. The Linux jobs turn systemd-oomd off and add swap
@@ -26,8 +38,20 @@ name: Compiler
 
 on:
   pull_request:
+    paths:
+      - "compiler/**"
+      - "trials/**"
+      - "binaries/**"
+      - "!compiler/design_documents/**"
+      - "!compiler/tutorials_and_howtos/**"
   push:
     branches: [main]
+    paths:
+      - "compiler/**"
+      - "trials/**"
+      - "binaries/**"
+      - "!compiler/design_documents/**"
+      - "!compiler/tutorials_and_howtos/**"
   workflow_dispatch:
 
 permissions:
@@ -141,6 +165,26 @@ jobs:
           chmod +x "${compiler}"
           echo "building with: ${compiler} -> $(readlink "${compiler}" || basename "${compiler}")"
           echo "compiler=${compiler}" >> "${GITHUB_OUTPUT}"
+          # The build cache is only worth restoring when it was made by this same host compiler:
+          # unit_cache.sh rebuilds every unit when the compiler's sha256 changes.
+          if command -v sha256sum >/dev/null 2>&1; then
+            compiler_sha="$(sha256sum "${compiler}" | cut -d' ' -f1)"
+          else
+            compiler_sha="$(shasum -a 256 "${compiler}" | cut -d' ' -f1)"
+          fi
+          echo "host compiler sha256: ${compiler_sha}"
+          echo "compiler_sha=${compiler_sha}" >> "${GITHUB_OUTPUT}"
+
+      # compiler/build/<target>/ holds every unit's .sams/.iface/.o and the unit_cache manifest.
+      # With it restored, compiler/tools/unit_cache.sh recompiles only units whose source, used
+      # interfaces or host compiler changed. Pull requests can restore what main saved.
+      - name: Restore the build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: compiler/build/${{ matrix.emit_target }}
+          key: compiler-build-v1-${{ matrix.emit_target }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.host.outputs.compiler_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            compiler-build-v1-${{ matrix.emit_target }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.host.outputs.compiler_sha }}-
 
       - name: Build the compiler
         env:
@@ -164,6 +208,16 @@ jobs:
               SILICA_COMPILER_WBT_THROUGH=insert \
               SILICA_COMPILER="${GITHUB_WORKSPACE}/${HOST_COMPILER}"
           fi
+
+      # Saved even when the build fails or is cancelled: units of finished rounds are recorded in
+      # the manifest and the next run keeps them; a unit of an unfinished round has no entry and
+      # is compiled again.
+      - name: Save the build cache
+        if: always() && steps.host.outputs.compiler_sha != ''
+        uses: actions/cache/save@v4
+        with:
+          path: compiler/build/${{ matrix.emit_target }}
+          key: compiler-build-v1-${{ matrix.emit_target }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.host.outputs.compiler_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       # Trials. Left commented until the compiler build is known to finish on
       # these runners. Uncomment to run the host trial tree with the compiler

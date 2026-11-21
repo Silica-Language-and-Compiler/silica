@@ -235,7 +235,8 @@ uint8      uint16     uint32     uint64    underscore unit       use        wher
 
 `region` is both a keyword and the name of the region type constructor, so it cannot be used as the name of a binding, parameter, or field (E1040); the samples in this specification name region handles `r`.
 
-**Implementation status (2026-10-16).** Checked with the published compiler: `region` as a binding name (`region: int64 <- 3;`) is rejected by the parser with E1040, whose text is the generic "expected ';' after this statement before the next statement" at the token after `region`; `region` as a function parameter name is rejected with E1000, the uncategorized syntax error, at the parameter. A record field named `region` is accepted (`{ region: 3 }`, the type `{ region: int64 }` and the read `r.region` all compile), and the compiler's own record types use such a field. No diagnostic yet says that `region` is a reserved word, and the field case is not rejected, so the rule above is the design for fields and the codes above are what a program meets today for bindings and parameters.
+**Implementation status (2026-10-16).** Checked with the published compiler: `region` as a binding name (`region: int64 <- 3;`) is rejected by the parser with E1040, whose text is the generic "expected ';' after this statement before the next statement" at the token after `region`; `region` as a function parameter name is rejected with E1000, the uncategorized syntax error, at the parameter. A record field named `region` is accepted (`{ region: 3 }`, the type `{ region: int64 }` and the read `r.region` all compile), and the compiler's own record types use such a field. No diagnostic yet says that `region` is a reserved word, and the field case is not rejected, so the rule above is the design for fields and the codes above are what a program meets today for bindings and parameters. 
+**Status 2026-11-18 (PR #74, `157a4f51ba`; trial `error_enforcement_addition/region_reserved_binding_name`):** a binding named `region` now gives E1058, the reserved-keyword diagnostic. Lee ruled 2026-11-18 that a record field named `region` stays accepted and that a parameter named `region` keeps the generic E1000, so the field and parameter cases above stand as written.
 
 #### 2.2.2 Identifiers
 Identifiers start with a letter (a-z, A-Z) or underscore (_), followed by any number of letters, digits (0-9), or underscores.
@@ -6670,7 +6671,7 @@ r2: region(L2, normal) <- alloc_region(normal)
 #### 12.1.4 Static Region Lifetime Analysis
 The compiler performs static analysis to verify region lifetimes and ensure memory safety:
 
-**Implementation status**: Phase A (single scope) is implemented. Phases B (nested scopes) and C (cross-function analysis) require implementation after functions are fully supported.
+**Implementation status**: Phase A (single scope) is implemented. Phases B (nested scopes) and C (cross-function analysis) require implementation after functions are fully supported. **Status 2026-11-18 (Lee): Phases B and C as first written are superseded by the per-call lifetime check (E2311, always on) and the region checker (`compiler/src/region_checker/region_checker_core.silica`: E2301 use after move, flow-sensitive through nested lets and case arms; E2300 case (a); E2302 for `write_ref` of a frame value into an older cell), which runs only for a unit that declares `strict region_check;`; the gaps, not built, are: (1) the reference-use rule of Phase B (nothing checks that the region behind a `ref` is still live when the ref is used); (2) the callee-side rule of Phase C (a `ref(L)` parameter with no `region(L)` parameter may not be returned or sent); (3) E2300 cases (b) and (c); (4) the Phase A return check does not look inside records or lists (hazard H8).** The old text above is kept as the record.
 
 **Lifetime Tracking:**
 - Regions are tracked through their lexical scope (sequence blocks)
@@ -9025,7 +9026,7 @@ call_stack:
 === End Silica Actor Failure ===
 ```
 
-`actor_id` is the actor's 64-bit identity (§15.1.4) printed in decimal. `reason` (added 2026-10-24) is the failure reason in readable form; the dash is U+2014 and the detail text after it appears only where the runtime knows the cause (`integer division by zero`, `no case arm matched`); an atom that the runtime's copy of the atom table does not hold prints `:unknown`. Implemented on all four targets (trial `failure_reason_line_addition`); verified on the Mac, Linux verification in progress, ESP32-S3 board run pending. `reason_tag` is the runtime's code for the failure reason; the codes are 0 for `:normal`, 2 for `:language_error` (division by zero, no case arm matched, and the convention-mismatch, name-taken and misuse sites), 3 for `:memory_fault` (a board CPU exception in an actor), 4 for every `(:explicit, atom)` reason (including `(:explicit, :killed)` from `kill_abnormal` and from a `shutdown` of 0, `(:explicit, :shutdown)` from a `shutdown` above 0, and `(:explicit, :actor_not_found)`) and 5 for `:foreign_fault`. Tag 1 is no longer written; before 2026-10-23 it meant `(:explicit, :killed)`. The report has no source file or line, no `behavior` or `message_seq` field, and no `supervisor:` line. The root supervisor's own report is recognised by a null `supervisor_acb` and the frame `#0  <unknown behavior>`. The hosted runtimes append a `=== Region Dump ===` block per held region when the reporter's `region_dump_limit()` is above zero. The fault line of a process-fatal report (§15.4.5.5) prints the current actor's control-block address in `actor=0x…`, not its identity. The format above, with source file and line, `behavior`, `message_seq`, a `supervisor:` line and the MTE tags, remains the design and is what a conforming report will carry; the short form printed today is described, with the runtime symbols that print it, in [runtime_failure_reporting.md](runtime_failure_reporting.md) §7.
+`actor_id` is the actor's 64-bit identity (§15.1.4) printed in decimal. `reason` (added 2026-10-24) is the failure reason in readable form; the dash is U+2014 and the detail text after it appears only where the runtime knows the cause (`integer division by zero`, `no case arm matched`); an atom that the runtime's copy of the atom table does not hold prints `:unknown`. Implemented on all four targets (trial `failure_reason_line_addition`); verified on the Mac, Linux verification in progress, ESP32-S3 board run pending. **Status 2026-11-18:** superseded; `failure_reason_line_addition` has `.linux_aarch64.ascomp`, `.linux_x86_64.ascomp` and `.esp32_s3.ascomp` goldens and is not in the ESP32-S3 skip list (`trials/targets/ESP32-S3_raw.skip`; only the STM32 skip list names it), and the Linux and ESP32-S3 whole-tree runs were green (`f81d3e136e`, 2026-11-04; board runs `029447ad31`, 2026-11-07, and `978f663e08`, 2026-11-12), as runtime_failure_reporting.md records. `reason_tag` is the runtime's code for the failure reason; the codes are 0 for `:normal`, 2 for `:language_error` (division by zero, no case arm matched, and the convention-mismatch, name-taken and misuse sites), 3 for `:memory_fault` (a board CPU exception in an actor), 4 for every `(:explicit, atom)` reason (including `(:explicit, :killed)` from `kill_abnormal` and from a `shutdown` of 0, `(:explicit, :shutdown)` from a `shutdown` above 0, and `(:explicit, :actor_not_found)`) and 5 for `:foreign_fault`. Tag 1 is no longer written; before 2026-10-23 it meant `(:explicit, :killed)`. The report has no source file or line, no `behavior` or `message_seq` field, and no `supervisor:` line. The root supervisor's own report is recognised by a null `supervisor_acb` and the frame `#0  <unknown behavior>`. The hosted runtimes append a `=== Region Dump ===` block per held region when the reporter's `region_dump_limit()` is above zero. The fault line of a process-fatal report (§15.4.5.5) prints the current actor's control-block address in `actor=0x…`, not its identity. The format above, with source file and line, `behavior`, `message_seq`, a `supervisor:` line and the MTE tags, remains the design and is what a conforming report will carry; the short form printed today is described, with the runtime symbols that print it, in [runtime_failure_reporting.md](runtime_failure_reporting.md) §7.
 
 **Example**
 
@@ -10647,7 +10648,7 @@ Carrier@provides(c: atom) -> boolean     // whether the language provides the ca
 | carrier to owner | `(:tx_credit, n: int64)` | the carrier can take `n` more `:tx` messages |
 | carrier to owner | `(:tx_failed, reason: atom)` | a segment was not sent (`:no_credit`, `:link_down`, `:too_long`) |
 | carrier to owner | `(:link_down, reason: atom)` | the link ended (`:closed`, `:reset`, `:timeout`, `:fault`) |
-| listener to owner | `(:accepted, conn: dangerous_actor_ref, info: string)` | a listening carrier accepted a peer into the connection carrier `conn`, which holds the peer and waits for its own `(:open, owner, "")`; the sender of that `:open` becomes the connection's owner and receives its `:link_up`, credits, `:rx` and `:link_down` as the owner of a connecting carrier does |
+| listener to owner | `(:accepted, fd: int64, info: string)` | a listening carrier accepted a peer; `fd` is the accepted connection's descriptor and `info` is carrier-specific. The listener starts no actor. The owner starts the connection carrier from the state `{ owner: actor_ref_of_word(0), fd: <fd>, rx_credit: 0, up: false, listening: false, link_spec: "" }`, either with `spawn_dangerous` or as a `:temporary` `:dangerous` child of a supervisor (`call_supervisor(sup, { op: :add_child, ... })` with behaviour `dangerous_tcp_carrier@carrier`); that carrier waits for its own `(:open, owner, "")`, and the sender of that `:open` becomes the connection's owner and receives its `:link_up`, credits, `:rx` and `:link_down` as the owner of a connecting carrier does. **Changed 2026-11-20:** the second field was `conn: dangerous_actor_ref`, a connection carrier the listener spawned itself as an unsupervised root actor. |
 
 Flow control is credit-based in both directions: nothing is pushed without credit. Ordering per sender is
 mailbox order. Failure is the carrier actor exiting with a reason, handled by links, monitors and supervisors
@@ -10655,9 +10656,9 @@ like any actor. The bytes a hosted carrier delivers are external-danger-touched,
 in the handler that receives them, where §16.4.4 permits it.
 
 A carrier opened to listen (`"listen:<port>"` on `:tcp`, or `"listen:any:<port>"` to bind every interface) carries no bytes itself: it answers `:link_up` once
-bound and `(:accepted, conn, info)` for every peer, each in a connection carrier of its own, so a program that
+bound and `(:accepted, fd, info)` for every peer; the owner starts a connection carrier of its own for each descriptor (2026-11-20; before then the listener started it), so a program that
 serves many peers gives each connection an owner of its own. `:close` to a listener closes the listening
-socket only; the connections it spawned live on.
+socket only; the connections it accepted live on.
 
 **The hosted carriers** (Apple Silicon macOS in this phase; Linux follows):
 
@@ -10698,7 +10699,7 @@ the timeout its address states (`"host:port:timeout_ms"`). A peer that does not 
 open: the carrier answers `(:link_down, :timeout)` and ends with `stop_self((:explicit, :link_timeout))`. A dial address
 that states no timeout, or a malformed or zero one, is refused before anything is dialled: `(:link_down, :fault)`, then
 `stop_self((:explicit, :bad_address))`, as for a host that is not a dotted quad (built 2026-11-15; not yet compiled or
-run).
+run). **Status 2026-11-18: compiled and run on the hosted targets** (trial `transport_addition/app_transport_tcp_link_rules/dangerous_link_dial_timeout_missing`, goldens refreshed in commit `c063517bd9`).
 `:link_down` is the last message the owner receives, and the carrier's reference is dead afterwards. A write that fails
 is a link failure: the owner receives `(:tx_failed, :link_down)` and then `:link_down`. A write to a peer that has gone
 fails with an error and never raises `SIGPIPE`.
@@ -10719,6 +10720,8 @@ and the diagnostics below. The Linux and Nucleo packs do not list any link yet, 
 E2412 until their rows are written. The hosted `(:interface, name)`, `(:ethernet, n)` and `(:wifi, n)` links are
 accepted and checked but the carrier does not yet bind its socket to the interface (it uses the host's default route);
 binding, the interface-family resolution and the `(:explicit, :link_unavailable)` failure at open are the next step.
+
+**Status 2026-11-18.** The Linux AArch64 and Linux x86-64 packs now list the hosted links (`loopback`, `interface`, `ethernet`, `wifi`, `serial_port`, `memory`, `backing`; `transport_pack.silica` of each target), and the hosted carriers now bind to the named interface and end with `(:explicit, :link_unavailable)` when it cannot be used (commits `b943620c00`, `6e3f85e229`; trials `transport_addition/app_transport_tcp_link_rules` and `app_transport_udp_link_rules`, with Linux goldens). The Nucleo pack still lists no link.
 
 A carrier's kind names how bytes travel (`:tcp`, `:udp`, `:serial`, `:ble_gatt`). A **link** is the hardware layer under it: the OS
 interface on a hosted target, or the UART, the USB-Serial-JTAG controller, a Wi-Fi station or an Ethernet MAC on a
@@ -10795,17 +10798,17 @@ cannot pass pins. A UART link is 8N1 with no flow control; parity, stop bits and
 **What the packs provide (2026-11-09).** apple_silicon_mac: `loopback`, `interface`, `ethernet n`, `wifi n`,
 `serial_port` (baud 9600 to 230400, the termios speeds the wrapper sets). ESP32-S3_raw: `uart 1` at 115200 (the
 worker's fixed clock divider) and `usb_serial_jtag`; `(:uart, 0, ...)` is the console and is rejected with the console
-note; UART2 waits for its window. linux_aarch64, linux_x86_64, STM32-L476RG_raw: none yet.
+note; UART2 waits for its window. linux_aarch64, linux_x86_64, STM32-L476RG_raw: none yet. **Status 2026-11-18:** linux_aarch64 and linux_x86_64 now provide the same links as apple_silicon_mac (the pack source of each target); STM32-L476RG_raw still provides none.
 
 **Link failure.** A link failure is a supervised actor failure, never a value the sender checks: the carrier (on a host)
 or the device worker (on the board) ends with an exit reason such as `(:explicit, :link_unavailable)`, `(:explicit,
 :link_lost)` or `(:explicit, :link_timeout)` after telling its owner `(:link_down, :fault)`, and the supervisor restarts
 it under the ordinary policy of §15.4.11 (no link-specific backoff). The hosted `(:explicit, :link_unavailable)` for an
-absent interface is not implemented yet (the interface links do not bind). One carrier per link instance: a UART
+absent interface is not implemented yet (the interface links do not bind; **implemented 2026-11-12**, commit `b943620c00`, `dangerous_tcp_carrier.silica`). One carrier per link instance: a UART
 instance, a serial port path or the USB-Serial-JTAG controller is claimed by one declaration (E2415); a loopback or
 network interface is shared freely.
 
-**Phase order.** A hosted link naming (Mac done; Linux AArch64 and Linux x86-64: pack rows pending); B UART on the
+**Phase order.** A hosted link naming (Mac done; Linux AArch64 and Linux x86-64: pack rows pending; **Status 2026-11-18: the Linux pack rows are written**); B UART on the
 ESP32-S3_raw (UART1 and USB-Serial-JTAG done through the declaration; UART2, the supervised bring-up actor pending);
 C UART on the STM32-L476RG_raw; D network links on boards, later.
 
@@ -10820,7 +10823,7 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | E2415 | two carrier declarations, in one module or across the modules of a compile, claim the same exclusive hardware: a UART or USB CDC instance, a serial port path, or the USB-Serial-JTAG controller |
 | E2416 | reserved: the link needs a board configuration function that is not defined (phase D; nothing reaches it yet) |
 | E2417 | a link parameter is not a literal, is of the wrong kind, is missing or is one too many, a baud is not positive, or the pack rejects the baud |
-| E2418 | a `(:tcp)` or `(:udp)` carrier on a link the target serves (`(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`) is opened by a `cast(x, (:open, owner, "<address>"))` whose address literal the link refuses: `"listen:any:<port>"` under any of them, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; for `(:udp)`, a local part `any:<port>` under any of them, or `<ipv4>:<port>` outside 127.0.0.0/8 under `(:loopback)`; a literal that is not a strict dotted quad gets no E2418 and ends `(:explicit, :bad_address)` at run time; `x` is bound in the same function by `spawn_dangerous_carrier`. An address the checker cannot see (a variable, a function's result) is refused at run time instead: the carrier tells its owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)` |
+| E2418 | a `(:tcp)` or `(:udp)` carrier on a link the target serves (`(:loopback)`, `(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)`) is opened by a `cast(x, (:open, owner, "<address>"))` whose address literal the link refuses: `"listen:any:<port>"` under any of them, or `"listen:<ipv4>:<port>"` outside 127.0.0.0/8 under `(:loopback)`; for `(:udp)`, a local part `any:<port>` under any of them, or `<ipv4>:<port>` outside 127.0.0.0/8 under `(:loopback)`; a literal that is not a strict dotted quad gets no E2418 and ends `(:explicit, :bad_address)` at run time; `x` is bound in the same function by `spawn_dangerous_carrier`. An address the checker cannot see (a variable, a function's result) is refused at run time instead: the carrier tells its owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)` **Status 2026-11-19:** IPv6 listen literals are judged as the IPv4 ones are (`bbd6eccbd1`). |
 
 #### 16.4.10 Diagnostics
 
@@ -10841,7 +10844,7 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 
 #### 16.4.11 Storage carriers
 
-**Status (2026-11-12).** Phases S0 and S1 of transport design §6.8 are implemented for the Apple Silicon macOS target and, in the source, in the two Linux transport packs (linux_aarch64, linux_x86_64; the Linux compiler build and trial runs are still pending):
+**Status (2026-11-12).** Phases S0 and S1 of transport design §6.8 are implemented for the Apple Silicon macOS target and, in the source, in the two Linux transport packs (linux_aarch64, linux_x86_64; the Linux compiler build and trial runs are still pending; **Status 2026-11-18: done**, the full hosted trial runs on linux_aarch64 and linux_x86_64 passed with no failures in commit `6e3f85e229`, and the Linux goldens of `trials/transport_addition/app_transport_store_memory` and `app_transport_store_backing` were refreshed in `c063517bd9`):
 the `(:store)` kind, the `(:memory, capacity, retention)` and `(:backing, path, capacity, retention)` links, the
 vocabulary below, the `:storage` framing mode and the stored-frame header of §16.4.7's module, and the on-medium form
 (`storelog`). The `(:sd_blocks, ...)` and `(:flash_region, ...)` links are named and checked by the language and provided

@@ -1,0 +1,223 @@
+# Run the trial tree for one architecture, or for every architecture.
+#
+# Dispatch only. Each shard installs the latest released compiler with silica-cli's
+# install.sh (https://github.com/Silica-Language-and-Compiler/silica-cli#install) and
+# runs the trials. It does not wait for, or use, a Compiler workflow build of this
+# commit: compiler changes are tested only once they are released.
+# A failed shard is the list `gh run view --log-failed` shows.
+#
+# Fifteen shards per target split the suites by source count. error_enforcement_addition
+# is about half the sources, so every shard runs one slice of it
+# (TRIAL_SUITE_SLICE) and the other suites run whole, each in one shard.
+# Suites with INTEGRATE_PENDING are left out, which is what `make integrate`
+# does. A suite that targets another platform is left out of a target's shards too:
+# trial_matrix.py reads the suite's TRIAL_TARGETS file (target names, or `host`) and its
+# BOARD_ONLY marker, and packs each target's own suites, so a host shard never runs
+# the ESP32-S3 or NUCLEO memory-space suites and no shard is left empty. Suites a
+# target only skips for a stated reason (trials/targets/<target>.skip) stay in; the
+# driver reports them as skipped.
+#
+# Input skip_golden_check (default false) sets TRIAL_SKIP_GOLDEN=1: the generated
+# assembly is not compared with the golden .ascomp copies (neither a difference nor a
+# missing golden fails). Run output, exit status and compile-failure goldens are still
+# checked, and each suite report says the assembly checks were skipped.
+#
+# Each shard uploads two artifacts, always, even when it failed:
+#   trials-<target>-shard-<n>  the .integrate_report*/.integrate_log* files
+#   golden-<target>-shard-<n>  the assembly this run generated, named as its golden
+#                              copies (<suite>/<stem>.ascomp on apple_silicon_mac,
+#                              <stem>.<linux_aarch64|linux_x86_64|esp32_s3>.ascomp elsewhere), laid out
+#                              relative to trials/, with MANIFEST.txt (first line
+#                              target=<target>, then one relative path per line).
+#                              Built by .github/scripts/collect_goldens.py.
+#
+# The ESP32-S3 shards boot each image in Espressif QEMU
+# (SILICA_BOARD_EMULATOR=qemu). That is not a board: USB, the GPIO matrix, and
+# the wall-clock stamp are absent, and a trial that dies before SILICA:START
+# is a model gap showing up as a failed trial.
+
+name: Trials
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Architecture
+        type: choice
+        default: all
+        options:
+          - all
+          - apple_silicon_mac
+          - linux_aarch64
+          - linux_x86_64
+          - ESP32-S3_raw
+      skip_golden_check:
+        description: Skip comparing generated assembly against the golden .ascomp copies
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: trials-${{ github.ref }}-${{ inputs.target }}-${{ inputs.skip_golden_check }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan shards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Split the trial tree into 15 shards
+        id: matrix
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          include="$(python3 .github/scripts/trial_matrix.py --trials trials --target "$TARGET" --shards 15)"
+          python3 -c 'import json,os,sys; rows=json.loads(sys.argv[1]); print("%d jobs" % len(rows))' "$include"
+          delimiter="$(uuidgen)"
+          {
+            echo "include<<${delimiter}"
+            echo "$include"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+  run:
+    name: ${{ matrix.target }} ${{ matrix.shard }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.include) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux host tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential clang
+
+      - name: Leave memory for the trials
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl disable --now systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
+          sudo systemctl mask systemd-oomd.socket systemd-oomd.service 2>/dev/null || true
+          have_kb="$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)"
+          if [ "${have_kb}" -lt $((4 * 1024 * 1024)) ]; then
+            avail_kb="$(df -Pk / | awk 'NR==2 { print $4 }')"
+            swap_kb="$((avail_kb - 4 * 1024 * 1024))"
+            if [ "${swap_kb}" -gt $((8 * 1024 * 1024)) ]; then
+              swap_kb="$((8 * 1024 * 1024))"
+            fi
+            if [ "${swap_kb}" -gt $((2 * 1024 * 1024)) ]; then
+              if sudo fallocate -l "${swap_kb}K" /swap-ci \
+                && sudo chmod 600 /swap-ci \
+                && sudo mkswap /swap-ci \
+                && sudo swapon /swap-ci; then
+                echo "added ${swap_kb}K of swap at /swap-ci"
+              else
+                sudo swapoff /swap-ci 2>/dev/null || true
+                sudo rm -f /swap-ci
+              fi
+            fi
+          fi
+          free -h
+
+      - name: Cache the ESP32 emulator tools
+        if: matrix.target == 'ESP32-S3_raw'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.tool_cache }}/silica-esp32
+          key: silica-esp32-emulator-v1
+
+      - name: Install the ESP32 emulator
+        if: matrix.target == 'ESP32-S3_raw'
+        env:
+          SILICA_ESP32_TOOLS: ${{ runner.tool_cache }}/silica-esp32
+        run: bash .github/scripts/install_esp32_emulator.sh
+
+      - name: Install the latest released compiler
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash .github/scripts/install_trial_compiler.sh "${{ matrix.target }}"
+
+      - name: Run this shard
+        working-directory: trials
+        env:
+          SILICA_TARGET_PROMPT: "0"
+          INTEGRATE_WATCHDOG_MINUTES: "45"
+          TRIAL_SUITE_SLICE: ${{ matrix.suite_slice }}
+          SKIP_GOLDEN_CHECK: ${{ inputs.skip_golden_check }}
+        run: |
+          set -euo pipefail
+          golden=""
+          if [ "${SKIP_GOLDEN_CHECK}" = "true" ]; then
+            golden=1
+            echo "::notice::Golden assembly checks are SKIPPED (skip_golden_check); output and exit status are still checked."
+          fi
+          export TRIAL_SKIP_GOLDEN="${golden}"
+          make integrate \
+            TRIAL_SKIP_GOLDEN="${golden}" \
+            TRIAL_TARGET="${{ matrix.trial_target }}" \
+            TRIAL_SUITES="${{ matrix.suites }}" \
+            JOBS=2 \
+            SDS_JOBS=1 \
+            SILICA_TARGET_PROMPT=0
+
+      - name: Collect the reports
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/trial-report"
+          find trials \
+            \( -name '.integrate_report' -o -name '.integrate_report.*' \
+               -o -name '.integrate_log' -o -name '.integrate_log.*' \) \
+            -type f -print0 |
+            while IFS= read -r -d '' file; do
+              rel="${file#trials/}"
+              mkdir -p "${RUNNER_TEMP}/trial-report/$(dirname "$rel")"
+              cp -p "$file" "${RUNNER_TEMP}/trial-report/$rel"
+            done
+
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trials-${{ matrix.target }}-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/trial-report
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+      - name: Collect the generated assembly as golden copies
+        if: always()
+        run: |
+          python3 .github/scripts/collect_goldens.py \
+            --trials trials \
+            --target "${{ matrix.target }}" \
+            --out "${RUNNER_TEMP}/golden"
+
+      - name: Upload the golden copies
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-${{ matrix.target }}-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/golden
+          retention-days: 14
+          include-hidden-files: true
+          if-no-files-found: ignore

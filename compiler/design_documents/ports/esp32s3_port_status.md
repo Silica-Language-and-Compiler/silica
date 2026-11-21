@@ -44,7 +44,7 @@ same `.scout` goldens the host uses (behaviour only: there are no Xtensa `.ascom
 | Transport carriers as device workers: `(:uart1)` (`silica_32_transport_uart1_etf`, `trials/transport_board_addition/device_uart1_carrier_tx`; sends only, nothing on the header) and `(:usb_serial_jtag)` (`silica_33_transport_usb_serial_jtag_etf`, `device_usb_serial_jtag_carrier_tx`): ETF `encode` on the board, `decode` on the board of the Mac's reply, `send_after`-driven receive polling in a device worker, the §6.2 carrier contract both ways against the Mac's `(:serial)` carrier and against an Erlang node through the serial-to-TCP bridge (`programmer_tools/transport_usb_serial_jtag_demo`; since 2026-11-10 the pairs are in `examples/transport_pairs/`, with stage S-D's accel/LED pair and the Silica pair) | `silica_32`, `silica_33` matched their `expected.scout` with `run_app.sh`; `transport_board_addition` 4 / 4 (two `.esp32_s3.ascomp`, two outputs) | 2026-11-09 |
 
 Not yet run on the board (§4.3, counts as of 2026-09-13) is the larger part of the tree; nothing there is known to fail, but nothing
-there is known to pass either.
+there is known to pass either. **Status 2026-11-18:** the whole tree has since been run: `make integrate TRIAL_TARGET=ESP32-S3_raw` gave 22,694 pass and 0 fail with 19 skipped (commit `029447ad31`, 2026-11-07), and the board goldens were regenerated and the target recorded green again on 2026-11-12 (commit `978f663e08`, compiler 999959).
 
 ## 2. Behaviours that differ from Apple Silicon
 
@@ -88,7 +88,7 @@ instead of Xtensa text, so the failure is immediate and legible.
 
 | Construct | `.error` text | Why |
 | --- | --- | --- |
-| Foreign calls (`ffi`) | `ESP32-S3: foreign (C) calls are not supported on this target` | No C runtime; the host's guarded FFI is setjmp / signal based. **Planned, not implemented:** Fifi on OS-free targets per [porting_for_os_free_targets.md §9.1](../porting_for_os_free_targets.md), with archives built against the board pack and faults caught by the trap vector. |
+| Foreign calls (`ffi`) | `ESP32-S3: foreign (C) calls are not supported on this target` | No C runtime; the host's guarded FFI is setjmp / signal based. **Planned, not implemented:** Fifi on OS-free targets per [porting_for_os_free_targets.md §9.1](../porting_for_os_free_targets.md), with archives built against the board pack and faults caught by the trap vector. **Status 2026-11-18: done** (commit `d036d03b43`: `board/runtime/rt_ffi.S`, `terms/ffi_foreign.silica`, board fixtures in `trials/ffi_addition/fixtures/board`; all 30 FFI trials pass on the board; a C fault ends the worker with `:foreign_fault`). The `.error` text is now given only for a parameter or result form the binding does not cover. |
 | File io | `ESP32-S3: file io is not supported on this target (<prim> -> <reg>)` | No filesystem. |
 | `peek` / `poke` of a register that is not 32 bits wide | `ESP32-S3: peek of a <n>-bit register is not supported on this board (...)` (same for `poke`) | The first lowering is `l32i` / `s32i` only (`terms/prims/prims_device.silica`). |
 | `map_device` with a constant base and size outside every board window | `ESP32-S3: map_device base <hex> size <hex> is not within a board window` | The window table is `board_pack.silica`; a computed base is checked at run time by `rt_device.S` (abort `illegal device map`, status 71). |
@@ -102,10 +102,10 @@ instead of Xtensa text, so the failure is immediate and legible.
 | --- | --- | --- |
 | Actor stacks that grow (spec §15.1.2.2) | `actor_stacks_addition` (13; skipped on the board, `ESP32-S3_raw.skip`) | Done 2026-10-08 (item F): the board grows and releases chunked stacks. The suite's own trials recurse hundreds of thousands of frames deep and expect megabytes committed, which the ~350 KB heap cannot hold, so it stays skipped; `stack_budget_board_addition` covers growth, the five release algorithms, a lowered reservation reached and a thousand idle actors on the board. |
 | `link` / `monitor` / `demonitor` | none: the host runtime's Phase G surface returns benign values, and so does the board's | The same work on both targets. |
-| Foreign calls | `ffi_addition` (16 apps), `warning_enforcement_addition` (its fixtures build C archives) | **Planned:** Fifi on OS-free targets, per [porting_for_os_free_targets.md §9.1](../porting_for_os_free_targets.md). That needs a board-pack C runtime for wrapper archives, and a trap-vector path that ends only the faulting FFI worker. It also needs the actor runtime above. Until then, record these suites as not applicable on the board. |
+| Foreign calls | `ffi_addition` (16 apps), `warning_enforcement_addition` (its fixtures build C archives) | **Planned:** Fifi on OS-free targets, per [porting_for_os_free_targets.md §9.1](../porting_for_os_free_targets.md). That needs a board-pack C runtime for wrapper archives, and a trap-vector path that ends only the faulting FFI worker. It also needs the actor runtime above. Until then, record these suites as not applicable on the board. **Status 2026-11-18: done** for `ffi_addition` (commit `d036d03b43`; the trials left out are listed in `trials/targets/ESP32-S3_raw.skip`); `warning_enforcement_addition` stays skipped because it builds C wrapper archives. |
 | File io | no dedicated suite; used inside some trials | Not applicable without a filesystem. |
-| Host fault semantics (status 70 and the `[silica] fault at …` line) | any trial whose golden encodes a host fault | Done 2026-09-19: `rt_console.S` prints the same report line and status (spec §15.4.5.5); goldens are folded, so no per-target `.scout` is needed. Not yet run on the board. |
-| Memory release | none directly; long-running allocation loops | Done 2026-09-28: `rt_heap.S` is now a real first-fit, coalescing allocator (`silica_rt_free` / `silica_rt_region_destroy` actually return memory) instead of the old no-op free; `memory_region_addition/region_local_release` is expected to pass. Not yet run on the board. Five sibling trials and one `compiler_addition` trial still cannot fit the board's real heap capacity regardless (1.6 MB / ~940 KB workloads against a ~170 KB heap) and are skipped, not failing; see [actor_memory_budget_plan.md](../actor_memory_budget_plan.md). |
+| Host fault semantics (status 70 and the `[silica] fault at …` line) | any trial whose golden encodes a host fault | Done 2026-09-19: `rt_console.S` prints the same report line and status (spec §15.4.5.5); goldens are folded, so no per-target `.scout` is needed. Not yet run on the board. **Status 2026-11-18:** covered by the whole-tree board run of 2026-11-07 (22,694 pass, 0 fail; commit `029447ad31`). |
+| Memory release | none directly; long-running allocation loops | Done 2026-09-28: `rt_heap.S` is now a real first-fit, coalescing allocator (`silica_rt_free` / `silica_rt_region_destroy` actually return memory) instead of the old no-op free; `memory_region_addition/region_local_release` is expected to pass. Not yet run on the board. **Status 2026-11-18:** covered by the whole-tree board run of 2026-11-07 (commit `029447ad31`). Five sibling trials and one `compiler_addition` trial still cannot fit the board's real heap capacity regardless (1.6 MB / ~940 KB workloads against a ~170 KB heap) and are skipped, not failing; see [actor_memory_budget_plan.md](../actor_memory_budget_plan.md). |
 
 ### 4.2 ESP32-S3 FP1 items beyond Apple Silicon FP1
 
@@ -127,6 +127,8 @@ peek and poke are 32-bit only on this board (§3); the board runs of the device 
 the diagnostic channel is narrow (§3's refusals other than the device rows are still `.error` lines).
 
 ### 4.3 Trial suites not yet run on the board
+
+**Status 2026-11-18:** every suite below was run in the whole-tree board run of 2026-11-07 (`make integrate TRIAL_TARGET=ESP32-S3_raw`: 22,694 pass, 0 fail, 19 skipped by `ESP32-S3_raw.skip`, commit `029447ad31`) and again on 2026-11-12 (commit `978f663e08`); the table is the plan as written on 2026-10-16.
 
 Every suite below is expected to work — the emitter converts every non-actor primitive and the bring-up apps
 cover each area once — but has not been run. Times are estimates at ~1.9 s per program trial.
@@ -156,7 +158,7 @@ long; per suite with `TRIAL_SUITES=`. The Mac is kept awake by the driver.
 | --- | --- | --- |
 | `ordered_data_structures` | skipped (`driver:`) | Its 10 sub-suites share one stdlib build and put programs in leaf directories; `board_suite.sh` handles one flat suite. |
 | Sub-suites with their own Makefile (the 7 under `error_enforcement_addition`) | skipped automatically, reported | Recurse into them the way the host `Makefile`s do. |
-| No Xtensa `.ascomp` | assembly is never compared on the board target | By design for now; an Xtensa golden set would need its own hand-derivation policy. |
+| No Xtensa `.ascomp` | assembly is never compared on the board target | By design for now; an Xtensa golden set would need its own hand-derivation policy. **Status 2026-11-18: done** (commit `d036d03b43`: `board_suite.sh` checks `.esp32_s3.ascomp` goldens, `gen_board_ascomp.sh` writes them; regenerated in `978f663e08`). |
 | One board | suites compile in parallel but run one trial at a time on the single board | More boards, `BOARD_PORT` per worker. |
 
 ### 4.5 Emitter performance

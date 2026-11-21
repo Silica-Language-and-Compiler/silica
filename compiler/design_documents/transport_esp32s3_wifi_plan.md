@@ -3,7 +3,7 @@
 Status: **target changed by Lee, 2026-11-09: serial over USB-C is the transport between the Mac and the board; the Wi-Fi
 stages (3 to 9) are deferred (§8).** Route R2 was chosen for Wi-Fi (§3) and stays the Wi-Fi route when it resumes. Stage 1
 is closed (§7); stages S-A, S-B and S-C are done (§7, 2026-11-09), and S-D, end to end over USB-C with both peers,
-on 2026-11-10 (§7; synthetic readings: the I2C0 accelerometer worker is not built). Stage results are recorded in §7. It refines Phase D of
+on 2026-11-10 (§7; synthetic readings: the I2C0 accelerometer worker is not built; **status 2026-11-18: built**, `device_esp32s3_i2c0.silica` and `device_mma8452q.silica`, commit `de4a10e6c2`). Stage results are recorded in §7. It refines Phase D of
 [transport_links_design.md](transport_links_design.md) §8–§9 ("decided later") and uses the item letters of
 [esp32s3_board_peripherals_plan.md](esp32s3_board_peripherals_plan.md) §5. Facts below were read from those two
 documents, `emitter/ESP32-S3_raw/transport_pack.silica` and `compiler/stdlib`; anything not checked is marked
@@ -85,7 +85,7 @@ change). Stages 0 to 2 need no radio.
 - Parse and check `carried_on` declarations; `Link.silica`; pack `provides_link` rows for the three hosted targets and the
   board; `spawn_dangerous_carrier` taking a declaration; E2412 to E2417; the hosted `(:wifi, n)`, `(:loopback)` and
   `(:serial_port, ...)` rows; hosted `getpeername` (so `:accepted` and `:link_up` carry the peer address, not
-  `"peer:accepted"`).
+  `"peer:accepted"`). (Note 2026-11-20: on the hosted `(:tcp)` carrier `(:accepted, fd, info)` now carries the accepted descriptor `fd: int64` instead of a spawned connection carrier; the owner starts the connection carrier. A Wi-Fi carrier on the ESP32-S3 that accepts connections should follow the same contract, which is the one the owner can supervise.)
 - **Closes when:** the links design's phase A trials pass, and the existing loopback and serial trials pass with a
   declaration in place of the module and address strings.
 
@@ -179,7 +179,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     read by nothing yet: the carrier check E2412 / `provides_link` is stage 2). `Carrier.silica` is unchanged: the
     `(:uart1)` row of §6.4 is the defaults (mtu 0, `:stream`, `:reliable_ordered`); `addressing(:uart1)` still answers
     `:endpoint` (should be `:none`) and `provides(:uart1)` false, deferred to stage 2 because `Carrier.silica` has
-    Linux assembly goldens that cannot be regenerated on the Mac.
+    Linux assembly goldens that cannot be regenerated on the Mac. (Status 2026-11-18: done in stage S-C; `Carrier.silica` answers `provides` true for `:uart1` and `:usb_serial_jtag`.)
   - Demo: `board/apps/silica_32_transport_uart1_etf` (encode + `wireframe@frame` with `Carrier@mtu((:uart1))` /
     `Carrier@boundaries((:uart1))`, one 52-byte `:tx`); `programmer_tools/transport_uart1_demo` (the Mac peer on the
     hosted `(:serial)` carrier, `serial_to_tcp_bridge.py` toward the Erlang peer of `transport_beam_demo`,
@@ -354,7 +354,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
     `transport_err_not_on_target.linux_*.golden_fail` are unaffected (the message did not change). The Apple goldens were
     regenerated from the compiler built from this tree (`compiler/build/apple_silicon_mac/silica-compiler`); the published
     `binaries/silica-compiler` predates `carried_on` and cannot compile the link trials until it is republished.
-  - Not done: the hosted interface links bind nothing yet (`(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)` are
+  - (Status 2026-11-18: the hosted interface binding is done, stage E2 of [transport_hosted_ethernet_plan.md](transport_hosted_ethernet_plan.md), verified 2026-11-13/14.) Not done: the hosted interface links bind nothing yet (`(:interface, name)`, `(:ethernet, n)`, `(:wifi, n)` are
     accepted and spawn the plain carriers; no `getifaddrs`, no `(:explicit, :link_unavailable)` at open, so the
     `link_interface_absent` / `link_family_absent` trials of the links design §10 wait); E2416 (phase D); the Linux
     and Nucleo pack rows; UART2; the supervised board bring-up (no `:device` flavor). Decisions for Lee: the parser
@@ -367,7 +367,7 @@ Each stage's result is recorded here when it closes: date, what was built, trial
 - **Stage S-D, 2026-11-10: end to end over the native USB-C jack, on the board, with the Silica peer and with the
   Erlang peer; the board drives the LED each reply names. The readings are synthetic. The pairs now live in
   `examples/transport_pairs/`.** The board's MMA8452Q is on I2C0, and the I2C0 worker is not built
-  (esp32s3_board_peripherals_plan.md item 2). The board therefore sends four readings from a fixed table in the
+  (esp32s3_board_peripherals_plan.md item 2; status 2026-11-18: built, commit `de4a10e6c2`). The board therefore sends four readings from a fixed table in the
   program, as `(x, y, z, at_ms)`: `(1, -2, 512, 1000)`, `(3, 1, 100, 1250)`, `(-5, 4, 300, 1500)`, `(0, 0, -480, 1750)`.
   Row 0 is the §13.4 reading. Nothing reads the sensor. Built:
   - **The board program,** `examples/transport_pairs/usb_accel_led_erlang_and_silica/accel_led_board/device_usb_accel_led.silica`
@@ -496,10 +496,10 @@ serial-to-TCP bridge of `programmer_tools/transport_uart1_demo`).
   needed no change.**
 - **S-C. Link naming (old stage 2).** `carried_on` with `(:usb_serial_jtag)` / `(:uart, 1, baud)` (UART0 is the console and is
   rejected, decision 17), `Link.silica`, E2412 to E2415 and E2417 (E2416 is phase D), `spawn_dangerous_carrier`;
-  `getpeername` stays a Wi-Fi item. **Done 2026-11-09 on the Mac and the board (§7).**
+  `getpeername` stays a Wi-Fi item (status 2026-11-18: the hosted carrier reports the peer by `getpeername` since stage E2; the board has no network carrier). **Done 2026-11-09 on the Mac and the board (§7).**
 - **S-D. End to end.** The board sends accelerometer readings; the Mac replies with an LED command; the same with the
   Erlang peer. Run by script outside `make integrate`, like the BEAM demo.
   **Done 2026-11-10 with both peers on the board (§7); the readings are a fixed synthetic table, not the
-  MMA8452Q (the I2C0 worker, peripherals plan item 2, is not built). Run by `examples/transport_pairs/run_all.sh`.**
+  MMA8452Q (the I2C0 worker, peripherals plan item 2, is not built; status 2026-11-18: built, commit `de4a10e6c2`). Run by `examples/transport_pairs/run_all.sh`.**
 - **S-E. Hardening and docs.** Framing recovery after a lost byte, flow control (no hardware flow control on the CP2102N
   path: lossy under sustained load per §6.4), the console-interleaving rule, status in the designs.

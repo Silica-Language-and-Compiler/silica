@@ -142,8 +142,15 @@ _silica_rt_child_table_free:
 ; The rows and the block outlive this actor while a linked child still holds a reference: the
 ; child's last act is its row's exit_done store (sb_child_done), after its own teardown. This
 ; actor's teardown drops its reference; the last one frees the rows and the block (sb_unref).
-	ldr	x0, [x19, #216]
+; #216 is cleared under this actor's lock, where a call_supervisor body takes its reference
+; (_silica_rt_sup_ref_call), so a reader either holds the block or finds none.
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	x20, [x19, #216]
 	str	xzr, [x19, #216]
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x20
 	bl	_silica_rt_sb_unref
 Lct_free_none:
 	ldr	x30, [sp, #16]
@@ -314,6 +321,32 @@ Lsbu_free_block:
 	ldp	x29, x30, [sp, #16]
 	ldp	x20, x19, [sp], #32
 Lsbu_ret:
+	ret
+; _silica_rt_sup_release_if_mine(X0 = supervisor): releases its restart token when the running
+; actor (1 for main) holds it (a drain_hold that may have answered 0 took nothing).
+	.globl	_silica_rt_sup_release_if_mine
+	.p2align	2
+_silica_rt_sup_release_if_mine:
+	stp	x29, x30, [sp, #-32]!
+	mov	x29, sp
+	str	x19, [sp, #16]
+	mov	x19, x0
+	bl	_silica_rt_tls_current_actor_get
+	cmp	x0, #0
+	mov	x9, #1
+	csel	x0, x9, x0, eq
+	ldr	x9, [x19, #216]
+	cbz	x9, Lsrim_ret
+	ldr	x10, [x9, #120]
+	cmp	x10, x0
+	b.ne	Lsrim_ret
+	mov	x0, x19
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
+	b	_silica_rt_sup_restart_release
+Lsrim_ret:
+	ldr	x19, [sp, #16]
+	ldp	x29, x30, [sp], #32
 	ret
 	.globl	_silica_rt_sb_child_done
 	.p2align	2
@@ -653,9 +686,49 @@ fn child_table_rt_asm_chunk_2(danger_idx: int64) -> string {
 _silica_rt_supervisor_start_child:
 	.cfi_startproc
 ; The builtin start_child(spec): the supervisor is the thread's current actor (the supervisor's own
-; init or behaviour). X1 = 0 asks the body to read it.
-	mov	x1, xzr
-	b	_silica_rt_supervisor_start_child_in
+; init or behaviour). The row is made while the supervisor holds its own restart token (taken
+; without draining: pending notices stay for its dispatch, signalled by the release), so a
+; call_supervisor operation of another actor cannot change the table meanwhile. The block the
+; token lives in is made first when the supervisor is alive and has none. When the token cannot
+; be taken (the supervisor is ending) the row is made as before, without it.
+	stp	x29, x30, [sp, #-48]!
+	mov	x29, sp
+	stp	x19, x20, [sp, #16]
+	str	x21, [sp, #32]
+	mov	x20, x0
+	mov	x21, xzr
+	bl	_silica_rt_tls_current_actor_get
+	mov	x19, x0
+	cbz	x19, Lscown_run
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
+	ldr	w9, [x19, #152]
+	cbz	w9, Lscown_sb_done
+	mov	x0, x19
+	bl	_silica_rt_sb_require
+Lscown_sb_done:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
+	mov	x0, x19
+	mov	x1, x19
+	mov	x2, #1
+	bl	_silica_rt_sup_restart_acquire
+	cmp	x0, #1
+	cset	x21, eq
+Lscown_run:
+	mov	x0, x20
+	mov	x1, x19
+	bl	_silica_rt_supervisor_start_child_in
+	cbz	x21, Lscown_ret
+	mov	x20, x0
+	mov	x0, x19
+	bl	_silica_rt_sup_restart_release
+	mov	x0, x20
+Lscown_ret:
+	ldr	x21, [sp, #32]
+	ldp	x19, x20, [sp, #16]
+	ldp	x29, x30, [sp], #48
+	ret
 	.cfi_endproc
 	.globl	_silica_rt_supervisor_start_child_in
 	.p2align	2
@@ -1023,9 +1096,24 @@ _silica_rt_supervisor_add_child_acb:
 	mov	x21, x1
 	bl	_silica_rt_tls_current_actor_get
 	mov	x22, x0
+; The new row is made while this actor holds the supervisor's restart token, after draining
+; (_silica_rt_supervisor_drain_hold), so no restart, other add, start_child or row stop changes
+; the table meanwhile. The block the token lives in is made first, under the supervisor's lock,
+; when the supervisor is alive and has none. No token (the supervisor or this actor has ended):
+; no child is started, the answer is the no-child identity.
+	add	x0, x20, #16
+	bl	_os_unfair_lock_lock
+	ldr	w9, [x20, #152]
+	cbz	w9, Ladd_child_sb_done
+	mov	x0, x20
+	bl	_silica_rt_sb_require
+Ladd_child_sb_done:
+	add	x0, x20, #16
+	bl	_os_unfair_lock_unlock
 	mov	x1, x22
 	mov	x0, x20
-	bl	_silica_rt_supervisor_drain_ingress
+	bl	_silica_rt_supervisor_drain_hold
+	cbz	x0, Ladd_child_no_token
 ; §20.3.1: an id a live actor or supervisor already holds starts no child; the actor that asked for
 ; the add fails with (:explicit, :duplicate_child_id). In main (no current actor) it is the
 ; language-level failure of §15.4.5.5: the atom's name on standard error, exit status 1.
@@ -1037,11 +1125,23 @@ _silica_rt_supervisor_add_child_acb:
 	mov	x0, x21
 	mov	x1, x20
 	bl	_silica_rt_supervisor_start_child_in
+	mov	x19, x0
+	mov	x0, x20
+	bl	_silica_rt_sup_restart_release
+	mov	x0, x19
+	ldp	x29, x30, [sp, #32]
+	ldp	x20, x19, [sp, #16]
+	ldp	x22, x21, [sp], #48
+	ret
+Ladd_child_no_token:
+	mov	x0, #-1
 	ldp	x29, x30, [sp, #32]
 	ldp	x20, x19, [sp, #16]
 	ldp	x22, x21, [sp], #48
 	ret
 Ladd_child_duplicate:
+	mov	x0, x20
+	bl	_silica_rt_sup_restart_release
 	cbz	x22, Ladd_child_duplicate_main
 	mov	x0, x22
 	adrp	x8, _silica_rt_duplicate_child_id_atom@PAGE
@@ -1337,6 +1437,11 @@ Lmr_ofa_kill_at_idx:
 	mov	x1, x28
 	mov	x3, xzr
 	bl	_silica_rt_row_wait
+; The stopped sibling's notice is dropped as in the :rest_for_one loop below: its row gets a new
+; child, so no later handler could match it, and a cascade over many siblings must not fill the ingress.
+	mov	x0, x20
+	mov	x1, x27
+	bl	_silica_rt_supervisor_drop_pending_exit
 Lmr_ofa_kill_next:
 	add	x25, x25, #1
 	b	Lmr_ofa_kill_loop
@@ -1893,10 +1998,13 @@ _silica_rt_supervisor_which_children_acb:
 	stp	x29, x30, [sp, #80]
 	add	x29, sp, #80
 	mov	x19, x0
+; The rows are counted and then filled in while this actor holds the restart token (drain_hold), so
+; no row is added between the two walks (the area is sized by the count); released at the end
+; (_silica_rt_sup_release_if_mine).
 	bl	_silica_rt_tls_current_actor_get
 	mov	x1, x0
 	mov	x0, x19
-	bl	_silica_rt_supervisor_drain_ingress
+	bl	_silica_rt_supervisor_drain_hold
 	ldr	x20, [x19, #216]
 	cbz	x20, Lsbh_10
 	ldr	x20, [x20, #24]
@@ -1917,6 +2025,10 @@ Lswhich_counted:
 	mul	x9, x21, x9
 	add	x9, x9, #15
 	and	x9, x9, #0xfffffffffffffff0
+; The area is as large as the supervisor has children: the caller's stack must hold it before SP moves
+; (_silica_rt_stack_room keeps every register; too large ends the calling actor).
+	mov	x16, x9
+	bl	_silica_rt_stack_room
 	mov	x10, sp
 	sub	sp, sp, x9
 	mov	x11, sp
@@ -1981,6 +2093,8 @@ Lswhich_next:
 	ldr	x20, [x20, #80]
 	b	Lswhich_scan
 Lswhich_done:
+	mov	x0, x19
+	bl	_silica_rt_sup_release_if_mine
 	mov	x0, x21
 	ldr	x9, [x29, #16]
 	and	x9, x9, #0xfffffffffffffff0
@@ -1993,6 +2107,8 @@ Lswhich_done:
 	ldp	x29, x30, [x29]
 	ret
 Lswhich_none:
+	mov	x0, x19
+	bl	_silica_rt_sup_release_if_mine
 	mov	x0, xzr
 	ldp	x29, x30, [sp, #80]
 	ldp	x20, x19, [sp, #64]

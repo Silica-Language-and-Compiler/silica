@@ -6,10 +6,15 @@
 #   bash programmer_tools/run_trials_all_platforms.sh --targets linux_x86_64
 #   bash programmer_tools/run_trials_all_platforms.sh --remote linux_aarch64=admin@pix.local
 #   bash programmer_tools/run_trials_all_platforms.sh --sync --board
+#   bash programmer_tools/run_trials_all_platforms.sh --compiler /path/to/silica-compiler
+#   bash programmer_tools/run_trials_all_platforms.sh --compiler esp32=/path/to/silica-compiler-ESP32-S3_raw --board
 #
 # This script never builds a compiler. Each machine must already have its own native compiler at
-# <repo>/binaries/silica-compiler; a raw target is driven from this machine with the cross compiler
-# this machine built for it.
+# <repo>/binaries/silica-compiler (the normal compiler, which build_all_platforms.sh installs);
+# a raw target is driven from this machine with binaries/silica-compiler-<target>. The script
+# refuses to start when one is missing. The suite that tests a normal build uses the normal
+# compiler through SILICA_NORMAL_COMPILER.
+# --compiler (below) tests another one.
 #
 # Which platforms, and where their machines are:
 #   .silica_build_hosts in the repository root, the file programmer_tools/build_all_platforms.sh
@@ -23,6 +28,21 @@
 #                       that platform's goldens back, deletes what this tree no longer has, pushes;
 #                       built artifacts excluded: see sync_excludes.sh)
 #   --sync-only         do that copy and stop; no trial runs
+#   --compiler <path>   test this compiler instead of binaries/silica-compiler, on THIS machine's own
+#                       (native host) run: SILICA_COMPILER=<absolute path> goes on the make integrate
+#                       command line (an environment variable would be ignored). The file must be named
+#                       exactly silica-compiler (the trials read the target from the name), be
+#                       executable, and exist; otherwise the script refuses and runs nothing. A Mac build
+#                       is compiler/build/apple_silicon_mac/silica-compiler.
+#   --compiler <target>=<path>   the same per platform; repeatable. Targets take the names above.
+#                       Native host: as the bare form. Board (ESP32-S3_raw, STM32-L476RG_raw): the local
+#                       file, passed as BOARD_SILICA_COMPILER for that board's run (default
+#                       binaries/silica-compiler-<target>); needs --board. Remote machine: a path ON that
+#                       machine (a leading ~/ is expanded there), passed as SILICA_COMPILER on its make
+#                       command line; its file name must also be silica-compiler. A target that is not
+#                       part of this run, an unknown target, or two compilers for one target is an error.
+#                       Without --compiler nothing changes. The plan, --list, each log's first line and
+#                       the final summary name the compiler used per target.
 #
 # Short names are accepted anywhere a platform is: mac, pi, nix, esp32, all, hosted.
 #
@@ -58,7 +78,16 @@ JOBS_STM32_L476RG_raw="${NUCLEO_JOBS:-5}"
 SDS_STM32_L476RG_raw="${NUCLEO_SDS_JOBS:-1}"
 
 STAMP="$(date '+%Y%m%d-%H%M%S')"
-LOG_DIR="${LOG_DIR:-$REPO/../silica_trial_runs/$STAMP}"
+# Default log location: beside the MAIN checkout, never inside a .claude/worktrees directory (the
+# agent-worktree cleanup owns that and has deleted a run's logs mid-run). In a git worktree the main
+# checkout is the parent of the common git dir; fall back to $REPO when git cannot say.
+MAIN_REPO="$REPO"
+if _common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+        && [ -n "$_common" ] && [ -d "$_common" ] && [ "$(basename "$_common")" = ".git" ]; then
+    MAIN_REPO="$(dirname "$_common")"
+fi
+case "$MAIN_REPO" in */.claude/worktrees/*) MAIN_REPO="${MAIN_REPO%%/.claude/worktrees/*}" ;; esac
+LOG_DIR="${LOG_DIR:-$MAIN_REPO/../silica_trial_runs/$STAMP}"
 DO_SYNC=0
 SYNC_ONLY=0
 DO_BOARD=0
@@ -71,6 +100,7 @@ usage() {  # every comment line of the header, however long it grows
 }
 
 declare -a REMOTE_SPECS=()
+declare -a COMPILER_SPECS=()
 
 # mac/pi/nix/esp32 are the names this script has always taken; keep them working.
 expand_name() {
@@ -94,6 +124,8 @@ while [ $# -gt 0 ]; do
         --log-dir)  LOG_DIR="$2"; shift ;;
         --targets)  SELECTED="$SELECTED $(echo "$2" | tr ',' ' ')"; shift ;;
         --remote)   REMOTE_SPECS+=("$2"); shift ;;
+        --compiler) [ $# -ge 2 ] || { echo "--compiler needs <path> or <target>=<path>" >&2; exit 1; }
+                    COMPILER_SPECS+=("$2"); shift ;;
         --mac-jobs) JOBS_apple_silicon_mac="$2"; shift ;;
         --pi-jobs)  JOBS_linux_aarch64="$2"; shift ;;
         --nix-jobs) JOBS_linux_x86_64="$2"; shift ;;
@@ -192,20 +224,104 @@ for t in $TARGETS; do
     fi
 done
 
+# ---------------------------------------------------------------- --compiler
+
+declare -a C_TARGET=() C_PATH=()
+
+compiler_of() {  # $1 = target; prints the --compiler path given for it, status 1 when none
+    local i
+    [ ${#C_TARGET[@]} -gt 0 ] || return 1
+    for i in "${!C_TARGET[@]}"; do
+        [ "${C_TARGET[$i]}" = "$1" ] && { echo "${C_PATH[$i]}"; return 0; }
+    done
+    return 1
+}
+
+cdie() { echo "error: --compiler $1" >&2; exit 1; }
+
+check_local_compiler() {  # $1 = path, $2 = "must be named silica-compiler" (1) or not (0)
+    [ -e "$1" ] || cdie "$1: no such file"
+    [ -f "$1" ] || cdie "$1: not a file"
+    [ -x "$1" ] || cdie "$1: not executable"
+    if [ "$2" = 1 ] && [ "$(basename "$1")" != silica-compiler ]; then
+        cdie "$1: the file must be named exactly silica-compiler (the trials read the emit target from the name; a differently named file such as silica-NNNNNN-<platform> would be taken for another target). Point at compiler/build/<platform>/silica-compiler or make a link of that name."
+    fi
+}
+
+for spec in ${COMPILER_SPECS[@]+"${COMPILER_SPECS[@]}"}; do
+    ctarget=""; cpath="$spec"
+    case "$spec" in
+        */*=*) ;;                                  # a path that happens to contain '=': a bare path
+        *=*)   ctarget="${spec%%=*}"; cpath="${spec#*=}" ;;
+    esac
+    [ -n "$cpath" ] || cdie "needs a path: $spec"
+    if [ -z "$ctarget" ]; then
+        ctarget="$HOST_TARGET"
+    else
+        ctarget="$(expand_name "$ctarget")"
+        case "$ctarget" in *" "*) cdie "needs one platform, not a list: $spec" ;; esac
+        echo " $ALL_TARGETS " | grep -q " $ctarget " || cdie "unknown platform '${spec%%=*}' (known: $ALL_TARGETS)"
+    fi
+    echo " $([ "$RUN_NATIVE" = 1 ] && echo "$HOST_TARGET") $RUN_RAW $RUN_REMOTE " | grep -q " $ctarget " \
+        || cdie "names $ctarget, which does not run here (runs:$([ "$RUN_NATIVE" = 1 ] && echo " $HOST_TARGET")$RUN_RAW$RUN_REMOTE; skipped:${SKIPPED:- none})"
+    ! compiler_of "$ctarget" >/dev/null || cdie "given twice for $ctarget"
+    C_TARGET+=("$ctarget"); C_PATH+=("$cpath")
+done
+
+# Local files are checked now, before anything starts; the remote machines' paths are only checked for
+# their name (they are checked for existence by the remote make).
+if [ ${#C_TARGET[@]} -gt 0 ]; then
+    for i in "${!C_TARGET[@]}"; do
+        t="${C_TARGET[$i]}"; p="${C_PATH[$i]}"
+        if [ "$t" != "$HOST_TARGET" ] && ! is_raw "$t"; then
+            conn_of "$t" >/dev/null || cdie "$t has no machine to run on, so '$p' cannot be used"
+            [ "$(basename "$p")" = silica-compiler ] || cdie "$p: the file on the remote machine must be named exactly silica-compiler"
+            continue
+        fi
+        case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+        if [ "$t" = "$HOST_TARGET" ]; then check_local_compiler "$p" 1; else check_local_compiler "$p" 0; fi
+        C_PATH[$i]="$p"
+    done
+fi
+
+compiler_label() {  # $1 = target; what that target's run uses, for the plan, the logs and the summary
+    local c
+    if c="$(compiler_of "$1")"; then echo "$c"; return; fi
+    if [ "$1" = "$HOST_TARGET" ]; then echo "$REPO/binaries/silica-compiler (default)"
+    elif is_raw "$1"; then echo "$REPO/binaries/silica-compiler-$1 (default)"
+    else echo "binaries/silica-compiler on the remote machine (default)"; fi
+}
+
+qremote() {  # quote a path for the remote shell; a leading ~/ stays unquoted so the remote shell expands it
+    case "$1" in
+        "~/"*) printf '~/%q' "${1#"~/"}" ;;
+        *)     printf '%q' "$1" ;;
+    esac
+}
+
 echo "this machine : $HOST_PLATFORM ($HOST_TARGET)"
 echo "runs here    :$([ "$RUN_NATIVE" = 1 ] && echo " $HOST_TARGET")$RUN_RAW"
 echo "runs remote  :$([ -n "$RUN_REMOTE" ] && echo "$RUN_REMOTE" || echo " none")"
 [ -n "$SKIPPED" ] && echo "skipped      :$SKIPPED"
 echo "logs         : $LOG_DIR"
+if [ ${#C_TARGET[@]} -gt 0 ]; then
+    echo "compilers    :"
+    for t in $([ "$RUN_NATIVE" = 1 ] && echo "$HOST_TARGET") $RUN_RAW $RUN_REMOTE; do
+        echo "  $t: $(compiler_label "$t")"
+    done
+fi
 
 if [ "$LIST_ONLY" = 1 ]; then
-    [ "$RUN_NATIVE" = 1 ] && echo "  $HOST_TARGET: make integrate TRIAL_TARGET=host, here"
-    for t in $RUN_RAW; do echo "  $t: make integrate TRIAL_TARGET=$t, here, on the attached board"; done
-    for t in $RUN_REMOTE; do echo "  $t: make integrate TRIAL_TARGET=host on $(conn_of "$t")"; done
+    [ "$RUN_NATIVE" = 1 ] && echo "  $HOST_TARGET: make integrate TRIAL_TARGET=host, here; compiler $(compiler_label "$HOST_TARGET")$(compiler_of "$HOST_TARGET" >/dev/null && echo "  [SILICA_COMPILER on the make command line]")"
+    for t in $RUN_RAW; do echo "  $t: make integrate TRIAL_TARGET=$t, here, on the attached board; compiler $(compiler_label "$t")$(compiler_of "$t" >/dev/null && echo "  [BOARD_SILICA_COMPILER]")"; done
+    for t in $RUN_REMOTE; do echo "  $t: make integrate TRIAL_TARGET=host on $(conn_of "$t"); compiler $(compiler_label "$t")$(compiler_of "$t" >/dev/null && echo "  [SILICA_COMPILER on the remote make command line]")"; done
     exit 0
 fi
 
-mkdir -p "$LOG_DIR"
+if ! mkdir -p "$LOG_DIR" || [ ! -d "$LOG_DIR" ] || [ ! -w "$LOG_DIR" ]; then
+    echo "error: cannot create or write the log directory $LOG_DIR (use --log-dir or LOG_DIR=)" >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------- sync (optional)
 
@@ -232,6 +348,27 @@ fi
 
 [ "$SYNC_ONLY" = 1 ] && { echo "sync only: done"; exit 0; }
 
+# ---------------------------------------------------------------- compilers
+
+# The trials are compiled by the normal compilers. Refuse to start when one is missing, before any run begins.
+missing=""
+[ "$RUN_NATIVE" = 1 ] && [ ! -x "$REPO/binaries/silica-compiler" ] \
+    && missing="$missing\n  here: $REPO/binaries/silica-compiler"
+for t in $RUN_RAW; do
+    [ -x "$REPO/binaries/silica-compiler-$t" ] \
+        || missing="$missing\n  here: $REPO/binaries/silica-compiler-$t"
+done
+for t in $RUN_REMOTE; do
+    spec="$(conn_of "$t")"
+    ssh -o BatchMode=yes "${spec%%:*}" "test -x ${spec#*:}/binaries/silica-compiler" >/dev/null 2>&1 \
+        || missing="$missing\n  $t: ${spec%%:*}:${spec#*:}/binaries/silica-compiler"
+done
+if [ -n "$missing" ]; then
+    printf 'No compiler, so no trial run starts. Missing:%b\n' "$missing" >&2
+    echo "Build them with: bash programmer_tools/build_all_platforms.sh (or, in compiler/src: make build [TARGET=<t>] INSTALL_SELFHOST=1 SILICA_TARGET_PROMPT=0)" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------- runs
 
 jobs_for() { eval "echo \"\${JOBS_$(echo "$1" | tr '-' '_'):-}\""; }
@@ -242,10 +379,13 @@ run_remote() {  # $1 = target
     spec="$(conn_of "$t")"; conn="${spec%%:*}"; rpath="${spec#*:}"
     jobs="$(jobs_for "$t")"; sds="$(sds_for "$t")"
     log="$LOG_DIR/$t.log"
-    echo "  start $t on $conn (JOBS=${jobs:-default} SDS_JOBS=$sds)"
+    local rcomp="" cc
+    cc="$(compiler_of "$t")" && rcomp="SILICA_COMPILER=$(qremote "$cc")"
+    echo "  start $t on $conn (JOBS=${jobs:-default} SDS_JOBS=$sds) compiler: $(compiler_label "$t")"
+    echo "compiler: $(compiler_label "$t")" > "$log"
     ssh -o BatchMode=yes "$conn" \
-        "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host ${jobs:+JOBS=$jobs} SDS_JOBS=$sds" \
-        > "$log" 2>&1
+        "cd $rpath/trials && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET=host ${jobs:+JOBS=$jobs} SDS_JOBS=$sds${rcomp:+ $rcomp}" \
+        >> "$log" 2>&1
     rc=$?
     ssh -o BatchMode=yes "$conn" "cd $rpath/trials && { cat .integrate_report.$t 2>/dev/null || cat .integrate_report; }" > "$LOG_DIR/$t.report" 2>/dev/null
     echo "$rc" > "$LOG_DIR/$t.rc"
@@ -256,9 +396,16 @@ run_here() {  # $1 = target, $2 = TRIAL_TARGET value
     local t="$1" tt="$2" jobs sds log rc
     jobs="$(jobs_for "$t")"; sds="$(sds_for "$t")"
     log="$LOG_DIR/$t.log"
-    echo "  start $t here (TRIAL_TARGET=$tt JOBS=${jobs:-default} SDS_JOBS=$sds)"
-    ( cd "$REPO/trials" && make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET="$tt" \
-        ${jobs:+JOBS=$jobs} SDS_JOBS="$sds" ) > "$log" 2>&1
+    # --compiler: the host run gets SILICA_COMPILER on the make command line (the trials ignore the
+    # environment); a board run gets BOARD_SILICA_COMPILER in its environment (what trial_target.sh reads).
+    local cc="" cmake_arg=() cenv=()
+    if cc="$(compiler_of "$t")"; then
+        if [ "$t" = "$HOST_TARGET" ]; then cmake_arg=("SILICA_COMPILER=$cc"); else cenv=("BOARD_SILICA_COMPILER=$cc"); fi
+    fi
+    echo "  start $t here (TRIAL_TARGET=$tt JOBS=${jobs:-default} SDS_JOBS=$sds) compiler: $(compiler_label "$t")"
+    echo "compiler: $(compiler_label "$t")" > "$log"
+    ( cd "$REPO/trials" && env ${cenv[@]+"${cenv[@]}"} make integrate SILICA_TARGET_PROMPT=0 TRIAL_TARGET="$tt" \
+        ${jobs:+JOBS=$jobs} SDS_JOBS="$sds" ${cmake_arg[@]+"${cmake_arg[@]}"} ) >> "$log" 2>&1
     rc=$?
     # A host run's report is named after the machine's target (macos_applesilicon on the Mac), a board's after the board.
     hk="$t"; [ "$t" = apple_silicon_mac ] && hk=macos_applesilicon
@@ -301,6 +448,11 @@ for t in $TARGETS; do
     printf '%-20s %-7s %-9s %-9s %s\n' "$t" "$status" "${pass:-?}" "${fail:-?}" "$rep"
 done
 
+echo
+echo "Compilers used:"
+for t in $TARGETS; do
+    [ -f "$LOG_DIR/$t.rc" ] && echo "  $t: $(compiler_label "$t")"
+done
 echo
 echo "Every failure should be a documented defect trial; read each report's failure list."
 exit "$overall"

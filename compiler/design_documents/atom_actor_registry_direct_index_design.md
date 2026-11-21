@@ -1,5 +1,7 @@
 # Atom-keyed actor registry — direct indexing design
 
+**Status 2026-11-18:** fully implemented in all four runtimes (see the implementation status below); nothing in this document is open.
+
 ## Implementation status (2026-10-16)
 
 The design is implemented in the runtimes, with these specifics:

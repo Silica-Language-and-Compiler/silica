@@ -10,6 +10,7 @@
 #   bash programmer_tools/build_all_platforms.sh --set_targets "apple_silicon_mac linux_x86_64"
 #   bash programmer_tools/build_all_platforms.sh --refresh_targets
 #   bash programmer_tools/build_all_platforms.sh --no-fixpoint --trials
+#   bash programmer_tools/build_all_platforms.sh --link-only --remote linux_x86_64=lee@nix.local:~/silica
 #
 # An OS-hosted platform compiles its own code: macOS on Apple Silicon, Linux on AArch64, Linux on
 # x86-64. Each one builds natively on its own machine and reaches its own fixed point there. This
@@ -18,11 +19,27 @@
 # needs its first one handed to it, which this script offers to do (build here, emit the assembly
 # here, link there).
 #
+# The hand-over, in detail: the cross compiler for the target is built here (make build), copied out
+# of its build directory, and used to emit the target's assembly (make bootstrap-assembly, which
+# checks the assembly is for the target's architecture and fails otherwise). The .sams are synced to
+# the machine and `make bootstrap-link` assembles and links the first compiler there. Then the
+# machine builds with it (build, gen1, gen2, fixed point), unless you pass --link-only.
+#   --link-only         stop after bootstrap-link: no build, fixed point or trials on the remote. For
+#                       a host too small to build the compiler (the heaviest unit needs 6-8 GB; a
+#                       3.9 GB host with no swap cannot). The linked compiler is at
+#                       compiler/build/<t>/silica-compiler on the remote; give it to the trials with
+#                       run_trials_all_platforms.sh --compiler <t>=<path>. A host that already has
+#                       binaries/silica-compiler is not handed anything and is skipped.
+# The sync leaves binaries/ out, so the script sends binaries/install_compiler.bash itself before
+# linking, and bootstrap-link can install the result as that host's binaries/silica-compiler.
+#
 # A raw platform has no OS and cannot host a compiler: ESP32-S3_raw. Its cross compiler is built
 # here, on this machine, and its board images are built and flashed separately.
 #
 # Per machine the work is: build, gen1, gen2, fixed-point check, publish (skip the last four with
 # --no-fixpoint). One compiler build at a time per machine; the heaviest unit needs 6-8 GB.
+#
+# Raw targets build with at most 5 jobs.
 #
 # Which platforms are built, and where:
 #   .silica_build_hosts in the repository root remembers the platforms and their machines. It is
@@ -52,6 +69,7 @@ PLATFORM_MK="$REPO/project_makefiles/platform/platforms.mk"
 
 DO_FIXPOINT=1
 DO_TRIALS=0
+LINK_ONLY=0
 LOCAL_ONLY=0
 LIST_ONLY=0
 JOBS=""
@@ -73,6 +91,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --no-fixpoint) DO_FIXPOINT=0 ;;
         --trials)      DO_TRIALS=1 ;;
+        --link-only)   LINK_ONLY=1 ;;
         --local-only)  LOCAL_ONLY=1 ;;
         --list)        LIST_ONLY=1 ;;
         --jobs)        JOBS="$2"; shift ;;
@@ -394,6 +413,8 @@ remote_build_and_fixpoint() {  # $1 = target, $2 = user@host, $3 = remote repo p
 
     if ! remote_sh "$conn" "test -x $rpath/binaries/silica-compiler" >/dev/null 2>&1; then
         echo "  no compiler there yet: handing one over (build here, emit here, link there)"
+        # build leaves the macOS-hosted cross compiler for $t at compiler/build/$t/silica-compiler;
+        # bootstrap-assembly copies it out, cleans the directory and emits the target's assembly with it.
         ( cd "$SRC" && make clean TARGET="$t" SILICA_TARGET_PROMPT=0 && \
           make build TARGET="$t" SILICA_TARGET_PROMPT=0 INSTALL_SELFHOST=0 ${JOBS:+JOBS=$JOBS} && \
           make bootstrap-assembly BOOTSTRAP_TARGET="$t" SILICA_TARGET_PROMPT=0 ) >>"$log" 2>&1 || {
@@ -405,10 +426,22 @@ remote_build_and_fixpoint() {  # $1 = target, $2 = user@host, $3 = remote repo p
         rsync -a --include '*/' --include '*.sams' --include 'silica.link' --exclude '*' \
             "$REPO/compiler/build/$t/" "$conn:$rpath/compiler/build/$t/" >>"$log" 2>&1 || {
             echo "  sync of the emitted assembly failed"; return 1; }
+        # binaries/ is not synced; bootstrap-link installs through this script when it is there.
+        remote_sh "$conn" "mkdir -p $rpath/binaries" >>"$log" 2>&1
+        rsync -a "$BIN/install_compiler.bash" "$conn:$rpath/binaries/install_compiler.bash" >>"$log" 2>&1 || \
+            echo "  note: could not send binaries/install_compiler.bash; bootstrap-link will not install the compiler"
         remote_sh "$conn" "cd $rpath/$SRC_REL && make bootstrap-link" >>"$log" 2>&1 || {
             echo "  bootstrap-link failed on $conn (see $log)"; return 1; }
         echo "  first compiler linked on $conn"
         ( cd "$SRC" && make clean TARGET="$t" SILICA_TARGET_PROMPT=0 ) >/dev/null 2>&1
+        if [ "$LINK_ONLY" = 1 ]; then
+            echo "  --link-only: stopping after the link. The compiler is $rpath/compiler/build/$t/silica-compiler on $conn;"
+            echo "  for the trials: run_trials_all_platforms.sh --compiler $t=$rpath/compiler/build/$t/silica-compiler"
+            return 0
+        fi
+    elif [ "$LINK_ONLY" = 1 ]; then
+        echo "  --link-only: $conn already has a compiler ($rpath/binaries/silica-compiler); nothing to hand over"
+        return 0
     fi
 
     if [ "$DO_FIXPOINT" = 1 ]; then

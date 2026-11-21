@@ -162,5 +162,7 @@ differently by gen2 than by gen1, gen3 byte-identical to gen2; build log
 runtime is still one OS thread per actor; the trial holds a thousand, and the count waits on ROADMAP chunk 2's
 carriers) and the `vm.max_map_count` decision above.
 
+**Update 2026-11-18.** The carriers this paragraph waits on are done on all three hosted paths (ROADMAP chunk 2: Apple Silicon 2026-10-19, Linux AArch64 `aa8101edf2` and Linux x86-64 `ef2e778126`, 2026-10-20), so the hosted runtime is no longer one OS thread per actor except for a dangerous actor, and [actor_memory_budget_plan.md](../actor_memory_budget_plan.md) §16 records the Mac holding up to 1,000,000 idle actors. Still open: a trial that holds more than a thousand actors (none exists) and the `vm.max_map_count` decision (no runtime code or standard library source checks it).
+
 Related: [region_memory_safety_todo.md](region_memory_safety_todo.md) (arena ownership and release),
 [porting_for_os_free_targets.md](../porting_for_os_free_targets.md) (board stacks and the port table).
