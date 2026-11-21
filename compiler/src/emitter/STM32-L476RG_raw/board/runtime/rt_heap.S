@@ -115,6 +115,8 @@ silica_rt_arenas:
     LFUNC rt_arena_alloc
     push    {r4-r8, lr}
     mov     r8, r1                          // r8 = arena
+    cmp     r0, #RT_ALLOC_MAX
+    bhi.w   9f                              // an overflow, not a size: the sums below must not wrap
     add     r4, r0, #(HDR + 15)
     bic     r4, r4, #15                     // r4 = block size, header included
     // first fit over the free list (r5 = prev header's tag slot or the head word, r6 = header)
@@ -145,10 +147,11 @@ silica_rt_arenas:
     b.w     5f
 4:  // bump
     ldr     r6, [r8, #AR_NEXT]
-    add     r1, r6, r4
     ldr     r3, [r8, #AR_END]
-    cmp     r1, r3
+    sub     r3, r3, r6                      // what the arena has left above the bump
+    cmp     r4, r3
     bhi.w   9f
+    add     r1, r6, r4
     str     r1, [r8, #AR_NEXT]
     str     r4, [r6, #0]
 5:  MOV32   r1, HEAP_USED

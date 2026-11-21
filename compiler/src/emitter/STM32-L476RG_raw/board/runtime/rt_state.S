@@ -29,7 +29,7 @@
 // entries and doubles.
 //
 // THE COPIER walks a value through the descriptors the emitter spells (terms/term_message_copy.silica:
-// KIND 0 word, 1 region witness, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST, 8 STRING, 9 closure),
+// KIND 0 word, 1 region witness, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST, 8 STRING, 9 closure, 10 opaque: below 65536 a word, else the copy is refused),
 // given in the ROOT-WORD form `.quad 1, -1; .quad KIND, AUX` (16-byte entries, the low word read). The
 // data words are 8 bytes (lo, hi), a pointer in the low word; a value below 65536 is an atom, nil or a
 // small scalar and travels as it is. Sizes: an aggregate N * 8; a REF1 cell 8; a REFTUP cell 8 plus its
@@ -201,6 +201,11 @@ silica_rt_ccb_block:
     push    {r4-r6, lr}
     mov     r4, r0
     mov     r5, r1
+    // A node of no bytes has no free-list head and one above RT_ALLOC_MAX can never be met: neither is allocated.
+    cmp     r5, #0
+    beq.w   9f
+    cmp     r5, #RT_ALLOC_MAX
+    bhi.w   9f
     bl      silica_rt_state_chain_init
     mov     r0, r4
     mov     r1, r5
@@ -209,10 +214,11 @@ silica_rt_ccb_block:
     bne.w   7f
     ldr     r6, [r4, #ACB_SCUR]
     ldr     r0, [r6, #SCH_CUR]
-    add     r1, r0, r5
     ldr     r2, [r6, #SCH_END]
-    cmp     r1, r2
-    bhi.w   2f
+    sub     r2, r2, r0                      // what the chunk has left (the cursor never passes the end)
+    cmp     r5, r2
+    bhi.w   2f                              // bytes > end - cursor: no cursor + bytes that could wrap
+    add     r1, r0, r5
     str     r1, [r6, #SCH_CUR]
     b.w     7f
 2:  ldr     r0, [r6, #SCH_SIZE]
@@ -626,6 +632,9 @@ silica_rt_ccb_block:
 // rt_buf_bytes(r0 = buffer elements, r1 = element bytes) -> r0 = the node's bytes: the count word at
 // [buf - 8] plus count * elem rounded to 8.
     LFUNC rt_buf_bytes
+    cmp     r1, #65536                      // AUX a label (elements that can hold pointers): 8 bytes each
+    it      hs
+    movhs   r1, #8
     ldr     r2, [r0, #-8]
     mul     r2, r2, r1
     add     r2, r2, #15
@@ -666,6 +675,8 @@ silica_rt_ccb_block:
     beq.w   7f
     cmp     r1, #8
     beq.w   8f
+    cmp     r1, #10
+    beq.w   12f
     b.w     10f                             // 0 word, 1 region, 9 closure, unknown
 9:  bx      lr
     // every node kind: an old node is kept, not followed
@@ -753,7 +764,23 @@ silica_rt_ccb_block:
     mov     r1, r5
     bl      rt_buf_bytes
     bl      rt_sm_add
-    b.w     29b
+    cmp     r5, #65536                      // AUX a label: elements that can hold pointers, each by the
+    blo.w   29b                             // element entry of the one-entry descriptor `.quad 1, 8`
+    ldr     r7, [r4, #-8]                   // count
+    mov     r8, r4
+68: cmp     r7, #0
+    beq.w   29b
+    ldr     r0, [r8, #0]
+    ldr     r1, [r5, #16]
+    ldr     r2, [r5, #24]
+    bl      rt_sm_val
+    add     r8, r8, #8
+    sub     r7, r7, #1
+    b.w     68b
+    // KIND 10: a word the descriptors cannot follow, 65536 or more (it may point into the sender's
+    // frame or state): the copying actor fails as when the copy cannot be placed
+12: bl      silica_rt_region_alloc_failed
+    b.w     12b
     // LIST: the handle, then the spine chunk by chunk, each element by the element entry
 7:  mov     r0, r4
     bl      rt_is_old
@@ -863,6 +890,8 @@ silica_rt_ccb_block:
     beq.w   7f
     cmp     r2, #8
     beq.w   8f
+    cmp     r2, #10
+    beq.w   12f
     b.w     11f                             // 0 word, 1 region, 9 closure, unknown: as it is
 9:  bx      lr
     // REF1: a cell of one word
@@ -977,14 +1006,39 @@ silica_rt_ccb_block:
     bl      rt_buf_bytes
     mov     r7, r0
     bl      rt_place
+    str     r0, [sp, #0]                    // dest
     str     r1, [sp, #4]                    // final
     mov     r1, r0
     sub     r0, r4, #8                      // from the count word
     mov     r2, r7
     bl      rt_copy_bytes
-    ldr     r0, [sp, #4]
+    cmp     r5, #65536                      // AUX a label: each element through the element entry
+    blo.w   69f
+    ldr     r7, [r4, #-8]
+    str     r7, [sp, #8]                    // elements left
+    ldr     r7, [sp, #0]
+    add     r7, r7, #8                      // the destination element
+68: ldr     r0, [sp, #8]
+    cmp     r0, #0
+    beq.w   69f
+    sub     r0, r0, #1
+    str     r0, [sp, #8]
+    ldr     r0, [r4, #0]
+    ldr     r1, [r4, #4]
+    ldr     r2, [r5, #16]
+    ldr     r3, [r5, #24]
+    bl      rt_sc_val
+    str     r0, [r7, #0]
+    str     r1, [r7, #4]
+    add     r7, r7, #8
+    add     r4, r4, #8
+    b.w     68b
+69: ldr     r0, [sp, #4]
     add     r0, r0, #8                      // the elements
     b.w     29b
+    // KIND 10 (see rt_sm_val): the copying actor fails
+12: bl      silica_rt_region_alloc_failed
+    b.w     12b
     // LIST: the handle, then the spine chunk by chunk, each element by the element entry
 7:  mov     r0, r4
     bl      rt_is_old
@@ -1711,6 +1765,12 @@ silica_rt_ccb_block:
     FUNC silica_rt_state_retain_node
     ENTRY_SAVE
     mov     r6, r0
+    // n is X0 = r0:r1. A count that does not fit the low word, or above RT_ALLOC_MAX, is refused before
+    // the rounding below (size check).
+    cmp     r1, #0
+    bne.w   9f
+    cmp     r6, #RT_ALLOC_MAX
+    bhi.w   9f
     bl      silica_rt_current
     ldrb    r1, [r0, #ACB_KIND]
     cmp     r1, #KIND_ACTOR

@@ -69,6 +69,7 @@ SYNC_BUILD_EXCLUDES=(
     --exclude 'compiler/build/' --exclude '/build/' --exclude 'fixtures/build/'
     --exclude 'app_*/dangerous_exposure_source'
     --exclude '/compiler/src/silica-*'
+    --exclude 'binaries/TRIAL_BUILD_*' --exclude '/TRIAL_BUILD_*' --exclude 'compiler/build/TRIAL_BUILD_*'
 )
 
 # Built trial executables. They have no extension (the trial's name), the execute bit, and sit

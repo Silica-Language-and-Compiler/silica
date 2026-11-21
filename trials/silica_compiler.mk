@@ -1,4 +1,4 @@
-# Shared seed host for trials — always binaries/silica-compiler unless overridden
+# Shared seed host for trials — always binaries/silica-compiler (the normal compiler) unless overridden
 # on the make command line (e.g. `make SILICA_COMPILER=/path/to/other integrate`).
 # Paths are anchored to this file (trials/silica_compiler.mk).
 #
@@ -63,8 +63,16 @@ include $(_SILICA_COMPILER_MK_DIR)../project_makefiles/platform/platforms.mk
 SOUT_TARGET := $(if $(filter apple_silicon_mac,$(SILICA_HOST_EMIT_TARGET)),macos_applesilicon,$(SILICA_HOST_EMIT_TARGET))
 SOUT_EXT := .$(SOUT_TARGET).sout
 
+# The emit target is read from the compiler's file name: silica-compiler is the host, silica-compiler-<target> a cross compiler.
 _SILICA_COMPILER_NAME := $(notdir $(SILICA_COMPILER))
 SILICA_EMIT_TARGET ?= $(if $(filter silica-compiler-%,$(_SILICA_COMPILER_NAME)),$(patsubst silica-compiler-%,%,$(_SILICA_COMPILER_NAME)),$(SILICA_HOST_EMIT_TARGET))
+
+# The normal compiler, used by suites that test a normal build (e.g. error_enforcement_addition/
+# normal_build_trial_hook_rejected_trial). The unpublished normal build compiler/build/<emit target>/silica-compiler
+# is preferred when it exists; otherwise the published binaries/ compiler of the same name.
+# Override on the make command line.
+_SILICA_NORMAL_UNPUBLISHED := $(abspath $(_SILICA_COMPILER_MK_DIR)../compiler/build/$(SILICA_EMIT_TARGET)/silica-compiler)
+SILICA_NORMAL_COMPILER ?= $(if $(wildcard $(_SILICA_NORMAL_UNPUBLISHED)),$(_SILICA_NORMAL_UNPUBLISHED),$(dir $(SILICA_COMPILER))$(_SILICA_COMPILER_NAME))
 
 # 1 when the emitted code is for this host and the whole pipeline can run; 0 when the trial
 # can only be compiled here. An unknown host leaves SILICA_HOST_EMIT_TARGET empty, which is
@@ -112,7 +120,7 @@ SCOUT_FOR = $(if $(SCOUT_EXT),$(_SCOUT_PICK_SH),$(1).scout)
 # still carry their own macOS values; once those lines are deleted this include is the only source.
 -include $(_SILICA_COMPILER_MK_DIR)platform/$(SILICA_EMIT_TARGET).mk
 
-# If silica-compiler is missing, run update_silica_compiler_link.bash and re-check.
+# If the compiler is missing, say how to build it and stop (it is never relinked or published).
 #
 # RULE: the link binaries/silica-compiler is never replaced while a host run of this machine is in
 # progress (a live process holds trials/.integrate.lock.<host key>, e.g. .integrate.lock.macos_applesilicon):
@@ -139,12 +147,9 @@ define ENSURE_SILICA_COMPILER
 	fi; \
 	if [ ! -x "$(SILICA_COMPILER)" ]; then \
 		if [ -n "$$ensure_busy" ]; then ensure_note; echo "Missing $(SILICA_COMPILER) and it cannot be relinked during a host run."; exit 1; fi; \
-		echo "Missing $(SILICA_COMPILER); running update_silica_compiler_link.bash..."; \
-		"$(UPDATE_SILICA_COMPILER_LINK)" || exit 1; \
-		if [ ! -x "$(SILICA_COMPILER)" ]; then \
-			echo "Missing seed host after update: $(SILICA_COMPILER)"; \
-			exit 1; \
-		fi; \
+		echo "Missing $(SILICA_COMPILER)"; \
+		echo "build it: make -C compiler/src build SILICA_TARGET_PROMPT=0 (or bash programmer_tools/build_all_platforms.sh)"; \
+		exit 1; \
 	fi
 endef
 

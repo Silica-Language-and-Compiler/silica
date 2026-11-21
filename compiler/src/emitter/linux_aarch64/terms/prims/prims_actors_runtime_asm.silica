@@ -130,6 +130,7 @@ use ffi_fault_runtime_asm;
 use ordering_identity_runtime_asm;
 use checked_int64_runtime_asm;
 use linux_rt_shims_asm;
+use build_flavor;
 
 export emit_actor_runtime_helpers/1;
 
@@ -732,9 +733,18 @@ LBB1_wait:
 // neither LBB1_free nor the reply path would release it, so a token taken here stayed held for
 // the rest of the actor's life. Only an exit notice (+24 == 0) takes it.
 	ldr	w9, [x20, #24]
-	cbnz	w9, LBB1_process
+	cbnz	w9, LBB1_wait_trial
 	str	x19, [x8, #120]
 	b	LBB1_process
+LBB1_wait_trial:
+// An actor that has ended (#152 == 0) does not run its behaviour again: a trial-hook node left in
+// its ingress is dropped (its +8 is an inline int64, nothing else to free) and the dequeue repeats,
+// so the ingress empties and the exit path is reached.
+	ldr	w9, [x19, #152]
+	cbnz	w9, LBB1_process
+	mov	x0, x20
+	bl	free
+	b	LBB1_wait
 LBB1_try_std:
 	ldr	w9, [x19, #152]
 	cbz	w9, LBB1_exit
@@ -1909,10 +1919,8 @@ silica_rt_actor_call_registered: // @silica_rt_actor_call_registered
 	b.ge	LBB4r_not_found
 	add	x10, x9, x11, lsl #3
 	ldar	x10, [x10]
-	cmp	x10, #1
-	b.ne	LBB4r_not_found
-	add	x9, x9, x13, lsl #3
-	ldr	x0, [x9, x11, lsl #3]
+	cbz	x10, LBB4r_not_found
+	sub	x0, x10, #1
 	mov	x1, x12
 	b	silica_rt_actor_call
 LBB4r_not_found:
@@ -1947,10 +1955,8 @@ silica_rt_actor_cast_registered: // @silica_rt_actor_cast_registered
 	b.ge	LBB3r_not_found
 	add	x10, x9, x11, lsl #3
 	ldar	x10, [x10]
-	cmp	x10, #1
-	b.ne	LBB3r_not_found
-	add	x9, x9, x13, lsl #3
-	ldr	x0, [x9, x11, lsl #3]
+	cbz	x10, LBB3r_not_found
+	sub	x0, x10, #1
 	mov	x1, x12
 	b	silica_rt_actor_cast_or_raise
 LBB3r_not_found:
@@ -1977,10 +1983,8 @@ silica_rt_actor_cast_dangerous_registered: // @silica_rt_actor_cast_dangerous_re
 	b.ge	LBB3dr_not_found
 	add	x10, x9, x11, lsl #3
 	ldar	x10, [x10]
-	cmp	x10, #1
-	b.ne	LBB3dr_not_found
-	add	x9, x9, x13, lsl #3
-	ldr	x0, [x9, x11, lsl #3]
+	cbz	x10, LBB3dr_not_found
+	sub	x0, x10, #1
 	mov	x1, x12
 	b	silica_rt_actor_cast_or_raise
 LBB3dr_not_found:
@@ -2007,10 +2011,8 @@ silica_rt_actor_cast_device_registered: // @silica_rt_actor_cast_device_register
 	b.ge	LBB3dv_not_found
 	add	x10, x9, x11, lsl #3
 	ldar	x10, [x10]
-	cmp	x10, #1
-	b.ne	LBB3dv_not_found
-	add	x9, x9, x13, lsl #3
-	ldr	x0, [x9, x11, lsl #3]
+	cbz	x10, LBB3dv_not_found
+	sub	x0, x10, #1
 	mov	x1, x12
 	b	silica_rt_actor_cast_or_raise
 LBB3dv_not_found:
@@ -2664,6 +2666,10 @@ silica_rt_remove_actor_acb: // @silica_rt_remove_actor
 	bl	silica_rt_tls_current_actor_get
 	cmp	x0, x19
 	b.eq	Lremove_actor_self
+// A runtime registry never ends: naming one fails the caller with :language_error, as naming itself does.
+	mov	x0, x19
+	bl	silica_rt_is_registry_acb
+	cbnz	x0, Lremove_actor_self
 	add	x0, x19, #16
 	bl	silica_rt_lock_lock
 	str	wzr, [x19, #152]
@@ -2693,9 +2699,13 @@ silica_rt_register_actor_named:
 // X0 = reference, X1 = atom registry key -> X0 = 0 stored (or the actor already holds this name, or it
 // has ended: an ended actor is never named), 1 the name is held by a live actor or supervisor and
 // nothing was stored (§20.3.1). The slots hold identities (§15.1.4); liveness is the identity table's.
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
+// The slot word is the holder's identity + 1 (0 = free), changed only by compare-and-swap, so a
+// reader's one load never sees a half-written slot and two registrations of one name cannot both win.
+	stp	x24, x23, [sp, #-64]!
+	stp	x22, x21, [sp, #16]
+	stp	x20, x19, [sp, #32]
+	stp	x29, x30, [sp, #48]
+	add	x29, sp, #48
 	mov	x19, x0
 	mov	x20, x1
 	bl	silica_rt_ref_alive
@@ -2711,36 +2721,39 @@ silica_rt_register_actor_named:
 	ldr	x13, [x13, :lo12:silica_registry_slots]
 	cmp	x20, x13
 	b.ge	Lreg_named_taken
-	add	x10, x9, x20, lsl #3
-	ldar	x10, [x10]
-	cmp	x10, #1
-	b.ne	Lreg_named_store
-	add	x11, x9, x13, lsl #3
-	ldr	x0, [x11, x20, lsl #3]
-	cmp	x0, x19
+	add	x21, x9, x20, lsl #3
+	add	x22, x19, #1
+Lreg_named_load:
+	ldar	x23, [x21]
+	cbz	x23, Lreg_named_store
+	cmp	x23, x22
 	b.eq	Lreg_named_done
+	sub	x0, x23, #1
 	bl	silica_rt_ref_alive
 	cbnz	x0, Lreg_named_taken
 Lreg_named_store:
-	adrp	x8, silica_pid_registry_ref
-	ldr	x8, [x8, :lo12:silica_pid_registry_ref]
-	ldr	x9, [x8]
-	adrp	x13, silica_registry_slots
-	ldr	x13, [x13, :lo12:silica_registry_slots]
-	add	x11, x9, x13, lsl #3
-	str	x19, [x11, x20, lsl #3]
-	mov	x10, #1
-	add	x11, x9, x20, lsl #3
-	stlr	x10, [x11]
+	ldaxr	x10, [x21]
+	cmp	x10, x23
+	b.ne	Lreg_named_lost
+	stlxr	w11, x22, [x21]
+	cbnz	w11, Lreg_named_store
+	b	Lreg_named_done
+Lreg_named_lost:
+	clrex
+	b	Lreg_named_load
 Lreg_named_done:
 	mov	x0, #0
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldp	x29, x30, [sp, #48]
+	ldp	x20, x19, [sp, #32]
+	ldp	x22, x21, [sp, #16]
+	ldp	x24, x23, [sp], #64
 	ret
 Lreg_named_taken:
 	mov	x0, #1
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldp	x29, x30, [sp, #48]
+	ldp	x20, x19, [sp, #32]
+	ldp	x22, x21, [sp, #16]
+	ldp	x24, x23, [sp], #64
 	ret
 	.cfi_endproc
                                         // -- End function
@@ -2751,9 +2764,13 @@ silica_rt_register_dangerous_actor_named:
 // X0 = reference, X1 = atom registry key -> X0 = 0 stored (or the actor already holds this name, or it
 // has ended: an ended actor is never named), 1 the name is held by a live actor or supervisor and
 // nothing was stored (§20.3.1). The slots hold identities (§15.1.4); liveness is the identity table's.
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
+// The slot word is the holder's identity + 1 (0 = free), changed only by compare-and-swap, so a
+// reader's one load never sees a half-written slot and two registrations of one name cannot both win.
+	stp	x24, x23, [sp, #-64]!
+	stp	x22, x21, [sp, #16]
+	stp	x20, x19, [sp, #32]
+	stp	x29, x30, [sp, #48]
+	add	x29, sp, #48
 	mov	x19, x0
 	mov	x20, x1
 	bl	silica_rt_ref_alive
@@ -2769,36 +2786,39 @@ silica_rt_register_dangerous_actor_named:
 	ldr	x13, [x13, :lo12:silica_registry_slots]
 	cmp	x20, x13
 	b.ge	Lreg_danger_named_taken
-	add	x10, x9, x20, lsl #3
-	ldar	x10, [x10]
-	cmp	x10, #1
-	b.ne	Lreg_danger_named_store
-	add	x11, x9, x13, lsl #3
-	ldr	x0, [x11, x20, lsl #3]
-	cmp	x0, x19
+	add	x21, x9, x20, lsl #3
+	add	x22, x19, #1
+Lreg_danger_named_load:
+	ldar	x23, [x21]
+	cbz	x23, Lreg_danger_named_store
+	cmp	x23, x22
 	b.eq	Lreg_danger_named_done
+	sub	x0, x23, #1
 	bl	silica_rt_ref_alive
 	cbnz	x0, Lreg_danger_named_taken
 Lreg_danger_named_store:
-	adrp	x8, silica_dangerous_pid_registry_ref
-	ldr	x8, [x8, :lo12:silica_dangerous_pid_registry_ref]
-	ldr	x9, [x8]
-	adrp	x13, silica_registry_slots
-	ldr	x13, [x13, :lo12:silica_registry_slots]
-	add	x11, x9, x13, lsl #3
-	str	x19, [x11, x20, lsl #3]
-	mov	x10, #1
-	add	x11, x9, x20, lsl #3
-	stlr	x10, [x11]
+	ldaxr	x10, [x21]
+	cmp	x10, x23
+	b.ne	Lreg_danger_named_lost
+	stlxr	w11, x22, [x21]
+	cbnz	w11, Lreg_danger_named_store
+	b	Lreg_danger_named_done
+Lreg_danger_named_lost:
+	clrex
+	b	Lreg_danger_named_load
 Lreg_danger_named_done:
 	mov	x0, #0
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldp	x29, x30, [sp, #48]
+	ldp	x20, x19, [sp, #32]
+	ldp	x22, x21, [sp, #16]
+	ldp	x24, x23, [sp], #64
 	ret
 Lreg_danger_named_taken:
 	mov	x0, #1
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldp	x29, x30, [sp, #48]
+	ldp	x20, x19, [sp, #32]
+	ldp	x22, x21, [sp, #16]
+	ldp	x24, x23, [sp], #64
 	ret
 	.cfi_endproc
                                         // -- End function
@@ -2809,9 +2829,13 @@ silica_rt_register_device_actor_named:
 // X0 = reference, X1 = atom registry key -> X0 = 0 stored (or the actor already holds this name, or it
 // has ended: an ended actor is never named), 1 the name is held by a live actor or supervisor and
 // nothing was stored (§20.3.1). The slots hold identities (§15.1.4); liveness is the identity table's.
-	stp	x20, x19, [sp, #-32]!
-	stp	x29, x30, [sp, #16]
-	add	x29, sp, #16
+// The slot word is the holder's identity + 1 (0 = free), changed only by compare-and-swap, so a
+// reader's one load never sees a half-written slot and two registrations of one name cannot both win.
+	stp	x24, x23, [sp, #-64]!
+	stp	x22, x21, [sp, #16]
+	stp	x20, x19, [sp, #32]
+	stp	x29, x30, [sp, #48]
+	add	x29, sp, #48
 	mov	x19, x0
 	mov	x20, x1
 	bl	silica_rt_ref_alive
@@ -2827,36 +2851,39 @@ silica_rt_register_device_actor_named:
 	ldr	x13, [x13, :lo12:silica_registry_slots]
 	cmp	x20, x13
 	b.ge	Lreg_device_named_taken
-	add	x10, x9, x20, lsl #3
-	ldar	x10, [x10]
-	cmp	x10, #1
-	b.ne	Lreg_device_named_store
-	add	x11, x9, x13, lsl #3
-	ldr	x0, [x11, x20, lsl #3]
-	cmp	x0, x19
+	add	x21, x9, x20, lsl #3
+	add	x22, x19, #1
+Lreg_device_named_load:
+	ldar	x23, [x21]
+	cbz	x23, Lreg_device_named_store
+	cmp	x23, x22
 	b.eq	Lreg_device_named_done
+	sub	x0, x23, #1
 	bl	silica_rt_ref_alive
 	cbnz	x0, Lreg_device_named_taken
 Lreg_device_named_store:
-	adrp	x8, silica_device_pid_registry_ref
-	ldr	x8, [x8, :lo12:silica_device_pid_registry_ref]
-	ldr	x9, [x8]
-	adrp	x13, silica_registry_slots
-	ldr	x13, [x13, :lo12:silica_registry_slots]
-	add	x11, x9, x13, lsl #3
-	str	x19, [x11, x20, lsl #3]
-	mov	x10, #1
-	add	x11, x9, x20, lsl #3
-	stlr	x10, [x11]
+	ldaxr	x10, [x21]
+	cmp	x10, x23
+	b.ne	Lreg_device_named_lost
+	stlxr	w11, x22, [x21]
+	cbnz	w11, Lreg_device_named_store
+	b	Lreg_device_named_done
+Lreg_device_named_lost:
+	clrex
+	b	Lreg_device_named_load
 Lreg_device_named_done:
 	mov	x0, #0
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldp	x29, x30, [sp, #48]
+	ldp	x20, x19, [sp, #32]
+	ldp	x22, x21, [sp, #16]
+	ldp	x24, x23, [sp], #64
 	ret
 Lreg_device_named_taken:
 	mov	x0, #1
-	ldp	x29, x30, [sp, #16]
-	ldp	x20, x19, [sp], #32
+	ldp	x29, x30, [sp, #48]
+	ldp	x20, x19, [sp, #32]
+	ldp	x22, x21, [sp, #16]
+	ldp	x24, x23, [sp], #64
 	ret
 	.cfi_endproc
                                         // -- End function
@@ -2908,10 +2935,8 @@ silica_rt_actor_kill_abnormal_named:
 	cbz	x9, Lkabn_none
 	add	x10, x9, x11, lsl #3
 	ldar	x10, [x10]
-	cmp	x10, #1
-	b.ne	Lkabn_none
-	add	x9, x9, x13, lsl #3
-	ldr	x0, [x9, x11, lsl #3]
+	cbz	x10, Lkabn_none
+	sub	x0, x10, #1
 	b	silica_rt_actor_kill_abnormal
 Lkabn_none:
 	mov	x0, #0
@@ -2946,6 +2971,10 @@ silica_rt_actor_kill_abnormal:
 	mov	x22, x0
 	cmp	x22, x19
 	b.eq	Lkab_self
+// A runtime registry never ends: naming one fails the caller with :language_error, as naming itself does.
+	mov	x0, x19
+	bl	silica_rt_is_registry_acb
+	cbnz	x0, Lkab_self
 	ldr	x20, [x19, #208]
 	ldr	x21, [x19, #192]
 	mov	x23, xzr
@@ -4063,7 +4092,12 @@ Lmig_not_found:
 "
 }
 
+// actor_rt_asm_chunk_13 = actor_rt_asm_chunk_13_a, the trial-only ingress hook (empty in a normal build), actor_rt_asm_chunk_13_b.
 fn actor_rt_asm_chunk_13() -> string {
+    concat(concat(actor_rt_asm_chunk_13_a(), actor_rt_asm_trial_ingress_hook()), actor_rt_asm_chunk_13_b())
+}
+
+fn actor_rt_asm_chunk_13_a() -> string {
     "	.text
 // get_actor_memory_usage lives in prims_actors_stack_asm.silica (four-field record).
 // The implicit heap (silica_rt_region_alloc, silica_rt_region_alloc_in, silica_rt_actor_init_region,
@@ -4124,7 +4158,14 @@ LBBrw_oom:
 	ldp	x20, x19, [sp], #32
 	ret
                                         // -- End function
-	.globl	silica_rt_actor_supervision_ingress_enqueue // Phase B — synthetic exit / trial hook; bounded queue
+"
+}
+
+// The trial-only supervision_ingress_enqueue entry point, split out of actor_rt_asm_chunk_13 at its function
+// boundaries: a trial build (build_flavor@trial_hooks_enabled()) emits it, a normal build's runtime does
+// not contain it. Its local labels (Lsie_*) and its ACB body are used by nothing else.
+fn actor_rt_asm_trial_ingress_hook_text() -> string {
+    "	.globl	silica_rt_actor_supervision_ingress_enqueue // Phase B — synthetic exit / trial hook; bounded queue
 	.p2align	2
 silica_rt_actor_supervision_ingress_enqueue:
 // X0 = reference: resolved and held for the body below (silica_rt_ref_call).
@@ -4155,7 +4196,7 @@ silica_rt_actor_supervision_ingress_enqueue_acb:
 	bl	silica_rt_sb_require
 	ldr	w9, [x0, #16]
 	cmp	w9, #1024
-	b.hs	Lsie_abort
+	b.hs	Lsie_full
 	mov	w0, #1
 	mov	w1, #152
 	bl	calloc
@@ -4190,11 +4231,37 @@ Lsie_fail_nolock:
 	ldp	x20, x19, [sp, #16]
 	ldp	x22, x21, [sp], #48
 	ret
+// A full ingress ends its owner as silica_rt_sup_enqueue_exit does (Lsee_full): (:explicit,
+// :ingress_full) when it has a supervisor, the whole program (status 71) when it has none. The
+// message is not queued.
+Lsie_full:
+	ldr	x9, [x19, #192]
+	cbz	x9, Lsie_abort
+	add	x0, x19, #16
+	bl	silica_rt_lock_unlock
+	mov	x0, x19
+	mov	x1, #4
+	adrp	x8, silica_rt_ingress_full_atom
+	add	x8, x8, :lo12:silica_rt_ingress_full_atom
+	ldr	x2, [x8]
+	bl	silica_rt_actor_stop
+	b	Lsie_fail_nolock
 Lsie_abort:
 	bl	silica_rt_abort_ingress_full
 	.cfi_endproc
                                         // -- End function
-	.globl	silica_rt_sb_require
+"
+}
+
+fn actor_rt_asm_trial_ingress_hook() -> string {
+    case build_flavor@trial_hooks_enabled() of {
+        true -> actor_rt_asm_trial_ingress_hook_text();
+        false -> ""
+    }
+}
+
+fn actor_rt_asm_chunk_13_b() -> string {
+    "	.globl	silica_rt_sb_require
 	.p2align	2
 silica_rt_sb_require:
 // X0 = ACB -> X0 = its supervision block (SB, 144 B: #0/#8 ingress front/rear, #16 depth u32,
@@ -4294,20 +4361,29 @@ silica_rt_actor_add_child:
 	mov	x0, x19
 	mov	x1, x20
 	bl	silica_rt_actor_add_child_acb
+	mov	x21, x0
 	mov	x0, x19
 	bl	silica_rt_acb_release
 	mov	x0, x20
 	bl	silica_rt_acb_release
-	mov	x0, #0
+	mov	x0, x21
 	ldr	x21, [sp, #32]
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #48
+	cbnz	x0, Ladd_child_refused_fail
 	ret
+Ladd_child_refused_fail:
+	b	silica_rt_language_error_current
 	.p2align	2
 silica_rt_actor_add_child_acb:
 	.cfi_startproc
-// X0=parent supervisor actor_ref, X1=child actor_ref -> X0=atom :ok.
-// Records the explicit parent/child relationship used by supervisor ingress teardown.
+// X0 = parent ACB, X1 = child ACB (both held by the caller, either 0 when its actor has ended) ->
+// X0 = 0 done (or nothing to do: an ended actor), 1 refused (the caller then fails with
+// :language_error). Records the explicit parent/child relationship used by supervisor ingress teardown.
+// Who may ask: the parent itself, or main. What may be added: an actor with no supervisor yet (or
+// this parent already), never the parent itself and never a runtime registry. A supervised child is
+// never moved to another parent: its supervisor's row would keep naming it and its exit would go
+// elsewhere.
 	cbz	x0, Ladd_child_done
 	cbz	x1, Ladd_child_done
 	stp	x20, x19, [sp, #-32]!
@@ -4315,18 +4391,38 @@ silica_rt_actor_add_child_acb:
 	add	x29, sp, #16
 	mov	x19, x0
 	mov	x20, x1
+	cmp	x19, x20
+	b.eq	Ladd_child_refused
+	mov	x0, x20
+	bl	silica_rt_is_registry_acb
+	cbnz	x0, Ladd_child_refused
+	bl	silica_rt_tls_current_actor_get
+	cbz	x0, Ladd_child_asker_ok
+	cmp	x0, x19
+	b.ne	Ladd_child_refused
+Ladd_child_asker_ok:
 	ldr	x9, [x20, #192]
 	cmp	x9, x19
 	b.eq	Ladd_child_held
+	cbnz	x9, Ladd_child_refused
 // The child holds its supervisor until its exit path is done with it (silica_rt_actor_final_release).
+// The supervisor word is set only while it is still 0.
 	mov	x0, x19
 	bl	silica_rt_acb_hold
 	add	x9, x20, #192
-Ladd_child_swap:
-	ldaxr	x0, [x9]
+Ladd_child_cas:
+	ldaxr	x10, [x9]
+	cbnz	x10, Ladd_child_lost
 	stlxr	w11, x19, [x9]
-	cbnz	w11, Ladd_child_swap
+	cbnz	w11, Ladd_child_cas
+	b	Ladd_child_held
+Ladd_child_lost:
+	clrex
+	mov	x0, x19
 	bl	silica_rt_acb_release
+	ldr	x9, [x20, #192]
+	cmp	x9, x19
+	b.ne	Ladd_child_refused
 Ladd_child_held:
 	add	x0, x19, #16
 	bl	silica_rt_lock_lock
@@ -4336,6 +4432,11 @@ Ladd_child_held:
 	ldp	x20, x19, [sp], #32
 Ladd_child_done:
 	mov	x0, #0
+	ret
+Ladd_child_refused:
+	ldp	x29, x30, [sp, #16]
+	ldp	x20, x19, [sp], #32
+	mov	x0, #1
 	ret
 	.cfi_endproc
                                         // -- End function
@@ -4382,6 +4483,8 @@ fn actor_rt_asm_phase_c_chunk(table: { is_empty: boolean, index_map: { root: ref
     explicit_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":explicit"));
     unknown_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":unknown"));
     foreign_fault_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":foreign_fault"));
+    // (:explicit, :ingress_full): the reason a supervisor ends with when its ingress is full (Lsee_full).
+    ingress_full_idx: string <- atom_table@int64_to_decimal_string(atom_table@lexeme_to_index_first_added_order(table, ":ingress_full"));
     p0: string <- concat("	.text
 	.globl	silica_rt_actor_deliver_exit // Phase C — §15.4.10 unified delivery
 	.p2align	2
@@ -4483,7 +4586,7 @@ silica_rt_sup_enqueue_exit:
 	bl	silica_rt_sb_require
 	ldr	w9, [x0, #16]
 	cmp	w9, #1024
-	b.hs	Lsee_abort
+	b.hs	Lsee_full
 	mov	w0, #1
 	mov	w1, #152
 	bl	calloc
@@ -4515,6 +4618,27 @@ Lsee_ret:
 	ldp	x20, x19, [sp, #16]
 	ldp	x22, x21, [sp], #48
 	ret
+// The ingress holds its limit of notices. A supervisor with a supervisor of its own ends with
+// (:explicit, :ingress_full) through the ordinary stop (silica_rt_actor_stop): its exit path shuts
+// its children down, frees the notices still queued with its block (silica_rt_sb_unref) and
+// delivers its exit to its own supervisor, which decides. Its alive flag is now 0, so this notice
+// and every later one are dropped as for an ended supervisor (Lsee_dead). A root supervisor (no
+// supervisor of its own) takes the whole program down (Lsee_abort, status 71).
+Lsee_full:
+	ldr	x9, [x20, #192]
+	cbz	x9, Lsee_abort
+	add	x0, x20, #16
+	bl	silica_rt_lock_unlock
+	mov	x0, x20
+	mov	x1, #4
+	adrp	x8, silica_rt_ingress_full_atom
+	add	x8, x8, :lo12:silica_rt_ingress_full_atom
+	ldr	x2, [x8]
+	bl	silica_rt_actor_stop
+	mov	x0, x21
+	bl	silica_rt_exit_payload_free
+	mov	x0, #1
+	b	Lsee_ret
 Lsee_abort:
 	bl	silica_rt_abort_exit_queue_full
 	.globl	silica_rt_actor_supervision_wait_and_drain_one // Phase C trial accessor — behavior-only
@@ -4679,10 +4803,17 @@ silica_rt_actor_failure_release: // X0=payload ptr; frees payload; returns X0=at
 Lfrr_zero:
 	mov	x0, #");
     p12: string <- concat(p11, ok_idx);
-    concat(p12, "
+    p13: string <- concat(p12, "
 	ret
 	.cfi_endproc
                                         // -- End function
+	.data
+	.p2align	3
+	.globl	silica_rt_ingress_full_atom
+silica_rt_ingress_full_atom:
+	.quad	");
+    concat(concat(p13, ingress_full_idx), "
+	.text
 
 ")
 }
@@ -5504,10 +5635,12 @@ silica_rt_sup_op_child:
 Lsoc_own:
 	ret
 // PID registry primitive actor (spec §20.3.1).
-// State layout: one calloc block of silica_registry_slots * 16 B: occ[slots] (int64, 1 = held) at +0,
-// actor_ref words[slots] at +slots*8. The same block is read directly by the keyed forms and by
-// silica_rt_register_actor_named (the store writes the ref before the occ word; a removal clears
-// the occ word first).
+// State layout: one calloc block of silica_registry_slots * 16 B; the first slots words are the
+// slots: the holder's identity + 1, 0 when the name is free (an identity can be 0, so 0 is never a
+// held slot); the second half is unused. Every write is a compare-and-swap on that one word
+// (silica_rt_register_*_named, :insert, :delete, silica_rt_registry_table_forget) and every read
+// is one acquire load, so no reader sees a slot half written. The same block is read directly by
+// the keyed forms.
 // Message record layout follows record emission: shape word@0, op@8, name@16, pid@24.
 // Behavior return layout follows actor runtime convention: tag@0, reply@8, next_state@16.
 // :insert replies :ok (stored, or the actor already holds this very name), :name_taken (a live actor
@@ -5563,19 +5696,17 @@ L_pidreg_insert:
 	cmp	x22, x13
 	b.ge	L_pidreg_name_taken
 // The pid is an identity (§15.1.4): liveness is the identity table's, and so is the holder's.
+// X21 (the op, no longer needed) keeps the slot word the store is conditional on.
 	mov	x0, x23
 	bl	silica_rt_ref_alive
 	mov	x9, x0
 	ldr	x0, [x24, #8]
-	adrp	x13, silica_registry_slots
-	ldr	x13, [x13, :lo12:silica_registry_slots]
 	cbz	x9, L_pidreg_actor_not_found
+L_pidreg_insert_load:
 	add	x8, x20, x22, lsl #3
-	ldar	x8, [x8]
-	cmp	x8, #1
-	b.ne	L_pidreg_insert_free
-	add	x9, x20, x13, lsl #3
-	ldr	x9, [x9, x22, lsl #3]
+	ldar	x21, [x8]
+	cbz	x21, L_pidreg_insert_free
+	sub	x9, x21, #1
 	cmp	x9, x23
 	b.eq	L_pidreg_insert_ok
 	mov	x0, x9
@@ -5588,13 +5719,18 @@ L_pidreg_insert_free:
 	mov	x1, x23
 	bl	silica_rt_registry_table_holds
 	cbnz	x0, L_pidreg_already_registered
-	adrp	x13, silica_registry_slots
-	ldr	x13, [x13, :lo12:silica_registry_slots]
-	add	x9, x20, x13, lsl #3
-	str	x23, [x9, x22, lsl #3]
-	mov	x8, #1
-	add	x9, x20, x22, lsl #3
-	stlr	x8, [x9]
+	add	x8, x20, x22, lsl #3
+	add	x10, x23, #1
+L_pidreg_insert_cas:
+	ldaxr	x9, [x8]
+	cmp	x9, x21
+	b.ne	L_pidreg_insert_lost
+	stlxr	w11, x10, [x8]
+	cbnz	w11, L_pidreg_insert_cas
+	b	L_pidreg_insert_ok
+L_pidreg_insert_lost:
+	clrex
+	b	L_pidreg_insert_load
 L_pidreg_insert_ok:
 	ldr	x0, [x24, #8]
 	mov	x8, #");
@@ -5631,15 +5767,13 @@ L_pidreg_lookup:
 	cmp	x22, x13
 	b.ge	L_pidreg_not_found
 	add	x8, x20, x22, lsl #3
-	ldar	x8, [x8]
-	cmp	x8, #1
-	b.ne	L_pidreg_not_found
+	ldar	x10, [x8]
+	cbz	x10, L_pidreg_not_found
+	sub	x10, x10, #1
 	mov	x8, #");
     p11: string <- concat(p10g, found_idx);
     p12: string <- concat(p11, "
 	str	x8, [x0]
-	add	x9, x20, x13, lsl #3
-	ldr	x10, [x9, x22, lsl #3]
 	str	x10, [x0, #8]
 	b	L_pidreg_done
 L_pidreg_not_found:
@@ -5650,16 +5784,54 @@ L_pidreg_not_found:
 	str	xzr, [x0, #8]
 	b	L_pidreg_done
 L_pidreg_delete:
+// A name is removed by its holder, by main, or once its holder has ended; any other asker is answered
+// :name_taken and the slot is kept. The asker is the caller of the call being served (wrapper +56; 0 is
+// main); a cast carries no asker, so it removes only an ended holder's name.
 	cmp	x22, #0
 	b.lt	L_pidreg_delete_ok
 	cmp	x22, x13
 	b.ge	L_pidreg_delete_ok
-	str	xzr, [x20, x22, lsl #3]
-	add	x9, x20, x13, lsl #3
-	str	xzr, [x9, x22, lsl #3]
-L_pidreg_delete_ok:
+L_pidreg_delete_load:
+	add	x8, x20, x22, lsl #3
+	ldar	x21, [x8]
+	cbz	x21, L_pidreg_delete_ok
+	bl	silica_rt_tls_current_actor_get
+	ldr	x9, [x0, #240]
+	cbz	x9, L_pidreg_delete_holder
+	ldr	x9, [x9, #56]
+	cbz	x9, L_pidreg_delete_clear
+	ldr	x9, [x9, #408]
+	sub	x10, x21, #1
+	cmp	x9, x10
+	b.eq	L_pidreg_delete_clear
+L_pidreg_delete_holder:
+	sub	x0, x21, #1
+	bl	silica_rt_ref_alive
+	cbnz	x0, L_pidreg_delete_refused
+L_pidreg_delete_clear:
+	add	x8, x20, x22, lsl #3
+L_pidreg_delete_cas:
+	ldaxr	x9, [x8]
+	cmp	x9, x21
+	b.ne	L_pidreg_delete_lost
+	stlxr	w11, xzr, [x8]
+	cbnz	w11, L_pidreg_delete_cas
+	b	L_pidreg_delete_ok
+L_pidreg_delete_lost:
+	clrex
+	b	L_pidreg_delete_load
+L_pidreg_delete_refused:
+	ldr	x0, [x24, #8]
 	mov	x8, #");
-    p15: string <- concat(p14, ok_idx);
+    p14b: string <- concat(p14, name_taken_idx);
+    p14c: string <- concat(p14b, "
+	str	x8, [x0]
+	str	x23, [x0, #8]
+	b	L_pidreg_done
+L_pidreg_delete_ok:
+	ldr	x0, [x24, #8]
+	mov	x8, #");
+    p15: string <- concat(p14c, ok_idx);
     concat(p15, "
 	str	x8, [x0]
 	str	x23, [x0, #8]
@@ -5678,19 +5850,15 @@ L_pidreg_ret_null:
 silica_rt_registry_table_holds:
 	adrp	x9, silica_registry_slots
 	ldr	x9, [x9, :lo12:silica_registry_slots]
-	add	x10, x0, x9, lsl #3
+	add	x10, x1, #1
 	mov	x11, #0
 Lrth_loop:
 	cmp	x11, x9
 	b.ge	Lrth_no
 	add	x12, x0, x11, lsl #3
 	ldar	x12, [x12]
-	cmp	x12, #1
-	b.ne	Lrth_next
-	ldr	x12, [x10, x11, lsl #3]
-	cmp	x12, x1
+	cmp	x12, x10
 	b.eq	Lrth_yes
-Lrth_next:
 	add	x11, x11, #1
 	b	Lrth_loop
 Lrth_yes:
@@ -5700,26 +5868,28 @@ Lrth_no:
 	mov	x0, #0
 	ret
 // silica_rt_registry_table_forget(X0 = registry state block, X1 = actor_ref): clears every slot the
-// actor holds in that table, occ word first so a reader never sees a held slot with a stale ref.
+// actor holds in that table. Each clear is a compare-and-swap from this actor's word to 0, so a slot
+// another actor has taken meanwhile is left alone.
 	.globl	silica_rt_registry_table_forget
 	.p2align	2
 silica_rt_registry_table_forget:
 	adrp	x9, silica_registry_slots
 	ldr	x9, [x9, :lo12:silica_registry_slots]
-	add	x10, x0, x9, lsl #3
+	add	x10, x1, #1
 	mov	x11, #0
 Lrtf_loop:
 	cmp	x11, x9
 	b.ge	Lrtf_done
 	add	x12, x0, x11, lsl #3
-	ldar	x12, [x12]
-	cmp	x12, #1
-	b.ne	Lrtf_next
-	ldr	x12, [x10, x11, lsl #3]
-	cmp	x12, x1
-	b.ne	Lrtf_next
-	str	xzr, [x0, x11, lsl #3]
-	str	xzr, [x10, x11, lsl #3]
+Lrtf_try:
+	ldaxr	x13, [x12]
+	cmp	x13, x10
+	b.ne	Lrtf_skip
+	stlxr	w14, xzr, [x12]
+	cbnz	w14, Lrtf_try
+	b	Lrtf_next
+Lrtf_skip:
+	clrex
 Lrtf_next:
 	add	x11, x11, #1
 	b	Lrtf_loop
@@ -5735,7 +5905,9 @@ silica_rt_registry_forget_actor:
 	stp	x29, x30, [sp, #-32]!
 	stp	x19, x20, [sp, #16]
 	mov	x29, sp
-	ldr	x19, [x0, #408]
+	mov	x19, x0
+	bl	silica_rt_sup_token_drop
+	ldr	x19, [x19, #408]
 	adrp	x8, silica_pid_registry_ref
 	ldr	x8, [x8, :lo12:silica_pid_registry_ref]
 	cbz	x8, Lrfa_dangerous
@@ -5779,10 +5951,8 @@ silica_rt_registry_held_in:
 	b.ge	Lrhi_no
 	add	x11, x9, x1, lsl #3
 	ldar	x11, [x11]
-	cmp	x11, #1
-	b.ne	Lrhi_no
-	add	x12, x9, x10, lsl #3
-	ldr	x0, [x12, x1, lsl #3]
+	cbz	x11, Lrhi_no
+	sub	x0, x11, #1
 	b	silica_rt_ref_alive
 Lrhi_no:
 	mov	x0, #0
@@ -5909,8 +6079,9 @@ silica_rt_pid_registry_init_spawn:
 	bl	silica_rt_actor_spawn
 	adrp	x9, silica_rt_spawn_rec_override
 	str	xzr, [x9, :lo12:silica_rt_spawn_rec_override]
-// The registries never end, so their ACBs are kept (not held) for the runtime's own use.
-	bl	silica_rt_ref_peek
+// The registries never end (remove_actor and kill_abnormal refuse them, silica_rt_is_registry_acb),
+// and the runtime keeps a hold on each for good, so their ACBs are never freed.
+	bl	silica_rt_ref_hold
 	ldp	x19, x20, [sp], #16
 	ldp	x29, x30, [sp], #16
 	ret
@@ -5955,8 +6126,9 @@ silica_rt_dangerous_pid_registry_init_spawn:
 	bl	silica_rt_actor_spawn
 	adrp	x9, silica_rt_spawn_rec_override
 	str	xzr, [x9, :lo12:silica_rt_spawn_rec_override]
-// The registries never end, so their ACBs are kept (not held) for the runtime's own use.
-	bl	silica_rt_ref_peek
+// The registries never end (remove_actor and kill_abnormal refuse them, silica_rt_is_registry_acb),
+// and the runtime keeps a hold on each for good, so their ACBs are never freed.
+	bl	silica_rt_ref_hold
 	ldp	x19, x20, [sp], #16
 	ldp	x29, x30, [sp], #16
 	ret
@@ -6000,8 +6172,9 @@ silica_rt_device_pid_registry_init_spawn:
 	bl	silica_rt_actor_spawn
 	adrp	x9, silica_rt_spawn_rec_override
 	str	xzr, [x9, :lo12:silica_rt_spawn_rec_override]
-// The registries never end, so their ACBs are kept (not held) for the runtime's own use.
-	bl	silica_rt_ref_peek
+// The registries never end (remove_actor and kill_abnormal refuse them, silica_rt_is_registry_acb),
+// and the runtime keeps a hold on each for good, so their ACBs are never freed.
+	bl	silica_rt_ref_hold
 	ldp	x19, x20, [sp], #16
 	ldp	x29, x30, [sp], #16
 	ret
@@ -6719,6 +6892,30 @@ Lacbh_add:
 	cbnz	w11, Lacbh_add
 Lacbh_ret:
 	ret
+// silica_rt_is_registry_acb(X0 = ACB) -> X0 = 1 when it is one of the three runtime registries'
+// control blocks (they never end: remove_actor and kill_abnormal refuse them), else 0. Leaf, x9-x10.
+	.globl	silica_rt_is_registry_acb
+	.p2align	2
+silica_rt_is_registry_acb:
+	cbz	x0, Lira_no
+	adrp	x9, silica_pid_registry_ref
+	ldr	x9, [x9, :lo12:silica_pid_registry_ref]
+	cmp	x9, x0
+	b.eq	Lira_yes
+	adrp	x9, silica_dangerous_pid_registry_ref
+	ldr	x9, [x9, :lo12:silica_dangerous_pid_registry_ref]
+	cmp	x9, x0
+	b.eq	Lira_yes
+	adrp	x9, silica_device_pid_registry_ref
+	ldr	x9, [x9, :lo12:silica_device_pid_registry_ref]
+	cmp	x9, x0
+	b.eq	Lira_yes
+Lira_no:
+	mov	x0, #0
+	ret
+Lira_yes:
+	mov	x0, #1
+	ret
 	.globl	silica_rt_acb_release
 	.p2align	2
 silica_rt_acb_release:
@@ -7307,13 +7504,33 @@ silica_rt_sup_ref_call:
 	cbz	x19, Lsrc_not_found
 	ldr	w9, [x19, #152]
 	cbz	w9, Lsrc_dead
+// The supervision block, and with it every row the body walks or writes, is held (#112) for the
+// body: taken under the supervisor's lock, where silica_rt_child_table_free clears #216, so a
+// supervisor that ends meanwhile frees its rows only when the body is done (X20 = the block or 0).
+	add	x0, x19, #16
+	bl	silica_rt_lock_lock
+	ldr	x20, [x19, #216]
+	cbz	x20, Lsrc_sb_held
+	add	x9, x20, #112
+Lsrc_sb_ref:
+	ldaxr	x10, [x9]
+	add	x10, x10, #1
+	stlxr	w11, x10, [x9]
+	cbnz	w11, Lsrc_sb_ref
+Lsrc_sb_held:
+	add	x0, x19, #16
+	bl	silica_rt_lock_unlock
+// The body takes X0 = the held supervisor ACB (the unlock above clobbered X0).
+	mov	x0, x19
 	ldp	x1, x2, [sp, #32]
 	ldp	x3, x9, [sp, #48]
 	blr	x9
-	mov	x20, x0
+	str	x0, [x29, #32]
+	mov	x0, x20
+	bl	silica_rt_sb_unref
 	mov	x0, x19
 	bl	silica_rt_acb_release
-	mov	x0, x20
+	ldr	x0, [x29, #32]
 // Chunk 15 stage 4e (design §9.1): a body that built its answer in its own frame (which_children,
 // get_child_info) returns with SP lowered onto it; the lowered SP is passed on to the emitted call site,
 // which adopts it (prims_actors@runtime_call_asm). A body that kept SP gets this frame popped as before.

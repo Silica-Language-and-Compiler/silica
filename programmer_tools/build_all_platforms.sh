@@ -39,6 +39,8 @@
 # Per machine the work is: build, gen1, gen2, fixed-point check, publish (skip the last four with
 # --no-fixpoint). One compiler build at a time per machine; the heaviest unit needs 6-8 GB.
 #
+# Raw targets build with at most 5 jobs.
+#
 # Which platforms are built, and where:
 #   .silica_build_hosts in the repository root remembers the platforms and their machines. It is
 #   written the first time you are asked, and used silently after that. It is gitignored and must

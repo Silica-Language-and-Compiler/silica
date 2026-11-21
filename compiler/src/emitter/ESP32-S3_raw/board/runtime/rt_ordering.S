@@ -40,6 +40,8 @@
     .balign 8
 silica_rt_ordering_env_next:
     .space  8
+silica_rt_ordering_env_lock:      // a leaf lock around the 64-bit read-increment (both cores call
+    .space  4                     // this): held for a few instructions, nothing else taken under it
 
     .section .text.silica_rt_ordering, "ax"
     .literal_position
@@ -49,6 +51,12 @@ silica_rt_ordering_env_next:
     .type   silica_rt_ordering_env_fresh, @function
 silica_rt_ordering_env_fresh:
     entry   a1, 32
+    movi    a11, silica_rt_ordering_env_lock
+2:  movi    a9, 0
+    wsr     a9, scompare1
+    movi    a9, 1
+    s32c1i  a9, a11, 0
+    bnez    a9, 2b
     movi    a8, silica_rt_ordering_env_next
     l32i    a2, a8, 0
     l32i    a3, a8, 4
@@ -58,6 +66,10 @@ silica_rt_ordering_env_fresh:
     saltu   a10, a9, a2           // carry
     add     a10, a3, a10
     s32i    a10, a8, 4
+    memw
+    movi    a9, 0
+    s32i    a9, a11, 0
+    memw
     or      a9, a2, a3
     bnez    a9, 1f
     movi    a2, 1                 // never 0

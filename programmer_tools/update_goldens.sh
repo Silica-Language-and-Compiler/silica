@@ -60,7 +60,9 @@
 #     a file is reported loudly and skipped, never copied.
 #
 # WHERE THE .sams COME FROM
-#   This script never compiles and never builds a compiler. "Current .sams" means the files the
+#   This script never compiles and never builds a compiler (the trials are compiled by the
+#   normal compilers, binaries/silica-compiler[-<target>], so the .sams it reads come from them).
+#   "Current .sams" means the files the
 #   last trial run left in the tree:
 #     native platform   trials/<suite>/**/<stem>.sams  (a suite's `integrate` cleans first and
 #                       leaves its .sams behind; a tree-wide `make clean` removes them)

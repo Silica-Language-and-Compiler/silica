@@ -32,7 +32,7 @@ When in doubt: if the file is under `compiler/src` and is compiler, emitter or r
 - If Fable tokens run out, switch the compiler work to Opus (Lee 2026-10-24) and tell Lee. The Opus agent resumes from the Fable agent's notes file, with the same rules (it does not build either).
 - Only one agent may be building or compiling at a time on a machine; no agent spawns parallel building subagents. The build-slot lock is not a substitute for this. Trial runs of different targets may run at the same time (each has its own lock, work directory and port); a target runs once at a time.
 - Builds: never publish (`INSTALL_SELFHOST=0`) unless Lee has asked for a publish step; no fixed point unless Lee asks for one; never `make clean` a shared build directory; take the build-slot lock (`mkdir` of the session scratchpad's `build_slot/lock`) for heavy builds and remove it afterwards.
-- Point `SILICA_COMPILER` at a file named exactly `silica-compiler`; the trial harness reads the target from the name.
+- Trials use `TRIAL_BUILD_silica-compiler` (made by `make build TRIAL_BUILD=1`; the harness derives the emit target after stripping the `TRIAL_BUILD_` prefix from the name). The hook trials need a trial build; rejection trials use the normal compiler (`SILICA_NORMAL_COMPILER`).
 - `make integrate` is the gate; a bare `make` only compiles.
 - Goldens: a `.ascomp` may be refreshed only when that trial's `.sout` matches its `.scout`; a `.scout` changes only with Lee's approval; error goldens are re-derived from real output with the same error code and construct.
 - No workarounds for compiler defects: fix them, with a trial.

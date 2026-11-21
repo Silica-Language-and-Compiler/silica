@@ -1082,6 +1082,7 @@ Lstm_root_entry:
 	mov	rax, QWORD PTR [rbp - 64]
 	mov	rsi, QWORD PTR [rax + 16]
 	mov	rdx, QWORD PTR [rax + 24]
+	mov	QWORD PTR [rbp - 64], 0
 	mov	rdi, QWORD PTR [rbp - 56]
 	call	Lstm_word
 	mov	rdi, QWORD PTR [rbp - 80]
@@ -1092,7 +1093,9 @@ Lstm_root_entry:
 	mov	rsp, rbp
 	pop	rbp
 	mov	rdi, rax
-	jmp	Lstm_root_done
+	cmp	QWORD PTR [rbp - 64], 0
+	je	Lstm_root_done
+	jmp	Lstm_root_notable
 Lstm_root_notable:
 	mov	QWORD PTR [rbp - 104], -1
 Lstm_root_done:
@@ -1140,7 +1143,17 @@ Lstm_word:
 	je	Lstm_list
 	cmp	rsi, 8
 	je	Lstm_str
+	cmp	rsi, 10
+	je	Lstm_opaque
 	jmp	Lstm_ref
+Lstm_opaque:
+# KIND 10: a word the descriptors cannot follow. Below 65536 (an atom, a small scalar) it is counted as a
+# word; any other value marks the measure refused (X20 = 1, cleared at the root): the measure answers -1,
+# which every caller already turns into a contained failure of the copying actor.
+	cmp	rdi, 65536
+	jb	Lstm_w_ret
+	mov	QWORD PTR [rbp - 64], 1
+	ret
 Lstm_w_agg:
 	mov	rsi, rdx
 	jmp	Lstm_agg
@@ -1284,6 +1297,8 @@ fn state_asm_measure_ref() -> string {
 	je	Lstm_ref1
 	cmp	QWORD PTR [rbp - 120], 3
 	je	Lstm_refrec
+	cmp	QWORD PTR [rbp - 128], 65536
+	jae	Lstm_refbuf
 	mov	rax, QWORD PTR [rbp - 112]
 	mov	r10, QWORD PTR [rax - 8]
 	mov	rax, r10
@@ -1298,6 +1313,31 @@ fn state_asm_measure_ref() -> string {
 	lea	rax, [rax + r10]
 	mov	QWORD PTR [rbp - 104], rax
 	jmp	Lstm_ref_done
+Lstm_refbuf:
+# A buffer whose elements can hold pointers (AUX = the one-entry descriptor `.quad 1, 8` of an element):
+# the count word and 8 bytes an element, then every element through Lstm_word. [rsp] = the element index.
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax - 8]
+	lea	r10, [r10*8 + 8]
+	mov	rax, QWORD PTR [rbp - 104]
+	lea	rax, [rax + r10]
+	mov	QWORD PTR [rbp - 104], rax
+	mov	QWORD PTR [rsp], 0
+Lstm_rb_loop:
+	mov	r10, QWORD PTR [rsp]
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r11, QWORD PTR [rax - 8]
+	cmp	r10, r11
+	jae	Lstm_ref_done
+	mov	rdi, QWORD PTR [rax + r10*8]
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	rsi, QWORD PTR [rax + 16]
+	mov	rdx, QWORD PTR [rax + 24]
+	call	Lstm_word
+	mov	r10, QWORD PTR [rsp]
+	lea	r10, [r10 + 1]
+	mov	QWORD PTR [rsp], r10
+	jmp	Lstm_rb_loop
 Lstm_ref1:
 	mov	rax, QWORD PTR [rbp - 104]
 	lea	rax, [rax + 8]
@@ -1369,8 +1409,8 @@ Lstm_ref_asis:
 
 fn state_asm_measure_list_str() -> string {
     "Lstm_list:
-	cmp	rdi, 0
-	je	Lstm_ml_ret
+	cmp	rdi, 65536
+	jb	Lstm_ml_ret
 	sub	rsp, 16
 	lea	rsp, [rsp - 16]
 	mov	rbx, QWORD PTR [rbp - 112]
@@ -1782,7 +1822,20 @@ Lstc_word:
 	je	Lstc_list
 	cmp	rsi, 8
 	je	Lstc_str
+	cmp	rsi, 10
+	je	Lstc_opaque
 	jmp	Lstc_ref
+Lstc_opaque:
+# KIND 10 (Lstm_opaque): below 65536 copied as is. Otherwise, in evacuation mode (no measure ran) the actor
+# fails as a state that cannot be placed does (Lstc_fail_actor); a bump copy always follows a measure, which
+# refused this value, so meeting one there is the measure-copy disagreement the overrun check aborts on.
+	cmp	rdi, 65536
+	jb	Lstc_w_ret
+	mov	rax, QWORD PTR [rbp - 64]
+	cmp	QWORD PTR [rax + 8], 0
+	je	Lstc_bump_overrun
+	mov	rdi, QWORD PTR [rax + 16]
+	jmp	Lstc_fail_actor
 Lstc_w_agg:
 	mov	rsi, rdx
 	jmp	Lstc_agg
@@ -1990,6 +2043,8 @@ Lstc_ref_new:
 	je	Lstc_ref1
 	cmp	QWORD PTR [rbp - 120], 3
 	je	Lstc_refrec
+	cmp	QWORD PTR [rbp - 128], 65536
+	jae	Lstc_refbuf
 	mov	rax, QWORD PTR [rbp - 112]
 	mov	r10, QWORD PTR [rax - 8]
 	mov	rax, r10
@@ -2036,6 +2091,47 @@ Lstc_buf_copied:
 	mov	rsi, QWORD PTR [rbp - 120]
 	call	Lstc_insert
 	mov	rdi, QWORD PTR [rbp - 120]
+	jmp	Lstc_ref_done
+Lstc_refbuf:
+# A buffer whose elements can hold pointers: the count word and 8 bytes an element are bumped and the node is
+# entered in the table (by its final element pointer) before each element is copied through Lstc_word into
+# the copy. [rsp] = the element index, [rsp + 8] = the copy's final address; X27 = where the copy is written.
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax - 8]
+	lea	r15, [r10*8 + 8]
+	call	Lstc_bump
+	mov	QWORD PTR [rbp - 120], rdi
+	mov	QWORD PTR [rsp + 8], rsi
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r10, QWORD PTR [rax - 8]
+	mov	rax, QWORD PTR [rbp - 120]
+	mov	QWORD PTR [rax], r10
+	mov	rdi, QWORD PTR [rbp - 112]
+	mov	rsi, QWORD PTR [rsp + 8]
+	lea	rsi, [rsi + 8]
+	call	Lstc_insert
+	mov	QWORD PTR [rsp], 0
+Lstc_rb_loop:
+	mov	r10, QWORD PTR [rsp]
+	mov	rax, QWORD PTR [rbp - 112]
+	mov	r11, QWORD PTR [rax - 8]
+	cmp	r10, r11
+	jae	Lstc_rb_done
+	mov	rdi, QWORD PTR [rax + r10*8]
+	mov	rax, QWORD PTR [rbp - 128]
+	mov	rsi, QWORD PTR [rax + 16]
+	mov	rdx, QWORD PTR [rax + 24]
+	call	Lstc_word
+	mov	r10, QWORD PTR [rsp]
+	mov	rax, QWORD PTR [rbp - 120]
+	lea	r11, [rax + 8]
+	mov	QWORD PTR [r11 + r10*8], rdi
+	lea	r10, [r10 + 1]
+	mov	QWORD PTR [rsp], r10
+	jmp	Lstc_rb_loop
+Lstc_rb_done:
+	mov	rdi, QWORD PTR [rsp + 8]
+	lea	rdi, [rdi + 8]
 	jmp	Lstc_ref_done
 Lstc_ref1:
 	mov	r15, 8
@@ -2126,8 +2222,8 @@ Lstc_ref_asis:
 
 fn state_asm_copy_list_str() -> string {
     "Lstc_list:
-	cmp	rdi, 0
-	je	Lstc_ml_ret
+	cmp	rdi, 65536
+	jb	Lstc_ml_ret
 	mov	rax, QWORD PTR [rbp - 64]
 	mov	r10, QWORD PTR [rax + 8]
 	cmp	r10, 0

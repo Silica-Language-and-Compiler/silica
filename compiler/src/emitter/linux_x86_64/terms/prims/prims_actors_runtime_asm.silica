@@ -771,9 +771,17 @@ LBB1_wait:
 # neither LBB1_free nor the reply path would release it, so a token taken here stayed held for
 # the rest of the actor's life. Only an exit notice (+24 == 0) takes it. rdi is still the node.
 	cmp	DWORD PTR [rdi + 24], 0
-	jne	LBB1_process
+	jne	LBB1_wait_trial
 	mov	QWORD PTR [rcx + 120], rax
 	jmp	LBB1_process
+LBB1_wait_trial:
+# An actor that has ended (+152 == 0) does not run its behaviour again: a trial-hook node left in
+# its ingress is dropped (its +8 is an inline int64, nothing else to free) and the dequeue repeats,
+# so the ingress empties and the exit path is reached. rax = the actor, rdi = the node.
+	cmp	DWORD PTR [rax + 152], 0
+	jne	LBB1_process
+	call	free
+	jmp	LBB1_wait
 LBB1_try_std:
 	mov	rax, QWORD PTR [rbp - 8]
 	mov	r10d, DWORD PTR [rax + 152]
@@ -2062,10 +2070,9 @@ silica_rt_actor_call_registered: # @silica_rt_actor_call_registered
 	cmp	r12, r9
 	jge	LBB4r_not_found
 	mov	r11, QWORD PTR [r10 + r12*8]
-	cmp	r11, 1
-	jne	LBB4r_not_found
-	lea	r10, [r10 + r9*8]
-	mov	rdi, QWORD PTR [r10 + r12*8]
+	test	r11, r11
+	jz	LBB4r_not_found
+	lea	rdi, [r11 - 1]
 	mov	rsi, r13
 	jmp	silica_rt_actor_call
 LBB4r_not_found:
@@ -2098,10 +2105,9 @@ silica_rt_actor_cast_registered: # @silica_rt_actor_cast_registered
 	cmp	r12, r9
 	jge	LBB3r_not_found
 	mov	r11, QWORD PTR [r10 + r12*8]
-	cmp	r11, 1
-	jne	LBB3r_not_found
-	lea	r10, [r10 + r9*8]
-	mov	rdi, QWORD PTR [r10 + r12*8]
+	test	r11, r11
+	jz	LBB3r_not_found
+	lea	rdi, [r11 - 1]
 	mov	rsi, r13
 	jmp	silica_rt_actor_cast_or_raise
 LBB3r_not_found:
@@ -2125,10 +2131,9 @@ silica_rt_actor_cast_dangerous_registered: # @silica_rt_actor_cast_dangerous_reg
 	cmp	r12, r9
 	jge	LBB3dr_not_found
 	mov	r11, QWORD PTR [r10 + r12*8]
-	cmp	r11, 1
-	jne	LBB3dr_not_found
-	lea	r10, [r10 + r9*8]
-	mov	rdi, QWORD PTR [r10 + r12*8]
+	test	r11, r11
+	jz	LBB3dr_not_found
+	lea	rdi, [r11 - 1]
 	mov	rsi, r13
 	jmp	silica_rt_actor_cast_or_raise
 LBB3dr_not_found:
@@ -2152,10 +2157,9 @@ silica_rt_actor_cast_device_registered: # @silica_rt_actor_cast_device_registere
 	cmp	r12, r9
 	jge	LBB3dv_not_found
 	mov	r11, QWORD PTR [r10 + r12*8]
-	cmp	r11, 1
-	jne	LBB3dv_not_found
-	lea	r10, [r10 + r9*8]
-	mov	rdi, QWORD PTR [r10 + r12*8]
+	test	r11, r11
+	jz	LBB3dv_not_found
+	lea	rdi, [r11 - 1]
 	mov	rsi, r13
 	jmp	silica_rt_actor_cast_or_raise
 LBB3dv_not_found:
@@ -2750,6 +2754,11 @@ silica_rt_remove_actor_acb: # @silica_rt_remove_actor
 	call	silica_rt_tls_current_actor_get
 	cmp	rdi, QWORD PTR [rbp - 8]
 	je	Lremove_actor_self
+# A runtime registry never ends: naming one fails the caller with :language_error, as naming itself does.
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_is_registry_acb
+	test	rax, rax
+	jnz	Lremove_actor_self
 	mov	rdi, QWORD PTR [rbp - 8]
 	add	rdi, 16
 	call	silica_rt_lock_lock
@@ -2798,26 +2807,30 @@ silica_rt_register_actor_named:
 	mov	r9, QWORD PTR [rip + silica_registry_slots]
 	cmp	rax, r9
 	jge	Lreg_named_taken
-	mov	r11, QWORD PTR [r10 + rax*8]
-	cmp	r11, 1
-	jne	Lreg_named_store
-	lea	r8, [r10 + r9*8]
-	mov	rdi, QWORD PTR [r8 + rax*8]
+# The slot word is the holder's identity + 1 (0 = free), changed only by compare-and-swap, so a
+# reader's one load never sees a half-written slot and two registrations of one name cannot both win.
+# [rbp - 24] = the slot's address, [rbp - 32] = the word the store is conditional on.
+	lea	r8, [r10 + rax*8]
+	mov	QWORD PTR [rbp - 24], r8
+Lreg_named_load:
+	mov	r8, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [r8]
+	mov	QWORD PTR [rbp - 32], rax
+	test	rax, rax
+	jz	Lreg_named_store
+	lea	rdi, [rax - 1]
 	cmp	rdi, QWORD PTR [rbp - 8]
 	je	Lreg_named_done
 	call	silica_rt_ref_alive
 	test	rdi, rdi
 	jnz	Lreg_named_taken
 Lreg_named_store:
-	mov	rbx, QWORD PTR [rip + silica_pid_registry_ref]
-	mov	r10, QWORD PTR [rbx]
-	mov	r9, QWORD PTR [rip + silica_registry_slots]
-	mov	rax, QWORD PTR [rbp - 16]
-	lea	r8, [r10 + r9*8]
+	mov	r8, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [rbp - 32]
 	mov	rcx, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [r8 + rax*8], rcx
-	mov	r11d, 1
-	mov	QWORD PTR [r10 + rax*8], r11
+	add	rcx, 1
+	lock cmpxchg	QWORD PTR [r8], rcx
+	jne	Lreg_named_load
 Lreg_named_done:
 	xor	edi, edi
 	leave
@@ -2853,26 +2866,30 @@ silica_rt_register_dangerous_actor_named:
 	mov	r9, QWORD PTR [rip + silica_registry_slots]
 	cmp	rax, r9
 	jge	Lreg_danger_named_taken
-	mov	r11, QWORD PTR [r10 + rax*8]
-	cmp	r11, 1
-	jne	Lreg_danger_named_store
-	lea	r8, [r10 + r9*8]
-	mov	rdi, QWORD PTR [r8 + rax*8]
+# The slot word is the holder's identity + 1 (0 = free), changed only by compare-and-swap, so a
+# reader's one load never sees a half-written slot and two registrations of one name cannot both win.
+# [rbp - 24] = the slot's address, [rbp - 32] = the word the store is conditional on.
+	lea	r8, [r10 + rax*8]
+	mov	QWORD PTR [rbp - 24], r8
+Lreg_danger_named_load:
+	mov	r8, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [r8]
+	mov	QWORD PTR [rbp - 32], rax
+	test	rax, rax
+	jz	Lreg_danger_named_store
+	lea	rdi, [rax - 1]
 	cmp	rdi, QWORD PTR [rbp - 8]
 	je	Lreg_danger_named_done
 	call	silica_rt_ref_alive
 	test	rdi, rdi
 	jnz	Lreg_danger_named_taken
 Lreg_danger_named_store:
-	mov	rbx, QWORD PTR [rip + silica_dangerous_pid_registry_ref]
-	mov	r10, QWORD PTR [rbx]
-	mov	r9, QWORD PTR [rip + silica_registry_slots]
-	mov	rax, QWORD PTR [rbp - 16]
-	lea	r8, [r10 + r9*8]
+	mov	r8, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [rbp - 32]
 	mov	rcx, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [r8 + rax*8], rcx
-	mov	r11d, 1
-	mov	QWORD PTR [r10 + rax*8], r11
+	add	rcx, 1
+	lock cmpxchg	QWORD PTR [r8], rcx
+	jne	Lreg_danger_named_load
 Lreg_danger_named_done:
 	xor	edi, edi
 	leave
@@ -2908,26 +2925,30 @@ silica_rt_register_device_actor_named:
 	mov	r9, QWORD PTR [rip + silica_registry_slots]
 	cmp	rax, r9
 	jge	Lreg_device_named_taken
-	mov	r11, QWORD PTR [r10 + rax*8]
-	cmp	r11, 1
-	jne	Lreg_device_named_store
-	lea	r8, [r10 + r9*8]
-	mov	rdi, QWORD PTR [r8 + rax*8]
+# The slot word is the holder's identity + 1 (0 = free), changed only by compare-and-swap, so a
+# reader's one load never sees a half-written slot and two registrations of one name cannot both win.
+# [rbp - 24] = the slot's address, [rbp - 32] = the word the store is conditional on.
+	lea	r8, [r10 + rax*8]
+	mov	QWORD PTR [rbp - 24], r8
+Lreg_device_named_load:
+	mov	r8, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [r8]
+	mov	QWORD PTR [rbp - 32], rax
+	test	rax, rax
+	jz	Lreg_device_named_store
+	lea	rdi, [rax - 1]
 	cmp	rdi, QWORD PTR [rbp - 8]
 	je	Lreg_device_named_done
 	call	silica_rt_ref_alive
 	test	rdi, rdi
 	jnz	Lreg_device_named_taken
 Lreg_device_named_store:
-	mov	rbx, QWORD PTR [rip + silica_device_pid_registry_ref]
-	mov	r10, QWORD PTR [rbx]
-	mov	r9, QWORD PTR [rip + silica_registry_slots]
-	mov	rax, QWORD PTR [rbp - 16]
-	lea	r8, [r10 + r9*8]
+	mov	r8, QWORD PTR [rbp - 24]
+	mov	rax, QWORD PTR [rbp - 32]
 	mov	rcx, QWORD PTR [rbp - 8]
-	mov	QWORD PTR [r8 + rax*8], rcx
-	mov	r11d, 1
-	mov	QWORD PTR [r10 + rax*8], r11
+	add	rcx, 1
+	lock cmpxchg	QWORD PTR [r8], rcx
+	jne	Lreg_device_named_load
 Lreg_device_named_done:
 	xor	edi, edi
 	leave
@@ -2978,10 +2999,10 @@ silica_rt_actor_kill_abnormal_named:
 	mov	r10, QWORD PTR [rbx]
 	test	r10, r10
 	jz	Lkabn_none
-	cmp	QWORD PTR [r10 + rdi*8], 1
-	jne	Lkabn_none
-	lea	r10, [r10 + r9*8]
-	mov	rdi, QWORD PTR [r10 + rdi*8]
+	mov	r11, QWORD PTR [r10 + rdi*8]
+	test	r11, r11
+	jz	Lkabn_none
+	lea	rdi, [r11 - 1]
 	jmp	silica_rt_actor_kill_abnormal
 Lkabn_none:
 	xor	edi, edi
@@ -3016,6 +3037,11 @@ silica_rt_actor_kill_abnormal:
 	mov	QWORD PTR [rbp - 40], rdi
 	cmp	rdi, QWORD PTR [rbp - 8]
 	je	Lkab_self
+# A runtime registry never ends: naming one fails the caller with :language_error, as naming itself does.
+	mov	rdi, QWORD PTR [rbp - 8]
+	call	silica_rt_is_registry_acb
+	test	rax, rax
+	jnz	Lkab_self
 	mov	rdi, QWORD PTR [rbp - 8]
 	mov	rax, QWORD PTR [rdi + 208]
 	mov	QWORD PTR [rbp - 16], rax

@@ -31,8 +31,8 @@
 //          .quad RIDX         index of the first word of kind REGION, or -1
 //          .quad KIND, AUX    one entry per word
 //
-//   KIND 0 WORD    scalars, atoms, strings, actor references, function values, lists (slice-1
-//                  limit: a List is shared with the sender as before), type parameters: copied as is
+//   KIND 0 WORD    scalars, atoms and actor references: copied as is (the builtin scalar and handle types,
+//                  ev_word_type_ok and mc_known_word; every other name is KIND 10)
 //   KIND 1 REGION  an owned region handle: replaced by the fresh region it maps to
 //   KIND 2 REF1    ref / ref? to a one-word cell; AUX = a one-entry descriptor for the cell's word
 //   KIND 3 REFTUP  ref / ref? to an alloc_rec cell (one word pointing at the tuple payload); AUX =
@@ -41,13 +41,17 @@
 //                  entry of a `ref?(L, S, rec)` points back at that tuple's own descriptor. An
 //                  UNBOUND `rec` (no enclosing tuple: a record field, a parameter or return type
 //                  such as a structure's `root: ref?(L, normal, rec)`) names no layout; that ref is
-//                  a WORD, shared with the sender as before (Lee decides its handling)
+//                  KIND 10
 //   KIND 4 AGG     pointer to a record or tuple; AUX = its descriptor (a value below 65536 is an
 //                  atom or nil and is copied as is)
 //   KIND 5 SUM     a sum value; AUX = a table `.quad -1-M; .quad TAG, DESC ...` matched against the
 //                  value's first word (a tuple alternative's tag atom, a record alternative's
 //                  shape number); an atom alternative (< 65536) is copied as is
-//   KIND 6 BUF     a buffer (length word before the elements); AUX = element byte size
+//   KIND 6 BUF     a buffer (length word before the elements); AUX = the element byte size (1, 2, 4 or 8,
+//                  prims_tuple@buf_elem_bytes, the size the allocation and buf_load / buf_store use) when
+//                  no element can hold a pointer, else (a value of 65536 or more) the label of a one-entry
+//                  descriptor `.quad 1, 8` whose entry describes one element word: every copy walks each
+//                  element through it
 //   KIND 7 LIST    a list handle (chunk15_stack_memory_design.md §3.6, decision 30); AUX = a one-entry
 //                  descriptor `.quad 1, SLOT` whose entry describes one element word (SLOT = the
 //                  chunk slot bytes; a slot above 8 holds an inline aggregate). Phase 0 (2026-10-24):
@@ -61,6 +65,14 @@
 //                  L_mc_root; the phase 4a mailbox buffer copies header and bytes
 //   KIND 9 CLOSURE a function value (§3.6): copied as a WORD until closure environments are described
 //                  records (phase 2 rejects a captured closure at a send or return, E2300)
+//   KIND 10 OPAQUE a word whose type the descriptors cannot follow: a type parameter, a trait type, an
+//                  unbound `rec`, nesting deeper than mc_depth_bound, a sum whose alternatives the value's
+//                  first word cannot tell apart (mc_sum_shape). A value below 65536 (an atom, a small
+//                  scalar) is copied as is; any other value ends the copying actor (in main the process)
+//                  with a contained failure, so no word that may point into the sender's frame or state
+//                  reaches another actor. A sum with one untagged pointer alternative and otherwise atoms
+//                  is described by that alternative's own entry (every walker copies a value below 65536
+//                  as is)
 //
 // Measuring mode (§5.1): L_mc_measure(value, descriptor) walks exactly as the copy does, with the
 // same per-message table, and returns the byte total of the copy; phase 0 emits it with the helper
@@ -138,7 +150,11 @@ export md_type_label/2;
 export md_type_descriptors_block/3;
 export ev_type_described/1;
 export ev_type_has_node_root/1;
+export ev_type_boundary_root/1;
 export ev_site_descriptor_rodata/3;
+export md_fn_trait_marker/2;
+export md_site_type/2;
+export md_resolve_type/2;
 
 // ---- strings ----------------------------------------------------------------------------------
 
@@ -257,14 +273,59 @@ fn mc_is_sum(t: string) -> boolean {
     mc_top_sep(t, 0, 0, "|") < length_bytes(t)
 }
 
+// A function type spelled without the `fn` keyword: the type checker's environment and its type printer
+// spell a named function's type `(T1,T2) -> R` (type_checker_declarations_functions build_function_type,
+// type_interner_print kind 100), so a message, reply or state naming a function (a lifted function literal's
+// wrapper, `f impl ActorMessage {}`) carries that spelling. A parenthesised list at the start directly
+// followed by `->` (spaces stripped). Tested before the tuple and sum tests: `()->(int64,int64)` ends in `)`
+// and `()->:a|:b` has a `|` at depth zero, yet both are function values.
+fn mc_is_arrow_fn(t: string) -> boolean {
+    case mc_starts_with(t, "(") of {
+        false -> false;
+        true -> {
+            c: int64 <- mc_close_at(t, 1, 1);
+            case c + 3 <= length_bytes(t) of {
+                false -> false;
+                true -> substring(t, c + 1, c + 3) == "->"
+            }
+        }
+    }
+}
+
+// Index of the closing bracket that brings the nesting depth (over (), [], {}) back to zero, scanning from i
+// at `depth`, or the length when none does.
+fn mc_close_at(s: string, i: int64, depth: int64) -> int64 {
+    case i >= length_bytes(s) of {
+        true -> length_bytes(s);
+        false -> {
+            c: string <- substring(s, i, i + 1);
+            case c == "(" or c == "[" or c == "{" of {
+                true -> mc_close_at(s, i + 1, depth + 1);
+                false -> case c == ")" or c == "]" or c == "}" of {
+                    true -> case depth == 1 of {
+                        true -> i;
+                        false -> mc_close_at(s, i + 1, depth - 1)
+                    };
+                    false -> mc_close_at(s, i + 1, depth)
+                }
+            }
+        }
+    }
+}
+
 // 0 WORD, 1 REGION, 2 REF1, 3 REFTUP, 4 AGG, 5 SUM, 6 BUF, 7 LIST, 8 STRING, 9 CLOSURE for a
 // (space-stripped) type; `bound` is true when an enclosing tuple type binds `rec` (a bare `rec`, or
 // `ref?(L, S, rec)`, is a WORD otherwise). A function type is tested before the sum test: its result
 // may be a sum (`fn(a, b) -> :less | :equal | :greater`) whose `|` sits at depth zero.
+// `fn_ptr` is the type_name the SIR generator gives a function NAME used as a value (terms
+// expr_to_sir_with_expected / expr_to_sir_in_let_body, kind 1 naming a function: a named function, a lifted
+// literal or its capture wrapper `<fn>.__lwN`), so a message, reply or state written as a bare function name,
+// or a tuple literal holding one (prims_actors message_term_type spells each element by its type_name), carries
+// it. It is a code address like every other function value: KIND 9, never the opaque KIND 10.
 fn mc_kind_of(t: string, bound: boolean) -> int64 {
     case length_bytes(t) == 0 of {
         true -> 0;
-        false -> case mc_starts_with(t, "fn(") of {
+        false -> case t == "fn_ptr" or mc_starts_with(t, "fn(") or mc_is_arrow_fn(t) of {
             true -> 9;
             false -> case mc_starts_with(t, "List[") of {
                 true -> 7;
@@ -313,7 +374,7 @@ fn mc_kind_of_rest(t: string, bound: boolean) -> int64 {
 // `bound`: an enclosing tuple binds `rec` here. A ref to a tuple counts without looking inside it
 // (its payload is a described cell).
 fn mc_needs_copy_at(t: string, depth: int64, bound: boolean) -> boolean {
-    case depth > 12 of {
+    case depth > mc_depth_bound() of {
         true -> false;
         false -> case mc_kind_of(t, bound) of {
             0 -> false;
@@ -409,6 +470,15 @@ fn ev_type_has_node_root(t0: string) -> boolean {
     md_root_needs_descriptor(prims_record@strip_spaces_rt(t0))
 }
 
+// Whether an actor boundary (a message, a reply, a spawn or child-spec state, a behaviour's new state) passes a
+// root-word descriptor for a value of this type: a node root (ev_type_has_node_root), or a root word the
+// descriptors cannot follow (KIND 10: a bare type parameter, a trait type), which the copier then refuses unless
+// it is below 65536. Only the boundary sites ask this; ev_type_has_node_root keeps its meaning elsewhere.
+fn ev_type_boundary_root(t0: string) -> boolean {
+    t: string <- prims_record@strip_spaces_rt(t0);
+    md_root_needs_descriptor(t) or mc_entry_kind(t, false) == 10
+}
+
 fn ev_word_type_ok(t: string) -> boolean {
     t == "int64" or t == "uint64" or t == "int32" or t == "uint32" or t == "int16" or t == "uint16" or t == "int8" or t == "uint8"
         or t == "float64" or t == "float32" or t == "float16" or t == "boolean" or t == "bool" or t == "unit" or t == "lifetime"
@@ -416,7 +486,7 @@ fn ev_word_type_ok(t: string) -> boolean {
 }
 
 fn ev_described_at(t: string, depth: int64, bound: boolean) -> boolean {
-    case depth > 12 or length_bytes(t) == 0 of {
+    case depth > mc_depth_bound() or length_bytes(t) == 0 of {
         true -> false;
         false -> case mc_kind_of(t, bound) of {
             0 -> ev_word_type_ok(t);
@@ -430,8 +500,12 @@ fn ev_described_at(t: string, depth: int64, bound: boolean) -> boolean {
                 true -> ev_fields_described(substring(t, 1, length_bytes(t) - 1), 0, depth, bound);
                 false -> ev_elems_described(substring(t, 1, length_bytes(t) - 1), 0, depth)
             };
-            5 -> ev_alts_described(t, 0, depth, bound);
-            6 -> true;
+            5 -> case mc_sum_shape(t, bound) of {
+                0 -> ev_alts_described(t, 0, depth, bound);
+                1 -> ev_described_at(mc_sum_lone_alt(t, 0, bound), depth + 1, bound);
+                _: int64 -> false
+            };
+            6 -> ev_buf_described(t, depth, bound);
             7 -> ev_described_at(prims_list@list_elem_type_from_list_t(t), depth + 1, bound);
             8 -> true;
             // A function value is a code address (no captured environment is built today), never a node.
@@ -491,6 +565,135 @@ fn ev_site_descriptor_rodata(t0: string, label: string, table: { is_empty: boole
     concat(mc_lbl(label, 0), concat(":\n    .quad 1, -1\n", concat(e.line, e.child)))
 }
 
+// ---- what the descriptors can follow -----------------------------------------------------------
+
+// Aggregate nesting the descriptors describe; a word nested deeper is KIND 10 (and not described).
+fn mc_depth_bound() -> int64 {
+    64
+}
+
+// Builtin names whose values are scalars, handles or device addresses, never a node of the sender's frame,
+// carried as words (KIND 0) although ev_word_type_ok does not list them (they stay undescribed for the
+// evacuation, which adopts the callee's frame for them as before).
+fn mc_known_word(t: string) -> boolean {
+    t == "discard" or t == "supervisor_ref" or t == "monitor_ref" or t == "pid" or t == "dangerous_pid" or t == "char"
+        or t == "failure_reason" or t == "bytes" or t == "Bytes" or t == "String" or t == "stack_policy" or t == "device_window"
+        or mc_starts_with(t, "device_window(") or mc_starts_with(t, "state_policy(") or mc_starts_with(t, "stack_policy(")
+}
+
+// A KIND 0 spelling that names no builtin word: a type parameter, a trait type, an unbound `rec` or a ref with
+// no layout. Only meaningful where mc_kind_of answers 0.
+fn mc_is_opaque_word(t: string) -> boolean {
+    length_bytes(t) > 0 and ev_word_type_ok(t) == false and mc_known_word(t) == false
+}
+
+// The kind a descriptor entry gets: mc_kind_of, with KIND 10 for an opaque word and for a sum whose
+// alternatives cannot be told apart.
+fn mc_entry_kind(t: string, bound: boolean) -> int64 {
+    k: int64 <- mc_kind_of(t, bound);
+    case k of {
+        0 -> case mc_is_opaque_word(t) of {
+            true -> 10;
+            false -> 0
+        };
+        5 -> case mc_sum_shape(t, bound) == 2 of {
+            true -> 10;
+            false -> 5
+        };
+        _: int64 -> k
+    }
+}
+
+// The class of one sum alternative: 0 an atom; 1 untagged and able to hold a pointer (a string, list, buffer,
+// ref, untagged tuple or opaque word); 2 untagged and pointer-free (a builtin word, a function value, a region
+// witness); 3 tagged (a record, matched by its shape number, or a tuple led by an atom).
+fn mc_alt_class(a: string, bound: boolean) -> int64 {
+    case mc_starts_with(a, ":") of {
+        true -> 0;
+        false -> case mc_is_record(a) or (mc_is_tuple(a) and mc_starts_with(substring(a, 1, length_bytes(a)), ":")) of {
+            true -> 3;
+            false -> {
+                k: int64 <- mc_kind_of(a, bound);
+                case k == 1 or k == 9 or (k == 0 and mc_is_opaque_word(a) == false) of {
+                    true -> 2;
+                    false -> 1
+                }
+            }
+        }
+    }
+}
+
+fn mc_sum_count(t: string, i: int64, bound: boolean, cls: int64) -> int64 {
+    case i >= length_bytes(t) of {
+        true -> 0;
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, "|");
+            here: int64 <- case mc_alt_class(substring(t, i, e), bound) == cls of { true -> 1; false -> 0 };
+            here + mc_sum_count(t, e + 1, bound, cls)
+        }
+    }
+}
+
+// How the copier tells a sum's alternatives apart by the value: 0 every alternative that can hold a pointer is
+// tagged (the alternative table, mc_sum_table); 1 exactly one alternative can hold a pointer, it has no tag and
+// every other alternative is an atom (an atom is below 65536, so the value is that alternative whenever it is
+// 65536 or more: the alternative's own entry describes the sum); 2 anything else (KIND 10).
+fn mc_sum_shape(t: string, bound: boolean) -> int64 {
+    p: int64 <- mc_sum_count(t, 0, bound, 1);
+    case p == 0 of {
+        true -> 0;
+        false -> case p == 1 and mc_sum_count(t, 0, bound, 2) == 0 and mc_sum_count(t, 0, bound, 3) == 0 of {
+            true -> 1;
+            false -> 2
+        }
+    }
+}
+
+// The first alternative of class 1, or "".
+fn mc_sum_lone_alt(t: string, i: int64, bound: boolean) -> string {
+    case i >= length_bytes(t) of {
+        true -> "";
+        false -> {
+            e: int64 <- mc_top_sep(t, i, 0, "|");
+            a: string <- substring(t, i, e);
+            case mc_alt_class(a, bound) == 1 of {
+                true -> a;
+                false -> mc_sum_lone_alt(t, e + 1, bound)
+            }
+        }
+    }
+}
+
+// A buffer is described when no element can hold a pointer, or when its element type is.
+fn ev_buf_described(t: string, depth: int64, bound: boolean) -> boolean {
+    e: string <- prims_tuple@buf_elem_type(t);
+    case length_bytes(e) == 0 or prims_tuple@buf_elem_bytes_of(e) < 8 of {
+        true -> true;
+        false -> ev_described_at(e, depth + 1, bound)
+    }
+}
+
+// A buffer's entry: AUX = the element bytes when no element can hold a pointer (a narrow scalar, or an element
+// entry of KIND 0, 1 or 9), else the label of the one-entry descriptor `.quad 1, 8` over one element word.
+fn mc_buf_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
+    e: string <- prims_tuple@buf_elem_type(t);
+    ek: int64 <- case length_bytes(e) == 0 or prims_tuple@buf_elem_bytes_of(e) < 8 of {
+        true -> 0;
+        false -> case depth + 1 > mc_depth_bound() of {
+            true -> 10;
+            false -> mc_entry_kind(e, length_bytes(encl) > 0)
+        }
+    };
+    case ek == 0 or ek == 1 or ek == 9 of {
+        true -> { line: concat("    .quad 6, ", concat(mc_itos(mc_buf_elem_bytes(t)), "\n")), child: "", k: k };
+        false -> {
+            c: { line: string, child: string, k: int64 } <- mc_entry(e, base, k + 1, table, depth + 1, encl);
+            own: string <- concat(mc_lbl(base, k), concat(":\n    .quad 1, 8\n", c.line));
+            { line: mc_label_entry(6, mc_lbl(base, k)), child: concat(own, c.child), k: c.k }
+        }
+    }
+}
+
 // ---- descriptors --------------------------------------------------------------------------------
 
 fn md_site_label(fnl: string, node: int64) -> string {
@@ -504,7 +707,7 @@ fn mc_lbl(base: string, k: int64) -> string {
 // One entry line and the rodata of the descriptors it points at; `encl` is the label of the
 // innermost enclosing tuple's descriptor ("" when none), which is what `rec` names.
 fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index_map: { root: ref?(L, normal, (string, int64, int64, ref?(L, normal, rec), ref?(L, normal, rec))), compare_key: fn(string, string) -> :less | :equal | :greater, compare_value: fn(int64, int64) -> :less | :equal | :greater, specialization_key: int64, compare_key_ordering_bundle: int64, compare_value_ordering_bundle: int64 }, lexemes: List[string, mem(normal)] }, depth: int64, encl: string) -> { line: string, child: string, k: int64 } {
-    kind: int64 <- case depth > 12 of { true -> 0; false -> mc_kind_of(t, length_bytes(encl) > 0) };
+    kind: int64 <- case depth > mc_depth_bound() of { true -> 10; false -> mc_entry_kind(t, length_bytes(encl) > 0) };
     case kind of {
         0 -> { line: "    .quad 0, 0\n", child: "", k: k };
         1 -> { line: "    .quad 1, 0\n", child: "", k: k };
@@ -515,7 +718,8 @@ fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index
                 { line: mc_label_entry(3, mc_lbl(base, k)), child: d.text, k: d.k }
             }
         };
-        6 -> { line: concat("    .quad 6, ", concat(mc_itos(mc_buf_elem_bytes(t)), "\n")), child: "", k: k };
+        6 -> mc_buf_entry(t, base, k, table, depth, encl);
+        10 -> { line: "    .quad 10, 0\n", child: "", k: k };
         2 -> {
             // A one-word descriptor for the cell's content.
             c: { line: string, child: string, k: int64 } <- mc_entry(mc_ref_elem_type(t), base, k + 1, table, depth + 1, encl);
@@ -534,9 +738,12 @@ fn mc_entry(t: string, base: string, k: int64, table: { is_empty: boolean, index
         };
         8 -> { line: "    .quad 8, 0\n", child: "", k: k };
         9 -> { line: "    .quad 9, 0\n", child: "", k: k };
-        _: int64 -> {
-            d: { text: string, k: int64 } <- mc_sum_table(t, base, k, table, depth + 1, encl);
-            { line: mc_label_entry(5, mc_lbl(base, k)), child: d.text, k: d.k }
+        _: int64 -> case mc_sum_shape(t, length_bytes(encl) > 0) == 1 of {
+            true -> mc_entry(mc_sum_lone_alt(t, 0, length_bytes(encl) > 0), base, k, table, depth, encl);
+            false -> {
+                d: { text: string, k: int64 } <- mc_sum_table(t, base, k, table, depth + 1, encl);
+                { line: mc_label_entry(5, mc_lbl(base, k)), child: d.text, k: d.k }
+            }
         }
     }
 }
@@ -546,12 +753,22 @@ fn mc_label_entry(kind: int64, label: string) -> string {
     concat("    .quad ", concat(mc_itos(kind), concat(", ", concat(label, "\n"))))
 }
 
+// The element bytes of a buffer type: prims_tuple@buf_elem_bytes, exactly what the allocation and the element
+// loads and stores use (prims_memory). A spelling that is not `buf(L, S, T, N)` falls back to the allocator's
+// own by-name rule (prims_memory elem_size_shift_by_name).
 fn mc_buf_elem_bytes(t: string) -> int64 {
-    case mc_has(t, "int8") or mc_has(t, "uint8") or mc_has(t, "boolean") of {
+    case length_bytes(prims_tuple@buf_elem_type(t)) > 0 of {
+        true -> prims_tuple@buf_elem_bytes(t);
+        false -> mc_buf_elem_bytes_by_name(t)
+    }
+}
+
+fn mc_buf_elem_bytes_by_name(t: string) -> int64 {
+    case mc_has(t, "int8") of {
         true -> 1;
-        false -> case mc_has(t, "int16") or mc_has(t, "uint16") or mc_has(t, "float16") of {
+        false -> case mc_has(t, "int16") of {
             true -> 2;
-            false -> case mc_has(t, "int32") or mc_has(t, "uint32") or mc_has(t, "float32") of {
+            false -> case mc_has(t, "int32") of {
                 true -> 4;
                 false -> 8
             }
@@ -1333,5 +1550,178 @@ fn mcp_fields_pointer_free(t: string, i: int64) -> boolean {
                 }
             }
         }
+    }
+}
+
+// ---- collection trait types resolved to their implementing layouts ---------------------------------
+//
+// A collection trait type (`PriorityQueue[int64, string, mem(normal)]`) names no layout, so its word would be
+// KIND 10 and the copier would refuse any value of it. The SIR module's trait_layouts (sir_generator_core
+// tl_layouts_for_functions) records, for each such spelling of the unit that one registered construction
+// module implements, that module's record with the trait's parameters put for its placeholders:
+// `SPELLING=LAYOUT` entries joined by `;`, spaces removed, `|` written `^`. Each function carries the
+// entries whose family it mentions in its binding string ("|_tl=", md_fn_trait_marker); an actor-boundary
+// site passes its type through md_site_type (the behaviour epilogue through md_resolve_type) before the
+// descriptor is built, so the word is described by the record's own entries. Whether a site gets a
+// descriptor (ev_type_boundary_root) and a call result's evacuation (ev_type_described) still read the
+// spelled type. A spelling with no entry stays KIND 10.
+
+fn md_fn_trait_marker(layouts: string, fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }) -> string {
+    case length_bytes(layouts) == 0 of {
+        true -> "";
+        false -> {
+            kept: string <- mtl_keep(layouts, 0, fn_val, "");
+            case length_bytes(kept) == 0 of {
+                true -> "";
+                false -> concat("|_tl=", kept)
+            }
+        }
+    }
+}
+
+fn mtl_keep(layouts: string, i: int64, fn_val: { name: string, return_type: string, effects: string, body: { nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], root: int64 }, param_names: string, param_types: string }, acc: string) -> string {
+    case i >= length_bytes(layouts) of {
+        true -> acc;
+        false -> {
+            e: int64 <- mtl_entry_end(layouts, i);
+            entry: string <- substring(layouts, i, e);
+            fam: string <- mtl_family(entry);
+            keep: boolean <- length_bytes(fam) > 0 and (contains(fn_val.return_type, fam) or contains(fn_val.param_types, fam) or mtl_nodes_mention(fn_val.body.nodes, fam));
+            nxt: string <- case keep of {
+                false -> acc;
+                true -> case length_bytes(acc) == 0 of {
+                    true -> entry;
+                    false -> concat(acc, concat(";", entry))
+                }
+            };
+            mtl_keep(layouts, e + 1, fn_val, nxt)
+        }
+    }
+}
+
+fn mtl_nodes_mention(nodes: List[{ kind: int64, type_name: string, value: string, name: string, inner: int64, right_expr: int64 }, mem(normal)], fam: string) -> boolean {
+    case nodes.is_nil of {
+        true -> false;
+        false -> case contains(nodes.head.type_name, fam) of {
+            true -> true;
+            false -> mtl_nodes_mention(nodes.tail, fam)
+        }
+    }
+}
+
+fn mtl_entry_end(s: string, i: int64) -> int64 {
+    e: int64 <- mc_find_from(s, ";", i);
+    case e < 0 of {
+        true -> length_bytes(s);
+        false -> e
+    }
+}
+
+// The family name of an entry: its spelling up to the `[`.
+fn mtl_family(entry: string) -> string {
+    b: int64 <- mc_find_from(entry, "[", 0);
+    case b <= 0 of {
+        true -> "";
+        false -> substring(entry, 0, b)
+    }
+}
+
+// `t` with every trait spelling this function's "|_tl=" entries describe replaced by its layout.
+fn md_site_type(t: string, outer_reg: string) -> string {
+    case contains(outer_reg, "|_tl=") of {
+        false -> t;
+        true -> md_resolve_type(t, var@find_sp_binding(outer_reg, "_tl"))
+    }
+}
+
+// `t0` (spaces removed) with every spelling of the `enc` entries replaced by its layout; `t0` unchanged when
+// no entry's family occurs in it.
+fn md_resolve_type(t0: string, enc: string) -> string {
+    case length_bytes(enc) == 0 of {
+        true -> t0;
+        false -> {
+            t: string <- prims_record@strip_spaces_rt(t0);
+            case mtl_mentions_any(t, enc, 0) of {
+                false -> t0;
+                true -> mtl_subst(t, enc, 0, 0, "")
+            }
+        }
+    }
+}
+
+fn mtl_mentions_any(t: string, enc: string, i: int64) -> boolean {
+    case i >= length_bytes(enc) of {
+        true -> false;
+        false -> {
+            e: int64 <- mtl_entry_end(enc, i);
+            fam: string <- mtl_family(substring(enc, i, e));
+            case length_bytes(fam) > 0 and contains(t, fam) of {
+                true -> true;
+                false -> mtl_mentions_any(t, enc, e + 1)
+            }
+        }
+    }
+}
+
+fn mtl_ident_char(c: string) -> boolean {
+    length_bytes(c) == 1 and contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_", c)
+}
+
+fn mtl_ident_start(t: string, j: int64) -> int64 {
+    case j > 0 and mtl_ident_char(substring(t, j - 1, j)) of {
+        true -> mtl_ident_start(t, j - 1);
+        false -> j
+    }
+}
+
+// Left to right over the `[` of `t`: a bracket type with an entry is replaced (an enclosing spelling is met
+// before the ones inside it), any other is kept and the scan goes on inside it.
+fn mtl_subst(t: string, enc: string, i: int64, start: int64, acc: string) -> string {
+    j: int64 <- mc_find_from(t, "[", i);
+    case j < 0 of {
+        true -> concat(acc, substring(t, start, length_bytes(t)));
+        false -> {
+            k: int64 <- mtl_ident_start(t, j);
+            c: int64 <- mc_close_at(t, j + 1, 1);
+            layout: string <- case k < j and k >= start and c < length_bytes(t) of {
+                true -> mtl_lookup(enc, mtl_swap(substring(t, k, c + 1), "|", "^"), 0);
+                false -> ""
+            };
+            case length_bytes(layout) == 0 of {
+                true -> mtl_subst(t, enc, j + 1, start, acc);
+                false -> mtl_subst(t, enc, c + 1, c + 1, concat(acc, concat(substring(t, start, k), mtl_swap(layout, "^", "|"))))
+            }
+        }
+    }
+}
+
+// The (escaped) layout of the entry whose (escaped) spelling is `key`, or "".
+fn mtl_lookup(enc: string, key: string, i: int64) -> string {
+    case i >= length_bytes(enc) of {
+        true -> "";
+        false -> {
+            e: int64 <- mtl_entry_end(enc, i);
+            n: int64 <- length_bytes(key);
+            case i + n < e and substring(enc, i, i + n) == key and substring(enc, i + n, i + n + 1) == "=" of {
+                true -> substring(enc, i + n + 1, e);
+                false -> mtl_lookup(enc, key, e + 1)
+            }
+        }
+    }
+}
+
+// Every one-character `from` in `s` written `to`.
+fn mtl_swap(s: string, old_c: string, new_c: string) -> string {
+    case contains(s, old_c) of {
+        false -> s;
+        true -> mtl_swap_from(s, old_c, new_c, 0, "")
+    }
+}
+
+fn mtl_swap_from(s: string, old_c: string, new_c: string, i: int64, acc: string) -> string {
+    j: int64 <- mc_find_from(s, old_c, i);
+    case j < 0 of {
+        true -> concat(acc, substring(s, i, length_bytes(s)));
+        false -> mtl_swap_from(s, old_c, new_c, j + 1, concat(acc, concat(substring(s, i, j), new_c)))
     }
 }

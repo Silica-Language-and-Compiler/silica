@@ -374,6 +374,12 @@ Lcad_have_index:
 	cbz	x0, Lcad_no_carrier
 	mov	x20, x0
 Lcad_bound:
+; The carrier fields are set under the actor's lock: its identity resolves already, so a cast or a
+; stop may reach it before this, and the mail signal reads #440/#448 under that lock (a cast seen
+; with #440 = 0 made nobody ready; one between the stores below would have pushed it and then had
+; its run-queue link #456 cleared). Mail that came first, or an end, makes it ready here instead.
+	add	x0, x19, #16
+	bl	_os_unfair_lock_lock
 	str	x20, [x19, #440]
 	mov	x9, #1
 	str	x9, [x19, #448]
@@ -382,16 +388,34 @@ Lcad_bound:
 	str	xzr, [x19, #472]
 	str	xzr, [x19, #512]
 	cbnz	x22, Lcad_ready
+	ldr	w9, [x19, #152]
+	cbz	w9, Lcad_pending
+	ldr	x9, [x19, #216]
+	cbz	x9, Lcad_std
+	ldr	x10, [x9]
+	ldr	x11, [x9, #8]
+	orr	x10, x10, x11
+	cbnz	x10, Lcad_pending
+Lcad_std:
+	ldr	x10, [x19, #128]
+	ldr	x11, [x19, #136]
+	orr	x10, x10, x11
+	cbz	x10, Lcad_idle
+Lcad_pending:
+	mov	x9, #2
+	str	x9, [x19, #448]
+	mov	x0, x19
+	bl	_silica_rt_carrier_push
+Lcad_idle:
+	add	x0, x19, #16
+	bl	_os_unfair_lock_unlock
 	mov	x0, x19
 	mov	x1, #1
 	bl	_silica_rt_started_store
 	mov	x0, #1
 	b	Lcad_ret
 Lcad_ready:
-; A trampoline to run: ready on its carrier, under its lock (its identity resolves already, so a
-; cast could race the status; a push needs the status guarded by the actor's lock).
-	add	x0, x19, #16
-	bl	_os_unfair_lock_lock
+; A trampoline to run: ready on its carrier, under its lock (taken at Lcad_bound).
 	mov	x9, #2
 	str	x9, [x19, #448]
 	mov	x0, x19
@@ -1101,14 +1125,25 @@ _silica_rt_started_store:
 ; makes a carrier actor parked in the spawn (#472) ready. The parker stores #472 and then reads #224
 ; under its own lock; this side stores #224 and then reads #472: with the barriers one of them sees
 ; the other's store, and the status check under the parker's lock settles the rest.
+; The parker is TAKEN from #472 (an exclusive swap to 0), so a parker that has already left its
+; spawn wait (it takes #472 back the same way, _silica_rt_spawn_wait_started) is never touched: its
+; status 4 may by then be another park, or its block freed. Once done with a parker this side
+; stores 1 in #472, which the parker waits for when it found #472 already taken: until then its
+; block stays in use here. 0 and 1 name no parker. X19 the parker, X20 the child.
 	stp	x29, x30, [sp, #-32]!
 	mov	x29, sp
-	str	x19, [sp, #16]
+	stp	x19, x20, [sp, #16]
+	mov	x20, x0
 	add	x9, x0, #224
 	stlr	x1, [x9]
 	dmb	ish
-	ldr	x19, [x0, #472]
-	cbz	x19, Lsts_ret
+	add	x9, x20, #472
+Lsts_take:
+	ldaxr	x19, [x9]
+	cmp	x19, #1
+	b.ls	Lsts_none
+	stxr	w10, xzr, [x9]
+	cbnz	w10, Lsts_take
 	add	x0, x19, #16
 	bl	_os_unfair_lock_lock
 	ldr	x10, [x19, #448]
@@ -1121,8 +1156,14 @@ _silica_rt_started_store:
 Lsts_unlock:
 	add	x0, x19, #16
 	bl	_os_unfair_lock_unlock
+	mov	x10, #1
+	add	x9, x20, #472
+	stlr	x10, [x9]
+	b	Lsts_ret
+Lsts_none:
+	clrex
 Lsts_ret:
-	ldr	x19, [sp, #16]
+	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
 	ret
 	.globl	_silica_rt_spawn_wait_started
@@ -1168,6 +1209,23 @@ Lsws_park_loop:
 Lsws_started:
 	add	x0, x20, #16
 	bl	_os_unfair_lock_unlock
+; Take #472 back (_silica_rt_started_store): this actor, or the started store's 1, means no started
+; store holds this actor any more; 0 means one took it and is still using it (it waits for this
+; actor's lock, which is free now), so this actor waits for its 1 before it parks anywhere else.
+	add	x9, x19, #472
+Lsws_take_back:
+	ldaxr	x8, [x9]
+	stlxr	w10, xzr, [x9]
+	cbnz	w10, Lsws_take_back
+	cbnz	x8, Lsws_ret
+Lsws_wait_store:
+	ldar	x8, [x9]
+	cmp	x8, #1
+	b.eq	Lsws_store_done
+	yield
+	b	Lsws_wait_store
+Lsws_store_done:
+	str	xzr, [x9]
 	b	Lsws_ret
 Lsws_spin:
 	add	x9, x19, #224
@@ -1559,6 +1617,11 @@ _silica_rt_sup_restart_try:
 	mov	x9, #1
 Lsrt_take:
 	str	x9, [x8, #120]
+; An asking actor records the supervisor whose token it holds (ACB #184), so its exit path gives
+; the token back if it ends before its release (_silica_rt_sup_token_drop).
+	cbz	x20, Lsrt_taken
+	str	x19, [x20, #184]
+Lsrt_taken:
 	mov	x20, #1
 	b	Lsrt_unlock
 Lsrt_no:
@@ -1585,6 +1648,15 @@ _silica_rt_sup_restart_release:
 	bl	_os_unfair_lock_lock
 	ldr	x20, [x19, #216]
 	cbz	x20, Lsrr_unlock
+; The holder's record of this token (ACB #184) goes with it; 1 is main, which has no record.
+	ldr	x9, [x20, #120]
+	cmp	x9, #1
+	b.ls	Lsrr_clear
+	ldr	x10, [x9, #184]
+	cmp	x10, x19
+	b.ne	Lsrr_clear
+	str	xzr, [x9, #184]
+Lsrr_clear:
 	str	xzr, [x20, #120]
 	ldr	x9, [x20]
 	ldr	x10, [x20, #8]
@@ -1601,6 +1673,26 @@ Lsrr_unlock:
 Lsrr_ret:
 	ldp	x19, x20, [sp, #16]
 	ldp	x29, x30, [sp], #32
+	ret
+; _silica_rt_sup_token_drop(X0 = an ending actor's ACB): when the actor still holds the restart
+; token of the supervisor it recorded (#184, set when it took the token, cleared at the release), it
+; ended inside a call_supervisor operation or a drain before releasing it: the token is released
+; here, on its exit path, so the supervisor and every later drainer are not blocked for good. The
+; supervisor's control block is still allocated: the operation that took the token holds it.
+	.globl	_silica_rt_sup_token_drop
+	.p2align	2
+_silica_rt_sup_token_drop:
+	ldr	x9, [x0, #184]
+	cbz	x9, Lstd_ret
+	str	xzr, [x0, #184]
+	ldr	x10, [x9, #216]
+	cbz	x10, Lstd_ret
+	ldr	x10, [x10, #120]
+	cmp	x10, x0
+	b.ne	Lstd_ret
+	mov	x0, x9
+	b	_silica_rt_sup_restart_release
+Lstd_ret:
 	ret
 	.globl	_silica_rt_sup_restart_acquire
 	.p2align	2
@@ -1672,6 +1764,11 @@ Lsra_take_now:
 	mov	x9, #1
 Lsra_take:
 	str	x9, [x8, #120]
+; An asking actor records the supervisor whose token it holds (ACB #184), so its exit path gives
+; the token back if it ends before its release (_silica_rt_sup_token_drop).
+	cbz	x20, Lsra_taken
+	str	x19, [x20, #184]
+Lsra_taken:
 	mov	x23, #1
 	b	Lsra_unlock
 Lsra_settle:

@@ -74,6 +74,13 @@
 #define CH_MIRROR        32
 #define CH_USABLE_OFF    128
 #define ACHUNK_CAP       4096
+// The largest byte count one run-time-sized allocation may ask for: far
+// above this board's memory, and small enough that no sum the allocators make from it (the count plus
+// headers, rounding, headroom, the transient part or an address) can pass 32 bits. A larger request can
+// never be met, so each entry refuses it before doing any arithmetic with it. The emitter refuses the
+// same sizes in 64 bits before the low word is passed (terms/prims/prims_memory.silica emit_alloc_buf,
+// emit_alloc_buf_retained).
+#define RT_ALLOC_MAX     0x08000000
 #define ACHUNK_HEADROOM  256
 
 #define ACB_KIND         19
@@ -208,7 +215,10 @@ silica_rt_dyn_alloc:
     s32i    a7, a1, 20
     rur     a8, threadptr
     l32i    a2, a8, VRG_ARG             // a2 = n
-    l32i    a3, a8, VRG_VSP             // a3 = sp
+    movi    a9, RT_ALLOC_MAX
+    bgeu    a9, a2, 1f
+    j       8f                          // no chunk can hold it; the sums below must not wrap
+1:  l32i    a3, a8, VRG_VSP             // a3 = sp
     l32i    a4, a8, VRG_FLOOR           // a4 = floor
     l32i    a5, a8, VRG_ACHUNK          // a5 = chunk
     mov     a10, a3
@@ -216,14 +226,18 @@ silica_rt_dyn_alloc:
     mov     a12, a5
     call8   rt_transient_len
     mov     a6, a10                     // a6 = len
-    // the floor in this chunk and room for the block and the moved transient part above the limit
+    // the floor in this chunk and room for the block and the moved transient part above the limit:
+    // n + len <= floor - limit, compared without forming floor - n (size check: no
+    // subtraction that can wrap)
     l32i    a8, a5, CH_LIMIT
     l32i    a9, a5, CH_TOP
     bltu    a4, a8, 2f
     bltu    a9, a4, 2f
+    sub     a9, a4, a8                  // a9 = the room: floor - limit
+    bltu    a9, a2, 2f
+    sub     a9, a9, a2
+    bltu    a9, a6, 2f
     sub     a7, a4, a2                  // a7 = block
-    sub     a9, a7, a6
-    bltu    a9, a8, 2f
     j       3f
 2:  // a fresh chunk after this one: the block at its top, the transient part under it
     call8   silica_rt_current
@@ -591,7 +605,10 @@ silica_rt_ev_frame:
     .type   silica_rt_frame_alloc, @function
 silica_rt_frame_alloc:
     entry   a1, 32
-    addi    a2, a2, 15
+    movi    a8, RT_ALLOC_MAX
+    bgeu    a8, a2, 1f                  // before the rounding can wrap
+    call8   silica_rt_region_alloc_failed
+1:  addi    a2, a2, 15
     movi    a8, -16
     and     a2, a2, a8
     rur     a8, threadptr

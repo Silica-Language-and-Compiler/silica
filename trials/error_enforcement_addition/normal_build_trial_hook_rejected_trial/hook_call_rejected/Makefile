@@ -1,0 +1,45 @@
+# One compile-defect trial, compiled by the compiler in SILICA_COMPILER (the parent passes the normal
+# compiler as SILICA_COMPILER). The output is diffed against hook_call_rejected.golden_fail.
+# Do not read COMPILER here: error_enforcement_addition/Makefile passes COMPILER=<trial compiler> on its
+# children's command lines, so it reaches this make through MAKEFLAGS and wins over `COMPILER ?=`; the
+# trial compiler then accepted the hook and the trial compiled cleanly.
+THIS_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+include $(THIS_DIR)../../../silica_compiler.mk
+
+TRIAL_DIR := $(notdir $(patsubst %/,%,$(THIS_DIR)))
+MSG_PREFIX := $(TRIAL_DIR)/
+MAIN := hook_call_rejected
+
+.DEFAULT_GOAL := all
+.PHONY: all integrate check clean help silica.config
+
+all: integrate
+
+integrate-run: check
+
+silica.config: | clean
+silica.config:
+	@cd "$(THIS_DIR)" && { \
+		echo "$(MAIN).silica"; \
+	} > silica.config && $(TRIAL_SUPPORT_CONFIG)
+
+check: silica.config
+	@cd "$(THIS_DIR)" && { $(call RUN_SILICA_COMPILER_QUIET_WITH,$(abspath $(SILICA_COMPILER))); } > $(MAIN).cur_fail 2>&1 || true
+	@if diff -q "$(THIS_DIR)$(MAIN).cur_fail" "$(or $(wildcard $(THIS_DIR)$(MAIN)$(GOLDEN_FAIL_EXT).golden_fail),$(THIS_DIR)$(MAIN).golden_fail)" > /dev/null 2>&1; then \
+		echo "✅✅ $(MSG_PREFIX)$(TRIAL_DIR)"; \
+		$(INTEGRATE_DOT_OK); \
+		printf '%d %d\n' 1 0 > "$(THIS_DIR).integrate_counts"; \
+	else \
+		echo "❌❌ $(MSG_PREFIX)$(TRIAL_DIR): .cur_fail differs from .golden_fail"; \
+		$(INTEGRATE_DOT_FAIL); \
+		diff "$(THIS_DIR)$(MAIN).cur_fail" "$(or $(wildcard $(THIS_DIR)$(MAIN)$(GOLDEN_FAIL_EXT).golden_fail),$(THIS_DIR)$(MAIN).golden_fail)" || true; \
+		printf '%d %d\n' 0 1 > "$(THIS_DIR).integrate_counts"; \
+		exit 1; \
+	fi
+
+clean:
+	@rm -rf "$(THIS_DIR)$(MAIN).cur_fail" "$(THIS_DIR)silica.config" "$(THIS_DIR).integrate_counts" "$(THIS_DIR).trial_stdlib" "$(THIS_DIR)"*.sams "$(THIS_DIR)"*.iface
+
+help:
+	@echo "$(TRIAL_DIR) (E2007: the trial hook name is not a builtin in a normal build)"
+	@echo "  integrate - regenerate silica.config, run the normal compiler, diff $(MAIN).cur_fail against $(MAIN).golden_fail"
