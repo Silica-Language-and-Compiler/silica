@@ -73,3 +73,13 @@ silica_abi_i64_result silica_abi_i64_result_ok(int64_t value) {
     result.error_code = 0;
     return result;
 }
+
+/* Three int64 arguments and a struct result: more argument words than a 32-bit target has argument
+   registers. Each argument shows in its own digits of the value. */
+silica_abi_i64_result silica_abi_i64_result_of3(int64_t a, int64_t b, int64_t c) {
+    silica_abi_i64_result result;
+    result.tag = 0;
+    result.value = a * 10000 + b * 100 + c;
+    result.error_code = 0;
+    return result;
+}

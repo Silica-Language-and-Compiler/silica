@@ -53,6 +53,7 @@ silica_rt_heap_next:
     .space  4
 silica_rt_heap_free_head:
     .space  4
+    .global silica_rt_heap_lock               // read by foreign code that preempts an actor (hci_shim.c)
 silica_rt_heap_lock:
     .space  4
     .global silica_rt_region_lock             // taken by silica_rt_region_grow (below) and by

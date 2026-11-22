@@ -159,6 +159,16 @@ code under that model rather than as device workers. **Decided 2026-11-09:** Lee
 network stack of §4.6, which can sit on a wired link (UART1, USB, SPI Ethernet) and, if Wi-Fi is ever
 adopted, on top of the radio's link layer.
 
+**Bluetooth, as built (2026-11-14).** The bare-metal port stays free of ESP-IDF and has no radio. A program
+that declares a `(:ble_gatt)` carrier is built instead as a guest of ESP-IDF 6.2 by the same compiler: ESP-IDF
+owns the chip and runs the closed controller and the NimBLE host, Silica's two schedulers run as its tasks,
+and NimBLE is reached through Fifi (`board/guest`; the trial target `ESP32-S3_idf`). The board is a peripheral
+or a central, holds one link at a time, and as peripheral requires an encrypted link. With a link up ESP-IDF's
+internal heap has about 35 KB free beside Silica's 208 KB block. The plan and its measurements are
+[transport_ble_plan.md](transport_ble_plan.md); the carrier is in
+[transport_serialization_design.md](transport_serialization_design.md) §6.5. Wi-Fi is
+[transport_esp32s3_wifi_plan.md](transport_esp32s3_wifi_plan.md).
+
 ### 4.5 Order of effort, smallest first
 
 | Rank | Item | Size |

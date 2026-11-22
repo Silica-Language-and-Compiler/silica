@@ -48,6 +48,8 @@ APP_DIRS := \
 	$(APP_FFI_RESULT_CAST_DIR) \
 	$(APP_FOREIGN_ABI_DIR) \
 	$(APP_FOREIGN_ABI_TYPES_E2E_DIR) \
+	app_foreign_tagged_result_e2e \
+	app_foreign_three_int64_result_e2e \
 	$(APP_E2E_DIR) \
 	$(APP_GUARDED_ONCE_DIR) \
 	$(APP_GUARDED_TWICE_DIR) \
@@ -193,6 +195,8 @@ phase-7: phase-6
 	@$(MAKE) -C "$(THIS_DIR)$(APP_FOREIGN_ABI_DIR)" integrate
 	@$(MAKE) abi-valid
 	@$(MAKE) -C "$(THIS_DIR)$(APP_FOREIGN_ABI_TYPES_E2E_DIR)" integrate
+	@$(MAKE) -C "$(THIS_DIR)app_foreign_tagged_result_e2e" integrate
+	@$(MAKE) -C "$(THIS_DIR)app_foreign_three_int64_result_e2e" integrate
 	@echo "✅ ffi_addition phase-7 complete ($(APP_FOREIGN_ABI_DIR), abi_addition/, $(APP_FOREIGN_ABI_TYPES_E2E_DIR))"
 
 phase-8: phase-7 fixtures
@@ -245,6 +249,8 @@ clean-apps:
 	@for dir in $(APP_DIRS); do $(MAKE) -C "$(THIS_DIR)$$dir" clean; done
 	@$(MAKE) -C "$(THIS_DIR)abi_addition" clean
 	@$(MAKE) -C "$(THIS_DIR)$(APP_FOREIGN_ABI_TYPES_E2E_DIR)" clean
+	@$(MAKE) -C "$(THIS_DIR)app_foreign_tagged_result_e2e" clean
+	@$(MAKE) -C "$(THIS_DIR)app_foreign_three_int64_result_e2e" clean
 
 clean: clean-fixtures clean-apps
 	@rm -f .integrate_counts
@@ -261,6 +267,8 @@ help:
 	@echo "  $(APP_FOREIGN_ABI_DIR)  - Silica-side ABI declarations compile and run"
 	@echo "  abi_addition/           - compile-success trials for documented C ABI data shapes"
 	@echo "  $(APP_FOREIGN_ABI_TYPES_E2E_DIR) - int64/boolean/record-by-value runtime ABI e2e"
+	@echo "  app_foreign_tagged_result_e2e - a struct result read as a record, field by field"
+	@echo "  app_foreign_three_int64_result_e2e - three int64 arguments and a struct result (eight argument words on the ESP32-S3)"
 	@echo "  $(APP_E2E_DIR) - scalar add and string echo end-to-end foreign calls"
 	@echo ""
 	@echo "Targets:"

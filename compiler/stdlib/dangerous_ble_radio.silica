@@ -1,0 +1,463 @@
+{-
+
+   Copyright 2026 COPYRIGHT-HOLDER-PLACEHOLDER (to be decided before this is merged)
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+-}
+
+// The radio actor of transport_ble_plan.md §2.2: the one actor that owns the Bluetooth host on the
+// ESP32-S3 (NimBLE, through dangerous_nimble). Every request to the host is a cast to it, and
+// everything the host reports reaches the owner as a message. A (:ble_gatt) carrier
+// (dangerous_ble_gatt_board_carrier) spawns it under the name :dangerous_ble_radio and is its owner;
+// a program can also start it itself to advertise only.
+//
+//   (:start, owner)        starts the controller and the host; the owner gets what follows, first a
+//                          (:radio_memory, ...) taken before the radio has any memory
+//   (:advertise, service)  advertises the service whose UUID is the text ("" for the Nordic UART
+//                          Service), now or as soon as the host is ready, and again after a central
+//                          that connected has left
+//   :stop_advertising
+//   :memory                the owner gets (:radio_memory, free, least_free, largest_block): ESP-IDF's
+//                          internal heap in bytes. Ignored before the host is started
+//
+// A link, one at a time, in the peripheral's role (stage 7) or the central's (stage 9):
+//
+//   (:serve, owner, service)  publishes the service, starts the host if it is not started, and
+//                             advertises until a central connects and subscribes. The sender becomes
+//                             the owner. The host takes its attribute table when it starts, so a
+//                             :serve with another service after that is (:radio, :serve_failed, 9)
+//   (:seek, owner, service)   the central's role (stage 9): starts the host if it is not started, scans
+//                             for a peripheral that advertises the service, connects, and subscribes
+//                             to its indications. The sender becomes the owner. A connection that
+//                             fails, or a peripheral that goes before the link is up, is sought again
+//   (:send, bytes)            one segment, an indication to a central or a write with response to a
+//                             peripheral; (:radio, :sent, 0) when the peer has confirmed it
+//   (:rx_credit, n)           the owner takes n more segments; each comes as (:radio_rx, bytes)
+//   :drop                     ends the link, or the wait for one
+//
+// The owner gets (:radio, what, n):
+//   (:radio, :ready, 0)               the host is ready
+//   (:radio, :advertising, 0)         advertising has started
+//   (:radio, :advertise_failed, code) the wrapper's error code (6: the text is no UUID)
+//   (:radio, :connected, handle)      a central connected; advertising has stopped
+//   (:radio, :link_up, mtu)           the central subscribed, or this end has subscribed to the peripheral:
+//                                     segments of up to mtu bytes pass
+//   (:radio, :sent, code)             a segment ended: 0 confirmed, otherwise not delivered
+//   (:radio, :send_failed, code)      a :send was refused: 3 no link, 4 empty or longer than the mtu,
+//                                     5 eight segments already wait
+//   (:radio, :disconnected, reason)   the central left, NimBLE's reason (0x213 the central ended the
+//                                     link, 0x216 this end did, 0x208 the link was lost). After a link
+//                                     that was up the radio does not advertise again until the next
+//                                     :serve; a central that left before it subscribed is replaced
+//   (:radio, :reset, reason)          the host lost the controller; :ready follows when it is back
+//   (:radio, :start_failed, code)     the controller or the host did not start
+//   (:radio, :serve_failed, code)     the service was not published (6: the text is no UUID)
+//   (:radio, :seek_failed, code)      the search did not start (6: the text is no UUID), or the peripheral
+//                                     found cannot be used (1 no such service, 2 it lacks a characteristic
+//                                     to write or one that indicates, 3 no subscription, 4 it sent a
+//                                     segment while eight waited for the owner's credit, 5 it requires
+//                                     an encrypted link and the pairing failed); not sought again
+//
+// No call into the host waits. The actor looks for one event each 20 ms (1 ms after it found one), so
+// it never holds its core's scheduler. What the host reports reaches the owner in the order it
+// happened; a segment the owner had no credit for is delivered when the credit comes.
+module dangerous_ble_radio;
+
+use dangerous_nimble;
+
+export initial/0;
+export radio/2;
+
+// phase: 0 not started, 1 started and waiting for the host, 2 the host is ready. central: the central's
+// connection, -1 when there is none. up: the central has subscribed. waiting: segments the central
+// wrote that the owner has given no credit for yet.
+fn initial() -> { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } {
+    { owner: actor_ref_of_word(0), phase: 0, service: "", wanted: false, serving: false, seeking: false, up: false, central: 0 - 1, rx_credit: 0, waiting: 0 }
+}
+
+fn pure_int(r: (:ok, int64) | (:rejected, atom)) -> int64 {
+    case r of {
+        (:ok, v: int64) -> v;
+        (:rejected, _why: atom) -> 0 - 1
+    }
+}
+
+fn msg_kind(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:seek, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll) -> atom {
+    case msg of {
+        (:start, _o: actor_ref) -> :start;
+        (:serve, _o: actor_ref, _s: string) -> :serve;
+        (:seek, _o: actor_ref, _s: string) -> :seek;
+        (:advertise, _s: string) -> :advertise;
+        :stop_advertising -> :stop_advertising;
+        :memory -> :memory;
+        (:send, _s: string) -> :send;
+        (:rx_credit, _n: int64) -> :rx_credit;
+        :drop -> :drop;
+        :poll -> :poll
+    }
+}
+
+fn msg_owner(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:seek, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll, fallback: actor_ref) -> actor_ref {
+    case msg of {
+        (:start, o: actor_ref) -> o;
+        (:serve, o: actor_ref, _s: string) -> o;
+        (:seek, o: actor_ref, _s: string) -> o;
+        (:advertise, _s: string) -> fallback;
+        :stop_advertising -> fallback;
+        :memory -> fallback;
+        (:send, _s: string) -> fallback;
+        (:rx_credit, _n: int64) -> fallback;
+        :drop -> fallback;
+        :poll -> fallback
+    }
+}
+
+// The service of :serve and :advertise, the bytes of :send.
+fn msg_text(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:seek, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll, fallback: string) -> string {
+    case msg of {
+        (:start, _o: actor_ref) -> fallback;
+        (:serve, _o: actor_ref, s: string) -> s;
+        (:seek, _o: actor_ref, s: string) -> s;
+        (:advertise, s: string) -> s;
+        :stop_advertising -> fallback;
+        :memory -> fallback;
+        (:send, s: string) -> s;
+        (:rx_credit, _n: int64) -> fallback;
+        :drop -> fallback;
+        :poll -> fallback
+    }
+}
+
+fn msg_count(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:seek, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll) -> int64 {
+    case msg of {
+        (:start, _o: actor_ref) -> 0;
+        (:serve, _o: actor_ref, _s: string) -> 0;
+        (:seek, _o: actor_ref, _s: string) -> 0;
+        (:advertise, _s: string) -> 0;
+        :stop_advertising -> 0;
+        :memory -> 0;
+        (:send, _s: string) -> 0;
+        (:rx_credit, n: int64) -> n;
+        :drop -> 0;
+        :poll -> 0
+    }
+}
+
+// What the owner is told, in small functions so that the behaviour's own frame stays small: the
+// largest frame in a program sets the stack reserve of every actor on the board. Scalars only: a
+// record costs a frame far more than its fields.
+fn tell_start(owner: actor_ref, serve_failed: boolean, serve_code: int64, start_failed: boolean, start_code: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case serve_failed of {
+            true -> cast(owner, (:radio, :serve_failed, serve_code) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case start_failed of {
+            true -> cast(owner, (:radio, :start_failed, start_code) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_host(owner: actor_ref, ready_now: boolean, reset_now: boolean, connected: boolean, f0: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case ready_now of {
+            true -> cast(owner, (:radio, :ready, 0) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case reset_now of {
+            true -> cast(owner, (:radio, :reset, f0) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case connected of {
+            true -> cast(owner, (:radio, :connected, f0) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_up(owner: actor_ref, subscribed: boolean, mtu: int64, sent_now: boolean, f1: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case subscribed of {
+            true -> cast(owner, (:radio, :link_up, mtu) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case sent_now of {
+            true -> cast(owner, (:radio, :sent, f1) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_data(owner: actor_ref, got_rx: boolean, bytes_in: string, sending: boolean, do_send: boolean, send_code: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case got_rx of {
+            true -> cast(owner, (:radio_rx, bytes_in) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case sending of {
+            true -> case do_send and send_code == 0 of {
+                true -> true;
+                false -> cast(owner, (:radio, :send_failed, case do_send of { true -> send_code; false -> 3 }) impl ActorMessage {})
+            };
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_down(owner: actor_ref, disconnected: boolean, f1: int64, do_adv: boolean, adv_code: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case disconnected of {
+            true -> cast(owner, (:radio, :disconnected, f1) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case do_adv of {
+            true -> case adv_code == 0 of {
+                true -> cast(owner, (:radio, :advertising, 0) impl ActorMessage {});
+                false -> cast(owner, (:radio, :advertise_failed, adv_code) impl ActorMessage {})
+            };
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_seek(owner: actor_ref, seek_code: int64, fault_now: boolean, f1: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case seek_code != 0 of {
+            true -> cast(owner, (:radio, :seek_failed, seek_code) impl ActorMessage {});
+            false -> true
+        };
+        _: boolean <- case fault_now of {
+            true -> cast(owner, (:radio, :seek_failed, f1) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+fn tell_memory(owner: actor_ref, do_memory: boolean, m0: int64, m1: int64, m2: int64) -> boolean {
+    sequence proc[concurrency]
+        _: boolean <- case do_memory of {
+            true -> cast(owner, (:radio_memory, m0, m1, m2) impl ActorMessage {});
+            false -> true
+        }
+    produces
+        pure true
+    end
+}
+
+// The next state, built in two functions for the same reason.
+fn with_host(state: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 }, owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean) -> { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } {
+    { owner: owner, phase: phase, service: service, wanted: wanted, serving: serving, seeking: seeking, up: state.up, central: state.central, rx_credit: state.rx_credit, waiting: state.waiting }
+}
+
+fn with_link(state: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 }, up: boolean, central: int64, rx_credit: int64, waiting: int64) -> { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } {
+    { owner: state.owner, phase: state.phase, service: state.service, wanted: state.wanted, serving: state.serving, seeking: state.seeking, up: up, central: central, rx_credit: rx_credit, waiting: waiting }
+}
+
+// One mailbox message, one pass: the sequence proc[external_danger] is the whole body.
+fn radio(msg: (:start, actor_ref) | (:serve, actor_ref, string) | (:seek, actor_ref, string) | (:advertise, string) | :stop_advertising | :memory | (:send, string) | (:rx_credit, int64) | :drop | :poll, state: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 }) -> (:no_reply, { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 }) {
+    sequence proc[external_danger, transport]
+        kind: atom <- msg_kind(msg);
+        serve_now: boolean <- kind == :serve;
+        seek_now: boolean <- kind == :seek;
+        start_now: boolean <- kind == :start and state.phase == 0;
+        owner: actor_ref <- case start_now or serve_now or seek_now of { true -> msg_owner(msg, state.owner); false -> state.owner };
+        service: string <- case serve_now or seek_now or kind == :advertise of { true -> msg_text(msg, state.service); false -> state.service };
+        // the heap before the radio takes its share, and whenever the owner asks
+        do_memory: boolean <- start_now or (kind == :memory and state.phase != 0);
+        m0_raw: int64 <- case do_memory of { true -> dangerous_nimble@memory_value(0); false -> 0 };
+        m1_raw: int64 <- case do_memory of { true -> dangerous_nimble@memory_value(1); false -> 0 };
+        m2_raw: int64 <- case do_memory of { true -> dangerous_nimble@memory_value(2); false -> 0 };
+        m0: int64 <- pure_int(recreate(m0_raw));
+        m1: int64 <- pure_int(recreate(m1_raw));
+        m2: int64 <- pure_int(recreate(m2_raw));
+        // the service goes to the host before it starts
+        serve_code_raw: int64 <- case serve_now of {
+            true -> dangerous_nimble@serve_error(service);
+            false -> 0
+        };
+        serve_code: int64 <- pure_int(recreate(serve_code_raw));
+        served: boolean <- serve_now and serve_code == 0;
+        serve_failed: boolean <- serve_now and served == false;
+        starting: boolean <- start_now or ((served or seek_now) and state.phase == 0);
+        start_code_raw: int64 <- case starting of {
+            true -> dangerous_nimble@start_error();
+            false -> 0
+        };
+        start_code: int64 <- pure_int(recreate(start_code_raw));
+        started: boolean <- starting and start_code == 0;
+        start_failed: boolean <- starting and started == false;
+
+        polling: boolean <- kind == :poll and state.phase != 0;
+
+        // one event from the host
+        do_event: boolean <- polling;
+        event_kind_raw: int64 <- case do_event of {
+            true -> dangerous_nimble@event_kind();
+            false -> 0
+        };
+        event_kind: int64 <- pure_int(recreate(event_kind_raw));
+        got: boolean <- do_event and event_kind > 0;
+        f0_raw: int64 <- case got of {
+            true -> dangerous_nimble@event_value(0);
+            false -> 0
+        };
+        f1_raw: int64 <- case got of {
+            true -> dangerous_nimble@event_value(1);
+            false -> 0
+        };
+        f0: int64 <- pure_int(recreate(f0_raw));
+        f1: int64 <- pure_int(recreate(f1_raw));
+        ready_now: boolean <- got and event_kind == 1;
+        reset_now: boolean <- got and event_kind == 2;
+        adv_ended: boolean <- got and event_kind == 3;
+        connected: boolean <- got and event_kind == 4 and f1 == 0;
+        connect_failed: boolean <- got and event_kind == 4 and f1 != 0;
+        disconnected: boolean <- got and event_kind == 5;
+        subscribed: boolean <- got and event_kind == 6 and f1 == 1 and f0 == state.central and state.up == false;
+        sent_now: boolean <- got and event_kind == 7;
+        written: boolean <- got and event_kind == 8;
+        fault_now: boolean <- got and event_kind == 9;
+
+        // one segment the central wrote, when the owner has credit for it: as its :written event comes,
+        // so that what the host reports reaches the owner in the order it happened, or later, when the
+        // credit does
+        credit: int64 <- case kind == :rx_credit of { true -> state.rx_credit + msg_count(msg); false -> state.rx_credit };
+        waiting: int64 <- case written of { true -> state.waiting + 1; false -> state.waiting };
+        do_rx: boolean <- (polling or kind == :rx_credit) and state.up and waiting > 0 and credit > 0;
+        rx_length_raw: int64 <- case do_rx of {
+            true -> dangerous_nimble@recv_length(state.central);
+            false -> 0
+        };
+        rx_length: int64 <- pure_int(recreate(rx_length_raw));
+        got_rx: boolean <- do_rx and rx_length > 0;
+        bytes_in: string <- case got_rx of {
+            true -> dangerous_nimble@take(state.central);
+            false -> ""
+        };
+        mtu_raw: int64 <- case subscribed of {
+            true -> dangerous_nimble@mtu_value(f0);
+            false -> 0
+        };
+        mtu: int64 <- pure_int(recreate(mtu_raw));
+        phase_next: int64 <- case started of {
+            true -> 1;
+            false -> case ready_now of {
+                true -> 2;
+                false -> case reset_now of { true -> 1; false -> state.phase }
+            }
+        };
+        serving: boolean <- served or state.serving;
+        // the role of what is wanted: the central's while a :seek is the last request for a link
+        seeking: boolean <- case seek_now of {
+            true -> true;
+            false -> case served or kind == :advertise of { true -> false; false -> state.seeking }
+        };
+        dropping: boolean <- kind == :drop;
+        // a served link that was up and is lost ends the service until the next :serve
+        link_lost: boolean <- (disconnected and f0 == state.central) or reset_now;
+        ended: boolean <- state.up and link_lost;
+        wanted: boolean <- case kind == :advertise or served or seek_now of {
+            true -> true;
+            false -> case kind == :stop_advertising or dropping or ended or fault_now of { true -> false; false -> state.wanted }
+        };
+        up_next: boolean <- case subscribed of {
+            true -> true;
+            false -> case link_lost or dropping or served or seek_now of { true -> false; false -> state.up }
+        };
+        link_next: int64 <- case connected of {
+            true -> f0;
+            false -> case link_lost of { true -> 0 - 1; false -> state.central }
+        };
+
+        // advertise: when asked and the host is ready, when it becomes ready, and again when
+        // advertising ended or the central left
+        resume: boolean <- ready_now or adv_ended or connect_failed or disconnected;
+        do_adv: boolean <- wanted and seeking == false and phase_next == 2 and (kind == :advertise or served or resume);
+        // seek: the same for the central's role, and again when a connection failed or a peripheral
+        // left before the link was up
+        do_seek: boolean <- wanted and seeking and phase_next == 2 and (seek_now or resume);
+        seek_code_raw: int64 <- case do_seek of {
+            true -> dangerous_nimble@seek_error(service);
+            false -> 0
+        };
+        seek_code: int64 <- pure_int(recreate(seek_code_raw));
+        adv_code_raw: int64 <- case do_adv of {
+            true -> dangerous_nimble@advertise_error(service);
+            false -> 0
+        };
+        adv_code: int64 <- pure_int(recreate(adv_code_raw));
+        do_stop: boolean <- (kind == :stop_advertising or dropping) and state.phase == 2;
+        _: int64 <- case do_stop of {
+            true -> dangerous_nimble@stop_advertising_error();
+            false -> 0
+        };
+        do_drop: boolean <- dropping and state.phase == 2;
+        _: int64 <- case do_drop of {
+            true -> dangerous_nimble@drop_error(state.central);
+            false -> 0
+        };
+        sending: boolean <- kind == :send;
+        do_send: boolean <- sending and state.up;
+        segment: string <- msg_text(msg, "");
+        send_code_raw: int64 <- case do_send of {
+            true -> dangerous_nimble@send_error(state.central, segment);
+            false -> 0
+        };
+        send_code: int64 <- pure_int(recreate(send_code_raw));
+
+        _: boolean <- tell_start(owner, serve_failed, serve_code, start_failed, start_code);
+        _: boolean <- tell_host(owner, ready_now, reset_now, connected, f0);
+        _: boolean <- tell_up(owner, subscribed, mtu, sent_now, f1);
+        _: boolean <- tell_data(owner, got_rx, bytes_in, sending, do_send, send_code);
+        _: boolean <- tell_down(owner, disconnected, f1, do_adv, adv_code);
+        _: boolean <- tell_seek(owner, seek_code, fault_now, f1);
+        _: boolean <- tell_memory(owner, do_memory, m0, m1, m2);
+        // an :advertise the host refused is not asked again
+        wanted_next: boolean <- wanted and (do_adv == false or adv_code == 0) and seek_code == 0;
+        credit_next: int64 <- case got_rx of { true -> credit - 1; false -> credit };
+        // a new central starts with nothing waiting; a segment the wrapper no longer has is not waited for
+        waiting_next: int64 <- case connected or (do_rx and got_rx == false) of {
+            true -> 0;
+            false -> case got_rx of { true -> waiting - 1; false -> waiting }
+        };
+        keep_polling: boolean <- started or (polling and phase_next != 0);
+        poll_delay: uint64 <- case got or got_rx of { true -> 1; false -> 20 };
+        _: boolean <- case keep_polling of {
+            true -> {
+                sequence proc[concurrency]
+                    _: timer_ref <- send_after(poll_delay, self(), :poll impl ActorMessage {})
+                produces
+                    pure true
+                end
+            };
+            false -> true
+        };
+        host_next: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } <- with_host(state, owner, phase_next, service, wanted_next, serving, seeking);
+        next: { owner: actor_ref, phase: int64, service: string, wanted: boolean, serving: boolean, seeking: boolean, up: boolean, central: int64, rx_credit: int64, waiting: int64 } <- with_link(host_next, up_next, link_next, credit_next, waiting_next)
+    produces
+        pure (:no_reply, next)
+    end
+}

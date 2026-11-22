@@ -10621,7 +10621,7 @@ wireframe@unframe(state: { mode: atom, expected: int64, pending: string }, segme
 
 #### 16.4.8 Carriers
 
-A carrier is an actor the language provides, one built-in implementation per carrier kind (`:tcp`, `:udp`, `:serial`), installed by the
+A carrier is an actor the language provides, one built-in implementation per carrier kind (`:tcp`, `:udp`, `:serial`, `:ble_gatt`), installed by the
 program with `spawn_dangerous_carrier` from a `carried_on` declaration (§16.4.9) or with `spawn_dangerous` (hosted carriers are Fifi wrappers over the host's sockets and serial ports)
 and spoken to only through casts. `Carrier` is a closed trait (E2409); its properties are literals per tag,
 read through the built-in module `carrier` by the tag's atom (the design's `Carrier@mtu((:tcp))` is the same
@@ -10667,6 +10667,19 @@ socket only; the connections it accepted live on.
 | `:tcp` | `dangerous_tcp_carrier@carrier` | `"host:port:timeout_ms"` connects and waits at most `timeout_ms` milliseconds for the peer to answer (the connect timeout is stated in the address, 1 to 9 decimal digits, greater than 0; there is no default, and `"host:port"` without it is a malformed address; `:link_up` carries `"host:port"`); `"listen:port"` listens on 127.0.0.1 (port 0 picks a free port; `:link_up` carries `"port:<n>"` once bound), `"listen:any:port"` the same on every IPv4 interface (0.0.0.0), and announces every accepted peer with `(:accepted, conn, "peer:accepted")`; the accepted connection's `:link_up` carries `"peer:accepted"` | 0 | `:stream` | `:reliable_ordered` |
 | `:udp` | `dangerous_udp_carrier@carrier` | `"host:port@local"`: the peer of every `:tx` (the link does not restrict it), and the local address to bind (`:link_up` carries `"port:<n>"`); `local` is `<port>`, `<ipv4>:<port>` or `any:<port>`: with no link `<port>` binds 127.0.0.1, `any` 0.0.0.0, an ip that ip; under `(:loopback)` `any` is refused and an ip must lie in 127.0.0.0/8; under a named link `<port>` binds the interface's first IPv4 address, `any` is refused and an ip must be that interface's address; a refusal tells the owner `(:link_down, :fault)` and ends `(:explicit, :link_unavailable)`; a malformed peer host or local ip ends `(:explicit, :bad_address)` (strict dotted quad) | 65507 | `:datagram` | `:unreliable` |
 | `:serial` | `dangerous_serial_carrier@carrier` | `""` when the port is declared (`carried_on ... (:serial_port, path, baud)`, §16.4.9), else `"path@baud"`; raw 8N1; `:link_up` carries `"path@baud"` | 0 | `:stream` | `:reliable_ordered` |
+| `:ble_gatt` | `dangerous_ble_gatt_carrier@carrier` (Apple Silicon macOS only) | `"central:<uuid>"` scans for a peripheral offering the service and connects; `"peripheral:<uuid>"` advertises the service and waits for a central; `<uuid>` is the service's UUID, and nothing after the colon means the Nordic UART Service; `:link_up` carries `"mtu:<n>"`, the largest segment the link negotiated | 20 | `:datagram` | `:reliable_ordered` |
+
+The `:ble_gatt` carrier (2026-11-10, stage 3 of [transport_ble_plan.md](transport_ble_plan.md)) moves one segment
+per `:tx`: a write with response toward a peripheral, an indication toward a central, so both directions are
+acknowledged. Its `mtu` row is the floor every connection has; a link that negotiated more says so in `:link_up`, and
+an owner that wants larger segments passes that value to `wireframe@frame`. The service has one characteristic toward
+each side. A peripheral publishes them at the service's UUID plus 1 (written by the central) and plus 2 (indicated to
+the central) in the UUID's first group, as the Nordic UART Service does; a central finds them by their properties. A
+segment longer than the link's mtu is `(:tx_failed, :too_long)`. `:link_down` carries `:closed` after `:close` or
+when the peer ended the link, `:timeout` when the link was lost, and `:fault` for an address that names no role, an
+unreadable UUID, or an adapter that is off or not permitted. Its wrapper is the dangerous module `dangerous_ble`
+over `libsilica_ble.a` (Objective-C over CoreBluetooth, `compiler/stdlib/ble/`), linked with
+`-framework CoreBluetooth -framework Foundation`.
 
 A carrier's initial state is the record its module's `initial/0` spells; a program that installs a carrier through
 `spawn_dangerous` writes that literal (a `dangerous_*` function cannot be called outside an `external_danger` block);
@@ -10710,7 +10723,7 @@ binding, the interface-family resolution and the `(:explicit, :link_unavailable)
 
 **Status 2026-11-18.** The Linux AArch64 and Linux x86-64 packs now list the hosted links (`loopback`, `interface`, `ethernet`, `wifi`, `serial_port`, `memory`, `backing`; `transport_pack.silica` of each target), and the hosted carriers now bind to the named interface and end with `(:explicit, :link_unavailable)` when it cannot be used (commits `b943620c00`, `6e3f85e229`; trials `transport_addition/app_transport_tcp_link_rules` and `app_transport_udp_link_rules`, with Linux goldens). The Nucleo pack still lists no link.
 
-A carrier's kind names how bytes travel (`:tcp`, `:udp`, `:serial`). A **link** is the hardware layer under it: the OS
+A carrier's kind names how bytes travel (`:tcp`, `:udp`, `:serial`, `:ble_gatt`). A **link** is the hardware layer under it: the OS
 interface on a hosted target, or the UART, the USB-Serial-JTAG controller, a Wi-Fi station or an Ethernet MAC on a
 board. A link is a tag followed by parameters, written as a tagged tuple such as `(:uart, 1, 115200)`. A link is read
 by the compiler only: it is literal, never a run-time value, and a one-atom link such as `(:loopback)` is a type-level
@@ -10726,6 +10739,16 @@ tag like a protocol tag (§16.4.1). The language names these links:
 | `(:serial_port, path, baud)` | a string literal, an integer literal | `:serial` | hosted: a termios port |
 | `(:usb_cdc, n)` | an integer literal | `:serial` | board, later |
 | `(:usb_serial_jtag)` | none | `:serial` | ESP32-S3: the native USB-C jack through the USB-Serial-JTAG controller |
+| `(:bluetooth, n)` | an integer literal | `:ble_gatt` | hosted: the host's n-th Bluetooth adapter; Apple Silicon macOS provides instance 0. ESP32-S3: instance 0, the chip's own radio, in a program built as a guest of ESP-IDF |
+
+**Bluetooth (2026-11-10, stages 2 and 3 of [transport_ble_plan.md](transport_ble_plan.md)).** The carrier kind
+`:ble_gatt` and the link `(:bluetooth, n)` are named by the language and checked by the compiler
+(E2408, E2413, E2414, E2417), and have their rows in `Carrier` and `Link`. The Apple Silicon macOS pack
+provides the kind on `(:bluetooth, 0)`, the carrier of §16.4.8; another adapter instance is E2412
+there. The ESP32-S3 pack provides the kind on `(:bluetooth, 0)`, the chip's own radio, in both roles
+(2026-11-14, stages 7 and 9 of the same plan), for a program built as a guest of ESP-IDF; its carrier is an
+ordinary actor, so `spawn_dangerous_carrier` answers an `actor_ref` there. No other target's pack provides
+the kind, so the declaration is E2410 on them.
 
 **The carrier declaration.** A top-level form, a pure declaration with no effects; `carried_on` is a reserved word:
 
@@ -10792,7 +10815,7 @@ C UART on the STM32-L476RG_raw; D network links on boards, later.
 | Code | Check |
 | --- | --- |
 | E1081 | a `carried_on` line that does not have the form above (the declaration is never skipped silently), or a `spawn_dangerous_carrier` whose first argument is not a `carried_on` declaration of the module |
-| E2408 | the carrier kind is not one the language names (`:tcp`, `:udp`, `:serial`); the same code as a misspelt protocol tag |
+| E2408 | the carrier kind is not one the language names (`:tcp`, `:udp`, `:serial`, `:ble_gatt`); the same code as a misspelt protocol tag |
 | E2410 | the carrier kind is not provided by the build's target (the kind row of the pack), at the declaration or at the spawn |
 | E2412 | a carrier declaration names a link the target's transport pack does not provide, including a UART instance that is the target's console (the message says so and lists the links the target provides); raised wherever the declaration appears, even unused, and at a `spawn_dangerous_carrier` of it |
 | E2413 | a link tag the language does not name |
