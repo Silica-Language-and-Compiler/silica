@@ -62,7 +62,7 @@ What is there now:
     - **A bridge** runs both. Edge nodes reach stable services through it, and from there TRUST's rules apply: TEMPUS decides who may be a member, and TRUST decides what a member may do.
 - A balancer that moves actors between cores the way the BEAM balances run queues, using `migrate_actor`. It is trialled on the three hosted targets, and an ESP32-S3 version of the example exists.
 
-Still being developed for a full and complete BEES extension: TEMPUS configuration improvements and churn and soak measurements; the OTP `gen` call and cast protocol, so compiled code can call `gen_server`s on OTP nodes and the other way round; sending a node's logs through the storage carrier; reading `bees.config` at boot instead of at build time; TLS and transport on the boards, starting with the ESP32-S3; work stealing in the balancer; and an external security review before a first release. `development-plan/roadmap.md` has the detail.
+Still being developed for a full and complete BEES extension: TEMPUS configuration improvements and churn and soak measurements; the OTP `gen` call and cast protocol, so compiled code can call `gen_server`s on OTP nodes and the other way round; sending a node's logs through the storage carrier; reading `bees.config` at boot instead of at build time; TLS and transport on the boards, starting with the ESP32-S3; and work stealing in the balancer. `development-plan/roadmap.md` has the detail.
 
 ## to-silica
 
