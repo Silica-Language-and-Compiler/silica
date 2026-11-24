@@ -10,7 +10,7 @@ permalink: /project-status/
 
 > **Pre-release.** Silica, BEES and to-silica are all pre-release. None of them has had a first release yet. A security review has been done, and the interfaces, wire contracts and file formats are stabilized, though they may see minor changes in the future. Try it, build on it for experiments, and tell us what breaks, but do not deploy it where failure matters.
 
-This page is an update, from the Silica Steering Committee, on where the Silica-based projects it oversees stand. The committee works through the [Silica-Language-and-Compiler](https://github.com/Silica-Language-and-Compiler) GitHub organization, which is responsible for overseeing the Silica language and its standard components: the compiler, BEES, the transpilers, the book, and the CLI and examples repos. Everything below is public there. This is an overview; the repos have the details.
+This page is an update, from the Silica Steering Committee, on where the Silica-based projects it oversees stand. The committee works through the [Silica-Language-and-Compiler](https://github.com/Silica-Language-and-Compiler) GitHub organization ([website](https://silica-language-and-compiler.github.io/)), which is responsible for overseeing the Silica language and its standard components: the compiler, BEES, the transpilers, the book, and the CLI and examples repos. Everything below is public there. This is an overview; the repos have the details.
 
 Two highlights for people who work with the BEAM:
 
