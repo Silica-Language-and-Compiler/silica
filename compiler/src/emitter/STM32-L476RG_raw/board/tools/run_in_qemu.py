@@ -15,16 +15,17 @@
 
 """Run a bare-metal STM32L476RG (NUCLEO-L476RG) RAM image in QEMU instead of on the board.
 
-    run_on_board.py [--timeout S] [--out FILE]
+    SILICA_BOARD_EMULATOR=qemu run_on_board.py [--timeout S] [--out FILE]
                     [--send TEXT [--send-delay S] [--send-marker M [--send-marker-count N]]] image.elf
-    run_on_board.py --probe
-    run_on_board.py --list-ports
-    run_on_board.py --print-qemu image.elf
+    SILICA_BOARD_EMULATOR=qemu run_on_board.py --probe | --list-ports | --print-qemu image.elf
+    run_in_qemu.py ...                (the same, without the variable)
 
-The interface, the console protocol (the START / EXIT markers, --send after the start marker and the
-trial's marker) and the exit statuses are those of the board runner, ../../tools/run_on_board.py, whose
-capture code this one imports; only the load differs. The image is the one ../../tools/build_image.sh
-builds for the board (the same runtime, linker script and emitted code).
+run_on_board.py hands its whole command line to this module when SILICA_BOARD_EMULATOR=qemu, as the
+ESP32-S3_raw runner does, so the STM32-L476RG_raw trial target runs in QEMU with that variable set
+(see ../QEMU.md). The interface, the console protocol (the START / EXIT markers, --send after the start
+marker and the trial's marker) and the exit statuses are those of the board runner, whose capture code
+this one imports; only the load differs. The image is the one build_image.sh builds with
+SILICA_BOARD_EMULATOR=qemu (the board's runtime, linker script and emitted code, BOARD_QEMU defined).
 
 The machine: QEMU's `b-l475e-iot01a`, an STM32L475VG. The L475 and the L476 are the same STM32L4x5/L4x6
 die family: Cortex-M4F at 80 MHz, SRAM1 96 KiB at 0x2000_0000, SRAM2 32 KiB at 0x1000_0000, the same RCC,
@@ -39,9 +40,9 @@ QEMU's generic loader; `_start` then sets sp and VTOR itself, as on the board. N
 The wall clock: as on the board, the host's Unix time in milliseconds is written into the runtime's
 `silica_rt_wall_clock` (.data) before the start, here by patching a copy of the ELF.
 
-What the model does not have (see ../README.md): the ST-LINK, real timing (QEMU runs as fast as the host
+What the model does not have (see ../QEMU.md): the ST-LINK, real timing (QEMU runs as fast as the host
 lets it, SysTick follows the host's clock), the flash interface (FLASH_ACR is an unimplemented device:
-reads give 0, so the runtime is assembled with BOARD_QEMU for this target: see build_image.sh here),
+reads give 0, so build_image.sh assembles the runtime with BOARD_QEMU under SILICA_BOARD_EMULATOR=qemu),
 and bus faults on unmapped addresses that the silicon raises.
 
 Environment: SILICA_QEMU_ARM, the qemu-system-arm to run (default: the one on PATH, then Homebrew's);
@@ -67,9 +68,9 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BOARD_RUNNER = os.path.join(HERE, "..", "..", "tools", "run_on_board.py")
+BOARD_RUNNER = os.path.join(HERE, "run_on_board.py")
 
-sys.dont_write_bytecode = True   # no __pycache__ left in the board's tools/
+sys.dont_write_bytecode = True   # no __pycache__ left in tools/
 _spec = importlib.util.spec_from_file_location("stm32_run_on_board", BOARD_RUNNER)
 board = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(board)
@@ -288,6 +289,8 @@ def main():
     mode.add_argument("--probe", action="store_true", help="check QEMU and its machine; print a description")
     mode.add_argument("--list-ports", action="store_true", help="print the pseudo port name, qemu")
     mode.add_argument("--print-qemu", action="store_true", help="print the QEMU command for the image and exit")
+    ap.add_argument("--exec", dest="exec_mode", choices=("ram", "flash"), default="ram",
+                    help="ram only: QEMU runs RAM images (flash is refused)")
     ap.add_argument("--expect-serial", default="", help="accepted and ignored (board interface)")
     ap.add_argument("--expect-mac", default="", help="accepted and ignored (board interface)")
     ap.add_argument("--send", help="text to write to the console after the start marker (Python escapes, e.g. 'exit\\n')")
@@ -295,6 +298,9 @@ def main():
     ap.add_argument("--send-marker", help="with --send: also wait until the output holds this marker (then quiet)")
     ap.add_argument("--send-marker-count", type=int, default=1, help="occurrences of --send-marker to wait for (default 1)")
     a = ap.parse_args()
+    if a.exec_mode != "ram":
+        sys.stderr.write("run_on_board: --exec flash is refused under SILICA_BOARD_EMULATOR=qemu (RAM images only)\n")
+        return 2
     if a.send_marker:
         board.SEND_MARKER = a.send_marker.encode("utf-8")
         board.SEND_MARKER_COUNT = max(1, a.send_marker_count)

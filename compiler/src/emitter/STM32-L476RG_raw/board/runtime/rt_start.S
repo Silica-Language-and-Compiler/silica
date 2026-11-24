@@ -150,7 +150,7 @@
     orr     r0, r0, #FLASH_ACR_LATENCY_4WS
     str     r0, [r2]
 .ifndef BOARD_QEMU
-    // BOARD_QEMU (the STM32-L476RG_qemu trial target, board/qemu/): QEMU's STM32L4x5 has no flash
+    // BOARD_QEMU (build_image.sh under SILICA_BOARD_EMULATOR=qemu, ../QEMU.md): QEMU's STM32L4x5 has no flash
     // interface model (FLASH is an unimplemented device: reads give 0), so this read-back would never
     // end there. The write above is kept; the board's image is assembled without the symbol. The loop's
     // 12 bytes become 6 narrow NOPs, so every address and the heap size are the board image's.

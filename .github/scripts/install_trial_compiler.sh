@@ -3,9 +3,9 @@
 # README says to (https://github.com/Silica-Language-and-Compiler/silica-cli#install),
 # then point binaries/ at it.
 # Host targets replace binaries/silica-compiler. ESP32-S3_raw also installs the cross
-# compiler and replaces binaries/silica-compiler-ESP32-S3_raw. STM32-L476RG_qemu (the emulated
-# Nucleo) installs the STM32-L476RG_raw cross compiler as binaries/silica-compiler-STM32-L476RG_raw;
-# the workflow runs this only when that compiler is released (released_compiler_exists.sh).
+# compiler and replaces binaries/silica-compiler-ESP32-S3_raw; STM32-L476RG_raw likewise
+# (binaries/silica-compiler-STM32-L476RG_raw). The workflow installs the STM32 one only when it is
+# released (released_compiler_exists.sh).
 #
 # This is the latest release, not a compiler built from this commit.
 
@@ -26,7 +26,7 @@ case "$target" in
         installed="$SILICA_HOME/bin/silica-compiler-ESP32_S3_raw"
         link="silica-compiler-ESP32-S3_raw"
         ;;
-    STM32-L476RG_qemu|STM32-L476RG_raw)
+    STM32-L476RG_raw)
         "$silica" update --target STM32-L476RG_raw
         installed="$SILICA_HOME/bin/silica-compiler-STM32_L476RG_raw"
         link="silica-compiler-STM32-L476RG_raw"

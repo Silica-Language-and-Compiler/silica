@@ -11,7 +11,7 @@ Makefiles compare against (trials/silica_compiler.mk ASCOMP_EXT):
   linux_aarch64      <stem>.linux_aarch64.ascomp
   linux_x86_64       <stem>.linux_x86_64.ascomp
   ESP32-S3_raw       <stem>.esp32_s3.ascomp      (TARGET_ASCOMP_PLATFORM of trials/targets/ESP32-S3_raw.conf)
-  STM32-L476RG_qemu  <stem>.st_nucleo.ascomp     (TARGET_ASCOMP_PLATFORM of trials/targets/STM32-L476RG_qemu.conf)
+  STM32-L476RG_raw   <stem>.st_nucleo.ascomp     (TARGET_ASCOMP_PLATFORM of trials/targets/STM32-L476RG_raw.conf)
 
 Hosted runs leave the .sams next to the trial sources. A board run compiles in
 trials/.target/<target>/<suite>/src/ (and .../apps/<app>/ for the ffi_addition apps) and compares

@@ -23,7 +23,7 @@ same tools usually work; older ones are untested.
 | Build or run trials on another machine over ssh | Host tools on both, plus [`rsync` and key-based `ssh`](#building-across-machines) |
 | Build the ESP32-S3 cross compiler | Host tools on the machine you build it from |
 | Build ESP32-S3 images, run programs or trials on a board | Host tools plus the [ESP32-S3 board tools](#esp32-s3-board-tools) and a [board](#the-board) |
-| Run the NUCLEO-L476RG trials without a board (`TRIAL_TARGET=STM32-L476RG_qemu`) | Host tools plus the [emulated Nucleo tools](#emulated-nucleo-l476rg-tools) |
+| Run the NUCLEO-L476RG trials without a board (`SILICA_BOARD_EMULATOR=qemu`, `TRIAL_TARGET=STM32-L476RG_raw`) | Host tools plus the [emulated Nucleo tools](#emulated-nucleo-l476rg-tools) |
 
 ## Host tools (macOS on Apple Silicon)
 
@@ -132,8 +132,9 @@ It is installed as `binaries/silica-NNNNNN-ESP32_S3_raw-<platform>`, with its ow
 
 ## Emulated NUCLEO-L476RG tools
 
-The `STM32-L476RG_qemu` trial target runs what `binaries/silica-compiler-STM32-L476RG_raw` emits in QEMU's
-STM32L4x5 model instead of on a Nucleo (`compiler/src/emitter/STM32-L476RG_raw/board/qemu/README.md`).
+With `SILICA_BOARD_EMULATOR=qemu`, the `STM32-L476RG_raw` trial target runs what
+`binaries/silica-compiler-STM32-L476RG_raw` emits in QEMU's STM32L4x5 model instead of on a Nucleo
+(`compiler/src/emitter/STM32-L476RG_raw/board/QEMU.md`).
 
 | Software | Version used | Used for |
 | -------- | ------------ | -------- |
@@ -143,7 +144,7 @@ STM32L4x5 model instead of on a Nucleo (`compiler/src/emitter/STM32-L476RG_raw/b
 
 ```bash
 brew install qemu arm-none-eabi-gcc arm-none-eabi-binutils
-python3 compiler/src/emitter/STM32-L476RG_raw/board/qemu/tools/run_on_board.py --probe
+SILICA_BOARD_EMULATOR=qemu python3 compiler/src/emitter/STM32-L476RG_raw/board/tools/run_on_board.py --probe
 ```
 
 ## Checking an installation

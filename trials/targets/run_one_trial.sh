@@ -61,8 +61,18 @@ conf="$here/$target.conf"
 TARGET_DESCRIPTION=""; TARGET_BOARD_DIR=""; TARGET_PYTHON=""; TARGET_ASCOMP_PLATFORM=""
 TARGET_IMAGE_EXT="bin"; TARGET_PORT_DEFAULT=""; TARGET_PY_MODULES="esptool serial"; TARGET_TOOLS=""
 TARGET_COMPILER=""; TARGET_GOLDENS=""; TARGET_RUN_SLOTS=1
+TARGET_EMULATOR_PYTHON=""; TARGET_EMULATOR_PY_MODULES=""; TARGET_EMULATOR_TOOLS=""; TARGET_EMULATOR_RUN_SLOTS=""
 # shellcheck disable=SC1090
 . "$conf"
+# SILICA_BOARD_EMULATOR=qemu: the conf's TARGET_EMULATOR_* settings apply (trial_target.sh apply_emulator_settings)
+emulated=0
+if [ "${SILICA_BOARD_EMULATOR:-}" = qemu ] && [ -n "$TARGET_EMULATOR_TOOLS" ]; then
+    emulated=1
+    [ -z "$TARGET_EMULATOR_PYTHON" ] || TARGET_PYTHON=$TARGET_EMULATOR_PYTHON
+    [ -z "$TARGET_EMULATOR_PY_MODULES" ] || TARGET_PY_MODULES=$TARGET_EMULATOR_PY_MODULES
+    TARGET_TOOLS=$TARGET_EMULATOR_TOOLS
+    [ -z "$TARGET_EMULATOR_RUN_SLOTS" ] || TARGET_RUN_SLOTS=$TARGET_EMULATOR_RUN_SLOTS
+fi
 tools="$repo_root/$TARGET_BOARD_DIR/tools"
 py="${BOARD_PYTHON:-$TARGET_PYTHON}"
 compiler="${BOARD_SILICA_COMPILER:-$repo_root/binaries/silica-compiler-${TARGET_COMPILER:-$target}}"
@@ -78,8 +88,9 @@ trap 'exit 130' INT TERM
 for t in $TARGET_TOOLS; do command -v "$t" > /dev/null 2>&1 || die "$t not found on PATH"; done
 [ -f "$tools/run_on_board.py" ] && [ -f "$tools/build_image.sh" ] || die "board tools missing under $tools"
 
-# Port, as trial_target.sh chooses it (without the interactive menu).
+# Port, as trial_target.sh chooses it (without the interactive menu); the emulator's is "qemu".
 port=${BOARD_PORT:-}
+[ "$emulated" = 0 ] || port=qemu
 if [ -z "$port" ] && [ -n "$TARGET_PORT_DEFAULT" ] && [ -e "$TARGET_PORT_DEFAULT" ]; then port=$TARGET_PORT_DEFAULT; fi
 if [ -z "$port" ]; then
     ports=$("$py" "$tools/run_on_board.py" --list-ports)

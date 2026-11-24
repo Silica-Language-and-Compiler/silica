@@ -641,7 +641,7 @@ if [ "${#appdirs[@]}" -gt 0 ]; then
     export XTENSA_BIN=${XTENSA_BIN:-$HOME/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin}
     # the board's C fixtures: fixtures_board_<emit target>.mk when the suite has one (STM32-L476RG_raw),
     # else fixtures_board.mk (ESP32-S3_raw); each builds fixtures/build/<emit target>/. The emit target
-    # is the compiler's (BOARD_EMIT_TARGET): STM32-L476RG_qemu links the STM32-L476RG_raw fixtures.
+    # is the compiler's (BOARD_EMIT_TARGET): ESP32-S3_idf links the ESP32-S3_raw fixtures.
     fixtures_mk="$src/fixtures_board.mk"
     [ -f "$src/fixtures_board_$emit_target.mk" ] && fixtures_mk="$src/fixtures_board_$emit_target.mk"
     view="$src/fixtures/build/$emit_target/dangerous_exposure_source"

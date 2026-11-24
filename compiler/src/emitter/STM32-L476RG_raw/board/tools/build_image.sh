@@ -84,9 +84,20 @@ fi
 # calling convention. -ffixed-r9 keeps C away from TP (rt_defs.h).
 ARCH="-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=softfp"
 # The runtime sources are preprocessed (.S: rt_defs.h); emitted .sams are plain assembler.
-# BOARD_ASFLAGS adds assembler flags to every source (the QEMU trial target's wrapper, ../qemu/tools/build_image.sh,
-# passes -Wa,--defsym,BOARD_QEMU=1; unset for the board, whose images are unchanged by it).
+# BOARD_ASFLAGS adds assembler flags to every source.
+# SILICA_BOARD_EMULATOR=qemu builds the image for QEMU's STM32L4x5 model (tools/run_in_qemu.py, ../QEMU.md):
+# every source is assembled with BOARD_QEMU defined (rt_start.S then skips the FLASH_ACR read-back QEMU
+# cannot give; the layout stays the board's), the runtime cache is kept apart (<cache>/qemu, so board and
+# emulator objects never mix) and flash images are refused. Unset: the board's images, unchanged.
 ASFLAGS="-c $ARCH -I$RT ${BOARD_ASFLAGS:-}"
+if [ "${SILICA_BOARD_EMULATOR:-}" = qemu ]; then
+    if [ "${BOARD_EXEC:-ram}" != ram ]; then
+        echo "$0: SILICA_BOARD_EMULATOR=qemu builds RAM images only (BOARD_EXEC=${BOARD_EXEC})" >&2
+        exit 2
+    fi
+    ASFLAGS="$ASFLAGS -Wa,--defsym,BOARD_QEMU=1"
+    [ -z "$rtcache" ] || rtcache="$rtcache/qemu"
+fi
 LDSCRIPT="$RT/silica_stm32l476rg.ld"
 case "${BOARD_EXEC:-ram}" in
     ram) ;;
