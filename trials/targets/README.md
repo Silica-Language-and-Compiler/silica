@@ -218,6 +218,24 @@ bash trials/targets/run_one_trial.sh STM32-L476RG_raw base test     # one trial,
 - [STM32-L476RG_raw.skip](STM32-L476RG_raw.skip) skips every suite but `base` for now (the runtime has no
   message copier, call, failure reports yet); delete a suite's line to widen the run.
 
+### STM32-L476RG_raw in QEMU (no board)
+
+```
+SILICA_BOARD_EMULATOR=qemu make integrate TRIAL_TARGET=STM32-L476RG_raw                     # every suite, no board
+SILICA_BOARD_EMULATOR=qemu bash trials/targets/run_one_trial.sh STM32-L476RG_raw base test  # one trial
+```
+
+- With `SILICA_BOARD_EMULATOR=qemu` (as for `ESP32-S3_raw` in CI) the same target builds every image for
+  QEMU's STM32L4x5 model and runs it in `qemu-system-arm` instead of on the Nucleo: same compiler, goldens
+  and skip list. The conf's `TARGET_EMULATOR_*` settings replace the board's preflight (any Python 3,
+  `qemu-system-arm` and the Arm toolchain instead of pyserial, OpenOCD and stlink); the port is the pseudo
+  port `qemu` and the probe checks that QEMU has the `b-l475e-iot01a` machine.
+- It is the same target as the board run: one lock, mirror, `<trial>.STM32-L476RG_raw.sout` and report, so the
+  two never run at once; the report's `board:` line says which one ran.
+- Programs run `TARGET_EMULATOR_RUN_SLOTS` (4) at a time, one QEMU each (`BOARD_RUN_SLOTS=N` overrides; the
+  board keeps one). How the image is loaded and what the model leaves out:
+  [compiler/src/emitter/STM32-L476RG_raw/board/QEMU.md](../../compiler/src/emitter/STM32-L476RG_raw/board/QEMU.md).
+
 `run_one_trial.sh <target> <suite> <stem>` runs one program or compile-failure trial through
 `board_suite.sh` (`BOARD_ONLY_STEM`), prints the diff on a mismatch, keeps its work area (`--work <dir>`
 or a new directory under `$TMPDIR`) and works for both board targets. It refuses to start while a
@@ -240,6 +258,8 @@ or a new directory under `$TMPDIR`) and works for both board targets. It refuses
 | `SILICA_BUILD_HOSTS` | `.silica_build_hosts` in the repository root | the machine list |
 | `BOARD_TRIAL_TIMEOUT` | 300 | seconds a program may run on the board before it counts as hung |
 | `BOARD_FAIL_JOBS` | 4 | compile-failure trials compiled at once |
+| `BOARD_RUN_SLOTS` | the conf's `TARGET_RUN_SLOTS` (1), or `TARGET_EMULATOR_RUN_SLOTS` under `SILICA_BOARD_EMULATOR=qemu` (4 for `STM32-L476RG_raw`) | programs run at once; more than 1 only in an emulator |
+| `SILICA_BOARD_EMULATOR` | (off) | `qemu`: `ESP32-S3_raw` (with `SILICA_QEMU`) and `STM32-L476RG_raw` run in QEMU instead of on the board |
 
 ## Files
 

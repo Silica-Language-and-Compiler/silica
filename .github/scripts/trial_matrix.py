@@ -35,6 +35,7 @@ TARGETS = (
     "linux_aarch64",
     "linux_x86_64",
     "ESP32-S3_raw",
+    "STM32-L476RG_raw",
 )
 
 RUNNERS = {
@@ -42,15 +43,26 @@ RUNNERS = {
     "linux_aarch64": "ubuntu-24.04-arm",
     "linux_x86_64": "ubuntu-24.04",
     "ESP32-S3_raw": "macos-latest",
+    "STM32-L476RG_raw": "macos-latest",
 }
 
 # On the matching runner, "host" is that machine. ESP32-S3_raw is the board
-# target; the workflow points it at QEMU.
+# target; the workflow points it at QEMU. So is STM32-L476RG_raw: the workflow
+# runs the NUCLEO-L476RG trials in QEMU's STM32L4x5 model (SILICA_BOARD_EMULATOR=qemu).
 TRIAL_TARGET = {
     "apple_silicon_mac": "host",
     "linux_aarch64": "host",
     "linux_x86_64": "host",
     "ESP32-S3_raw": "ESP32-S3_raw",
+    "STM32-L476RG_raw": "STM32-L476RG_raw",
+}
+
+# Targets whose compiler may not be released yet. Their rows carry
+# skip_without_release, and the workflow skips the shard (install, run,
+# collect) when the latest release has no compiler for the emit target,
+# instead of failing it.
+OPTIONAL_RELEASE = {
+    "STM32-L476RG_raw": "STM32-L476RG_raw",
 }
 
 HOSTS = ("apple_silicon_mac", "linux_aarch64", "linux_x86_64")
@@ -138,6 +150,7 @@ def matrix(trials: str, target: str, shards: int) -> list[dict[str, object]]:
                 "trial_target": TRIAL_TARGET[name],
                 "suites": " ".join(sorted(suites)),
                 "suite_slice": ("%s:%d:%d" % (SLICED_SUITE, shards, shard)) if sliced else "",
+                "skip_without_release": OPTIONAL_RELEASE.get(name, ""),
             })
     return rows
 

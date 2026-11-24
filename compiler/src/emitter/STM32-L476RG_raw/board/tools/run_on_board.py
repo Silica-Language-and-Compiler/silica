@@ -63,6 +63,10 @@ Exit status: 0 a marker pair was seen; 3 no exit marker before the timeout (the 
 stderr); 4 the board is unavailable (no or refused port, no or several or unexpected ST-LINK, OpenOCD
 failed, serial error); 2 usage.
 
+SILICA_BOARD_EMULATOR=qemu runs the image in QEMU's STM32L4x5 model instead of on the board: the whole
+command line goes to run_in_qemu.py (no ST-LINK, no serial port, no pyserial; ../QEMU.md), as the
+ESP32-S3_raw runner does under the same variable.
+
 Needs pyserial: run it under the ESP-IDF Python environment, e.g.
     ~/.espressif/python_env/idf6.2_py3.14_env/bin/python run_on_board.py image.elf
 """
@@ -315,7 +319,20 @@ def run_on_board(port_name, image, timeout, send=None, send_delay=1.0, exec_mode
         port.close()
 
 
+def run_in_qemu_main():
+    """SILICA_BOARD_EMULATOR=qemu: the emulator runner (run_in_qemu.py, beside this file) takes over."""
+    import importlib.util
+    sys.dont_write_bytecode = True
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_in_qemu.py")
+    spec = importlib.util.spec_from_file_location("stm32_run_in_qemu", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.main()
+
+
 def main():
+    if os.environ.get("SILICA_BOARD_EMULATOR") == "qemu":
+        return run_in_qemu_main()
     ap = argparse.ArgumentParser()
     ap.add_argument("image", nargs="?")
     ap.add_argument("--port")

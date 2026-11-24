@@ -313,6 +313,17 @@ cmd_normalize() {
     if [ "$list" = host ]; then echo host; else echo $list; fi
 }
 
+# SILICA_BOARD_EMULATOR=qemu: a conf's TARGET_EMULATOR_* settings (STM32-L476RG_raw.conf) replace its
+# Python, modules, tools and run slots for the run. Called right after a conf is sourced.
+apply_emulator_settings() {
+    [ "${SILICA_BOARD_EMULATOR:-}" = qemu ] || return 0
+    [ -z "$TARGET_EMULATOR_PYTHON" ] || TARGET_PYTHON=$TARGET_EMULATOR_PYTHON
+    [ -z "$TARGET_EMULATOR_PY_MODULES" ] || TARGET_PY_MODULES=$TARGET_EMULATOR_PY_MODULES
+    [ -z "$TARGET_EMULATOR_TOOLS" ] || TARGET_TOOLS=$TARGET_EMULATOR_TOOLS
+    [ -z "$TARGET_EMULATOR_RUN_SLOTS" ] || TARGET_RUN_SLOTS=$TARGET_EMULATOR_RUN_SLOTS
+    [ -z "$TARGET_EMULATOR_TOOLS" ] || TARGET_DESCRIPTION="$TARGET_DESCRIPTION, emulated in QEMU (SILICA_BOARD_EMULATOR=qemu)"
+}
+
 # Board port: $BOARD_PORT, else the target's TARGET_PORT_DEFAULT when that exists, else the single
 # candidate; with several, ask (terminal) or fail. $3 is TARGET_PORT_DEFAULT (may be empty).
 choose_port() {
@@ -374,9 +385,11 @@ run_board() {
     [ -f "$conf" ] || die "unknown trial target '$target' (defined: host $(board_targets | tr '\n' ' '))"
     TARGET_DESCRIPTION=""; TARGET_BOARD_DIR=""; TARGET_PYTHON=""; TARGET_ASCOMP_PLATFORM=""
     TARGET_IMAGE_EXT="bin"; TARGET_PORT_DEFAULT=""; TARGET_PY_MODULES="esptool serial"; TARGET_TOOLS=""
-    TARGET_COMPILER=""; TARGET_GOLDENS=""
+    TARGET_COMPILER=""; TARGET_GOLDENS=""; TARGET_RUN_SLOTS=1
+    TARGET_EMULATOR_PYTHON=""; TARGET_EMULATOR_PY_MODULES=""; TARGET_EMULATOR_TOOLS=""; TARGET_EMULATOR_RUN_SLOTS=""
     # shellcheck disable=SC1090
     . "$conf"
+    apply_emulator_settings
     local board_dir="$repo_root/$TARGET_BOARD_DIR"
     local tools="$board_dir/tools"
     local py="${BOARD_PYTHON:-$TARGET_PYTHON}"
@@ -404,8 +417,13 @@ run_board() {
 
     local port probe
     # CI runs the ESP32-S3 image in QEMU. There is no serial port to probe; run_on_board.py
-    # reads SILICA_BOARD_EMULATOR and boots each image itself.
-    if [ "${SILICA_BOARD_EMULATOR:-}" = qemu ] && [ "$target" = ESP32-S3_raw ]; then
+    # reads SILICA_BOARD_EMULATOR and boots each image itself. STM32-L476RG_raw does the same
+    # (its runner checks qemu-system-arm and the machine on --probe).
+    if [ "${SILICA_BOARD_EMULATOR:-}" = qemu ] && [ "$target" != ESP32-S3_raw ] && [ -n "$TARGET_EMULATOR_TOOLS" ]; then
+        port=qemu
+        probe=$("$py" "$tools/run_on_board.py" --probe 2>&1) \
+            || pdie "emulator check failed: ${probe#run_on_board: }"
+    elif [ "${SILICA_BOARD_EMULATOR:-}" = qemu ] && [ "$target" = ESP32-S3_raw ]; then
         [ -n "${SILICA_QEMU:-}" ] && [ -x "${SILICA_QEMU}" ] \
             || pdie "SILICA_BOARD_EMULATOR=qemu but SILICA_QEMU is not an executable"
         # Start QEMU once before any trial. A QEMU that cannot load (a missing Homebrew dylib makes
@@ -500,7 +518,8 @@ $(head -5 "$mirror/.rt.log")"
     [ "${BOARD_ASCOMP:-}" != off ] || ascomp_platform=""
     export TRIAL_TARGET="$target" BOARD_PORT="$port" BOARD_SILICA_COMPILER="$compiler" BOARD_PYTHON="$py" \
         BOARD_TOOLS="$tools" BOARD_RT_CACHE="$mirror/.rt" TRIALS_ROOT="$trials_root" \
-        BOARD_ASCOMP_PLATFORM="$ascomp_platform" BOARD_IMAGE_EXT="$TARGET_IMAGE_EXT" BOARD_GOLDEN_TARGET="$TARGET_GOLDENS"
+        BOARD_ASCOMP_PLATFORM="$ascomp_platform" BOARD_IMAGE_EXT="$TARGET_IMAGE_EXT" BOARD_GOLDEN_TARGET="$TARGET_GOLDENS" \
+        BOARD_RUN_SLOTS="${BOARD_RUN_SLOTS:-$TARGET_RUN_SLOTS}" BOARD_EMIT_TARGET="$emit"
     # TRIAL_TARGET goes on the command line: a TRIAL_TARGET given to the user's make is passed down
     # in MAKEFLAGS and would override both the environment and the generated makefile.
     local st
