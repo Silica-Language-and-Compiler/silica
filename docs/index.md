@@ -13,7 +13,6 @@ layout: default
   <a class="card" href="{{ '/build-and-test/' | relative_url }}"><b>Build and Test</b><span>Build the compiler for every platform, some of them, or just this machine, and run the trials.</span></a>
   <a class="card" href="{{ '/required-software/' | relative_url }}"><b>Required Software</b><span>What to install to build the compiler and run the trials, on a host machine and on an ESP32-S3 board.</span></a>
   <a class="card" href="{{ '/participate/' | relative_url }}"><b>Participate</b><span>In-flight work on parallel language and runtime tracks.</span></a>
-  <a class="card" href="{{ '/project-status/' | relative_url }}"><b>Project Status</b><span>Where Silica, BEES, to-silica and The Tao of Silica stand today, and what you can do with them. Pre-release.</span></a>
 </div>
 
 Silica's target is to be the world’s most intellectually honest, secure language and runtime—without asking you to fight the tools or the language to get there.
