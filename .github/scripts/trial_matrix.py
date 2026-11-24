@@ -11,6 +11,7 @@ A suite also stays out of a target's rows when it does not apply to that target:
     (apple_silicon_mac, linux_aarch64, linux_x86_64, ESP32-S3_raw,
     STM32-L476RG_raw) or `host` for the three hosted ones; `#` lines are comments.
     The suite runs only on the listed targets. No file means every target.
+    STM32-L476RG_qemu reads the file as STM32-L476RG_raw (MARKER_TARGET).
   - BOARD_ONLY (older marker): the suite is not run on the hosted targets.
 `make integrate` applies the same two files to a whole-tree host run, so local
 and CI agree. A suite a target merely skips for a stated reason
@@ -35,6 +36,7 @@ TARGETS = (
     "linux_aarch64",
     "linux_x86_64",
     "ESP32-S3_raw",
+    "STM32-L476RG_qemu",
 )
 
 RUNNERS = {
@@ -42,15 +44,33 @@ RUNNERS = {
     "linux_aarch64": "ubuntu-24.04-arm",
     "linux_x86_64": "ubuntu-24.04",
     "ESP32-S3_raw": "macos-latest",
+    "STM32-L476RG_qemu": "macos-latest",
 }
 
 # On the matching runner, "host" is that machine. ESP32-S3_raw is the board
-# target; the workflow points it at QEMU.
+# target; the workflow points it at QEMU. STM32-L476RG_qemu is the NUCLEO-L476RG
+# emulated in QEMU (trials/targets/STM32-L476RG_qemu.conf), run with the
+# STM32-L476RG_raw compiler.
 TRIAL_TARGET = {
     "apple_silicon_mac": "host",
     "linux_aarch64": "host",
     "linux_x86_64": "host",
     "ESP32-S3_raw": "ESP32-S3_raw",
+    "STM32-L476RG_qemu": "STM32-L476RG_qemu",
+}
+
+# A target that stands in for another one: its suites are the ones TRIAL_TARGETS
+# allows for that target (the emulated Nucleo runs what the Nucleo runs).
+MARKER_TARGET = {
+    "STM32-L476RG_qemu": "STM32-L476RG_raw",
+}
+
+# Targets whose compiler may not be released yet. Their rows carry
+# skip_without_release, and the workflow skips the shard (install, run,
+# collect) when the latest release has no compiler for the emit target,
+# instead of failing it.
+OPTIONAL_RELEASE = {
+    "STM32-L476RG_qemu": "STM32-L476RG_raw",
 }
 
 HOSTS = ("apple_silicon_mac", "linux_aarch64", "linux_x86_64")
@@ -62,6 +82,7 @@ SLICED_SUITE = "error_enforcement_addition"
 
 def applies(trials: str, suite: str, target: str) -> bool:
     """True when the suite's TRIAL_TARGETS / BOARD_ONLY markers allow this target."""
+    target = MARKER_TARGET.get(target, target)
     path = os.path.join(trials, suite)
     if target in HOSTS and os.path.isfile(os.path.join(path, "BOARD_ONLY")):
         return False
@@ -138,6 +159,7 @@ def matrix(trials: str, target: str, shards: int) -> list[dict[str, object]]:
                 "trial_target": TRIAL_TARGET[name],
                 "suites": " ".join(sorted(suites)),
                 "suite_slice": ("%s:%d:%d" % (SLICED_SUITE, shards, shard)) if sliced else "",
+                "skip_without_release": OPTIONAL_RELEASE.get(name, ""),
             })
     return rows
 
