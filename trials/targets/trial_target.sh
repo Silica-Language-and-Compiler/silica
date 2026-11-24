@@ -374,7 +374,7 @@ run_board() {
     [ -f "$conf" ] || die "unknown trial target '$target' (defined: host $(board_targets | tr '\n' ' '))"
     TARGET_DESCRIPTION=""; TARGET_BOARD_DIR=""; TARGET_PYTHON=""; TARGET_ASCOMP_PLATFORM=""
     TARGET_IMAGE_EXT="bin"; TARGET_PORT_DEFAULT=""; TARGET_PY_MODULES="esptool serial"; TARGET_TOOLS=""
-    TARGET_COMPILER=""; TARGET_GOLDENS=""
+    TARGET_COMPILER=""; TARGET_GOLDENS=""; TARGET_RUN_SLOTS=1
     # shellcheck disable=SC1090
     . "$conf"
     local board_dir="$repo_root/$TARGET_BOARD_DIR"
@@ -500,7 +500,8 @@ $(head -5 "$mirror/.rt.log")"
     [ "${BOARD_ASCOMP:-}" != off ] || ascomp_platform=""
     export TRIAL_TARGET="$target" BOARD_PORT="$port" BOARD_SILICA_COMPILER="$compiler" BOARD_PYTHON="$py" \
         BOARD_TOOLS="$tools" BOARD_RT_CACHE="$mirror/.rt" TRIALS_ROOT="$trials_root" \
-        BOARD_ASCOMP_PLATFORM="$ascomp_platform" BOARD_IMAGE_EXT="$TARGET_IMAGE_EXT" BOARD_GOLDEN_TARGET="$TARGET_GOLDENS"
+        BOARD_ASCOMP_PLATFORM="$ascomp_platform" BOARD_IMAGE_EXT="$TARGET_IMAGE_EXT" BOARD_GOLDEN_TARGET="$TARGET_GOLDENS" \
+        BOARD_RUN_SLOTS="${BOARD_RUN_SLOTS:-$TARGET_RUN_SLOTS}" BOARD_EMIT_TARGET="$emit"
     # TRIAL_TARGET goes on the command line: a TRIAL_TARGET given to the user's make is passed down
     # in MAKEFLAGS and would override both the environment and the generated makefile.
     local st

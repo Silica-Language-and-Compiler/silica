@@ -149,10 +149,20 @@
     bic     r0, r0, #FLASH_ACR_LATENCY_MASK
     orr     r0, r0, #FLASH_ACR_LATENCY_4WS
     str     r0, [r2]
+.ifndef BOARD_QEMU
+    // BOARD_QEMU (the STM32-L476RG_qemu trial target, board/qemu/): QEMU's STM32L4x5 has no flash
+    // interface model (FLASH is an unimplemented device: reads give 0), so this read-back would never
+    // end there. The write above is kept; the board's image is assembled without the symbol. The loop's
+    // 12 bytes become 6 narrow NOPs, so every address and the heap size are the board image's.
 4:  ldr     r0, [r2]
     and     r0, r0, #FLASH_ACR_LATENCY_MASK
     cmp     r0, #FLASH_ACR_LATENCY_4WS
     bne.w   4b
+.else
+    .rept 6
+    nop
+    .endr
+.endif
 .ifdef BOARD_EXEC_FLASH
     // Code runs from flash: the ART accelerator's prefetch, instruction cache and data cache on
     // (PRFTEN | ICEN | DCEN, bits 8-10; the latency field kept), read back like the latency.

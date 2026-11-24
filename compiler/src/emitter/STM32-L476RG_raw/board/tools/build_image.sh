@@ -84,7 +84,9 @@ fi
 # calling convention. -ffixed-r9 keeps C away from TP (rt_defs.h).
 ARCH="-mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=softfp"
 # The runtime sources are preprocessed (.S: rt_defs.h); emitted .sams are plain assembler.
-ASFLAGS="-c $ARCH -I$RT"
+# BOARD_ASFLAGS adds assembler flags to every source (the QEMU trial target's wrapper, ../qemu/tools/build_image.sh,
+# passes -Wa,--defsym,BOARD_QEMU=1; unset for the board, whose images are unchanged by it).
+ASFLAGS="-c $ARCH -I$RT ${BOARD_ASFLAGS:-}"
 LDSCRIPT="$RT/silica_stm32l476rg.ld"
 case "${BOARD_EXEC:-ram}" in
     ram) ;;

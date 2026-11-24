@@ -9,6 +9,7 @@
 | `linux_x86_64` | the compiler built on that machine | the x86-64 Linux machine ("nix"), reached over ssh: remote hosted |
 | `ESP32-S3_raw` | `binaries/silica-compiler-ESP32-S3_raw` | an ESP32-S3 board on USB, bare metal |
 | `STM32-L476RG_raw` | `binaries/silica-compiler-STM32-L476RG_raw` | an ST NUCLEO-L476RG over its ST-LINK, bare metal (see below) |
+| `STM32-L476RG_qemu` | `binaries/silica-compiler-STM32-L476RG_raw` | the NUCLEO-L476RG emulated in QEMU, bare metal, no board (see below) |
 
 A board target is defined by `<target>.conf` in this directory. The software each target needs is
 listed in [docs/required-software.md](../../docs/required-software.md). A remote hosted target is a
@@ -218,6 +219,25 @@ bash trials/targets/run_one_trial.sh STM32-L476RG_raw base test     # one trial,
 - [STM32-L476RG_raw.skip](STM32-L476RG_raw.skip) skips every suite but `base` for now (the runtime has no
   message copier, call, failure reports yet); delete a suite's line to widen the run.
 
+## Target STM32-L476RG_qemu (the emulated Nucleo)
+
+```
+make integrate TRIAL_TARGET=STM32-L476RG_qemu                       # every suite the Nucleo runs, no board
+bash trials/targets/run_one_trial.sh STM32-L476RG_qemu base test    # one trial, same code path
+```
+
+- A separate trial target with its own lock, mirror (`.target/STM32-L476RG_qemu/`), outputs
+  (`<trial>.STM32-L476RG_qemu.sout`) and report (`.integrate_report.STM32-L476RG_qemu`), so it runs at the same
+  time as the board run. It uses the board's compiler (`TARGET_COMPILER`), its assembly goldens
+  (`.st_nucleo.ascomp`), its output goldens and its skip list (`TARGET_GOLDENS=STM32-L476RG_raw`), then its own
+  [STM32-L476RG_qemu.skip](STM32-L476RG_qemu.skip) for what only the emulator cannot do.
+- Prerequisites: `brew install qemu arm-none-eabi-gcc` and any Python 3. The probe checks that
+  `qemu-system-arm` starts and has the `b-l475e-iot01a` machine (the STM32L4x5 model); the port is the pseudo
+  port `qemu`.
+- Programs run `TARGET_RUN_SLOTS` (4) at a time, one QEMU each (`BOARD_RUN_SLOTS=N` overrides; the board
+  targets keep one). How the image is loaded and what the model leaves out:
+  [compiler/src/emitter/STM32-L476RG_raw/board/qemu/README.md](../../compiler/src/emitter/STM32-L476RG_raw/board/qemu/README.md).
+
 `run_one_trial.sh <target> <suite> <stem>` runs one program or compile-failure trial through
 `board_suite.sh` (`BOARD_ONLY_STEM`), prints the diff on a mismatch, keeps its work area (`--work <dir>`
 or a new directory under `$TMPDIR`) and works for both board targets. It refuses to start while a
@@ -240,6 +260,7 @@ or a new directory under `$TMPDIR`) and works for both board targets. It refuses
 | `SILICA_BUILD_HOSTS` | `.silica_build_hosts` in the repository root | the machine list |
 | `BOARD_TRIAL_TIMEOUT` | 300 | seconds a program may run on the board before it counts as hung |
 | `BOARD_FAIL_JOBS` | 4 | compile-failure trials compiled at once |
+| `BOARD_RUN_SLOTS` | the conf's `TARGET_RUN_SLOTS` (1; 4 for `STM32-L476RG_qemu`) | programs run at once; more than 1 only for an emulated target |
 
 ## Files
 

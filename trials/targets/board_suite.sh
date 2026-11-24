@@ -59,6 +59,9 @@
 set -u
 
 MARK_ROOT="${SILICA_INTEGRATE_ROOT:-.}"
+# The target the compiler emits for (the conf's TARGET_COMPILER, else the trial target itself): the board
+# C fixtures (fixtures_board_<emit target>.mk, fixtures/build/<emit target>/) are built for it.
+emit_target="${BOARD_EMIT_TARGET:-$1}"
 TRIAL_TIMEOUT="${BOARD_TRIAL_TIMEOUT:-300}"
 COMPILE_TIMEOUT="${SILICA_COMPILE_TIMEOUT:-300}"
 # Extension of the image build_image.sh writes and run_on_board.py loads (conf TARGET_IMAGE_EXT: bin for
@@ -495,7 +498,9 @@ run_program() {
         grep -m 12 -i 'error\|undefined' "build/$stem.image.log" || head -n 12 "build/$stem.image.log"
         ko=$((ko + 1)); return 0
     fi
-    # The board runs one trial at a time for the whole run (flock on .board.lock). The run is
+    # The board runs one trial at a time for the whole run (flock on .board.lock). An emulated target
+    # (BOARD_RUN_SLOTS > 1, the conf's TARGET_RUN_SLOTS) runs up to that many at once, each holding one
+    # of .board.lock.1 .. .board.lock.N. The run is
     # registered like every host trial so the integrate watchdog can stop it.
     # $^F: perl closes every descriptor above 2 on exec, which released the lock the moment
     # run_on_board.py started; two suites then opened the port together and the second one
@@ -526,8 +531,11 @@ run_program() {
     fi
     integrate_killed=0
     perl -e 'setpgrp(0, 0); exec @ARGV or exit 127' \
-        perl -MFcntl=:flock -e '$^F = 255; open(my $f, ">>", shift @ARGV) or die "board lock: $!\n"; flock($f, LOCK_EX) or die "board lock: $!\n"; exec @ARGV or exit 127' \
-        "$MARK_ROOT/.board.lock" "$BOARD_PYTHON" "$BOARD_TOOLS/run_on_board.py" --port "$BOARD_PORT" \
+        perl -MFcntl=:flock -e '$^F = 255; my ($lock, $n) = splice(@ARGV, 0, 2); my $f;
+            if ($n <= 1) { open($f, ">>", $lock) or die "board lock: $!\n"; flock($f, LOCK_EX) or die "board lock: $!\n"; }
+            else { SLOT: while (1) { for my $i (1 .. $n) { open($f, ">>", "$lock.$i") or die "board lock: $!\n"; last SLOT if flock($f, LOCK_EX | LOCK_NB); close($f); } select(undef, undef, undef, 0.05); } }
+            exec @ARGV or exit 127' \
+        "$MARK_ROOT/.board.lock" "${BOARD_RUN_SLOTS:-1}" "$BOARD_PYTHON" "$BOARD_TOOLS/run_on_board.py" --port "$BOARD_PORT" \
         --timeout "$TRIAL_TIMEOUT" ${send[@]+"${send[@]}"} --out "build/$stem.sout" "$img.$IMG_EXT" 2> "build/$stem.run.err" &
     pid=$!
     reg="$MARK_ROOT/.integrate_running/$pid"
@@ -581,9 +589,9 @@ suite_ffi=0
 if [ "${#programs[@]}" -gt 0 ] && grep -qs '^wrapper_meta "dangerous_exposure_source/' "$src"/*.silica; then
     ffi_src="$TRIALS_ROOT/ffi_addition"
     ffi_mk="$ffi_src/fixtures_board.mk"
-    [ -f "$ffi_src/fixtures_board_$target.mk" ] && ffi_mk="$ffi_src/fixtures_board_$target.mk"
+    [ -f "$ffi_src/fixtures_board_$emit_target.mk" ] && ffi_mk="$ffi_src/fixtures_board_$emit_target.mk"
     if [ -f "$ffi_mk" ] && make -s -f "$ffi_mk" > build/fixtures_board.log 2>&1; then
-        ln -sfn "$ffi_src/fixtures/build/$target/dangerous_exposure_source" src/dangerous_exposure_source
+        ln -sfn "$ffi_src/fixtures/build/$emit_target/dangerous_exposure_source" src/dangerous_exposure_source
         suite_ffi=1
     else
         mark_fail
@@ -631,11 +639,12 @@ fi
 # the skip file (<suite>/<stem>) are reported as skipped and left out of the compile.
 if [ "${#appdirs[@]}" -gt 0 ]; then
     export XTENSA_BIN=${XTENSA_BIN:-$HOME/.espressif/tools/xtensa-esp-elf/esp-16.1.0_20260609/xtensa-esp-elf/bin}
-    # the board's C fixtures: fixtures_board_<target>.mk when the suite has one (STM32-L476RG_raw),
-    # else fixtures_board.mk (ESP32-S3_raw); each builds fixtures/build/<target>/
+    # the board's C fixtures: fixtures_board_<emit target>.mk when the suite has one (STM32-L476RG_raw),
+    # else fixtures_board.mk (ESP32-S3_raw); each builds fixtures/build/<emit target>/. The emit target
+    # is the compiler's (BOARD_EMIT_TARGET): STM32-L476RG_qemu links the STM32-L476RG_raw fixtures.
     fixtures_mk="$src/fixtures_board.mk"
-    [ -f "$src/fixtures_board_$target.mk" ] && fixtures_mk="$src/fixtures_board_$target.mk"
-    view="$src/fixtures/build/$target/dangerous_exposure_source"
+    [ -f "$src/fixtures_board_$emit_target.mk" ] && fixtures_mk="$src/fixtures_board_$emit_target.mk"
+    view="$src/fixtures/build/$emit_target/dangerous_exposure_source"
     fixtures_ok=0
     fixtures_started=0
     mkdir -p apps

@@ -60,7 +60,7 @@ conf="$here/$target.conf"
 
 TARGET_DESCRIPTION=""; TARGET_BOARD_DIR=""; TARGET_PYTHON=""; TARGET_ASCOMP_PLATFORM=""
 TARGET_IMAGE_EXT="bin"; TARGET_PORT_DEFAULT=""; TARGET_PY_MODULES="esptool serial"; TARGET_TOOLS=""
-TARGET_COMPILER=""; TARGET_GOLDENS=""
+TARGET_COMPILER=""; TARGET_GOLDENS=""; TARGET_RUN_SLOTS=1
 # shellcheck disable=SC1090
 . "$conf"
 tools="$repo_root/$TARGET_BOARD_DIR/tools"
@@ -106,6 +106,7 @@ printf 'run_one_trial: %s %s/%s on %s (%s); work area %s\n' "$target" "$suite" "
 export TRIAL_TARGET="$target" BOARD_PORT="$port" BOARD_SILICA_COMPILER="$compiler" BOARD_PYTHON="$py" \
     BOARD_TOOLS="$tools" BOARD_RT_CACHE="$work/.rt" TRIALS_ROOT="$trials_root" \
     BOARD_ASCOMP_PLATFORM="$platform" BOARD_IMAGE_EXT="$TARGET_IMAGE_EXT" BOARD_GOLDEN_TARGET="$TARGET_GOLDENS" \
+    BOARD_RUN_SLOTS="${BOARD_RUN_SLOTS:-$TARGET_RUN_SLOTS}" BOARD_EMIT_TARGET="${TARGET_COMPILER:-$target}" \
     BOARD_ONLY_STEM="$stem" SILICA_INTEGRATE_ROOT="$work"
 bash "$here/board_suite.sh" "$target" "$suite" "$work"
 st=$?
