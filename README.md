@@ -2,6 +2,8 @@
 
 # Silica
 
+> **This repository is for developing Silica:** the compiler, its runtimes, the specification and the trials. If you just want to use Silica, go to [silica-cli](https://github.com/Silica-Language-and-Compiler/silica-cli), the command line tool that downloads the latest compiler and builds and runs Silica programs.
+
 Silica is a memory-safe, functional systems language. The compiler rejects unsafe or accidental behavior at compile time, with errors you can act on. Effects are explicit, actors pass messages, and memory is region-based with no garbage collector.
 
 Silica is designed for bare metal systems development, but also supports applications hosted by operating systems. The toolchain builds and reproduces itself today on macOS (Apple Silicon), Linux on AArch64 and Linux on x86-64, and cross-compiles for the OS-free ESP32-S3.
